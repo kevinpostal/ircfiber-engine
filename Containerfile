@@ -41,7 +41,9 @@ COPY config/ ./config/
 COPY public/ ./public/
 
 RUN dub build --compiler=ldc2 --build=release --force --parallel
+RUN dub build --config=engine --compiler=ldc2 --build=release --force --parallel
 RUN strip /build/irc-fiber
+RUN strip /build/irc-fiber-engine
 
 # Runtime stage
 FROM ubuntu:22.04
@@ -49,10 +51,12 @@ RUN apt-get update && apt-get install -y \
     libssl3 \
     zlib1g \
     curl \
+    procps \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY --from=builder /build/irc-fiber /app/
+COPY --from=builder /build/irc-fiber-engine /app/
 COPY --from=builder /build/views /app/views
 COPY --from=builder /build/config /app/config
 COPY --from=builder /build/public /app/public
@@ -62,4 +66,4 @@ RUN mkdir -p /app/data
 
 EXPOSE 8090
 
-ENTRYPOINT ["/app/irc-fiber"]
+# No default entrypoint; command set in docker-compose
