@@ -1,0 +1,105 @@
+version: '3.8'
+
+services:
+  irc_fiber:
+    build:
+      context: .
+      dockerfile: Containerfile
+    image: irc-fiber:latest
+    container_name: irc_fiber
+    restart: unless-stopped
+    networks:
+      - irc_network
+    depends_on:
+      redis:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+    environment:
+      IRCFIBER_REDIS_URL: redis://redis:6379/0
+      IRCFIBER_MONGO_URL: mongodb://mongo:27017/ircfiber
+      IRCFIBER_CONFIG_PATH: /config/prod.conf
+      IRCFIBER_LOG_LEVEL: info
+    volumes:
+      - ./config/prod.conf:/config/prod.conf:ro
+      - irc_fiber_logs:/var/log/irc-fiber
+      - ./data:/app/data
+    ports:
+      - "8090:8090"
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 128M
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8090/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  redis:
+    image: redis:7-alpine
+    container_name: irc_redis
+    restart: unless-stopped
+    networks:
+      - irc_network
+    volumes:
+      - redis_data:/data
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  mongo:
+    image: mongo:7
+    container_name: irc_mongo
+    restart: unless-stopped
+    networks:
+      - irc_network
+    volumes:
+      - mongo_data:/data/db
+    environment:
+      MONGO_INITDB_DATABASE: ircfiber
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    ports:
+      - "27017:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+networks:
+  irc_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  redis_data:
+    driver: local
+  mongo_data:
+    driver: local
+  irc_fiber_logs:
+    driver: local
