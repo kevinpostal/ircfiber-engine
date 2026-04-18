@@ -64,7 +64,13 @@ ICON_BOX    := □
 .PHONY: all help build build-release build-debug run test clean fmt
 .PHONY: dscanner dscanner-install dscanner-syntax dscanner-lint dscanner-unused
 .PHONY: dscanner-complexity dscanner-imports dscanner-fix dscanner-size dscanner-outline dscanner-all
-.PHONY: deps-check docker-up docker-down docker-logs docker-build cross-linux-x64 cross-linux-arm64 cross-linux-armv7
+.PHONY: deps-check ensure-colima docker-up docker-down docker-logs docker-build docker-restart-gateway \
+         docker-up-web docker-down-web docker-restart-web \
+         docker-up-backend docker-down-backend docker-restart-backend docker-restart \
+         podman-up podman-down podman-logs \
+         podman-up-web podman-down-web podman-restart-web \
+         podman-up-backend podman-down-backend podman-restart-backend podman-restart \
+         cross-linux-x64 cross-linux-arm64 cross-linux-armv7
 
 # ----------------------------------------------------------------------------
 # Main Build Targets
@@ -74,7 +80,7 @@ all: build
 
 build:
 	@printf '\n%b\n' "$(BG_CYAN)$(BLACK)$(BOLD)  Building IRC Fiber  $(RESET)"
-	@$(DUB) build 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | tail -8
+	@$(DUB) build 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | grep -v "during/source/during/package.d" | grep -v "Deprecation: accessing" | tail -8
 	@if [ -f $(APP) ]; then \
 		SIZE=$$(ls -lh $(APP) | awk '{print $$5}'); \
 		printf '\n%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Build successful$(RESET) $(DIM)($$SIZE)$(RESET)"; \
@@ -84,13 +90,13 @@ build:
 
 build-release:
 	@printf '\n%b\n' "$(BG_CYAN)$(BLACK)$(BOLD)  Building IRC Fiber (Release)  $(RESET)"
-	@$(DUB) build --build=release 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | tail -8
+	@$(DUB) build --build=release 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | grep -v "during/source/during/package.d" | grep -v "Deprecation: accessing" | tail -8
 	@SIZE=$$(ls -lh $(APP) 2>/dev/null | awk '{print $$5}'); \
 		printf '\n%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Release build successful$(RESET) $(DIM)($$SIZE)$(RESET)"
 
 build-debug:
 	@printf '\n%b\n' "$(BG_CYAN)$(BLACK)$(BOLD)  Building IRC Fiber (Debug)  $(RESET)"
-	@$(DUB) build --build=debug 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | tail -8
+	@$(DUB) build --build=debug 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | grep -v "during/source/during/package.d" | grep -v "Deprecation: accessing" | tail -8
 	@printf '\n%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Debug build successful$(RESET)"
 
 # Build with direct ldc2 (no dub dependency resolution overhead)
@@ -174,23 +180,81 @@ dscanner-all: dscanner-syntax dscanner-lint dscanner-unused dscanner-complexity
 # Docker / Podman Compose
 # ----------------------------------------------------------------------------
 
-docker-up:
+ensure-colima:
+	@if ! docker info >/dev/null 2>&1; then \
+		if command -v colima >/dev/null 2>&1; then \
+			printf '\n%b\n' "$(YELLOW)$(ICON_WARN) Docker daemon is not reachable$(RESET)"; \
+			printf '%b' "$(CYAN)Colima appears to be installed but not running. Start it now? [Y/n] $(RESET)"; \
+			read -r answer < /dev/tty; \
+			case "$$answer" in \
+				[Nn]|[Nn][Oo]) \
+					printf '%b\n' "$(YELLOW)$(ICON_WARN) Aborted. Start Colima manually with: colima start$(RESET)"; \
+					exit 1; \
+					;; \
+				*) \
+					printf '%b\n' "$(CYAN)→ Starting Colima...$(RESET)"; \
+					colima start; \
+					;; \
+			esac; \
+		else \
+			printf '\n%b\n' "$(YELLOW)$(ICON_WARN) Docker daemon is not running and Colima is not installed$(RESET)"; \
+			exit 1; \
+		fi \
+	fi
+
+docker-up: ensure-colima
 	@printf '\n%b\n' "$(BG_GREEN)$(BLACK)$(BOLD)  Starting Docker Services  $(RESET)"
 	@docker compose up -d
 	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Services started$(RESET) $(DIM)(http://localhost:8090)$(RESET)"
 
-docker-down:
+docker-down: ensure-colima
 	@printf '%b\n' "$(DIM)→ Stopping Docker services...$(RESET)"
 	@docker compose down
 	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Services stopped$(RESET)"
 
-docker-logs:
+docker-logs: ensure-colima
 	@docker compose logs -f
 
-docker-build:
+docker-build: ensure-colima
 	@printf '\n%b\n' "$(BG_GREEN)$(BLACK)$(BOLD)  Building Docker Image  $(RESET)"
 	@docker compose build
 	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Docker image built$(RESET)"
+
+docker-restart-gateway: docker-restart-web
+
+docker-up-web: ensure-colima
+	@printf '\n%b\n' "$(BG_GREEN)$(BLACK)$(BOLD)  Starting Web Server (Gateway)  $(RESET)"
+	@docker compose up -d irc_fiber
+	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Web server started$(RESET) $(DIM)(http://localhost:8090)$(RESET)"
+
+docker-down-web: ensure-colima
+	@printf '%b\n' "$(DIM)→ Stopping web server...$(RESET)"
+	@docker compose stop irc_fiber
+	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Web server stopped$(RESET)"
+
+docker-restart-web: ensure-colima
+	@printf '\n%b\n' "$(BG_GREEN)$(BLACK)$(BOLD)  Restarting Web Server (Gateway)  $(RESET)"
+	@docker compose build irc_fiber
+	@docker compose up -d --force-recreate irc_fiber
+	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Web server restarted$(RESET) $(DIM)(http://localhost:8090)$(RESET)"
+
+docker-up-backend: ensure-colima
+	@printf '\n%b\n' "$(BG_GREEN)$(BLACK)$(BOLD)  Starting Backend Services  $(RESET)"
+	@docker compose up -d irc_engine redis mongo
+	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Backend services started$(RESET)"
+
+docker-down-backend: ensure-colima
+	@printf '%b\n' "$(DIM)→ Stopping backend services...$(RESET)"
+	@docker compose stop irc_engine redis mongo
+	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Backend services stopped$(RESET)"
+
+docker-restart-backend: ensure-colima
+	@printf '\n%b\n' "$(BG_GREEN)$(BLACK)$(BOLD)  Restarting Backend Services  $(RESET)"
+	@docker compose up -d --build --force-recreate irc_engine redis mongo
+	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Backend services restarted$(RESET)"
+
+docker-restart: docker-restart-web docker-restart-backend
+	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) All services restarted$(RESET)"
 
 podman-up:
 	@printf '\n%b\n' "$(BG_GREEN)$(BLACK)$(BOLD)  Starting Podman Services  $(RESET)"
@@ -201,6 +265,39 @@ podman-down:
 	@printf '%b\n' "$(DIM)→ Stopping Podman services...$(RESET)"
 	@podman compose down
 	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Services stopped$(RESET)"
+
+podman-up-web:
+	@printf '\n%b\n' "$(BG_GREEN)$(BLACK)$(BOLD)  Starting Web Server (Podman)  $(RESET)"
+	@podman compose up -d irc_fiber
+	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Web server started$(RESET) $(DIM)(http://localhost:8090)$(RESET)"
+
+podman-down-web:
+	@printf '%b\n' "$(DIM)→ Stopping web server (Podman)...$(RESET)"
+	@podman compose stop irc_fiber
+	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Web server stopped$(RESET)"
+
+podman-restart-web:
+	@printf '\n%b\n' "$(BG_GREEN)$(BLACK)$(BOLD)  Restarting Web Server (Podman)  $(RESET)"
+	@podman compose up -d --build --force-recreate irc_fiber
+	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Web server restarted$(RESET) $(DIM)(http://localhost:8090)$(RESET)"
+
+podman-up-backend:
+	@printf '\n%b\n' "$(BG_GREEN)$(BLACK)$(BOLD)  Starting Backend Services (Podman)  $(RESET)"
+	@podman compose up -d irc_engine redis mongo
+	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Backend services started$(RESET)"
+
+podman-down-backend:
+	@printf '%b\n' "$(DIM)→ Stopping backend services (Podman)...$(RESET)"
+	@podman compose stop irc_engine redis mongo
+	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Backend services stopped$(RESET)"
+
+podman-restart-backend:
+	@printf '\n%b\n' "$(BG_GREEN)$(BLACK)$(BOLD)  Restarting Backend Services (Podman)  $(RESET)"
+	@podman compose up -d --build --force-recreate irc_engine redis mongo
+	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Backend services restarted$(RESET)"
+
+podman-restart: podman-restart-web podman-restart-backend
+	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) All Podman services restarted$(RESET)"
 
 # ----------------------------------------------------------------------------
 # Cross Compilation
@@ -277,11 +374,19 @@ help:
 	@echo ""
 	@echo "$(BG_YELLOW)$(BLACK)  Docker / Podman  $(RESET)"
 	@echo "  $(YELLOW)make docker-up$(RESET)          - Start all services with Docker"
-	@echo "  $(YELLOW)make docker-down$(RESET)        - Stop Docker services"
+	@echo "  $(YELLOW)make docker-down$(RESET)        - Stop all Docker services"
+	@echo "  $(YELLOW)make docker-restart$(RESET)     - Restart all Docker services"
+	@echo "  $(YELLOW)make docker-up-web$(RESET)      - Start web server only"
+	@echo "  $(YELLOW)make docker-down-web$(RESET)    - Stop web server only"
+	@echo "  $(YELLOW)make docker-restart-web$(RESET) - Restart web server only"
+	@echo "  $(YELLOW)make docker-up-backend$(RESET)  - Start backend services only"
+	@echo "  $(YELLOW)make docker-down-backend$(RESET)- Stop backend services only"
+	@echo "  $(YELLOW)make docker-restart-backend$(RESET)- Restart backend services only"
 	@echo "  $(YELLOW)make docker-logs$(RESET)        - Tail Docker logs"
 	@echo "  $(YELLOW)make docker-build$(RESET)       - Rebuild Docker image"
 	@echo "  $(YELLOW)make podman-up$(RESET)          - Start with Podman Compose"
 	@echo "  $(YELLOW)make podman-down$(RESET)        - Stop Podman services"
+	@echo "  $(YELLOW)make podman-restart$(RESET)     - Restart all Podman services"
 	@echo ""
 	@echo "$(BG_MAGENTA)$(BLACK)  Code Quality  $(RESET)"
 	@echo "  $(MAGENTA)make dscanner-all$(RESET)       - Run all D-Scanner checks"
