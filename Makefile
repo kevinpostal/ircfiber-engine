@@ -49,6 +49,9 @@ BRIGHT_GREEN:= \033[92m
 BRIGHT_YELLOW:= \033[93m
 BRIGHT_CYAN := \033[96m
 BG_GREEN    := \033[42m
+BG_YELLOW   := \033[43m
+BG_MAGENTA  := \033[45m
+BG_BLUE     := \033[44m
 BG_CYAN     := \033[46m
 BLACK       := \033[30m
 
@@ -61,12 +64,14 @@ ICON_BOX    := □
 # ----------------------------------------------------------------------------
 # Phony Targets
 # ----------------------------------------------------------------------------
-.PHONY: all help build build-release build-debug run test clean fmt
+.PHONY: all help build build-engine build-release build-debug build-ldc2 run test clean fmt stop down
 .PHONY: dscanner dscanner-install dscanner-syntax dscanner-lint dscanner-unused
 .PHONY: dscanner-complexity dscanner-imports dscanner-fix dscanner-size dscanner-outline dscanner-all
 .PHONY: deps-check ensure-colima docker-up docker-down docker-logs docker-build docker-restart-gateway \
          docker-up-web docker-down-web docker-restart-web \
          docker-up-backend docker-down-backend docker-restart-backend docker-restart \
+         docker-up-test docker-down-test docker-restart-test \
+         ircd-up ircd-down \
          podman-up podman-down podman-logs \
          podman-up-web podman-down-web podman-restart-web \
          podman-up-backend podman-down-backend podman-restart-backend podman-restart \
@@ -78,9 +83,17 @@ ICON_BOX    := □
 
 all: build
 
+# Platform detection
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+    OPENSSL_LIB := $(shell brew --prefix openssl 2>/dev/null || echo /usr/local)/lib
+else
+    OPENSSL_LIB := $(shell pkg-config --variable=libdir openssl 2>/dev/null || echo /usr/lib)
+endif
+
 build:
 	@printf '\n%b\n' "$(BG_CYAN)$(BLACK)$(BOLD)  Building IRC Fiber  $(RESET)"
-	@$(DUB) build 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | grep -v "during/source/during/package.d" | grep -v "Deprecation: accessing" | tail -8
+	@bash -o pipefail -c '$(DUB) build 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | tail -8'
 	@if [ -f $(APP) ]; then \
 		SIZE=$$(ls -lh $(APP) | awk '{print $$5}'); \
 		printf '\n%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Build successful$(RESET) $(DIM)($$SIZE)$(RESET)"; \
@@ -88,21 +101,26 @@ build:
 		printf '\n%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Dub build complete$(RESET)"; \
 	fi
 
+build-engine:
+	@printf '\n%b\n' "$(BG_CYAN)$(BLACK)$(BOLD)  Building IRC Fiber Engine  $(RESET)"
+	@bash -o pipefail -c '$(DUB) build --config=engine 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | tail -8'
+	@printf '\n%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Engine build successful$(RESET)"
+
 build-release:
 	@printf '\n%b\n' "$(BG_CYAN)$(BLACK)$(BOLD)  Building IRC Fiber (Release)  $(RESET)"
-	@$(DUB) build --build=release 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | grep -v "during/source/during/package.d" | grep -v "Deprecation: accessing" | tail -8
+	@bash -o pipefail -c '$(DUB) build --build=release 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | tail -8'
 	@SIZE=$$(ls -lh $(APP) 2>/dev/null | awk '{print $$5}'); \
 		printf '\n%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Release build successful$(RESET) $(DIM)($$SIZE)$(RESET)"
 
 build-debug:
 	@printf '\n%b\n' "$(BG_CYAN)$(BLACK)$(BOLD)  Building IRC Fiber (Debug)  $(RESET)"
-	@$(DUB) build --build=debug 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | grep -v "during/source/during/package.d" | grep -v "Deprecation: accessing" | tail -8
+	@bash -o pipefail -c '$(DUB) build --build=debug 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | grep -v "during/source/during/package.d" | grep -v "Deprecation: accessing" | tail -8'
 	@printf '\n%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Debug build successful$(RESET)"
 
 # Build with direct ldc2 (no dub dependency resolution overhead)
 build-ldc2:
 	@printf '\n%b\n' "$(BG_CYAN)$(BLACK)$(BOLD)  Building IRC Fiber (LDC2 Direct)  $(RESET)"
-	@$(LDC) $(SRCS) -of=$(APP) -Isource -Jviews \
+	@bash -o pipefail -c '$(LDC) $(SRCS) -of=$(APP) -Isource -Jviews \
 		$$(find $(DUB_PKG)/vibe-d/0.10.*/vibe-d/source \
 		      $(DUB_PKG)/vibe-core/2.*/vibe-core/source \
 		      $(DUB_PKG)/vibe-http/1.*/vibe-http/source \
@@ -115,19 +133,72 @@ build-ldc2:
 		      $(DUB_PKG)/stdx-allocator/2.*/stdx-allocator/source \
 		      $(DUB_PKG)/eventcore/0.9.*/eventcore/source \
 		      -name "*.d" | xargs -I{} echo -I{}) \
-		-version=VibeUseFibers \
-		-L=-L$(shell brew --prefix openssl)/lib -L=-lssl -L=-lcrypto \
-		2>&1 | grep -v "deployment version" | tail -12
-	@SIZE=$$(ls -lh $(APP) 2>/dev/null | awk '{print $$5}'); \
-		printf '\n%b\n' "$(BRIGHT_GREEN)$(ICON_OK) LDC2 build successful$(RESET) $(DIM)($$SIZE)$(RESET)"
+		-d-version=VibeUseFibers \
+		-L=-L$(OPENSSL_LIB) -L=-lssl -L=-lcrypto \
+		2>&1 | grep -v "deployment version" | tail -12'
+	@if [ -f $(APP) ]; then \
+		SIZE=$$(ls -lh $(APP) 2>/dev/null | awk '{print $$5}'); \
+		printf '\n%b\n' "$(BRIGHT_GREEN)$(ICON_OK) LDC2 build successful$(RESET) $(DIM)($$SIZE)$(RESET)"; \
+	else \
+		printf '\n%b\n' "$(YELLOW)$(ICON_WARN) LDC2 build failed$(RESET)"; \
+		exit 1; \
+	fi
 
 # ----------------------------------------------------------------------------
 # Run & Test
 # ----------------------------------------------------------------------------
 
-run: build
-	@printf '%b\n' "$(CYAN)$(ICON_ARROW) Starting $(APP)...$(RESET)"
-	@./$(APP)
+run: build build-engine
+	@bash -c ' \
+		printf "\n%b\n" "$(BG_GREEN)$(BLACK)$(BOLD)  Cleaning up existing processes  $(RESET)"; \
+		killall -9 irc-fiber-engine 2>/dev/null || true; \
+		killall -9 irc-fiber 2>/dev/null || true; \
+		sleep 1; \
+		SERVER_ID=$${IRCFIBER_SERVER_ID:-localengine}; \
+		if docker info >/dev/null 2>&1; then \
+			docker compose exec -T redis redis-cli del irc:server:$$SERVER_ID irc:servers irc:network:assignments >/dev/null 2>&1 || true; \
+		fi; \
+		printf "%b\n" "$(BRIGHT_GREEN)$(ICON_OK) Cleanup complete$(RESET)"; \
+		printf "\n%b\n" "$(BG_GREEN)$(BLACK)$(BOLD)  Checking Backend Services  $(RESET)"; \
+		if ! docker info >/dev/null 2>&1; then \
+			printf "%b\n" "$(YELLOW)$(ICON_WARN) Docker is not running$(RESET)"; \
+			printf "%b\n" "$(DIM)Start Docker first, or run: make docker-up-backend$(RESET)"; \
+			exit 1; \
+		fi; \
+		if ! docker compose ps mongo redis ircd 2>/dev/null | grep -q "healthy"; then \
+			printf "%b\n" "$(YELLOW)$(ICON_WARN) Backend services not running. Starting them now...$(RESET)"; \
+			docker compose up -d mongo redis ircd; \
+			printf "%b\n" "$(CYAN)→ Waiting for services to be ready...$(RESET)"; \
+			for i in 1 2 3 4 5 6 7 8 9 10; do \
+				if docker compose ps mongo redis ircd 2>/dev/null | grep -q "healthy"; then \
+					printf "%b\n" "$(BRIGHT_GREEN)$(ICON_OK) Backend services ready$(RESET)"; \
+					break; \
+				fi; \
+				if [ $$i -eq 10 ]; then \
+					printf "%b\n" "$(YELLOW)$(ICON_WARN) Services still starting, continuing anyway...$(RESET)"; \
+				fi; \
+				sleep 1; \
+			done; \
+		else \
+			printf "%b\n" "$(BRIGHT_GREEN)$(ICON_OK) Backend services already running$(RESET)"; \
+		fi; \
+		printf "\n%b\n" "$(BG_CYAN)$(BLACK)$(BOLD)  Starting IRC Fiber Engine  $(RESET)"; \
+		env IRCFIBER_MONGO_URL=mongodb://127.0.0.1:27017/ircfiber IRCFIBER_REDIS_URL=redis://127.0.0.1:6379/0 IRCFIBER_SERVER_ID=$${IRCFIBER_SERVER_ID:-localengine} IRCFIBER_BIND_ADDRESS=$${IRCFIBER_BIND_ADDRESS:-127.0.0.1} nohup ./irc-fiber-engine > /tmp/irc-fiber-engine.log 2>&1 & \
+		ENGINE_PID=$$!; \
+		printf "%b\n" "$(CYAN)$(ICON_ARROW) Engine PID: $$ENGINE_PID$(RESET)"; \
+		sleep 3; \
+		printf "\n%b\n" "$(BG_CYAN)$(BLACK)$(BOLD)  Starting IRC Fiber Gateway  $(RESET)"; \
+		printf "%b\n" "$(CYAN)$(ICON_ARROW) http://localhost:8090$(RESET)"; \
+		trap "printf \"\\n%b\\n\" \"$(DIM)→ Stopping engine (PID $$ENGINE_PID)...$(RESET)\"; kill $$ENGINE_PID 2>/dev/null; exit" INT TERM EXIT; \
+		env IRCFIBER_MONGO_URL=mongodb://127.0.0.1:27017/ircfiber IRCFIBER_REDIS_URL=redis://127.0.0.1:6379/0 ./irc-fiber; \
+	'
+
+run-engine: build
+	@printf '\n%b\n' "$(BG_CYAN)$(BLACK)$(BOLD)  Starting IRC Fiber Engine  $(RESET)"
+	@if [ -z "$(IRCFIBER_SERVER_ID)" ]; then \
+		export IRCFIBER_SERVER_ID=localengine; \
+	fi
+	@env IRCFIBER_MONGO_URL=mongodb://127.0.0.1:27017/ircfiber IRCFIBER_REDIS_URL=redis://127.0.0.1:6379/0 IRCFIBER_SERVER_ID=$${IRCFIBER_SERVER_ID:-localengine} IRCFIBER_BIND_ADDRESS=$${IRCFIBER_BIND_ADDRESS:-127.0.0.1} ./irc-fiber-engine
 
 test:
 	@printf '\n%b\n' "$(BG_CYAN)$(BLACK)$(BOLD)  Running Tests  $(RESET)"
@@ -207,10 +278,18 @@ docker-up: ensure-colima
 	@docker compose up -d
 	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Services started$(RESET) $(DIM)(http://localhost:8090)$(RESET)"
 
+stop: docker-down
+down: docker-down
+
 docker-down: ensure-colima
-	@printf '%b\n' "$(DIM)→ Stopping Docker services...$(RESET)"
+	@printf '%b\n' "$(DIM)→ Stopping Docker services (docker-compose.yml)...$(RESET)"
 	@docker compose down
 	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Services stopped$(RESET)"
+
+docker-down-test: ensure-colima
+	@printf '%b\n' "$(DIM)→ Stopping Docker test services (docker-compose.test.yml)...$(RESET)"
+	@docker compose -f docker-compose.test.yml down
+	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Test services stopped$(RESET)"
 
 docker-logs: ensure-colima
 	@docker compose logs -f
@@ -240,18 +319,28 @@ docker-restart-web: ensure-colima
 
 docker-up-backend: ensure-colima
 	@printf '\n%b\n' "$(BG_GREEN)$(BLACK)$(BOLD)  Starting Backend Services  $(RESET)"
-	@docker compose up -d irc_engine redis mongo
+	@docker compose up -d irc_engine redis mongo ircd
 	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Backend services started$(RESET)"
 
 docker-down-backend: ensure-colima
 	@printf '%b\n' "$(DIM)→ Stopping backend services...$(RESET)"
-	@docker compose stop irc_engine redis mongo
+	@docker compose stop irc_engine redis mongo ircd
 	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Backend services stopped$(RESET)"
 
 docker-restart-backend: ensure-colima
 	@printf '\n%b\n' "$(BG_GREEN)$(BLACK)$(BOLD)  Restarting Backend Services  $(RESET)"
-	@docker compose up -d --build --force-recreate irc_engine redis mongo
+	@docker compose up -d --build --force-recreate irc_engine redis mongo ircd
 	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Backend services restarted$(RESET)"
+
+ircd-up: ensure-colima
+	@printf '\n%b\n' "$(BG_GREEN)$(BLACK)$(BOLD)  Starting IRCD Test Server  $(RESET)"
+	@docker compose up -d ircd
+	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) IRCD started$(RESET) $(DIM)(localhost:6667)$(RESET)"
+
+ircd-down: ensure-colima
+	@printf '%b\n' "$(DIM)→ Stopping IRCD...$(RESET)"
+	@docker compose stop ircd
+	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) IRCD stopped$(RESET)"
 
 docker-restart: docker-restart-web docker-restart-backend
 	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) All services restarted$(RESET)"
@@ -283,17 +372,17 @@ podman-restart-web:
 
 podman-up-backend:
 	@printf '\n%b\n' "$(BG_GREEN)$(BLACK)$(BOLD)  Starting Backend Services (Podman)  $(RESET)"
-	@podman compose up -d irc_engine redis mongo
+	@podman compose up -d irc_engine redis mongo ircd
 	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Backend services started$(RESET)"
 
 podman-down-backend:
 	@printf '%b\n' "$(DIM)→ Stopping backend services (Podman)...$(RESET)"
-	@podman compose stop irc_engine redis mongo
+	@podman compose stop irc_engine redis mongo ircd
 	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Backend services stopped$(RESET)"
 
 podman-restart-backend:
 	@printf '\n%b\n' "$(BG_GREEN)$(BLACK)$(BOLD)  Restarting Backend Services (Podman)  $(RESET)"
-	@podman compose up -d --build --force-recreate irc_engine redis mongo
+	@podman compose up -d --build --force-recreate irc_engine redis mongo ircd
 	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Backend services restarted$(RESET)"
 
 podman-restart: podman-restart-web podman-restart-backend
@@ -362,8 +451,10 @@ help:
 	@echo ""
 	@echo "$(BG_GREEN)$(BLACK)  Quick Start  $(RESET)"
 	@echo "  $(BRIGHT_GREEN)make build$(RESET)          - Build the application with dub"
-	@echo "  $(BRIGHT_GREEN)make run$(RESET)            - Build and run the server"
+	@echo "  $(BRIGHT_GREEN)make run$(RESET)            - Build and run the gateway (auto-starts backends)"
+	@echo "  $(BRIGHT_GREEN)make run-engine$(RESET)     - Run the IRC engine (needs backends running)"
 	@echo "  $(BRIGHT_GREEN)make docker-up$(RESET)      - Start with Docker Compose (MongoDB + Redis)"
+	@echo "  $(BRIGHT_GREEN)make stop$(RESET)           - Stop all Docker services"
 	@echo ""
 	@echo "$(BG_CYAN)$(BLACK)  Build Targets  $(RESET)"
 	@echo "  $(GREEN)make build$(RESET)              - Default debug build"
@@ -374,7 +465,9 @@ help:
 	@echo ""
 	@echo "$(BG_YELLOW)$(BLACK)  Docker / Podman  $(RESET)"
 	@echo "  $(YELLOW)make docker-up$(RESET)          - Start all services with Docker"
-	@echo "  $(YELLOW)make docker-down$(RESET)        - Stop all Docker services"
+	@echo "  $(YELLOW)make stop$(RESET)               - Stop all Docker services"
+	@echo "  $(YELLOW)make docker-down$(RESET)        - Stop all Docker services (alias)"
+	@echo "  $(YELLOW)make docker-down-test$(RESET)   - Stop test services (ircd + mongo + redis)"
 	@echo "  $(YELLOW)make docker-restart$(RESET)     - Restart all Docker services"
 	@echo "  $(YELLOW)make docker-up-web$(RESET)      - Start web server only"
 	@echo "  $(YELLOW)make docker-down-web$(RESET)    - Stop web server only"
@@ -384,6 +477,8 @@ help:
 	@echo "  $(YELLOW)make docker-restart-backend$(RESET)- Restart backend services only"
 	@echo "  $(YELLOW)make docker-logs$(RESET)        - Tail Docker logs"
 	@echo "  $(YELLOW)make docker-build$(RESET)       - Rebuild Docker image"
+	@echo "  $(YELLOW)make ircd-up$(RESET)            - Start test IRCD (localhost:6667)"
+	@echo "  $(YELLOW)make ircd-down$(RESET)          - Stop test IRCD"
 	@echo "  $(YELLOW)make podman-up$(RESET)          - Start with Podman Compose"
 	@echo "  $(YELLOW)make podman-down$(RESET)        - Stop Podman services"
 	@echo "  $(YELLOW)make podman-restart$(RESET)     - Restart all Podman services"

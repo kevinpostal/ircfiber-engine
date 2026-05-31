@@ -56,10 +56,14 @@ services:
         condition: service_healthy
       mongo:
         condition: service_healthy
+      ircd:
+        condition: service_healthy
     environment:
       IRCFIBER_REDIS_URL: redis://redis:6379/0
       IRCFIBER_MONGO_URL: mongodb://mongo:27017/ircfiber
       IRCFIBER_LOG_LEVEL: info
+      IRCFIBER_SERVER_ID: dockerengine1
+      IRCFIBER_BIND_ADDRESS: 0.0.0.0
     volumes: []
     deploy:
       resources:
@@ -93,8 +97,8 @@ services:
       resources:
         limits:
           memory: 256M
-    # ports:
-    #   - "6379:6379"
+    ports:
+      - "6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -115,14 +119,33 @@ services:
       resources:
         limits:
           memory: 512M
-    # ports:
-    #   - "27017:27017"
+    ports:
+      - "27017:27017"
     healthcheck:
       test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 20s
+
+  ircd:
+    build:
+      context: ./docker/ircd
+      dockerfile: Dockerfile
+    image: ircd-test:latest
+    container_name: ircd_test
+    restart: unless-stopped
+    networks:
+      - irc_network
+    ports:
+      - "6667:6667"
+      - "6668:6668"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "6667"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
 
 networks:
   irc_network:
