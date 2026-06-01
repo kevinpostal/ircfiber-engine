@@ -19,69 +19,59 @@ LDC         := ldc2
 APP         := irc-fiber
 DUB_PKG     := $(HOME)/.dub/packages
 
-# D-Scanner detection
-DSCANNER_BIN := $(shell which dscanner 2>/dev/null || echo "")
-DSCANNER_DUB_BIN := $(shell ls -1 $(DUB_PKG)/dscanner/*/dscanner/bin/dscanner 2>/dev/null | tail -1)
-ifeq ($(DSCANNER_BIN),)
-    ifeq ($(DSCANNER_DUB_BIN),)
-        DSCANNER := dub run dscanner --
-    else
-        DSCANNER := $(DSCANNER_DUB_BIN)
-    endif
-else
-    DSCANNER := $(DSCANNER_BIN)
-endif
+# D-Scanner detection (system > dub package > fallback)
+DSCANNER := $(or $(shell which dscanner 2>/dev/null),\
+                  $(shell ls -1 $(DUB_PKG)/dscanner/*/dscanner/bin/dscanner 2>/dev/null | tail -1),\
+                  dub run dscanner --)
 
 # Source files
-SRCS        := $(shell find source -name "*.d" 2>/dev/null)
-DT_SRCS     := $(shell find views -name "*.dt" 2>/dev/null)
+SRCS        := $(shell find source -name '*.d')
+DT_SRCS     := $(shell find views -name '*.dt')
 
-# Colors
-RESET       := \033[0m
-BOLD        := \033[1m
-DIM         := \033[2m
-GREEN       := \033[32m
-YELLOW      := \033[33m
-BLUE        := \033[34m
-MAGENTA     := \033[35m
-CYAN        := \033[36m
-BRIGHT_GREEN:= \033[92m
-BRIGHT_YELLOW:= \033[93m
-BRIGHT_CYAN := \033[96m
-BG_GREEN    := \033[42m
-BG_YELLOW   := \033[43m
-BG_MAGENTA  := \033[45m
-BG_BLUE     := \033[44m
-BG_CYAN     := \033[46m
-BLACK       := \033[30m
+# Colors & icons
+R  := \033[0m
+B  := \033[1m
+D  := \033[2m
+K  := \033[30m
+G  := \033[32m
+Y  := \033[33m
+C  := \033[36m
+BG := \033[92m
+BY := \033[93m
+_BC := \033[42m
+_BY := \033[43m
+_BM := \033[45m
+_BB := \033[44m
+_BCn:= \033[46m
 
-ICON_OK     := ✓
-ICON_WARN   := ⚠
-ICON_BULLET := •
-ICON_ARROW  := →
-ICON_BOX    := □
+OK := ✓
+WR := ⚠
+BL := •
+AR := →
 
 # ----------------------------------------------------------------------------
 # Phony Targets
 # ----------------------------------------------------------------------------
-.PHONY: all help build build-engine build-release build-debug build-ldc2 run test clean fmt stop down
-.PHONY: dscanner dscanner-install dscanner-syntax dscanner-lint dscanner-unused
-.PHONY: dscanner-complexity dscanner-imports dscanner-fix dscanner-size dscanner-outline dscanner-all
-.PHONY: deps-check ensure-colima docker-up docker-down docker-logs docker-build docker-restart-gateway \
-         docker-up-web docker-down-web docker-restart-web \
-         docker-up-backend docker-down-backend docker-restart-backend docker-restart \
-         docker-up-test docker-down-test docker-restart-test \
-         ircd-up ircd-down \
-         podman-up podman-down podman-logs \
-         podman-up-web podman-down-web podman-restart-web \
-         podman-up-backend podman-down-backend podman-restart-backend podman-restart \
-         cross-linux-x64 cross-linux-arm64 cross-linux-armv7
+# Phony targets (grouped by category)
+.PHONY: all help build build-engine build-release build-debug build-ldc2
+.PHONY: start run run-engine up down restart-web logs-web logs-engine watch-web
+.PHONY: test clean fmt deps-check
+.PHONY: dscanner-install dscanner-all dscanner-syntax dscanner-lint dscanner-unused \
+        dscanner-complexity dscanner-imports dscanner-fix dscanner-size dscanner-outline
+.PHONY: ensure-colima docker-up docker-down docker-logs docker-build \
+        docker-up-web docker-down-web docker-restart-web \
+        docker-up-backend docker-down-backend docker-restart-backend docker-restart \
+        docker-down-test ircd-up ircd-down
+.PHONY: podman-up podman-down podman-logs \
+        podman-up-web podman-down-web podman-restart-web \
+        podman-up-backend podman-down-backend podman-restart-backend podman-restart
+.PHONY: cross-linux-x64 cross-linux-arm64 cross-linux-armv7
 
 # ----------------------------------------------------------------------------
 # Main Build Targets
 # ----------------------------------------------------------------------------
 
-all: build
+all: build ## Utils > Build the default target
 
 # Platform detection
 UNAME_S := $(shell uname -s)
@@ -91,35 +81,35 @@ else
     OPENSSL_LIB := $(shell pkg-config --variable=libdir openssl 2>/dev/null || echo /usr/lib)
 endif
 
-build:
-	@printf '\n%b\n' "$(BG_CYAN)$(BLACK)$(BOLD)  Building IRC Fiber  $(RESET)"
+build: ## Build > Build the application with dub
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building IRC Fiber  $(R)"
 	@bash -o pipefail -c '$(DUB) build 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | tail -8'
 	@if [ -f $(APP) ]; then \
 		SIZE=$$(ls -lh $(APP) | awk '{print $$5}'); \
-		printf '\n%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Build successful$(RESET) $(DIM)($$SIZE)$(RESET)"; \
+		printf '\n%b\n' "$(BG)$(OK) Build successful$(R) $(D)($$SIZE)$(R)"; \
 	else \
-		printf '\n%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Dub build complete$(RESET)"; \
+		printf '\n%b\n' "$(BG)$(OK) Dub build complete$(R)"; \
 	fi
 
-build-engine:
-	@printf '\n%b\n' "$(BG_CYAN)$(BLACK)$(BOLD)  Building IRC Fiber Engine  $(RESET)"
+build-engine: ## Build > Build the IRC engine binary
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building IRC Fiber Engine  $(R)"
 	@bash -o pipefail -c '$(DUB) build --config=engine 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | tail -8'
-	@printf '\n%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Engine build successful$(RESET)"
+	@printf '\n%b\n' "$(BG)$(OK) Engine build successful$(R)"
 
-build-release:
-	@printf '\n%b\n' "$(BG_CYAN)$(BLACK)$(BOLD)  Building IRC Fiber (Release)  $(RESET)"
+build-release: ## Build > Optimized release build
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building IRC Fiber (Release)  $(R)"
 	@bash -o pipefail -c '$(DUB) build --build=release 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | tail -8'
 	@SIZE=$$(ls -lh $(APP) 2>/dev/null | awk '{print $$5}'); \
-		printf '\n%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Release build successful$(RESET) $(DIM)($$SIZE)$(RESET)"
+		printf '\n%b\n' "$(BG)$(OK) Release build successful$(R) $(D)($$SIZE)$(R)"
 
-build-debug:
-	@printf '\n%b\n' "$(BG_CYAN)$(BLACK)$(BOLD)  Building IRC Fiber (Debug)  $(RESET)"
+build-debug: ## Build > Explicit debug build
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building IRC Fiber (Debug)  $(R)"
 	@bash -o pipefail -c '$(DUB) build --build=debug 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | grep -v "during/source/during/package.d" | grep -v "Deprecation: accessing" | tail -8'
-	@printf '\n%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Debug build successful$(RESET)"
+	@printf '\n%b\n' "$(BG)$(OK) Debug build successful$(R)"
 
 # Build with direct ldc2 (no dub dependency resolution overhead)
-build-ldc2:
-	@printf '\n%b\n' "$(BG_CYAN)$(BLACK)$(BOLD)  Building IRC Fiber (LDC2 Direct)  $(RESET)"
+build-ldc2: ## Build > Direct ldc2 build (no dub overhead)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building IRC Fiber (LDC2 Direct)  $(R)"
 	@bash -o pipefail -c '$(LDC) $(SRCS) -of=$(APP) -Isource -Jviews \
 		$$(find $(DUB_PKG)/vibe-d/0.10.*/vibe-d/source \
 		      $(DUB_PKG)/vibe-core/2.*/vibe-core/source \
@@ -138,366 +128,464 @@ build-ldc2:
 		2>&1 | grep -v "deployment version" | tail -12'
 	@if [ -f $(APP) ]; then \
 		SIZE=$$(ls -lh $(APP) 2>/dev/null | awk '{print $$5}'); \
-		printf '\n%b\n' "$(BRIGHT_GREEN)$(ICON_OK) LDC2 build successful$(RESET) $(DIM)($$SIZE)$(RESET)"; \
+		printf '\n%b\n' "$(BG)$(OK) LDC2 build successful$(R) $(D)($$SIZE)$(R)"; \
 	else \
-		printf '\n%b\n' "$(YELLOW)$(ICON_WARN) LDC2 build failed$(RESET)"; \
+		printf '\n%b\n' "$(Y)$(WR) LDC2 build failed$(R)"; \
 		exit 1; \
 	fi
+
+# ----------------------------------------------------------------------------
+# Shared helpers
+# ----------------------------------------------------------------------------
+
+# Bash snippet: kill old processes, clear redis, check/start backend services
+define _docker_setup
+killall -9 irc-fiber-engine 2>/dev/null || true; \
+killall -9 irc-fiber 2>/dev/null || true; \
+sleep 1; \
+SERVER_ID=$${IRCFIBER_SERVER_ID:-localengine}; \
+if docker info >/dev/null 2>&1; then \
+	docker compose exec -T redis redis-cli del irc:server:$$SERVER_ID irc:servers irc:network:assignments >/dev/null 2>&1 || true; \
+fi; \
+if ! docker info >/dev/null 2>&1; then \
+	printf "%b\n" "$(Y)$(WR) Docker is not running$(R)"; \
+	printf "%b\n" "$(D)Start Docker first, or run: make docker-up-backend$(R)"; \
+	exit 1; \
+fi; \
+if ! docker compose ps mongo redis ircd 2>/dev/null | grep -q "healthy"; then \
+	printf "%b\n" "$(Y)$(WR) Backend services not running. Starting them now...$(R)"; \
+	docker compose up -d mongo redis ircd; \
+	printf "%b\n" "$(C)→ Waiting for services to be ready...$(R)"; \
+	for i in 1 2 3 4 5 6 7 8 9 10; do \
+		if docker compose ps mongo redis ircd 2>/dev/null | grep -q "healthy"; then \
+			printf "%b\n" "$(BG)$(OK) Backend services ready$(R)"; \
+			break; \
+		fi; \
+		if [ $$i -eq 10 ]; then \
+			printf "%b\n" "$(Y)$(WR) Services still starting, continuing anyway...$(R)"; \
+		fi; \
+		sleep 1; \
+	done; \
+else \
+	printf "%b\n" "$(BG)$(OK) Backend services already running$(R)"; \
+fi
+endef
 
 # ----------------------------------------------------------------------------
 # Run & Test
 # ----------------------------------------------------------------------------
 
-run: build build-engine
+start: run ## Quick Start > Alias for make run
+
+run: build build-engine ## Quick Start > Build and run gateway in foreground
 	@bash -c ' \
-		printf "\n%b\n" "$(BG_GREEN)$(BLACK)$(BOLD)  Cleaning up existing processes  $(RESET)"; \
-		killall -9 irc-fiber-engine 2>/dev/null || true; \
-		killall -9 irc-fiber 2>/dev/null || true; \
-		sleep 1; \
-		SERVER_ID=$${IRCFIBER_SERVER_ID:-localengine}; \
-		if docker info >/dev/null 2>&1; then \
-			docker compose exec -T redis redis-cli del irc:server:$$SERVER_ID irc:servers irc:network:assignments >/dev/null 2>&1 || true; \
-		fi; \
-		printf "%b\n" "$(BRIGHT_GREEN)$(ICON_OK) Cleanup complete$(RESET)"; \
-		printf "\n%b\n" "$(BG_GREEN)$(BLACK)$(BOLD)  Checking Backend Services  $(RESET)"; \
-		if ! docker info >/dev/null 2>&1; then \
-			printf "%b\n" "$(YELLOW)$(ICON_WARN) Docker is not running$(RESET)"; \
-			printf "%b\n" "$(DIM)Start Docker first, or run: make docker-up-backend$(RESET)"; \
-			exit 1; \
-		fi; \
-		if ! docker compose ps mongo redis ircd 2>/dev/null | grep -q "healthy"; then \
-			printf "%b\n" "$(YELLOW)$(ICON_WARN) Backend services not running. Starting them now...$(RESET)"; \
-			docker compose up -d mongo redis ircd; \
-			printf "%b\n" "$(CYAN)→ Waiting for services to be ready...$(RESET)"; \
-			for i in 1 2 3 4 5 6 7 8 9 10; do \
-				if docker compose ps mongo redis ircd 2>/dev/null | grep -q "healthy"; then \
-					printf "%b\n" "$(BRIGHT_GREEN)$(ICON_OK) Backend services ready$(RESET)"; \
-					break; \
-				fi; \
-				if [ $$i -eq 10 ]; then \
-					printf "%b\n" "$(YELLOW)$(ICON_WARN) Services still starting, continuing anyway...$(RESET)"; \
-				fi; \
-				sleep 1; \
-			done; \
-		else \
-			printf "%b\n" "$(BRIGHT_GREEN)$(ICON_OK) Backend services already running$(RESET)"; \
-		fi; \
-		printf "\n%b\n" "$(BG_CYAN)$(BLACK)$(BOLD)  Starting IRC Fiber Engine  $(RESET)"; \
+		printf "\n%b\n" "$(_BC)$(K)$(B)  Cleaning up existing processes  $(R)"; \
+		$(_docker_setup); \
+		printf "%b\n" "$(BG)$(OK) Cleanup complete$(R)"; \
+		printf "\n%b\n" "$(_BCn)$(K)$(B)  Starting IRC Fiber Engine  $(R)"; \
 		env IRCFIBER_MONGO_URL=mongodb://127.0.0.1:27017/ircfiber IRCFIBER_REDIS_URL=redis://127.0.0.1:6379/0 IRCFIBER_SERVER_ID=$${IRCFIBER_SERVER_ID:-localengine} IRCFIBER_BIND_ADDRESS=$${IRCFIBER_BIND_ADDRESS:-127.0.0.1} nohup ./irc-fiber-engine > /tmp/irc-fiber-engine.log 2>&1 & \
 		ENGINE_PID=$$!; \
-		printf "%b\n" "$(CYAN)$(ICON_ARROW) Engine PID: $$ENGINE_PID$(RESET)"; \
+		printf "%b\n" "$(C)$(AR) Engine PID: $$ENGINE_PID$(R)"; \
 		sleep 3; \
-		printf "\n%b\n" "$(BG_CYAN)$(BLACK)$(BOLD)  Starting IRC Fiber Gateway  $(RESET)"; \
-		printf "%b\n" "$(CYAN)$(ICON_ARROW) http://localhost:8090$(RESET)"; \
-		trap "printf \"\\n%b\\n\" \"$(DIM)→ Stopping engine (PID $$ENGINE_PID)...$(RESET)\"; kill $$ENGINE_PID 2>/dev/null; exit" INT TERM EXIT; \
+		printf "\n%b\n" "$(_BCn)$(K)$(B)  Starting IRC Fiber Gateway  $(R)"; \
+		printf "%b\n" "$(C)$(AR) http://localhost:8090$(R)"; \
+		trap "printf \"\\n%b\\n\" \"$(D)→ Stopping engine (PID $$ENGINE_PID)...$(R)\"; kill $$ENGINE_PID 2>/dev/null; exit" INT TERM EXIT; \
 		env IRCFIBER_MONGO_URL=mongodb://127.0.0.1:27017/ircfiber IRCFIBER_REDIS_URL=redis://127.0.0.1:6379/0 ./irc-fiber; \
 	'
 
-run-engine: build
-	@printf '\n%b\n' "$(BG_CYAN)$(BLACK)$(BOLD)  Starting IRC Fiber Engine  $(RESET)"
-	@if [ -z "$(IRCFIBER_SERVER_ID)" ]; then \
-		export IRCFIBER_SERVER_ID=localengine; \
-	fi
+run-engine: build ## Quick Start > Run the IRC engine (needs backends running)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Starting IRC Fiber Engine  $(R)"
 	@env IRCFIBER_MONGO_URL=mongodb://127.0.0.1:27017/ircfiber IRCFIBER_REDIS_URL=redis://127.0.0.1:6379/0 IRCFIBER_SERVER_ID=$${IRCFIBER_SERVER_ID:-localengine} IRCFIBER_BIND_ADDRESS=$${IRCFIBER_BIND_ADDRESS:-127.0.0.1} ./irc-fiber-engine
 
-test:
-	@printf '\n%b\n' "$(BG_CYAN)$(BLACK)$(BOLD)  Running Tests  $(RESET)"
+# ----------------------------------------------------------------------------
+# Background Run & Live Reload
+# ----------------------------------------------------------------------------
+
+up: build build-engine ## Quick Start > Start engine + gateway in background
+	@bash -c ' \
+		printf "\n%b\n" "$(_BC)$(K)$(B)  Starting IRC Fiber (Background)  $(R)"; \
+		$(_docker_setup); \
+		printf "\n%b\n" "$(_BCn)$(K)$(B)  Starting IRC Fiber Engine  $(R)"; \
+		env IRCFIBER_MONGO_URL=mongodb://127.0.0.1:27017/ircfiber IRCFIBER_REDIS_URL=redis://127.0.0.1:6379/0 IRCFIBER_SERVER_ID=$${IRCFIBER_SERVER_ID:-localengine} IRCFIBER_BIND_ADDRESS=$${IRCFIBER_BIND_ADDRESS:-127.0.0.1} nohup ./irc-fiber-engine > /tmp/irc-fiber-engine.log 2>&1 & \
+		ENGINE_PID=$$!; \
+		echo $$ENGINE_PID > /tmp/irc-fiber-engine.pid; \
+		printf "%b\n" "$(C)$(AR) Engine PID: $$ENGINE_PID$(R)"; \
+		sleep 3; \
+		printf "\n%b\n" "$(_BCn)$(K)$(B)  Starting IRC Fiber Gateway  $(R)"; \
+		printf "%b\n" "$(C)$(AR) http://localhost:8090$(R)"; \
+		env IRCFIBER_MONGO_URL=mongodb://127.0.0.1:27017/ircfiber IRCFIBER_REDIS_URL=redis://127.0.0.1:6379/0 nohup ./irc-fiber > /tmp/irc-fiber.log 2>&1 & \
+		GATEWAY_PID=$$!; \
+		echo $$GATEWAY_PID > /tmp/irc-fiber.pid; \
+		printf "%b\n" "$(C)$(AR) Gateway PID: $$GATEWAY_PID$(R)"; \
+		printf "\n%b\n" "$(BG)$(OK) IRC Fiber running in background$(R)"; \
+		printf "%b\n" "$(D)Logs:  make logs-web  |  make logs-engine$(R)"; \
+		printf "%b\n" "$(D)Stop:  make down$(R)"; \
+		printf "%b\n" "$(D)Watch: make watch-web$(R)"; \
+	'
+
+down: ## Quick Start > Stop background engine + gateway
+	@printf '%b\n' "$(D)→ Stopping IRC Fiber...$(R)"
+	@if [ -f /tmp/irc-fiber.pid ]; then \
+		kill $$(cat /tmp/irc-fiber.pid) 2>/dev/null || true; \
+		rm -f /tmp/irc-fiber.pid; \
+	fi
+	@if [ -f /tmp/irc-fiber-engine.pid ]; then \
+		kill $$(cat /tmp/irc-fiber-engine.pid) 2>/dev/null || true; \
+		rm -f /tmp/irc-fiber-engine.pid; \
+	fi
+	@killall -9 irc-fiber 2>/dev/null || true
+	@killall -9 irc-fiber-engine 2>/dev/null || true
+	@printf '%b\n' "$(BG)$(OK) Stopped$(R)"
+
+restart-web: build ## Quick Start > Rebuild and restart just the gateway
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Restarting Gateway  $(R)"
+	@if [ -f /tmp/irc-fiber.pid ]; then \
+		kill $$(cat /tmp/irc-fiber.pid) 2>/dev/null || true; \
+		rm -f /tmp/irc-fiber.pid; \
+	fi
+	@killall -9 irc-fiber 2>/dev/null || true
+	@sleep 1
+	@env IRCFIBER_MONGO_URL=mongodb://127.0.0.1:27017/ircfiber IRCFIBER_REDIS_URL=redis://127.0.0.1:6379/0 nohup ./irc-fiber > /tmp/irc-fiber.log 2>&1 & \
+		GATEWAY_PID=$$!; \
+		echo $$GATEWAY_PID > /tmp/irc-fiber.pid; \
+		printf '%b\n' "$(C)$(AR) Gateway PID: $$GATEWAY_PID$(R)"
+	@printf '%b\n' "$(BG)$(OK) Gateway restarted$(R) $(D)(http://localhost:8090)$(R)"
+
+logs-web: ## Quick Start > Tail gateway logs
+	@if [ -f /tmp/irc-fiber.log ]; then \
+		tail -f /tmp/irc-fiber.log; \
+	else \
+		printf '%b\n' "$(Y)$(WR) No gateway log found. Run: make up$(R)"; \
+	fi
+
+logs-engine: ## Quick Start > Tail engine logs
+	@if [ -f /tmp/irc-fiber-engine.log ]; then \
+		tail -f /tmp/irc-fiber-engine.log; \
+	else \
+		printf '%b\n' "$(Y)$(WR) No engine log found. Run: make up$(R)"; \
+	fi
+
+watch-web: ## Quick Start > Auto-rebuild gateway on file changes
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Watching for file changes  $(R)"
+	@printf '%b\n' "$(D)Polls every 2s. Install fswatch for instant updates: brew install fswatch$(R)"
+	@bash -c ' \
+		LAST=$$(find source views public -type f -print0 2>/dev/null | xargs -0 stat -f %m 2>/dev/null | sort -n | tail -1); \
+		printf "%b\n" "$(C)→ Watching source/, views/, public/ for changes...$(R)"; \
+		while true; do \
+			sleep 2; \
+			CURR=$$(find source views public -type f -print0 2>/dev/null | xargs -0 stat -f %m 2>/dev/null | sort -n | tail -1); \
+			if [ "$$CURR" != "$$LAST" ]; then \
+				printf "\n%b\n" "$(Y)→ Change detected, restarting gateway...$(R)"; \
+				$(MAKE) --no-print-directory restart-web; \
+				LAST=$$CURR; \
+			fi; \
+		done; \
+	'
+
+test: ## Build > Run unit tests
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Running Tests  $(R)"
 	@$(DUB) test 2>&1 | tail -20
 
 # ----------------------------------------------------------------------------
 # Code Quality (D-Scanner)
 # ----------------------------------------------------------------------------
 
-dscanner-install:
+dscanner-install: ## Quality > Install D-Scanner if missing
 	@command -v dscanner >/dev/null 2>&1 || dub fetch dscanner
 
-dscanner-syntax:
-	@printf '\n%b\n' "$(DIM)--- D-Scanner syntax check ---$(RESET)"
-	@$(DSCANNER) --syntaxCheck $(SRCS) 2>/dev/null || true
+# D-Scanner rule template: $(1)=target suffix, $(2)=label, $(3)=flag, $(4)=post-filter
+define _ds_rule
+dscanner-$(1): ## Quality > $(2)
+	@printf '\n%b\n' "$(D)--- D-Scanner $(2) ---$(R)"
+	@$(DSCANNER) $(3) $(SRCS) 2>/dev/null $(4)
+endef
 
-dscanner-lint:
-	@printf '\n%b\n' "$(DIM)--- D-Scanner lint ---$(RESET)"
-	@$(DSCANNER) --styleCheck $(SRCS) 2>/dev/null || true
+$(eval $(call _ds_rule,syntax,syntax check,--syntaxCheck,|| true))
+dscanner-syntax: ## Quality > Syntax check
+$(eval $(call _ds_rule,lint,lint,--styleCheck,|| true))
+dscanner-lint: ## Quality > Style lint
+$(eval $(call _ds_rule,unused,unused check,--styleCheck,| grep -E "unused_(variable|parameter|import)" || printf '%b\n' "$(G)$(OK) No unused symbols found$(R)"))
+dscanner-unused: ## Quality > Find unused imports/symbols
+$(eval $(call _ds_rule,complexity,complexity check,--styleCheck,| grep "cyclomatic_complexity" || printf '%b\n' "$(G)$(OK) No high-complexity functions found$(R)"))
+dscanner-complexity: ## Quality > Cyclomatic complexity check
+$(eval $(call _ds_rule,imports,import analysis,--imports,|| true))
+dscanner-imports: ## Quality > Import analysis
+$(eval $(call _ds_rule,fix,auto-fix,--fixStyle,|| true))
+dscanner-fix: ## Quality > Auto-fix style issues
+$(eval $(call _ds_rule,size,SLOC count,--sloc,|| true))
+dscanner-size: ## Quality > SLOC count
+$(eval $(call _ds_rule,outline,outline,--outline,|| true))
+dscanner-outline: ## Quality > Outline
 
-dscanner-unused:
-	@printf '\n%b\n' "$(DIM)--- D-Scanner unused check ---$(RESET)"
-	@$(DSCANNER) --styleCheck $(SRCS) 2>/dev/null | grep -E "unused_(variable|parameter|import)" || \
-		printf '%b\n' "$(GREEN)$(ICON_OK) No unused symbols found$(RESET)"
-
-dscanner-complexity:
-	@printf '\n%b\n' "$(DIM)--- D-Scanner complexity check ---$(RESET)"
-	@$(DSCANNER) --styleCheck $(SRCS) 2>/dev/null | grep "cyclomatic_complexity" || \
-		printf '%b\n' "$(GREEN)$(ICON_OK) No high-complexity functions found$(RESET)"
-
-dscanner-imports:
-	@printf '\n%b\n' "$(DIM)--- Import analysis ---$(RESET)"
-	@$(DSCANNER) --imports $(SRCS) 2>/dev/null || true
-
-dscanner-fix:
-	@printf '\n%b\n' "$(DIM)--- Auto-fix style issues ---$(RESET)"
-	@$(DSCANNER) --fixStyle $(SRCS) 2>/dev/null || true
-
-dscanner-size:
-	@printf '\n%b\n' "$(DIM)--- SLOC count ---$(RESET)"
-	@$(DSCANNER) --sloc $(SRCS) 2>/dev/null || true
-
-dscanner-outline:
-	@printf '\n%b\n' "$(DIM)--- Outline ---$(RESET)"
-	@$(DSCANNER) --outline $(SRCS) 2>/dev/null || true
-
-dscanner-all: dscanner-syntax dscanner-lint dscanner-unused dscanner-complexity
+dscanner-all: dscanner-syntax dscanner-lint dscanner-unused dscanner-complexity ## Quality > Run all D-Scanner checks
 
 # ----------------------------------------------------------------------------
 # Docker / Podman Compose
 # ----------------------------------------------------------------------------
 
 ensure-colima:
-	@if ! docker info >/dev/null 2>&1; then \
+	@if ! command -v docker >/dev/null 2>&1; then \
 		if command -v colima >/dev/null 2>&1; then \
-			printf '\n%b\n' "$(YELLOW)$(ICON_WARN) Docker daemon is not reachable$(RESET)"; \
-			printf '%b' "$(CYAN)Colima appears to be installed but not running. Start it now? [Y/n] $(RESET)"; \
+			if colima status >/dev/null 2>&1; then \
+				printf '\n%b\n' "$(Y)$(WR) Colima is running but Docker CLI is not installed$(R)"; \
+			else \
+				printf '\n%b\n' "$(Y)$(WR) Docker daemon is not reachable$(R)"; \
+			fi; \
+			printf '%b' "$(C)Install Docker CLI now? [Y/n] $(R)"; \
 			read -r answer < /dev/tty; \
 			case "$$answer" in \
 				[Nn]|[Nn][Oo]) \
-					printf '%b\n' "$(YELLOW)$(ICON_WARN) Aborted. Start Colima manually with: colima start$(RESET)"; \
+					printf '%b\n' "$(Y)$(WR) Aborted. Install manually: brew install docker$(R)"; \
 					exit 1; \
 					;; \
 				*) \
-					printf '%b\n' "$(CYAN)→ Starting Colima...$(RESET)"; \
+					printf '%b\n' "$(C)→ Installing Docker CLI...$(R)"; \
+					brew install docker docker-compose 2>/dev/null || \
+						brew install docker 2>/dev/null || \
+						(printf '%b\n' "$(Y)$(WR) brew not found. Install Docker CLI manually.$(R)"; exit 1); \
+					;; \
+			esac; \
+		else \
+			printf '\n%b\n' "$(Y)$(WR) Docker is not installed and Colima is not available$(R)"; \
+			printf '%b\n' "$(D)Install: brew install colima docker docker-compose$(R)"; \
+			exit 1; \
+		fi; \
+	elif ! docker info >/dev/null 2>&1; then \
+		if command -v colima >/dev/null 2>&1 && ! colima status >/dev/null 2>&1; then \
+			printf '\n%b\n' "$(Y)$(WR) Docker daemon is not reachable$(R)"; \
+			printf '%b' "$(C)Colima appears installed but stopped. Start it now? [Y/n] $(R)"; \
+			read -r answer < /dev/tty; \
+			case "$$answer" in \
+				[Nn]|[Nn][Oo]) \
+					printf '%b\n' "$(Y)$(WR) Aborted. Start manually: colima start$(R)"; \
+					exit 1; \
+					;; \
+				*) \
+					printf '%b\n' "$(C)→ Starting Colima...$(R)"; \
 					colima start; \
 					;; \
 			esac; \
 		else \
-			printf '\n%b\n' "$(YELLOW)$(ICON_WARN) Docker daemon is not running and Colima is not installed$(RESET)"; \
+			printf '\n%b\n' "$(Y)$(WR) Docker daemon is not reachable$(R)"; \
+			printf '%b\n' "$(D)Check: docker info  |  colima status$(R)"; \
 			exit 1; \
-		fi \
+		fi; \
 	fi
 
-docker-up: ensure-colima
-	@printf '\n%b\n' "$(BG_GREEN)$(BLACK)$(BOLD)  Starting Docker Services  $(RESET)"
+docker-up: ensure-colima ## Docker > Start all services with Docker Compose
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting Docker Services  $(R)"
 	@docker compose up -d
-	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Services started$(RESET) $(DIM)(http://localhost:8090)$(RESET)"
+	@printf '%b\n' "$(BG)$(OK) Services started$(R) $(D)(http://localhost:8090)$(R)"
 
 stop: docker-down
 down: docker-down
 
-docker-down: ensure-colima
-	@printf '%b\n' "$(DIM)→ Stopping Docker services (docker-compose.yml)...$(RESET)"
+docker-down: ensure-colima ## Docker > Stop all Docker services
+	@printf '%b\n' "$(D)→ Stopping Docker services (docker-compose.yml)...$(R)"
 	@docker compose down
-	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Services stopped$(RESET)"
+	@printf '%b\n' "$(BG)$(OK) Services stopped$(R)"
 
-docker-down-test: ensure-colima
-	@printf '%b\n' "$(DIM)→ Stopping Docker test services (docker-compose.test.yml)...$(RESET)"
+docker-down-test: ensure-colima ## Docker > Stop test services (ircd + mongo + redis)
+	@printf '%b\n' "$(D)→ Stopping Docker test services (docker-compose.test.yml)...$(R)"
 	@docker compose -f docker-compose.test.yml down
-	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Test services stopped$(RESET)"
+	@printf '%b\n' "$(BG)$(OK) Test services stopped$(R)"
 
-docker-logs: ensure-colima
+docker-logs: ensure-colima ## Docker > Tail Docker logs
 	@docker compose logs -f
 
-docker-build: ensure-colima
-	@printf '\n%b\n' "$(BG_GREEN)$(BLACK)$(BOLD)  Building Docker Image  $(RESET)"
+docker-build: ensure-colima ## Docker > Rebuild Docker image
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Building Docker Image  $(R)"
 	@docker compose build
-	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Docker image built$(RESET)"
+	@printf '%b\n' "$(BG)$(OK) Docker image built$(R)"
 
 docker-restart-gateway: docker-restart-web
 
-docker-up-web: ensure-colima
-	@printf '\n%b\n' "$(BG_GREEN)$(BLACK)$(BOLD)  Starting Web Server (Gateway)  $(RESET)"
+docker-up-web: ensure-colima ## Docker > Start web server only
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting Web Server (Gateway)  $(R)"
 	@docker compose up -d irc_fiber
-	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Web server started$(RESET) $(DIM)(http://localhost:8090)$(RESET)"
+	@printf '%b\n' "$(BG)$(OK) Web server started$(R) $(D)(http://localhost:8090)$(R)"
 
-docker-down-web: ensure-colima
-	@printf '%b\n' "$(DIM)→ Stopping web server...$(RESET)"
+docker-down-web: ensure-colima ## Docker > Stop web server only
+	@printf '%b\n' "$(D)→ Stopping web server...$(R)"
 	@docker compose stop irc_fiber
-	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Web server stopped$(RESET)"
+	@printf '%b\n' "$(BG)$(OK) Web server stopped$(R)"
 
-docker-restart-web: ensure-colima
-	@printf '\n%b\n' "$(BG_GREEN)$(BLACK)$(BOLD)  Restarting Web Server (Gateway)  $(RESET)"
+docker-restart-web: ensure-colima ## Docker > Restart web server only
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Restarting Web Server (Gateway)  $(R)"
 	@docker compose build irc_fiber
 	@docker compose up -d --force-recreate irc_fiber
-	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Web server restarted$(RESET) $(DIM)(http://localhost:8090)$(RESET)"
+	@printf '%b\n' "$(BG)$(OK) Web server restarted$(R) $(D)(http://localhost:8090)$(R)"
 
-docker-up-backend: ensure-colima
-	@printf '\n%b\n' "$(BG_GREEN)$(BLACK)$(BOLD)  Starting Backend Services  $(RESET)"
+docker-up-backend: ensure-colima ## Docker > Start backend services only
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting Backend Services  $(R)"
 	@docker compose up -d irc_engine redis mongo ircd
-	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Backend services started$(RESET)"
+	@printf '%b\n' "$(BG)$(OK) Backend services started$(R)"
 
-docker-down-backend: ensure-colima
-	@printf '%b\n' "$(DIM)→ Stopping backend services...$(RESET)"
+docker-down-backend: ensure-colima ## Docker > Stop backend services only
+	@printf '%b\n' "$(D)→ Stopping backend services...$(R)"
 	@docker compose stop irc_engine redis mongo ircd
-	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Backend services stopped$(RESET)"
+	@printf '%b\n' "$(BG)$(OK) Backend services stopped$(R)"
 
-docker-restart-backend: ensure-colima
-	@printf '\n%b\n' "$(BG_GREEN)$(BLACK)$(BOLD)  Restarting Backend Services  $(RESET)"
+docker-restart-backend: ensure-colima ## Docker > Restart backend services only
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Restarting Backend Services  $(R)"
 	@docker compose up -d --build --force-recreate irc_engine redis mongo ircd
-	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Backend services restarted$(RESET)"
+	@printf '%b\n' "$(BG)$(OK) Backend services restarted$(R)"
 
-ircd-up: ensure-colima
-	@printf '\n%b\n' "$(BG_GREEN)$(BLACK)$(BOLD)  Starting IRCD Test Server  $(RESET)"
+ircd-up: ensure-colima ## Docker > Start test IRCD (localhost:6667)
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting IRCD Test Server  $(R)"
 	@docker compose up -d ircd
-	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) IRCD started$(RESET) $(DIM)(localhost:6667)$(RESET)"
+	@printf '%b\n' "$(BG)$(OK) IRCD started$(R) $(D)(localhost:6667)$(R)"
 
-ircd-down: ensure-colima
-	@printf '%b\n' "$(DIM)→ Stopping IRCD...$(RESET)"
+ircd-down: ensure-colima ## Docker > Stop test IRCD
+	@printf '%b\n' "$(D)→ Stopping IRCD...$(R)"
 	@docker compose stop ircd
-	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) IRCD stopped$(RESET)"
+	@printf '%b\n' "$(BG)$(OK) IRCD stopped$(R)"
 
-docker-restart: docker-restart-web docker-restart-backend
-	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) All services restarted$(RESET)"
+docker-restart: docker-restart-web docker-restart-backend ## Docker > Restart all Docker services
+	@printf '%b\n' "$(BG)$(OK) All services restarted$(R)"
 
-podman-up:
-	@printf '\n%b\n' "$(BG_GREEN)$(BLACK)$(BOLD)  Starting Podman Services  $(RESET)"
+podman-up: ## Podman > Start all services with Podman Compose
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting Podman Services  $(R)"
 	@podman compose up -d
-	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Services started$(RESET) $(DIM)(http://localhost:8090)$(RESET)"
+	@printf '%b\n' "$(BG)$(OK) Services started$(R) $(D)(http://localhost:8090)$(R)"
 
-podman-down:
-	@printf '%b\n' "$(DIM)→ Stopping Podman services...$(RESET)"
+podman-down: ## Podman > Stop all Podman services
+	@printf '%b\n' "$(D)→ Stopping Podman services...$(R)"
 	@podman compose down
-	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Services stopped$(RESET)"
+	@printf '%b\n' "$(BG)$(OK) Services stopped$(R)"
 
-podman-up-web:
-	@printf '\n%b\n' "$(BG_GREEN)$(BLACK)$(BOLD)  Starting Web Server (Podman)  $(RESET)"
+podman-up-web: ## Podman > Start web server only (Podman)
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting Web Server (Podman)  $(R)"
 	@podman compose up -d irc_fiber
-	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Web server started$(RESET) $(DIM)(http://localhost:8090)$(RESET)"
+	@printf '%b\n' "$(BG)$(OK) Web server started$(R) $(D)(http://localhost:8090)$(R)"
 
-podman-down-web:
-	@printf '%b\n' "$(DIM)→ Stopping web server (Podman)...$(RESET)"
+podman-down-web: ## Podman > Stop web server only (Podman)
+	@printf '%b\n' "$(D)→ Stopping web server (Podman)...$(R)"
 	@podman compose stop irc_fiber
-	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Web server stopped$(RESET)"
+	@printf '%b\n' "$(BG)$(OK) Web server stopped$(R)"
 
-podman-restart-web:
-	@printf '\n%b\n' "$(BG_GREEN)$(BLACK)$(BOLD)  Restarting Web Server (Podman)  $(RESET)"
+podman-restart-web: ## Podman > Restart web server only (Podman)
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Restarting Web Server (Podman)  $(R)"
 	@podman compose up -d --build --force-recreate irc_fiber
-	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Web server restarted$(RESET) $(DIM)(http://localhost:8090)$(RESET)"
+	@printf '%b\n' "$(BG)$(OK) Web server restarted$(R) $(D)(http://localhost:8090)$(R)"
 
-podman-up-backend:
-	@printf '\n%b\n' "$(BG_GREEN)$(BLACK)$(BOLD)  Starting Backend Services (Podman)  $(RESET)"
+podman-up-backend: ## Podman > Start backend services only (Podman)
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting Backend Services (Podman)  $(R)"
 	@podman compose up -d irc_engine redis mongo ircd
-	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Backend services started$(RESET)"
+	@printf '%b\n' "$(BG)$(OK) Backend services started$(R)"
 
-podman-down-backend:
-	@printf '%b\n' "$(DIM)→ Stopping backend services (Podman)...$(RESET)"
+podman-down-backend: ## Podman > Stop backend services only (Podman)
+	@printf '%b\n' "$(D)→ Stopping backend services (Podman)...$(R)"
 	@podman compose stop irc_engine redis mongo ircd
-	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Backend services stopped$(RESET)"
+	@printf '%b\n' "$(BG)$(OK) Backend services stopped$(R)"
 
-podman-restart-backend:
-	@printf '\n%b\n' "$(BG_GREEN)$(BLACK)$(BOLD)  Restarting Backend Services (Podman)  $(RESET)"
+podman-restart-backend: ## Podman > Restart backend services only (Podman)
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Restarting Backend Services (Podman)  $(R)"
 	@podman compose up -d --build --force-recreate irc_engine redis mongo ircd
-	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Backend services restarted$(RESET)"
+	@printf '%b\n' "$(BG)$(OK) Backend services restarted$(R)"
 
-podman-restart: podman-restart-web podman-restart-backend
-	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) All Podman services restarted$(RESET)"
+podman-restart: podman-restart-web podman-restart-backend ## Podman > Restart all Podman services
+	@printf '%b\n' "$(BG)$(OK) All Podman services restarted$(R)"
 
 # ----------------------------------------------------------------------------
 # Cross Compilation
 # ----------------------------------------------------------------------------
 
-cross-linux-x64:
-	@printf '\n%b\n' "$(BG_CYAN)$(BLACK)$(BOLD)  Cross-compiling for Linux x64  $(RESET)"
-	@$(DUB) build --config=release --arch=x86_64-linux-gnu 2>&1 | tail -8 || \
-		printf '%b\n' "$(YELLOW)$(ICON_WARN) Cross-compilation may require a Linux toolchain$(RESET)"
+# Cross-compilation template: $(1)=target suffix, $(2)=display name, $(3)=arch flag
+define _cross_rule
+cross-linux-$(1): ## Cross > Cross-compile for Linux $(2)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Cross-compiling for Linux $(2)  $(R)"
+	@$(DUB) build --config=release --arch=$(3) 2>&1 | tail -8 || \
+		printf '%b\n' "$(Y)$(WR) Cross-compilation may require a Linux $(2) toolchain$(R)"
+endef
 
-cross-linux-arm64:
-	@printf '\n%b\n' "$(BG_CYAN)$(BLACK)$(BOLD)  Cross-compiling for Linux ARM64  $(RESET)"
-	@$(DUB) build --config=release --arch=aarch64-linux-gnu 2>&1 | tail -8 || \
-		printf '%b\n' "$(YELLOW)$(ICON_WARN) Cross-compilation may require a Linux ARM64 toolchain$(RESET)"
-
-cross-linux-armv7:
-	@printf '\n%b\n' "$(BG_CYAN)$(BLACK)$(BOLD)  Cross-compiling for Linux ARMv7  $(RESET)"
-	@$(DUB) build --config=release --arch=arm-linux-gnueabihf 2>&1 | tail -8 || \
-		printf '%b\n' "$(YELLOW)$(ICON_WARN) Cross-compilation may require a Linux ARMv7 toolchain$(RESET)"
+$(eval $(call _cross_rule,x64,x64,x86_64-linux-gnu))
+cross-linux-x64: ## Cross > Cross-compile for Linux x64
+$(eval $(call _cross_rule,arm64,ARM64,aarch64-linux-gnu))
+cross-linux-arm64: ## Cross > Cross-compile for Linux ARM64
+$(eval $(call _cross_rule,armv7,ARMv7,arm-linux-gnueabihf))
+cross-linux-armv7: ## Cross > Cross-compile for Linux ARMv7
 
 # ----------------------------------------------------------------------------
 # Dependency Check
 # ----------------------------------------------------------------------------
 
-deps-check:
-	@printf '\n%b\n' "$(BG_CYAN)$(BLACK)$(BOLD)  Checking Dependencies  $(RESET)"
-	@which $(DUB) >/dev/null && printf '  %b\n' "$(GREEN)$(ICON_OK) dub$(RESET)" || \
-		printf '  %b\n' "$(YELLOW)$(ICON_WARN) dub - Install D compiler package$(RESET)"
-	@which $(LDC) >/dev/null && printf '  %b\n' "$(GREEN)$(ICON_OK) ldc2$(RESET)" || \
-		printf '  %b\n' "$(YELLOW)$(ICON_WARN) ldc2 - Install: brew install ldc$(RESET)"
-	@which docker >/dev/null && printf '  %b\n' "$(GREEN)$(ICON_OK) docker$(RESET)" || \
-		printf '  %b\n' "$(DIM)$(ICON_BULLET) docker - optional$(RESET)"
-	@which redis-cli >/dev/null && printf '  %b\n' "$(GREEN)$(ICON_OK) redis-cli$(RESET)" || \
-		printf '  %b\n' "$(DIM)$(ICON_BULLET) redis-cli - optional$(RESET)"
-	@which mongosh >/dev/null && printf '  %b\n' "$(GREEN)$(ICON_OK) mongosh$(RESET)" || \
-		printf '  %b\n' "$(DIM)$(ICON_BULLET) mongosh - optional$(RESET)"
+deps-check: ## Utils > Check for required dependencies
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Checking Dependencies  $(R)"
+	@which $(DUB) >/dev/null && printf '  %b\n' "$(G)$(OK) dub$(R)" || \
+		printf '  %b\n' "$(Y)$(WR) dub - Install D compiler package$(R)"
+	@which $(LDC) >/dev/null && printf '  %b\n' "$(G)$(OK) ldc2$(R)" || \
+		printf '  %b\n' "$(Y)$(WR) ldc2 - Install: brew install ldc$(R)"
+	@which docker >/dev/null && printf '  %b\n' "$(G)$(OK) docker$(R)" || \
+		printf '  %b\n' "$(D)$(BL) docker - optional$(R)"
+	@which redis-cli >/dev/null && printf '  %b\n' "$(G)$(OK) redis-cli$(R)" || \
+		printf '  %b\n' "$(D)$(BL) redis-cli - optional$(R)"
+	@which mongosh >/dev/null && printf '  %b\n' "$(G)$(OK) mongosh$(R)" || \
+		printf '  %b\n' "$(D)$(BL) mongosh - optional$(R)"
 
 # ----------------------------------------------------------------------------
 # Utility Targets
 # ----------------------------------------------------------------------------
 
-clean:
-	@printf '%b\n' "$(DIM)→ Cleaning build artifacts...$(RESET)"
+clean: ## Utils > Remove build artifacts
+	@printf '%b\n' "$(D)→ Cleaning build artifacts...$(R)"
 	@rm -f $(APP) *.o
 	@rm -rf .dub
 	@$(DUB) clean 2>/dev/null || true
-	@printf '%b\n' "$(BRIGHT_GREEN)$(ICON_OK) Clean complete$(RESET)"
+	@printf '%b\n' "$(BG)$(OK) Clean complete$(R)"
 
-fmt:
-	@printf '%b\n' "$(DIM)→ Formatting D source files...$(RESET)"
+fmt: ## Utils > Format D source files with dfmt
+	@printf '%b\n' "$(D)→ Formatting D source files...$(R)"
 	@find source -name "*.d" -exec dfmt -i {} \; 2>/dev/null || \
-		printf '%b\n' "$(YELLOW)$(ICON_WARN) dfmt not found. Install: dub fetch dfmt$(RESET)"
+		printf '%b\n' "$(Y)$(WR) dfmt not found. Install: dub fetch dfmt$(R)"
 
 # ----------------------------------------------------------------------------
-# Help
+# Help — auto-generated from ## comments on each target
 # ----------------------------------------------------------------------------
 
 help:
-	@echo ""
-	@echo "$(BOLD)IRC Fiber - IRC Bouncer & Web Client$(RESET)"
-	@echo "$(DIM)=====================================$(RESET)"
-	@echo ""
-	@echo "$(BG_GREEN)$(BLACK)  Quick Start  $(RESET)"
-	@echo "  $(BRIGHT_GREEN)make build$(RESET)          - Build the application with dub"
-	@echo "  $(BRIGHT_GREEN)make run$(RESET)            - Build and run the gateway (auto-starts backends)"
-	@echo "  $(BRIGHT_GREEN)make run-engine$(RESET)     - Run the IRC engine (needs backends running)"
-	@echo "  $(BRIGHT_GREEN)make docker-up$(RESET)      - Start with Docker Compose (MongoDB + Redis)"
-	@echo "  $(BRIGHT_GREEN)make stop$(RESET)           - Stop all Docker services"
-	@echo ""
-	@echo "$(BG_CYAN)$(BLACK)  Build Targets  $(RESET)"
-	@echo "  $(GREEN)make build$(RESET)              - Default debug build"
-	@echo "  $(GREEN)make build-release$(RESET)      - Optimized release build"
-	@echo "  $(GREEN)make build-debug$(RESET)        - Explicit debug build"
-	@echo "  $(GREEN)make build-ldc2$(RESET)         - Direct ldc2 build (no dub overhead)"
-	@echo "  $(GREEN)make test$(RESET)               - Run unit tests"
-	@echo ""
-	@echo "$(BG_YELLOW)$(BLACK)  Docker / Podman  $(RESET)"
-	@echo "  $(YELLOW)make docker-up$(RESET)          - Start all services with Docker"
-	@echo "  $(YELLOW)make stop$(RESET)               - Stop all Docker services"
-	@echo "  $(YELLOW)make docker-down$(RESET)        - Stop all Docker services (alias)"
-	@echo "  $(YELLOW)make docker-down-test$(RESET)   - Stop test services (ircd + mongo + redis)"
-	@echo "  $(YELLOW)make docker-restart$(RESET)     - Restart all Docker services"
-	@echo "  $(YELLOW)make docker-up-web$(RESET)      - Start web server only"
-	@echo "  $(YELLOW)make docker-down-web$(RESET)    - Stop web server only"
-	@echo "  $(YELLOW)make docker-restart-web$(RESET) - Restart web server only"
-	@echo "  $(YELLOW)make docker-up-backend$(RESET)  - Start backend services only"
-	@echo "  $(YELLOW)make docker-down-backend$(RESET)- Stop backend services only"
-	@echo "  $(YELLOW)make docker-restart-backend$(RESET)- Restart backend services only"
-	@echo "  $(YELLOW)make docker-logs$(RESET)        - Tail Docker logs"
-	@echo "  $(YELLOW)make docker-build$(RESET)       - Rebuild Docker image"
-	@echo "  $(YELLOW)make ircd-up$(RESET)            - Start test IRCD (localhost:6667)"
-	@echo "  $(YELLOW)make ircd-down$(RESET)          - Stop test IRCD"
-	@echo "  $(YELLOW)make podman-up$(RESET)          - Start with Podman Compose"
-	@echo "  $(YELLOW)make podman-down$(RESET)        - Stop Podman services"
-	@echo "  $(YELLOW)make podman-restart$(RESET)     - Restart all Podman services"
-	@echo ""
-	@echo "$(BG_MAGENTA)$(BLACK)  Code Quality  $(RESET)"
-	@echo "  $(MAGENTA)make dscanner-all$(RESET)       - Run all D-Scanner checks"
-	@echo "  $(MAGENTA)make dscanner-syntax$(RESET)    - Syntax check"
-	@echo "  $(MAGENTA)make dscanner-lint$(RESET)      - Style lint"
-	@echo "  $(MAGENTA)make dscanner-unused$(RESET)    - Find unused imports/symbols"
-	@echo "  $(MAGENTA)make dscanner-complexity$(RESET)- Cyclomatic complexity check"
-	@echo "  $(MAGENTA)make dscanner-fix$(RESET)       - Auto-fix style issues"
-	@echo ""
-	@echo "$(BG_BLUE)$(BLACK)  Cross Compilation  $(RESET)"
-	@echo "  $(BLUE)make cross-linux-x64$(RESET)    - Cross-compile for Linux x86_64"
-	@echo "  $(BLUE)make cross-linux-arm64$(RESET)  - Cross-compile for Linux ARM64"
-	@echo "  $(BLUE)make cross-linux-armv7$(RESET)  - Cross-compile for Linux ARMv7"
-	@echo ""
-	@echo "$(DIM)Other:$(RESET)"
-	@echo "  make deps-check         - Check for required dependencies"
-	@echo "  make clean              - Remove build artifacts"
-	@echo "  make fmt                - Format D source files with dfmt"
-	@echo ""
+	@awk 'BEGIN {FS = ":.*##[ \t]*"} \
+		/^[a-zA-Z0-9_-]+:.*##/ { \
+			target = $$1; \
+			rest = $$2; \
+			p = index(rest, ">"); \
+			if (p > 0) { \
+				cat = substr(rest, 1, p - 1); \
+				desc = substr(rest, p + 1); \
+				gsub(/^[ \t]+|[ \t]+$$/, "", cat); \
+				gsub(/^[ \t]+|[ \t]+$$/, "", desc); \
+			} else { \
+				cat = "Other"; desc = rest; \
+			} \
+			if (!(cat in seen)) { \
+				seen[cat] = ++ncat; \
+				order[ncat] = cat; \
+			} \
+			idx = ++cnt[cat]; \
+			t[cat, idx] = target; \
+			d[cat, idx] = desc; \
+			w = length(target); \
+			if (w > mw[cat]) mw[cat] = w; \
+		} \
+		END { \
+			print ""; \
+			print "\033[1mIRC Fiber - IRC Bouncer & Web Client\033[0m"; \
+			print "\033[2m=====================================\033[0m"; \
+			for (i = 1; i <= ncat; i++) { \
+				c = order[i]; \
+				col = ""; \
+				if (c == "Quick Start") col = "\033[42m\033[30m\033[1m"; \
+				else if (c == "Build")       col = "\033[46m\033[30m\033[1m"; \
+				else if (c == "Docker")      col = "\033[43m\033[30m\033[1m"; \
+				else if (c == "Podman")      col = "\033[43m\033[30m\033[1m"; \
+				else if (c == "Quality")     col = "\033[45m\033[30m\033[1m"; \
+				else if (c == "Cross")       col = "\033[44m\033[30m\033[1m"; \
+				if (c == "Utils") printf "\n\033[2m%s:\033[0m\n", c; \
+				else           printf "\n%s  %s  \033[0m\n", col, c; \
+				w = mw[c] + 1; \
+				for (j = 1; j <= cnt[c]; j++) { \
+					printf "  \033[92mmake %-*s\033[0m %s\n", w, t[c, j], d[c, j]; \
+				} \
+			} \
+			print ""; \
+		}' $(MAKEFILE_LIST)
