@@ -108,24 +108,18 @@ build-debug: ## Build > Explicit debug build
 	@printf '\n%b\n' "$(BG)$(OK) Debug build successful$(R)"
 
 # Build with direct ldc2 (no dub dependency resolution overhead)
-build-ldc2: ## Build > Direct ldc2 build (no dub overhead)
-	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building IRC Fiber (LDC2 Direct)  $(R)"
-	@bash -o pipefail -c '$(LDC) $(SRCS) -of=$(APP) -Isource -Jviews \
-		$$(find $(DUB_PKG)/vibe-d/0.10.*/vibe-d/source \
-		      $(DUB_PKG)/vibe-core/2.*/vibe-core/source \
-		      $(DUB_PKG)/vibe-http/1.*/vibe-http/source \
-		      $(DUB_PKG)/vibe-inet/1.*/vibe-inet/source \
-		      $(DUB_PKG)/vibe-serialization/1.*/vibe-serialization/source \
-		      $(DUB_PKG)/vibe-stream/1.*/vibe-stream/source \
-		      $(DUB_PKG)/vibe-container/1.*/vibe-container/source \
-		      $(DUB_PKG)/diet-ng/1.*/diet-ng/source \
-		      $(DUB_PKG)/taggedalgebraic/1.*/taggedalgebraic/source \
-		      $(DUB_PKG)/stdx-allocator/2.*/stdx-allocator/source \
-		      $(DUB_PKG)/eventcore/0.9.*/eventcore/source \
-		      -name "*.d" | xargs -I{} echo -I{}) \
-		-d-version=VibeUseFibers \
-		-L=-L$(OPENSSL_LIB) -L=-lssl -L=-lcrypto \
-		2>&1 | grep -v "deployment version" | tail -12'
+# Uses ldc2 as compiler while dub manages the build process and linking.
+# For pure ldc2 without dub, see compiler-direct skill.
+build-ldc2: ## Build > LDC2 build (dub-managed, use 'make build' for gdc/dmd)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building IRC Fiber (LDC2)  $(R)"
+	@$(DUB) build --compiler=ldc2 --build=debug --force 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | tail -8
+	@if [ -f $(APP) ]; then \
+		SIZE=$$(ls -lh $(APP) 2>/dev/null | awk '{print $$5}'); \
+		printf '\n%b\n' "$(BG)$(OK) LDC2 build successful$(R) $(D)($$SIZE)$(R)"; \
+	else \
+		printf '\n%b\n' "$(Y)$(WR) LDC2 build failed$(R)"; \
+		exit 1; \
+	fi
 	@if [ -f $(APP) ]; then \
 		SIZE=$$(ls -lh $(APP) 2>/dev/null | awk '{print $$5}'); \
 		printf '\n%b\n' "$(BG)$(OK) LDC2 build successful$(R) $(D)($$SIZE)$(R)"; \
