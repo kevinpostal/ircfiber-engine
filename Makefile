@@ -53,7 +53,7 @@ AR := →
 # Phony Targets
 # ----------------------------------------------------------------------------
 # Phony targets (grouped by category)
-.PHONY: all help build build-engine build-release build-debug build-ldc2
+.PHONY: all help build build-engine build-release build-debug build-ldc2 frontend frontend-dev frontend-install
 .PHONY: start run run-engine up down restart-web logs-web logs-engine watch-web
 .PHONY: test clean fmt deps-check
 .PHONY: dscanner-install dscanner-all dscanner-syntax dscanner-lint dscanner-unused \
@@ -81,7 +81,7 @@ else
     OPENSSL_LIB := $(shell pkg-config --variable=libdir openssl 2>/dev/null || echo /usr/lib)
 endif
 
-build: ## Build > Build the application with dub
+build: frontend ## Build > Build the application with dub
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building IRC Fiber  $(R)"
 	@bash -o pipefail -c '$(DUB) build 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | tail -8'
 	@if [ -f $(APP) ]; then \
@@ -90,6 +90,17 @@ build: ## Build > Build the application with dub
 	else \
 		printf '\n%b\n' "$(BG)$(OK) Dub build complete$(R)"; \
 	fi
+
+frontend: ## Build > Build Svelte 5 frontend bundle
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building Svelte frontend  $(R)"
+	@cd frontend && npm run build 2>&1 | grep -E 'built|error|Error' | tail -8
+	@printf '\n%b\n' "$(BG)$(OK) Frontend build complete$(R)"
+
+frontend-dev: ## Build > Run Svelte frontend dev server
+	@cd frontend && npm run dev
+
+frontend-install: ## Build > Install Svelte frontend dependencies
+	@cd frontend && npm install
 
 build-engine: ## Build > Build the IRC engine binary
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building IRC Fiber Engine  $(R)"
@@ -263,11 +274,11 @@ watch-web: ## Quick Start > Auto-rebuild gateway on file changes
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Watching for file changes  $(R)"
 	@printf '%b\n' "$(D)Polls every 2s. Install fswatch for instant updates: brew install fswatch$(R)"
 	@bash -c ' \
-		LAST=$$(find source views public -type f -print0 2>/dev/null | xargs -0 stat -f %m 2>/dev/null | sort -n | tail -1); \
-		printf "%b\n" "$(C)→ Watching source/, views/, public/ for changes...$(R)"; \
+		LAST=$$(find source views public frontend/src -type f -print0 2>/dev/null | xargs -0 stat -f %m 2>/dev/null | sort -n | tail -1); \
+		printf "%b\n" "$(C)→ Watching source/, views/, public/, frontend/src/ for changes...$(R)"; \
 		while true; do \
 			sleep 2; \
-			CURR=$$(find source views public -type f -print0 2>/dev/null | xargs -0 stat -f %m 2>/dev/null | sort -n | tail -1); \
+			CURR=$$(find source views public frontend/src -type f -print0 2>/dev/null | xargs -0 stat -f %m 2>/dev/null | sort -n | tail -1); \
 			if [ "$$CURR" != "$$LAST" ]; then \
 				printf "\n%b\n" "$(Y)→ Change detected, restarting gateway...$(R)"; \
 				$(MAKE) --no-print-directory restart-web; \
@@ -276,9 +287,13 @@ watch-web: ## Quick Start > Auto-rebuild gateway on file changes
 		done; \
 	'
 
-test: ## Build > Run unit tests
-	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Running Tests  $(R)"
+test: ## Build > Run D backend unit tests
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Running D Tests  $(R)"
 	@$(DUB) test 2>&1 | tail -20
+
+test-frontend: ## Build > Run Svelte frontend tests (Vitest)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Running Frontend Tests  $(R)"
+	@cd frontend && npm run test 2>&1 | tail -8
 
 # ----------------------------------------------------------------------------
 # Code Quality (D-Scanner)
@@ -367,6 +382,8 @@ ensure-colima:
 	fi
 
 docker-up: ensure-colima ## Docker > Start all services with Docker Compose
+	@printf '\n%b\n' "$(D)→ Pruning stale Docker layers before start...$(R)"
+	@docker system prune -af --volumes=false 2>&1 | tail -2
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting Docker Services  $(R)"
 	@docker compose up -d
 	@printf '%b\n' "$(BG)$(OK) Services started$(R) $(D)(http://localhost:8090)$(R)"
@@ -383,6 +400,23 @@ docker-down-test: ensure-colima ## Docker > Stop test services (ircd + mongo + r
 	@printf '%b\n' "$(D)→ Stopping Docker test services (docker-compose.test.yml)...$(R)"
 	@docker compose -f docker-compose.test.yml down
 	@printf '%b\n' "$(BG)$(OK) Test services stopped$(R)"
+
+docker-prune: ensure-colima ## Docker > Remove dangling images, stopped containers, build cache (safe — keeps volumes)
+	@printf '%b\n' "$(D)→ Pruning stale Docker resources...$(R)"
+	@docker system prune -af --volumes=false 2>&1 | tail -2
+	@printf '%b\n' "$(BG)$(OK) Docker resources pruned$(R)"
+
+docker-clean: ensure-colima ## Docker > Full cleanup including unused volumes (⚠ destroys mongo/redis data)
+	@printf '%b\n' "$(Y)$(WR) This removes ALL unused Docker resources INCLUDING volumes!$(R)"
+	@printf '%b\n' "$(Y)$(WR) MongoDB and Redis data will be lost!$(R)"
+	@printf '%b' "$(C)Are you sure? [y/N] $(R)"; \
+		read -r answer < /dev/tty; \
+		case "$$answer" in \
+			[Yy]|[Yy][Ee][Ss]) ;; \
+			*) printf '%b\n' "$(Y)$(WR) Aborted$(R)"; exit 1 ;; \
+		esac
+	@docker system prune -af --volumes 2>&1 | tail -2
+	@printf '%b\n' "$(BG)$(OK) Full Docker cleanup complete$(R)"
 
 docker-logs: ensure-colima ## Docker > Tail Docker logs
 	@docker compose logs -f
@@ -411,6 +445,8 @@ docker-restart-web: ensure-colima ## Docker > Restart web server only
 	@printf '%b\n' "$(BG)$(OK) Web server restarted$(R) $(D)(http://localhost:8090)$(R)"
 
 docker-up-backend: ensure-colima ## Docker > Start backend services only
+	@printf '\n%b\n' "$(D)→ Pruning stale Docker layers...$(R)"
+	@docker system prune -af --volumes=false 2>&1 | tail -2
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting Backend Services  $(R)"
 	@docker compose up -d irc_engine redis mongo ircd
 	@printf '%b\n' "$(BG)$(OK) Backend services started$(R)"
