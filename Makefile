@@ -61,10 +61,8 @@ AR := →
 .PHONY: ensure-colima docker-up docker-down docker-logs docker-build \
         docker-up-web docker-down-web docker-restart-web \
         docker-up-backend docker-down-backend docker-restart-backend docker-restart \
-        docker-down-test ircd-up ircd-down
-.PHONY: podman-up podman-down podman-logs \
-        podman-up-web podman-down-web podman-restart-web \
-        podman-up-backend podman-down-backend podman-restart-backend podman-restart
+        docker-down-test \
+        docker-shell docker-shell-engine docker-shell-redis docker-shell-mongo docker-shell-ircd ircd-up ircd-down
 .PHONY: cross-linux-x64 cross-linux-arm64 cross-linux-armv7
 
 # ----------------------------------------------------------------------------
@@ -329,7 +327,7 @@ dscanner-outline: ## Quality > Outline
 dscanner-all: dscanner-syntax dscanner-lint dscanner-unused dscanner-complexity ## Quality > Run all D-Scanner checks
 
 # ----------------------------------------------------------------------------
-# Docker / Podman Compose
+# Docker Compose
 # ----------------------------------------------------------------------------
 
 ensure-colima:
@@ -457,9 +455,86 @@ docker-down-backend: ensure-colima ## Docker > Stop backend services only
 	@printf '%b\n' "$(BG)$(OK) Backend services stopped$(R)"
 
 docker-restart-backend: ensure-colima ## Docker > Restart backend services only
-	@printf '\n%b\n' "$(_BC)$(K)$(B)  Restarting Backend Services  $(R)"
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Restarting Backend Services  $(R)"
 	@docker compose up -d --build --force-recreate irc_engine redis mongo ircd
 	@printf '%b\n' "$(BG)$(OK) Backend services restarted$(R)"
+
+# ----------------------------------------------------------------------------
+# Docker — interactive shells
+# ----------------------------------------------------------------------------
+# Usage:
+#   make docker-shell              # gateway (irc_fiber_test) by default
+#   make docker-shell-engine       # IRC engine
+#   make docker-shell-redis        # redis with redis-cli as entrypoint
+#   make docker-shell-mongo        # mongo with mongosh as entrypoint
+#   make docker-shell-ircd         # test ircd
+#   make docker-shell SVC=redis    # any service by container name
+#
+# Compose files: respects DOCKER_COMPOSE (default: docker-compose.yml).
+# Both docker-compose.yml and docker-compose.test.yml use the same
+# container_name values, so `docker exec` always finds the right one.
+DOCKER_COMPOSE ?= docker-compose.yml
+SHELL_SVC ?= irc_fiber
+
+docker-shell: ensure-colima ## Docker > Open bash shell in the gateway container
+	@SVC=$${SVC:-$(SHELL_SVC)}; \
+		printf '\n%b\n' "$(_BCn)$(K)$(B)  Opening shell in $${SVC}  $(R)"; \
+		if ! docker ps --format '{{.Names}}' | grep -q "$${SVC}"; then \
+			printf '%b\n' "$(Y)$(WR) Container $${SVC} is not running.$(R)"; \
+			printf '%b\n' "$(D)  • For the full Docker stack:    make docker-up$(R)"; \
+			printf '%b\n' "$(D)  • Just redis/mongo containers: make docker-up-backend$(R)"; \
+			printf '%b\n' "$(D)  • If you used 'make up', the engine/gateway are running on the host, not in Docker.$(R)"; \
+			exit 1; \
+		fi; \
+		SHELL_BIN=$$(docker exec -it --user root "$${SVC}" sh -c 'command -v bash >/dev/null 2>&1 && echo bash || echo sh'); \
+		docker exec -it --user root "$${SVC}" "$${SHELL_BIN}"
+
+docker-shell-engine: ensure-colima ## Docker > Open bash shell in the IRC engine container
+	@SVC=irc_engine; \
+		printf '\n%b\n' "$(_BCn)$(K)$(B)  Opening shell in $${SVC}  $(R)"; \
+		if ! docker ps --format '{{.Names}}' | grep -q "$${SVC}"; then \
+			printf '%b\n' "$(Y)$(WR) Container $${SVC} is not running.$(R)"; \
+			printf '%b\n' "$(D)  • For the full Docker stack:    make docker-up$(R)"; \
+			printf '%b\n' "$(D)  • If you used 'make up', the engine is running on the host as ./irc-fiber-engine.$(R)"; \
+			printf '%b\n' "$(D)  • Host logs:  make logs-engine  (host:  tail -f /tmp/irc-fiber-engine.log)$(R)"; \
+			exit 1; \
+		fi; \
+		SHELL_BIN=$$(docker exec -it --user root "$${SVC}" sh -c 'command -v bash >/dev/null 2>&1 && echo bash || echo sh'); \
+		docker exec -it --user root "$${SVC}" "$${SHELL_BIN}"
+
+docker-shell-redis: ensure-colima ## Docker > Open redis-cli against the redis container
+	@SVC=redis; \
+		printf '\n%b\n' "$(_BCn)$(K)$(B)  Opening redis-cli in $${SVC}  $(R)"; \
+		if ! docker ps --format '{{.Names}}' | grep -q "$${SVC}"; then \
+			printf '%b\n' "$(Y)$(WR) Container $${SVC} is not running.$(R)"; \
+			printf '%b\n' "$(D)  • Start it:  make docker-up-backend  (or  make docker-up  for everything)$(R)"; \
+			printf '%b\n' "$(D)  • If you used 'make up', redis is running on the host at 127.0.0.1:6379.$(R)"; \
+			printf '%b\n' "$(D)  • Host fallback:  redis-cli -h 127.0.0.1 -p 6379$(R)"; \
+			exit 1; \
+		fi; \
+		docker exec -it "$${SVC}" redis-cli
+
+docker-shell-mongo: ensure-colima ## Docker > Open mongosh against the mongo container
+	@SVC=mongo; \
+		printf '\n%b\n' "$(_BCn)$(K)$(B)  Opening mongosh in $${SVC}  $(R)"; \
+		if ! docker ps --format '{{.Names}}' | grep -q "$${SVC}"; then \
+			printf '%b\n' "$(Y)$(WR) Container $${SVC} is not running.$(R)"; \
+			printf '%b\n' "$(D)  • Start it:  make docker-up-backend  (or  make docker-up  for everything)$(R)"; \
+			printf '%b\n' "$(D)  • If you used 'make up', mongo is running on the host at 127.0.0.1:27017.$(R)"; \
+			printf '%b\n' "$(D)  • Host fallback:  mongosh mongodb://127.0.0.1:27017/ircfiber$(R)"; \
+			exit 1; \
+		fi; \
+		docker exec -it "$${SVC}" mongosh ircfiber
+
+docker-shell-ircd: ensure-colima ## Docker > Open bash shell in the test ircd container
+	@SVC=ircd; \
+		printf '\n%b\n' "$(_BCn)$(K)$(B)  Opening shell in $${SVC}  $(R)"; \
+		if ! docker ps --format '{{.Names}}' | grep -q "$${SVC}"; then \
+			printf '%b\n' "$(Y)$(WR) Container $${SVC} is not running. Start it: make ircd-up$(R)"; \
+			exit 1; \
+		fi; \
+		SHELL_BIN=$$(docker exec -it --user root "$${SVC}" sh -c 'command -v bash >/dev/null 2>&1 && echo bash || echo sh'); \
+		docker exec -it --user root "$${SVC}" "$${SHELL_BIN}"
 
 ircd-up: ensure-colima ## Docker > Start test IRCD (localhost:6667)
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting IRCD Test Server  $(R)"
@@ -474,49 +549,8 @@ ircd-down: ensure-colima ## Docker > Stop test IRCD
 docker-restart: docker-restart-web docker-restart-backend ## Docker > Restart all Docker services
 	@printf '%b\n' "$(BG)$(OK) All services restarted$(R)"
 
-podman-up: ## Podman > Start all services with Podman Compose
-	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting Podman Services  $(R)"
-	@podman compose up -d
-	@printf '%b\n' "$(BG)$(OK) Services started$(R) $(D)(http://localhost:8090)$(R)"
-
-podman-down: ## Podman > Stop all Podman services
-	@printf '%b\n' "$(D)→ Stopping Podman services...$(R)"
-	@podman compose down
-	@printf '%b\n' "$(BG)$(OK) Services stopped$(R)"
-
-podman-up-web: ## Podman > Start web server only (Podman)
-	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting Web Server (Podman)  $(R)"
-	@podman compose up -d irc_fiber
-	@printf '%b\n' "$(BG)$(OK) Web server started$(R) $(D)(http://localhost:8090)$(R)"
-
-podman-down-web: ## Podman > Stop web server only (Podman)
-	@printf '%b\n' "$(D)→ Stopping web server (Podman)...$(R)"
-	@podman compose stop irc_fiber
-	@printf '%b\n' "$(BG)$(OK) Web server stopped$(R)"
-
-podman-restart-web: ## Podman > Restart web server only (Podman)
-	@printf '\n%b\n' "$(_BC)$(K)$(B)  Restarting Web Server (Podman)  $(R)"
-	@podman compose up -d --build --force-recreate irc_fiber
-	@printf '%b\n' "$(BG)$(OK) Web server restarted$(R) $(D)(http://localhost:8090)$(R)"
-
-podman-up-backend: ## Podman > Start backend services only (Podman)
-	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting Backend Services (Podman)  $(R)"
-	@podman compose up -d irc_engine redis mongo ircd
-	@printf '%b\n' "$(BG)$(OK) Backend services started$(R)"
-
-podman-down-backend: ## Podman > Stop backend services only (Podman)
-	@printf '%b\n' "$(D)→ Stopping backend services (Podman)...$(R)"
-	@podman compose stop irc_engine redis mongo ircd
-	@printf '%b\n' "$(BG)$(OK) Backend services stopped$(R)"
-
-podman-restart-backend: ## Podman > Restart backend services only (Podman)
-	@printf '\n%b\n' "$(_BC)$(K)$(B)  Restarting Backend Services (Podman)  $(R)"
-	@podman compose up -d --build --force-recreate irc_engine redis mongo ircd
-	@printf '%b\n' "$(BG)$(OK) Backend services restarted$(R)"
-
-podman-restart: podman-restart-web podman-restart-backend ## Podman > Restart all Podman services
-	@printf '%b\n' "$(BG)$(OK) All Podman services restarted$(R)"
-
+# ----------------------------------------------------------------------------
+# Cross Compilation
 # ----------------------------------------------------------------------------
 # Cross Compilation
 # ----------------------------------------------------------------------------
@@ -607,7 +641,6 @@ help:
 				if (c == "Quick Start") col = "\033[42m\033[30m\033[1m"; \
 				else if (c == "Build")       col = "\033[46m\033[30m\033[1m"; \
 				else if (c == "Docker")      col = "\033[43m\033[30m\033[1m"; \
-				else if (c == "Podman")      col = "\033[43m\033[30m\033[1m"; \
 				else if (c == "Quality")     col = "\033[45m\033[30m\033[1m"; \
 				else if (c == "Cross")       col = "\033[44m\033[30m\033[1m"; \
 				if (c == "Utils") printf "\n\033[2m%s:\033[0m\n", c; \
