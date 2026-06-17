@@ -22,6 +22,7 @@
 
 - name: Sync source to target & build
   hosts: "{{ target | default('ircfiber_gw') }}"
+  become: true
   gather_facts: true
   tags:
     - build
@@ -29,15 +30,16 @@
   vars:
     src_root: /opt/ircfiber-src
   tasks:
-    - name: Ensure source directory exists on target
+    - name: Ensure source directory exists on target (root, writable by SSH user)
       ansible.builtin.file:
         path: "{{ src_root }}"
         state: directory
-        owner: "{{ ansible_user }}"
-        group: "{{ ansible_user }}"
-        mode: "0755"
+        owner: root
+        group: root
+        mode: "0777"
 
-    - name: Sync local source tree to target (rsync over SSH)
+    - name: Sync local source tree to target (rsync over SSH, run as SSH user)
+      become: false
       ansible.posix.synchronize:
         src: "{{ playbook_dir }}/../../"
         dest: "{{ src_root }}"
