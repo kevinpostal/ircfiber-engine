@@ -156,7 +156,7 @@
       until: health.status in [200, 404]
       ignore_errors: true
 
-- name: Build engine binary & inject (serial: 1)
+- name: "Build engine binary & inject (serial: 1)"
   hosts: ircfiber_engines
   become: true
   serial: 1
