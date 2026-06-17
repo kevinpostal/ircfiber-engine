@@ -89,7 +89,7 @@ AR := →
 .PHONY: cross-linux-x64 cross-linux-arm64 cross-linux-armv7
 .PHONY: verify precommit ci install-env
 .PHONY: sync-db-to-tailnet sync-mongo-to-tailnet sync-redis-to-tailnet
-.PHONY: deploy update
+.PHONY: deploy update update-fast update-assets update-views update-stats update-status update-clean deploy-rebuild deploy-image-builder _touch_marker
 
 # ----------------------------------------------------------------------------
 # Main Build Targets
@@ -118,6 +118,7 @@ build: frontend ## Build > Build the application with dub
 frontend: ## Build > Build Svelte 5 frontend bundle
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building Svelte frontend  $(R)"
 	@cd frontend && npm run build 2>&1 | grep -E 'built|error|Error' | tail -8
+	@node frontend/inject-manifest.js
 	@printf '\n%b\n' "$(BG)$(OK) Frontend build complete$(R)"
 
 frontend-dev: ## Build > Run Svelte frontend dev server
@@ -736,32 +737,195 @@ sync-mongo-to-tailnet: ## Data > Sync only local Mongo → tailnet
 sync-redis-to-tailnet: ## Data > Sync only local Redis → tailnet
 	@$(MAKE) --no-print-directory sync-db-to-tailnet SYNC_TAG=redis
 
-update: frontend ## Deploy > Build on VPS Docker native (fastest), inject binary
-	@printf '\n%b\n' "$(_BC)$(K)$(B)  Building on VPS (native x86_64 Docker)  $(R)"
-	@printf '%b\n' "$(D)  First build: 4-6 min (LDC install + full compile)$(R)"
-	@printf '%b\n' "$(D)  Incremental: 10-30s (.dub/ cache mount preserves .o files)$(R)"
-	@printf '%b\n' "$(D)  Note: QEMU cross-compile on Mac is 10x slower$(R)"
-	@bash -c '\
-		CTX="vps"; \
-		SOCK="ssh://deploy@ircfiber-prod-1.tail544547.ts.net"; \
-		docker context create $$CTX --docker "host=$$SOCK" 2>/dev/null || true; \
-		printf "%b\n" "$(C)=== Building on VPS (native x86_64) ===$(R)"; \
-		docker -c $$CTX build --target builder -t ircfiber-builder:latest -f Containerfile . 2>&1; \
-		printf "%b\n" "$(C)=== Extracting binary from builder ===$(R)"; \
-		TMP=$$(docker -c $$CTX run -d --entrypoint sh ircfiber-builder:latest); \
-		docker -c $$CTX cp "$$TMP:/build/irc-fiber" /tmp/irc-fiber; \
-		docker -c $$CTX cp "$$TMP:/build/irc-fiber-engine" /tmp/irc-fiber-engine 2>/dev/null || true; \
-		docker -c $$CTX rm -f "$$TMP" >/dev/null 2>&1; \
-		printf "%b\n" "$(C)=== Injecting + restarting ===$(R)"; \
-		docker -c $$CTX cp /tmp/irc-fiber ircfiber-gateway:/app/irc-fiber && \
-		docker -c $$CTX cp /tmp/irc-fiber-engine ircfiber-engine-localengine:/app/irc-fiber-engine 2>/dev/null; \
-		docker -c $$CTX exec ircfiber-gateway chmod +x /app/irc-fiber; \
-		rm -f /tmp/irc-fiber /tmp/irc-fiber-engine; \
-		docker -c $$CTX restart ircfiber-gateway 2>/dev/null; \
-		sleep 1; \
-		docker -c $$CTX restart ircfiber-engine-localengine 2>/dev/null || true; \
-		printf "%b\n" "$(BG)$(OK) Deploy complete$(R)"; \
-	'
+# ----------------------------------------------------------------------------
+# Deploy — incremental remote builds
+# ----------------------------------------------------------------------------
+#
+# Two paths, both with the same outcome (binaries running in ircfiber-gateway
+# and ircfiber-engine-localengine on the tailnet VPS):
+#
+#   make update          # smart default — picks hot path if possible
+#   make update-fast     # force hot path: rsync + dub in persistent container (~5-15s)
+#   make update-assets   # asset-only: just public/* (no dub build, no restart, ~2-3s)
+#   make update-views    # Diet template only: hot build but no engine restart
+#   make update-stats    # show builder state, cache sizes, last-build timing
+#   make update-status   # same, no actions
+#   make update-clean    # nuke the builder container + cache (forces cold path next time)
+#   deploy-rebuild       # force cold path: rebuild builder image from scratch
+#   deploy-image-builder # build the ircfiber-builder image locally, push nowhere (just a test)
+#
+# Three content classes, three deploy strategies:
+#
+#   1. D source changed (.d files in source/):
+#      Full hot path: ensure-builder + tar source + dub build (gateway) +
+#      dub build (engine) + inject both binaries + restart both containers.
+#      ~80-90s (gated by ldc2 link on 2 vCPUs).
+#
+#   2. Diet template changed (views/*.dt):
+#      In release builds, .dt files are embedded in the binary by diet-ng,
+#      so they go through path 1. In debug builds with DietUseLive they're
+#      read from disk, so they're path 3.
+#
+#   3. HTML/CSS/asset changed (public/* — landing.html, style.css, dist/*):
+#      Asset-only path: tar public/ + `docker exec -i ircfiber-gateway
+#      tar -xf -` + done. The gateway reads these files at request time
+#      via D's read()/readText(), so no binary change, no restart, no
+#      reconnect. ~2-3s.
+#
+# `make update` auto-routes by detecting what's changed (computed once
+# at make-startup, like NEEDS_FRONTEND_REBUILD above).
+# -----------------------------------------------------------------------------
+# Hot path requires a long-lived `ircfiber-builder` container on the VPS with
+# .dub/ on a named volume. The first `make update` after this change will
+# auto-bootstrap it (cold path); every subsequent run is incremental.
+#
+# Why the original was slow:
+#   - docker build with no persistent cache → LDC + dub packages re-fetched every run
+#   - frontend/ rebuilt locally on every invocation (wasted; Svelte ships in public/dist/)
+#   - .dockerignore too loose → node_modules, frontend/src, logs all shipped over SSH
+#   - no incremental mechanism: every change triggered a full multi-stage build
+#
+# The new architecture:
+#   1. One-time: docker buildx build (cold) produces ircfiber-builder:latest on VPS
+#   2. Steady state: ircfiber-builder container runs idle, with /build on a volume
+#   3. On every push: rsync source → volume, `dub build` inside container,
+#      docker cp the resulting binaries out, inject into running gateway+engine
+# ----------------------------------------------------------------------------
+
+# Invoke the deploy script via `bash -c` so Make doesn't interpret
+# the path as a target reference (which would trigger an expensive
+# implicit-rule search — ~50s on the first `make update` call).
+#
+# The path is relative to the Makefile's directory. The recipe always
+# `cd`s to the repo root first so the script's own `cd $(dirname $0)/..`
+# resolves correctly.
+DEPLOY_SCRIPT := deploy/remote-build.sh
+
+# Decide whether to rebuild the Svelte bundle by mtime comparison.
+# Computed once at make-startup with `find -newer` (early-exit, ~ms).
+NEEDS_FRONTEND_REBUILD := $(shell \
+    if [ -f public/dist/index.html ] && [ -d frontend/src ]; then \
+        src_newer=$$(find frontend/src -type f -newer public/dist/index.html -print -quit 2>/dev/null); \
+        if [ -n "$$src_newer" ]; then echo 1; else echo 0; fi; \
+    else \
+        echo 0; \
+    fi)
+
+# Classify what changed since the last successful deploy. The marker
+# is .make-deploy-marker (touched after each successful update). find
+# -newer with `-print -quit` short-circuits on the first match, so the
+# cost is bounded to a single stat() per directory.
+#
+# Touching .make-deploy-marker at the end of a successful update makes
+# the *next* `make update` a no-op if nothing has changed. This is the
+# trick that gives us "no-op deploy in <1s" without doing any work.
+LAST_DEPLOY_MARKER := .make-deploy-marker
+CHANGED_D_SOURCE := $(shell \
+    if [ -e $(LAST_DEPLOY_MARKER) ]; then \
+        find source -name '*.d' -newer $(LAST_DEPLOY_MARKER) -print -quit 2>/dev/null; \
+    else \
+        find source -name '*.d' -print -quit 2>/dev/null; \
+    fi)
+CHANGED_DT       := $(shell \
+    if [ -e $(LAST_DEPLOY_MARKER) ]; then \
+        find views -name '*.dt' -newer $(LAST_DEPLOY_MARKER) -print -quit 2>/dev/null; \
+    else \
+        find views -name '*.dt' -print -quit 2>/dev/null; \
+    fi)
+CHANGED_ASSETS   := $(shell \
+    if [ -e $(LAST_DEPLOY_MARKER) ]; then \
+        find public -type f -newer $(LAST_DEPLOY_MARKER) -print -quit 2>/dev/null; \
+    else \
+        find public -type f -print -quit 2>/dev/null; \
+    fi)
+
+# Touch the marker at the end of any successful deploy.
+.PHONY: _touch_marker
+_touch_marker:
+	@touch $(LAST_DEPLOY_MARKER)
+
+# Run the deploy script with the rest of the recipe as bash arguments.
+# Note: we use a path containing / so Make doesn't try to implicit-rule
+# search. A simple file name "foo" causes ~50s of search; a "./foo" is fine.
+RUN_DEPLOY = ./deploy/remote-build.sh
+
+# Wrapper that invokes the script via `bash -c` so Make sees `bash` as
+# the command (definitely not a target) and our script as an argument
+# (not a dependency). The single-quoted body ensures the recipe stays
+# one logical line.
+_RUN_VIA_BASH = $(RUN_DEPLOY)
+
+update: ## Deploy > Smart deploy to VPS (auto-routes by change type)
+	@bash -c 'T0=$$(date +%s); \
+		printf "\n\033[42m\033[30m\033[1m  Deploying IRC Fiber to VPS  \033[0m\n"; \
+		if [ "$(NEEDS_FRONTEND_REBUILD)" = "1" ]; then \
+			printf "\033[36m→ Frontend source newer than dist — rebuilding Svelte bundle\033[0m\n"; \
+			$(MAKE) --no-print-directory frontend; \
+		else \
+			printf "\033[2m  Frontend: up to date (skipping Svelte build)\033[0m\n"; \
+		fi; \
+		if [ -n "$(CHANGED_D_SOURCE)" ]; then \
+			printf "\033[36m→ D source changed ($(CHANGED_D_SOURCE)) — full hot deploy\033[0m\n"; \
+			./deploy/remote-build.sh; \
+		elif [ -n "$(CHANGED_DT)" ]; then \
+			printf "\033[36m→ Diet template changed ($(CHANGED_DT)) — full hot deploy\033[0m\n"; \
+			./deploy/remote-build.sh; \
+		elif [ -n "$(CHANGED_ASSETS)" ]; then \
+			printf "\033[36m→ Asset changed ($(CHANGED_ASSETS)) — fast asset path\033[0m\n"; \
+			./deploy/remote-build.sh --assets; \
+		else \
+			printf "\033[2m  No changes detected — nothing to deploy\033[0m\n"; \
+		fi; \
+		T1=$$(date +%s); \
+		printf "\n\033[92m✓ Deploy complete in $$((T1-T0))s total\033[0m\n"; \
+		touch $(LAST_DEPLOY_MARKER)'
+
+update-fast: ## Deploy > Force hot path: rsync + dub in persistent builder
+	@bash -c 'T0=$$(date +%s); \
+		printf "\n\033[42m\033[30m\033[1m  Hot deploy (rsync → dub in builder)  \033[0m\n"; \
+		./deploy/remote-build.sh --hot; \
+		T1=$$(date +%s); \
+		printf "\n\033[92m✓ Hot deploy complete in $$((T1-T0))s total\033[0m\n"; \
+		touch $(LAST_DEPLOY_MARKER)'
+
+update-assets: ## Deploy > Asset-only: public/* to ircfiber-gateway (no rebuild, no restart, ~2-3s)
+	@bash -c 'T0=$$(date +%s); \
+		printf "\n\033[42m\033[30m\033[1m  Asset-only deploy (public/* → gateway)  \033[0m\n"; \
+		./deploy/remote-build.sh --assets; \
+		T1=$$(date +%s); \
+		printf "\n\033[92m✓ Asset deploy complete in $$((T1-T0))s total\033[0m\n"; \
+		touch $(LAST_DEPLOY_MARKER)'
+
+update-views: ## Deploy > Diet template only: hot build, restart gateway only (skip engine)
+	@bash -c 'T0=$$(date +%s); \
+		printf "\n\033[42m\033[30m\033[1m  View-only deploy (.dt → hot build)  \033[0m\n"; \
+		./deploy/remote-build.sh --views; \
+		T1=$$(date +%s); \
+		printf "\n\033[92m✓ View deploy complete in $$((T1-T0))s total\033[0m\n"; \
+		touch $(LAST_DEPLOY_MARKER)'
+
+deploy-rebuild: ## Deploy > Force cold path: rebuild builder image from scratch
+	@bash -c 'T0=$$(date +%s); \
+		printf "\n\033[42m\033[30m\033[1m  Cold deploy (rebuild builder image)  \033[0m\n"; \
+		./deploy/remote-build.sh --cold; \
+		T1=$$(date +%s); \
+		printf "\n\033[92m✓ Cold deploy complete in $$((T1-T0))s total\033[0m\n"; \
+		touch $(LAST_DEPLOY_MARKER)'
+
+update-stats update-status: ## Deploy > Show builder state and cache stats
+	@./deploy/remote-build.sh --status
+
+update-clean: ## Deploy > Remove builder container and cache (next run goes cold)
+	@printf '%b\n' "$(Y)$(WR) Removing remote builder container and .dub/ cache volume$(R)"
+	@./deploy/remote-build.sh --clean
+
+deploy-image-builder: ## Deploy > Build ircfiber-builder image locally (smoke test)
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Building ircfiber-builder locally  $(R)"
+	@docker buildx build --target builder -t ircfiber-builder:latest -f Containerfile . 2>&1 | tail -10
+	@printf '%b\n' "$(BG)$(OK) Local builder image built$(R)"
+
+deploy: update ## Deploy > Alias for `make update`
+
 
 # ----------------------------------------------------------------------------
 # Cross Compilation
