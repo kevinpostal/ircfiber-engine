@@ -123,23 +123,19 @@
         remote_src: true
         mode: "0755"
 
-    - name: Stop stuck container (may be in restart loop)
+    - name: Stop stuck container (if in restart loop from prior failed deploy)
       community.docker.docker_container:
         name: "{{ container_name }}"
         state: stopped
       ignore_errors: true
 
-    - name: Inject binary and restart
+    - name: Copy binary into container (works on stopped containers)
       ansible.builtin.shell: |
-        docker cp {{ host_binary }} {{ container_name }}:{{ container_binary }}.new && \
-        docker exec {{ container_name }} mv {{ container_binary }}.new {{ container_binary }} && \
-        docker exec {{ container_name }} chmod +x {{ container_binary }}
+        docker cp {{ host_binary }} {{ container_name }}:{{ container_binary }}
       args:
         executable: /bin/bash
-      register: inject
-      ignore_errors: true
 
-    - name: Start gateway container
+    - name: Start gateway container (new binary already in place)
       community.docker.docker_container:
         name: "{{ container_name }}"
         state: started
@@ -175,16 +171,19 @@
         remote_src: true
         mode: "0755"
 
-    - name: Inject and restart engine
+    - name: Stop stuck engine (if in restart loop)
+      community.docker.docker_container:
+        name: "{{ container_name }}"
+        state: stopped
+      ignore_errors: true
+
+    - name: Copy binary into engine container (works on stopped containers)
       ansible.builtin.shell: |
-        docker cp {{ host_binary }} {{ container_name }}:{{ container_binary }}.new && \
-        docker exec {{ container_name }} mv {{ container_binary }}.new {{ container_binary }} && \
-        docker exec {{ container_name }} chmod +x {{ container_binary }}
+        docker cp {{ host_binary }} {{ container_name }}:{{ container_binary }}
       args:
         executable: /bin/bash
-      changed_when: true
 
-    - name: Restart engine
+    - name: Start engine container (new binary already in place)
       community.docker.docker_container:
         name: "{{ container_name }}"
         state: started
