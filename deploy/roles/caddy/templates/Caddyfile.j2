@@ -1,0 +1,105 @@
+# {{ ansible_managed }}
+# IRC Fiber — Caddyfile
+# Public TLS termination in front of the irc-fiber gateway.
+# Caddy v2 automatically negotiates WebSocket upgrades for paths that
+# request them (e.g. /ws). Long timeouts are configured for the WS connection.
+#
+# We use ONE site block per host (looping over ircfiber_domain + any
+# caddy_extra_serve_hosts entries) instead of a single merged block.
+# Caddy's auto-TLS only manages certificates for the FIRST host in a
+# merged site block, so an additional Tailscale MagicDNS hostname would
+# otherwise be served a cert with the wrong SAN and the TLS handshake
+# would fail.
+#
+# Per-host cert handling:
+#   - *.ts.net hosts: Caddy's built-in caddytls.Tailscale manager fetches
+#     a real Tailscale-issued cert via tailscaled.sock (mounted into the
+#     container by the caddy role). No browser cert warning.
+#   - Other hosts:    follow the global default — Let's Encrypt when
+#     ircfiber_use_lets_encrypt=true, Caddy's local CA (self-signed)
+#     otherwise.
+{%- set serve_hosts = ([ircfiber_domain] + (caddy_extra_serve_hosts | default([]))) | unique %}
+{%- set use_internal_ca = not (ircfiber_use_lets_encrypt | default(true) | bool) %}
+
+# Snippet containing the shared per-site config (proxy + headers + log).
+# Imported into every site block below so we don't duplicate 60 lines
+# of config across blocks.
+(common_site_config) {
+    encode zstd gzip
+
+    # Health endpoints — serve directly with 200, never go to the upstream.
+    @health path /health /api/health
+    handle @health {
+        respond "OK\n" 200
+    }
+
+    reverse_proxy ircfiber-gateway:{{ gateway_http_port }} {
+        # Long-lived transport for WebSockets and slow message-history fetches
+        transport http {
+            dial_timeout 30s
+            response_header_timeout 60s
+            read_timeout 24h
+            write_timeout 24h
+        }
+    }
+
+    # Security headers
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "no-referrer"
+        # CSP allows:
+        #  - 'self' for app assets
+        #  - 'unsafe-inline' + 'unsafe-eval' for the Svelte app's inline
+        #    JS and inline styles (the app uses both)
+        #  - Google Fonts (fonts.googleapis.com + fonts.gstatic.com) for
+        #    Space Grotesk / Inter / JetBrains Mono typography
+        #  - jsdelivr and cloudflare CDNs (used by the Svelte app)
+        #  - wss:// for the gateway WebSocket connection
+        #  - data: URIs for inline images and font fallbacks
+        Content-Security-Policy "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://fonts.googleapis.com; font-src 'self' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://fonts.gstatic.com data:; script-src 'self' 'unsafe-inline' 'unsafe-eval'; connect-src 'self' wss: https:; frame-ancestors 'none'"
+        -Server
+    }
+
+    log {
+        output file /data/access.log {
+            roll_size 10mb
+            roll_keep 5
+        }
+        level INFO
+    }
+}
+
+{
+    # Admin API on localhost only (operational access via `docker exec`)
+    admin localhost:2019
+{% if use_internal_ca %}
+    local_certs
+{% endif %}
+}
+
+{% for host in serve_hosts %}
+# Site block for {{ host }}
+{{ host }} {
+{% if use_internal_ca or host is match("\.ts\.net$") %}
+    # Tailscale hostname → real cert via Tailscale cert manager.
+    # No explicit tls needed — Caddy's Tailscale integration handles this
+    # when the tailscaled.sock is mounted.
+{% else %}
+    # Public domain — use internal CA for the tunnel origin connection.
+    # The tunnel connects via HTTPS with "No TLS Verify" enabled.
+    # Cloudflare handles real TLS termination at the edge.
+    tls internal
+{% endif %}
+    import common_site_config
+}
+
+{% endfor %}
+
+# Internal listener for Cloudflare Tunnel on port {{ caddy_tunnel_port }}.
+# Plain HTTP — the tunnel connects here instead of port 80 to avoid
+# Caddy's auto-HTTPS redirect loop.
+:{{ caddy_tunnel_port }} {
+    import common_site_config
+}

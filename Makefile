@@ -19,6 +19,29 @@ LDC         := ldc2
 APP         := irc-fiber
 DUB_PKG     := $(HOME)/.dub/packages
 
+# Dev backend selection for `make run` / `make start` / `make dev`.
+# Default is `tailnet` — points the Vite dev server at the tailnet
+# gateway (https://ircfiber-prod-1.tail544547.ts.net). Override per-call:
+#
+#   make run                      # tailnet (default)
+#   make run-tailnet              # explicit tailnet
+#   make run-local                # local docker-compose (http://127.0.0.1:8090)
+#   make run BACKEND=local        # same as run-local, no separate target
+#   make run BACKEND=https://x     # custom backend URL
+#
+# For the D backend runner (the previous `make run`), use `make run-gateway`.
+BACKEND ?= local
+VITE_BACKEND_URL ?= https://ircfiber-prod-1.tail544547.ts.net
+
+ifeq ($(BACKEND),tailnet)
+  EFFECTIVE_BACKEND_URL := https://ircfiber-prod-1.tail544547.ts.net
+else ifeq ($(BACKEND),local)
+  EFFECTIVE_BACKEND_URL := http://127.0.0.1:8090
+else
+  # Treat BACKEND as a literal URL when it's neither "tailnet" nor "local"
+  EFFECTIVE_BACKEND_URL := $(BACKEND)
+endif
+
 # D-Scanner detection (system > dub package > fallback)
 DSCANNER := $(or $(shell which dscanner 2>/dev/null),\
                   $(shell ls -1 $(DUB_PKG)/dscanner/*/dscanner/bin/dscanner 2>/dev/null | tail -1),\
@@ -54,8 +77,8 @@ AR := →
 # ----------------------------------------------------------------------------
 # Phony targets (grouped by category)
 .PHONY: all help build build-engine build-release build-debug build-ldc2 frontend frontend-dev frontend-install
-.PHONY: start run run-engine up down restart-web logs-web logs-engine watch-web
-.PHONY: test clean fmt deps-check
+.PHONY: start run run-tailnet run-local run-gateway run-engine up down restart-web logs-web logs-engine watch-web
+.PHONY: test test-frontend test-all test-watch test-coverage test-lib test-client clean fmt fmt-check lint deps-check
 .PHONY: dscanner-install dscanner-all dscanner-syntax dscanner-lint dscanner-unused \
         dscanner-complexity dscanner-imports dscanner-fix dscanner-size dscanner-outline
 .PHONY: ensure-colima docker-up docker-down docker-logs docker-build \
@@ -64,6 +87,8 @@ AR := →
         docker-down-test \
         docker-shell docker-shell-engine docker-shell-redis docker-shell-mongo docker-shell-ircd ircd-up ircd-down
 .PHONY: cross-linux-x64 cross-linux-arm64 cross-linux-armv7
+.PHONY: verify precommit ci install-env
+.PHONY: sync-db-to-tailnet sync-mongo-to-tailnet sync-redis-to-tailnet
 
 # ----------------------------------------------------------------------------
 # Main Build Targets
@@ -177,10 +202,43 @@ endef
 # ----------------------------------------------------------------------------
 # Run & Test
 # ----------------------------------------------------------------------------
+#
+# `make run` is the primary entry point for the dev loop. It starts the
+# Svelte dev server pointed at the backend selected by the BACKEND
+# variable (default: tailnet). The D backend runner is at `make run-gateway`
+# (renamed from the old `make run`).
+#
+#   make run               # frontend dev, tailnet backend (default)
+#   make run-tailnet       # explicit
+#   make run-local         # frontend dev, local docker backend
+#   make run-gateway       # D gateway, local backend (was `make run`)
+#   make run-engine        # D engine only, local backend
 
-start: run ## Quick Start > Alias for make run
+start: run ## Quick Start > Alias for `make run` (frontend dev server)
 
-run: build build-engine ## Quick Start > Build and run gateway in foreground
+run: frontend-install ## Quick Start > Start frontend dev server (default: tailnet)
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting frontend dev server  $(R)"
+	@printf '%b\n' "$(D)Backend: $(BACKEND)  →  $(EFFECTIVE_BACKEND_URL)$(R)"
+	@printf '%b\n' "$(D)Open http://localhost:5173 when ready$(R)"
+	@printf '%b\n' "$(D)Switch:  make run-local   |   make run-tailnet   |   make run BACKEND=<url>$(R)"
+	@cd frontend && VITE_BACKEND_URL=$(EFFECTIVE_BACKEND_URL) npm run dev
+
+run-tailnet: build ## Quick Start > Build + run D gateway with tailnet Mongo+Redis
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting IRC Fiber Gateway (tailnet DBs)  $(R)"
+	@printf '%b\n' "$(C)$(AR) The built frontend is served at http://localhost:8090$(R)"
+	@printf '%b\n' "$(D)Open that URL in your browser — no separate Vite server needed.$(R)"
+	@printf '%b\n' "$(D)Vite dev server (HMR for frontend work): make run-local$(R)"
+	@printf '%b\n' "$(D)Engine: already running on the tailnet.$(R)"
+	@bash -c ' \
+		IRCFIBER_MONGO_URL="mongodb://ircfiber:MongoAppPass2026@100.107.178.48:27017/ircfiber" \
+		IRCFIBER_REDIS_URL="redis://100.107.178.48:6379/0" \
+		./irc-fiber; \
+	'
+
+run-local: ## Quick Start > Frontend dev server, local docker backend
+	@$(MAKE) --no-print-directory run BACKEND=local
+
+run-gateway: build build-engine ## Quick Start > Build + run D gateway locally (was `make run`)
 	@bash -c ' \
 		printf "\n%b\n" "$(_BC)$(K)$(B)  Cleaning up existing processes  $(R)"; \
 		$(_docker_setup); \
@@ -285,13 +343,115 @@ watch-web: ## Quick Start > Auto-rebuild gateway on file changes
 		done; \
 	'
 
-test: ## Build > Run D backend unit tests
-	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Running D Tests  $(R)"
+# ----------------------------------------------------------------------------
+# Testing & Quality
+# ----------------------------------------------------------------------------
+#
+# Layered test targets so you can run just what you need:
+#
+#   make test               # D backend tests only (fast)
+#   make test-frontend      # Svelte/Vitest only (fast, no browser by default)
+#   make test-lib           # Pure utility tests (Node, fastest)
+#   make test-client        # Component + store tests (headless Chromium)
+#   make test-all           # D backend + all frontend tests
+#   make test-coverage      # Code coverage report for the frontend
+#   make test-watch         # Vitest watch mode (frontend, re-runs on save)
+#   make test-ci            # Headless, single-run, JUnit output — for CI
+#
+# Quality / lint:
+#
+#   make lint               # All linters (D + frontend)
+#   make lint-d             # D-Scanner style + syntax + unused checks
+#   make lint-frontend      # svelte-check (TS) + svelte-check (Svelte)
+#   make fmt                # Format D sources
+#   make fmt-check          # Fail if any D source is unformatted (CI gate)
+#
+# Aggregators (run everything):
+#
+#   make verify             # lint + test (pre-push gate)
+#   make precommit          # fmt-check + lint + test (pre-commit gate)
+#   make ci                 # Everything, headless, fail-fast on first error
+
+test: ## Test > D backend unit tests (fast)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Running D backend tests  $(R)"
 	@$(DUB) test 2>&1 | tail -20
 
-test-frontend: ## Build > Run Svelte frontend tests (Vitest)
-	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Running Frontend Tests  $(R)"
-	@cd frontend && npm run test 2>&1 | tail -8
+test-frontend: ## Test > Svelte/Vitest frontend tests (both projects)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Running frontend tests  $(R)"
+	@cd frontend && npm run test 2>&1 | tail -20
+
+test-lib: ## Test > Frontend lib tests only (Node, fastest — pure utilities)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Running frontend lib tests  $(R)"
+	@cd frontend && npm run test:lib 2>&1 | tail -15
+
+test-client: ## Test > Frontend client tests only (headless Chromium — components/stores)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Running frontend client tests  $(R)"
+	@cd frontend && npm run test:client 2>&1 | tail -15
+
+test-all: test test-frontend ## Test > D backend + frontend (everything)
+	@printf '\n%b\n' "$(BG)$(OK) All test suites passed$(R)"
+
+test-coverage: ## Test > Frontend coverage report (HTML + text)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Generating frontend coverage report  $(R)"
+	@cd frontend && npm run test:coverage 2>&1 | tail -20
+	@printf '%b\n' "$(D)Open frontend/coverage/index.html in a browser$(R)"
+
+test-watch: ## Test > Vitest watch mode (frontend, re-runs on save)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Vitest watch mode  $(R)"
+	@cd frontend && npm run test:watch
+
+test-ci: ## Test > CI-mode: headless, single-run, JUnit XML output
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  CI-mode frontend tests (JUnit XML)  $(R)"
+	@cd frontend && CI=1 npm run test -- --reporter=default --reporter=junit --outputFile=test-results/junit.xml
+	@$(DUB) test --build=unittest-cov 2>&1 | tail -10
+
+# --- Lint ---------------------------------------------------------------------
+
+lint: lint-d lint-frontend ## Quality > All linters
+	@printf '\n%b\n' "$(BG)$(OK) All linters passed$(R)"
+
+lint-d: dscanner-syntax dscanner-lint dscanner-unused dscanner-complexity ## Quality > D backend linters
+	@printf '\n%b\n' "$(BG)$(OK) D backend lint passed$(R)"
+
+lint-frontend: ## Quality > Frontend type-check (svelte-check)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Running svelte-check  $(R)"
+	@cd frontend && npm run check 2>&1 | tail -30
+
+# --- Format -------------------------------------------------------------------
+
+fmt: ## Quality > Format D sources in-place
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Formatting D sources  $(R)"
+	@find source -name "*.d" -exec dfmt -i {} \; 2>/dev/null || \
+		printf '%b\n' "$(Y)$(WR) dfmt not found. Install: dub fetch dfmt$(R)"
+	@printf '%b\n' "$(BG)$(OK) D sources formatted$(R)"
+
+fmt-check: ## Quality > Verify all D sources are formatted (CI gate, no writes)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Checking D source formatting  $(R)"
+	@UNFORMATTED=$$(find source -name "*.d" -exec dfmt -c {} \; 2>&1 | grep -v "^$" || true); \
+	if [ -n "$$UNFORMATTED" ]; then \
+		printf '%b\n' "$(Y)$(WR) Unformatted sources detected:$(R)"; \
+		echo "$$UNFORMATTED"; \
+		printf '%b\n' "$(D)Fix with: make fmt$(R)"; \
+		exit 1; \
+	else \
+		printf '%b\n' "$(BG)$(OK) All D sources formatted$(R)"; \
+	fi
+
+# --- Aggregators --------------------------------------------------------------
+
+verify: lint test ## Verify > lint + test (pre-push gate)
+	@printf '\n%b\n' "$(BG)$(OK) verify passed (lint + test)$(R)"
+
+precommit: fmt-check lint test ## Verify > fmt-check + lint + test (pre-commit gate)
+	@printf '\n%b\n' "$(BG)$(OK) precommit passed (fmt + lint + test)$(R)"
+
+ci: precommit ## Verify > Full CI suite (fmt + lint + test, fail-fast)
+	@printf '\n%b\n' "$(BG)$(OK) CI pipeline passed$(R)"
+
+# --- Environment --------------------------------------------------------------
+
+install-env: frontend-install deps-check ## Utils > Install dev environment (frontend deps + verify CLI tools)
+	@printf '\n%b\n' "$(BG)$(OK) Dev environment ready$(R)"
 
 # ----------------------------------------------------------------------------
 # Code Quality (D-Scanner)
@@ -550,6 +710,32 @@ docker-restart: docker-restart-web docker-restart-backend ## Docker > Restart al
 	@printf '%b\n' "$(BG)$(OK) All services restarted$(R)"
 
 # ----------------------------------------------------------------------------
+# Data Sync — Local Docker → Tailnet
+# ----------------------------------------------------------------------------
+#
+# Delegate to the Ansible playbook. The playbook handles vault decryption
+# natively, gets confirmation via the `pause` module, and runs against
+# the tailnet host via SSH (dedicated unpassphrased key configured in
+# ~/.ssh/config). Tags let you run Mongo or Redis only.
+#
+#   make sync-db-to-tailnet                 # both, interactive
+#   make sync-mongo-to-tailnet              # Mongo only
+#   make sync-redis-to-tailnet              # Redis only
+#   SYNC_YES=1 make sync-db-to-tailnet      # skip confirmation
+
+sync-db-to-tailnet: ## Data > Sync local Mongo + Redis to tailnet (playbook, prompts unless SYNC_YES=1)
+	@cd deploy && \
+		[ -n "$$SYNC_YES" ] && A="-e sync_yes=true" || A=""; \
+		[ -n "$$SYNC_TAG" ] && A="$$A --tags $$SYNC_TAG"; \
+		ansible-playbook playbooks/sync-db-to-tailnet.yml $$A
+
+sync-mongo-to-tailnet: ## Data > Sync only local Mongo → tailnet
+	@$(MAKE) --no-print-directory sync-db-to-tailnet SYNC_TAG=mongo
+
+sync-redis-to-tailnet: ## Data > Sync only local Redis → tailnet
+	@$(MAKE) --no-print-directory sync-db-to-tailnet SYNC_TAG=redis
+
+# ----------------------------------------------------------------------------
 # Cross Compilation
 # ----------------------------------------------------------------------------
 # Cross Compilation
@@ -597,11 +783,6 @@ clean: ## Utils > Remove build artifacts
 	@rm -rf .dub
 	@$(DUB) clean 2>/dev/null || true
 	@printf '%b\n' "$(BG)$(OK) Clean complete$(R)"
-
-fmt: ## Utils > Format D source files with dfmt
-	@printf '%b\n' "$(D)→ Formatting D source files...$(R)"
-	@find source -name "*.d" -exec dfmt -i {} \; 2>/dev/null || \
-		printf '%b\n' "$(Y)$(WR) dfmt not found. Install: dub fetch dfmt$(R)"
 
 # ----------------------------------------------------------------------------
 # Help — auto-generated from ## comments on each target

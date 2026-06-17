@@ -1,0 +1,5 @@
+---
+- name: Restart gateway
+  community.docker.docker_container:
+    name: "{{ gateway_container_name }}"
+    restart: true

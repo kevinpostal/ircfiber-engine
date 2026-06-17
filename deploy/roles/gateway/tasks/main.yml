@@ -1,0 +1,84 @@
+---
+- name: Discover this host's Tailscale IPv4 address
+  ansible.builtin.command: tailscale ip -4
+  register: tailscale_ip_raw
+  changed_when: false
+  failed_when: tailscale_ip_raw.rc != 0
+  check_mode: false
+
+- name: Set host_tailscale_ip fact
+  ansible.builtin.set_fact:
+    host_tailscale_ip: "{{ tailscale_ip_raw.stdout | trim | split('\n') | first | trim }}"
+
+- name: Resolve backend Tailscale IP (where mongo & redis live)
+  ansible.builtin.set_fact:
+    backend_tailscale_ip: >-
+      {{ hostvars[groups['ircfiber_backend'][0]]['host_tailscale_ip']
+         | default(host_tailscale_ip) }}
+
+- name: Pull irc-fiber image (registry configured)
+  community.docker.docker_image:
+    name: "{{ ircfiber_image_full }}"
+    source: pull
+    state: present
+  when: docker_registry_url | length > 0
+  # Note: when docker_registry_url is empty, the ircfiber_image role has
+  # already built the image on this host via docker build, so no pull/build
+  # is needed here.
+
+- name: Ensure ircfiber config dir exists
+  ansible.builtin.file:
+    path: /etc/ircfiber/gateway
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Render gateway env file
+  ansible.builtin.template:
+    src: env.j2
+    dest: /etc/ircfiber/gateway/env
+    owner: root
+    group: root
+    mode: "0640"
+  notify: Restart gateway
+
+- name: Ensure uploads & logs volumes exist
+  community.docker.docker_volume:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - "{{ gateway_uploads_volume }}"
+    - "{{ gateway_logs_volume }}"
+
+- name: Resolve the ircfiber network name
+  ansible.builtin.set_fact:
+    ircfiber_networks_for_gateway:
+      - name: "{{ docker_ircfiber_network }}"
+
+- name: Run ircfiber-gateway
+  community.docker.docker_container:
+    name: "{{ gateway_container_name }}"
+    image: "{{ ircfiber_image_full }}"
+    state: started
+    restart_policy: unless-stopped
+    command: ["/app/irc-fiber"]
+    networks: "{{ ircfiber_networks_for_gateway }}"
+    networks_cli_compatible: true
+    env_file: /etc/ircfiber/gateway/env
+    volumes:
+      - "{{ gateway_uploads_volume }}:/app/uploads"
+      - "{{ gateway_logs_volume }}:/var/log/irc-fiber"
+    security_opts:
+      - "no-new-privileges:true"
+    ulimits:
+      - "nofile:65536:65536"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:{{ gateway_http_port }}/health"]
+      interval: "{{ gateway_healthcheck_interval }}"
+      timeout: "{{ gateway_healthcheck_timeout }}"
+      retries: "{{ gateway_healthcheck_retries }}"
+      start_period: "{{ gateway_healthcheck_start_period }}"
+    labels:
+      com.ircfiber.component: "gateway"
+      com.ircfiber.version: "{{ ircfiber_version }}"

@@ -1,0 +1,27 @@
+---
+caddy_container_name: ircfiber-caddy
+caddy_admin_port: 2019
+caddy_no_new_privileges: true
+# Path on host where the Caddyfile lives (mounted read-only)
+caddy_config_dir: /etc/ircfiber/caddy
+# Additional virtual-host names Caddy should serve in addition to
+# ircfiber_domain. Useful for exposing the web UI on a Tailscale MagicDNS
+# hostname (e.g. "<host>.tail<id>.ts.net") so tailnet members can reach the
+# app without going through the public domain. Override per host in
+# inventories/production/host_vars/<hostname>.yml.
+# When a *.ts.net entry is present, Caddy will obtain a real cert via the
+# built-in Tailscale cert manager (provided caddy_tailscale_socket points
+# at a working tailscaled.sock). No browser cert warning, no manual trust.
+# Example: caddy_extra_serve_hosts: ["ircfiber-prod-1.tail544547.ts.net"]
+caddy_extra_serve_hosts: []  # yamllint disable-line rule:line-length
+# Path on the HOST where tailscaled exposes its local API socket. Caddy
+# uses this to fetch TLS certificates for *.ts.net hostnames via Tailscale's
+# built-in ACME flow. Bind-mounted into the Caddy container at the same
+# path so the caddytls.Tailscale manager can reach it. Set to "" to skip
+# the mount (e.g. on hosts without Tailscale).
+caddy_tailscale_socket: "/var/run/tailscale/tailscaled.sock"
+# Internal port for Cloudflare Tunnel traffic. Caddy listens on this port
+# inside the container (no host port mapping needed). cloudflared on the
+# ircfiber_net connects to ircfiber-caddy:{{ caddy_tunnel_port }}.
+# This port has no auto-HTTPS redirect — Cloudflare terminates TLS at the edge.
+caddy_tunnel_port: 8080

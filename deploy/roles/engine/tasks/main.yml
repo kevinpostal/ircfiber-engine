@@ -1,0 +1,75 @@
+---
+- name: Preflight — IRCFIBER_SERVER_ID must be set
+  ansible.builtin.assert:
+    that:
+      - ircfiber_engine_id is defined
+      - ircfiber_engine_id | length > 0
+    fail_msg: "ircfiber_engine_id must be set in host_vars or group_vars."
+
+- name: Discover this host's Tailscale IPv4 address
+  ansible.builtin.command: tailscale ip -4
+  register: tailscale_ip_raw
+  changed_when: false
+  failed_when: tailscale_ip_raw.rc != 0
+  check_mode: false
+
+- name: Set host_tailscale_ip fact
+  ansible.builtin.set_fact:
+    host_tailscale_ip: "{{ tailscale_ip_raw.stdout | trim | split('\n') | first | trim }}"
+
+- name: Resolve backend Tailscale IP (where mongo & redis live)
+  ansible.builtin.set_fact:
+    backend_tailscale_ip: >-
+      {{ hostvars[groups['ircfiber_backend'][0]]['host_tailscale_ip']
+         | default(host_tailscale_ip) }}
+
+- name: Pull irc-fiber image (registry configured)
+  community.docker.docker_image:
+    name: "{{ ircfiber_image_full }}"
+    source: pull
+    state: present
+  when: docker_registry_url | length > 0
+  # Note: when docker_registry_url is empty, the ircfiber_image role has
+  # already built the image on this host via docker build.
+
+- name: Ensure engine config dir exists
+  ansible.builtin.file:
+    path: "/etc/ircfiber/engine"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Render engine env file
+  ansible.builtin.template:
+    src: env.j2
+    dest: "/etc/ircfiber/engine/env-{{ ircfiber_engine_id }}"
+    owner: root
+    group: root
+    mode: "0640"
+  notify: Restart engine
+
+- name: Run ircfiber-engine
+  community.docker.docker_container:
+    name: "{{ engine_container_name }}"
+    image: "{{ ircfiber_image_full }}"
+    state: started
+    restart_policy: unless-stopped
+    command: ["/app/irc-fiber-engine"]
+    networks:
+      - name: "{{ docker_ircfiber_network }}"
+    env_file: "/etc/ircfiber/engine/env-{{ ircfiber_engine_id }}"
+    security_opts:
+      - "no-new-privileges:true"
+    ulimits:
+      - "nofile:65536:65536"
+    healthcheck:
+      test: ["CMD-SHELL", "pidof irc-fiber-engine || exit 1"]
+      interval: "{{ engine_healthcheck_interval }}"
+      timeout: "{{ engine_healthcheck_timeout }}"
+      retries: "{{ engine_healthcheck_retries }}"
+      start_period: "{{ engine_healthcheck_start_period }}"
+    labels:
+      com.ircfiber.component: "engine"
+      com.ircfiber.version: "{{ ircfiber_version }}"
+      com.ircfiber.engine_id: "{{ ircfiber_engine_id }}"

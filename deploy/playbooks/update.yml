@@ -1,0 +1,83 @@
+---
+# Bump the irc-fiber image version and roll-restart the gateway and engines.
+# Usage:
+#   ansible-playbook playbooks/update.yml -e ircfiber_version=0.4.0
+# Defaults to the version in group_vars/all.yml if not overridden.
+
+- name: Bump image tag & push
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  tasks:
+    - name: Show target version
+      ansible.builtin.debug:
+        msg: "Building irc-fiber:{{ ircfiber_version }}"
+
+    - name: Build & push new image
+      ansible.builtin.include_role:
+        name: ircfiber_image
+
+- name: Pull new image on gateway host
+  hosts: ircfiber_gw
+  become: true
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  tasks:
+    - name: Pull irc-fiber:{{ ircfiber_version }} (registry)
+      community.docker.docker_image:
+        name: "{{ ircfiber_image_full }}"
+        source: pull
+        state: present
+      when: docker_registry_url | length > 0
+
+    - name: Rebuild irc-fiber:{{ ircfiber_version }} on target (no registry)
+      community.docker.docker_image:
+        name: "{{ ircfiber_image_full }}"
+        build:
+          path: "/opt/ircfiber-src"
+          dockerfile: "{{ ircfiber_containerfile }}"
+          args: "{{ ircfiber_build_args }}"
+        source: build
+        state: present
+      when: docker_registry_url | length == 0
+
+    - name: Restart gateway
+      community.docker.docker_container:
+        name: "{{ gateway_container_name }}"
+        restart: true
+
+- name: Pull new image & roll-restart engines one at a time
+  hosts: ircfiber_engines
+  become: true
+  serial: 1
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  tasks:
+    - name: Pull irc-fiber:{{ ircfiber_version }} (registry)
+      community.docker.docker_image:
+        name: "{{ ircfiber_image_full }}"
+        source: pull
+        state: present
+      when: docker_registry_url | length > 0
+
+    - name: Rebuild on target (no registry)
+      community.docker.docker_image:
+        name: "{{ ircfiber_image_full }}"
+        build:
+          path: "/opt/ircfiber-src"
+          dockerfile: "{{ ircfiber_containerfile }}"
+          args: "{{ ircfiber_build_args }}"
+        source: build
+        state: present
+      when: docker_registry_url | length == 0
+
+    - name: Restart engine
+      community.docker.docker_container:
+        name: "ircfiber-engine-{{ ircfiber_engine_id }}"
+        restart: true
+
+    - name: Wait 15s for engine to re-register
+      ansible.builtin.pause:
+        seconds: 15

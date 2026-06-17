@@ -1,0 +1,107 @@
+---
+# ircfiber_image role.
+#
+# Two build strategies:
+#   - With a configured registry: build on the Ansible control node, push
+#     to the registry. Target hosts pull.
+#   - Without a registry: build directly on each target host, since the
+#     image needs to exist in the target's local docker daemon.
+
+# ---- Preflight (always on the control node) --------------------------------
+- name: Preflight — verify Containerfile exists
+  ansible.builtin.stat:
+    path: "{{ ircfiber_repo_root }}/{{ ircfiber_containerfile }}"
+  register: containerfile_check
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Fail if Containerfile missing
+  ansible.builtin.fail:
+    msg: "Containerfile not found at {{ ircfiber_repo_root }}/{{ ircfiber_containerfile }}"
+  when: not containerfile_check.stat.exists
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+# ---- With registry: build on control node, push ----------------------------
+- name: Build irc-fiber image on the control node
+  community.docker.docker_image:
+    name: "{{ ircfiber_image_name }}"
+    tag: "{{ docker_image_tag }}"
+    build:
+      path: "{{ ircfiber_repo_root }}"
+      dockerfile: "{{ ircfiber_containerfile }}"
+      args: "{{ ircfiber_build_args }}"
+      pull: "{{ ircfiber_build_pull }}"
+    source: build
+    force_source: "{{ ircfiber_force_rebuild }}"
+    push: true
+    state: present
+  delegate_to: localhost
+  become: false
+  run_once: true
+  when: docker_registry_url | length > 0
+
+- name: Tag image as latest
+  community.docker.docker_image:
+    name: "{{ ircfiber_image_name }}:{{ docker_image_tag }}"
+    repository: "{{ ircfiber_image_name }}:latest"
+    source: local
+    force_tag: true
+    state: present
+  delegate_to: localhost
+  become: false
+  run_once: true
+  when: docker_registry_url | length > 0
+
+- name: Push latest tag
+  community.docker.docker_image:
+    name: "{{ ircfiber_image_name }}:latest"
+    push: true
+    source: local
+  delegate_to: localhost
+  become: false
+  run_once: true
+  when: docker_registry_url | length > 0
+
+# ---- Without registry: build on each target host ---------------------------
+# Need the source on the target. We rsync from control node first.
+# synchronize's "dest" is on the target host and "src" is on the control node.
+- name: Rsync irc-fiber repo to the target host (no-registry mode)
+  ansible.posix.synchronize:
+    src: "{{ ircfiber_repo_root }}/"
+    dest: "/opt/ircfiber-src/"
+    delete: false
+    recursive: true
+    rsync_opts:
+      - "--exclude=.git"
+      - "--exclude=node_modules"
+      - "--exclude=.dub"
+      - "--exclude=deploy"
+      - "--exclude=e2e/test-results"
+      - "--exclude=*.log"
+  when: docker_registry_url | length == 0
+  throttle: 1
+
+- name: Build irc-fiber image on the target host (no-registry mode)
+  ansible.builtin.command: >
+    docker build
+    --tag {{ ircfiber_image_full }}
+    --build-arg LDC_VERSION={{ ircfiber_build_args.LDC_VERSION }}
+    --build-arg TARGETARCH={{ ircfiber_build_args.TARGETARCH }}
+    -f /opt/ircfiber-src/{{ ircfiber_containerfile }}
+    /opt/ircfiber-src
+  args:
+    chdir: /opt/ircfiber-src
+  changed_when: true
+  when: docker_registry_url | length == 0
+
+# ---- Report ----------------------------------------------------------------
+- name: Show resulting image on target
+  ansible.builtin.command: >-
+    docker images {{ ircfiber_image_full }}
+    --format '{{ "{{" }}.Repository{{ "}}" }}:{{ "{{" }}.Tag{{ "}}" }} -> {{ "{{" }}.ID{{ "}}" }}'
+  register: image_inventory
+  changed_when: false
+  become: false

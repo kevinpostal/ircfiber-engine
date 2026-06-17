@@ -1,0 +1,6 @@
+---
+- name: Reload caddy
+  ansible.builtin.command: docker exec {{ caddy_container_name }} caddy reload --config /etc/caddy/Caddyfile
+  register: caddy_reload
+  changed_when: "'reload' in caddy_reload.stderr or caddy_reload.rc == 0"
+  failed_when: false

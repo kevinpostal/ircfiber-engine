@@ -1,0 +1,11 @@
+---
+engine_container_name: "ircfiber-engine-{{ ircfiber_engine_id }}"
+engine_no_new_privileges: true
+engine_ulimits:
+  nofile:
+    soft: 65536
+    hard: 65536
+engine_healthcheck_interval: 30s
+engine_healthcheck_timeout: 5s
+engine_healthcheck_retries: 3
+engine_healthcheck_start_period: 10s

@@ -1,0 +1,86 @@
+---
+- name: Ensure Caddy directories exist
+  ansible.builtin.file:
+    path: "{{ caddy_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Ensure Caddy data & config volumes exist
+  community.docker.docker_volume:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - "{{ caddy_data_volume }}"
+    - "{{ caddy_config_volume }}"
+
+- name: Detect tailscaled.sock (for Caddy Tailscale cert manager)
+  ansible.builtin.stat:
+    path: "{{ caddy_tailscale_socket }}"
+  register: caddy_tailscale_socket_stat
+  when: caddy_tailscale_socket | length > 0
+
+- name: Render Caddyfile
+  ansible.builtin.template:
+    src: Caddyfile.j2
+    dest: "{{ caddy_config_dir }}/Caddyfile"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload caddy
+
+- name: Run ircfiber-caddy
+  community.docker.docker_container:
+    name: "{{ caddy_container_name }}"
+    image: "{{ caddy_image }}"
+    state: started
+    restart_policy: unless-stopped
+    # Caddy joins the ircfiber_net bridge so it can resolve
+    # 'ircfiber-gateway' (the gateway container's DNS alias on that net).
+    networks:
+      - name: "{{ docker_ircfiber_network }}"
+    networks_cli_compatible: true
+    command:
+      - "caddy"
+      - "run"
+      - "--environ"
+      - "--config"
+      - "/etc/caddy/Caddyfile"
+    ports:
+      - "80:80"
+      - "443:443"
+    # Bind-mount tailscaled.sock so the built-in caddytls.Tailscale cert
+    # manager can fetch real certs for *.ts.net hostnames. Mounted at the
+    # same path inside the container (Caddy looks there by default).
+    volumes: "{{ caddy_volumes }}"
+    capabilities:
+      - NET_BIND_SERVICE
+    security_opts:
+      - "no-new-privileges:true"
+    healthcheck:
+      # Use the docker-network DNS name so this works inside the
+      # container without depending on host DNS.
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:80/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    labels:
+      com.ircfiber.component: "caddy"
+      com.ircfiber.version: "{{ ircfiber_version }}"
+  vars:
+    caddy_volumes: >-
+      {{
+        [
+          (caddy_config_dir + '/Caddyfile:/etc/caddy/Caddyfile:ro'),
+          (caddy_data_volume + ':/data'),
+          (caddy_config_volume + ':/config')
+        ]
+        +
+        (
+          [(caddy_tailscale_socket + ':/var/run/tailscale/tailscaled.sock')]
+          if (caddy_tailscale_socket | length > 0
+              and (caddy_tailscale_socket_stat.stat.exists | default(false)))
+          else []
+        )
+      }}
