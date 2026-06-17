@@ -744,6 +744,9 @@ deploy: ## Deploy > Build on metal + push binary to prod (gateway + engines)
 	@printf '%b\n' "$(D)  make deploy ARGS=--tags engines   # include engines (serial: 1)$(R)"
 	@printf '%b\n' "$(D)  make deploy ARGS=--tags gateway   # gateway only (default)$(R)"
 
+update: deploy ## Deploy > Alias for 'make deploy' — git pull + build + bounce on target
+	@true
+
 # ----------------------------------------------------------------------------
 # Cross Compilation
 # ----------------------------------------------------------------------------
