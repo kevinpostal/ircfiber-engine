@@ -38,6 +38,16 @@
         group: root
         mode: "0777"
 
+    - name: Install D build tools (ldc + dub + libssl-dev) — cached across builds
+      ansible.builtin.package:
+        name:
+          - ldc
+          - dub
+          - libssl-dev
+          - pkg-config
+        state: present
+      when: ansible_pkg_mgr != 'unknown'
+
     - name: Sync local source tree to target (rsync over SSH, run as SSH user)
       become: false
       ansible.posix.synchronize:
