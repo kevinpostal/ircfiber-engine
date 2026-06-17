@@ -736,17 +736,29 @@ sync-mongo-to-tailnet: ## Data > Sync only local Mongo → tailnet
 sync-redis-to-tailnet: ## Data > Sync only local Redis → tailnet
 	@$(MAKE) --no-print-directory sync-db-to-tailnet SYNC_TAG=redis
 
-deploy: ## Deploy > Build on metal + push binary to prod (gateway + engines)
-	@printf '\n%b\n' "$(_BC)$(K)$(B)  Deploying to production  $(R)"
-	@printf '%b\n' "$(C)$(AR) Building D backend + frontend on target machine(s)$(R)"
-	@printf '%b\n' "$(D)  (compiles natively — avoids Docker multi-stage overhead)$(R)"
-	@cd deploy && ansible-playbook playbooks/deploy-binary.yml $(ARGS)
-	@printf '%b\n' "$(BG)$(OK) Deploy complete$(R)"
-	@printf '%b\n' "$(D)  make deploy ARGS=--tags engines   # include engines (serial: 1)$(R)"
-	@printf '%b\n' "$(D)  make deploy ARGS=--tags gateway   # gateway only (default)$(R)"
-
-update: deploy ## Deploy > Alias for 'make deploy' — git pull + build + bounce on target
-	@true
+update: frontend ## Deploy > Build + inject on VPS via Tailscale Docker over SSH
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Building on VPS via Tailscale  $(R)"
+	@printf '%b\n' "$(D)  First build: 2-5 min (downloading deps)$(R)"
+	@printf '%b\n' "$(D)  Subsequent: 10-30s (incremental dub build via cache mount)$(R)"
+	@bash -c '\
+		CTX="vps"; \
+		SOCK="ssh://deploy@ircfiber-prod-1.tail544547.ts.net"; \
+		docker context create $$CTX --docker "host=$$SOCK" 2>/dev/null || true; \
+		printf "%b\n" "$(C)=== Building D backend on VPS ===$(R)"; \
+		docker -c $$CTX build --target builder -t ircfiber-builder:latest -f Containerfile . 2>&1; \
+		printf "%b\n" "$(C)=== Extracting binary ===$(R)"; \
+		CID=$$(docker -c $$CTX create ircfiber-builder:latest); \
+		mkdir -p /opt/ircfiber/bin; \
+		docker -c $$CTX cp "$$CID:/build/irc-fiber" /opt/ircfiber/bin/irc-fiber; \
+		docker -c $$CTX cp "$$CID:/build/irc-fiber-engine" /opt/ircfiber/bin/irc-fiber-engine 2>/dev/null || true; \
+		docker -c $$CTX rm "$$CID" >/dev/null 2>&1; \
+		docker -c $$CTX cp /opt/ircfiber/bin/irc-fiber ircfiber-gateway:/app/irc-fiber; \
+		printf "%b\n" "$(C)=== Restarting gateway ===$(R)"; \
+		docker -c $$CTX stop ircfiber-gateway 2>/dev/null; \
+		sleep 1; \
+		docker -c $$CTX start ircfiber-gateway; \
+		printf "%b\n" "$(BG)$(OK) Deploy complete$(R)"; \
+	'
 
 # ----------------------------------------------------------------------------
 # Cross Compilation

@@ -32,16 +32,16 @@ WORKDIR /build
 
 # Dependency caching layer
 COPY dub.sdl dub.selections.json ./
-RUN dub fetch --cache=local || true
+RUN --mount=type=cache,target=/build/.dub dub fetch --cache=local || true
 
-# Source and build
+# Source and build — .dub/ preserved across builds via Docker cache mount
 COPY source/ ./source/
 COPY views/ ./views/
 COPY config/ ./config/
 COPY public/ ./public/
 
-RUN dub build --compiler=ldc2 --build=release --force --parallel
-RUN dub build --config=engine --compiler=ldc2 --build=release --force --parallel
+RUN --mount=type=cache,target=/build/.dub dub build --compiler=ldc2 --build=release --force --parallel 2>&1 | tail -5
+RUN --mount=type=cache,target=/build/.dub dub build --config=engine --compiler=ldc2 --build=release --force --parallel 2>&1 | tail -5
 RUN strip /build/irc-fiber
 RUN strip /build/irc-fiber-engine
 
