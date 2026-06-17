@@ -1,60 +1,88 @@
 ---
-# IRCCloud-style "push binary, bounce process" — lightest possible deploy.
+# IRCCloud-style "build on metal, bounce process" — lightest possible deploy.
 #
-# Builds the frontend + D backend binary locally on the control node,
-# copies the binary to target hosts, injects it into running containers
-# via `docker cp`, then restarts.  No Docker image rebuild needed.
+# Clones/pulls the repo on the target machine, builds the D binary natively
+# (no Docker build-stage overhead), copies it into the running container,
+# and restarts.  The Docker multi-stage build (Containerfile) installs LDC
+# from scratch every time — this playbook skips all of that by building
+# on the bare host where LDC can be cached between deploys.
 #
 # Usage:
 #   ansible-playbook playbooks/deploy-binary.yml
 #
-# Tags (run only what you need):
-#   --tags build     # rebuild D + frontend on control node (optional)
-#   --tags gateway   # push binary to gateway only
-#   --tags engines   # push binary to engines only (serial: 1)
+# Tags:
+#   --tags gateway   # gateway only (default)
+#   --tags engines   # engines one-at-a-time with cooldown
+#
+# Prerequisites (target):
+#   - ldc2 + dub installed (via package manager — cached across builds)
+#   - Node.js + npm installed (for frontend build)
+#   - Docker running
+#   - Containers named ircfiber-gateway / ircfiber-engine-*
 #
 # Rollback:
 #   The previous binary is saved as <name>.prev on the host.
 #   docker cp <name>.prev <container>:/app/<name> && docker restart <container>
-#
-# Requirements:
-#   - Control node: dub/ldc2, npm, or pre-built binaries
-#   - Target: Docker, running ircfiber-gateway / ircfiber-engine-* containers
-#
-# Example workflow:
-#   make build                          # pre-build locally
-#   ansible-playbook playbooks/deploy-binary.yml   # push & bounce
-#
-#   # Or let the playbook build (same as make build):
-#   ansible-playbook playbooks/deploy-binary.yml -e build_on_control=true
 
-- name: Build D backend + frontend locally (skip if pre-built)
-  hosts: localhost
-  connection: local
-  gather_facts: false
+- name: Build D backend + frontend on the target machine
+  hosts: "{{ target | default('ircfiber_gw') }}"
+  become: true
+  gather_facts: true
   tags:
     - build
+    - always
+  vars:
+    src_root: /opt/ircfiber-src
+    repo_url: "{{ ircfiber_repo_url | default('https://github.com/ircfiber/irc-fiber.git') }}"
+    repo_branch: "{{ ircfiber_repo_branch | default('main') }}"
   tasks:
-    - name: Check if binaries exist (skip if pre-built unless forced)
-      ansible.builtin.stat:
-        path: "{{ playbook_dir }}/../../{{ item }}"
-      register: bin_stat
-      loop:
-        - irc-fiber
+    - name: Ensure build dependencies are present
+      ansible.builtin.package:
+        name:
+          - ldc
+          - dub
+          - nodejs
+          - npm
+          - git
+          - curl
+          - libssl-dev
+          - zlib1g-dev
+          - pkg-config
+        state: present
+      when: ansible_pkg_mgr != 'unknown'
+
+    - name: Ensure source directory exists
+      ansible.builtin.file:
+        path: "{{ src_root }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Clone or pull latest source
+      ansible.builtin.git:
+        repo: "{{ repo_url }}"
+        dest: "{{ src_root }}"
+        version: "{{ repo_branch }}"
+        force: true
+        update: true
 
     - name: Build D backend (dub build --force)
-      when: build_on_control | default(false) or not bin_stat.results[0].stat.exists
       ansible.builtin.command:
         cmd: dub build --force
-        chdir: "{{ playbook_dir }}/../.."
+        chdir: "{{ src_root }}"
       register: dub_out
       changed_when: "'Linking' in dub_out.stdout"
+      environment:
+        HOME: /root
 
-    - name: Build frontend (npm run build)
-      when: build_on_control | default(false) or not bin_stat.results[0].stat.exists
+    - name: Build frontend (npm ci && npm run build)
       ansible.builtin.command:
-        cmd: npm run build
-        chdir: "{{ playbook_dir }}/../../frontend"
+        cmd: "{{ item }}"
+        chdir: "{{ src_root }}/frontend"
+      loop:
+        - npm ci
+        - npm run build
       register: npm_out
       changed_when: "'built in' in npm_out.stdout"
 
@@ -66,6 +94,7 @@
     - gateway
   vars:
     container_name: "{{ gateway_container_name | default('ircfiber-gateway') }}"
+    src_root: /opt/ircfiber-src
     host_binary_dir: /opt/ircfiber/bin
     host_binary: "{{ host_binary_dir }}/irc-fiber"
     host_binary_prev: "{{ host_binary_dir }}/irc-fiber.prev"
@@ -87,16 +116,17 @@
         mode: "0755"
       ignore_errors: true
 
-    - name: Copy new binary to target host
+    - name: Copy freshly-built binary to deploy path
       ansible.builtin.copy:
-        src: "{{ playbook_dir }}/../../irc-fiber"
+        src: "{{ src_root }}/irc-fiber"
         dest: "{{ host_binary }}"
+        remote_src: true
         mode: "0755"
 
-    - name: Inject binary into running container via docker cp
+    - name: Inject binary into running container
       ansible.builtin.shell: |
-        docker cp {{ host_binary }} {{ container_name }}:{{ container_binary }}.new
-        docker exec {{ container_name }} mv {{ container_binary }}.new {{ container_binary }}
+        docker cp {{ host_binary }} {{ container_name }}:{{ container_binary }}.new && \
+        docker exec {{ container_name }} mv {{ container_binary }}.new {{ container_binary }} && \
         docker exec {{ container_name }} chmod +x {{ container_binary }}
       args:
         executable: /bin/bash
@@ -104,7 +134,7 @@
       ignore_errors: true
       changed_when: inject is success
 
-    - name: Fallback — stop container & docker cp (if running inject failed)
+    - name: Fallback — stop container, docker cp, start
       when: inject is failed
       block:
         - name: Stop gateway container
@@ -112,12 +142,10 @@
             name: "{{ container_name }}"
             state: stopped
 
-        - name: Copy binary into container layer
+        - name: Copy binary into stopped container layer
           ansible.builtin.shell: |
-            CONTAINER_ID=$(docker ps -aq --filter name='^{{ container_name }}$' | head -1)
-            if [ -n "$CONTAINER_ID" ]; then
-              docker cp {{ host_binary }} $CONTAINER_ID:{{ container_binary }}
-            fi
+            CID=$(docker ps -aq --filter name='^{{ container_name }}$' | head -1)
+            if [ -n "$CID" ]; then docker cp {{ host_binary }} "$CID":{{ container_binary }}; fi
           args:
             executable: /bin/bash
 
@@ -146,20 +174,20 @@
   tags:
     - engines
   vars:
+    src_root: /opt/ircfiber-src
     host_binary_dir: /opt/ircfiber/bin
     host_binary: "{{ host_binary_dir }}/irc-fiber-engine"
     host_binary_prev: "{{ host_binary_dir }}/irc-fiber-engine.prev"
     container_binary: /app/irc-fiber-engine
   tasks:
-    - name: Check if engine binary exists locally
+    - name: Check if engine binary was built
       ansible.builtin.stat:
-        path: "{{ playbook_dir }}/../../irc-fiber-engine"
-      delegate_to: localhost
-      register: local_engine_bin
+        path: "{{ src_root }}/irc-fiber-engine"
+      register: engine_src
 
-    - name: Skip — no engine binary found
+    - name: Skip — no engine binary in build output
       ansible.builtin.meta: end_host
-      when: not local_engine_bin.stat.exists
+      when: not engine_src.stat.exists
 
     - name: Ensure binary directory exists on target
       ansible.builtin.file:
@@ -177,10 +205,11 @@
         mode: "0755"
       ignore_errors: true
 
-    - name: Copy new engine binary to target host
+    - name: Copy freshly-built engine binary to deploy path
       ansible.builtin.copy:
-        src: "{{ playbook_dir }}/../../irc-fiber-engine"
+        src: "{{ src_root }}/irc-fiber-engine"
         dest: "{{ host_binary }}"
+        remote_src: true
         mode: "0755"
 
     - name: Resolve engine container name for this host
@@ -189,8 +218,8 @@
 
     - name: Inject binary into engine container
       ansible.builtin.shell: |
-        docker cp {{ host_binary }} {{ engine_container }}:{{ container_binary }}.new
-        docker exec {{ engine_container }} mv {{ container_binary }}.new {{ container_binary }}
+        docker cp {{ host_binary }} {{ engine_container }}:{{ container_binary }}.new && \
+        docker exec {{ engine_container }} mv {{ container_binary }}.new {{ container_binary }} && \
         docker exec {{ engine_container }} chmod +x {{ container_binary }}
       args:
         executable: /bin/bash
@@ -198,7 +227,7 @@
       ignore_errors: true
       changed_when: engine_inject is success
 
-    - name: Fallback — stop engine & docker cp
+    - name: Fallback — stop engine, docker cp, start
       when: engine_inject is failed
       block:
         - name: Stop engine container
@@ -206,12 +235,10 @@
             name: "{{ engine_container }}"
             state: stopped
 
-        - name: Copy binary into engine container layer
+        - name: Copy binary into stopped engine layer
           ansible.builtin.shell: |
-            CONTAINER_ID=$(docker ps -aq --filter name='^{{ engine_container }}$' | head -1)
-            if [ -n "$CONTAINER_ID" ]; then
-              docker cp {{ host_binary }} $CONTAINER_ID:{{ container_binary }}
-            fi
+            CID=$(docker ps -aq --filter name='^{{ engine_container }}$' | head -1)
+            if [ -n "$CID" ]; then docker cp {{ host_binary }} "$CID":{{ container_binary }}; fi
 
     - name: Restart engine container
       community.docker.docker_container:
