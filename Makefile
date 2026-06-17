@@ -735,6 +735,14 @@ sync-mongo-to-tailnet: ## Data > Sync only local Mongo → tailnet
 sync-redis-to-tailnet: ## Data > Sync only local Redis → tailnet
 	@$(MAKE) --no-print-directory sync-db-to-tailnet SYNC_TAG=redis
 
+deploy: build ## Deploy > Push local binary to prod gateway (+ engines with --tags engines)
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Deploying to production  $(R)"
+	@cd deploy && ansible-playbook playbooks/deploy-binary.yml $(ARGS)
+	@printf '%b\n' "$(BG)$(OK) Deploy complete$(R)"
+	@printf '%b\n' "$(D)  make deploy ARGS=--tags gateway   # gateway only (default)$(R)"
+	@printf '%b\n' "$(D)  make deploy ARGS=--tags engines   # engines only$(R)"
+	@printf '%b\n' "$(D)  make deploy ARGS=--tags build     # build on control (skip if pre-built)$(R)"
+
 # ----------------------------------------------------------------------------
 # Cross Compilation
 # ----------------------------------------------------------------------------
