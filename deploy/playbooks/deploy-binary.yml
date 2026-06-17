@@ -50,9 +50,8 @@
 
     - name: Build Docker image for target platform
       ansible.builtin.shell: |
-        docker buildx build \
+        docker build \
           --platform {{ hostvars[groups[target | default('ircfiber_gw')][0]].target_platform }} \
-          --load \
           -t {{ tag }} \
           -f {{ playbook_dir }}/../../Containerfile \
           {{ playbook_dir }}/../..
