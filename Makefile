@@ -738,23 +738,26 @@ sync-redis-to-tailnet: ## Data > Sync only local Redis → tailnet
 
 update: frontend ## Deploy > Build + inject on VPS via Tailscale Docker over SSH
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Building on VPS via Tailscale  $(R)"
-	@printf '%b\n' "$(D)  First build: 2-5 min (downloading deps)$(R)"
-	@printf '%b\n' "$(D)  Subsequent: 10-30s (incremental dub build via cache mount)$(R)"
+	@printf '%b\n' "$(D)  Build: 5-30s (incremental dub via cache mount)$(R)"
 	@bash -c '\
 		CTX="vps"; \
 		SOCK="ssh://deploy@ircfiber-prod-1.tail544547.ts.net"; \
 		docker context create $$CTX --docker "host=$$SOCK" 2>/dev/null || true; \
-		printf "%b\n" "$(C)=== Building D backend on VPS ===$(R)"; \
+		printf "%b\n" "$(C)=== Building on VPS ===$(R)"; \
 		docker -c $$CTX build --target builder -t ircfiber-builder:latest -f Containerfile . 2>&1; \
-		printf "%b\n" "$(C)=== Copying binary from builder to container ===$(R)"; \
-		CID=$$(docker -c $$CTX create ircfiber-builder:latest); \
-		docker -c $$CTX cp "$$CID:/build/irc-fiber" ircfiber-gateway:/app/irc-fiber; \
-		docker -c $$CTX cp "$$CID:/build/irc-fiber-engine" ircfiber-engine-localengine:/app/irc-fiber-engine 2>/dev/null || true; \
-		docker -c $$CTX rm "$$CID" >/dev/null 2>&1; \
-		printf "%b\n" "$(C)=== Restarting gateway ===$(R)"; \
+		printf "%b\n" "$(C)=== Extracting binary from builder ===$(R)"; \
+		TMP=$$(docker -c $$CTX run -d --entrypoint sh ircfiber-builder:latest); \
+		docker -c $$CTX cp "$$TMP:/build/irc-fiber" /tmp/irc-fiber; \
+		docker -c $$CTX cp "$$TMP:/build/irc-fiber-engine" /tmp/irc-fiber-engine 2>/dev/null || true; \
+		docker -c $$CTX rm -f "$$TMP" >/dev/null 2>&1; \
+		printf "%b\n" "$(C)=== Injecting into containers ===$(R)"; \
+		docker -c $$CTX cp /tmp/irc-fiber ircfiber-gateway:/app/irc-fiber; \
+		docker -c $$CTX cp /tmp/irc-fiber-engine ircfiber-engine-localengine:/app/irc-fiber-engine 2>/dev/null || true; \
+		docker -c $$CTX exec ircfiber-gateway chmod +x /app/irc-fiber; \
 		docker -c $$CTX restart ircfiber-gateway 2>/dev/null; \
-		sleep 2; \
+		sleep 1; \
 		docker -c $$CTX restart ircfiber-engine-localengine 2>/dev/null || true; \
+		rm -f /tmp/irc-fiber /tmp/irc-fiber-engine; \
 		printf "%b\n" "$(BG)$(OK) Deploy complete$(R)"; \
 	'
 
