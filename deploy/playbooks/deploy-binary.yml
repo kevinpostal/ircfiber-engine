@@ -64,14 +64,37 @@
           - "--exclude=frontend/node_modules"
           - "--exclude=public/dist"
 
+    - name: Clean stale dub locks from previous aborted builds
+      ansible.builtin.file:
+        path: "{{ src_root }}/.dub"
+        state: absent
+      ignore_errors: true
+      tags: build
+
     - name: Build D backend (dub build --build=release — static link D runtime)
-      ansible.builtin.command:
-        cmd: dub build --build=release --force --parallel
+      ansible.builtin.shell: |
+        killall -9 dub ldc2 2>/dev/null || true
+        dub build --build=release --force --parallel 2>&1
+      args:
         chdir: "{{ src_root }}"
+        executable: /bin/bash
       register: dub_out
       changed_when: "'Linking' in dub_out.stdout"
       environment:
         HOME: /root
+      timeout: 600
+
+    - name: Build D engine (dub build --config=engine --build=release)
+      ansible.builtin.shell: |
+        dub build --config=engine --build=release --force --parallel 2>&1
+      args:
+        chdir: "{{ src_root }}"
+        executable: /bin/bash
+      register: eng_out
+      changed_when: "'Linking' in eng_out.stdout"
+      environment:
+        HOME: /root
+      timeout: 600
 
     - name: Build frontend (npm ci && npm run build)
       ansible.builtin.command:
@@ -82,6 +105,7 @@
         - npm run build
       register: npm_out
       changed_when: "'built in' in npm_out.stdout"
+      timeout: 120
 
 - name: Push gateway binary & roll-restart
   hosts: ircfiber_gw
@@ -97,6 +121,12 @@
     host_binary_prev: "{{ host_binary_dir }}/irc-fiber.prev"
     container_binary: /app/irc-fiber
   tasks:
+    - name: Stop stuck container (may be in restart loop from previous failed deploy)
+      community.docker.docker_container:
+        name: "{{ container_name }}"
+        state: stopped
+      ignore_errors: true
+
     - name: Ensure binary directory exists on target
       ansible.builtin.file:
         path: "{{ host_binary_dir }}"
