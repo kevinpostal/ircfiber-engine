@@ -51,7 +51,6 @@
           - "--exclude=irc-fiber-engine"
           - "--exclude=frontend/node_modules"
           - "--exclude=public/dist"
-      delegate_to: "{{ ansible_host }}"
 
     - name: Build D backend (dub build --force)
       ansible.builtin.command:
