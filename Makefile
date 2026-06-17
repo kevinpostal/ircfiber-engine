@@ -746,17 +746,15 @@ update: frontend ## Deploy > Build + inject on VPS via Tailscale Docker over SSH
 		docker context create $$CTX --docker "host=$$SOCK" 2>/dev/null || true; \
 		printf "%b\n" "$(C)=== Building D backend on VPS ===$(R)"; \
 		docker -c $$CTX build --target builder -t ircfiber-builder:latest -f Containerfile . 2>&1; \
-		printf "%b\n" "$(C)=== Extracting binary ===$(R)"; \
+		printf "%b\n" "$(C)=== Copying binary from builder to container ===$(R)"; \
 		CID=$$(docker -c $$CTX create ircfiber-builder:latest); \
-		mkdir -p /opt/ircfiber/bin; \
-		docker -c $$CTX cp "$$CID:/build/irc-fiber" /opt/ircfiber/bin/irc-fiber; \
-		docker -c $$CTX cp "$$CID:/build/irc-fiber-engine" /opt/ircfiber/bin/irc-fiber-engine 2>/dev/null || true; \
+		docker -c $$CTX cp "$$CID:/build/irc-fiber" ircfiber-gateway:/app/irc-fiber; \
+		docker -c $$CTX cp "$$CID:/build/irc-fiber-engine" ircfiber-engine-localengine:/app/irc-fiber-engine 2>/dev/null || true; \
 		docker -c $$CTX rm "$$CID" >/dev/null 2>&1; \
-		docker -c $$CTX cp /opt/ircfiber/bin/irc-fiber ircfiber-gateway:/app/irc-fiber; \
 		printf "%b\n" "$(C)=== Restarting gateway ===$(R)"; \
-		docker -c $$CTX stop ircfiber-gateway 2>/dev/null; \
-		sleep 1; \
-		docker -c $$CTX start ircfiber-gateway; \
+		docker -c $$CTX restart ircfiber-gateway 2>/dev/null; \
+		sleep 2; \
+		docker -c $$CTX restart ircfiber-engine-localengine 2>/dev/null || true; \
 		printf "%b\n" "$(BG)$(OK) Deploy complete$(R)"; \
 	'
 
