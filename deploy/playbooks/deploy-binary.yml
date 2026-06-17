@@ -1,145 +1,150 @@
 ---
-# Build Docker image locally (cross-compile for target arch), push to server,
-# restart containers.  Leverages Docker layer caching — LDC installation is
-# cached, only the `dub build` step re-runs on source changes.
+# Lightweight deploy using the target's Docker daemon for builds.
+#
+# Instead of compiling natively (requires LDC installed on host, was slow)
+# or cross-compiling locally (QEMU emulation, was very slow), this
+# approach rsyncs source to the target and builds INSIDE Docker using the
+# Containerfile builder stage — the LDC installation layer is **cached**
+# across deploys, only the `dub build` layer re-runs on source changes.
+#
+# Then the binary is extracted from the builder stage via `docker cp`,
+# injected into the running container, and the container is restarted.
+# No registry push/pull, no multi-architecture emulation.
 #
 # Usage:
-#   make update
+#   make update                           # gateway + frontend
+#   make update ARGS="--tags engines"     # engines too
+#   make update ARGS="--tags build"       # source sync + build only
 #
-# How it works:
-#   1. Detect target server's OS/arch via ansible
-#   2. docker buildx build --platform=linux/amd64 locally (Colima)
-#   3. docker save → gzip → copy to target → docker load
-#   4. Restart containers (no registry needed)
+# Rollback:
+#   Previous binary saved as /opt/ircfiber/bin/irc-fiber.prev
+#   docker cp irc-fiber.prev ircfiber-gateway:/app/irc-fiber
+#   docker restart ircfiber-gateway
 
-- name: Detect target architecture
+- name: Sync source to target
   hosts: "{{ target | default('ircfiber_gw') }}"
   become: true
   gather_facts: true
   tags:
-    - detect
-  tasks:
-    - name: Show target platform
-      ansible.builtin.debug:
-        msg: "Target: {{ ansible_system }} {{ ansible_architecture }}"
-
-    - name: Set platform fact for Docker buildx
-      ansible.builtin.set_fact:
-        target_platform: "{{ 'linux/amd64' if ansible_architecture == 'x86_64' else 'linux/arm64' }}"
-
-- name: Build Docker image locally (cross-compile for target)
-  hosts: localhost
-  connection: local
-  gather_facts: false
-  tags:
     - build
+    - always
   vars:
-    tag: "ircfiber:deploy"
-    image_path: "/tmp/ircfiber-image.tar.gz"
+    src_root: /opt/ircfiber-src
   tasks:
-    - name: Ensure Docker is running (check Colima)
-      ansible.builtin.command: docker info
-      register: docker_ok
-      changed_when: false
-      failed_when: false
+    - name: Ensure source directory exists
+      ansible.builtin.file:
+        path: "{{ src_root }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0777"
 
-    - name: Fail if Docker is not running
-      ansible.builtin.fail:
-        msg: "Docker is not running. Start it: colima start"
-      when: docker_ok.rc != 0
+    - name: Sync local source tree (rsync over SSH)
+      become: false
+      ansible.posix.synchronize:
+        src: "{{ playbook_dir }}/../../"
+        dest: "{{ src_root }}"
+        delete: true
+        rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=node_modules"
+          - "--exclude=.dub"
+          - "--exclude=*.o"
+          - "--exclude=irc-fiber"
+          - "--exclude=irc-fiber-engine"
+          - "--exclude=frontend/node_modules"
+          - "--exclude=public/dist"
 
-    - name: Build Docker image for target platform
-      ansible.builtin.shell: |
-        docker build \
-          --platform {{ hostvars[groups[target | default('ircfiber_gw')][0]].target_platform }} \
-          -t {{ tag }} \
-          -f {{ playbook_dir }}/../../Containerfile \
-          {{ playbook_dir }}/../..
-      args:
-        executable: /bin/bash
-      register: build_out
-      changed_when: true
-      timeout: 600
-
-    - name: Save image to tarball (docker save + gzip)
-      ansible.builtin.shell: |
-        docker save {{ tag }} | gzip > {{ image_path }}
-      args:
-        executable: /bin/bash
-      register: save_out
-      changed_when: true
-
-    - name: Get image file size
-      ansible.builtin.stat:
-        path: "{{ image_path }}"
-      register: img_stat
-
-    - name: Show image size
-      ansible.builtin.debug:
-        msg: "Image size: {{ (img_stat.stat.size / 1024 / 1024) | round(1) }} MB"
-
-- name: Copy image to target, load & restart gateway
+- name: Build inside Docker (cached LDC layer) + inject into gateway container
   hosts: ircfiber_gw
   become: true
   gather_facts: false
   tags:
+    - build
     - gateway
   vars:
+    src_root: /opt/ircfiber-src
+    host_binary_dir: /opt/ircfiber/bin
+    host_binary: "{{ host_binary_dir }}/irc-fiber"
+    host_binary_prev: "{{ host_binary_dir }}/irc-fiber.prev"
+    container_binary: /app/irc-fiber
     container_name: "{{ gateway_container_name | default('ircfiber-gateway') }}"
-    tag: "ircfiber:deploy"
-    image_path: "/tmp/ircfiber-image.tar.gz"
   tasks:
-    - name: Copy Docker image tarball to target
-      ansible.builtin.copy:
-        src: "{{ image_path }}"
-        dest: /tmp/ircfiber-image.tar.gz
-        mode: "0644"
+    - name: Ensure binary directory exists
+      ansible.builtin.file:
+        path: "{{ host_binary_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
 
-    - name: Load image into target Docker daemon
+    - name: Save current binary as .prev (one-bounce rollback)
+      ansible.builtin.copy:
+        src: "{{ host_binary }}"
+        dest: "{{ host_binary_prev }}"
+        remote_src: true
+        mode: "0755"
+      ignore_errors: true
+
+    - name: Build D backend inside Docker (cached LDC layer)
       ansible.builtin.shell: |
-        docker load < /tmp/ircfiber-image.tar.gz
+        cd {{ src_root }}
+        # Build only the gateway binary from the Containerfile builder stage
+        docker build \
+          --target builder \
+          -t ircfiber-builder \
+          -f Containerfile \
+          .
+        # Extract the binary from the builder image
+        CONTAINER_ID=$(docker create ircfiber-builder)
+        docker cp "$CONTAINER_ID":/build/irc-fiber {{ host_binary }}
+        docker rm "$CONTAINER_ID" >/dev/null 2>&1 || true
       args:
         executable: /bin/bash
-      register: load_out
-      changed_when: "'Loaded image' in load_out.stdout"
+      register: build_out
+      changed_when: "'Successfully built' in build_out.stdout"
+      timeout: 600
 
-    - name: Tag loaded image with consistent name
+    - name: Build frontend (npm ci && npm run build)
+      ansible.builtin.command:
+        cmd: "{{ item }}"
+        chdir: "{{ src_root }}/frontend"
+      loop:
+        - npm ci
+        - npm run build
+      register: npm_out
+      changed_when: "'built in' in npm_out.stdout"
+      timeout: 120
+
+    - name: Inject binary into running container
       ansible.builtin.shell: |
-        docker tag {{ tag }} {{ tag }} 2>/dev/null || true
+        docker cp {{ host_binary }} {{ container_name }}:{{ container_binary }}.new && \
+        docker exec {{ container_name }} mv {{ container_binary }}.new {{ container_binary }} && \
+        docker exec {{ container_name }} chmod +x {{ container_binary }}
+      args:
+        executable: /bin/bash
+      register: inject
+      ignore_errors: true
+      changed_when: inject is success
 
-    - name: Stop running container (may be in restart loop)
+    - name: Stop container (if inject failed — stuck in restart loop)
+      when: inject is failed
       community.docker.docker_container:
         name: "{{ container_name }}"
         state: stopped
       ignore_errors: true
 
-    - name: Recreate gateway container with new image
+    - name: Inject via docker cp after stop (fallback)
+      when: inject is failed
+      ansible.builtin.shell: |
+        CID=$(docker ps -aq --filter name='^{{ container_name }}$' | head -1)
+        if [ -n "$CID" ]; then docker cp {{ host_binary }} "$CID":{{ container_binary }}; fi
+
+    - name: Restart gateway container
       community.docker.docker_container:
         name: "{{ container_name }}"
-        image: "{{ tag }}"
         state: started
-        restart_policy: unless-stopped
-        command: ["/app/irc-fiber"]
-        networks:
-          - name: "{{ docker_ircfiber_network | default('ircfiber-net') }}"
-        networks_cli_compatible: true
-        env_file: /etc/ircfiber/gateway/env
-        volumes:
-          - "{{ gateway_uploads_volume | default('ircfiber-uploads') }}:/app/uploads"
-          - "{{ gateway_logs_volume | default('ircfiber-logs') }}:/var/log/irc-fiber"
-        security_opts:
-          - "no-new-privileges:true"
-        ulimits:
-          - "nofile:65536:65536"
-        healthcheck:
-          test: ["CMD", "curl", "-fsS", "http://localhost:{{ gateway_http_port | default(8090) }}/health"]
-          interval: 30s
-          timeout: 10s
-          retries: 3
-          start_period: 40s
-        labels:
-          com.ircfiber.component: "gateway"
-      register: gw_create
+        restart: true
 
     - name: Wait for gateway health endpoint
       ansible.builtin.uri:
@@ -151,7 +156,7 @@
       until: health.status in [200, 404]
       ignore_errors: true
 
-- name: Restart engine container
+- name: Build engine binary & inject (serial: 1)
   hosts: ircfiber_engines
   become: true
   serial: 1
@@ -159,50 +164,76 @@
   tags:
     - engines
   vars:
+    src_root: /opt/ircfiber-src
+    host_binary_dir: /opt/ircfiber/bin
+    host_binary: "{{ host_binary_dir }}/irc-fiber-engine"
+    host_binary_prev: "{{ host_binary_dir }}/irc-fiber-engine.prev"
+    container_binary: /app/irc-fiber-engine
     container_name: "{{ 'ircfiber-engine-' ~ ircfiber_engine_id }}"
-    image_path: "/tmp/ircfiber-image.tar.gz"
   tasks:
-    - name: Check image tarball exists
-      ansible.builtin.stat:
-        path: /tmp/ircfiber-image.tar.gz
-      register: img_file
+    - name: Ensure binary directory exists
+      ansible.builtin.file:
+        path: "{{ host_binary_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
 
-    - name: Load image into Docker daemon (if not already)
-      when: img_file.stat.exists
+    - name: Save current engine binary as .prev
+      ansible.builtin.copy:
+        src: "{{ host_binary }}"
+        dest: "{{ host_binary_prev }}"
+        remote_src: true
+        mode: "0755"
+      ignore_errors: true
+
+    - name: Build engine binary via Docker builder stage
       ansible.builtin.shell: |
-        docker load < /tmp/ircfiber-image.tar.gz
+        cd {{ src_root }}
+        docker build \
+          --target builder \
+          -t ircfiber-builder \
+          -f Containerfile \
+          .
+        CONTAINER_ID=$(docker create ircfiber-builder)
+        docker cp "$CONTAINER_ID":/build/irc-fiber-engine {{ host_binary }}
+        docker rm "$CONTAINER_ID" >/dev/null 2>&1 || true
       args:
         executable: /bin/bash
-      register: load_out
-      changed_when: "'Loaded image' in load_out.stdout"
+      register: build_out
+      changed_when: "'Successfully built' in build_out.stdout"
+      timeout: 600
 
-    - name: Stop engine container
+    - name: Inject engine binary
+      ansible.builtin.shell: |
+        docker cp {{ host_binary }} {{ container_name }}:{{ container_binary }}.new && \
+        docker exec {{ container_name }} mv {{ container_binary }}.new {{ container_binary }} && \
+        docker exec {{ container_name }} chmod +x {{ container_binary }}
+      args:
+        executable: /bin/bash
+      register: inject
+      ignore_errors: true
+      changed_when: inject is success
+
+    - name: Stop engine (fallback for restart loop)
+      when: inject is failed
       community.docker.docker_container:
         name: "{{ container_name }}"
         state: stopped
       ignore_errors: true
 
-    - name: Recreate engine container
+    - name: Inject via docker cp after stop (fallback)
+      when: inject is failed
+      ansible.builtin.shell: |
+        CID=$(docker ps -aq --filter name='^{{ container_name }}$' | head -1)
+        if [ -n "$CID" ]; then docker cp {{ host_binary }} "$CID":{{ container_binary }}; fi
+
+    - name: Restart engine container
       community.docker.docker_container:
         name: "{{ container_name }}"
-        image: "{{ tag }}"
         state: started
-        command: ["/app/irc-fiber-engine"]
-        env_file: /etc/ircfiber/engine/env
-      register: eng_create
+        restart: true
 
     - name: Cooldown — let engine re-register before next host
       ansible.builtin.pause:
         seconds: 15
-
-- name: Clean up local image tarball
-  hosts: localhost
-  connection: local
-  gather_facts: false
-  tags:
-    - cleanup
-  tasks:
-    - name: Remove local image tarball
-      ansible.builtin.file:
-        path: /tmp/ircfiber-image.tar.gz
-        state: absent
