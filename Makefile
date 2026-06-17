@@ -89,6 +89,7 @@ AR := →
 .PHONY: cross-linux-x64 cross-linux-arm64 cross-linux-armv7
 .PHONY: verify precommit ci install-env
 .PHONY: sync-db-to-tailnet sync-mongo-to-tailnet sync-redis-to-tailnet
+.PHONY: deploy update
 
 # ----------------------------------------------------------------------------
 # Main Build Targets

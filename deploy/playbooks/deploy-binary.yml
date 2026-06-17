@@ -1,71 +1,57 @@
 ---
 # IRCCloud-style "build on metal, bounce process" — lightest possible deploy.
 #
-# Clones/pulls the repo on the target machine, builds the D binary natively
-# (no Docker build-stage overhead), copies it into the running container,
-# and restarts.  The Docker multi-stage build (Containerfile) installs LDC
-# from scratch every time — this playbook skips all of that by building
-# on the bare host where LDC can be cached between deploys.
+# Syncs the local source tree to the target machine (uses the same
+# ircfiber_repo_root variable as the Docker image build), compiles the
+# D binary natively on the target, copies it into the running container,
+# and restarts.  Avoids the Docker multi-stage build (which installs LDC
+# from scratch every time).
 #
 # Usage:
-#   ansible-playbook playbooks/deploy-binary.yml
-#
-# Tags:
-#   --tags gateway   # gateway only (default)
-#   --tags engines   # engines one-at-a-time with cooldown
+#   make update
+#   make update ARGS="--tags gateway --tags engines"   # include engines
 #
 # Prerequisites (target):
-#   - ldc2 + dub installed (via package manager — cached across builds)
+#   - ldc2 + dub installed (cached across builds)
 #   - Node.js + npm installed (for frontend build)
-#   - Docker running
-#   - Containers named ircfiber-gateway / ircfiber-engine-*
+#   - Docker running, container name ircfiber-gateway
 #
 # Rollback:
-#   The previous binary is saved as <name>.prev on the host.
-#   docker cp <name>.prev <container>:/app/<name> && docker restart <container>
+#   docker cp /opt/ircfiber/bin/irc-fiber.prev ircfiber-gateway:/app/irc-fiber
+#   docker restart ircfiber-gateway
 
-- name: Build D backend + frontend on the target machine
+- name: Sync source to target & build
   hosts: "{{ target | default('ircfiber_gw') }}"
-  become: true
   gather_facts: true
   tags:
     - build
     - always
   vars:
     src_root: /opt/ircfiber-src
-    repo_url: "{{ ircfiber_repo_url | default('https://github.com/ircfiber/irc-fiber.git') }}"
-    repo_branch: "{{ ircfiber_repo_branch | default('main') }}"
   tasks:
-    - name: Ensure build dependencies are present
-      ansible.builtin.package:
-        name:
-          - ldc
-          - dub
-          - nodejs
-          - npm
-          - git
-          - curl
-          - libssl-dev
-          - zlib1g-dev
-          - pkg-config
-        state: present
-      when: ansible_pkg_mgr != 'unknown'
-
-    - name: Ensure source directory exists
+    - name: Ensure source directory exists on target
       ansible.builtin.file:
         path: "{{ src_root }}"
         state: directory
-        owner: root
-        group: root
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
         mode: "0755"
 
-    - name: Clone or pull latest source
-      ansible.builtin.git:
-        repo: "{{ repo_url }}"
+    - name: Sync local source tree to target (rsync over SSH)
+      ansible.posix.synchronize:
+        src: "{{ playbook_dir }}/../../"
         dest: "{{ src_root }}"
-        version: "{{ repo_branch }}"
-        force: true
-        update: true
+        delete: true
+        rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=node_modules"
+          - "--exclude=.dub"
+          - "--exclude=*.o"
+          - "--exclude=irc-fiber"
+          - "--exclude=irc-fiber-engine"
+          - "--exclude=frontend/node_modules"
+          - "--exclude=public/dist"
+      delegate_to: "{{ ansible_host }}"
 
     - name: Build D backend (dub build --force)
       ansible.builtin.command:
@@ -108,7 +94,7 @@
         group: root
         mode: "0755"
 
-    - name: Save current running binary as .prev (one-bounce rollback)
+    - name: Save current binary as .prev (one-bounce rollback)
       ansible.builtin.copy:
         src: "{{ host_binary }}"
         dest: "{{ host_binary_prev }}"
@@ -134,7 +120,7 @@
       ignore_errors: true
       changed_when: inject is success
 
-    - name: Fallback — stop container, docker cp, start
+    - name: Fallback — stop container, docker cp, restart
       when: inject is failed
       block:
         - name: Stop gateway container
@@ -142,12 +128,10 @@
             name: "{{ container_name }}"
             state: stopped
 
-        - name: Copy binary into stopped container layer
+        - name: Copy binary into container
           ansible.builtin.shell: |
             CID=$(docker ps -aq --filter name='^{{ container_name }}$' | head -1)
             if [ -n "$CID" ]; then docker cp {{ host_binary }} "$CID":{{ container_binary }}; fi
-          args:
-            executable: /bin/bash
 
     - name: Restart gateway container
       community.docker.docker_container:
@@ -185,11 +169,11 @@
         path: "{{ src_root }}/irc-fiber-engine"
       register: engine_src
 
-    - name: Skip — no engine binary in build output
+    - name: Skip — no engine binary found
       ansible.builtin.meta: end_host
       when: not engine_src.stat.exists
 
-    - name: Ensure binary directory exists on target
+    - name: Ensure binary directory exists
       ansible.builtin.file:
         path: "{{ host_binary_dir }}"
         state: directory
@@ -212,7 +196,7 @@
         remote_src: true
         mode: "0755"
 
-    - name: Resolve engine container name for this host
+    - name: Resolve engine container name
       ansible.builtin.set_fact:
         engine_container: "{{ 'ircfiber-engine-' ~ ircfiber_engine_id }}"
 
@@ -227,7 +211,7 @@
       ignore_errors: true
       changed_when: engine_inject is success
 
-    - name: Fallback — stop engine, docker cp, start
+    - name: Fallback — stop engine, docker cp, restart
       when: engine_inject is failed
       block:
         - name: Stop engine container
@@ -235,7 +219,7 @@
             name: "{{ engine_container }}"
             state: stopped
 
-        - name: Copy binary into stopped engine layer
+        - name: Copy binary into engine container
           ansible.builtin.shell: |
             CID=$(docker ps -aq --filter name='^{{ engine_container }}$' | head -1)
             if [ -n "$CID" ]; then docker cp {{ host_binary }} "$CID":{{ container_binary }}; fi
