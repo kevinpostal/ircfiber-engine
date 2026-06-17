@@ -64,9 +64,9 @@
           - "--exclude=frontend/node_modules"
           - "--exclude=public/dist"
 
-    - name: Build D backend (dub build --force)
+    - name: Build D backend (dub build --build=release — static link D runtime)
       ansible.builtin.command:
-        cmd: dub build --force
+        cmd: dub build --build=release --force --parallel
         chdir: "{{ src_root }}"
       register: dub_out
       changed_when: "'Linking' in dub_out.stdout"
