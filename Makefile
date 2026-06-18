@@ -1064,12 +1064,12 @@ _vault_arg = $(if $(VAULT_PASS_FILE),--vault-password-file $(VAULT_PASS_FILE),--
 _target     = $(or $(TARGET),ircfiber-prod-1)
 _playbook   = cd deploy && ansible-playbook -l $(_target) $(_vault_arg)
 
-# Fast hot path: rsync source → server, dub build in persistent builder
-# container, extract binary, inject into running gateway + engine.
-# No full image rebuild, no DB restart. ~5-15s after warm cache.
-update: ## Deploy > Fast incremental binary deploy (rsync + BuildKit + inject)
+# Fast hot path: rsync source → persistent builder container with named
+# dub cache volume. Only changed .d files recompile. LDC stays in the
+# builder image (no re-download). ~5-15s after warm dub cache.
+update: ## Deploy > Fast incremental deploy (persistent builder + dub cache)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Incremental deploy → $(_target)  $(R)"
-	@$(_playbook) playbooks/deploy-binary.yml
+	@$(_playbook) playbooks/deploy-update.yml
 
 # Alias: fast path is the default
 update-fast: update ## Deploy > Force hot path (same as `make update`)
@@ -1095,10 +1095,11 @@ update-status: ## Deploy > Show running containers & image versions
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Deploy status → $(_target)  $(R)"
 	@$(_playbook) playbooks/status.yml
 
-# Nuke the builder cache on the target (forces cold path next update).
-update-clean: ## Deploy > Nuke builder cache on target (forces cold rebuild)
+# Nuke BuildKit cache + builder image on the target.
+# Forces cold rebuild: full dub download + compile next update.
+update-clean: ## Deploy > Nuke BuildKit cache + builder image on target
 	@printf '\n%b\n' "$(_BY)$(K)$(B)  Cleaning builder cache → $(_target)  $(R)"
-	@ssh deploy@$(_target) 'docker rm -f ircfiber-builder 2>/dev/null; docker volume rm ircfiber_dub_cache 2>/dev/null; echo "Builder cache cleared"'
+	@ssh deploy@$(_target) 'docker rmi ircfiber-builder:latest 2>/dev/null; docker builder prune --force 2>/dev/null; echo "Builder cache cleared"'
 
 # ----------------------------------------------------------------------------
 # Cross Compilation
