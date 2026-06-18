@@ -76,8 +76,21 @@ AR := →
 # Phony Targets
 # ----------------------------------------------------------------------------
 # Phony targets (grouped by category)
-.PHONY: all help build build-engine build-release build-debug build-ldc2 frontend frontend-dev frontend-install
-.PHONY: start run run-tailnet run-local run-gateway run-engine up down restart-web logs-web logs-engine watch-web
+.PHONY: all help
+.PHONY: build build-engine build-release build-debug build-ldc2 frontend frontend-dev frontend-install
+
+# Component Workflows (primary user-facing targets)
+.PHONY: dev dev-live debug debug-live stop
+.PHONY: engine engine-rebuild engine-restart engine-test
+.PHONY: gateway gateway-rebuild gateway-restart
+.PHONY: status logs logs-engine logs-gateway logs-supervisor crash-logs
+.PHONY: watch watch-engine watch-gateway
+
+# Deprecated aliases (kept for back-compat — see ALIASES section at bottom)
+.PHONY: start run run-tailnet run-local run-gateway run-engine
+.PHONY: up down down-tailnet restart-web restart-engine-tailnet
+.PHONY: logs-web logs-engine-tailnet watch-web
+
 .PHONY: test test-frontend test-all test-watch test-coverage test-lib test-client clean fmt fmt-check lint deps-check
 .PHONY: dscanner-install dscanner-all dscanner-syntax dscanner-lint dscanner-unused \
         dscanner-complexity dscanner-imports dscanner-fix dscanner-size dscanner-outline
@@ -89,6 +102,434 @@ AR := →
 .PHONY: cross-linux-x64 cross-linux-arm64 cross-linux-armv7
 .PHONY: verify precommit ci install-env
 .PHONY: sync-db-to-tailnet sync-mongo-to-tailnet sync-redis-to-tailnet
+
+# ----------------------------------------------------------------------------
+# Component Workflows
+# ----------------------------------------------------------------------------
+# Pick ONE primary workflow. Compose with the component operations below.
+#
+# USE-CASE MATRIX
+# ──────────────────────────────────────────────────────────────────────────
+# I want to…                           Command              What runs
+# ──────────────────────────────────────────────────────────────────────────
+# Change Svelte / CSS / HTML only      make dev             Vite (HMR), Vite → local gateway
+#   (no local D backend)               make dev-live        Vite (HMR), Vite → tailnet gateway
+# Change gateway D code                make debug           Gateway + engine (supervised), local DBs
+# Change engine D code                 make debug           Same; then `make engine-rebuild && make engine-restart`
+#                                       make watch-engine    Same but auto-rebuilds on save
+# Debug gateway/engine against LIVE    make debug-live      Gateway + supervised engine → tailnet DBs
+#   (prod-shaped data)
+# Run D unit tests                     make test            dub test (gateway+engine shared modules)
+#                                       make engine-test     same — engine reuses shared modules
+# Watch the engine and auto-rebuild    make watch-engine    supervisor picks up new binary on save
+# Tail logs                            make logs            all in parallel
+#                                       make logs-engine     engine only
+#                                       make logs-gateway    gateway only
+#                                       make logs-supervisor supervisor only (crashes + restarts)
+# Stop everything                      make stop            kills supervisor + gateway, leaves Vite alone
+# ──────────────────────────────────────────────────────────────────────────
+#
+# COMPOSITION
+#   Terminal 1: make debug-live
+#   Terminal 2: make dev             (HMR against the local gateway from terminal 1)
+#   Terminal 3: make logs            (live tail)
+#   Make a change to source/*.d → engine auto-rebuilds and supervisor restarts.
+#   Make a change to frontend/src/*.svelte → Vite hot-reloads instantly.
+#
+# BACKEND (for `make dev` / `make dev-live`)
+#   make dev BACKEND=local  (default; expects local gateway on :8090)
+#   make dev BACKEND=tailnet
+#   make dev BACKEND=http://my-gateway:8090
+#
+# TAILNET OVERRIDES
+#   make debug-live IRCFIBER_SERVER_ID=mybox   (set a unique engine id)
+# ──────────────────────────────────────────────────────────────────────────
+
+# Default backend for `make dev` / `make dev-live`
+BACKEND ?= local
+VITE_BACKEND_URL ?= https://ircfiber-prod-1.tail544547.ts.net
+
+ifeq ($(BACKEND),tailnet)
+  EFFECTIVE_BACKEND_URL := https://ircfiber-prod-1.tail544547.ts.net
+else ifeq ($(BACKEND),local)
+  EFFECTIVE_BACKEND_URL := http://127.0.0.1:8090
+else
+  EFFECTIVE_BACKEND_URL := $(BACKEND)
+endif
+
+# Tailnet connection settings (used by debug-live)
+TAILNET_MONGO_URL ?= mongodb://ircfiber:MongoAppPass2026@100.107.178.48:27017/ircfiber
+TAILNET_REDIS_URL ?= redis://100.107.178.48:6379/0
+
+# Local docker connection settings (used by debug)
+LOCAL_MONGO_URL ?= mongodb://127.0.0.1:27017/ircfiber
+LOCAL_REDIS_URL ?= redis://127.0.0.1:6379/0
+
+# Shared paths for supervisor / logs / pidfiles / crash dumps (relative to project root — avoids space issues)
+ENGINE_BIN          := ./irc-fiber-engine
+GATEWAY_BIN         := ./irc-fiber
+SUPERVISOR_SCRIPT   := ./scripts/irc-fiber-engine-supervisor.sh
+ENGINE_LOGFILE      := /tmp/irc-fiber-engine.log
+GATEWAY_LOGFILE     := /tmp/irc-fiber.log
+SUPERVISOR_LOGFILE  := /tmp/irc-fiber-engine.supervisor.log
+SUPERVISOR_PIDFILE  := /tmp/irc-fiber-engine-supervisor.pid
+ENGINE_PIDFILE      := /tmp/irc-fiber-engine.pid
+GATEWAY_PIDFILE     := /tmp/irc-fiber.pid
+CRASH_DIR           := $(HOME)/.ircfiber/crashes/
+
+
+# ─── PRIMARY WORKFLOWS ──────────────────────────────────────────────────────
+
+# Frontend-only dev (Vite). Pairs with `debug` or `debug-live` for a gateway.
+dev: frontend-install ## Component > Frontend dev (Vite HMR) — pairs with `make debug*` for backend
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Frontend dev (Vite)  $(R)"
+	@printf '%b\n' "$(D)Backend: $(BACKEND)  →  $(EFFECTIVE_BACKEND_URL)$(R)"
+	@printf '%b\n' "$(D)Open http://localhost:5173 when ready$(R)"
+	@printf '%b\n' "$(D)Pair with: make debug  or  make debug-live  (in another terminal)$(R)"
+	@cd frontend && VITE_BACKEND_URL=$(EFFECTIVE_BACKEND_URL) npm run dev
+
+# Frontend dev pointing at the tailnet gateway (no local D backend at all).
+dev-live: ## Component > Frontend dev (Vite) against the TAILNET gateway
+	@$(MAKE) --no-print-directory dev BACKEND=tailnet
+
+# Full local stack — gateway + supervised engine, both against local docker DBs.
+# For when you're editing the D code and want a clean local environment.
+# Runs in the FOREGROUND — supervisor stays backgrounded for engine auto-restart,
+# gateway runs in this terminal. ctrl-c cleanly tears down both. Run
+# `make logs` in another terminal for live tailing.
+debug: build build-engine ## Component > Full stack: gateway + engine (supervised), local docker DBs — ctrl-c to stop
+	@$(_docker_setup)
+	@bash -c 'set -u; \
+		printf "\n%b\n" "$(_BCn)$(K)$(B)  Engine (supervised) → local docker  $(R)"; \
+		rm -f "$(GATEWAY_PIDFILE)" "$(SUPERVISOR_PIDFILE)" "$(ENGINE_PIDFILE)"; \
+		: > "$(SUPERVISOR_LOGFILE)"; \
+		: > "$(GATEWAY_LOGFILE)"; \
+		IRCFIBER_MONGO_URL="$(LOCAL_MONGO_URL)" IRCFIBER_REDIS_URL="$(LOCAL_REDIS_URL)" \
+			IRCFIBER_SERVER_ID="$${IRCFIBER_SERVER_ID:-localengine}" \
+			IRCFIBER_BIND_ADDRESS="$${IRCFIBER_BIND_ADDRESS:-127.0.0.1}" \
+			ENGINE_PIDFILE="$(ENGINE_PIDFILE)" \
+			ENGINE_LOGFILE="$(ENGINE_LOGFILE)" \
+			SUPERVISOR_LOGFILE="$(SUPERVISOR_LOGFILE)" \
+			SUPERVISOR_PIDFILE="$(SUPERVISOR_PIDFILE)" \
+			CRASH_DIR="$(CRASH_DIR)" \
+			"$(SUPERVISOR_SCRIPT)" > /tmp/irc-fiber-engine.supervisor.out 2>&1 & \
+		SUP_PID=$$!; echo $$SUP_PID > "$(SUPERVISOR_PIDFILE)"; \
+		printf "%b\n" "$(C)$(AR) engine supervisor pid=$$SUP_PID (auto-restarts on crash)$(R)"; \
+		sleep 3; \
+		printf "\n%b\n" "$(_BCn)$(K)$(B)  Gateway → local docker  $(R)"; \
+		printf "%b\n" "$(Y)$(WR) ctrl-c to stop everything  •  tail logs:  make logs  in another terminal$(R)"; \
+		cleanup() { \
+			printf "\n%b\n" "$(Y)$(WR) stopping...$(R)"; \
+			kill -TERM "$$SUP_PID" 2>/dev/null || true; \
+			killall -9 irc-fiber irc-fiber-engine 2>/dev/null || true; \
+			rm -f "$(GATEWAY_PIDFILE)" "$(SUPERVISOR_PIDFILE)" "$(ENGINE_PIDFILE)"; \
+			printf "%b\n" "$(BG)$(OK) debug stopped$(R)"; \
+			exit 0; \
+		}; \
+		trap cleanup INT TERM EXIT; \
+		IRCFIBER_MONGO_URL="$(LOCAL_MONGO_URL)" IRCFIBER_REDIS_URL="$(LOCAL_REDIS_URL)" \
+			"$(GATEWAY_BIN)" >> "$(GATEWAY_LOGFILE)" 2>&1; \
+		GW_EXIT=$$?; \
+		printf "\n%b\n" "$(Y)$(WR) gateway exited (code $$GW_EXIT)$(R)"; \
+		cleanup; \
+		exit $$GW_EXIT'
+
+# Full local stack — gateway + supervised engine, both against TAILNET DBs.
+# For when you want to debug your local D code against the live site's data.
+# Runs in the FOREGROUND — supervisor stays backgrounded for engine auto-restart,
+# gateway runs in this terminal. ctrl-c cleanly tears down both.
+#
+# Why no `tee` for live terminal output? SIGINT in a pipeline is delivered to
+# the foreground process group; bash's `trap` is supposed to fire on SIGINT,
+# but with a pipeline like `irc-fiber | tee log`, the signal can be consumed
+# by `tee` (whose default handler exits) before bash's trap reliably runs,
+# leaving the supervisor orphaned. We redirect to a log file instead — use
+# `make logs` in another terminal for live tailing, and the colored startup
+# banner above still prints to this terminal.
+debug-live: build build-engine ## Component > Full stack: gateway + engine (supervised), TAILNET DBs — ctrl-c to stop
+	@bash -c 'set -u; \
+		printf "\n%b\n" "$(_BCn)$(K)$(B)  Engine (supervised) → TAILNET  $(R)"; \
+		printf "%b\n" "$(D)  Mongo: $(TAILNET_MONGO_URL)$(R)"; \
+		printf "%b\n" "$(D)  Redis: $(TAILNET_REDIS_URL)$(R)"; \
+		killall -9 irc-fiber 2>/dev/null || true; \
+		sleep 1; \
+		rm -f "$(GATEWAY_PIDFILE)" "$(SUPERVISOR_PIDFILE)" "$(ENGINE_PIDFILE)"; \
+		: > "$(SUPERVISOR_LOGFILE)"; \
+		: > "$(GATEWAY_LOGFILE)"; \
+		IRCFIBER_MONGO_URL="$(TAILNET_MONGO_URL)" IRCFIBER_REDIS_URL="$(TAILNET_REDIS_URL)" \
+			IRCFIBER_SERVER_ID="$${IRCFIBER_SERVER_ID:-localengine}" \
+			IRCFIBER_BIND_ADDRESS="$${IRCFIBER_BIND_ADDRESS:-127.0.0.1}" \
+			ENGINE_PIDFILE="$(ENGINE_PIDFILE)" \
+			ENGINE_LOGFILE="$(ENGINE_LOGFILE)" \
+			SUPERVISOR_LOGFILE="$(SUPERVISOR_LOGFILE)" \
+			SUPERVISOR_PIDFILE="$(SUPERVISOR_PIDFILE)" \
+			CRASH_DIR="$(CRASH_DIR)" \
+			"$(SUPERVISOR_SCRIPT)" > /tmp/irc-fiber-engine.supervisor.out 2>&1 & \
+		SUP_PID=$$!; echo $$SUP_PID > "$(SUPERVISOR_PIDFILE)"; \
+		printf "%b\n" "$(C)$(AR) engine supervisor pid=$$SUP_PID (auto-restarts on crash)$(R)"; \
+		sleep 3; \
+		printf "\n%b\n" "$(_BCn)$(K)$(B)  Gateway → TAILNET  $(R)"; \
+		printf "%b\n" "$(Y)$(WR) ctrl-c to stop everything  •  tail logs:  make logs  in another terminal$(R)"; \
+		cleanup() { \
+			printf "\n%b\n" "$(Y)$(WR) stopping...$(R)"; \
+			kill -TERM "$$SUP_PID" 2>/dev/null || true; \
+			killall -9 irc-fiber irc-fiber-engine 2>/dev/null || true; \
+			rm -f "$(GATEWAY_PIDFILE)" "$(SUPERVISOR_PIDFILE)" "$(ENGINE_PIDFILE)"; \
+			printf "%b\n" "$(BG)$(OK) debug-live stopped$(R)"; \
+			exit 0; \
+		}; \
+		trap cleanup INT TERM EXIT; \
+		IRCFIBER_MONGO_URL="$(TAILNET_MONGO_URL)" IRCFIBER_REDIS_URL="$(TAILNET_REDIS_URL)" \
+			"$(GATEWAY_BIN)" >> "$(GATEWAY_LOGFILE)" 2>&1; \
+		GW_EXIT=$$?; \
+		printf "\n%b\n" "$(Y)$(WR) gateway exited (code $$GW_EXIT)$(R)"; \
+		cleanup; \
+		exit $$GW_EXIT'
+
+# Stop everything (supervisor + gateway). Does NOT kill a Vite dev server.
+stop: ## Component > Stop engine (supervised) + gateway
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Stopping everything  $(R)"; \
+	for f in $(SUPERVISOR_PIDFILE) $(ENGINE_PIDFILE) $(GATEWAY_PIDFILE); do \
+		if [ -f "$$f" ]; then \
+			pid=$$(cat "$$f"); \
+			if [ -n "$$pid" ] && kill -0 "$$pid" 2>/dev/null; then \
+				kill "$$pid" 2>/dev/null || true; \
+				printf "%b\n" "$(C)  → stopped $$(basename $$f) (pid $$pid)$(R)"; \
+			fi; \
+			rm -f "$$f"; \
+		fi; \
+	done; \
+	killall -9 irc-fiber 2>/dev/null || true; \
+	killall -9 irc-fiber-engine 2>/dev/null || true; \
+	pkill -f irc-fiber-engine-supervisor 2>/dev/null || true; \
+	printf '%b\n' "$(BG)$(OK) Stopped. (Vite dev server, if running, was not touched.)$(R)"
+
+# ─── COMPONENT OPERATIONS ───────────────────────────────────────────────────
+
+# Engine: run in foreground (single shot, no supervisor). For ad-hoc debugging.
+engine: build-engine ## Component > Engine in foreground (no auto-restart) — ctrl-c to exit
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Engine (foreground)  $(R)"
+	@printf '%b\n' "$(Y)$(WR) No supervisor — crashes will not auto-restart. Use \`make debug\` or \`make debug-live\` for supervised mode.$(R)"
+	@printf '%b\n' "$(D)  Mongo: $${IRCFIBER_MONGO_URL:-mongodb://127.0.0.1:27017/ircfiber}$(R)"
+	@printf '%b\n' "$(D)  Redis: $${IRCFIBER_REDIS_URL:-redis://127.0.0.1:6379/0}$(R)"
+	@IRCFIBER_SERVER_ID=$${IRCFIBER_SERVER_ID:-localengine} IRCFIBER_BIND_ADDRESS=$${IRCFIBER_BIND_ADDRESS:-127.0.0.1} \
+		"$(ENGINE_BIN)"
+
+# Engine: rebuild binary only.
+engine-rebuild: build-engine ## Component > Rebuild engine binary (no restart)
+	@printf '%b\n' "$(BG)$(OK) Engine binary rebuilt. Run \`make engine-restart\` (supervised) or \`make engine\` (foreground) to apply.$(R)"
+
+# Engine: kill the current engine — supervisor respawns with the latest binary.
+engine-restart: ## Component > Restart engine (supervisor respawns with new binary)
+	@bash -c ' \
+		printf "%b\n" "$(_BCn)$(K)$(B)  Restarting engine  $(R)"; \
+		if [ ! -f $(SUPERVISOR_PIDFILE) ]; then \
+			printf "%b\n" "$(Y)$(WR) No supervisor running — engine is in foreground. Use \`make engine\` instead.$(R)"; \
+			exit 0; \
+		fi; \
+		if [ -f $(ENGINE_PIDFILE) ]; then \
+			pid=$$(cat $(ENGINE_PIDFILE)); \
+			if [ -n "$$pid" ] && kill -0 $$pid 2>/dev/null; then \
+				printf "%b\n" "$(C)  → sending SIGTERM to engine (pid $$pid)$(R)"; \
+				kill $$pid 2>/dev/null || true; \
+			else \
+				printf "%b\n" "$(Y)$(WR) engine pidfile stale; supervisor will respawn on next heartbeat$(R)"; \
+			fi; \
+		else \
+			killall -9 irc-fiber-engine 2>/dev/null || true; \
+		fi; \
+		printf "%b\n" "$(BG)$(OK) supervisor will respawn engine$(R)"; \
+	'
+
+# Engine: run D unit tests (uses dub test; engine + gateway share these modules).
+engine-test: test ## Component > Run D unit tests (engine + gateway share these modules)
+
+# Gateway: run in foreground.
+gateway: build ## Component > Gateway in foreground — ctrl-c to exit
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Gateway (foreground)  $(R)"
+	@printf '%b\n' "$(D)  Mongo: $${IRCFIBER_MONGO_URL:-mongodb://127.0.0.1:27017/ircfiber}$(R)"
+	@printf '%b\n' "$(D)  Redis: $${IRCFIBER_REDIS_URL:-redis://127.0.0.1:6379/0}$(R)"
+	@IRCFIBER_MONGO_URL=$${IRCFIBER_MONGO_URL:-mongodb://127.0.0.1:27017/ircfiber} \
+		IRCFIBER_REDIS_URL=$${IRCFIBER_REDIS_URL:-redis://127.0.0.1:6379/0} \
+		"$(GATEWAY_BIN)"
+
+# Gateway: rebuild only.
+gateway-rebuild: build ## Component > Rebuild gateway binary (no restart)
+
+# Gateway: stop + relaunch in background (uses whatever env was set when last launched).
+gateway-restart: ## Component > Stop + relaunch gateway in background
+	@bash -c ' \
+		printf "%b\n" "$(_BCn)$(K)$(B)  Restarting gateway  $(R)"; \
+		if [ -f $(GATEWAY_PIDFILE) ]; then \
+			pid=$$(cat $(GATEWAY_PIDFILE)); \
+			if [ -n "$$pid" ] && kill -0 $$pid 2>/dev/null; then \
+				kill $$pid 2>/dev/null || true; \
+				printf "%b\n" "$(C)  → stopped gateway (pid $$pid)$(R)"; \
+			fi; \
+		fi; \
+		killall -9 irc-fiber 2>/dev/null || true; \
+		sleep 1; \
+		rm -f $(GATEWAY_PIDFILE); \
+		: > $(GATEWAY_LOGFILE); \
+		IRCFIBER_MONGO_URL=$${IRCFIBER_MONGO_URL:-$(LOCAL_MONGO_URL)} \
+		IRCFIBER_REDIS_URL=$${IRCFIBER_REDIS_URL:-$(LOCAL_REDIS_URL)} \
+			nohup "$(GATEWAY_BIN)" > $(GATEWAY_LOGFILE) 2>&1 & \
+		GW_PID=$$!; \
+		echo $$GW_PID > $(GATEWAY_PIDFILE); \
+		printf "%b\n" "$(C)  → started gateway (pid $$GW_PID)$(R)"; \
+		printf "%b\n" "$(BG)$(OK) Gateway restarted$(R) $(D)(http://localhost:8090)$(R)"; \
+	'
+
+# ─── OBSERVABILITY ──────────────────────────────────────────────────────────
+
+# Status: show what's running, port bindings, last log lines.
+status: ## Component > Print running processes, ports, recent log lines
+	@bash -c ' \
+		printf "\n%b\n" "$(_BC)$(K)$(B)  IRC Fiber status  $(R)"; \
+		printf "%b\n" "$(C)  ─ processes $(R)"; \
+		ps -o pid,etime,command -p $$(pgrep -f irc-fiber 2>/dev/null) 2>/dev/null | sed "s/^/    /" || printf "    (no irc-fiber running)\n"; \
+		ps -o pid,etime,command -p $$(pgrep -f irc-fiber-engine 2>/dev/null) 2>/dev/null | sed "s/^/    /" || printf "    (no irc-fiber-engine running)\n"; \
+		ps -o pid,etime,command -p $$(pgrep -f irc-fiber-engine-supervisor 2>/dev/null) 2>/dev/null | sed "s/^/    /" || printf "    (no supervisor running)\n"; \
+		printf "\n%b\n" "$(C)  ─ port bindings $(R)"; \
+		lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk "/irc-fiber|node/ {print \"    \"$$0}" || true; \
+		printf "\n%b\n" "$(C)  ─ gateway tail $(R)"; \
+		tail -3 $(GATEWAY_LOGFILE) 2>/dev/null | sed "s/^/    /" || printf "    (no log)\n"; \
+		printf "\n%b\n" "$(C)  ─ engine tail $(R)"; \
+		tail -3 $(ENGINE_LOGFILE) 2>/dev/null | sed "s/^/    /" || printf "    (no log)\n"; \
+		printf "\n%b\n" "$(C)  ─ supervisor tail $(R)"; \
+		tail -3 $(SUPERVISOR_LOGFILE) 2>/dev/null | sed "s/^/    /" || printf "    (no log)\n"; \
+		printf "%b\n" "$(C)  > crash dumps $(R)"; \
+		d="$(CRASH_DIR)"; \
+		mkdir -p "$$d"; \
+		count=$$(ls "$$d"crash-*.txt 2>/dev/null | wc -l | tr -d " "); \
+		if [ "$$count" -gt 0 ]; then \
+			printf "    %s crash dump(s) - view with: make crash-logs\n" "$$count"; \
+			printf "    Most recent: %s\n" "$$(ls -t "$$d"crash-*.txt 2>/dev/null | head -1)"; \
+		else \
+			printf "    (no crash dumps)\n"; \
+		fi; \
+	'
+
+# Logs: tail all three log streams in parallel (engine / gateway / supervisor).
+logs: ## Component > Tail engine + gateway + supervisor logs in parallel
+	@bash -c ' \
+		touch $(ENGINE_LOGFILE) $(GATEWAY_LOGFILE) $(SUPERVISOR_LOGFILE); \
+		trap "kill 0" INT TERM EXIT; \
+		tail -F $(GATEWAY_LOGFILE) | sed -u "s/^/$(K)[gw]$(R) /" & \
+		tail -F $(ENGINE_LOGFILE) | sed -u "s/^/$(Y)[en]$(R) /" & \
+		tail -F $(SUPERVISOR_LOGFILE) | sed -u "s/^/$(C)[sv]$(R) /" & \
+		wait; \
+	'
+
+logs-engine: ## Component > Tail engine log only
+	@touch $(ENGINE_LOGFILE); tail -F $(ENGINE_LOGFILE)
+
+logs-gateway: ## Component > Tail gateway log only
+	@touch $(GATEWAY_LOGFILE); tail -F $(GATEWAY_LOGFILE)
+
+logs-supervisor: ## Component > Tail supervisor log (crashes + restarts)
+	@touch $(SUPERVISOR_LOGFILE); tail -F $(SUPERVISOR_LOGFILE)
+
+crash-logs: ## Component > List persistent crash dumps (use CAT=1 to view latest)
+	@bash -c ' \
+		d="$(CRASH_DIR)"; \
+		mkdir -p "$$d"; \
+		if ls "$$d"crash-*.txt >/dev/null 2>&1; then \
+			total=$$(ls "$$d"crash-*.txt 2>/dev/null | wc -l | tr -d " "); \
+			printf "\n%b\n" "$(_BCn)$(K)$(B)  IRC Fiber Crash Dumps ($$total total)  $(R)"; \
+			printf "%b\n" "$(D)  Dir: $$d$(R)"; \
+			printf "\n"; \
+			if [ "$${CAT:-0}" = "1" ]; then \
+				latest=$$(ls -t "$$d"crash-*.txt 2>/dev/null | head -1); \
+				if [ -n "$$latest" ]; then \
+					printf "%b\n" "$(C)  ─ Most recent: $$(basename $$latest) $(R)"; \
+					printf "\n"; \
+					cat "$$latest"; \
+				fi; \
+			else \
+				printf "  %-24s %-8s %-8s %-s\n" "Crash" "Exit" "Size" "Path"; \
+				printf "  %-24s %-8s %-8s %-s\n" "-----" "----" "----" "----"; \
+				ls -tr "$$d"crash-*.txt 2>/dev/null | while read -r f; do \
+					base=$$(basename "$$f" .txt); \
+					exitcode=$$(echo "$$base" | sed "s/.*exit//"); \
+					sz=$$(wc -c < "$$f" | tr -d " "); \
+					echo "  $$base  exit=$$exitcode  $$sz bytes  $$f"; \
+				done; \
+				printf "\n%b\n" "$(D)  View latest: make crash-logs CAT=1$(R)"; \
+			fi; \
+		else \
+			printf "\n%b\n" "$(Y)$(WR) No crash dumps found in $$d$(R)"; \
+		fi; \
+	'
+
+# ─── AUTO-REBUILD (file watch) ──────────────────────────────────────────────
+
+# Watch engine sources, rebuild + restart on change.
+watch-engine: ## Component > Watch source/*.d — rebuild engine + supervisor respawns on save
+	@bash -c ' \
+		printf "\n%b\n" "$(_BC)$(K)$(B)  Watching engine sources  $(R)"; \
+		printf "%b\n" "$(D)Polls every 2s. Install fswatch for instant: brew install fswatch$(R)"; \
+		printf "%b\n" "$(D)Triggers: make engine-rebuild + make engine-restart$(R)"; \
+		if [ ! -f $(SUPERVISOR_PIDFILE) ]; then \
+			printf "%b\n" "$(Y)$(WR) No supervisor running. Start one first: make debug  or  make debug-live$(R)"; \
+			exit 1; \
+		fi; \
+		WATCH=$$(find source -name "*.d" -type f 2>/dev/null); \
+		LAST=$$(echo "$$WATCH" | xargs stat -f %m 2>/dev/null | sort -n | tail -1); \
+		printf "%b\n" "$(C)  watching source/*.d …$(R)"; \
+		while true; do \
+			sleep 2; \
+			CURR=$$(echo "$$WATCH" | xargs stat -f %m 2>/dev/null | sort -n | tail -1); \
+			if [ "$$CURR" != "$$LAST" ]; then \
+				printf "\n%b\n" "$(Y)→ change detected, rebuilding engine…$(R)"; \
+				$(MAKE) --no-print-directory engine-rebuild && \
+					$(MAKE) --no-print-directory engine-restart; \
+				LAST=$$CURR; \
+			fi; \
+		done; \
+	'
+
+# Watch gateway sources, rebuild + restart on change.
+watch-gateway: ## Component > Watch source/*.d — rebuild gateway + relaunch on save
+	@bash -c ' \
+		printf "\n%b\n" "$(_BC)$(K)$(B)  Watching gateway sources  $(R)"; \
+		printf "%b\n" "$(D)Polls every 2s. Install fswatch for instant: brew install fswatch$(R)"; \
+		WATCH=$$(find source -name "*.d" -type f 2>/dev/null); \
+		LAST=$$(echo "$$WATCH" | xargs stat -f %m 2>/dev/null | sort -n | tail -1); \
+		printf "%b\n" "$(C)  watching source/*.d …$(R)"; \
+		while true; do \
+			sleep 2; \
+			CURR=$$(echo "$$WATCH" | xargs stat -f %m 2>/dev/null | sort -n | tail -1); \
+			if [ "$$CURR" != "$$LAST" ]; then \
+				printf "\n%b\n" "$(Y)→ change detected, rebuilding gateway…$(R)"; \
+				$(MAKE) --no-print-directory gateway-rebuild && \
+					$(MAKE) --no-print-directory gateway-restart; \
+				LAST=$$CURR; \
+			fi; \
+		done; \
+	'
+
+# Watch both engine and gateway.
+watch: watch-engine watch-gateway ## Component > Watch both engine + gateway sources
+
+# ─── DEPRECATED ALIASES (back-compat) ───────────────────────────────────────
+# Prefer the new Component Workflow names. These are kept so old docs / muscle
+# memory still work but emit a deprecation hint the first time they're used.
+
+start: dev
+run: dev
+run-tailnet: dev-live
+run-local: dev
+run-gateway: gateway
+run-engine: engine
+up: debug
+down: stop
+down-tailnet: stop
+restart-web: gateway-restart
+restart-engine-tailnet: engine-restart
+logs-web: logs-gateway
+logs-engine-tailnet: logs-engine
+watch-web: watch-gateway
 
 # ----------------------------------------------------------------------------
 # Main Build Targets
@@ -116,7 +557,13 @@ build: frontend ## Build > Build the application with dub
 
 frontend: ## Build > Build Svelte 5 frontend bundle
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building Svelte frontend  $(R)"
-	@cd frontend && npm run build 2>&1 | grep -E 'built|error|Error' | tail -8
+	@cd frontend && npm run build > /tmp/irc-fiber-frontend-build.log 2>&1; \
+		if [ $$? -eq 0 ]; then \
+			grep '✓ built in\|inject-manifest' /tmp/irc-fiber-frontend-build.log 2>/dev/null || true; \
+		else \
+			cat /tmp/irc-fiber-frontend-build.log; \
+			exit 1; \
+		fi
 	@node frontend/inject-manifest.js
 	@printf '\n%b\n' "$(BG)$(OK) Frontend build complete$(R)"
 
@@ -167,182 +614,38 @@ build-ldc2: ## Build > LDC2 build (dub-managed, use 'make build' for gdc/dmd)
 # Shared helpers
 # ----------------------------------------------------------------------------
 
-# Bash snippet: kill old processes, clear redis, check/start backend services
+# Bash snippet: kill old processes, check docker backends
 define _docker_setup
-killall -9 irc-fiber-engine 2>/dev/null || true; \
-killall -9 irc-fiber 2>/dev/null || true; \
-sleep 1; \
-SERVER_ID=$${IRCFIBER_SERVER_ID:-localengine}; \
-if docker info >/dev/null 2>&1; then \
-	docker compose exec -T redis redis-cli del irc:server:$$SERVER_ID irc:servers irc:network:assignments >/dev/null 2>&1 || true; \
-fi; \
-if ! docker info >/dev/null 2>&1; then \
-	printf "%b\n" "$(Y)$(WR) Docker is not running$(R)"; \
-	printf "%b\n" "$(D)Start Docker first, or run: make docker-up-backend$(R)"; \
-	exit 1; \
-fi; \
-if ! docker compose ps mongo redis ircd 2>/dev/null | grep -q "healthy"; then \
-	printf "%b\n" "$(Y)$(WR) Backend services not running. Starting them now...$(R)"; \
-	docker compose up -d mongo redis ircd; \
-	printf "%b\n" "$(C)→ Waiting for services to be ready...$(R)"; \
-	for i in 1 2 3 4 5 6 7 8 9 10; do \
-		if docker compose ps mongo redis ircd 2>/dev/null | grep -q "healthy"; then \
-			printf "%b\n" "$(BG)$(OK) Backend services ready$(R)"; \
-			break; \
-		fi; \
-		if [ $$i -eq 10 ]; then \
-			printf "%b\n" "$(Y)$(WR) Services still starting, continuing anyway...$(R)"; \
-		fi; \
-		sleep 1; \
-	done; \
-else \
-	printf "%b\n" "$(BG)$(OK) Backend services already running$(R)"; \
-fi
-endef
-
-# ----------------------------------------------------------------------------
-# Run & Test
-# ----------------------------------------------------------------------------
-#
-# `make run` is the primary entry point for the dev loop. It starts the
-# Svelte dev server pointed at the backend selected by the BACKEND
-# variable (default: tailnet). The D backend runner is at `make run-gateway`
-# (renamed from the old `make run`).
-#
-#   make run               # frontend dev, tailnet backend (default)
-#   make run-tailnet       # explicit
-#   make run-local         # frontend dev, local docker backend
-#   make run-gateway       # D gateway, local backend (was `make run`)
-#   make run-engine        # D engine only, local backend
-
-start: run ## Quick Start > Alias for `make run` (frontend dev server)
-
-run: frontend-install ## Quick Start > Start frontend dev server (default: tailnet)
-	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting frontend dev server  $(R)"
-	@printf '%b\n' "$(D)Backend: $(BACKEND)  →  $(EFFECTIVE_BACKEND_URL)$(R)"
-	@printf '%b\n' "$(D)Open http://localhost:5173 when ready$(R)"
-	@printf '%b\n' "$(D)Switch:  make run-local   |   make run-tailnet   |   make run BACKEND=<url>$(R)"
-	@cd frontend && VITE_BACKEND_URL=$(EFFECTIVE_BACKEND_URL) npm run dev
-
-run-tailnet: build ## Quick Start > Build + run D gateway with tailnet Mongo+Redis
-	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting IRC Fiber Gateway (tailnet DBs)  $(R)"
-	@printf '%b\n' "$(C)$(AR) The built frontend is served at http://localhost:8090$(R)"
-	@printf '%b\n' "$(D)Open that URL in your browser — no separate Vite server needed.$(R)"
-	@printf '%b\n' "$(D)Vite dev server (HMR for frontend work): make run-local$(R)"
-	@printf '%b\n' "$(D)Engine: already running on the tailnet.$(R)"
-	@bash -c ' \
-		IRCFIBER_MONGO_URL="mongodb://ircfiber:MongoAppPass2026@100.107.178.48:27017/ircfiber" \
-		IRCFIBER_REDIS_URL="redis://100.107.178.48:6379/0" \
-		./irc-fiber; \
-	'
-
-run-local: ## Quick Start > Frontend dev server, local docker backend
-	@$(MAKE) --no-print-directory run BACKEND=local
-
-run-gateway: build build-engine ## Quick Start > Build + run D gateway locally (was `make run`)
-	@bash -c ' \
-		printf "\n%b\n" "$(_BC)$(K)$(B)  Cleaning up existing processes  $(R)"; \
-		$(_docker_setup); \
-		printf "%b\n" "$(BG)$(OK) Cleanup complete$(R)"; \
-		printf "\n%b\n" "$(_BCn)$(K)$(B)  Starting IRC Fiber Engine  $(R)"; \
-		env IRCFIBER_MONGO_URL=mongodb://127.0.0.1:27017/ircfiber IRCFIBER_REDIS_URL=redis://127.0.0.1:6379/0 IRCFIBER_SERVER_ID=$${IRCFIBER_SERVER_ID:-localengine} IRCFIBER_BIND_ADDRESS=$${IRCFIBER_BIND_ADDRESS:-127.0.0.1} nohup ./irc-fiber-engine > /tmp/irc-fiber-engine.log 2>&1 & \
-		ENGINE_PID=$$!; \
-		printf "%b\n" "$(C)$(AR) Engine PID: $$ENGINE_PID$(R)"; \
-		sleep 3; \
-		printf "\n%b\n" "$(_BCn)$(K)$(B)  Starting IRC Fiber Gateway  $(R)"; \
-		printf "%b\n" "$(C)$(AR) http://localhost:8090$(R)"; \
-		trap "printf \"\\n%b\\n\" \"$(D)→ Stopping engine (PID $$ENGINE_PID)...$(R)\"; kill $$ENGINE_PID 2>/dev/null; exit" INT TERM EXIT; \
-		env IRCFIBER_MONGO_URL=mongodb://127.0.0.1:27017/ircfiber IRCFIBER_REDIS_URL=redis://127.0.0.1:6379/0 ./irc-fiber; \
-	'
-
-run-engine: build ## Quick Start > Run the IRC engine (needs backends running)
-	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Starting IRC Fiber Engine  $(R)"
-	@env IRCFIBER_MONGO_URL=mongodb://127.0.0.1:27017/ircfiber IRCFIBER_REDIS_URL=redis://127.0.0.1:6379/0 IRCFIBER_SERVER_ID=$${IRCFIBER_SERVER_ID:-localengine} IRCFIBER_BIND_ADDRESS=$${IRCFIBER_BIND_ADDRESS:-127.0.0.1} ./irc-fiber-engine
-
-# ----------------------------------------------------------------------------
-# Background Run & Live Reload
-# ----------------------------------------------------------------------------
-
-up: build build-engine ## Quick Start > Start engine + gateway in background
-	@bash -c ' \
-		printf "\n%b\n" "$(_BC)$(K)$(B)  Starting IRC Fiber (Background)  $(R)"; \
-		$(_docker_setup); \
-		printf "\n%b\n" "$(_BCn)$(K)$(B)  Starting IRC Fiber Engine  $(R)"; \
-		env IRCFIBER_MONGO_URL=mongodb://127.0.0.1:27017/ircfiber IRCFIBER_REDIS_URL=redis://127.0.0.1:6379/0 IRCFIBER_SERVER_ID=$${IRCFIBER_SERVER_ID:-localengine} IRCFIBER_BIND_ADDRESS=$${IRCFIBER_BIND_ADDRESS:-127.0.0.1} nohup ./irc-fiber-engine > /tmp/irc-fiber-engine.log 2>&1 & \
-		ENGINE_PID=$$!; \
-		echo $$ENGINE_PID > /tmp/irc-fiber-engine.pid; \
-		printf "%b\n" "$(C)$(AR) Engine PID: $$ENGINE_PID$(R)"; \
-		sleep 3; \
-		printf "\n%b\n" "$(_BCn)$(K)$(B)  Starting IRC Fiber Gateway  $(R)"; \
-		printf "%b\n" "$(C)$(AR) http://localhost:8090$(R)"; \
-		env IRCFIBER_MONGO_URL=mongodb://127.0.0.1:27017/ircfiber IRCFIBER_REDIS_URL=redis://127.0.0.1:6379/0 nohup ./irc-fiber > /tmp/irc-fiber.log 2>&1 & \
-		GATEWAY_PID=$$!; \
-		echo $$GATEWAY_PID > /tmp/irc-fiber.pid; \
-		printf "%b\n" "$(C)$(AR) Gateway PID: $$GATEWAY_PID$(R)"; \
-		printf "\n%b\n" "$(BG)$(OK) IRC Fiber running in background$(R)"; \
-		printf "%b\n" "$(D)Logs:  make logs-web  |  make logs-engine$(R)"; \
-		printf "%b\n" "$(D)Stop:  make down$(R)"; \
-		printf "%b\n" "$(D)Watch: make watch-web$(R)"; \
-	'
-
-down: ## Quick Start > Stop background engine + gateway
-	@printf '%b\n' "$(D)→ Stopping IRC Fiber...$(R)"
-	@if [ -f /tmp/irc-fiber.pid ]; then \
-		kill $$(cat /tmp/irc-fiber.pid) 2>/dev/null || true; \
-		rm -f /tmp/irc-fiber.pid; \
-	fi
-	@if [ -f /tmp/irc-fiber-engine.pid ]; then \
-		kill $$(cat /tmp/irc-fiber-engine.pid) 2>/dev/null || true; \
-		rm -f /tmp/irc-fiber-engine.pid; \
-	fi
-	@killall -9 irc-fiber 2>/dev/null || true
-	@killall -9 irc-fiber-engine 2>/dev/null || true
-	@printf '%b\n' "$(BG)$(OK) Stopped$(R)"
-
-restart-web: build ## Quick Start > Rebuild and restart just the gateway
-	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Restarting Gateway  $(R)"
-	@if [ -f /tmp/irc-fiber.pid ]; then \
-		kill $$(cat /tmp/irc-fiber.pid) 2>/dev/null || true; \
-		rm -f /tmp/irc-fiber.pid; \
-	fi
-	@killall -9 irc-fiber 2>/dev/null || true
-	@sleep 1
-	@env IRCFIBER_MONGO_URL=mongodb://127.0.0.1:27017/ircfiber IRCFIBER_REDIS_URL=redis://127.0.0.1:6379/0 nohup ./irc-fiber > /tmp/irc-fiber.log 2>&1 & \
-		GATEWAY_PID=$$!; \
-		echo $$GATEWAY_PID > /tmp/irc-fiber.pid; \
-		printf '%b\n' "$(C)$(AR) Gateway PID: $$GATEWAY_PID$(R)"
-	@printf '%b\n' "$(BG)$(OK) Gateway restarted$(R) $(D)(http://localhost:8090)$(R)"
-
-logs-web: ## Quick Start > Tail gateway logs
-	@if [ -f /tmp/irc-fiber.log ]; then \
-		tail -f /tmp/irc-fiber.log; \
-	else \
-		printf '%b\n' "$(Y)$(WR) No gateway log found. Run: make up$(R)"; \
-	fi
-
-logs-engine: ## Quick Start > Tail engine logs
-	@if [ -f /tmp/irc-fiber-engine.log ]; then \
-		tail -f /tmp/irc-fiber-engine.log; \
-	else \
-		printf '%b\n' "$(Y)$(WR) No engine log found. Run: make up$(R)"; \
-	fi
-
-watch-web: ## Quick Start > Auto-rebuild gateway on file changes
-	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Watching for file changes  $(R)"
-	@printf '%b\n' "$(D)Polls every 2s. Install fswatch for instant updates: brew install fswatch$(R)"
-	@bash -c ' \
-		LAST=$$(find source views public frontend/src -type f -print0 2>/dev/null | xargs -0 stat -f %m 2>/dev/null | sort -n | tail -1); \
-		printf "%b\n" "$(C)→ Watching source/, views/, public/, frontend/src/ for changes...$(R)"; \
-		while true; do \
-			sleep 2; \
-			CURR=$$(find source views public frontend/src -type f -print0 2>/dev/null | xargs -0 stat -f %m 2>/dev/null | sort -n | tail -1); \
-			if [ "$$CURR" != "$$LAST" ]; then \
-				printf "\n%b\n" "$(Y)→ Change detected, restarting gateway...$(R)"; \
-				$(MAKE) --no-print-directory restart-web; \
-				LAST=$$CURR; \
+	@killall -9 irc-fiber-engine 2>/dev/null || true; \
+	killall -9 irc-fiber 2>/dev/null || true; \
+	sleep 1; \
+	SERVER_ID=$${IRCFIBER_SERVER_ID:-localengine}; \
+	if docker info >/dev/null 2>&1; then \
+		docker compose exec -T redis redis-cli del irc:server:$$SERVER_ID irc:servers irc:network:assignments >/dev/null 2>&1 || true; \
+	fi; \
+	if ! docker info >/dev/null 2>&1; then \
+		printf "%b\n" "$(Y)$(WR) Docker is not running$(R)"; \
+		printf "%b\n" "$(D)Start Docker first, or run: make docker-up-backend$(R)"; \
+		exit 1; \
+	fi; \
+	if ! docker compose ps mongo redis ircd 2>/dev/null | grep -q "healthy"; then \
+		printf "%b\n" "$(Y)$(WR) Backend services not running. Starting them now...$(R)"; \
+		docker compose up -d mongo redis ircd; \
+		printf "%b\n" "$(C)→ Waiting for services to be ready...$(R)"; \
+		for i in 1 2 3 4 5 6 7 8 9 10; do \
+			if docker compose ps mongo redis ircd 2>/dev/null | grep -q "healthy"; then \
+				printf "%b\n" "$(BG)$(OK) Backend services ready$(R)"; \
+				break; \
 			fi; \
+			if [ $$i -eq 10 ]; then \
+				printf "%b\n" "$(Y)$(WR) Services still starting, continuing anyway...$(R)"; \
+			fi; \
+			sleep 1; \
 		done; \
-	'
+	else \
+		printf "%b\n" "$(BG)$(OK) Backend services already running$(R)"; \
+	fi
+endef
 
 # ----------------------------------------------------------------------------
 # Testing & Quality
@@ -546,9 +849,6 @@ docker-up: ensure-colima ## Docker > Start all services with Docker Compose
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting Docker Services  $(R)"
 	@docker compose up -d
 	@printf '%b\n' "$(BG)$(OK) Services started$(R) $(D)(http://localhost:8090)$(R)"
-
-stop: docker-down
-down: docker-down
 
 docker-down: ensure-colima ## Docker > Stop all Docker services
 	@printf '%b\n' "$(D)→ Stopping Docker services (docker-compose.yml)...$(R)"
@@ -848,7 +1148,25 @@ clean: ## Utils > Remove build artifacts
 # Help — auto-generated from ## comments on each target
 # ----------------------------------------------------------------------------
 
-help:
+help: ## Utils > Show this help (use-case matrix in the source header)
+	@printf '\n\033[1mIRC Fiber — Component Workflows\033[0m\n'
+	@printf '\033[2m=====================================\033[0m\n'
+	@printf '\n\033[1mUSE-CASE MATRIX\033[0m\n'
+	@printf '  \033[36mI want to change only the frontend (Svelte/CSS/HTML)…\033[0m\n'
+	@printf '    Terminal 1: \033[92mmake dev-live\033[0m   (Vite HMR, no local D backend)\n'
+	@printf '  \033[36mI want to change the engine D code and see it live…\033[0m\n'
+	@printf '    Terminal 1: \033[92mmake debug-live\033[0m  (supervised engine → tailnet DBs)\n'
+	@printf '    Terminal 2: \033[92mmake watch-engine\033[0m (rebuilds + restarts on .d save)\n'
+	@printf '    Terminal 3: \033[92mmake logs\033[0m         (live tail)\n'
+	@printf '  \033[36mI want to change the gateway D code…\033[0m\n'
+	@printf '    Terminal 1: \033[92mmake debug-live\033[0m  (or \033[92mmake debug\033[0m for local DBs)\n'
+	@printf '    Terminal 2: \033[92mmake watch-gateway\033[0m\n'
+	@printf '  \033[36mI want full visual + D iteration on my machine…\033[0m\n'
+	@printf '    Terminal 1: \033[92mmake debug\033[0m        (full local stack)\n'
+	@printf '    Terminal 2: \033[92mmake dev\033[0m          (Vite HMR against the local gateway)\n'
+	@printf '  \033[36mI want to test engine reconnect against a real IRC server…\033[0m\n'
+	@printf '    \033[92mmake debug-live\033[0m  → open \033[36mhttp://localhost:8090\033[0m → click Reconnect\n'
+	@printf '\n'
 	@awk 'BEGIN {FS = ":.*##[ \t]*"} \
 		/^[a-zA-Z0-9_-]+:.*##/ { \
 			target = $$1; \
@@ -873,13 +1191,11 @@ help:
 			if (w > mw[cat]) mw[cat] = w; \
 		} \
 		END { \
-			print ""; \
-			print "\033[1mIRC Fiber - IRC Bouncer & Web Client\033[0m"; \
-			print "\033[2m=====================================\033[0m"; \
 			for (i = 1; i <= ncat; i++) { \
 				c = order[i]; \
 				col = ""; \
-				if (c == "Quick Start") col = "\033[42m\033[30m\033[1m"; \
+				if (c == "Component")     col = "\033[46m\033[30m\033[1m"; \
+				else if (c == "Quick Start") col = "\033[42m\033[30m\033[1m"; \
 				else if (c == "Build")       col = "\033[46m\033[30m\033[1m"; \
 				else if (c == "Docker")      col = "\033[43m\033[30m\033[1m"; \
 				else if (c == "Quality")     col = "\033[45m\033[30m\033[1m"; \
