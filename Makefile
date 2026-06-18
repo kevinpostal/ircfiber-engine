@@ -1037,64 +1037,69 @@ sync-redis-to-tailnet: ## Data > Sync only local Redis → tailnet
 	@$(MAKE) --no-print-directory sync-db-to-tailnet SYNC_TAG=redis
 
 # ----------------------------------------------------------------------------
-# Deploy — incremental remote builds
+# Deploy — incremental remote builds via Ansible + SSH
 # ----------------------------------------------------------------------------
 #
-# Two paths, both with the same outcome (binaries running in ircfiber-gateway
-# and ircfiber-engine-localengine on the tailnet VPS):
+# Targets your production tailnet host (ircfiber-prod-1) using the ansible
+# playbooks in deploy/. All deploy commands run from the deploy/ directory.
 #
-#   make update          # smart default — picks hot path if possible
-#   make update-fast     # force hot path: rsync + dub in persistent container (~5-15s)
-#   make update-assets   # asset-only: just public/* (no dub build, no restart, ~2-3s)
-#   make update-views    # Diet template only: hot build but no engine restart
-#   make update-stats    # show builder state, cache sizes, last-build timing
-#   make update-status   # same, no actions
-#   make update-clean    # nuke the builder container + cache (forces cold path next time)
-#   deploy-rebuild       # force cold path: rebuild builder image from scratch
-#   deploy-image-builder # build the ircfiber-builder image locally, push nowhere (just a test)
+# Vault: by default prompts for the vault password. Set VAULT_PASS_FILE
+# to a path containing the vault password to skip the prompt:
+#   VAULT_PASS_FILE=~/.vault_pass.txt make update
 #
-# Three content classes, three deploy strategies:
+# Usage:
+#   make update           # fast incremental binary deploy (rsync + BuildKit)
+#   make update-full      # full docker image rebuild (Containerfile, all layers)
+#   make update-assets    # asset-only: just public/* (no build, no restart)
+#   make update-status    # show running images on the target
+#   make update-clean     # nuke builder cache on the target (forces cold path)
+#   make deploy           # alias for update-full
 #
-#   1. D source changed (.d files in source/):
-#      Full hot path: ensure-builder + tar source + dub build (gateway) +
-#      dub build (engine) + inject both binaries + restart both containers.
-#      ~80-90s (gated by ldc2 link on 2 vCPUs).
-#
-#   2. Diet template changed (views/*.dt):
-#      In release builds, .dt files are embedded in the binary by diet-ng,
-#      so they go through path 1. In debug builds with DietUseLive they're
-#      read from disk, so they're path 3.
-#
-#   3. HTML/CSS/asset changed (public/* — landing.html, style.css, dist/*):
-#      Asset-only path: tar public/ + `docker exec -i ircfiber-gateway
-#      tar -xf -` + done. The gateway reads these files at request time
-#      via D's read()/readText(), so no binary change, no restart, no
-#      reconnect. ~2-3s.
-#
-# `make update` auto-routes by detecting what's changed (computed once
-# at make-startup, like NEEDS_FRONTEND_REBUILD above).
-# -----------------------------------------------------------------------------
-# Hot path requires a long-lived `ircfiber-builder` container on the VPS with
-# .dub/ on a named volume. The first `make update` after this change will
-# auto-bootstrap it (cold path); every subsequent run is incremental.
-#
-# Why the original was slow:
-#   - docker build with no persistent cache → LDC + dub packages re-fetched every run
-#   - frontend/ rebuilt locally on every invocation (wasted; Svelte ships in public/dist/)
-#   - .dockerignore too loose → node_modules, frontend/src, logs all shipped over SSH
-#   - no incremental mechanism: every change triggered a full multi-stage build
-#
-# The new architecture:
-#   1. One-time: docker buildx build (cold) produces ircfiber-builder:latest on VPS
-#   2. Steady state: ircfiber-builder container runs idle, with /build on a volume
-#   3. On every push: rsync source → volume, `dub build` inside container,
-#      docker cp the resulting binaries out, inject into running gateway+engine
+# Override target host:
+#   TARGET=my-other-host make update
 # ----------------------------------------------------------------------------
 
-# Invoke the deploy script via `bash -c` so Make doesn't interpret
-# the path as a target reference (which would trigger an expensive
-# implicit-rule search — ~50s on the first `make update` call).
-#
+# Vault pass: use file if set, otherwise ask on every invocation.
+_vault_arg = $(if $(VAULT_PASS_FILE),--vault-password-file $(VAULT_PASS_FILE),--ask-vault-pass)
+_target     = $(or $(TARGET),ircfiber-prod-1)
+_playbook   = cd deploy && ansible-playbook -l $(_target) $(_vault_arg)
+
+# Fast hot path: rsync source → server, dub build in persistent builder
+# container, extract binary, inject into running gateway + engine.
+# No full image rebuild, no DB restart. ~5-15s after warm cache.
+update: ## Deploy > Fast incremental binary deploy (rsync + BuildKit + inject)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Incremental deploy → $(_target)  $(R)"
+	@$(_playbook) playbooks/deploy-binary.yml
+
+# Alias: fast path is the default
+update-fast: update ## Deploy > Force hot path (same as `make update`)
+
+# Full docker image rebuild: builds Containerfile from scratch on the target
+# (or via registry), recreates gateway + engine containers.
+update-full: ## Deploy > Full docker image rebuild + container recreate
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Full image rebuild → $(_target)  $(R)"
+	@$(_playbook) playbooks/deploy.yml
+
+deploy: update-full ## Deploy > Alias for update-full
+
+# Build frontend + push public/ to running gateway via SSH.
+# The gateway reads these files from disk at request time, so no binary
+# change, no container restart, no reconnect. ~2-3s after build.
+update-assets: frontend ## Deploy > Build frontend + push public/* to running gateway (no restart)
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Asset push → $(_target)  $(R)"
+	@printf '%b\n' "$(D)  Tarring public/ → ssh → docker exec tar -xf -$(R)"
+	@tar cz -C public . | ssh deploy@$(_target) 'docker exec -i ircfiber-gateway tar xzf - -C /app/public'
+
+# Show running container images and versions on the target.
+update-status: ## Deploy > Show running containers & image versions
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Deploy status → $(_target)  $(R)"
+	@$(_playbook) playbooks/status.yml
+
+# Nuke the builder cache on the target (forces cold path next update).
+update-clean: ## Deploy > Nuke builder cache on target (forces cold rebuild)
+	@printf '\n%b\n' "$(_BY)$(K)$(B)  Cleaning builder cache → $(_target)  $(R)"
+	@ssh deploy@$(_target) 'docker rm -f ircfiber-builder 2>/dev/null; docker volume rm ircfiber_dub_cache 2>/dev/null; echo "Builder cache cleared"'
+
 # ----------------------------------------------------------------------------
 # Cross Compilation
 # ----------------------------------------------------------------------------
@@ -1166,6 +1171,11 @@ help: ## Utils > Show this help (use-case matrix in the source header)
 	@printf '    Terminal 2: \033[92mmake dev\033[0m          (Vite HMR against the local gateway)\n'
 	@printf '  \033[36mI want to test engine reconnect against a real IRC server…\033[0m\n'
 	@printf '    \033[92mmake debug-live\033[0m  → open \033[36mhttp://localhost:8090\033[0m → click Reconnect\n'
+	@printf '  \033[36mI want to deploy to my tailnet server…\033[0m\n'
+	@printf '    \033[92mmake update\033[0m          (fast incremental binary deploy)\n'
+	@printf '    \033[92mmake update-full\033[0m      (full docker image rebuild)\n'
+	@printf '    \033[92mmake update-assets\033[0m     (asset-only: public/*, ~2-3s)\n'
+	@printf '    \033[92mmake update-status\033[0m     (show running containers)\n'
 	@printf '\n'
 	@awk 'BEGIN {FS = ":.*##[ \t]*"} \
 		/^[a-zA-Z0-9_-]+:.*##/ { \
