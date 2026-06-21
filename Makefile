@@ -21,7 +21,7 @@ DUB_PKG     := $(HOME)/.dub/packages
 
 # Dev backend selection for `make run` / `make start` / `make dev`.
 # Default is `tailnet` — points the Vite dev server at the tailnet
-# gateway (https://ircfiber-prod-1.tail544547.ts.net). Override per-call:
+# gateway (https://ircfiber-ovh.tail544547.ts.net). Override per-call:
 #
 #   make run                      # tailnet (default)
 #   make run-tailnet              # explicit tailnet
@@ -31,10 +31,10 @@ DUB_PKG     := $(HOME)/.dub/packages
 #
 # For the D backend runner (the previous `make run`), use `make run-gateway`.
 BACKEND ?= local
-VITE_BACKEND_URL ?= https://ircfiber-prod-1.tail544547.ts.net
+VITE_BACKEND_URL ?= https://ircfiber-ovh.tail544547.ts.net
 
 ifeq ($(BACKEND),tailnet)
-  EFFECTIVE_BACKEND_URL := https://ircfiber-prod-1.tail544547.ts.net
+  EFFECTIVE_BACKEND_URL := https://ircfiber-ovh.tail544547.ts.net
 else ifeq ($(BACKEND),local)
   EFFECTIVE_BACKEND_URL := http://127.0.0.1:8090
 else
@@ -147,10 +147,10 @@ AR := →
 
 # Default backend for `make dev` / `make dev-live`
 BACKEND ?= local
-VITE_BACKEND_URL ?= https://ircfiber-prod-1.tail544547.ts.net
+VITE_BACKEND_URL ?= https://ircfiber-ovh.tail544547.ts.net
 
 ifeq ($(BACKEND),tailnet)
-  EFFECTIVE_BACKEND_URL := https://ircfiber-prod-1.tail544547.ts.net
+  EFFECTIVE_BACKEND_URL := https://ircfiber-ovh.tail544547.ts.net
 else ifeq ($(BACKEND),local)
   EFFECTIVE_BACKEND_URL := http://127.0.0.1:8090
 else
@@ -1072,7 +1072,7 @@ sync-redis-to-tailnet: ## Data > Sync only local Redis → tailnet
 # Deploy — incremental remote builds via Ansible + SSH
 # ----------------------------------------------------------------------------
 #
-# Targets your production tailnet host (ircfiber-prod-1) using the ansible
+# Targets your production tailnet host (ircfiber-ovh) using the ansible
 # playbooks in deploy/. All deploy commands run from the deploy/ directory.
 #
 # Vault: by default prompts for the vault password. Set VAULT_PASS_FILE
