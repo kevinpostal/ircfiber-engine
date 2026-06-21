@@ -84,16 +84,26 @@ image_prune_keep_count: 3
 # The directory containing the IRC Fiber repo (with Containerfile, source/, public/, views/)
 # Playbooks live in deploy/playbooks/, so the repo root is two levels up.
 ircfiber_repo_root: "{{ playbook_dir }}/../.."
-ircfiber_containerfile: "Containerfile"
 ircfiber_build_target: "release"
 
-# Computed image reference. Used by ircfiber_image, gateway, engine, and update.
-# With a registry: "ghcr.io/me/irc-fiber:0.3.0".
-# Without a registry: "kevindpostal/irc-fiber:0.3.0" (local docker).
-ircfiber_image_name: >-
+# Gateway image (D / full app)
+ircfiber_gateway_containerfile: "Containerfile"
+ircfiber_gateway_build_args:
+  LDC_VERSION: "1.41.0"
+  TARGETARCH: "{{ 'amd64' if ansible_architecture == 'x86_64' else ('arm64' if ansible_architecture == 'aarch64' else ansible_architecture) }}"
+ircfiber_gateway_image_name: >-
   {{ (docker_registry_url + '/' if (docker_registry_url | length > 0) else '')
-     + docker_registry_namespace + '/irc-fiber' }}
-ircfiber_image_full: "{{ ircfiber_image_name }}:{{ docker_image_tag }}"
+     + docker_registry_namespace + '/irc-fiber-gateway' }}
+ircfiber_gateway_image_full: "{{ ircfiber_gateway_image_name }}:{{ docker_image_tag }}"
+
+# Engine image (Zig)
+ircfiber_engine_containerfile: "Containerfile.zig"
+ircfiber_engine_build_args:
+  TARGETARCH: "{{ 'amd64' if ansible_architecture == 'x86_64' else ('arm64' if ansible_architecture == 'aarch64' else ansible_architecture) }}"
+ircfiber_engine_image_name: >-
+  {{ (docker_registry_url + '/' if (docker_registry_url | length > 0) else '')
+     + docker_registry_namespace + '/ircfiber-engine' }}
+ircfiber_engine_image_full: "{{ ircfiber_engine_image_name }}:{{ docker_image_tag }}"
 
 # --- Engine defaults ----------------------------------------------------------
 # These can be overridden in host_vars for additional engines

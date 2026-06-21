@@ -18,7 +18,7 @@
 
 - name: Pull irc-fiber image (registry configured)
   community.docker.docker_image:
-    name: "{{ ircfiber_image_full }}"
+    name: "{{ ircfiber_gateway_image_full }}"
     source: pull
     state: present
   when: docker_registry_url | length > 0
@@ -59,7 +59,7 @@
 - name: Run ircfiber-gateway
   community.docker.docker_container:
     name: "{{ gateway_container_name }}"
-    image: "{{ ircfiber_image_full }}"
+    image: "{{ ircfiber_gateway_image_full }}"
     state: started
     restart_policy: unless-stopped
     command: ["/app/irc-fiber"]

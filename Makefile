@@ -576,7 +576,43 @@ frontend-install: ## Build > Install Svelte frontend dependencies
 build-engine: ## Build > Build the IRC engine binary
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building IRC Fiber Engine  $(R)"
 	@bash -o pipefail -c '$(DUB) build --config=engine 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | tail -8'
+<<<<<<< HEAD
 	@printf '\n%b\n' "$(BG)$(OK) Engine build successful$(R)"
+=======
+	@printf '\n%b\n' "$(BG)$(OK) Engine build successful (D)$(R)"
+
+build-engine-zig-alpine: ## Build > Cross-compile Zig engine for Alpine (musl) — full modular build
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building Zig Engine (Alpine target)  $(R)"
+	@mkdir -p engine/zig-out/bin
+	@zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe --cache-dir engine/.zig-cache
+	@cp zig-out/bin/ircfiber-engine engine/zig-out/bin/ircfiber-engine
+	@printf '%b\n' "$(BG)$(OK) Zig engine built for Alpine$(R) $(D)($(shell ls -lh engine/zig-out/bin/ircfiber-engine | awk '{print $$5}'))$(R)"
+
+build-engine-native: ## Build > Build Zig engine for local testing (macOS)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building Zig Engine (native)  $(R)"
+	@mkdir -p engine/zig-out/bin
+	@cd engine && zig build-exe src/core.zig src/redis_registration.c -O Debug -femit-bin=ircfiber-engine -lc
+	@printf '%b\n' "$(BG)$(OK) Zig engine built (native)$(R)"
+
+engine-test-local: build-engine-native ## Test > Run Zig engine against local Redis + IRC
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Testing Zig Engine locally  $(R)"
+	@printf '%b\n' "$(D)  Ensure redis-server is running locally (brew services start redis)$(R)"
+	@cd engine && timeout 5 ./ircfiber-engine 2>&1 || true
+	@redis-cli SMEMBERS irc:servers 2>&1
+	@redis-cli HGET irc:server:ovh isHealthy 2>&1
+	@redis-cli HGET irc:server:ovh lastHeartbeat 2>&1
+	@redis-cli DEL irc:server:ovh 2>&1
+	@redis-cli SREM irc:servers ovh 2>&1
+	@printf '%b\n' "$(BG)$(OK) Local test complete$(R)"
+
+build-engine-zig: ## Build > Build Zig engine for all targets
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building IRC Fiber Engine (Zig)  $(R)"
+	@cd engine && zig build -Doptimize=ReleaseSafe
+	@cd engine && zig build-exe src/core.zig -target x86_64-linux-musl -O ReleaseSafe -femit-bin=zig-out/bin/ircfiber-engine-alpine -lc
+	@cd engine && zig build-exe src/core.zig -target x86_64-linux-gnu -O ReleaseSafe -femit-bin=zig-out/bin/ircfiber-engine-linux -lc
+	@printf '\n%b\n' "$(D)  Targets: macOS (native) + Linux (glibc) + Linux (musl/Alpine)$(R)"
+	@printf '\n%b\n' "$(BG)$(OK) Zig engine build successful$(R)"
+>>>>>>> cbc20c0 (feat: restore Dlang engine, archive Zig engine experiment)
 
 build-release: ## Build > Optimized release build
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building IRC Fiber (Release)  $(R)"
@@ -1064,12 +1100,52 @@ _vault_arg = $(if $(VAULT_PASS_FILE),--vault-password-file $(VAULT_PASS_FILE),--
 _target     = $(or $(TARGET),ircfiber-prod-1)
 _playbook   = cd deploy && ansible-playbook -l $(_target) $(_vault_arg)
 
+<<<<<<< HEAD
 # Fast hot path: rsync source → persistent builder container with named
 # dub cache volume. Only changed .d files recompile. LDC stays in the
 # builder image (no re-download). ~5-15s after warm dub cache.
 update: ## Deploy > Fast incremental deploy (persistent builder + dub cache)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Incremental deploy → $(_target)  $(R)"
 	@$(_playbook) playbooks/deploy-update.yml
+=======
+# Fast hot path: build once on the gateway host, then deploy engine binaries
+# to every target host. For single-host use: TARGET=ircfiber-ovh make update.
+# Uses phased rollout: primary host first, then remaining hosts in parallel.
+update: build-engine ## Deploy > Build once, deploy engine to ALL hosts (phased per-host)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  IRC Fiber — Enterprise Deploy  $(R)"
+	@printf '%b\n' "$(D)  Target(s): $(_target)$(R)"
+	@printf '%b\n' "$(D)  Date:      $(shell date '+%Y-%m-%d %H:%M:%S')$(R)"
+	@printf '%b\n' "$(D)  Strategy:  Zig engine cross-compiled → Build D gateway on VPS → distribute all$(R)"
+	@printf '%b\n' "$(D)  ─────────────────────────────────────────$(R)"
+	@printf '\n'
+	@START=$$(date +%s); \
+	$(_playbook) playbooks/deploy-update.yml; \
+	_EXIT=$$?; \
+	_END=$$(date +%s); \
+	_WALL=$$(( _END - START )); \
+	echo ""; \
+	echo "  ════════════════════════════"; \
+	echo "  Build Phase (from builder)"; \
+	echo "  ────────────────────────────"; \
+	ssh deploy@ircfiber-ovh 'cat /tmp/ircfiber-deploy/.deploy-times 2>/dev/null' 2>/dev/null || true; \
+	echo "  ────────────────────────────"; \
+	printf "  Wall clock:              %02d:%02d\n" $$(( _WALL / 60 )) $$(( _WALL % 60 )); \
+	echo "  ════════════════════════════"; \
+	echo ""; \
+	if [ $$_EXIT -eq 0 ]; then \
+	  echo "  ✓  Deploy complete — all hosts updated"; \
+	  echo ""; \
+	  echo "  Rollback if needed:"; \
+	  echo "    make rollback"; \
+	  echo "    make rollback TARGET=ircfiber-backup-1"; \
+	  echo "    make rollback TS=20260620T001652Z  (specific archive)"; \
+	else \
+	  echo "  ✗  Deploy FAILED (exit code $$_EXIT)"; \
+	  echo "     Check logs on the affected host and retry."; \
+	fi; \
+	echo ""; \
+	exit $$_EXIT
+>>>>>>> cbc20c0 (feat: restore Dlang engine, archive Zig engine experiment)
 
 # Alias: fast path is the default
 update-fast: update ## Deploy > Force hot path (same as `make update`)

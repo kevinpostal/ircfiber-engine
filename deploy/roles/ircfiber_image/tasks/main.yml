@@ -1,38 +1,56 @@
 ---
 # ircfiber_image role.
 #
-# Two build strategies:
-#   - With a configured registry: build on the Ansible control node, push
-#     to the registry. Target hosts pull.
-#   - Without a registry: build directly on each target host, since the
-#     image needs to exist in the target's local docker daemon.
+# Builds two images:
+#   - irc-fiber-gateway  (D, from Containerfile)
+#   - ircfiber-engine    (Zig, from Containerfile.zig)
+#
+# Strategies:
+#   - With a registry: build on the Ansible control node, push, target pulls.
+#   - Without a registry: build directly on each target host.
 
 # ---- Preflight (always on the control node) --------------------------------
-- name: Preflight — verify Containerfile exists
+- name: Preflight — verify gateway Containerfile exists
   ansible.builtin.stat:
-    path: "{{ ircfiber_repo_root }}/{{ ircfiber_containerfile }}"
-  register: containerfile_check
+    path: "{{ ircfiber_repo_root }}/{{ ircfiber_gateway_containerfile }}"
+  register: gateway_containerfile_check
   delegate_to: localhost
   become: false
   run_once: true
 
-- name: Fail if Containerfile missing
+- name: Preflight — verify engine Containerfile exists
+  ansible.builtin.stat:
+    path: "{{ ircfiber_repo_root }}/{{ ircfiber_engine_containerfile }}"
+  register: engine_containerfile_check
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Fail if gateway Containerfile missing
   ansible.builtin.fail:
-    msg: "Containerfile not found at {{ ircfiber_repo_root }}/{{ ircfiber_containerfile }}"
-  when: not containerfile_check.stat.exists
+    msg: "Gateway Containerfile not found at {{ ircfiber_repo_root }}/{{ ircfiber_gateway_containerfile }}"
+  when: not gateway_containerfile_check.stat.exists
   delegate_to: localhost
   become: false
   run_once: true
 
-# ---- With registry: build on control node, push ----------------------------
-- name: Build irc-fiber image on the control node
+- name: Fail if engine Containerfile missing
+  ansible.builtin.fail:
+    msg: "Engine Containerfile not found at {{ ircfiber_repo_root }}/{{ ircfiber_engine_containerfile }}"
+  when: not engine_containerfile_check.stat.exists
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+# ---- With registry: build gateway image on control node, push --------------
+- name: Build gateway image on the control node
   community.docker.docker_image:
-    name: "{{ ircfiber_image_name }}"
+    name: "{{ ircfiber_gateway_image_name }}"
     tag: "{{ docker_image_tag }}"
     build:
       path: "{{ ircfiber_repo_root }}"
-      dockerfile: "{{ ircfiber_containerfile }}"
-      args: "{{ ircfiber_build_args }}"
+      dockerfile: "{{ ircfiber_gateway_containerfile }}"
+      args: "{{ ircfiber_gateway_build_args }}"
       pull: "{{ ircfiber_build_pull }}"
     source: build
     force_source: "{{ ircfiber_force_rebuild }}"
@@ -43,10 +61,10 @@
   run_once: true
   when: docker_registry_url | length > 0
 
-- name: Tag image as latest
+- name: Tag gateway image as latest
   community.docker.docker_image:
-    name: "{{ ircfiber_image_name }}:{{ docker_image_tag }}"
-    repository: "{{ ircfiber_image_name }}:latest"
+    name: "{{ ircfiber_gateway_image_name }}:{{ docker_image_tag }}"
+    repository: "{{ ircfiber_gateway_image_name }}:latest"
     source: local
     force_tag: true
     state: present
@@ -55,9 +73,50 @@
   run_once: true
   when: docker_registry_url | length > 0
 
-- name: Push latest tag
+- name: Push gateway latest tag
   community.docker.docker_image:
-    name: "{{ ircfiber_image_name }}:latest"
+    name: "{{ ircfiber_gateway_image_name }}:latest"
+    push: true
+    source: local
+  delegate_to: localhost
+  become: false
+  run_once: true
+  when: docker_registry_url | length > 0
+
+# ---- With registry: build engine image on control node, push ---------------
+- name: Build engine image on the control node
+  community.docker.docker_image:
+    name: "{{ ircfiber_engine_image_name }}"
+    tag: "{{ docker_image_tag }}"
+    build:
+      path: "{{ ircfiber_repo_root }}"
+      dockerfile: "{{ ircfiber_engine_containerfile }}"
+      args: "{{ ircfiber_engine_build_args }}"
+      pull: "{{ ircfiber_build_pull }}"
+    source: build
+    force_source: "{{ ircfiber_force_rebuild }}"
+    push: true
+    state: present
+  delegate_to: localhost
+  become: false
+  run_once: true
+  when: docker_registry_url | length > 0
+
+- name: Tag engine image as latest
+  community.docker.docker_image:
+    name: "{{ ircfiber_engine_image_name }}:{{ docker_image_tag }}"
+    repository: "{{ ircfiber_engine_image_name }}:latest"
+    source: local
+    force_tag: true
+    state: present
+  delegate_to: localhost
+  become: false
+  run_once: true
+  when: docker_registry_url | length > 0
+
+- name: Push engine latest tag
+  community.docker.docker_image:
+    name: "{{ ircfiber_engine_image_name }}:latest"
     push: true
     source: local
   delegate_to: localhost
@@ -66,8 +125,6 @@
   when: docker_registry_url | length > 0
 
 # ---- Without registry: build on each target host ---------------------------
-# Need the source on the target. We rsync from control node first.
-# synchronize's "dest" is on the target host and "src" is on the control node.
 - name: Rsync irc-fiber repo to the target host (no-registry mode)
   ansible.posix.synchronize:
     src: "{{ ircfiber_repo_root }}/"
@@ -81,16 +138,47 @@
       - "--exclude=deploy"
       - "--exclude=e2e/test-results"
       - "--exclude=*.log"
+      - "--exclude=frontend/node_modules"
+      - "--exclude=.reasonix"
+      - "--exclude=.playwright-mcp"
+      - "--exclude=test-results"
+      - "--exclude=e2e/test-results"
+      - "--exclude=*.log"
+      - "--exclude=.worktrees"
   when: docker_registry_url | length == 0
   throttle: 1
 
-- name: Build irc-fiber image on the target host (no-registry mode)
+- name: Build gateway image on the target host (no-registry mode)
   ansible.builtin.command: >
     docker build
+<<<<<<< HEAD
     --tag {{ ircfiber_image_full }}
     --build-arg LDC_VERSION={{ ircfiber_build_args.LDC_VERSION }}
     --build-arg TARGETARCH={{ ircfiber_build_args.TARGETARCH }}
     -f /opt/ircfiber-src/{{ ircfiber_containerfile }}
+=======
+    --progress=plain
+    --tag {{ ircfiber_gateway_image_full }}
+    {% for key, value in ircfiber_gateway_build_args.items() %}
+    --build-arg {{ key }}={{ value }}
+    {% endfor %}
+    -f /opt/ircfiber-src/{{ ircfiber_gateway_containerfile }}
+    /opt/ircfiber-src
+  args:
+    chdir: /opt/ircfiber-src
+  changed_when: true
+  when: docker_registry_url | length == 0
+
+- name: Build engine image on the target host (no-registry mode)
+  ansible.builtin.command: >
+    docker build
+    --progress=plain
+    --tag {{ ircfiber_engine_image_full }}
+    {% for key, value in ircfiber_engine_build_args.items() %}
+    --build-arg {{ key }}={{ value }}
+    {% endfor %}
+    -f /opt/ircfiber-src/{{ ircfiber_engine_containerfile }}
+>>>>>>> cbc20c0 (feat: restore Dlang engine, archive Zig engine experiment)
     /opt/ircfiber-src
   args:
     chdir: /opt/ircfiber-src
@@ -98,10 +186,18 @@
   when: docker_registry_url | length == 0
 
 # ---- Report ----------------------------------------------------------------
-- name: Show resulting image on target
+- name: Show resulting gateway image on target
   ansible.builtin.command: >-
-    docker images {{ ircfiber_image_full }}
+    docker images {{ ircfiber_gateway_image_full }}
     --format '{{ "{{" }}.Repository{{ "}}" }}:{{ "{{" }}.Tag{{ "}}" }} -> {{ "{{" }}.ID{{ "}}" }}'
-  register: image_inventory
+  register: gateway_image_inventory
+  changed_when: false
+  become: false
+
+- name: Show resulting engine image on target
+  ansible.builtin.command: >-
+    docker images {{ ircfiber_engine_image_full }}
+    --format '{{ "{{" }}.Repository{{ "}}" }}:{{ "{{" }}.Tag{{ "}}" }} -> {{ "{{" }}.ID{{ "}}" }}'
+  register: engine_image_inventory
   changed_when: false
   become: false

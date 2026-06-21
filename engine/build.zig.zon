@@ -1,0 +1,21 @@
+.{
+    .name = .ircfiber_engine,
+    .version = "0.2.0",
+    .fingerprint = 0x1635557daf627b2b,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .zircon = .{
+            .url = "https://github.com/vascocosta/zircon/archive/06800b4b9d235bc83b40a9b1f89c0eb1e1ace8db.tar.gz",
+            .hash = "zircon-0.7.0-_NQ2hUvlAACBzvjECSLJfRAhlzBoNfoV3HUEJCE4VCt5",
+        },
+        .tls = .{
+            .url = "https://github.com/ianic/tls.zig/archive/fe60069.tar.gz",
+            .hash = "tls-0.1.0-ER2e0kOpBQCRFI5ZJTlpYIKYTkYM5eNvBBkBf9MZteut",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

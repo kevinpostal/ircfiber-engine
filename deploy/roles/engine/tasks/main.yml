@@ -23,9 +23,9 @@
       {{ hostvars[groups['ircfiber_backend'][0]]['host_tailscale_ip']
          | default(host_tailscale_ip) }}
 
-- name: Pull irc-fiber image (registry configured)
+- name: Pull ircfiber-engine image (registry configured)
   community.docker.docker_image:
-    name: "{{ ircfiber_image_full }}"
+    name: "{{ ircfiber_engine_image_full }}"
     source: pull
     state: present
   when: docker_registry_url | length > 0
@@ -52,10 +52,10 @@
 - name: Run ircfiber-engine
   community.docker.docker_container:
     name: "{{ engine_container_name }}"
-    image: "{{ ircfiber_image_full }}"
+    image: "{{ ircfiber_engine_image_full }}"
     state: started
     restart_policy: unless-stopped
-    command: ["/app/irc-fiber-engine"]
+    command: ["/app/ircfiber-engine"]
     networks:
       - name: "{{ docker_ircfiber_network }}"
     env_file: "/etc/ircfiber/engine/env-{{ ircfiber_engine_id }}"
@@ -64,7 +64,7 @@
     ulimits:
       - "nofile:65536:65536"
     healthcheck:
-      test: ["CMD-SHELL", "pidof irc-fiber-engine || exit 1"]
+      test: ["CMD-SHELL", "pidof ircfiber-engine || exit 1"]
       interval: "{{ engine_healthcheck_interval }}"
       timeout: "{{ engine_healthcheck_timeout }}"
       retries: "{{ engine_healthcheck_retries }}"

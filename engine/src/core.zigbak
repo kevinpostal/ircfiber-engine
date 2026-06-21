@@ -1,0 +1,243 @@
+const std = @import("std");
+const mem = std.mem;
+const posix = std.posix;
+
+fn setNoDelay(sock: posix.socket_t) void {
+    const flag: i32 = 1;
+    posix.setsockopt(sock, 6, 1, &flag, @sizeOf(i32)) catch {};
+}
+
+fn setBlocking(sock: posix.socket_t) void {
+    const fl = posix.fcntl(sock, posix.F.GETFL, 0) catch return;
+    _ = posix.fcntl(sock, posix.F.SETFL, fl & ~@as(u32, posix.O.NONBLOCK)) catch {};
+}
+
+pub const Transport = struct {
+    fd: posix.socket_t,
+    host: []const u8,
+    read_pos: usize = 0,
+
+    pub fn connect(host: []const u8, port: u16, timeout_ms: u64) !Transport {
+        const hints = std.net.Address.Lookup{ .address_family = .ipv4 };
+        const addrs = try std.net.Address.lookup(host, port, hints);
+        for (addrs) |a| {
+            const sock = try posix.socket(a.any.family, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
+            errdefer posix.close(sock);
+            setNoDelay(sock);
+            _ = posix.connect(sock, &a.any, a.getOsSockLen()) catch |err| {
+                if (err != error.WouldBlock and err != error.InProgress) return err;
+                var pf = [1]posix.pollfd{.{.fd = sock, .events = posix.POLL.OUT, .revents = 0}};
+                if (posix.poll(&pf, @intCast(timeout_ms)) catch 0 == 0) return error.Timeout;
+                var e: i32 = 0;
+                var l: posix.socklen_t = @sizeOf(i32);
+                posix.getsockopt(sock, 1, 4, &e, &l) catch return error.SocketError;
+                if (e != 0) return error.ConnectionRefused;
+                setBlocking(sock);
+                return Transport{ .fd = sock, .host = host };
+            };
+        }
+        return error.HostNotFound;
+    }
+
+    pub fn adopt(raw_fd: posix.socket_t, host: []const u8) Transport {
+        setBlocking(raw_fd);
+        setNoDelay(raw_fd);
+        return Transport{ .fd = raw_fd, .host = host };
+    }
+
+    pub fn readLine(self: *Transport, buf: []u8, timeout_ms: u64) !?[]u8 {
+        const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+        while (true) {
+            if (mem.indexOfScalar(u8, buf[0..self.read_pos], '\n')) |idx| {
+                const line = buf[0..idx];
+                const rest = self.read_pos - idx - 1;
+                if (rest > 0) @memcpy(buf[0..rest], buf[idx + 1 .. self.read_pos]);
+                self.read_pos = rest;
+                return if (line.len > 0 and line[line.len - 1] == '\r') line[0 .. line.len - 1] else line;
+            }
+            if (self.read_pos >= buf.len) return error.BufferFull;
+            const now = std.time.milliTimestamp();
+            if (now >= deadline) return null;
+            var pf = [1]posix.pollfd{.{.fd = self.fd, .events = posix.POLL.IN, .revents = 0}};
+            var ms = deadline - now;
+            if (ms < 1) ms = 1;
+            _ = posix.poll(&pf, @intCast(ms)) catch {};
+            const n = posix.read(self.fd, buf[self.read_pos..]) catch |err| {
+                if (err == error.WouldBlock) continue;
+                return error.ConnectionLost;
+            };
+            if (n == 0) return error.ConnectionClosed;
+            self.read_pos += n;
+        }
+    }
+
+    pub fn writeLine(self: *const Transport, data: []const u8) !void {
+        var b: [8192]u8 = undefined;
+        const max = b.len - 2;
+        const d = if (data.len > max) data[0..max] else data;
+        @memcpy(b[0..d.len], d);
+        b[d.len] = '\r';
+        b[d.len + 1] = '\n';
+        _ = try posix.write(self.fd, b[0 .. d.len + 2]);
+    }
+
+    pub fn close(self: *Transport) void {
+        posix.close(self.fd);
+    }
+};
+
+pub const IrcEvent = struct {
+    prefix: ?[]const u8 = null,
+    command: []const u8 = "",
+    params: [][]const u8 = &.{},
+    trailing: ?[]const u8 = null,
+
+    pub fn parse(line: []const u8) IrcEvent {
+        var ev = IrcEvent{};
+        var pos: usize = 0;
+        if (pos < line.len and line[pos] == ':') {
+            pos += 1;
+            const end = mem.indexOfScalarPos(u8, line, pos, ' ') orelse line.len;
+            ev.prefix = line[pos..end];
+            pos = end;
+        }
+        while (pos < line.len and line[pos] == ' ') pos += 1;
+        const cs = pos;
+        while (pos < line.len and line[pos] != ' ') pos += 1;
+        ev.command = line[cs..pos];
+        var pl = std.ArrayList([]const u8).init(std.heap.page_allocator);
+        while (pos < line.len) {
+            while (pos < line.len and line[pos] == ' ') pos += 1;
+            if (pos >= line.len) break;
+            if (line[pos] == ':') { ev.trailing = line[pos + 1 ..]; break; }
+            const s = pos;
+            while (pos < line.len and line[pos] != ' ') pos += 1;
+            pl.append(line[s..pos]) catch {};
+        }
+        ev.params = pl.items;
+        return ev;
+    }
+
+    pub fn nick(self: IrcEvent) ?[]const u8 {
+        const p = self.prefix orelse return null;
+        const bang = mem.indexOfScalar(u8, p, '!');
+        return if (bang) |i| p[0..i] else p;
+    }
+};
+
+pub const IrcConnection = struct {
+    allocator: mem.Allocator,
+    transport: Transport,
+    nick: []const u8,
+    host: []const u8,
+    nw_id: []const u8,
+
+    pub fn new(allocator: mem.Allocator, host: []const u8, port: u16, nick: []const u8, nw_id: []const u8) !IrcConnection {
+        const t = try Transport.connect(host, port, 10000);
+        return IrcConnection{ .allocator = allocator, .transport = t, .nick = try allocator.dupe(u8, nick), .host = try allocator.dupe(u8, host), .nw_id = try allocator.dupe(u8, nw_id) };
+    }
+
+    pub fn adopt(allocator: mem.Allocator, fd: posix.socket_t, host: []const u8, nick: []const u8, nw_id: []const u8) IrcConnection {
+        const t = Transport.adopt(fd, host);
+        return IrcConnection{ .allocator = allocator, .transport = t, .nick = allocator.dupe(u8, nick) catch unreachable, .host = allocator.dupe(u8, host) catch unreachable, .nw_id = allocator.dupe(u8, nw_id) catch unreachable };
+    }
+};
+
+pub const ConnectionManager = struct {
+    allocator: mem.Allocator,
+    connections: std.ArrayList(IrcConnection),
+
+    pub fn init(allocator: mem.Allocator) ConnectionManager {
+        return ConnectionManager{ .allocator = allocator, .connections = std.ArrayList(IrcConnection).init(allocator) };
+    }
+
+    pub fn add(self: *ConnectionManager, conn: IrcConnection) !void {
+        try self.connections.append(conn);
+    }
+
+    pub fn collectFDs(self: *ConnectionManager, out: []posix.socket_t) usize {
+        var count: usize = 0;
+        for (self.connections.items) |*c| {
+            if (count >= out.len) break;
+            out[count] = c.transport.fd;
+            count += 1;
+        }
+        return count;
+    }
+};
+
+pub const Reload = struct {
+    pub fn serve(fds: []const posix.socket_t, path: []const u8) !void {
+        _ = posix.unlink(path);
+        const sock = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        defer posix.close(sock);
+        var addr = posix.sockaddr.un{ .path = undefined };
+        addr.family = posix.AF.UNIX;
+        @memcpy(addr.path[0..@min(path.len, 107)], path);
+        try posix.bind(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.un));
+        try posix.listen(sock, 1);
+        var pf = [1]posix.pollfd{.{.fd = sock, .events = posix.POLL.IN, .revents = 0}};
+        _ = posix.poll(&pf, 30000);
+        const client = try posix.accept(sock, null, null, 0);
+        defer posix.close(client);
+        var b: [16]u8 = undefined;
+        _ = try posix.read(client, &b);
+        const dummy: u8 = 0;
+        var iov = [1]posix.iovec{.{.iov_base = @constCast(@ptrCast(&dummy)), .iov_len = 1}};
+        var cbuf: [4096]u8 = undefined;
+        const hdr: *align(@alignOf(posix.cmsghdr)) posix.cmsghdr = @ptrCast(&cbuf[0]);
+        const fd_bytes = fds.len * @sizeOf(posix.socket_t);
+        hdr.cmsg_len = @intCast(@sizeOf(posix.cmsghdr) + fd_bytes);
+        hdr.cmsg_level = 1;
+        hdr.cmsg_type = 1;
+        const dst: [*]posix.socket_t = @ptrCast(@alignCast(hdr + 1));
+        for (fds, 0..) |fd, i| dst[i] = fd;
+        var msg = posix.msghdr{ .msg_iov = &iov, .msg_iovlen = 1, .msg_control = &cbuf, .msg_controllen = @intCast(@sizeOf(posix.cmsghdr) + fd_bytes) };
+        _ = try posix.sendmsg(client, &msg, 0);
+    }
+
+    pub fn receive(path: []const u8) ![]posix.socket_t {
+        const sock = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        defer posix.close(sock);
+        var addr = posix.sockaddr.un{ .path = undefined };
+        addr.family = posix.AF.UNIX;
+        @memcpy(addr.path[0..@min(path.len, 107)], path);
+        try posix.connect(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.un));
+        _ = try posix.write(sock, "READY\n");
+        const dummy: u8 = 0;
+        var iov = [1]posix.iovec{.{.iov_base = @constCast(@ptrCast(&dummy)), .iov_len = 1}};
+        var cbuf: [4096]u8 = undefined;
+        var msg = posix.msghdr{ .msg_iov = &iov, .msg_iovlen = 1, .msg_control = &cbuf, .msg_controllen = cbuf.len };
+        _ = posix.recvmsg(sock, &msg, 0);
+        const hdr: *align(@alignOf(posix.cmsghdr)) posix.cmsghdr = @ptrCast(&cbuf[0]);
+        const fd_count = (hdr.cmsg_len - @sizeOf(posix.cmsghdr)) / @sizeOf(posix.socket_t);
+        const src: [*]posix.socket_t = @ptrCast(@alignCast(hdr + 1));
+        var result = try std.heap.page_allocator.alloc(posix.socket_t, fd_count);
+        for (0..fd_count) |i| result[i] = src[i];
+        return result;
+    }
+};
+
+pub fn main() !void {
+    std.debug.print("IRC Fiber Engine v0.2.0 — Zig\n", .{});
+    std.debug.print("PID {d}\n", .{posix.getpid()});
+    std.debug.print("  Transport.fd() exposes raw socket\n", .{});
+    std.debug.print("  Transport.adopt() wraps existing FD\n", .{});
+    std.debug.print("  Reload.serve/receive sends FDs via SCM_RIGHTS\n", .{});
+    std.debug.print("  Reload keeps TCP conn alive — no QUIT sent\n", .{});
+}
+
+test "parse 001" {
+    const ev = IrcEvent.parse(":server 001 nick :Welcome");
+    try std.testing.expectEqualStrings("001", ev.command);
+}
+
+test "parse ERROR" {
+    const ev = IrcEvent.parse("ERROR :Banned (Z-Lined)");
+    try std.testing.expectEqualStrings("Banned (Z-Lined)", ev.trailing.?);
+}
+
+test "parse PING" {
+    const ev = IrcEvent.parse("PING :cobalt.libera.chat");
+    try std.testing.expectEqualStrings("PING", ev.command);
+}

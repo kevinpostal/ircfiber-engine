@@ -1,8 +1,6 @@
 ---
-# Image name is now defined in group_vars/all.yml so it's visible to all roles.
-# Keeping build-args here since they're role-specific.
-ircfiber_build_args:
-  LDC_VERSION: "1.41.0"
-  TARGETARCH: "{{ 'amd64' if ansible_architecture == 'x86_64' else ('arm64' if ansible_architecture == 'aarch64' else ansible_architecture) }}"
+# Image names are defined in group_vars/all.yml so they are visible to all roles.
+# These defaults are used by the ircfiber_image role to build both the gateway
+# (D) and engine (Zig) images.
 ircfiber_build_pull: true
 ircfiber_force_rebuild: false
