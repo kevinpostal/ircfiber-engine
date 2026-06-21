@@ -40,6 +40,9 @@ COPY views/ ./views/
 COPY config/ ./config/
 COPY public/ ./public/
 
+# Cache buster — change with every deploy to force full recompile
+ARG CACHE_BUST=0
+
 RUN --mount=type=cache,target=/build/.dub dub build --compiler=ldc2 --build=release --force --parallel 2>&1 | tail -5
 RUN --mount=type=cache,target=/build/.dub dub build --config=engine --compiler=ldc2 --build=release --force --parallel 2>&1 | tail -5
 RUN strip /build/irc-fiber

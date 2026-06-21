@@ -163,7 +163,7 @@
       changed_when: true
 
     - name: Restore Mongo with --drop (scoped to ircfiber.*)
-      # Mongo binds ONLY to the Tailscale IP (100.107.178.48) with
+      # Mongo binds ONLY to the Tailscale IP (100.126.197.92) with
       # network_mode: host. So we must connect via --host=<tailscale_ip>
       # instead of defaulting to localhost (which mongo doesn't listen on).
       ansible.builtin.shell: >-
@@ -171,7 +171,7 @@
         docker exec {{ mongo_tailnet_container }}
         mongorestore --archive={{ dump_remote_path }}
         --drop --nsInclude='{{ mongo_db }}.*'
-        --host=100.107.178.48 --port=27017
+        --host=100.126.197.92 --port=27017
         --username={{ vault_mongo_root_username }}
         --password='{{ vault_mongo_root_password }}'
         --authenticationDatabase=admin

@@ -21,7 +21,7 @@ DUB_PKG     := $(HOME)/.dub/packages
 
 # Dev backend selection for `make run` / `make start` / `make dev`.
 # Default is `tailnet` — points the Vite dev server at the tailnet
-# gateway (https://ircfiber-ovh.tail544547.ts.net). Override per-call:
+# gateway (https://ircfiber-ovh-1.tail544547.ts.net). Override per-call:
 #
 #   make run                      # tailnet (default)
 #   make run-tailnet              # explicit tailnet
@@ -31,10 +31,10 @@ DUB_PKG     := $(HOME)/.dub/packages
 #
 # For the D backend runner (the previous `make run`), use `make run-gateway`.
 BACKEND ?= local
-VITE_BACKEND_URL ?= https://ircfiber-ovh.tail544547.ts.net
+VITE_BACKEND_URL ?= https://ircfiber-ovh-1.tail544547.ts.net
 
 ifeq ($(BACKEND),tailnet)
-  EFFECTIVE_BACKEND_URL := https://ircfiber-ovh.tail544547.ts.net
+  EFFECTIVE_BACKEND_URL := https://ircfiber-ovh-1.tail544547.ts.net
 else ifeq ($(BACKEND),local)
   EFFECTIVE_BACKEND_URL := http://127.0.0.1:8090
 else
@@ -147,10 +147,10 @@ AR := →
 
 # Default backend for `make dev` / `make dev-live`
 BACKEND ?= local
-VITE_BACKEND_URL ?= https://ircfiber-ovh.tail544547.ts.net
+VITE_BACKEND_URL ?= https://ircfiber-ovh-1.tail544547.ts.net
 
 ifeq ($(BACKEND),tailnet)
-  EFFECTIVE_BACKEND_URL := https://ircfiber-ovh.tail544547.ts.net
+  EFFECTIVE_BACKEND_URL := https://ircfiber-ovh-1.tail544547.ts.net
 else ifeq ($(BACKEND),local)
   EFFECTIVE_BACKEND_URL := http://127.0.0.1:8090
 else
@@ -158,8 +158,8 @@ else
 endif
 
 # Tailnet connection settings (used by debug-live)
-TAILNET_MONGO_URL ?= mongodb://ircfiber:MongoAppPass2026@100.107.178.48:27017/ircfiber
-TAILNET_REDIS_URL ?= redis://100.107.178.48:6379/0
+TAILNET_MONGO_URL ?= mongodb://ircfiber:jqgwEv3GJwwizulaj3Fnbd8imqcMH4Gh@100.126.197.92:27017/ircfiber
+TAILNET_REDIS_URL ?= redis://100.126.197.92:6379/0
 
 # Local docker connection settings (used by debug)
 LOCAL_MONGO_URL ?= mongodb://127.0.0.1:27017/ircfiber
@@ -1072,7 +1072,7 @@ sync-redis-to-tailnet: ## Data > Sync only local Redis → tailnet
 # Deploy — incremental remote builds via Ansible + SSH
 # ----------------------------------------------------------------------------
 #
-# Targets your production tailnet host (ircfiber-ovh) using the ansible
+# Targets your production tailnet host (ircfiber-ovh-1) using the ansible
 # playbooks in deploy/. All deploy commands run from the deploy/ directory.
 #
 # Vault: by default prompts for the vault password. Set VAULT_PASS_FILE
@@ -1093,8 +1093,9 @@ sync-redis-to-tailnet: ## Data > Sync only local Redis → tailnet
 
 # Vault pass: use file if set, otherwise ask on every invocation.
 _vault_arg = $(if $(VAULT_PASS_FILE),--vault-password-file $(VAULT_PASS_FILE),--ask-vault-pass)
-_target     = $(or $(TARGET),ircfiber-ovh)
-_playbook   = cd deploy && ansible-playbook -l $(_target) $(_vault_arg)
+_target      = $(or $(TARGET),ircfiber-ovh-1)
+_target_ssh   = $(or $(TARGET_SSH),40.160.227.49)
+_playbook    = cd deploy && ansible-playbook -l $(_target) $(_vault_arg)
 
 update: build-engine ## Deploy > Build D engine, deploy to all hosts
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Deploy → $(_target)  $(R)"
@@ -1121,9 +1122,9 @@ deploy: update-full ## Deploy > Alias for update-full
 # The gateway reads these files from disk at request time, so no binary
 # change, no container restart, no reconnect. ~2-3s after build.
 update-assets: frontend ## Deploy > Build frontend + push public/* to running gateway (no restart)
-	@printf '\n%b\n' "$(_BC)$(K)$(B)  Asset push → $(_target)  $(R)"
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Asset push → $(_target_ssh) ($(_target))  $(R)"
 	@printf '%b\n' "$(D)  Tarring public/ → ssh → docker exec tar -xf -$(R)"
-	@tar cz -C public . | ssh deploy@$(_target) 'docker exec -i ircfiber-gateway tar xzf - -C /app/public'
+	@tar cz -C public . | ssh deploy@$(_target_ssh) 'docker exec -i ircfiber-gateway tar xzf - -C /app/public'
 
 # Show running container images and versions on the target.
 update-status: ## Deploy > Show running containers & image versions
@@ -1133,8 +1134,8 @@ update-status: ## Deploy > Show running containers & image versions
 # Nuke BuildKit cache + builder image on the target.
 # Forces cold rebuild: full dub download + compile next update.
 update-clean: ## Deploy > Nuke BuildKit cache + builder image on target
-	@printf '\n%b\n' "$(_BY)$(K)$(B)  Cleaning builder cache → $(_target)  $(R)"
-	@ssh deploy@$(_target) 'docker rmi ircfiber-builder:latest 2>/dev/null; docker builder prune --force 2>/dev/null; echo "Builder cache cleared"'
+	@printf '\n%b\n' "$(_BY)$(K)$(B)  Cleaning builder cache → $(_target_ssh) ($(_target))  $(R)"
+	@ssh deploy@$(_target_ssh) 'docker rmi ircfiber-builder:latest 2>/dev/null; docker builder prune --force 2>/dev/null; echo "Builder cache cleared"'
 
 # ----------------------------------------------------------------------------
 # Cross Compilation

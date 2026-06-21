@@ -1,0 +1,27 @@
+---
+# Per-host overrides for ircfiber-ovh-1 (new OVH server)
+# Tailscale MagicDNS hostname: ircfiber-ovh-1.tail544547.ts.net
+# Tailscale IP: 100.126.197.92
+
+# --- Tailscale: native on the host -------------------------------------------
+tailscale_deploy_method: "native"
+tailscale_up_extra_args: "--ssh --accept-routes"
+
+# --- Engine -------------------------------------------------------------------
+ircfiber_engine_id: "ovh"
+ircfiber_engine_bind_address: "0.0.0.0"
+ircfiber_engine_admin_port: 8091
+
+# --- Caddy: extra public-facing hostnames ------------------------------------
+caddy_extra_serve_hosts:
+  - "ircfiber-ovh-1.tail544547.ts.net"
+
+# --- TLS ----------------------------------------------------------------------
+ircfiber_use_lets_encrypt: true
+
+# --- Cloudflare DNS -----------------------------------------------------------
+cloudflare_target_ip: "40.160.227.49"
+
+# --- Engine container name for deploy-update ----------------------------------
+# The playbook constructs: ircfiber-engine-{{ ircfiber_engine_id }}
+# So engine_id=ovh → container name: ircfiber-engine-ovh
