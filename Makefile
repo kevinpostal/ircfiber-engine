@@ -1093,12 +1093,18 @@ sync-redis-to-tailnet: ## Data > Sync only local Redis → tailnet
 
 # Vault pass: use file if set, otherwise ask on every invocation.
 _vault_arg = $(if $(VAULT_PASS_FILE),--vault-password-file $(VAULT_PASS_FILE),--ask-vault-pass)
-_target     = $(or $(TARGET),ircfiber-prod-1)
+_target     = $(or $(TARGET),ircfiber-ovh)
 _playbook   = cd deploy && ansible-playbook -l $(_target) $(_vault_arg)
 
 update: build-engine ## Deploy > Build D engine, deploy to all hosts
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Deploy → $(_target)  $(R)"
 	@$(_playbook) playbooks/deploy-update.yml
+
+# Deploy engine only to the backup server.
+# Usage: make update-backup VAULT_PASS_FILE=.vault_pass.txt
+update-backup: build-engine ## Deploy > Deploy engine to backup server (ircfiber-backup-1)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Deploy engine → ircfiber-backup-1  $(R)"
+	@cd deploy && ansible-playbook -l ircfiber-backup-1 $(if $(VAULT_PASS_FILE),--vault-password-file ../$(VAULT_PASS_FILE),--vault-password-file .vault_pass.txt) playbooks/deploy-update.yml
 
 # Alias: fast path is the default
 update-fast: update ## Deploy > Force hot path (same as `make update`)

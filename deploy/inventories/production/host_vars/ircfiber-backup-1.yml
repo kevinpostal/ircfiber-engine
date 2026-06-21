@@ -1,0 +1,17 @@
+---
+# Per-host overrides for ircfiber-backup-1 (backup engine host)
+# Tailscale MagicDNS hostname: ircfiber-backup-1.tail544547.ts.net
+# Tailscale IP: 100.107.178.48
+#
+# Backup IRC engine only (no gateway, no caddy, no public frontend).
+# Connected via Tailscale tailnet — all traffic goes over the encrypted
+# mesh to the OVH gateway.
+
+# --- Engine -------------------------------------------------------------------
+ircfiber_engine_id: "backup1"
+ircfiber_engine_bind_address: "0.0.0.0"
+ircfiber_engine_admin_port: 8091
+
+# --- Caddy: extra public-facing hostnames ------------------------------------
+# Backup engine has no public-facing web frontend.
+caddy_extra_serve_hosts: []

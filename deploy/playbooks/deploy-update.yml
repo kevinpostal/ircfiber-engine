@@ -22,7 +22,7 @@
 #   ansible-playbook playbooks/deploy-update.yml -l ircfiber-prod-1
 
 - name: Hot-path deploy
-  hosts: "{{ target | default('ircfiber_gw') }}"
+  hosts: "{{ target | default('ircfiber_gw:ircfiber_engines') }}"
   become: true
   gather_facts: false
 
@@ -80,6 +80,7 @@
         DOCKER_BUILDKIT=1 docker build \
           --target builder \
           --build-arg LDC_VERSION={{ ldc_version }} \
+          --build-arg CACHE_BUST=$(date +%s) \
           -t {{ builder_image }}:latest \
           -f {{ src_root }}/Containerfile \
           {{ src_root }} 2>&1
@@ -102,16 +103,42 @@
       args:
         executable: /bin/bash
 
+    # ── Inject views/admin/ into gateway ──────────────────────────
+    # Templates are compiled at request time, so they must be synced
+    # into the running container after build.
+    - name: Sync admin views into gateway container
+      ansible.builtin.shell: |
+        if docker container inspect {{ gateway_container }} >/dev/null 2>&1; then
+          docker cp {{ src_root }}/views/admin/. {{ gateway_container }}:/app/views/admin/
+          echo "Admin views synced"
+        else
+          echo "No gateway container, skipping view sync"
+        fi
+      args:
+        executable: /bin/bash
+      ignore_errors: true
+      changed_when: true
+
     # ── Inject + restart gateway ─────────────────────────────────────
+    # Skip if no gateway container exists on this host (engine-only hosts)
+    - name: Check if gateway container exists
+      ansible.builtin.shell: |
+        docker container inspect {{ gateway_container }} >/dev/null 2>&1 && echo yes || echo no
+      register: gw_exists
+      changed_when: false
+      ignore_errors: true
+
     - name: Inject gateway binary
       ansible.builtin.command:
         cmd: docker cp {{ gateway_binary }} {{ gateway_container }}:/app/irc-fiber
+      when: gw_exists.stdout == 'yes'
 
     - name: Restart gateway
       community.docker.docker_container:
         name: "{{ gateway_container }}"
         state: started
         restart: true
+      when: gw_exists.stdout == 'yes'
 
     # ── Inject + restart engine ──────────────────────────────────────
     - name: Inject engine binary
