@@ -119,6 +119,26 @@
       ignore_errors: true
       changed_when: true
 
+    # Non-admin views (login, register, index, layout, message_fragment)
+    # are compiled at request time, so they must be synced into the
+    # running container after build — same pattern as admin views.
+    - name: Sync non-admin views into gateway container
+      ansible.builtin.shell: |
+        if docker container inspect {{ gateway_container }} >/dev/null 2>&1; then
+          docker cp {{ src_root }}/views/login.dt    {{ gateway_container }}:/app/views/login.dt
+          docker cp {{ src_root }}/views/register.dt {{ gateway_container }}:/app/views/register.dt
+          docker cp {{ src_root }}/views/index.dt    {{ gateway_container }}:/app/views/index.dt
+          docker cp {{ src_root }}/views/layout.dt   {{ gateway_container }}:/app/views/layout.dt
+          docker cp {{ src_root }}/views/message_fragment.dt {{ gateway_container }}:/app/views/message_fragment.dt
+          echo "Non-admin views synced"
+        else
+          echo "No gateway container, skipping view sync"
+        fi
+      args:
+        executable: /bin/bash
+      ignore_errors: true
+      changed_when: true
+
     - name: Sync public assets into gateway container
       ansible.builtin.shell: |
         if docker container inspect {{ gateway_container }} >/dev/null 2>&1; then
@@ -237,10 +257,11 @@
         - sock_ready is succeeded
       register: handoff_launched
 
-    - name: Wait for handoff to complete (old engine exits)
+    - name: Wait for handoff done marker (old engine completed transfer)
       ansible.builtin.shell: |
+        marker="/tmp/ircfiber-handoff-done-{{ ircfiber_engine_id }}"
         for i in $(seq 1 120); do
-          if ! docker exec {{ engine_container }} kill -0 {{ _engine_pid }} 2>/dev/null; then
+          if docker exec {{ engine_container }} test -f "$marker" 2>/dev/null; then
             echo "HANDOFF_OK"
             exit 0
           fi
@@ -272,11 +293,17 @@
         - engine_info.exists
         - sock_ready is failed or (handoff_done is not skipped and handoff_done.stdout | default('') != 'HANDOFF_OK')
 
-    - name: Restart engine container (hard — closes IRC sockets)
+    - name: Restart engine container with tini (prevents PID-1-kills-container)
       community.docker.docker_container:
         name: "{{ engine_container }}"
+        image: "{{ ircfiber_engine_image_full | default('irc-fiber:latest') }}"
         state: started
-        restart: true
+        recreate: true
+        restart_policy: unless-stopped
+        command: ["/usr/bin/tini", "--", "/app/irc-fiber-engine"]
+        networks:
+          - name: "{{ docker_ircfiber_network | default('irc_network') }}"
+        env_file: "{{ engine_env_file | default('/etc/ircfiber/engine/env-' ~ ircfiber_engine_id) }}"
       when:
         - ircfiber_engine_id is defined
         - engine_info.exists
