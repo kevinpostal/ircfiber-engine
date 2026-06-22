@@ -96,8 +96,8 @@ ircfiber_gateway_image_name: >-
      + docker_registry_namespace + '/irc-fiber-gateway' }}
 ircfiber_gateway_image_full: "{{ ircfiber_gateway_image_name }}:{{ docker_image_tag }}"
 
-# Engine image (Zig)
-ircfiber_engine_containerfile: "Containerfile.zig"
+# Engine image (D — same Containerfile as gateway, builds both binaries)
+ircfiber_engine_containerfile: "Containerfile"
 ircfiber_engine_build_args:
   TARGETARCH: "{{ 'amd64' if ansible_architecture == 'x86_64' else ('arm64' if ansible_architecture == 'aarch64' else ansible_architecture) }}"
 ircfiber_engine_image_name: >-
