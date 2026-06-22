@@ -151,12 +151,6 @@
 - name: Build gateway image on the target host (no-registry mode)
   ansible.builtin.command: >
     docker build
-<<<<<<< HEAD
-    --tag {{ ircfiber_image_full }}
-    --build-arg LDC_VERSION={{ ircfiber_build_args.LDC_VERSION }}
-    --build-arg TARGETARCH={{ ircfiber_build_args.TARGETARCH }}
-    -f /opt/ircfiber-src/{{ ircfiber_containerfile }}
-=======
     --progress=plain
     --tag {{ ircfiber_gateway_image_full }}
     {% for key, value in ircfiber_gateway_build_args.items() %}
@@ -178,7 +172,6 @@
     --build-arg {{ key }}={{ value }}
     {% endfor %}
     -f /opt/ircfiber-src/{{ ircfiber_engine_containerfile }}
->>>>>>> cbc20c0 (feat: restore Dlang engine, archive Zig engine experiment)
     /opt/ircfiber-src
   args:
     chdir: /opt/ircfiber-src
