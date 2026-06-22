@@ -293,16 +293,11 @@
         - engine_info.exists
         - sock_ready is failed or (handoff_done is not skipped and handoff_done.stdout | default('') != 'HANDOFF_OK')
 
-    - name: Restart engine container with tini (prevents PID-1-kills-container)
+    - name: Restart engine container (hard — this deploy; handoff on next)
       community.docker.docker_container:
         name: "{{ engine_container }}"
         state: started
-        recreate: true
-        restart_policy: unless-stopped
-        command: ["/usr/bin/tini", "--", "/app/irc-fiber-engine"]
-        networks:
-          - name: "{{ docker_ircfiber_network | default('irc_network') }}"
-        env_file: "{{ engine_env_file | default('/etc/ircfiber/engine/env-' ~ ircfiber_engine_id) }}"
+        restart: true
       when:
         - ircfiber_engine_id is defined
         - engine_info.exists
