@@ -253,6 +253,7 @@
         - ircfiber_engine_id is defined
         - sock_ready is succeeded
       register: handoff_launched
+      ignore_errors: true
 
     - name: Wait for handoff done marker (old engine completed transfer)
       ansible.builtin.shell: |
