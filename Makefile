@@ -1221,6 +1221,8 @@ _playbook    = cd deploy && ansible-playbook -l $(_target) $(_vault_arg)
 update: frontend build build-engine ## Deploy > Build frontend + gateway + engine, handoff-deploy (zero disconnect for engines)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Deploy → $(_target)  $(R)"
 	@$(_playbook) playbooks/deploy-update.yml
+	@printf '%b\n' "$(D)  Syncing frontend dist → ircfiber-gateway$(R)"
+	@tar cz -C public/dist . | ssh deploy@$(_target_ssh) 'docker exec -i ircfiber-gateway tar xzf - -C /app/public/dist'
 
 # Deploy engine only to the backup server.
 # Usage: make update-backup VAULT_PASS_FILE=.vault_pass.txt

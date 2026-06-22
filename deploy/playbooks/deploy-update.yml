@@ -214,9 +214,9 @@
         cmd: docker exec {{ engine_container }} chmod +x /app/irc-fiber-engine-handoff
       when: ircfiber_engine_id is defined and engine_info.exists and old_pid_raw.rc == 0
 
-    - name: Remove stale handoff socket
+    - name: Remove stale handoff socket and done marker
       ansible.builtin.command:
-        cmd: docker exec {{ engine_container }} rm -f /tmp/ircfiber-handoff-{{ ircfiber_engine_id }}.sock
+        cmd: docker exec {{ engine_container }} rm -f /tmp/ircfiber-handoff-{{ ircfiber_engine_id }}.sock /tmp/ircfiber-handoff-done-{{ ircfiber_engine_id }}
       changed_when: false
       ignore_errors: true
       when: ircfiber_engine_id is defined and engine_info.exists and old_pid_raw.rc == 0
@@ -296,7 +296,6 @@
     - name: Restart engine container with tini (prevents PID-1-kills-container)
       community.docker.docker_container:
         name: "{{ engine_container }}"
-        image: "{{ ircfiber_engine_image_full | default('irc-fiber:latest') }}"
         state: started
         recreate: true
         restart_policy: unless-stopped
