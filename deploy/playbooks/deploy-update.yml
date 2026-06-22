@@ -249,7 +249,7 @@
       ansible.builtin.command:
         cmd: >
           docker exec -d
-          -e IRCFIBER_RELOAD_FROM_PID={{ _engine_pid }}
+          -e IRCFIBER_RELOAD_FROM_PID={{ _engine_pid | default('1') }}
           {{ engine_container }}
           /app/irc-fiber-engine-handoff
       when:
