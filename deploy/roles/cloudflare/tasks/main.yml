@@ -64,13 +64,19 @@
         | default(cloudflare_records_default)
       }}
 
-- name: Manage Cloudflare A records
+- name: Manage Cloudflare DNS records (A + CNAME)
   community.general.cloudflare_dns:
     api_token: "{{ vault_cloudflare_api_token }}"
     zone: "{{ cloudflare_zone }}"
     record: "{{ item.name }}"
     type: "{{ item.type }}"
-    value: "{{ cloudflare_target_ip }}"
+    # A records get the host's public IP; CNAME records get their target
+    # hostname specified in the item's `value` field.
+    value: >-
+      {{
+        cloudflare_target_ip if item.type == 'A'
+        else (item.value | default(cloudflare_zone))
+      }}
     ttl: "{{ cloudflare_record_ttl | int if not (cloudflare_proxied | bool) else omit }}"
     proxied: "{{ cloudflare_proxied | bool }}"
     state: present

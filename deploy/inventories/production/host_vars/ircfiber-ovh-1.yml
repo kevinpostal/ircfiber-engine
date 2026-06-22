@@ -20,7 +20,16 @@ caddy_extra_serve_hosts:
 ircfiber_use_lets_encrypt: true
 
 # --- Cloudflare DNS -----------------------------------------------------------
+cloudflare_proxied: true
 cloudflare_target_ip: "40.160.227.49"
+# All records managed by the playbook. www is a CNAME so it inherits
+# the apex's proxying; the playbook sets proxied=true on all records.
+cloudflare_records:
+  - name: "@"
+    type: A
+  - name: "www"
+    type: CNAME
+    value: "ircfiber.com"
 
 # --- Engine container name for deploy-update ----------------------------------
 # The playbook constructs: ircfiber-engine-{{ ircfiber_engine_id }}

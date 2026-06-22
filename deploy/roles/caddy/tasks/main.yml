@@ -61,7 +61,9 @@
     healthcheck:
       # Use the docker-network DNS name so this works inside the
       # container without depending on host DNS.
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:80/"]
+      # Hit the plain-HTTP tunnel port + /health endpoint to avoid
+      # TLS redirect loops when Caddy has tls internal configured.
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
       interval: 30s
       timeout: 5s
       retries: 3

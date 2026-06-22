@@ -115,6 +115,17 @@ Two processes:
 
 The frontend talks to the gateway over WebSocket; the gateway forwards events to the browser, persists messages to MongoDB, and stores ephemeral state in Redis.
 
+### Graceful Engine Hot-Reload
+
+The engine supports **zero-disconnect hot-reload** (`make engine-handoff`). On save:
+1. A new engine process starts alongside the old one
+2. The old engine pauses its event loops, serialises each connection's state (channels, caps, nicks), and **transfers the raw TCP socket FD** to the new engine via Unix `SCM_RIGHTS`
+3. The new engine replays the state and resumes I/O on the adopted sockets
+4. IRC connections are **never closed** — the server sees no quit/rejoin
+5. TLS connections (where FD transfer is impossible) do a fast soft-reconnect (~1-2s, automatic)
+
+See `AGENTS.md` for the full protocol specification.
+
 ## Make Targets
 
 Run `make` (or `make help`) to list all targets. Highlights:
@@ -132,6 +143,10 @@ Run `make` (or `make help`) to list all targets. Highlights:
 | `make docker-up` | Start full stack (incl. test IRCD) via Docker |
 | `make docker-shell-mongo` | Open mongosh against the DB |
 | `make dscanner-all` | D-Scanner syntax / lint / complexity |
+| `make watch-engine` | Auto-rebuild engine + graceful hot-reload on save (preserves IRC sockets) |
+| `make engine-handoff` | Graceful engine hot-reload (transfer FDs, no disconnect) |
+| `make engine-handoff-redis` | Trigger handoff via `redis-cli LPUSH` (remote/scripting) |
+| `make engine-restart` | Hard restart (closes sockets, forces reconnect) |
 | `make cross-linux-arm64` | Cross-compile for Linux ARM64 |
 
 ## Development
