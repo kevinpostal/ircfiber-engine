@@ -157,7 +157,7 @@
     - name: Send gracefulReload control message via redis-cli (via Redis container)
       ansible.builtin.shell: |
         msg='{"action":"gracefulReload","config":{"newEnginePid":0,"socketPath":"{{ handoff_socket }}","deadlineMs":30000}}'
-        docker exec irc_redis_test redis-cli LPUSH "irc:control:{{ ircfiber_engine_id }}" "$msg"
+        docker exec {{ redis_container_name | default('ircfiber-redis') }} redis-cli LPUSH "irc:control:{{ ircfiber_engine_id }}" "$msg"
         echo "Control message sent to irc:control:{{ ircfiber_engine_id }}"
 
     - name: Wait for handoff socket to appear (old engine listener ready)

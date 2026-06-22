@@ -186,7 +186,7 @@
     - name: Try handoff — send gracefulReload control message
       ansible.builtin.shell: |
         msg='{"action":"gracefulReload","config":{"socketPath":"{{ _handoff_sock }}","deadlineMs":30000}}'
-        docker exec irc_redis_test redis-cli LPUSH "irc:control:{{ ircfiber_engine_id }}" "$msg"
+        docker exec {{ redis_container_name | default('ircfiber-redis') }} redis-cli LPUSH "irc:control:{{ ircfiber_engine_id }}" "$msg"
       when: ircfiber_engine_id is defined and engine_info.exists and old_pid_raw.rc == 0
       changed_when: true
 
