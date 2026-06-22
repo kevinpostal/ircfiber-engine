@@ -237,7 +237,8 @@
         cmd: docker exec {{ engine_container }} mv -f /app/irc-fiber-engine-handoff /app/irc-fiber-engine
       when:
         - ircfiber_engine_id is defined
-        - handoff_done.stdout == 'HANDOFF_OK'
+        - handoff_done is not skipped
+        - handoff_done.stdout | default('') == 'HANDOFF_OK'
 
     # ── Fallback: hard restart ────────────────────────────────────
     - name: Inject engine binary (restart path)
@@ -246,7 +247,7 @@
       when:
         - ircfiber_engine_id is defined
         - engine_info.exists
-        - (sock_ready is failed) or (handoff_done.stdout != 'HANDOFF_OK')
+        - sock_ready is failed or (handoff_done is not skipped and handoff_done.stdout | default('') != 'HANDOFF_OK')
 
     - name: Restart engine container (hard — closes IRC sockets)
       community.docker.docker_container:
@@ -256,4 +257,4 @@
       when:
         - ircfiber_engine_id is defined
         - engine_info.exists
-        - (sock_ready is failed) or (handoff_done.stdout != 'HANDOFF_OK')
+        - sock_ready is failed or (handoff_done is not skipped and handoff_done.stdout | default('') != 'HANDOFF_OK')
