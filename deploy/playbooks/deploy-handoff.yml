@@ -1,0 +1,256 @@
+---
+# Graceful engine hot-reload — zero IRC disconnect.
+#
+# Builds the new binary via BuildKit (same as deploy-update.yml), then
+# runs the new engine inside the EXISTING container alongside the old
+# engine. Both processes share the same PID and network namespace, so
+# SCM_RIGHTS FD transfer works. Once the handoff completes, the old
+# engine exits and the new binary replaces the old one on disk so
+# future container restarts pick up the new version.
+#
+# Flow:
+#   1. Build new binary (BuildKit → extract)
+#   2. Copy new binary into running engine container
+#   3. Launch new engine inside the container with
+#      IRCFIBER_RELOAD_FROM_PID=<old_pid>
+#   4. Send gracefulReload control message to old engine via redis-cli
+#   5. Old engine creates handoff socket, transfers FDs, exits rc=0
+#   6. Verify new engine is running and old engine is gone
+#   7. Replace binary on disk so next docker restart picks it up
+#
+# Usage:
+#   make handoff                        # all engine hosts
+#   make handoff IRCFIBER_SERVER_ID=ovh # single engine
+#   ansible-playbook playbooks/deploy-handoff.yml -l ircfiber-ovh-1
+
+- name: Graceful engine handoff (zero-disconnect hot-reload)
+  hosts: "{{ target | default('ircfiber_engines') }}"
+  become: true
+  gather_facts: false
+
+  vars:
+    src_root: /opt/ircfiber-src
+    builder_image: ircfiber-builder
+    host_bin_dir: /opt/ircfiber/bin
+    engine_container: "{{ 'ircfiber-engine-' ~ ircfiber_engine_id }}"
+    engine_binary_src: "{{ host_bin_dir }}/irc-fiber-engine"
+    engine_binary_stage: "/app/irc-fiber-engine-handoff"
+    engine_binary_dest: "/app/irc-fiber-engine"
+    handoff_socket: "/tmp/ircfiber-handoff-{{ ircfiber_engine_id }}.sock"
+    handoff_timeout: 30
+    ldc_version: "1.41.0"
+    # Redis connection — same as what the running engine uses.
+    redis_url: "redis://{{ backend_tailscale_ip | default(hostvars[groups['ircfiber_backend'][0]]['host_tailscale_ip']) }}:6379/0"
+
+  pre_tasks:
+    - name: Preflight — ircfiber_engine_id is required
+      ansible.builtin.assert:
+        that:
+          - ircfiber_engine_id is defined
+          - ircfiber_engine_id | length > 0
+        fail_msg: "ircfiber_engine_id must be defined for handoff target"
+
+  tasks:
+    # ── Build ─────────────────────────────────────────────────────────
+    - name: Ensure output directory exists
+      ansible.builtin.file:
+        path: "{{ host_bin_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Ensure source directory exists
+      ansible.builtin.file:
+        path: "{{ src_root }}"
+        state: directory
+        mode: "0755"
+
+    - name: rsync source → {{ src_root }}
+      become: false
+      ansible.posix.synchronize:
+        src: "{{ playbook_dir }}/../../"
+        dest: "{{ src_root }}"
+        delete: false
+        rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=node_modules"
+          - "--exclude=.dub"
+          - "--exclude=*.o"
+          - "--exclude=irc-fiber"
+          - "--exclude=irc-fiber-engine"
+          - "--exclude=frontend/node_modules"
+          - "--exclude=public/dist"
+          - "--exclude=.reasonix"
+          - "--exclude=.playwright-mcp"
+          - "--exclude=test-results"
+          - "--exclude=e2e/test-results"
+          - "--exclude=*.log"
+          - "--exclude=.worktrees"
+
+    - name: Build stage (BuildKit — cached dub + LDC)
+      ansible.builtin.shell: |
+        DOCKER_BUILDKIT=1 docker build \
+          --target builder \
+          --build-arg LDC_VERSION={{ ldc_version }} \
+          --build-arg CACHE_BUST=$(date +%s) \
+          -t {{ builder_image }}:latest \
+          -f {{ src_root }}/Containerfile \
+          {{ src_root }} 2>&1
+      args:
+        executable: /bin/bash
+      timeout: 900
+      changed_when: true
+
+    - name: Extract new engine binary from builder
+      ansible.builtin.shell: |
+        CID=$(docker create {{ builder_image }}:latest)
+        docker cp "$CID":/build/irc-fiber-engine {{ engine_binary_src }}
+        docker rm "$CID" >/dev/null
+        chmod 0755 {{ engine_binary_src }}
+        strip {{ engine_binary_src }} 2>/dev/null || true
+        echo "Engine: $(ls -lh {{ engine_binary_src }} | awk '{print $5}')"
+      args:
+        executable: /bin/bash
+
+    # ── Stage inside container ───────────────────────────────────────
+    - name: Check engine container is running
+      community.docker.docker_container_info:
+        name: "{{ engine_container }}"
+      register: engine_info
+
+    - name: Fail if engine container is not running
+      ansible.builtin.fail:
+        msg: "Engine container {{ engine_container }} is not running. Deploy first."
+      when: not engine_info.exists or not engine_info.container.State.Running
+
+    - name: Get old engine PID
+      ansible.builtin.command:
+        cmd: docker exec {{ engine_container }} pidof irc-fiber-engine
+      register: old_pid_raw
+      changed_when: false
+      failed_when: old_pid_raw.rc != 0
+
+    - name: Set old_pid fact
+      ansible.builtin.set_fact:
+        old_engine_pid: "{{ old_pid_raw.stdout | trim | split(' ') | first }}"
+
+    - name: Copy new binary into running container
+      ansible.builtin.command:
+        cmd: docker cp {{ engine_binary_src }} {{ engine_container }}:{{ engine_binary_stage }}
+
+    - name: Mark staged binary executable
+      ansible.builtin.command:
+        cmd: docker exec {{ engine_container }} chmod +x {{ engine_binary_stage }}
+
+    - name: Remove stale handoff socket if present
+      ansible.builtin.command:
+        cmd: docker exec {{ engine_container }} rm -f {{ handoff_socket }}
+      changed_when: false
+      ignore_errors: true
+
+    # ── Launch new engine (handoff mode) ─────────────────────────────
+    - name: Resolve backend tailscale IP for Redis
+      ansible.builtin.set_fact:
+        backend_ip: "{{ hostvars[groups['ircfiber_backend'][0]]['host_tailscale_ip']
+                       | default(hostvars[inventory_hostname]['host_tailscale_ip']) }}"
+
+    - name: Launch new engine inside container (handoff mode)
+      ansible.builtin.command:
+        cmd: >
+          docker exec -d
+          -e IRCFIBER_SERVER_ID={{ ircfiber_engine_id }}
+          -e IRCFIBER_BIND_ADDRESS={{ ircfiber_engine_bind_address }}
+          -e IRCFIBER_ADMIN_PORT={{ ircfiber_engine_admin_port }}
+          -e IRCFIBER_LOG_LEVEL={{ ircfiber_engine_log_level }}
+          -e IRCFIBER_MONGO_URL=mongodb://{{ backend_ip }}:{{ mongo_port }}/ircfiber
+          -e IRCFIBER_REDIS_URL=redis://{{ backend_ip }}:{{ redis_port }}/0
+          -e IRCFIBER_RELOAD_FROM_PID={{ old_engine_pid }}
+          {{ engine_container }}
+          {{ engine_binary_stage }}
+
+    - name: Set new engine PID fact
+      ansible.builtin.set_fact:
+        new_engine_pid: "none_yet"
+        handoff_pending: true
+
+    # ── Trigger handoff ──────────────────────────────────────────────
+    - name: Send gracefulReload control message via redis-cli
+      ansible.builtin.shell: |
+        msg='{"action":"gracefulReload","config":{"newEnginePid":0,"socketPath":"{{ handoff_socket }}","deadlineMs":30000}}'
+        redis-cli -u {{ redis_url }} LPUSH "irc:control:{{ ircfiber_engine_id }}" "$msg"
+        echo "Control message sent to irc:control:{{ ircfiber_engine_id }}"
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    # ── Wait for handoff to complete ────────────────────────────────
+    - name: Wait for old engine to exit (handoff complete)
+      ansible.builtin.shell: |
+        for i in $(seq 1 $(({{ handoff_timeout }} * 2))); do
+          alive=$(docker exec {{ engine_container }} kill -0 {{ old_engine_pid }} 2>/dev/null && echo 1 || echo 0)
+          if [ "$alive" = "0" ]; then
+            echo "HANDOFF_OK: old engine PID {{ old_engine_pid }} exited after $((i / 2)).$(( (i % 2) * 5 ))s"
+            exit 0
+          fi
+          sleep 0.5
+        done
+        echo "HANDOFF_TIMEOUT: old engine still running after {{ handoff_timeout }}s"
+        
+        # Get new engine PID
+        new_pid=$(docker exec {{ engine_container }} pidof irc-fiber-engine 2>/dev/null | tr ' ' '\n' | grep -v "{{ old_engine_pid }}" | head -1)
+        if [ -n "$new_pid" ]; then
+          echo "  new engine IS running (pid=$new_pid)"
+        else
+          echo "  new engine NOT running"
+        fi
+        exit 1
+      args:
+        executable: /bin/bash
+      register: handoff_result
+      ignore_errors: true
+      changed_when: false
+
+    - name: Verify handoff succeeded
+      ansible.builtin.assert:
+        that:
+          - '"HANDOFF_OK" in handoff_result.stdout'
+        fail_msg: "Handoff failed: {{ handoff_result.stdout }}"
+        success_msg: "Handoff succeeded: {{ handoff_result.stdout }}"
+
+    # ── Verify new engine is healthy ────────────────────────────────
+    - name: Wait for new engine to process events
+      ansible.builtin.pause:
+        seconds: 3
+
+    - name: Get new engine PID
+      ansible.builtin.command:
+        cmd: docker exec {{ engine_container }} pidof irc-fiber-engine
+      register: new_pids
+      changed_when: false
+
+    - name: Check new engine is the only one running
+      ansible.builtin.assert:
+        that:
+          - new_pids.stdout_lines | length > 0
+          - new_pids.stdout.split() | length == 1
+          - new_pids.stdout.split()[0] != old_engine_pid
+        success_msg: "New engine running (PID {{ new_pids.stdout.strip() }})"
+        fail_msg: "Unexpected engine state after handoff. PIDs: {{ new_pids.stdout.strip() }}"
+
+    # ── Seal: replace binary on disk ────────────────────────────────
+    - name: Replace old binary with new one (persistent across restarts)
+      ansible.builtin.command:
+        cmd: docker exec {{ engine_container }} mv -f {{ engine_binary_stage }} {{ engine_binary_dest }}
+      changed_when: true
+
+    - name: Health check — engine container status
+      community.docker.docker_container_info:
+        name: "{{ engine_container }}"
+      register: engine_after
+
+    - name: Report final status
+      ansible.builtin.debug:
+        msg:
+          - "Handoff complete for engine {{ ircfiber_engine_id }}"
+          - "  Container: {{ engine_container }} ({{ engine_after.container.State.Status }})"
+          - "  New PID: {{ new_pids.stdout.strip() }}"
+          - "  Binary replaced: {{ engine_binary_dest }}"

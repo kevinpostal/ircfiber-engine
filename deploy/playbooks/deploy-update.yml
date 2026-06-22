@@ -141,11 +141,13 @@
       when: gw_exists.stdout == 'yes'
 
     # ── Inject + restart engine ──────────────────────────────────────
+    # For zero-disconnect deploys, use `deploy-handoff.yml` instead.
+    # This hard-restart path closes all IRC sockets.
     - name: Inject engine binary
       ansible.builtin.command:
         cmd: docker cp {{ engine_binary }} {{ engine_container }}:/app/irc-fiber-engine
 
-    - name: Restart engine
+    - name: Restart engine (hard — closes IRC sockets)
       community.docker.docker_container:
         name: "{{ engine_container }}"
         state: started

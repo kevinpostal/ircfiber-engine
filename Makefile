@@ -81,7 +81,7 @@ AR := →
 
 # Component Workflows (primary user-facing targets)
 .PHONY: dev dev-live debug debug-live stop
-.PHONY: engine engine-rebuild engine-restart engine-test
+.PHONY: engine engine-rebuild engine-handoff engine-handoff-redis engine-restart engine-test
 .PHONY: gateway gateway-rebuild gateway-restart
 .PHONY: status logs logs-engine logs-gateway logs-supervisor crash-logs
 .PHONY: watch watch-engine watch-gateway
@@ -319,7 +319,128 @@ engine: build-engine ## Component > Engine in foreground (no auto-restart) — c
 engine-rebuild: build-engine ## Component > Rebuild engine binary (no restart)
 	@printf '%b\n' "$(BG)$(OK) Engine binary rebuilt. Run \`make engine-restart\` (supervised) or \`make engine\` (foreground) to apply.$(R)"
 
+# Engine: graceful handoff — old engine serves FDs to a freshly-started
+# new engine. Sockets are preserved across the reload, so IRC connections
+# are NOT closed. The new engine inherits the old engine's `serverId` and
+# takes over seamlessly.
+#
+# Flow:
+#   1. Send `gracefulReload` control message to the old engine via
+#      redis-cli LPUSH. The old engine picks it up on its BLPOP poll
+#      and starts `serveReload`, which creates a Unix listener on
+#      `/tmp/ircfiber-handoff-<serverId>.sock`.
+#   2. Wait for the socket file to appear (≤30s).
+#   3. Spawn the new engine with `IRCFIBER_RELOAD_FROM_PID=<oldpid>`.
+#      The new engine connects to the listener, receives state+FDs,
+#      adopts every connection, then starts its normal consumer loop.
+#   4. Wait for the old engine to exit (≤30s). The supervisor respawns
+#      with the new binary, which picks up the serverId the new engine
+#      is already running under.
+engine-handoff: ## Component > Hot-reload engine (preserves IRC sockets — no disconnect)
+	@bash -c ' \
+		printf "%b\n" "$(_BCn)$(K)$(B)  Hot-reloading engine (graceful handoff)  $(R)"; \
+		if [ ! -f $(ENGINE_PIDFILE) ]; then \
+			printf "%b\n" "$(Y)$(WR) No engine running. Run \`make engine\` to start one.$(R)"; \
+			exit 0; \
+		fi; \
+		pid=$$(cat $(ENGINE_PIDFILE) 2>/dev/null || echo ""); \
+		if [ -z "$$pid" ] || ! kill -0 $$pid 2>/dev/null; then \
+			printf "%b\n" "$(Y)$(WR) No engine running. Run \`make engine\` to start one.$(R)"; \
+			exit 0; \
+		fi; \
+		if [ -z "$${IRCFIBER_SERVER_ID:-}" ]; then \
+			printf "%b\n" "$(Y)$(WR) IRCFIBER_SERVER_ID not set — using \"localengine\".$(R)"; \
+			sid=localengine; \
+		else \
+			sid="$$IRCFIBER_SERVER_ID"; \
+		fi; \
+		bind=$${IRCFIBER_BIND_ADDRESS:-127.0.0.1}; \
+		redis_url=$${REDIS_URL:-redis://127.0.0.1:6379/0}; \
+		sock=/tmp/ircfiber-handoff-$$sid.sock; \
+		rm -f "$$sock" 2>/dev/null || true; \
+		# Step 1: tell the old engine to start serving the handoff.
+		msg="{\"action\":\"gracefulReload\",\"config\":{\"newEnginePid\":0,\"socketPath\":\"$$sock\",\"deadlineMs\":30000}}"; \
+		printf "%b\n" "$(C)  → LPUSH irc:control:$$sid (gracefulReload)$(R)"; \
+		redis-cli -u "$$redis_url" LPUSH "irc:control:$$sid" "$$msg" >/dev/null 2>&1; \
+		if [ $$? -ne 0 ]; then \
+			printf "%b\n" "$(Y)$(WR) redis-cli failed. Falling back to hard kill (no graceful handoff).$(R)"; \
+			kill $$pid 2>/dev/null || true; \
+			exit 1; \
+		fi; \
+		# Step 2: wait for the old engine to create the listener socket.
+		printf "%b\n" "$(C)  → waiting for old engine to create $$sock…$(R)"; \
+		for i in $$(seq 1 60); do \
+			if [ -S "$$sock" ]; then break; fi; \
+			if ! kill -0 $$pid 2>/dev/null; then \
+				printf "%b\n" "$(Y)$(WR) old engine died before creating the listener$(R)"; \
+				exit 1; \
+			fi; \
+			sleep 0.5; \
+		done; \
+		if [ ! -S "$$sock" ]; then \
+			printf "%b\n" "$(Y)$(WR) timed out waiting for handoff socket$(R)"; \
+			exit 1; \
+		fi; \
+		# Step 3: spawn the new engine. It will connect to the listener
+		# and adopt the live IRC sockets. The old engine exits 0 once
+		# the transfer is complete.
+		printf "%b\n" "$(C)  → spawning new engine (IRCFIBER_RELOAD_FROM_PID=$$pid)$(R)"; \
+		IRCFIBER_SERVER_ID=$$sid IRCFIBER_BIND_ADDRESS=$$bind IRCFIBER_RELOAD_FROM_PID=$$pid \
+			"$(ENGINE_BIN)" > /tmp/ircfiber-engine-handoff.log 2>&1 & \
+		new_pid=$$!; \
+		printf "%b\n" "$(C)  → new engine pid=$$new_pid, waiting for old engine to exit…$(R)"; \
+		# Step 4: wait for the old engine to exit (rc=0).
+		for i in $$(seq 1 60); do \
+			if ! kill -0 $$pid 2>/dev/null; then \
+				printf "%b\n" "$(BG)$(OK) old engine exited cleanly (handoff complete)$(R)"; \
+				printf "%b\n" "$(D)  new engine pid=$$new_pid is now running — supervisor will see clean rc=0 and respawn if needed$(R)"; \
+				exit 0; \
+			fi; \
+			sleep 0.5; \
+		done; \
+		printf "%b\n" "$(Y)$(WR) old engine still alive after 30s; killing new engine and old engine$(R)"; \
+		kill $$new_pid 2>/dev/null || true; \
+		kill $$pid 2>/dev/null || true; \
+		exit 1; \
+	'
+
+# Engine: hot-reload via redis-cli (no Makefile child process). Useful when
+# the Makefile is running on a different machine than the engine, or when
+# you want to trigger a handoff from a script or the admin dashboard.
+#
+# Usage: make engine-handoff-redis IRCFIBER_SERVER_ID=myengine
+#   Requires: redis-cli on PATH, REDIS_URL (or defaults to localhost:6379)
+#
+# Sends a gracefulReload control message to irc:control:<serverId> via
+# redis-cli LPUSH. The engine picks it up on its next BLPOP poll, then
+# starts its handoff listener. The caller must then launch the new engine
+# with IRCFIBER_RELOAD_FROM_PID=<old_pid> on the same host.
+engine-handoff-redis: ## Component > Trigger graceful handoff via redis-cli (no child process)
+	@bash -c ' \
+		printf "%b\n" "$(_BCn)$(K)$(B)  Triggering engine handoff via redis-cli  $(R)"; \
+		if [ -z "$${IRCFIBER_SERVER_ID:-}" ]; then \
+			printf "%b\n" "$(Y)$(WR) IRCFIBER_SERVER_ID is required. Usage: make engine-handoff-redis IRCFIBER_SERVER_ID=myengine$(R)"; \
+			exit 1; \
+		fi; \
+		sid="$$IRCFIBER_SERVER_ID"; \
+		redis_url="$${REDIS_URL:-redis://127.0.0.1:6379/0}"; \
+		# Build the control message JSON \
+		msg="{\"action\":\"gracefulReload\",\"config\":{\"newEnginePid\":0,\"socketPath\":\"/tmp/ircfiber-handoff-$$sid.sock\",\"deadlineMs\":30000}}"; \
+		printf "%b\n" "$(C)  → LPUSH irc:control:$$sid $(D)$$msg$(R)"; \
+		redis-cli -u "$$redis_url" LPUSH "irc:control:$$sid" "$$msg" 2>&1; \
+		rc=$$?; \
+		if [ $$rc -eq 0 ]; then \
+			printf "%b\n" "$(BG)$(OK) Handoff message sent to engine (serverId=$$sid)$(R)"; \
+			printf "%b\n" "$(D)  Next step: start the new engine on the same host:$(R)"; \
+			printf "%b\n" "$(D)    IRCFIBER_SERVER_ID=$$sid IRCFIBER_RELOAD_FROM_PID=<old_pid> $(ENGINE_BIN)$(R)"; \
+		else \
+			printf "%b\n" "$(Y)$(WR) redis-cli failed (rc=$$rc). Check REDIS_URL and redis-cli availability.$(R)"; \
+			exit $$rc; \
+		fi; \
+	'
+
 # Engine: kill the current engine — supervisor respawns with the latest binary.
+# Prefer `engine-handoff` for development to avoid closing IRC sockets.
 engine-restart: ## Component > Restart engine (supervisor respawns with new binary)
 	@bash -c ' \
 		printf "%b\n" "$(_BCn)$(K)$(B)  Restarting engine  $(R)"; \
@@ -465,11 +586,11 @@ crash-logs: ## Component > List persistent crash dumps (use CAT=1 to view latest
 # ─── AUTO-REBUILD (file watch) ──────────────────────────────────────────────
 
 # Watch engine sources, rebuild + restart on change.
-watch-engine: ## Component > Watch source/*.d — rebuild engine + supervisor respawns on save
+watch-engine: ## Component > Watch source/*.d — rebuild engine + hot-reload on save (preserves IRC sockets)
 	@bash -c ' \
 		printf "\n%b\n" "$(_BC)$(K)$(B)  Watching engine sources  $(R)"; \
 		printf "%b\n" "$(D)Polls every 2s. Install fswatch for instant: brew install fswatch$(R)"; \
-		printf "%b\n" "$(D)Triggers: make engine-rebuild + make engine-restart$(R)"; \
+		printf "%b\n" "$(D)Triggers: make engine-rebuild + make engine-handoff (NO socket close)$(R)"; \
 		if [ ! -f $(SUPERVISOR_PIDFILE) ]; then \
 			printf "%b\n" "$(Y)$(WR) No supervisor running. Start one first: make debug  or  make debug-live$(R)"; \
 			exit 1; \
@@ -481,9 +602,9 @@ watch-engine: ## Component > Watch source/*.d — rebuild engine + supervisor re
 			sleep 2; \
 			CURR=$$(echo "$$WATCH" | xargs stat -f %m 2>/dev/null | sort -n | tail -1); \
 			if [ "$$CURR" != "$$LAST" ]; then \
-				printf "\n%b\n" "$(Y)→ change detected, rebuilding engine…$(R)"; \
+				printf "\n%b\n" "$(Y)→ change detected, hot-reloading engine…$(R)"; \
 				$(MAKE) --no-print-directory engine-rebuild && \
-					$(MAKE) --no-print-directory engine-restart; \
+					$(MAKE) --no-print-directory engine-handoff; \
 				LAST=$$CURR; \
 			fi; \
 		done; \
@@ -1136,6 +1257,25 @@ update-status: ## Deploy > Show running containers & image versions
 update-clean: ## Deploy > Nuke BuildKit cache + builder image on target
 	@printf '\n%b\n' "$(_BY)$(K)$(B)  Cleaning builder cache → $(_target_ssh) ($(_target))  $(R)"
 	@ssh deploy@$(_target_ssh) 'docker rmi ircfiber-builder:latest 2>/dev/null; docker builder prune --force 2>/dev/null; echo "Builder cache cleared"'
+
+# ── Graceful engine handoff deploy ────────────────────────────────────────
+# Hot-reloads the engine binary WITHOUT closing IRC sockets. The new binary
+# is started inside the existing container alongside the old engine. The old
+# engine transfers its live TCP sockets to the new engine via SCM_RIGHTS FD
+# transfer (for plain connections) and soft-reconnects TLS connections.
+#
+# Usage:
+#   make handoff                                       # all engine hosts
+#   make handoff TARGET=ircfiber-ovh-1                 # single host
+#   make handoff-backup                                # backup engine only
+handoff: build-engine ## Deploy > Graceful engine hot-reload (zero IRC disconnect)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Hot-reload engine → $(_target)  $(R)"
+	@printf '%b\n' "$(D)  New engine runs inside existing container — IRC sockets preserved$(R)"
+	@$(_playbook) playbooks/deploy-handoff.yml
+
+handoff-backup: build-engine ## Deploy > Graceful engine hot-reload → backup engine
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Hot-reload backup engine → ircfiber-backup-1  $(R)"
+	@cd deploy && ansible-playbook -l ircfiber-backup-1 $(_vault_arg) playbooks/deploy-handoff.yml
 
 # ----------------------------------------------------------------------------
 # Cross Compilation

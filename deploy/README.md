@@ -159,12 +159,61 @@ assigning networks to it. No gateway changes required.
 ## Day-to-day operations
 
 ```bash
+# ── Code deploys ──────────────────────────────────────────────────────
+# Fast incremental binary deploy (daily use):
+make update                     # rsync + BuildKit → restart engine + gateway
+
+# Zero-disconnect engine hot-reload (preserves IRC sockets):
+make handoff                    # new binary runs in same container as old
+make handoff-backup             # hot-reload the backup engine
+
+# Full image rebuild (Containerfile from scratch):
+make update-full                # alias: make deploy
+
+# Asset-only deploy (no binary change, no restart):
+make update-assets
+
+# ── Component management ──────────────────────────────────────────────
 # Deploy/redeploy a single component
 ansible-playbook playbooks/mongo.yml
 ansible-playbook playbooks/redis.yml
 ansible-playbook playbooks/gateway.yml
 ansible-playbook playbooks/caddy.yml
 ansible-playbook playbooks/engine.yml
+```
+
+### Graceful engine handoff (zero disconnect)
+
+When `make handoff` runs, the new engine binary is started inside the **existing**
+Docker container alongside the old engine process. Both processes share the same
+PID and network namespace, so `SCM_RIGHTS` FD transfer works across processes
+even though they're inside a container.
+
+```
+make handoff
+```
+
+What happens:
+1. Builds the new engine binary via BuildKit (same as `make update`)
+2. Copies the new binary into the running container as `/app/irc-fiber-engine-handoff`
+3. Starts it inside the container with `IRCFIBER_RELOAD_FROM_PID=<old_pid>`
+4. Sends a `gracefulReload` control message to the old engine via `redis-cli LPUSH`
+5. Old engine pauses every IRC connection, serialises per-connection state,
+   transfers plain TCP sockets via `SCM_RIGHTS` over a Unix socket at
+   `/tmp/ircfiber-handoff-<serverId>.sock`, then exits with rc=0.
+6. New engine adopts the live sockets, replays channel/nick/cap state,
+   and continues the event loop on the same TCP socket the old engine had.
+7. The old binary is atomically replaced with the new one on disk so the
+   next `docker restart` picks up the correct version.
+
+TLS connections are soft-reconnected (1-2s CAP/SASL/JOIN), while plain TCP
+connections experience zero disruption.
+
+The first run takes ~80-90s (BuildKit build). Subsequent runs take 5-15s
+(incremental recompilation via Dockers' dub cache mount).
+
+```bash
+# Deploy/redeploy a single component
 
 # Add a new engine host on a new VM
 # 1. apt-install baseline; add to [ircfiber_engines] in hosts.ini
