@@ -1218,7 +1218,7 @@ _target      = $(or $(TARGET),ircfiber-ovh-1)
 _target_ssh   = $(or $(TARGET_SSH),40.160.227.49)
 _playbook    = cd deploy && ansible-playbook -l $(_target) $(_vault_arg)
 
-update: build-engine ## Deploy > Build D engine, deploy to all hosts
+update: build build-engine ## Deploy > Build gateway + engine, handoff-deploy engines (zero disconnect)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Deploy → $(_target)  $(R)"
 	@$(_playbook) playbooks/deploy-update.yml
 
