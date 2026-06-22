@@ -245,13 +245,10 @@
       ignore_errors: true
       changed_when: false
 
-    - name: Launch new engine (handoff path)
-      ansible.builtin.command:
-        cmd: >
-          docker exec -d
-          -e IRCFIBER_RELOAD_FROM_PID={{ _engine_pid | default('1') }}
-          {{ engine_container }}
-          /app/irc-fiber-engine-handoff
+    - name: Launch new engine (handoff path — detach with setsid)
+      ansible.builtin.shell: |
+        docker exec -d {{ engine_container }} sh -c \
+          'setsid /app/irc-fiber-engine-handoff > /tmp/ircfiber-handoff-child.log 2>&1 &'
       when:
         - ircfiber_engine_id is defined
         - sock_ready is succeeded
@@ -276,9 +273,13 @@
       ignore_errors: true
       changed_when: false
 
-    - name: Replace binary after successful handoff
-      ansible.builtin.command:
-        cmd: docker exec {{ engine_container }} mv -f /app/irc-fiber-engine-handoff /app/irc-fiber-engine
+    - name: Post-handoff — kill old engine and replace binary
+      ansible.builtin.shell: |
+        old_pid=$(docker exec {{ engine_container }} pidof irc-fiber-engine 2>/dev/null | awk '{print $1}')
+        docker exec {{ engine_container }} kill $old_pid 2>/dev/null || true
+        docker exec {{ engine_container }} mv -f /app/irc-fiber-engine-handoff /app/irc-fiber-engine
+        docker exec {{ engine_container }} rm -f /tmp/ircfiber-handoff-done-{{ ircfiber_engine_id }}
+        echo "Old PID $old_pid killed, binary replaced"
       when:
         - ircfiber_engine_id is defined
         - handoff_done is not skipped

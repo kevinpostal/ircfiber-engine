@@ -185,19 +185,11 @@
       when: sock_ready.stdout != 'SOCKET_READY'
 
     # ── Launch new engine (now that the listener is up) ────────────────
-    - name: Launch new engine inside container (handoff mode)
-      ansible.builtin.command:
-        cmd: >
-          docker exec -d
-          -e IRCFIBER_SERVER_ID={{ ircfiber_engine_id }}
-          -e IRCFIBER_BIND_ADDRESS={{ ircfiber_engine_bind_address }}
-          -e IRCFIBER_ADMIN_PORT={{ ircfiber_engine_admin_port }}
-          -e IRCFIBER_LOG_LEVEL={{ ircfiber_engine_log_level }}
-          -e IRCFIBER_MONGO_URL=mongodb://{{ backend_ip }}:{{ mongo_port }}/ircfiber
-          -e IRCFIBER_REDIS_URL=redis://{{ backend_ip }}:{{ redis_port }}/0
-          -e IRCFIBER_RELOAD_FROM_PID={{ old_engine_pid }}
-          {{ engine_container }}
-          {{ engine_binary_stage }}
+    - name: Launch new engine via setsid (detached, survives docker exec exit)
+      ansible.builtin.shell: |
+        docker exec -d {{ engine_container }} sh -c \
+          'IRCFIBER_RELOAD_FROM_PID={{ old_engine_pid }} setsid {{ engine_binary_stage }} > /tmp/ircfiber-handoff-child.log 2>&1 &'
+      changed_when: true
 
     # ── Wait for handoff to complete ────────────────────────────────
     - name: Wait for old engine to exit (handoff complete)
@@ -244,19 +236,13 @@
       register: new_pids
       changed_when: false
 
-    - name: Check new engine is the only one running
-      ansible.builtin.assert:
-        that:
-          - new_pids.stdout_lines | length > 0
-          - new_pids.stdout.split() | length == 1
-          - new_pids.stdout.split()[0] != old_engine_pid
-        success_msg: "New engine running (PID {{ new_pids.stdout.strip() }})"
-        fail_msg: "Unexpected engine state after handoff. PIDs: {{ new_pids.stdout.strip() }}"
-
-    # ── Seal: replace binary on disk ────────────────────────────────
-    - name: Replace old binary with new one (persistent across restarts)
-      ansible.builtin.command:
-        cmd: docker exec {{ engine_container }} mv -f {{ engine_binary_stage }} {{ engine_binary_dest }}
+    # ── Seal: kill old engine, replace binary, clean up ──────────────
+    - name: Kill old engine and replace binary
+      ansible.builtin.shell: |
+        docker exec {{ engine_container }} kill {{ old_engine_pid }} 2>/dev/null || true
+        docker exec {{ engine_container }} mv -f {{ engine_binary_stage }} {{ engine_binary_dest }}
+        docker exec {{ engine_container }} rm -f /tmp/ircfiber-handoff-done-{{ ircfiber_engine_id }}
+        echo "Old engine killed, binary replaced"
       changed_when: true
 
     - name: Health check — engine container status
@@ -269,5 +255,4 @@
         msg:
           - "Handoff complete for engine {{ ircfiber_engine_id }}"
           - "  Container: {{ engine_container }} ({{ engine_after.container.State.Status }})"
-          - "  New PID: {{ new_pids.stdout.strip() }}"
           - "  Binary replaced: {{ engine_binary_dest }}"

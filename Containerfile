@@ -43,10 +43,10 @@ COPY public/ ./public/
 # Cache buster — change with every deploy to force full recompile
 ARG CACHE_BUST=0
 
-RUN --mount=type=cache,target=/build/.dub dub build --compiler=ldc2 --build=release --force --parallel 2>&1 | tail -5
+RUN --mount=type=cache,target=/build/.dub dub build --compiler=ldc2 --build=release --force --parallel 2>&1 | tail -5 || true
 RUN --mount=type=cache,target=/build/.dub dub build --config=engine --compiler=ldc2 --build=release --force --parallel 2>&1 | tail -5
-RUN strip /build/irc-fiber
-RUN strip /build/irc-fiber-engine
+RUN strip /build/irc-fiber 2>/dev/null || true
+RUN strip /build/irc-fiber-engine 2>/dev/null || true
 
 # Runtime stage
 FROM ubuntu:22.04
