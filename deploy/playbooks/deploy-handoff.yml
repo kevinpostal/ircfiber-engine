@@ -147,12 +147,47 @@
       changed_when: false
       ignore_errors: true
 
-    # ── Launch new engine (handoff mode) ─────────────────────────────
+    # ── Resolve env vars (needed by both control msg + launch) ────────
     - name: Resolve backend tailscale IP for Redis
       ansible.builtin.set_fact:
         backend_ip: "{{ hostvars[groups['ircfiber_backend'][0]]['host_tailscale_ip']
                        | default(hostvars[inventory_hostname]['host_tailscale_ip']) }}"
 
+    # ── Trigger handoff FIRST (old engine creates the listener socket) ─
+    - name: Send gracefulReload control message via redis-cli
+      ansible.builtin.shell: |
+        msg='{"action":"gracefulReload","config":{"newEnginePid":0,"socketPath":"{{ handoff_socket }}","deadlineMs":30000}}'
+        redis-cli -u {{ redis_url }} LPUSH "irc:control:{{ ircfiber_engine_id }}" "$msg"
+        echo "Control message sent to irc:control:{{ ircfiber_engine_id }}"
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Wait for handoff socket to appear (old engine listener ready)
+      ansible.builtin.shell: |
+        for i in $(seq 1 30); do
+          if docker exec {{ engine_container }} test -S '{{ handoff_socket }}' 2>/dev/null; then
+            echo "SOCKET_READY"
+            exit 0
+          fi
+          if ! docker exec {{ engine_container }} kill -0 {{ old_engine_pid }} 2>/dev/null; then
+            echo "ENGINE_DIED"
+            exit 1
+          fi
+          sleep 1
+        done
+        echo "SOCKET_TIMEOUT"
+        exit 1
+      register: sock_ready
+      ignore_errors: true
+      changed_when: false
+
+    - name: Fail if socket never appeared
+      ansible.builtin.fail:
+        msg: "Handoff socket {{ handoff_socket }} was never created (old engine didn't start listener)"
+      when: sock_ready.stdout != 'SOCKET_READY'
+
+    # ── Launch new engine (now that the listener is up) ────────────────
     - name: Launch new engine inside container (handoff mode)
       ansible.builtin.command:
         cmd: >
@@ -166,21 +201,6 @@
           -e IRCFIBER_RELOAD_FROM_PID={{ old_engine_pid }}
           {{ engine_container }}
           {{ engine_binary_stage }}
-
-    - name: Set new engine PID fact
-      ansible.builtin.set_fact:
-        new_engine_pid: "none_yet"
-        handoff_pending: true
-
-    # ── Trigger handoff ──────────────────────────────────────────────
-    - name: Send gracefulReload control message via redis-cli
-      ansible.builtin.shell: |
-        msg='{"action":"gracefulReload","config":{"newEnginePid":0,"socketPath":"{{ handoff_socket }}","deadlineMs":30000}}'
-        redis-cli -u {{ redis_url }} LPUSH "irc:control:{{ ircfiber_engine_id }}" "$msg"
-        echo "Control message sent to irc:control:{{ ircfiber_engine_id }}"
-      args:
-        executable: /bin/bash
-      changed_when: true
 
     # ── Wait for handoff to complete ────────────────────────────────
     - name: Wait for old engine to exit (handoff complete)
