@@ -168,6 +168,16 @@
       failed_when: false
       when: ircfiber_engine_id is defined and engine_info.exists
 
+    - name: Install tini in engine container (needed for handoff)
+      ansible.builtin.shell: |
+        if ! docker exec {{ engine_container }} which tini >/dev/null 2>&1; then
+          docker exec {{ engine_container }} apt-get update -qq
+          docker exec {{ engine_container }} apt-get install -y -qq tini
+        fi
+        echo "tini OK"
+      when: ircfiber_engine_id is defined and engine_info.exists and old_pid_raw.rc == 0
+      changed_when: true
+
     - name: Set engine handoff vars
       ansible.builtin.set_fact:
         _engine_pid: "{{ old_pid_raw.stdout | trim | split(' ') | first }}"
