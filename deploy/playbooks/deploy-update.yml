@@ -216,12 +216,11 @@
       changed_when: false
 
     - name: Launch new engine (handoff path)
-      ansible.builtin.shell: |
-        # Read required env vars from container (inherited by docker exec)
-        redis_url=$(docker exec {{ engine_container }} printenv IRCFIBER_REDIS_URL 2>/dev/null || echo "redis://127.0.0.1:6379/0")
-        docker exec -d \
-          -e IRCFIBER_RELOAD_FROM_PID={{ _engine_pid }} \
-          {{ engine_container }} \
+      ansible.builtin.command:
+        cmd: >
+          docker exec -d
+          -e IRCFIBER_RELOAD_FROM_PID={{ _engine_pid }}
+          {{ engine_container }}
           /app/irc-fiber-engine-handoff
       when:
         - ircfiber_engine_id is defined

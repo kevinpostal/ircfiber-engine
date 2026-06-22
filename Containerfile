@@ -56,6 +56,7 @@ RUN apt-get update && apt-get install -y \
     curl \
     procps \
     ca-certificates \
+    tini \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -70,4 +71,8 @@ RUN mkdir -p /app/data /app/uploads
 
 EXPOSE 8090
 
-# No default entrypoint; command set in docker-compose
+# tini as init — prevents zombie processes and allows graceful
+# handoff within a container. Without it, the engine runs as PID 1
+# and exit(0) kills the entire container, defeating SCM_RIGHTS.
+ENTRYPOINT ["/usr/bin/tini", "--"]
+# Default command overridden in docker-compose/docker run.
