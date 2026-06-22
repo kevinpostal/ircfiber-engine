@@ -31,7 +31,7 @@
     builder_image: ircfiber-builder
     host_bin_dir: /opt/ircfiber/bin
     gateway_container: "{{ gateway_container_name | default('ircfiber-gateway') }}"
-    engine_container: "{{ 'ircfiber-engine-' ~ ircfiber_engine_id }}"
+    engine_container: "{{ ('ircfiber-engine-' ~ ircfiber_engine_id) if ircfiber_engine_id is defined else '' }}"
     ldc_version: "1.41.0"
     gateway_binary: "{{ host_bin_dir }}/irc-fiber"
     engine_binary: "{{ host_bin_dir }}/irc-fiber-engine"
@@ -175,21 +175,35 @@
       ignore_errors: true
       when: ircfiber_engine_id is defined and engine_info.exists and old_pid_raw.rc == 0
 
-    - name: Launch new engine inside container (handoff mode)
-      ansible.builtin.shell: |
-        docker exec -d \
-          -e IRCFIBER_RELOAD_FROM_PID={{ old_pid_raw.stdout | trim | split(' ') | first }} \
-          {{ engine_container }} \
-          /app/irc-fiber-engine-handoff
+    - name: Set handoff vars for engine host
+      ansible.builtin.set_fact:
+        _engine_pid: "{{ old_pid_raw.stdout | trim | split(' ') | first }}"
+        _handoff_sock: "/tmp/ircfiber-handoff-{{ ircfiber_engine_id }}.sock"
       when: ircfiber_engine_id is defined and engine_info.exists and old_pid_raw.rc == 0
+
+    - name: Launch new engine inside container (handoff mode)
+      ansible.builtin.command:
+        cmd: >
+          docker exec -d
+          -e IRCFIBER_RELOAD_FROM_PID={{ _engine_pid }}
+          {{ engine_container }}
+          /app/irc-fiber-engine-handoff
+      when:
+        - ircfiber_engine_id is defined
+        - engine_info.exists
+        - old_pid_raw.rc == 0
+        - _engine_pid is defined
 
     - name: Send gracefulReload control message via redis-cli
       ansible.builtin.shell: |
         redis_url=$(docker exec {{ engine_container }} printenv IRCFIBER_REDIS_URL 2>/dev/null || echo "redis://127.0.0.1:6379/0")
-        msg='{"action":"gracefulReload","config":{"newEnginePid":0,"socketPath":"/tmp/ircfiber-handoff-{{ ircfiber_engine_id }}.sock","deadlineMs":30000}}'
+        msg='{"action":"gracefulReload","config":{"newEnginePid":0,"socketPath":"{{ _handoff_sock }}","deadlineMs":30000}}'
         redis-cli -u "$redis_url" LPUSH "irc:control:{{ ircfiber_engine_id }}" "$msg"
         echo "Control message sent to irc:control:{{ ircfiber_engine_id }} via $redis_url"
-      when: ircfiber_engine_id is defined and engine_info.exists and old_pid_raw.rc == 0
+      when:
+        - ircfiber_engine_id is defined
+        - engine_info.exists
+        - old_pid_raw.rc == 0
       changed_when: true
 
     - name: Wait for old engine to exit (handoff complete)
