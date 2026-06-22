@@ -23,5 +23,5 @@ docker_daemon_config:
     max-file: "3"
   storage-driver: overlay2
   default-address-pools:
-    - base: "172.30.0.0/16"
+    - base: "172.17.0.0/12"
       size: 24

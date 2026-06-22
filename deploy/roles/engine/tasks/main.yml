@@ -55,7 +55,7 @@
     image: "{{ ircfiber_engine_image_full }}"
     state: started
     restart_policy: unless-stopped
-    command: ["/app/ircfiber-engine"]
+    command: ["/app/irc-fiber-engine"]
     networks:
       - name: "{{ docker_ircfiber_network }}"
     env_file: "/etc/ircfiber/engine/env-{{ ircfiber_engine_id }}"
@@ -64,7 +64,7 @@
     ulimits:
       - "nofile:65536:65536"
     healthcheck:
-      test: ["CMD-SHELL", "pidof ircfiber-engine || exit 1"]
+      test: ["CMD-SHELL", "pidof irc-fiber-engine || exit 1"]
       interval: "{{ engine_healthcheck_interval }}"
       timeout: "{{ engine_healthcheck_timeout }}"
       retries: "{{ engine_healthcheck_retries }}"

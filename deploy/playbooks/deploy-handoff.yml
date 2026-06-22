@@ -69,7 +69,7 @@
       ansible.posix.synchronize:
         src: "{{ playbook_dir }}/../../"
         dest: "{{ src_root }}"
-        delete: false
+        delete: true
         rsync_opts:
           - "--exclude=.git"
           - "--exclude=node_modules"

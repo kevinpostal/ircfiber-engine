@@ -129,3 +129,64 @@ make engine-restart          # Hard restart (closes sockets, reconnect)
 - SCM_RIGHTS FD transfer test uses pipe + socketpair — works on macOS and Linux
 - End-to-end handoff requires a running engine and a Linux environment (or macOS with BSD SCM_RIGHTS)
 - The `consumer.d` test runner may hang on macOS when vibe.d fiber context is required — disable via `excludedSourceFiles` in `dub.sdl` if needed
+
+---
+
+# IRC Fiber — Deploy Architecture
+
+## Architecture mismatch: local ARM64 vs remote x86_64
+
+Local dev is on Apple Silicon (ARM64). The production server `ircfiber-ovh-1` (40.160.227.49) is **x86_64**. **Never** compile D binaries locally and SCP them — they produce `exec format error` on the server.
+
+Always build via the **remote BuildKit** (docker build on the server) or use `make update` which handles this automatically. The only exception is frontend dist assets (`public/dist/`) which are platform-independent JS/CSS/HTML and can be pushed directly via the SSH tar pipe in the Makefile.
+
+```bash
+# Correct: builds on the remote server
+make update                        # full deploy (frontend + binaries + handoff)
+make handoff                       # engine-only handoff (builds on remote)
+
+# WRONG: local binary won't run on x86_64
+scp irc-fiber deploy@server:/tmp/  # ← do not do this
+```
+
+## Handoff deployment flow
+
+`deploy-update.yml` builds the binary INSIDE a Docker container on the remote server using BuildKit:
+1. Rsync local source → `/opt/ircfiber-src/` on remote
+2. `docker build --target builder` — compiles D code via dub + LDC
+3. Extracts binary from builder image
+4. `docker cp` into running gateway container + restart
+5. Engine hot-reload (handoff) — no IRC disconnect
+
+Key issue: `rsync delete: false` (now fixed to `delete: true`) allowed stale source files like `source/ircfiber/web/admin.d` to persist on the remote after the admin code was refactored into the `admin/` package directory. This caused `dub build` to fail with "package name conflicts with module name" — the error was hidden by `|| true` in the Containerfile's RUN command.
+
+## Admin SPA deployment
+
+Frontend assets (`public/dist/admin.html`, `assets/*`) are pushed to the gateway container via the Makefile's SSH tar pipe AFTER the playbook completes:
+```bash
+tar cz --no-xattrs -C public/dist . | ssh deploy@server \
+  'docker exec -i ircfiber-gateway sh -c "rm -rf /app/public/dist/ && mkdir -p /app/public/dist/ && tar xzf - -C /app/public/dist"'
+```
+The `--no-xattrs` flag prevents macOS extended attributes from creating duplicate `file 2.ext` entries on Linux.
+
+## Engine priority and assignment architecture
+
+`assignNetwork()` in `source/ircfiber/irc/registry.d` selects a server for new networks. Fixed from pure least-loaded to priority-aware:
+- Higher `priority` wins
+- `fallbackOnly` servers excluded unless no other healthy servers exist
+- Tiebreaker: fewest assigned networks
+
+Engine config overrides (`priority`, `fallbackOnly`, `maxConnections`) are stored in `irc:engine:config:<serverId>` in Redis. The engine reads them at boot and every 10s in the heartbeat loop. However, the heartbeat was only writing `lastHeartbeat`/`isHealthy` — the `data` field (containing priority etc.) was never synced to Redis. Fixed by adding `syncServerState()` which persists the full server record every heartbeat cycle.
+
+Existing network assignments are sticky — they stay on the current server until explicitly reassigned (via admin API `/api/admin/servers/:id/reassign`) or the server dies. `healthCheckAll()` now has a Phase 3 that reconciles orphaned assignments: networks in `irc:assignments` that don't appear in the assigned server's `assignedNetworks` list are reassigned to a proper home.
+
+## Server reboot behavior
+
+Engine config overrides (`priority`, `fallbackOnly`, `maxConnections`) are stored in Redis keys `irc:engine:config:<serverId>`. Redis persists to disk, so these survive reboots. On server restart (all containers start simultaneously):
+
+1. Redis/Mongo start first (host network mode)
+2. Gateway + Engine containers start on `ircfiber_net` bridge network
+3. Each engine reads its assigned networks from `irc:assignments` (Redis hash)
+4. **Key fix**: During boot, if a lower-priority engine sees networks assigned to a higher-priority engine (but that engine hasn't heartbeated yet), it **defers reclaim** instead of stealing them (`bootstrap.d:216-224`). This prevents backup1 from taking over OVH's networks during a full reboot.
+
+All containers use `restart_policy: unless-stopped`, so `docker restart` on the host recovers everything automatically.

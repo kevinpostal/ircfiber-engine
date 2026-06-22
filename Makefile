@@ -1221,8 +1221,8 @@ _playbook    = cd deploy && ansible-playbook -l $(_target) $(_vault_arg)
 update: frontend build build-engine ## Deploy > Build frontend + gateway + engine, handoff-deploy (zero disconnect for engines)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Deploy → $(_target)  $(R)"
 	@$(_playbook) playbooks/deploy-update.yml
-	@printf '%b\n' "$(D)  Syncing frontend dist → ircfiber-gateway$(R)"
-	@tar cz -C public/dist . | ssh deploy@$(_target_ssh) 'docker exec -i ircfiber-gateway tar xzf - -C /app/public/dist'
+	@printf '%b\n' "$(D)  Syncing frontend dist → ircfiber-gateway (clean extract)$(R)"
+	@tar cz --no-xattrs -C public/dist . | ssh deploy@$(_target_ssh) 'docker exec -i ircfiber-gateway sh -c "rm -rf /app/public/dist/ 2>/dev/null; mkdir -p /app/public/dist/ && tar xzf - -C /app/public/dist"'
 
 # Deploy engine only to the backup server.
 # Usage: make update-backup VAULT_PASS_FILE=.vault_pass.txt
@@ -1246,8 +1246,8 @@ deploy: update-full ## Deploy > Alias for update-full
 # change, no container restart, no reconnect. ~2-3s after build.
 update-assets: frontend ## Deploy > Build frontend + push public/* to running gateway (no restart)
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Asset push → $(_target_ssh) ($(_target))  $(R)"
-	@printf '%b\n' "$(D)  Tarring public/ → ssh → docker exec tar -xf -$(R)"
-	@tar cz -C public . | ssh deploy@$(_target_ssh) 'docker exec -i ircfiber-gateway tar xzf - -C /app/public'
+	@printf '%b\n' "$(D)  Tarring public/ → ssh → docker exec tar -xf - (clean extract)$(R)"
+	@tar cz --no-xattrs -C public . | ssh deploy@$(_target_ssh) 'docker exec -i ircfiber-gateway sh -c "rm -rf /app/public/dist/ /app/public/.vite/ /app/public/assets/ 2>/dev/null; tar xzf - -C /app/public"'
 
 # Show running container images and versions on the target.
 update-status: ## Deploy > Show running containers & image versions

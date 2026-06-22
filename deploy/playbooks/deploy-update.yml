@@ -50,7 +50,7 @@
       ansible.posix.synchronize:
         src: "{{ playbook_dir }}/../../"
         dest: "{{ src_root }}"
-        delete: false
+        delete: true
         rsync_opts:
           - "--exclude=.git"
           - "--exclude=node_modules"
@@ -248,7 +248,7 @@
     - name: Launch new engine (handoff path — detach with setsid)
       ansible.builtin.shell: |
         docker exec -d {{ engine_container }} sh -c \
-          'setsid /app/irc-fiber-engine-handoff > /tmp/ircfiber-handoff-child.log 2>&1 &'
+          'IRCFIBER_RELOAD_FROM_PID={{ _engine_pid }} setsid /app/irc-fiber-engine-handoff > /tmp/ircfiber-handoff-child.log 2>&1 &'
       when:
         - ircfiber_engine_id is defined
         - sock_ready is succeeded
