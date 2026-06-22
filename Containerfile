@@ -65,8 +65,8 @@ COPY --from=builder /build/views /app/views
 COPY --from=builder /build/config /app/config
 COPY --from=builder /build/public /app/public
 
-# Create data directory for JSON fallback storage
-RUN mkdir -p /app/data
+# Create data directory for JSON fallback storage and uploads directory
+RUN mkdir -p /app/data /app/uploads
 
 EXPOSE 8090
 

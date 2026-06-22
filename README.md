@@ -64,7 +64,7 @@ IRC_FIBER/
 │   │   ├── models/          Domain types (IRCEvent, Message, Network, User, IRCChannel)
 │   │   ├── redis/           Redis protocol / client
 │   │   ├── storage/         Buffer / session / redis storage layer
-│   │   ├── upload/          Catbox.moe upload client
+│   │   ├── upload/          Local file upload handler
 │   │   └── web/             HTTP routes / static / WebSocket
 │   ├── app.d                App entry point (gateway)
 │   └── app_engine.d         App entry point (IRC engine)
