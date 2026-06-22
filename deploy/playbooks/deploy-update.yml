@@ -119,6 +119,19 @@
       ignore_errors: true
       changed_when: true
 
+    - name: Sync public assets into gateway container
+      ansible.builtin.shell: |
+        if docker container inspect {{ gateway_container }} >/dev/null 2>&1; then
+          docker cp {{ src_root }}/public/. {{ gateway_container }}:/app/public/
+          echo "Public assets synced"
+        else
+          echo "No gateway container, skipping asset sync"
+        fi
+      args:
+        executable: /bin/bash
+      ignore_errors: true
+      changed_when: true
+
     # ── Inject + restart gateway ─────────────────────────────────────
     # Skip if no gateway container exists on this host (engine-only hosts)
     - name: Check if gateway container exists
@@ -203,11 +216,12 @@
       changed_when: false
 
     - name: Launch new engine (handoff path)
-      ansible.builtin.command:
-        cmd: >
-          docker exec -d
-          -e IRCFIBER_RELOAD_FROM_PID={{ _engine_pid }}
-          {{ engine_container }}
+      ansible.builtin.shell: |
+        # Read required env vars from container (inherited by docker exec)
+        redis_url=$(docker exec {{ engine_container }} printenv IRCFIBER_REDIS_URL 2>/dev/null || echo "redis://127.0.0.1:6379/0")
+        docker exec -d \
+          -e IRCFIBER_RELOAD_FROM_PID={{ _engine_pid }} \
+          {{ engine_container }} \
           /app/irc-fiber-engine-handoff
       when:
         - ircfiber_engine_id is defined
@@ -216,7 +230,7 @@
 
     - name: Wait for handoff to complete (old engine exits)
       ansible.builtin.shell: |
-        for i in $(seq 1 60); do
+        for i in $(seq 1 120); do
           if ! docker exec {{ engine_container }} kill -0 {{ _engine_pid }} 2>/dev/null; then
             echo "HANDOFF_OK"
             exit 0
