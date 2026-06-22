@@ -185,9 +185,8 @@
     # fall back to a hard restart. Next deploy will use handoff.
     - name: Try handoff — send gracefulReload control message
       ansible.builtin.shell: |
-        redis_url=$(docker exec {{ engine_container }} printenv IRCFIBER_REDIS_URL 2>/dev/null || echo "redis://127.0.0.1:6379/0")
         msg='{"action":"gracefulReload","config":{"socketPath":"{{ _handoff_sock }}","deadlineMs":30000}}'
-        redis-cli -u "$redis_url" LPUSH "irc:control:{{ ircfiber_engine_id }}" "$msg"
+        docker exec irc_redis_test redis-cli LPUSH "irc:control:{{ ircfiber_engine_id }}" "$msg"
       when: ircfiber_engine_id is defined and engine_info.exists and old_pid_raw.rc == 0
       changed_when: true
 

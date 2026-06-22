@@ -154,14 +154,11 @@
                        | default(hostvars[inventory_hostname]['host_tailscale_ip']) }}"
 
     # ── Trigger handoff FIRST (old engine creates the listener socket) ─
-    - name: Send gracefulReload control message via redis-cli
+    - name: Send gracefulReload control message via redis-cli (via Redis container)
       ansible.builtin.shell: |
         msg='{"action":"gracefulReload","config":{"newEnginePid":0,"socketPath":"{{ handoff_socket }}","deadlineMs":30000}}'
-        redis-cli -u {{ redis_url }} LPUSH "irc:control:{{ ircfiber_engine_id }}" "$msg"
+        docker exec irc_redis_test redis-cli LPUSH "irc:control:{{ ircfiber_engine_id }}" "$msg"
         echo "Control message sent to irc:control:{{ ircfiber_engine_id }}"
-      args:
-        executable: /bin/bash
-      changed_when: true
 
     - name: Wait for handoff socket to appear (old engine listener ready)
       ansible.builtin.shell: |
