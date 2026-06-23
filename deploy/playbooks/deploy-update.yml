@@ -173,7 +173,15 @@
         restart: true
       when: gw_exists.stdout == 'yes'
 
-    # ── Engine deploy: handoff if supported, hard restart otherwise ──
+    # ── Engine deploy: graceful handoff, fall back to hard restart ─────
+    # Flow:
+    #   1. Always inject the new binary (needed for both handoff + restart)
+    #   2. Try graceful handoff: send Redis control msg → wait for socket
+    #      → launch new engine → verify old engine exited
+    #   3. If handoff succeeds: old engine killed by post-handoff cleanup
+    #   4. If handoff fails (or PID not found): inject binary + hard restart
+    #
+    # Handoff preserves IRC sockets (zero disconnect). Hard restart drops them.
     - name: Check engine container exists
       community.docker.docker_container_info:
         name: "{{ engine_container }}"
@@ -188,6 +196,24 @@
       failed_when: false
       when: ircfiber_engine_id is defined and engine_info.exists
 
+    # ── Inject new binary into container (always — handoff + restart both need it) ──
+    - name: Stage new engine binary
+      ansible.builtin.command:
+        cmd: docker cp {{ engine_binary }} {{ engine_container }}:/app/irc-fiber-engine-handoff
+      when: ircfiber_engine_id is defined and engine_info.exists
+
+    - name: Mark staged binary executable
+      ansible.builtin.command:
+        cmd: docker exec {{ engine_container }} chmod +x /app/irc-fiber-engine-handoff
+      when: ircfiber_engine_id is defined and engine_info.exists
+
+    # ── Graceful handoff attempt ──────────────────────────────────────
+    - name: Set engine handoff vars
+      ansible.builtin.set_fact:
+        _engine_pid: "{{ old_pid_raw.stdout | trim | split(' ') | first }}"
+        _handoff_sock: "/tmp/ircfiber-handoff-{{ ircfiber_engine_id }}.sock"
+      when: ircfiber_engine_id is defined and engine_info.exists and old_pid_raw.rc == 0
+
     - name: Install tini in engine container (needed for handoff)
       ansible.builtin.shell: |
         if ! docker exec {{ engine_container }} which tini >/dev/null 2>&1; then
@@ -198,22 +224,6 @@
       when: ircfiber_engine_id is defined and engine_info.exists and old_pid_raw.rc == 0
       changed_when: true
 
-    - name: Set engine handoff vars
-      ansible.builtin.set_fact:
-        _engine_pid: "{{ old_pid_raw.stdout | trim | split(' ') | first }}"
-        _handoff_sock: "/tmp/ircfiber-handoff-{{ ircfiber_engine_id }}.sock"
-      when: ircfiber_engine_id is defined and engine_info.exists and old_pid_raw.rc == 0
-
-    - name: Stage new engine binary
-      ansible.builtin.command:
-        cmd: docker cp {{ engine_binary }} {{ engine_container }}:/app/irc-fiber-engine-handoff
-      when: ircfiber_engine_id is defined and engine_info.exists and old_pid_raw.rc == 0
-
-    - name: Mark staged binary executable
-      ansible.builtin.command:
-        cmd: docker exec {{ engine_container }} chmod +x /app/irc-fiber-engine-handoff
-      when: ircfiber_engine_id is defined and engine_info.exists and old_pid_raw.rc == 0
-
     - name: Remove stale handoff socket and done marker
       ansible.builtin.command:
         cmd: docker exec {{ engine_container }} rm -f /tmp/ircfiber-handoff-{{ ircfiber_engine_id }}.sock /tmp/ircfiber-handoff-done-{{ ircfiber_engine_id }}
@@ -221,11 +231,6 @@
       ignore_errors: true
       when: ircfiber_engine_id is defined and engine_info.exists and old_pid_raw.rc == 0
 
-    # Try handoff — old engine must already have handoff code for
-    # this to work. If the engine was just deployed for the first
-    # time with the handoff build, it won't know about the
-    # "gracefulReload" control action. In that case we wait 5s and
-    # fall back to a hard restart. Next deploy will use handoff.
     - name: Try handoff — send gracefulReload control message
       ansible.builtin.shell: |
         msg='{"action":"gracefulReload","config":{"socketPath":"{{ _handoff_sock }}","deadlineMs":30000}}'
@@ -233,9 +238,9 @@
       when: ircfiber_engine_id is defined and engine_info.exists and old_pid_raw.rc == 0
       changed_when: true
 
-    - name: Wait for handoff socket (5s — old engine may not support handoff yet)
+    - name: Wait for handoff socket (30s — old engine creates listener on gracefulReload)
       ansible.builtin.shell: |
-        for i in $(seq 1 10); do
+        for i in $(seq 1 60); do
           docker exec {{ engine_container }} test -S '{{ _handoff_sock }}' 2>/dev/null && exit 0
           sleep 0.5
         done
@@ -276,26 +281,29 @@
 
     - name: Post-handoff — kill old engine and replace binary
       ansible.builtin.shell: |
-        old_pid=$(docker exec {{ engine_container }} pidof irc-fiber-engine 2>/dev/null | awk '{print $1}')
-        docker exec {{ engine_container }} kill $old_pid 2>/dev/null || true
+        docker exec {{ engine_container }} kill {{ _engine_pid }} 2>/dev/null || true
         docker exec {{ engine_container }} mv -f /app/irc-fiber-engine-handoff /app/irc-fiber-engine
         docker exec {{ engine_container }} rm -f /tmp/ircfiber-handoff-done-{{ ircfiber_engine_id }}
-        echo "Old PID $old_pid killed, binary replaced"
+        echo "Old engine killed, binary replaced"
       when:
         - ircfiber_engine_id is defined
         - handoff_done is not skipped
         - handoff_done.stdout | default('') == 'HANDOFF_OK'
 
     # ── Fallback: hard restart ────────────────────────────────────
+    # Triggered when:
+    #   a) Engine PID not found (old_pid_raw.rc != 0)
+    #   b) Handoff socket never appeared (sock_ready is failed)
+    #   c) Handoff started but never completed (handoff_done is failed or skipped)
     - name: Inject engine binary (restart path)
       ansible.builtin.command:
         cmd: docker cp {{ engine_binary }} {{ engine_container }}:/app/irc-fiber-engine
       when:
         - ircfiber_engine_id is defined
         - engine_info.exists
-        - sock_ready is failed or (handoff_done is not skipped and handoff_done.stdout | default('') != 'HANDOFF_OK')
+        - old_pid_raw.rc != 0 or sock_ready is failed or handoff_done is failed or (handoff_done is not skipped and handoff_done.stdout | default('') != 'HANDOFF_OK')
 
-    - name: Restart engine container (hard — this deploy; handoff on next)
+    - name: Restart engine container (hard)
       community.docker.docker_container:
         name: "{{ engine_container }}"
         state: started
@@ -303,4 +311,4 @@
       when:
         - ircfiber_engine_id is defined
         - engine_info.exists
-        - sock_ready is failed or (handoff_done is not skipped and handoff_done.stdout | default('') != 'HANDOFF_OK')
+        - old_pid_raw.rc != 0 or sock_ready is failed or handoff_done is failed or (handoff_done is not skipped and handoff_done.stdout | default('') != 'HANDOFF_OK')
