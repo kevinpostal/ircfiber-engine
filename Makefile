@@ -80,7 +80,7 @@ AR := →
 .PHONY: build build-engine build-release build-debug build-ldc2 frontend frontend-dev frontend-install
 
 # Component Workflows (primary user-facing targets)
-.PHONY: dev dev-live debug debug-live stop
+.PHONY: dev dev-docker dev-live debug debug-live stop
 .PHONY: engine engine-rebuild engine-handoff engine-handoff-redis engine-restart engine-test
 .PHONY: gateway gateway-rebuild gateway-restart
 .PHONY: status logs logs-engine logs-gateway logs-supervisor crash-logs
@@ -97,7 +97,8 @@ AR := →
 .PHONY: ensure-colima docker-up docker-down docker-logs docker-build \
         docker-up-web docker-down-web docker-restart-web \
         docker-up-backend docker-down-backend docker-restart-backend docker-restart \
-        docker-down-test \
+        docker-restart-code \
+        docker-up-test docker-down-test test-server-log test-server-log-playwright \
         docker-shell docker-shell-engine docker-shell-redis docker-shell-mongo docker-shell-ircd ircd-up ircd-down
 .PHONY: cross-linux-x64 cross-linux-arm64 cross-linux-armv7
 .PHONY: verify precommit ci install-env
@@ -145,18 +146,6 @@ AR := →
 #   make debug-live IRCFIBER_SERVER_ID=mybox   (set a unique engine id)
 # ──────────────────────────────────────────────────────────────────────────
 
-# Default backend for `make dev` / `make dev-live`
-BACKEND ?= local
-VITE_BACKEND_URL ?= https://ircfiber-ovh-1.tail544547.ts.net
-
-ifeq ($(BACKEND),tailnet)
-  EFFECTIVE_BACKEND_URL := https://ircfiber-ovh-1.tail544547.ts.net
-else ifeq ($(BACKEND),local)
-  EFFECTIVE_BACKEND_URL := http://127.0.0.1:8090
-else
-  EFFECTIVE_BACKEND_URL := $(BACKEND)
-endif
-
 # Tailnet connection settings (used by debug-live)
 TAILNET_MONGO_URL ?= mongodb://ircfiber:jqgwEv3GJwwizulaj3Fnbd8imqcMH4Gh@100.126.197.92:27017/ircfiber
 TAILNET_REDIS_URL ?= redis://100.126.197.92:6379/0
@@ -191,6 +180,22 @@ dev: frontend-install ## Component > Frontend dev (Vite HMR) — pairs with `mak
 # Frontend dev pointing at the tailnet gateway (no local D backend at all).
 dev-live: ## Component > Frontend dev (Vite) against the TAILNET gateway
 	@$(MAKE) --no-print-directory dev BACKEND=tailnet
+
+# Docker + Vite dev — starts Docker backend (redis/mongo/ircd/gateway/engine)
+# then launches the Vite dev server with HMR. Fastest full-stack dev cycle:
+#   - Docker runs backend
+#   - Vite serves frontend with live reload on save
+#   - For D code changes: `make docker-restart-code` in another terminal
+dev-docker: ensure-colima ## Dev > Docker backend + Vite frontend dev (fastest full-stack cycle)
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting Docker backend  $(R)"
+	@if ! docker compose ps redis mongo ircd irc_fiber irc_engine 2>/dev/null | grep -q "healthy"; then \
+		docker compose up -d redis mongo ircd irc_fiber irc_engine; \
+		printf "%b\n" "$(BG)$(OK) Docker backend started$(R)"; \
+	else \
+		printf "%b\n" "$(BG)$(OK) Docker backend already running$(R)"; \
+	fi
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting Vite dev server  $(R)"
+	@cd frontend && VITE_BACKEND_URL=http://127.0.0.1:8090 npm run dev
 
 # Full local stack — gateway + supervised engine, both against local docker DBs.
 # For when you're editing the D code and want a clean local environment.
@@ -999,6 +1004,9 @@ ensure-colima:
 docker-up: ensure-colima ## Docker > Start all services with Docker Compose
 	@printf '\n%b\n' "$(D)→ Pruning stale Docker layers before start...$(R)"
 	@docker system prune -af --volumes=false 2>&1 | tail -2
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Building Docker image  $(R)"
+	@# Build once — both irc_fiber + irc_engine share the same image tag
+	@docker compose build irc_fiber
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting Docker Services  $(R)"
 	@docker compose up -d
 	@printf '%b\n' "$(BG)$(OK) Services started$(R) $(D)(http://localhost:8090)$(R)"
@@ -1009,9 +1017,33 @@ docker-down: ensure-colima ## Docker > Stop all Docker services
 	@printf '%b\n' "$(BG)$(OK) Services stopped$(R)"
 
 docker-down-test: ensure-colima ## Docker > Stop test services (ircd + mongo + redis)
-	@printf '%b\n' "$(D)→ Stopping Docker test services (docker-compose.test.yml)...$(R)"
+	@printf '\n%b\n' "$(D)→ Stopping Docker test services (docker-compose.test.yml)...$(R)"
 	@docker compose -f docker-compose.test.yml down
 	@printf '%b\n' "$(BG)$(OK) Test services stopped$(R)"
+
+docker-up-test: ensure-colima ## Docker > Start full test stack (ircd + mongo + redis + gateway + engine)
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting test stack (docker-compose.test.yml)  $(R)"
+	@docker compose -f docker-compose.test.yml up -d ircd redis mongo irc_fiber irc_engine
+	@printf '\n%b\n' "$(D)Waiting for gateway health check at http://127.0.0.1:8090/health ...$(R)"
+	@for i in $$(seq 1 30); do \
+		if curl -fsS http://127.0.0.1:8090/health >/dev/null 2>&1; then \
+			printf '%b\n' "$(BG)$(OK) Test stack healthy$(R)"; exit 0; \
+		fi; \
+		sleep 1; \
+	done
+	@printf '%b\n' "$(Y)$(WR) Gateway did not become healthy in 30s$(R)"
+
+test-server-log: docker-up-test ## Test > Run server-log timeline integration test (Node + WebSocket, against local ircd)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Running server-log timeline integration test  $(R)"
+	@PLAYWRIGHT_BASE_URL=$${PLAYWRIGHT_BASE_URL:-http://127.0.0.1:8090} node tests/server-log-timeline.test.mjs
+
+test-server-log-playwright: docker-up-test ## Test > Run server-log timeline Playwright spec (browser-level)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Running server-log Playwright spec  $(R)"
+	@cd e2e && npx playwright test server-log-timeline.spec.js
+
+seed-test-network: docker-up-test ## Utils > Seed a LocalIRCd network against the test stack (admin/REDACTED by default)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Seeding test network LocalIRCd  $(R)"
+	@FIBER_USERNAME=$${FIBER_USERNAME:-admin} FIBER_PASSWORD=$${FIBER_PASSWORD:-REDACTED} ./scripts/seed-test-network.sh
 
 docker-prune: ensure-colima ## Docker > Remove dangling images, stopped containers, build cache (safe — keeps volumes)
 	@printf '%b\n' "$(D)→ Pruning stale Docker resources...$(R)"
@@ -1163,6 +1195,18 @@ ircd-down: ensure-colima ## Docker > Stop test IRCD
 docker-restart: docker-restart-web docker-restart-backend ## Docker > Restart all Docker services
 	@printf '%b\n' "$(BG)$(OK) All services restarted$(R)"
 
+docker-restart-code: ensure-colima ## Dev > Rebuild frontend + D binaries + restart gateway & engine (keeps redis/mongo/ircd running)
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Rebuilding frontend (Vite)  $(R)"
+	@npm --prefix frontend run build 2>&1 | tail -3
+	@printf '%b\n' "$(BG)$(OK) Frontend built$(R)"
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Rebuilding D binary  $(R)"
+	@# Both services share image: irc-fiber:latest — build once to avoid tag collision
+	@docker compose build irc_fiber
+	@printf '%b\n' "$(BG)$(OK) Binary built$(R)"
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Restarting gateway + engine  $(R)"
+	@docker compose up -d --force-recreate irc_fiber irc_engine
+	@printf '%b\n' "$(BG)$(OK) Gateway + engine restarted$(R) $(D)(http://localhost:8090)$(R)"
+
 # ----------------------------------------------------------------------------
 # Data Sync — Local Docker → Tailnet
 # ----------------------------------------------------------------------------
@@ -1222,7 +1266,7 @@ update: frontend build build-engine ## Deploy > Build frontend + gateway + engin
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Deploy → $(_target)  $(R)"
 	@$(_playbook) playbooks/deploy-update.yml
 	@printf '%b\n' "$(D)  Syncing frontend dist → ircfiber-gateway (clean extract)$(R)"
-	@tar cz --no-xattrs -C public/dist . | ssh deploy@$(_target_ssh) 'docker exec -i ircfiber-gateway sh -c "rm -rf /app/public/dist/ 2>/dev/null; mkdir -p /app/public/dist/ && tar xzf - -C /app/public/dist"'
+	@tar cz --no-xattrs --format=ustar -C public/dist . | ssh deploy@$(_target_ssh) 'docker exec -i ircfiber-gateway sh -c "rm -rf /app/public/dist/ 2>/dev/null; mkdir -p /app/public/dist/ && tar xzf - -C /app/public/dist"'
 
 # Deploy engine only to the backup server.
 # Usage: make update-backup VAULT_PASS_FILE=.vault_pass.txt
@@ -1247,7 +1291,7 @@ deploy: update-full ## Deploy > Alias for update-full
 update-assets: frontend ## Deploy > Build frontend + push public/* to running gateway (no restart)
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Asset push → $(_target_ssh) ($(_target))  $(R)"
 	@printf '%b\n' "$(D)  Tarring public/ → ssh → docker exec tar -xf - (clean extract)$(R)"
-	@tar cz --no-xattrs -C public . | ssh deploy@$(_target_ssh) 'docker exec -i ircfiber-gateway sh -c "rm -rf /app/public/dist/ /app/public/.vite/ /app/public/assets/ 2>/dev/null; tar xzf - -C /app/public"'
+	@tar cz --no-xattrs --format=ustar -C public . | ssh deploy@$(_target_ssh) 'docker exec -i ircfiber-gateway sh -c "rm -rf /app/public/dist/ /app/public/.vite/ /app/public/assets/ 2>/dev/null; tar xzf - -C /app/public"'
 
 # Show running container images and versions on the target.
 update-status: ## Deploy > Show running containers & image versions
