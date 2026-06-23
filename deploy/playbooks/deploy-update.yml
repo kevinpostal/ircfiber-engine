@@ -214,13 +214,13 @@
         _handoff_sock: "/tmp/ircfiber-handoff-{{ ircfiber_engine_id }}.sock"
       when: ircfiber_engine_id is defined and engine_info.exists and old_pid_raw.rc == 0
 
-    - name: Install tini in engine container (needed for handoff)
+    - name: Install tini + util-linux in engine container (needed for handoff)
       ansible.builtin.shell: |
-        if ! docker exec {{ engine_container }} which tini >/dev/null 2>&1; then
+        if ! docker exec {{ engine_container }} which tini >/dev/null 2>&1 || ! docker exec {{ engine_container }} which setsid >/dev/null 2>&1; then
           docker exec {{ engine_container }} apt-get update -qq
-          docker exec {{ engine_container }} apt-get install -y -qq tini
+          docker exec {{ engine_container }} apt-get install -y -qq tini util-linux
         fi
-        echo "tini OK"
+        echo "tini + util-linux OK"
       when: ircfiber_engine_id is defined and engine_info.exists and old_pid_raw.rc == 0
       changed_when: true
 
@@ -253,7 +253,7 @@
     - name: Launch new engine (handoff path — detach with setsid)
       ansible.builtin.shell: |
         docker exec -d {{ engine_container }} sh -c \
-          'IRCFIBER_RELOAD_FROM_PID={{ _engine_pid }} setsid /app/irc-fiber-engine-handoff > /tmp/ircfiber-handoff-child.log 2>&1 &'
+          'IRCFIBER_RELOAD_FROM_PID={{ _engine_pid }} nohup /app/irc-fiber-engine-handoff > /tmp/ircfiber-handoff-child.log 2>&1 &'
       when:
         - ircfiber_engine_id is defined
         - sock_ready is succeeded

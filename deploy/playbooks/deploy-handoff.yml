@@ -202,7 +202,7 @@
     - name: Launch new engine via setsid (detached, survives docker exec exit)
       ansible.builtin.shell: |
         docker exec -d {{ engine_container }} sh -c \
-          'IRCFIBER_RELOAD_FROM_PID={{ old_engine_pid }} setsid {{ engine_binary_stage }} > /tmp/ircfiber-handoff-child.log 2>&1 &'
+          'IRCFIBER_RELOAD_FROM_PID={{ old_engine_pid }} nohup {{ engine_binary_stage }} > /tmp/ircfiber-handoff-child.log 2>&1 &'
       changed_when: true
 
     # ── Wait for handoff to complete ────────────────────────────────
