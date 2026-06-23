@@ -263,13 +263,16 @@
       register: new_pids
       changed_when: false
 
-    # ── Seal: kill old engine, replace binary, clean up ──────────────
-    - name: Kill old engine and replace binary
+    # ── Seal: replace binary, clean up (old engine stays alive as container anchor) ──
+    # The old engine (child of tini PID 1) keeps running to prevent Docker from
+    # restarting the container. The new engine (handoff child) is already processing
+    # IRC events. Killing the old engine would cause tini to exit → container restart →
+    # IRC disconnect. We just replace the binary on disk and leave the old process idle.
+    - name: Replace binary (old engine stays alive as container anchor)
       ansible.builtin.shell: |
-        docker exec {{ engine_container }} kill {{ old_engine_pid }} 2>/dev/null || true
         docker exec {{ engine_container }} mv -f {{ engine_binary_stage }} {{ engine_binary_dest }}
         docker exec {{ engine_container }} rm -f /tmp/ircfiber-handoff-done-{{ ircfiber_engine_id }}
-        echo "Old engine killed, binary replaced"
+        echo "Binary replaced, old engine running as container anchor"
       changed_when: true
 
     - name: Health check — engine container status

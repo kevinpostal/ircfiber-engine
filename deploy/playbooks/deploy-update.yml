@@ -279,12 +279,11 @@
       ignore_errors: true
       changed_when: false
 
-    - name: Post-handoff — kill old engine and replace binary
+    - name: Post-handoff — replace binary (old engine stays alive as container anchor)
       ansible.builtin.shell: |
-        docker exec {{ engine_container }} kill {{ _engine_pid }} 2>/dev/null || true
         docker exec {{ engine_container }} mv -f /app/irc-fiber-engine-handoff /app/irc-fiber-engine
         docker exec {{ engine_container }} rm -f /tmp/ircfiber-handoff-done-{{ ircfiber_engine_id }}
-        echo "Old engine killed, binary replaced"
+        echo "Binary replaced, old engine running as container anchor"
       when:
         - ircfiber_engine_id is defined
         - handoff_done is not skipped
