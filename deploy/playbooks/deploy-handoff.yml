@@ -40,7 +40,7 @@
     handoff_timeout: 30
     ldc_version: "1.41.0"
     # Redis connection — same as what the running engine uses.
-    redis_url: "redis://{{ backend_tailscale_ip | default(hostvars[groups['ircfiber_backend'][0]]['host_tailscale_ip']) }}:6379/0"
+    redis_url: "redis://{{ backend_tailscale_ip | default('127.0.0.1') }}:6379/0"
 
   pre_tasks:
     - name: Preflight — ircfiber_engine_id is required
@@ -147,11 +147,25 @@
       changed_when: false
       ignore_errors: true
 
-    # ── Resolve env vars (needed by both control msg + launch) ────────
-    - name: Resolve backend tailscale IP for Redis
+    # ── Resolve Tailscale IP (where mongo & redis live) ──────────────
+    # The engine/gateway roles normally set host_tailscale_ip during initial
+    # deploy. This playbook doesn't run those roles, so we discover it here.
+    - name: Discover this host's Tailscale IPv4 address
+      ansible.builtin.command: tailscale ip -4
+      register: tailscale_ip_raw
+      changed_when: false
+      failed_when: tailscale_ip_raw.rc != 0
+      check_mode: false
+
+    - name: Set host_tailscale_ip fact
       ansible.builtin.set_fact:
-        backend_ip: "{{ hostvars[groups['ircfiber_backend'][0]]['host_tailscale_ip']
-                       | default(hostvars[inventory_hostname]['host_tailscale_ip']) }}"
+        host_tailscale_ip: "{{ tailscale_ip_raw.stdout | trim | split('\n') | first | trim }}"
+
+    - name: Resolve backend Tailscale IP
+      ansible.builtin.set_fact:
+        backend_tailscale_ip: >-
+          {{ hostvars[groups['ircfiber_backend'][0]]['host_tailscale_ip']
+             | default(host_tailscale_ip) | default('127.0.0.1') }}
 
     # ── Trigger handoff FIRST (old engine creates the listener socket) ─
     - name: Send gracefulReload control message via redis-cli (via Redis container)
