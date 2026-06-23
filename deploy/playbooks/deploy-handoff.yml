@@ -37,7 +37,7 @@
     engine_binary_stage: "/app/irc-fiber-engine-handoff"
     engine_binary_dest: "/app/irc-fiber-engine"
     handoff_socket: "/tmp/ircfiber-handoff-{{ ircfiber_engine_id }}.sock"
-    handoff_timeout: 30
+    handoff_timeout: 60
     ldc_version: "1.41.0"
     # Redis connection — same as what the running engine uses.
     redis_url: "redis://{{ backend_tailscale_ip | default('127.0.0.1') }}:6379/0"
@@ -206,11 +206,21 @@
       changed_when: true
 
     # ── Wait for handoff to complete ────────────────────────────────
+    # Checks TWO conditions in parallel:
+    #   a) Old engine PID exits (normal shutdown after done marker)
+    #   b) Done marker file appears (handoff transfer complete)
+    # Either one means the handoff finished.
     - name: Wait for old engine to exit (handoff complete)
       ansible.builtin.shell: |
+        marker="{{ handoff_socket_dir | default('/tmp') }}/ircfiber-handoff-done-{{ ircfiber_engine_id }}"
         for i in $(seq 1 $(({{ handoff_timeout }} * 2))); do
-          alive=$(docker exec {{ engine_container }} kill -0 {{ old_engine_pid }} 2>/dev/null && echo 1 || echo 0)
-          if [ "$alive" = "0" ]; then
+          # Check done marker (handoff transfer complete)
+          if docker exec {{ engine_container }} test -f "$marker" 2>/dev/null; then
+            echo "HANDOFF_OK: done marker found after $((i / 2)).$(( (i % 2) * 5 ))s"
+            exit 0
+          fi
+          # Check old PID exited (engine shut down after handoff)
+          if ! docker exec {{ engine_container }} kill -0 {{ old_engine_pid }} 2>/dev/null; then
             echo "HANDOFF_OK: old engine PID {{ old_engine_pid }} exited after $((i / 2)).$(( (i % 2) * 5 ))s"
             exit 0
           fi
@@ -218,7 +228,7 @@
         done
         echo "HANDOFF_TIMEOUT: old engine still running after {{ handoff_timeout }}s"
         
-        # Get new engine PID
+        # Get new engine PID for diagnostics
         new_pid=$(docker exec {{ engine_container }} pidof irc-fiber-engine 2>/dev/null | tr ' ' '\n' | grep -v "{{ old_engine_pid }}" | head -1)
         if [ -n "$new_pid" ]; then
           echo "  new engine IS running (pid=$new_pid)"
@@ -236,7 +246,10 @@
       ansible.builtin.assert:
         that:
           - '"HANDOFF_OK" in handoff_result.stdout'
-        fail_msg: "Handoff failed: {{ handoff_result.stdout }}"
+        fail_msg: |
+          Handoff failed — old engine still running, new engine may not have started.
+          Check /tmp/ircfiber-handoff-child.log inside the engine container.
+          {{ handoff_result.stdout }}
         success_msg: "Handoff succeeded: {{ handoff_result.stdout }}"
 
     # ── Verify new engine is healthy ────────────────────────────────
