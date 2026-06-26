@@ -190,3 +190,56 @@ Engine config overrides (`priority`, `fallbackOnly`, `maxConnections`) are store
 4. **Key fix**: During boot, if a lower-priority engine sees networks assigned to a higher-priority engine (but that engine hasn't heartbeated yet), it **defers reclaim** instead of stealing them (`bootstrap.d:216-224`). This prevents backup1 from taking over OVH's networks during a full reboot.
 
 All containers use `restart_policy: unless-stopped`, so `docker restart` on the host recovers everything automatically.
+
+---
+
+# IRC Fiber — Connection Holder Architecture
+
+For the **enterprise-grade zero-disconnect hot-reload** solution, see [docs/CONNECTION_HOLDER.md](docs/CONNECTION_HOLDER.md). Key points:
+
+- **Holder** (`ircfiber-conn-holder`) is a long-lived daemon owning IRC TCP/TLS sockets.
+- **Engine** (`irc-fiber-engine`) is exec-reloadable, talks to holder via Unix-domain IPC.
+- When engine hot-reloads, holder keeps IRC connection alive — IRC server sees ONE continuous connection.
+- Enable via `IRCFIBER_HOLDER_SOCK` env var pointing to the shared Unix socket path.
+
+## Build & test the holder
+
+```bash
+cd frontend  # actually run from project root
+# Local fast tests (~25s)
+./run-holder-tests.sh          # 4 tests: protocol, compile, raw IPC e2e, engine integration
+./run-holder-enterprise-tests.sh  # 11 tests: health endpoints, graceful shutdown, multi-network, chaos
+```
+
+## Deploy the holder to OVH
+
+```bash
+bash scripts/deploy-holder-ovh.sh  # Builds remotely (Linux x86_64) + deploys both containers
+```
+
+## Key files
+
+| File | Purpose |
+|---|---|
+| `source/conn_holder/main.d` | Holder entry point with graceful shutdown |
+| `source/conn_holder/protocol.d` | Binary frame IPC protocol |
+| `source/conn_holder/irc_client.d` | Per-network IRC connection (raw TCP / TLS) |
+| `source/conn_holder/raw_fd_stream.d` | Vibe.d Stream wrapper for raw POSIX fd |
+| `source/conn_holder/ipc_server.d` | Unix-domain socket IPC server |
+| `source/conn_holder/client.d` | Engine-side HolderClient wrapper |
+| `source/conn_holder/health_server.d` | Health/metrics HTTP server |
+| `source/ircfiber/engine/holder_transport.d` | Engine-side IRC abstraction (same API as AdoptedSocket) |
+| `scripts/deploy-holder-ovh.sh` | OVH deployment script |
+| `docker-compose.holder.yml` | Two-container deployment |
+| `deploy/playbooks/deploy-holder.yml` | Ansible playbook |
+
+## ⚠️ Common pitfalls when modifying holder code
+
+1. **Never use `usleep()` in a vibe.d fiber** — it blocks the entire event loop thread. Use `vibe.core.core.sleep(Duration)` instead.
+2. **Never use raw `accept()`** — use non-blocking fd + `poll(timeout)` in a loop with `yield()`.
+3. **TLSStream.read with IOMode.once returns 0 if no decrypted bytes pending** — this is NOT EOF. Check `leastSize > 0` first, or use `dataAvailableForRead` + a small throwaway buffer to trigger decryption.
+4. **TLS empty read is a no-op** — pass at least 1 byte in the buffer.
+5. **Always update ALL three ConnectionManager paths** when adding holder mode: `addNetwork`, `addAndStartNetwork`, AND `adoptFromHandoff`.
+6. **Build D binaries on the target architecture** (Linux x86_64 for OVH) — local Mac ARM64 binaries won't run on Linux. Use BuildKit.
+7. **When committing new binaries to a Docker image**, the original entrypoint is preserved. Override with `--entrypoint /app/mybin` when running the new container.
+8. **DNS resolution**: use `getaddrinfo()` not `inet_pton()` if you want hostname support (IRC servers are hostnames, not IPs).

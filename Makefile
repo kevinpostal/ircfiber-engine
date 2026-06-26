@@ -82,6 +82,7 @@ AR := →
 # Component Workflows (primary user-facing targets)
 .PHONY: dev dev-docker dev-live debug debug-live stop
 .PHONY: engine engine-rebuild engine-handoff engine-handoff-redis engine-restart engine-test
+.PHONY: deploy-holder deploy-holder-test deploy-holder-enterprise-test
 .PHONY: gateway gateway-rebuild gateway-restart
 .PHONY: status logs logs-engine logs-gateway logs-supervisor crash-logs
 .PHONY: watch watch-engine watch-gateway
@@ -91,7 +92,7 @@ AR := →
 .PHONY: up down down-tailnet restart-web restart-engine-tailnet
 .PHONY: logs-web logs-engine-tailnet watch-web
 
-.PHONY: test test-frontend test-all test-watch test-coverage test-lib test-client clean fmt fmt-check lint deps-check
+.PHONY: test test-frontend test-all test-watch test-coverage test-lib test-client handoff-test exec-reload-test exec-reload-it clean fmt fmt-check lint deps-check
 .PHONY: dscanner-install dscanner-all dscanner-syntax dscanner-lint dscanner-unused \
         dscanner-complexity dscanner-imports dscanner-fix dscanner-size dscanner-outline
 .PHONY: ensure-colima docker-up docker-down docker-logs docker-build \
@@ -850,6 +851,33 @@ test-client: ## Test > Frontend client tests only (headless Chromium — compone
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Running frontend client tests  $(R)"
 	@cd frontend && npm run test:client 2>&1 | tail -15
 
+handoff-test: ## Test > Standalone handoff SCM_RIGHTS tests (no vibe.d, no engine deps)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Handoff tests  $(R)"
+	@$(DUB) build --config=handoff-test 2>&1 | tail -3
+	@./handoff-test
+
+exec-reload-test: ## Test > exec(2)-based hot-reload: TCP socket identity survives fork+SCM_RIGHTS
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Exec-reload tests  $(R)"
+	@$(DUB) build --config=exec-reload-test 2>&1 | tail -3
+	@./exec-reload-test
+
+# Full end-to-end exec-reload integration test against a mock IRC server.
+# Spawns a Python TCP listener, opens a connection from the OLD engine
+# path, execs into the NEW engine path, and verifies the same TCP socket
+# survives. Run from the repo root so the binary is in $PWD.
+exec-reload-it: ## Test > Full exec-reload flow: OLD engine → exec → NEW engine, mock IRC server
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Exec-reload integration test  $(R)"
+	@$(DUB) build --config=exec-reload-integration 2>&1 | tail -3
+	@chmod +x source/exec_reload_mock_irc.py
+	@bash -c 'set -e; rm -f /tmp/exec-reload-test.result; \
+	  python3 source/exec_reload_mock_irc.py 16667 /tmp/exec-reload-test.result & \
+	  MOCK_PID=$$!; \
+	  sleep 0.5; \
+	  ./exec-reload-integration old /tmp/exec-reload-test.snapshot /tmp/exec-reload-test.marker && \
+	  wait $$MOCK_PID 2>/dev/null || true; \
+	  echo; echo "--- mock_irc result file ---"; \
+	  cat /tmp/exec-reload-test.result 2>/dev/null || echo "(no result file)"'
+
 test-all: test test-frontend ## Test > D backend + frontend (everything)
 	@printf '\n%b\n' "$(BG)$(OK) All test suites passed$(R)"
 
@@ -1319,6 +1347,20 @@ handoff: build-engine ## Deploy > Graceful engine hot-reload (zero IRC disconnec
 	@printf '%b\n' "$(D)  New engine runs inside existing container — IRC sockets preserved$(R)"
 	@$(_playbook) playbooks/deploy-handoff.yml
 
+# Zero-disconnect engine hot-reload via exec(2).
+# Replaces the OLD engine's process image with the NEW binary in-place.
+# The TCP socket survives the exec (same PID, same FDs), so the IRC
+# server sees ONE continuous connection — no QUIT, no reconnect, no
+# nick collision. This is true Erlang-style hot code loading.
+#
+# Usage:
+#   make update-exec                                 # all engine hosts
+#   make update-exec TARGET=ircfiber-ovh-1           # single host
+update-exec: build-engine ## Deploy > Zero-disconnect exec-based engine hot-reload
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Zero-disconnect exec-reload engine → $(_target)  $(R)"
+	@printf '%b\n' "$(D)  OLD engine exec()s into NEW binary in-place — IRC socket survives$(R)"
+	@$(_playbook) playbooks/deploy-update-exec.yml
+
 handoff-backup: build-engine ## Deploy > Graceful engine hot-reload → backup engine
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Hot-reload backup engine → ircfiber-backup-1  $(R)"
 	@cd deploy && ansible-playbook -l ircfiber-backup-1 $(_vault_arg) playbooks/deploy-handoff.yml
@@ -1442,3 +1484,26 @@ help: ## Utils > Show this help (use-case matrix in the source header)
 			} \
 			print ""; \
 		}' $(MAKEFILE_LIST)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Connection Holder — long-lived IRC socket owner
+# ═══════════════════════════════════════════════════════════════════════════
+# Enables TRUE zero-disconnect hot-reload:
+#   1. Holder owns the IRC TCP/TLS socket (separate process/container)
+#   2. Engine exec-reloads don't touch the IRC socket (holder keeps it alive)
+#   3. Engine reconnects to holder, IRC sees ONE continuous connection
+#
+# Build, test, deploy:
+
+deploy-holder-test: ## Holder > Run basic holder tests locally (~25s)
+	@./run-holder-tests.sh
+
+deploy-holder-enterprise-test: ## Holder > Run enterprise tests with health endpoints (~30s)
+	@./run-holder-enterprise-tests.sh
+
+deploy-holder: ## Holder > Deploy two-container holder + engine to production
+	@bash -c 'printf "\033[1;33m  Deploying holder architecture to OVH\033[0m\n"; \
+		cd deploy && ansible-playbook -i inventories/production/hosts.ini \
+			playbooks/deploy-holder.yml \
+			-l ircfiber-ovh-1 \
+			-e ircfiber_engine_id=ovh'

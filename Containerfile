@@ -54,8 +54,13 @@ RUN --mount=type=cache,target=/build/.dub \
     echo "engine: $CACHE_BUST" && \
     dub build --config=engine --compiler=ldc2 --build=release --force --parallel 2>&1 | tail -5 && \
     test -f /build/irc-fiber-engine
+RUN --mount=type=cache,target=/build/.dub \
+    echo "holder: $CACHE_BUST" && \
+    dub build --config=conn-holder --compiler=ldc2 --build=release --force --parallel 2>&1 | tail -5 && \
+    test -f /build/ircfiber-conn-holder
 RUN strip /build/irc-fiber 2>/dev/null || true
 RUN strip /build/irc-fiber-engine 2>/dev/null || true
+RUN strip /build/ircfiber-conn-holder 2>/dev/null || true
 
 # Runtime stage
 FROM ubuntu:22.04
@@ -72,12 +77,16 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 COPY --from=builder /build/irc-fiber /app/
 COPY --from=builder /build/irc-fiber-engine /app/
+COPY --from=builder /build/ircfiber-conn-holder /app/
 COPY --from=builder /build/views /app/views
 COPY --from=builder /build/config /app/config
 COPY --from=builder /build/public /app/public
 
 # Create data directory for JSON fallback storage and uploads directory
 RUN mkdir -p /app/data /app/uploads
+
+# Create holder socket directory (used by conn-holder for health and IPC sockets)
+RUN mkdir -p /var/run/ircfiber && chmod 0755 /var/run/ircfiber
 
 EXPOSE 8090
 
