@@ -257,7 +257,7 @@ debug-live: build build-engine ## Component > Full stack: gateway + engine (supe
 		printf "\n%b\n" "$(_BCn)$(K)$(B)  Engine (supervised) → TAILNET  $(R)"; \
 		printf "%b\n" "$(D)  Mongo: $(TAILNET_MONGO_URL)$(R)"; \
 		printf "%b\n" "$(D)  Redis: $(TAILNET_REDIS_URL)$(R)"; \
-		killall -9 irc-fiber 2>/dev/null || true; \
+		killall -9 irc-fiber irc-fiber-engine 2>/dev/null || true; \
 		sleep 1; \
 		rm -f "$(GATEWAY_PIDFILE)" "$(SUPERVISOR_PIDFILE)" "$(ENGINE_PIDFILE)"; \
 		: > "$(SUPERVISOR_LOGFILE)"; \
