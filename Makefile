@@ -257,6 +257,12 @@ debug-live: build build-engine ## Component > Full stack: gateway + engine (supe
 		printf "\n%b\n" "$(_BCn)$(K)$(B)  Engine (supervised) → TAILNET  $(R)"; \
 		printf "%b\n" "$(D)  Mongo: $(TAILNET_MONGO_URL)$(R)"; \
 		printf "%b\n" "$(D)  Redis: $(TAILNET_REDIS_URL)$(R)"; \
+		if docker info >/dev/null 2>&1 && docker compose ps --status running irc_fiber irc_engine 2>/dev/null | tail -n +2 | grep -q .; then \
+			printf "%b\n" "$(Y)$(WR) Docker irc_fiber/irc_engine containers are running — stopping them so the local binaries can use TAILNET DBs$(R)"; \
+			docker compose stop irc_fiber irc_engine 2>/dev/null || true; \
+			sleep 1; \
+			printf "%b\n" "$(BG)$(OK) docker containers stopped (restart later with:  make docker-up)$(R)"; \
+		fi; \
 		killall -9 irc-fiber irc-fiber-engine 2>/dev/null || true; \
 		sleep 1; \
 		rm -f "$(GATEWAY_PIDFILE)" "$(SUPERVISOR_PIDFILE)" "$(ENGINE_PIDFILE)"; \
