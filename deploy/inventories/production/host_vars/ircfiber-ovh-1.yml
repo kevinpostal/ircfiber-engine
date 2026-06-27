@@ -30,6 +30,9 @@ cloudflare_records:
   - name: "www"
     type: CNAME
     value: "ircfiber.com"
+  - name: "irc"
+    type: A
+    proxied: false
 
 # --- Engine container name for deploy-update ----------------------------------
 # The playbook constructs: ircfiber-engine-{{ ircfiber_engine_id }}

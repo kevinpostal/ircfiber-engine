@@ -156,3 +156,12 @@
     - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
   roles:
     - role: engine
+
+- name: Deploy IRC daemon (Ergo)
+  hosts: ircfiber_backend
+  become: true
+  gather_facts: true
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  roles:
+    - role: ircd

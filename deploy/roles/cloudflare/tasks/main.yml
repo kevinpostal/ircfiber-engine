@@ -77,13 +77,19 @@
         cloudflare_target_ip if item.type == 'A'
         else (item.value | default(cloudflare_zone))
       }}
-    ttl: "{{ cloudflare_record_ttl | int if not (cloudflare_proxied | bool) else omit }}"
-    proxied: "{{ cloudflare_proxied | bool }}"
+    ttl: "{{ cloudflare_record_ttl | int if not (item_proxied | bool) else omit }}"
+    proxied: "{{ item_proxied | bool }}"
     state: present
   loop: "{{ cloudflare_records_to_manage }}"
   loop_control:
     label: "{{ item.name | default('@') }}.{{ cloudflare_zone }}"
   register: cloudflare_records_changed
+  vars:
+    # Per-record proxied override: each record entry can optionally specify
+    # `proxied` to override the global cloudflare_proxied default.
+    # Used for subdomains like "irc" that serve non-HTTP protocols and must
+    # remain DNS-only (Cloudflare only proxies HTTP/S on ports 80/443).
+    item_proxied: "{{ item.proxied | default(cloudflare_proxied) }}"
 
 - name: Summary of CF record changes
   ansible.builtin.debug:

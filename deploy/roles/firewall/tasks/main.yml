@@ -67,6 +67,18 @@
 
 
 
+- name: Allow IRC (plain) from anywhere
+  community.general.ufw:
+    rule: allow
+    port: "{{ ircd_port_plain }}"
+    proto: tcp
+
+- name: Allow IRC (TLS) from anywhere
+  community.general.ufw:
+    rule: allow
+    port: "{{ ircd_port_tls }}"
+    proto: tcp
+
 - name: Allow additional TCP ports
   community.general.ufw:
     rule: allow

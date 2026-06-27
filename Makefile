@@ -1507,3 +1507,14 @@ deploy-holder: ## Holder > Deploy two-container holder + engine to production
 			playbooks/deploy-holder.yml \
 			-l ircfiber-ovh-1 \
 			-e ircfiber_engine_id=ovh'
+
+# ── IRC daemon (Ergo) deploy ────────────────────────────────────────────────────
+# Deploys an Ergo IRC daemon to OVH for product support + testing.
+# Requires vault_ircd_oper_password to be set in vault.yml first.
+#
+# Usage:
+#   make deploy-ircd
+#   make deploy-ircd TARGET=ircfiber-ovh-1
+deploy-ircd: ## IRCd > Deploy Ergo IRC daemon to OVH (ports 6667 + 6697)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Deploy IRCd → $(_target)  $(R)"
+	@$(_playbook) playbooks/ircd.yml

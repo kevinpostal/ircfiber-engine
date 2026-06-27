@@ -5,14 +5,14 @@
 #   ansible-playbook playbooks/restart.yml -e components=mongo,redis,gateway
 #   ansible-playbook playbooks/restart.yml            # restart everything
 #
-# Valid components: caddy, gateway, engine, mongo, redis
+# Valid components: caddy, cloudflared, gateway, engine, mongo, redis, holder
 
 - name: Restart irc-fiber components
   hosts: all
   become: true
   gather_facts: false
   vars:
-    components: "caddy,gateway,engine,mongo,redis"
+    components: "caddy,cloudflared,gateway,engine,mongo,redis"
   tasks:
     - name: Show plan
       ansible.builtin.debug:
@@ -21,8 +21,8 @@
     - name: Validate component list
       ansible.builtin.assert:
         that:
-          - item in ['caddy', 'gateway', 'engine', 'mongo', 'redis']
-        fail_msg: "Unknown component '{{ item }}'. Valid: caddy, gateway, engine, mongo, redis"
+          - item in ['caddy', 'cloudflared', 'gateway', 'engine', 'holder', 'mongo', 'redis']
+        fail_msg: "Unknown component '{{ item }}'. Valid: caddy, cloudflared, gateway, engine, holder, mongo, redis"
       loop: "{{ components | split(',') | map('trim') | reject('equalto', '') | list }}"
 
     - name: Restart Caddy
@@ -30,6 +30,16 @@
         name: ircfiber-caddy
         restart: true
       when: "'caddy' in (components | split(',') | map('trim') | list)"
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['ircfiber_backend'] | default([]) }}"
+      loop_control:
+        loop_var: item
+
+    - name: Restart Cloudflare Tunnel
+      community.docker.docker_container:
+        name: "{{ cloudflared_container_name | default('ircfiber-cloudflared') }}"
+        restart: true
+      when: "'cloudflared' in (components | split(',') | map('trim') | list)"
       delegate_to: "{{ item }}"
       loop: "{{ groups['ircfiber_backend'] | default([]) }}"
       loop_control:
@@ -51,6 +61,16 @@
         restart: true
       when: "'engine' in (components | split(',') | map('trim') | list)"
       loop: "{{ groups['ircfiber_engines'] | default([]) }}"
+      loop_control:
+        loop_var: item
+
+    - name: Restart Connection Holder
+      community.docker.docker_container:
+        name: ircfiber-holder
+        restart: true
+      when: "'holder' in (components | split(',') | map('trim') | list)"
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['ircfiber_backend'] | default([]) }}"
       loop_control:
         loop_var: item
 

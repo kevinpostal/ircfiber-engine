@@ -44,6 +44,13 @@ vault_aws_secret_key: ""
 vault_cloudflare_api_token: "REPLACE-WITH-CF-API-TOKEN"
 vault_cloudflare_account_id: "REPLACE-WITH-CF-ACCOUNT-ID"
 
+# --- IRCd (Ergo) oper account ------------------------------------------------
+# Password for the admin oper account on the IRC daemon.
+# The password hash is generated during deploy via:
+#   docker run --rm ergochat/ergo:stable genpasswd <password>
+# Change this before first deploy.
+vault_ircd_oper_password: "REPLACE-WITH-STRONG-PASSWORD"
+
 # --- Cloudflare Tunnel (cloudflared) -----------------------------------------
 # Token for a named tunnel created in Cloudflare Zero Trust dashboard:
 #   https://one.dash.cloudflare.com/ → Networks → Tunnels → Add a tunnel
