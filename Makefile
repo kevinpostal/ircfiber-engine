@@ -1524,3 +1524,52 @@ deploy-holder: ## Holder > Deploy two-container holder + engine to production
 deploy-ircd: ## IRCd > Deploy Ergo IRC daemon to OVH (ports 6667 + 6697)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Deploy IRCd → $(_target)  $(R)"
 	@$(_playbook) playbooks/ircd.yml
+
+# ── Remote container restart ────────────────────────────────────────────────
+# Restart Docker containers on the remote host via Ansible. Wraps the
+# restart.yml playbook which supports selecting specific components.
+# By default restarts ALL containers (caddy, cloudflared, gateway,
+# engine, mongo, redis, holder).
+#
+# Usage:
+#   make deploy-restart                                  # restart everything
+#   make deploy-restart COMPONENTS=gateway,engine        # selective restart
+#   make deploy-restart COMPONENTS=gateway               # gateway only
+#   make deploy-restart TARGET=ircfiber-backup-1          # different host
+# Convenience: restart specific container(s) by name.
+# The color variable $(C) is taken (cyan ANSI escape), so the shorthand
+# for components is COMP or a trailing argument. Override at invocation:
+#
+#   make deploy-restart                 # restart EVERYTHING
+#   make deploy-restart-gateway         # gateway only
+#   make deploy-restart-engine          # engine only
+#   make deploy-restart COMP=gateway,engine   # gateway + engine
+#   make deploy-restart COMP=gateway          # gateway only
+
+deploy-restart: ## Deploy > Restart remote Docker containers (default: all; override COMP=gateway,engine)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Restarting containers → $(_target)  $(R)"
+	@comps="$(or $(COMP),$(COMPONENTS))"; \
+		if [ -z "$$comps" ]; then \
+			printf '%b\n' "$(C)  → Restarting ALL containers$(R)"; \
+		else \
+			printf '%b\n' "$(C)  → Restarting: $$comps$(R)"; \
+		fi
+	@$(_playbook) $(if $(or $(COMP),$(COMPONENTS)),-e components=$(or $(COMP),$(COMPONENTS)),) playbooks/restart.yml
+
+deploy-restart-gateway: ## Deploy > Restart gateway container only
+	@$(MAKE) --no-print-directory deploy-restart COMP=gateway
+
+deploy-restart-engine: ## Deploy > Restart engine container only
+	@$(MAKE) --no-print-directory deploy-restart COMP=engine
+
+deploy-restart-mongo: ## Deploy > Restart MongoDB container only
+	@$(MAKE) --no-print-directory deploy-restart COMP=mongo
+
+deploy-restart-redis: ## Deploy > Restart Redis container only
+	@$(MAKE) --no-print-directory deploy-restart COMP=redis
+
+deploy-restart-caddy: ## Deploy > Restart Caddy container only
+	@$(MAKE) --no-print-directory deploy-restart COMP=caddy
+
+deploy-restart-holder: ## Deploy > Restart connection holder container only
+	@$(MAKE) --no-print-directory deploy-restart COMP=holder
