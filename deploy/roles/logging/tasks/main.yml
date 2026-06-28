@@ -1,0 +1,148 @@
+---
+- name: Ensure ircfiber_logging Docker network exists
+  community.docker.docker_network:
+    name: ircfiber_logging
+    driver: bridge
+    state: present
+    driver_options:
+      com.docker.network.bridge.name: br-ircfiber-logging
+
+- name: Ensure logging Docker volumes exist
+  community.docker.docker_volume:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - "{{ grafana_data_volume }}"
+    - "{{ grafana_provisioning_volume }}"
+    - "{{ grafana_dashboards_volume }}"
+    - "{{ grafana_alerting_volume }}"
+    - "{{ grafana_plugins_volume }}"
+    - "{{ loki_data_volume }}"
+    - "{{ loki_config_volume }}"
+    - "{{ promtail_config_volume }}"
+    - "{{ promtail_positions_volume }}"
+
+- name: Render Loki config
+  ansible.builtin.template:
+    src: loki-config.yml.j2
+    dest: "/etc/ircfiber/loki/loki-config.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart loki
+
+- name: Render Promtail config
+  ansible.builtin.template:
+    src: promtail-config.yml.j2
+    dest: "/etc/ircfiber/promtail/promtail-config.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart promtail
+
+- name: Render Grafana datasources
+  ansible.builtin.template:
+    src: grafana-datasources.yml.j2
+    dest: "/etc/ircfiber/grafana/provisioning/datasources/loki.yml"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Render Grafana dashboards provider
+  ansible.builtin.template:
+    src: grafana-dashboards.yml.j2
+    dest: "/etc/ircfiber/grafana/provisioning/dashboards/ircfiber.yml"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Deploy Grafana dashboards
+  ansible.posix.synchronize:
+    src: dashboards/
+    dest: "/etc/ircfiber/grafana/dashboards/"
+    recursive: yes
+    delete: yes
+  register: grafana_dashboards_deploy
+  notify: Restart grafana
+
+- name: Render Loki alert rules
+  ansible.builtin.template:
+    src: loki-rules.yml.j2
+    dest: "/etc/ircfiber/loki/rules/ircfiber.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart loki
+
+- name: Render docker-compose for logging stack
+  ansible.builtin.template:
+    src: docker-compose.logging.yml.j2
+    dest: "/etc/ircfiber/logging/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart logging stack
+
+- name: Ensure logging directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - /etc/ircfiber/loki
+    - /etc/ircfiber/promtail
+    - /etc/ircfiber/grafana
+    - /etc/ircfiber/grafana/provisioning
+    - /etc/ircfiber/grafana/provisioning/datasources
+    - /etc/ircfiber/grafana/provisioning/dashboards
+    - /etc/ircfiber/grafana/dashboards
+    - /etc/ircfiber/grafana/alerting
+    - /etc/ircfiber/loki/rules
+    - /etc/ircfiber/logging
+
+# ────────────────────────────────────────────────────────────────────────
+# Deploy via docker compose
+# ────────────────────────────────────────────────────────────────────────
+- name: Deploy logging stack (Loki + Promtail + Grafana)
+  community.docker.docker_compose_v2:
+    project_src: /etc/ircfiber/logging
+    state: present
+    pull: missing  # pull new image tags only
+    remove_orphans: true
+    env_files:
+      - /etc/ircfiber/logging/logging.env
+  register: logging_deploy
+
+# ────────────────────────────────────────────────────────────────────────
+# Post-deploy healthchecks
+# ────────────────────────────────────────────────────────────────────────
+- name: Wait for Loki to become healthy
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:3100/ready"
+    status_code: 200
+  register: loki_ready
+  until: loki_ready.status == 200
+  retries: 10
+  delay: 3
+
+- name: Wait for Grafana to become healthy
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:3000/api/health"
+    status_code: 200
+    force_basic_auth: true
+    user: admin
+    password: "{{ grafana_admin_password }}"
+  register: grafana_ready
+  until: grafana_ready.status == 200
+  retries: 10
+  delay: 3
+
+# ────────────────────────────────────────────────────────────────────────
+# Caddy integration — add Grafana proxy route
+# ────────────────────────────────────────────────────────────────────────
+- name: Notify Caddy to reload after logging stack deployment
+  ansible.builtin.debug:
+    msg: "Caddy route for /grafana must be enabled in caddy role"
+  when: loki_ready is succeeded and grafana_ready is succeeded

@@ -1,0 +1,94 @@
+{
+  "annotations": {"list": []},
+  "description": "IRC engine lifecycle: handoffs, post-handoff QUITs, registration, connection lifecycle.",
+  "editable": true,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": true,
+  "panels": [
+    {
+      "datasource": {"type": "loki", "uid": "Loki"},
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 0},
+      "id": 1,
+      "options": {
+        "dedupStrategy": "exact",
+        "enableLogDetails": true,
+        "prettifyLogMessage": false,
+        "showCommonLabels": true,
+        "showLabels": true,
+        "showTime": true,
+        "sortOrder": "Descending",
+        "wrapLogMessage": true
+      },
+      "title": "Engine lifecycle events (handoff, post-handoff, connection, registration)",
+      "type": "logs",
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "Loki"},
+          "expr": "{job=\"ircfiber_containers\", container_name=~\"ircfiber-engine.*\"} |= \"Handoff\" or (component=~\"handoff|post-handoff|connection|registration\")",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {"type": "loki", "uid": "Loki"},
+      "gridPos": {"h": 10, "w": 12, "x": 0, "y": 10},
+      "id": 2,
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "Loki"},
+          "expr": "sum(rate({job=\"ircfiber_containers\", container_name=~\"ircfiber-engine.*\"} |~ \"Handoff\" |= \"sent [a-z]+ record\" [5m])) by (network)",
+          "legendFormat": "{{network}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Handoff records/sec (by network)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "Loki"},
+      "gridPos": {"h": 10, "w": 12, "x": 12, "y": 10},
+      "id": 3,
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "Loki"},
+          "expr": "sum(rate({job=\"ircfiber_containers\", container_name=~\"ircfiber-engine.*\", level=~\"warn|error\"} |~ \"Handoff|Post-handoff\" [5m]))",
+          "legendFormat": "{{level}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Handoff errors/sec",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["ircfiber", "engine", "lifecycle"],
+  "templating": {
+    "list": [
+      {
+        "current": {"selected": false, "text": "All", "value": "$__all"},
+        "datasource": {"type": "loki", "uid": "Loki"},
+        "definition": "label_values(network)",
+        "includeAll": true,
+        "label": "Network",
+        "multi": true,
+        "name": "network"
+      }
+    ]
+  },
+  "time": {"from": "now-3h", "to": "now"},
+  "title": "IRC Fiber — Engine Lifecycle",
+  "uid": "ircfiber-engine-lifecycle",
+  "version": 1
+}

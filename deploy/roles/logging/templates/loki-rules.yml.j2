@@ -1,0 +1,116 @@
+# {{ ansible_managed }}
+# Loki alerting rules — evaluated by the loki ruler.
+# Group: ircfiber_alerts
+
+groups:
+  - name: ircfiber_alerts
+    interval: 1m
+    rules:
+      # ─── Handoff stuck ──────────────────────────────────────────────────
+      # Multiple "Handoff:" events from old engine processes within
+      # 5 minutes = handoff isn't completing cleanly (zombie risk).
+      - alert: IrcfiberHandoffStuck
+        expr: |
+          count(
+            count_over_time(
+              {job="ircfiber_containers", container_name=~"ircfiber-engine.*"}
+                |~ "Handoff: (sent|serving|complete)"
+              [5m]
+            )
+          ) > 5
+        for: 0m
+        labels:
+          severity: warning
+          team: ircfiber-ops
+        annotations:
+          summary: "Excessive handoff events detected"
+          description: "More than 5 handoff events in 5 minutes — check for zombie processes in ircfiber-engine-ovh container. Run: docker exec ircfiber-engine-ovh ps aux | grep irc-fiber-engine"
+
+      # ─── Post-handoff cleanup failure ────────────────────────────────
+      - alert: IrcfiberHandoffCleanupFailed
+        expr: |
+          count_over_time(
+            {job="ircfiber_containers", container_name=~"ircfiber-engine.*"}
+              |= "Post-handoff cleanup failed"
+              |= "safety net"
+            [10m]
+          ) > 0
+        for: 0m
+        labels:
+          severity: critical
+          team: ircfiber-ops
+        annotations:
+          summary: "Post-handoff connection cleanup failed"
+          description: "Engine failed to close connections during handoff. Old sockets may be leaking. Check ps aux for zombie processes."
+
+      # ─── IRC server disconnect (any reason) ───────────────────────────
+      - alert: IrcfiberConnectionLost
+        expr: |
+          sum(
+            count_over_time(
+              {job="ircfiber_containers", container_name=~"ircfiber-engine.*"}
+                |= "DISCONNECT"
+                |= "reason"
+              [5m]
+            )
+          ) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "IRC connection lost: $labels.network"
+          description: "Network {{ $labels.network }} disconnected at {{ $labels.container_name }}. Check engine logs."
+
+      # ─── Nick collision (433) ────────────────────────────────────────
+      # If nick collisions spike, the handoff isn't releasing nicks properly.
+      - alert: IrcfiberNickCollision
+        expr: |
+          sum(
+            count_over_time(
+              {job="ircfiber_containers", container_name=~"ircfiber-engine.*"}
+                |~ "Nick change rejected|433|ERR_NICKNAMEINUSE"
+              [10m]
+            )
+          ) > 3
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Multiple nick collisions detected"
+          description: "Server rejected nick changes — handoff might not be releasing nick registrations. Check Post-handoff QUIT events."
+
+      # ─── Engine process count anomaly ────────────────────────────────
+      # We can't query the host directly from Loki, but we CAN alert on
+      # symptoms: many "started IRC client" events from the same network
+      # in a short window indicates a reconnect loop.
+      - alert: IrcfiberReconnectLoop
+        expr: |
+          sum(
+            count_over_time(
+              {job="ircfiber_containers", container_name=~"ircfiber-engine.*"}
+                |= "Started IRC client"
+              [2m]
+            )
+          ) > 6
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "IRC reconnect loop detected"
+          description: "More than 6 'Started IRC client' events in 2 minutes — engine is reconnecting repeatedly. Check connection state."
+
+      # ─── Container down (no logs) ────────────────────────────────────
+      - alert: IrcfiberContainerSilent
+        expr: |
+          sum(
+            count_over_time(
+              {job="ircfiber_containers", container_name=~"ircfiber-engine.*"}
+              [10m]
+            )
+          ) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "IRC Fiber engine container is silent"
+          description: "No log entries from ircfiber-engine-ovh in 10 minutes. Container may be crashed or stuck."

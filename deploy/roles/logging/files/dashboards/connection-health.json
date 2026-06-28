@@ -1,0 +1,94 @@
+{
+  "annotations": {"list": []},
+  "description": "IRC connection health, nick changes, network failures, raw IRC traffic errors.",
+  "editable": true,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": true,
+  "panels": [
+    {
+      "datasource": {"type": "loki", "uid": "Loki"},
+      "gridPos": {"h": 22, "w": 24, "x": 0, "y": 0},
+      "id": 1,
+      "options": {
+        "dedupStrategy": "exact",
+        "enableLogDetails": true,
+        "prettifyLogMessage": false,
+        "showCommonLabels": false,
+        "showLabels": true,
+        "showTime": true,
+        "sortOrder": "Descending",
+        "wrapLogMessage": true
+      },
+      "title": "Warnings & errors (engine)",
+      "type": "logs",
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "Loki"},
+          "expr": "{job=\"ircfiber_containers\", container_name=~\"ircfiber-engine.*\", level=~\"warn|error\"}",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {"type": "loki", "uid": "Loki"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 22},
+      "id": 2,
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom"},
+        "tooltip": {"mode": "single"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "Loki"},
+          "expr": "sum(rate({job=\"ircfiber_containers\", container_name=~\"ircfiber-engine.*\", level=~\"warn|error\"} [5m])) by (network)",
+          "legendFormat": "{{network}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Errors/min (by network)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "Loki"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 22},
+      "id": 3,
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom"},
+        "tooltip": {"mode": "single"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "loki", "uid": "Loki"},
+          "expr": "sum(count_over_time({job=\"ircfiber_containers\", container_name=~\"ircfiber-engine.*\", component=\"nick\"} [10m])) by (event)",
+          "legendFormat": "{{event}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Nick events (10m)",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["ircfiber", "health"],
+  "templating": {
+    "list": [
+      {
+        "current": {"selected": false, "text": "All", "value": "$__all"},
+        "datasource": {"type": "loki", "uid": "Loki"},
+        "definition": "label_values(network)",
+        "includeAll": true,
+        "label": "Network",
+        "multi": true,
+        "name": "network"
+      }
+    ]
+  },
+  "time": {"from": "now-12h", "to": "now"},
+  "title": "IRC Fiber — Connection Health",
+  "uid": "ircfiber-connection-health",
+  "version": 1
+}

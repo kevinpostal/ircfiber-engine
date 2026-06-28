@@ -1,0 +1,26 @@
+---
+- name: Restart loki
+  community.docker.docker_container:
+    name: "{{ loki_container_name }}"
+    state: started
+    restart: true
+
+- name: Restart promtail
+  community.docker.docker_container:
+    name: "{{ promtail_container_name }}"
+    state: started
+    restart: true
+
+- name: Restart grafana
+  community.docker.docker_container:
+    name: "{{ grafana_container_name }}"
+    state: started
+    restart: true
+
+- name: Restart logging stack
+  community.docker.docker_compose_v2:
+    project_src: /etc/ircfiber/logging
+    state: present
+    restarted: true
+    env_files:
+      - /etc/ircfiber/logging/logging.env

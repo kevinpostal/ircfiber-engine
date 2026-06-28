@@ -1,0 +1,60 @@
+---
+# Grafana admin password — required on first boot. Override in host_vars.
+grafana_admin_password: "{{ vault_grafana_admin_password | default('CHANGE_ME_GRAPHANA_PASSWORD') }}"
+
+# Where Grafana serves. Internal container port is 3000; Caddy proxies
+# /logs/* to it on the public domain.
+grafana_container_name: ircfiber-grafana
+grafana_image: "grafana/grafana:11.3.0"
+grafana_data_volume: ircfiber_grafana_data
+grafana_provisioning_volume: ircfiber_grafana_provisioning
+grafana_dashboards_volume: ircfiber_grafana_dashboards
+grafana_alerting_volume: ircfiber_grafana_alerting
+grafana_plugins_volume: ircfiber_grafana_plugins
+# Subpath on the public domain, e.g. https://ircfiber.com/grafana
+# Must NOT clash with /api, /ws, /admin, /health, or the SPA assets.
+grafana_public_path: /grafana
+# Root URL for Grafana (full URL — required for proper redirect handling).
+grafana_root_url: "https://{{ ircfiber_domain }}{{ grafana_public_path }}/"
+# Session lifetime, days
+grafana_session_lifetime_days: 7
+# Disable user signup — admin-only access.
+grafana_disable_signup: true
+# Auto-login via Caddy reverse-proxy basic auth header — see caddy
+# templates for the matching header injection. When true, Grafana trusts
+# the X-WEBAUTH-USER header from the reverse proxy.
+grafana_auth_proxy_enabled: "{{ grafana_auth_proxy_enabled | default(true) }}"
+
+# Loki
+loki_container_name: ircfiber-loki
+loki_image: "grafana/loki:3.4.0"
+loki_data_volume: ircfiber_loki_data
+loki_config_volume: ircfiber_loki_config
+# Retention period — Loki deletes old chunks after this many days.
+loki_retention_days: 30
+# Storage backend: "filesystem" or "s3"
+loki_storage_backend: filesystem
+# S3-compatible config (used only when loki_storage_backend=s3)
+loki_s3_endpoint: ""
+loki_s3_bucketnames: ""
+loki_s3_access_key_id: ""
+loki_s3_secret_access_key: ""
+loki_s3_region: us-east-1
+# Resource limits
+loki_memory_limit: 512m
+loki_cpu_limit: 1.0
+
+# Promtail
+promtail_container_name: ircfiber-promtail
+promtail_image: "grafana/promtail:3.4.0"
+promtail_config_volume: ircfiber_promtail_config
+promtail_positions_volume: ircfiber_promtail_positions
+# Memory for promtail — small Go binary.
+promtail_memory_limit: 128m
+promtail_cpu_limit: 0.5
+# Which Docker containers to scrape (regex on container_name).
+# Default: all containers matching the ircfiber-* or engine names.
+promtail_container_label_regex: "^ircfiber-|^ircfiber-ircd$|^ircfiber-engine-with"
+
+# Healthcheck endpoints (for internal monitoring)
+logging_healthcheck_interval: 30

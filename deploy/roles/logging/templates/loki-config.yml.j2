@@ -1,0 +1,145 @@
+# {{ ansible_managed }}
+# Loki 3.x — enterprise-grade log storage with multi-tenancy,
+# schema enforcement, and explicit retention.
+#
+# Storage:
+#   - filesystem (single-host) with chunk size + retention enforced.
+#   - For multi-host, switch to S3-compatible (loki_storage_backend=s3).
+#
+# Compactor:
+#   - Runs daily to merge per-stream index files into the global index.
+#   - Enforces loki_retention_days via delete_request_store.
+#
+# Limits:
+#   - Per-stream rate limits catch runaway producers (malformed D bus,
+#     accidental /var/log/* floods).
+#   - Per-tenant ingestion cap = 50 MB/s; per-stream = 10 MB/s.
+#
+# Schema enforcement rejects logs missing required labels.
+
+auth_enabled: true
+
+# ─── Server ────────────────────────────────────────────────────────────────
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: info
+  # Graceful shutdown — finish in-flight writes before exit.
+  graceful_shutdown_timeout: 30s
+
+# ─── Common ────────────────────────────────────────────────────────────────
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    {% if loki_storage_backend == 's3' %}
+    s3:
+      s3: "{{ loki_s3_endpoint }}"
+      bucketnames: "{{ loki_s3_bucketnames }}"
+      access_key_id: "{{ loki_s3_access_key_id }}"
+      secret_access_key: "{{ loki_s3_secret_access_key }}"
+      region: "{{ loki_s3_region }}"
+      s3forcepathstyle: true
+    {% else %}
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+    {% endif %}
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+# ─── Schema ────────────────────────────────────────────────────────────────
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: {{ 's3' if loki_storage_backend == 's3' else 'filesystem' }}
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+# ─── Ruler ──────────────────────────────────────────────────────────────────
+ruler:
+  alertmanager_url: http://127.0.0.1:9093
+  # Alert rules live in /loki/rules/fake/ (managed by Ansible).
+  rule_path: /loki/rules
+  storage:
+    type: local
+    local:
+      directory: /loki/rules
+  rule_format: yaml
+  enable_api: true
+
+# ─── Compactor ─────────────────────────────────────────────────────────────
+compactor:
+  working_directory: /loki/compactor
+  compaction_interval: 10m
+  retention_enabled: true
+  retention_delete_delay: 2h
+  retention_delete_worker_count: 150
+  delete_request_store: filesystem
+  delete_batch_size: 100
+
+# ─── Limits ────────────────────────────────────────────────────────────────
+limits_config:
+  # Per-stream rate limit — stops one chatty stream from eating the cluster.
+  ingestion_rate_mb: 50
+  ingestion_burst_factor: 2
+  # Per-tenant cap.
+  max_entries_limit_per_series: 100000
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h
+  # Retention at query time.
+  retention_period: {{ (loki_retention_days * 24) | int }}h
+  # Stream retention
+  stream_retention:
+    period: {{ (loki_retention_days * 24) | int }}h
+  # Cardinality cap (avoid label-explosion DoS).
+  max_label_names_per_series: 30
+  max_label_values_per_series: 200
+
+# ─── Operational ────────────────────────────────────────────────────────────
+operational_config:
+  ring:
+    kvstore:
+      store: inmemory
+
+# ─── Analytics ─────────────────────────────────────────────────────────────
+analytics:
+  reporting_enabled: false
+
+# ─── Tracing ───────────────────────────────────────────────────────────────
+# Disabled — we're not running a tracing collector. Set to jaeger if you
+# ever need distributed traces.
+tracing:
+  enabled: false
+
+# ─── Query Range ───────────────────────────────────────────────────────────
+query_range:
+  results_cache:
+    cache:
+      embedded_cache:
+        enabled: true
+        max_size_mb: 100
+        ttl: 5m
+  # Parallelism for query execution.
+  parallelise_shardable_queries: true
+  results_cache_query_timeout: 30s
+
+# ─── Usage ─────────────────────────────────────────────────────────────────
+# Per-tenant usage tracking. Useful for Grafana billing dashboards.
+usage:
+  enabled: true
+  storage:
+    type: local
+    local:
+      directory: /loki/usage
+
+# ─── Frontend ──────────────────────────────────────────────────────────────
+frontend:
+  # Embedded querier (Loki 3.x). Handles instant queries.
+  embed_querier: true
+  max_outstanding_per_tenant: 2048

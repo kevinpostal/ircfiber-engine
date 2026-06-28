@@ -1,0 +1,123 @@
+# {{ ansible_managed }}
+# IRC Fiber — enterprise log aggregation stack.
+# Stack: Grafana (UI) → Loki (storage) ← Promtail (collector)
+# All three run on the ircfiber_logging network (separate from ircfiber_net
+# so log traffic doesn't compete with IRC/IRCv3 control traffic).
+#
+# Resource budgets:
+#   Grafana:  256MB RAM, 0.5 CPU
+#   Loki:     512MB RAM, 1.0 CPU, 8GB disk (filesystem backend)
+#   Promtail: 128MB RAM, 0.5 CPU
+# Total:     ~900MB RAM, 2.0 CPU — fits well on 7.7GB/4-core VPS.
+
+x-logging-common: &logging-common
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+  healthcheck:
+    test: ["CMD", "true"]
+    interval: 30s
+    timeout: 5s
+    retries: 3
+    start_period: 30s
+
+services:
+  # ────────────────────────────────────────────────────────────────────────
+  # Grafana — query UI
+  # ────────────────────────────────────────────────────────────────────────
+  grafana:
+    <<: *logging-common
+    container_name: ${GRAFANA_CONTAINER_NAME:-ircfiber-grafana}
+    image: ${GRAFANA_IMAGE:-grafana/grafana:11.3.0}
+    hostname: ircfiber-grafana
+    networks:
+      - ircfiber_logging
+    ports:
+      # Internal-only — Caddy proxies /grafana/* to this port.
+      # NO host port binding — Grafana is NOT exposed publicly without
+      # Caddy. This is the production-safe default.
+      - "3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_DISABLE_SIGNUP=${GRAFANA_DISABLE_SIGNUP}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_AUTH_PROXY_ENABLED=${GF_AUTH_PROXY_ENABLED}
+      - GF_AUTH_PROXY_HEADER_NAME=X-WebAuth-User
+      - GF_AUTH_PROXY_HEADER_PROPERTY=username
+      - GF_AUTH_PROXY_AUTO_SIGN_UP=true
+      - GF_AUTH_PROXY_LDAP_ENABLED=false
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+      - GF_SESSION_LIFETIME=${GRAFANA_SESSION_LIFETIME_MINUTES:-10080}
+      - GF_SECURITY_COOKIE_SECURE=true
+      - GF_SECURITY_COOKIE_SAMESITE=strict
+      - GF_SERVER_ROOT_URL=${GF_SERVER_ROOT_URL}
+      - GF_SERVER_SERVE_FROM_SUB_PATH=true
+      - GF_USERS_DEFAULT_THEME=dark
+      - GF_INSTALL_PLUGINS=
+      # Disable telemetry
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+      - GF_ANALYTICS_CHECK_FOR_UPDATES=false
+    volumes:
+      - ${GRAFANA_DATA_VOLUME}:/var/lib/grafana
+      - ${GRAFANA_PROVISIONING_VOLUME}:/etc/grafana/provisioning
+      - ${GRAFANA_DASHBOARDS_VOLUME}:/var/lib/grafana/dashboards
+      - ${GRAFANA_ALERTING_VOLUME}:/var/lib/grafana/alerting
+    mem_limit: 256m
+    cpus: 0.5
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Loki — log storage (no indexing, just compressed chunks + labels)
+  # ────────────────────────────────────────────────────────────────────────
+  loki:
+    <<: *logging-common
+    container_name: ${LOKI_CONTAINER_NAME:-ircfiber-loki}
+    image: ${LOKI_IMAGE:-grafana/loki:3.4.0}
+    hostname: ircfiber-loki
+    networks:
+      - ircfiber_logging
+    # NO host port — only the internal bridge network.
+    command:
+      - /usr/bin/loki
+      - --config.file=/etc/loki/loki-config.yml
+      - --config.expand-env=true
+    volumes:
+      - ${LOKI_CONFIG_VOLUME}:/etc/loki:ro
+      - ${LOKI_DATA_VOLUME}:/loki
+    mem_limit: ${LOKI_MEMORY_LIMIT:-512m}
+    cpus: ${LOKI_CPU_LIMIT:-1.0}
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Promtail — scrapes Docker logs + sends to Loki
+  # ────────────────────────────────────────────────────────────────────────
+  promtail:
+    <<: *logging-common
+    container_name: ${PROMTAIL_CONTAINER_NAME:-ircfiber-promtail}
+    image: ${PROMTAIL_IMAGE:-grafana/promtail:3.4.0}
+    hostname: ircfiber-promtail
+    networks:
+      - ircfiber_logging
+    # Mount the host Docker socket to discover & tail containers.
+    # Promtail reads /var/lib/docker/containers/*/*-json.log for each
+    # matching container.
+    volumes:
+      - ${PROMTAIL_CONFIG_VOLUME}:/etc/promtail:ro
+      - ${PROMTAIL_POSITIONS_VOLUME}:/tmp
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command:
+      - /usr/bin/promtail
+      - --config.file=/etc/promtail/promtail-config.yml
+      - --config.expand-env=true
+    mem_limit: ${PROMTAIL_MEMORY_LIMIT:-128m}
+    cpus: ${PROMTAIL_CPU_LIMIT:-0.5}
+
+networks:
+  ircfiber_logging:
+    name: ircfiber_logging
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: br-ircfiber-logging

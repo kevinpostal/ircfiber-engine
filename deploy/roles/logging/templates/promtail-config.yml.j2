@@ -1,0 +1,139 @@
+# {{ ansible_managed }}
+# Promtail — collects logs from Docker containers (and system journals)
+# and ships them to Loki. Parses structured JSON from the engine for
+# automatic label extraction, and adds container_name/service labels
+# for every container.
+#
+# Two scrape pipelines:
+#   1. docker_sd_configs: discovers ircfiber-* containers, tails their
+#      JSON log driver output.
+#   2. journal pipeline: catches host-level systemd logs (caddy, etc).
+#
+# PipelineStages:
+#   - docker_labels: add container metadata as labels.
+#   - regex / json: parse the structured log line for fields.
+#   - labels: rewrite friendly names.
+#   - metrics: per-stage metrics for monitoring.
+
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+  log_level: info
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://ircfiber-loki:3100/loki/api/v1/push
+    batchwait: 1s
+    batchsize: 1048576
+    backoff_config:
+      min_period: 500ms
+      max_period: 5m
+      max_retries: 10
+    timeout: 10s
+
+scrape_configs:
+  # ──────────────────────────────────────────────────────────────────────
+  # 1. IRC Fiber containers (engine, gateway, holder, etc.)
+  # ──────────────────────────────────────────────────────────────────────
+  - job_name: ircfiber_containers
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 10s
+        # Only discover containers matching the project (ircfiber-* prefix).
+        # This avoids scraping system containers or unrelated workloads.
+        filters:
+          - name: label
+            values: ["ircfiber"]
+    relabel_configs:
+      # Source: container_name=<name>
+      # Drop containers we explicitly exclude.
+      - source_labels: ['__meta_docker_container_name']
+        regex: '/(.*)'
+        target_label: container_name
+      # service label = same as container_name for now.
+      - source_labels: ['__meta_docker_container_name']
+        regex: '/(.*)'
+        target_label: service
+      # Compose project name if present.
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_project']
+        target_label: project
+      # Drop our own log-shipping containers — recursion prevention.
+      - source_labels: ['__meta_docker_container_name']
+        regex: '.*(loki|promtail|grafana).*'
+        action: drop
+      # Convert Docker timestamp to RFC3339Nano for Loki.
+      - source_labels: ['__meta_docker_container_log_stream']
+        target_label: stream
+    pipeline_stages:
+      # Match the log driver output format. Docker's json-file driver
+      # wraps each line as {"log": "...", "stream": "stdout", "time": "..."}.
+      - docker:
+          # Use the embedded pipeline — pulls "log" field, adds docker labels.
+          # (No extra config needed.)
+
+      # If the engine emitted a structured JSON log line, parse it.
+      - match:
+          selector: '{job="ircfiber_containers"}'
+          stages:
+            # Parse the inner "log" field as JSON (engine/gateway emit JSON).
+            - json:
+                expressions:
+                  level: level
+                  component: component
+                  network: network
+                  nick: nick
+                  eid: eid
+                  pid: pid
+                  msg: msg
+                  event: event
+            - labels:
+                level:
+                component:
+                network:
+                nick:
+                event:
+            # If parsing succeeded (msg is present), the original line
+            # was JSON. Replace log with msg to avoid duplication.
+            - template:
+                source: msg
+                fallback: log
+            - replace:
+                expression: '{{ .Entry }}'
+
+      # Deduplication: engine sometimes logs the same handoff event from
+      # both the old and new process during the pause window. Promote a
+      # dedup hash.
+      - match:
+          selector: '{component=~"handoff|post-handoff|connection"}'
+          stages:
+            - fingerprint:
+              # Composite fingerprint — same content + same network collapses
+              # to one stream.
+              fields: [component, network, msg]
+            - labeldrop:
+              - __address__
+              - __meta_docker_container_log_stream
+
+  # ──────────────────────────────────────────────────────────────────────
+  # 2. Docker host journald (for caddy, ssh, kernel — useful for forensics)
+  # ──────────────────────────────────────────────────────────────────────
+  - job_name: journal
+    journal:
+      max_age: 12h
+      labels:
+        job: journal
+    relabel_configs:
+      - source_labels: ['__journal__systemd_unit']
+        target_label: unit
+
+limits_config:
+  retention_period: 0  # honor loki's retention
+  ingestion_rate_mb: 10
+  ingestion_burst_factor: 2
+
+# Disable the embedded scrape config validation that Promtail does on
+# startup with newer versions — it's noisy in CI.
+target_config:
+  sync_period: 10s
