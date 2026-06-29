@@ -25,3 +25,21 @@ caddy_tailscale_socket: "/var/run/tailscale/tailscaled.sock"
 # ircfiber_net connects to ircfiber-caddy:{{ caddy_tunnel_port }}.
 # This port has no auto-HTTPS redirect — Cloudflare terminates TLS at the edge.
 caddy_tunnel_port: 8080
+# Enable a Tailscale-only listener that serves the Grafana dashboard
+# exclusively to tailnet members. Bound to caddy_tailscale_logging_address
+# (the host's Tailscale IP) so it's unreachable from the public internet.
+# Requires the ircfiber-caddy container to be on the ircfiber_logging
+# Docker network (handled by the logging role's post_tasks). Disabled by
+# default to avoid adding an extra listener when logs aren't deployed.
+caddy_tailscale_logging_enabled: false
+# Tailscale IP of the host. Override per host in host_vars/.
+caddy_tailscale_logging_address: "100.126.197.92"
+# Port the Tailscale-only Grafana listener binds to on the Tailscale
+# interface. Default 3443 keeps it distinct from the main Caddy listener
+# on 443 and Tailscale's admin UI on 8443.
+caddy_tailscale_logging_port: 3443
+
+# Tailscale-only SigNoz listener. SigNoz handles its own auth so we
+# don't inject X-WebAuth-User headers.
+caddy_tailscale_signoz_enabled: false
+caddy_tailscale_signoz_port: 3003

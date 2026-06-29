@@ -200,9 +200,12 @@
 
     # ── Launch new engine (now that the listener is up) ────────────────
     - name: Launch new engine via setsid (detached, survives docker exec exit)
-      ansible.builtin.shell: |
-        docker exec -d {{ engine_container }} sh -c \
-          'IRCFIBER_RELOAD_FROM_PID={{ old_engine_pid }} nohup {{ engine_binary_stage }} > /tmp/ircfiber-handoff-child.log 2>&1 &'
+      vars:
+        # Use a quoted YAML scalar (no Jinja in this string) to avoid the
+        # `{% raw %}` / `2>&1` YAML-Jinja quoting nightmare. We then let
+        # Jinja expand ONLY the variables in the outer wrapping.
+        _redirect: '> /dev/stderr 2>&1 | tee -a /tmp/ircfiber-handoff-child.log &'
+      ansible.builtin.shell: "docker exec -d {{ engine_container }} sh -c 'IRCFIBER_RELOAD_FROM_PID={{ old_engine_pid }} nohup {{ engine_binary_stage }} {{ _redirect }}'"
       changed_when: true
 
     # ── Wait for handoff to complete ────────────────────────────────

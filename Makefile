@@ -77,7 +77,7 @@ AR := →
 # ----------------------------------------------------------------------------
 # Phony targets (grouped by category)
 .PHONY: all help
-.PHONY: build build-engine build-release build-debug build-ldc2 frontend frontend-dev frontend-install
+.PHONY: build build-engine build-release build-debug build-ldc2 janitor-migrate frontend frontend-dev frontend-install
 
 # Component Workflows (primary user-facing targets)
 .PHONY: dev dev-docker dev-live debug debug-live stop
@@ -154,6 +154,11 @@ TAILNET_REDIS_URL ?= redis://100.126.197.92:6379/0
 # Local docker connection settings (used by debug)
 LOCAL_MONGO_URL ?= mongodb://127.0.0.1:27017/ircfiber
 LOCAL_REDIS_URL ?= redis://127.0.0.1:6379/0
+
+# Default engine server-id used by `make stop` when IRCFIBER_SERVER_ID is
+# not exported. The Redis purge after stop must match the namespace the
+# engine actually wrote to, otherwise stale `*:<sid>:*` keys linger.
+IRCFIBER_DEFAULT_SERVER_ID ?= localengine
 
 # Shared paths for supervisor / logs / pidfiles / crash dumps (relative to project root — avoids space issues)
 ENGINE_BIN          := ./irc-fiber-engine
@@ -307,13 +312,28 @@ stop: ## Component > Stop engine (supervised) + gateway
 			if [ -n "$$pid" ] && kill -0 "$$pid" 2>/dev/null; then \
 				kill "$$pid" 2>/dev/null || true; \
 				printf "%b\n" "$(C)  → stopped $$(basename $$f) (pid $$pid)$(R)"; \
-			fi; \
+			}; \
 			rm -f "$$f"; \
 		fi; \
 	done; \
 	killall -9 irc-fiber 2>/dev/null || true; \
 	killall -9 irc-fiber-engine 2>/dev/null || true; \
 	pkill -f irc-fiber-engine-supervisor 2>/dev/null || true; \
+	sid=$${IRCFIBER_SERVER_ID:-$(IRCFIBER_DEFAULT_SERVER_ID)}; \
+	if command -v redis-cli >/dev/null 2>&1; then \
+		redis_url=$${IRCFIBER_REDIS_URL:-$(LOCAL_REDIS_URL)}; \
+		del_keys=$$(redis-cli -u "$$redis_url" --scan --pattern "*:$${sid}:*" 2>/dev/null | head -10000); \
+		if [ -n "$$del_keys" ]; then \
+			n=$$(printf '%s\n' "$$del_keys" | wc -l | tr -d ' '); \
+			printf '%s\n' "$$del_keys" | xargs redis-cli -u "$$redis_url" DEL >/dev/null 2>&1 || true; \
+			printf "%b\n" "$(C)  → purged $$n Redis key(s) matching *:$${sid}:*$(R)"; \
+		else \
+			printf "%b\n" "$(D)  → no Redis keys to purge for *:$${sid}:*$(R)"; \
+		fi; \
+	else \
+		printf "%b\n" "$(Y)$(WR) redis-cli not installed — skipping Redis purge$(R)"; \
+	fi; \
+	rm -f /tmp/ircfiber-handoff-$${sid}.sock 2>/dev/null || true; \
 	printf '%b\n' "$(BG)$(OK) Stopped. (Vite dev server, if running, was not touched.)$(R)"
 
 # ─── COMPONENT OPERATIONS ───────────────────────────────────────────────────
@@ -711,6 +731,14 @@ build-engine: ## Build > Build the IRC engine binary
 	@bash -o pipefail -c '$(DUB) build --config=engine 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | tail -8'
 	@printf '\n%b\n' "$(BG)$(OK) Engine build successful$(R)"
 
+# Janitor migrate tool — backfills TTLs on existing Redis state/scrollback/
+# dedup keys. Default is dry-run; set JSMIGRATE_DRY_RUN=0 to actually apply.
+janitor-migrate: ## Build > Run janitor-migrate (TTL backfill). Dry-run by default.
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Building janitor-migrate  $(R)"
+	@$(DUB) build --config=janitor-migrate 2>&1 | tail -5
+	@printf '%b\n' "$(BG)$(OK) Running janitor-migrate (dry-run)$(R)"
+	@JSMIGRATE_DRY_RUN=1 ./janitor-migrate
+
 build-engine-zig-alpine: ## Build > Cross-compile Zig engine for Alpine (musl)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building Zig Engine (Alpine target)  $(R)"
 	@mkdir -p engine/zig-out/bin
@@ -844,6 +872,73 @@ endef
 test: ## Test > D backend unit tests (fast)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Running D backend tests  $(R)"
 	@$(DUB) test 2>&1 | tail -20
+
+test-real: ## Test > Real unittest driver (replaces no-op unitThreadedLight)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building real unittest driver  $(R)"
+	@$(DUB) build --config=unittest --compiler=ldc2 --build=debug -b unittest 2>&1 | tail -3
+	@./irc-fiber-test
+
+prefs-test: ## Test > User-preferences defensive-parse suite (skips if Redis missing)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Prefs defensive-parse tests  $(R)"
+	@$(DUB) build --config=prefs-test 2>&1 | tail -3
+	@./prefs-test
+
+parser-test: ## Test > IRC parser defensive guards + RFC 2812 coverage
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Parser defensive-parse tests  $(R)"
+	@$(DUB) build --config=parser-test 2>&1 | tail -3
+	@./parser-test
+
+consumer-test: ## Test > consumer reconnect-dedup helpers
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Consumer reconnect-dedup tests  $(R)"
+	@$(DUB) build --config=consumer-test 2>&1 | tail -3
+	@./consumer-test
+
+holder-test: ## Test > conn_holder.protocol IPC framing defense
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Holder IPC framing tests  $(R)"
+	@$(DUB) build --config=holder-test 2>&1 | tail -3
+	@./holder-test
+
+janitor-test: ## Test > EngineJanitor basic reap (orphan → reaped, live → skipped)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  EngineJanitor basic-reap tests  $(R)"
+	@$(DUB) build --config=janitor-test 2>&1 | tail -3
+	@./janitor-test
+
+janitor-lock-test: ## Test > EngineJanitor distributed lock + manualReap()
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  EngineJanitor lock + manual-reap tests  $(R)"
+	@$(DUB) build --config=janitor-lock-test 2>&1 | tail -3
+	@./janitor-lock-test
+
+janitor-safety-test: ## Test > EngineJanitor status / events / purgeLocalServerNamespace / bumpServerStateTTLs
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  EngineJanitor safety + helpers tests  $(R)"
+	@$(DUB) build --config=janitor-safety-test 2>&1 | tail -3
+	@./janitor-safety-test
+
+janitor-tests: ## Test > All EngineJanitor test suites (basic + lock + safety)
+	@./run-janitor-tests.sh
+
+parser-fuzz-test: ## Test > parser property-based fuzz (10k random lines)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Parser fuzz tests  $(R)"
+	@$(DUB) build --config=parser-fuzz-test 2>&1 | tail -3
+	@./parser-fuzz-test
+
+test-fast: ## Test > All fast standalone test suites (prefs/parser/consumer/holder)
+	@for t in prefs-test parser-test consumer-test holder-test; do \
+		printf '\n%b\n' "$(_BCn)$(K)$(B)  $$t  $(R)"; \
+		$(DUB) build --config=$$t 2>&1 | tail -1 || exit 1; \
+		./$$t 2>&1 | tail -3; \
+	done
+
+# Real-CI runner. Builds with `-b unittest` so the compiler emits
+# unittest instances that `__traits(getUnitTests)` can enumerate at
+# runtime. Uses the heavy unit-threaded runner's `disableDefaultRunner`
+# mixin to skip D's runtime auto-unittest hook (which would hang on
+# vibe-d's leaked fibers past main()) so MY main() is the
+# authoritative test executor. Result: every unittest block in modules
+# imported by app_test_real.d runs exactly once.
+unit-test-real: ## Test > Real unittest driver (replaces no-op unitThreadedLight)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building real unittest driver  $(R)"
+	@$(DUB) build --config=unit-test-real --compiler=ldc2 --build=debug -b unittest 2>&1 | tail -3
+	@./irc-fiber-test-real
 
 test-frontend: ## Test > Svelte/Vitest frontend tests (both projects)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Running frontend tests  $(R)"
@@ -1298,7 +1393,7 @@ _playbook    = cd deploy && ansible-playbook -l $(_target) $(_vault_arg)
 
 update: frontend build build-engine ## Deploy > Build frontend + gateway + engine, handoff-deploy (zero disconnect for engines)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Deploy → $(_target)  $(R)"
-	@$(_playbook) playbooks/deploy-update.yml
+	@$(_playbook) playbooks/deploy-update.yml $(if $(SKIP_MIGRATE),-e skip_migrate=true)
 	@printf '%b\n' "$(D)  Syncing frontend dist → ircfiber-gateway (clean extract)$(R)"
 	@tar cz --no-xattrs --format=ustar -C public/dist . | ssh deploy@$(_target_ssh) 'docker exec -i ircfiber-gateway sh -c "rm -rf /app/public/dist/ 2>/dev/null; mkdir -p /app/public/dist/ && tar xzf - -C /app/public/dist"'
 
@@ -1315,7 +1410,7 @@ update-fast: update ## Deploy > Force hot path (same as `make update`)
 # (or via registry), recreates gateway + engine containers.
 update-full: ## Deploy > Full docker image rebuild + container recreate
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Full image rebuild → $(_target)  $(R)"
-	@$(_playbook) playbooks/deploy.yml
+	@$(_playbook) playbooks/deploy.yml $(if $(SKIP_MIGRATE),-e skip_migrate=true)
 
 deploy: update-full ## Deploy > Alias for update-full
 

@@ -1,0 +1,35 @@
+---
+# SigNoz — Foundry-based enterprise observability
+signoz_image: "signoz/signoz:latest"
+signoz_otel_collector_image: "signoz/signoz-otel-collector:latest"
+postgres_image: "postgres:16"
+clickhouse_image: "clickhouse/clickhouse-server:25.5.6"
+clickhouse_keeper_image: "clickhouse/clickhouse-keeper:25.5.6"
+
+signoz_container: "signoz-signoz"
+signoz_otel_collector_container: "signoz-ingester"
+signoz_postgres_container: "signoz-postgres"
+signoz_clickhouse_container: "signoz-clickhouse"
+signoz_keeper_container: "signoz-keeper"
+
+# Volumes
+signoz_postgres_data: "signoz_postgres_data"
+signoz_keeper_data: "signoz_keeper_data"
+signoz_clickhouse_data: "signoz_clickhouse_data"
+signoz_ingester_config: "signoz_ingester_config"
+
+# Memory limits
+# ClickHouse 25.x needs at least ~1.5 GB at boot even idle (merges, parts, query cache).
+# The 512m default OOM-kills on the OVH 7.7 GB host. 2 GB is the safe minimum.
+signoz_signoz_mem: 768m
+signoz_ingester_mem: 256m
+signoz_postgres_mem: 256m
+signoz_clickhouse_mem: 2g
+signoz_keeper_mem: 256m
+
+# Retention TTL applied to ClickHouse telemetry tables.
+# Defaults sized for a 7.7 GB host with the 2 GB container cap on ClickHouse.
+# Read by SigNoz as SIGNOZ_DEFAULT_*_RETENTION_DAYS env vars.
+signoz_logs_retention_days: 7
+signoz_traces_retention_days: 7
+signoz_metrics_retention_days: 30

@@ -23,7 +23,7 @@
 - name: Deploy IRC Fiber logging stack
   hosts: ircfiber
   become: true
-  gather_facts: false
+  gather_facts: true
 
   pre_tasks:
     - name: Ensure logging stack dependencies are present
@@ -46,25 +46,22 @@
         tasks_from: main
 
   post_tasks:
-    - name: Wait for Loki /ready to return 200
-      ansible.builtin.uri:
-        url: "http://127.0.0.1:3100/ready"
-        status_code: 200
+    - name: Wait for Loki /ready (via docker exec)
+      ansible.builtin.command:
+        cmd: "docker exec ircfiber-loki wget -qO- http://127.0.0.1:3100/ready"
       register: loki_health
-      until: loki_health.status == 200
+      changed_when: false
+      until: loki_health.rc == 0 and (loki_health.stdout | trim) == 'ready'
       retries: 12
       delay: 5
       failed_when: false
 
-    - name: Wait for Grafana /api/health to return 200
-      ansible.builtin.uri:
-        url: "http://127.0.0.1:3000/api/health"
-        status_code: 200
-        force_basic_auth: true
-        user: admin
-        password: "{{ grafana_admin_password }}"
+    - name: Wait for Grafana /api/health (via docker exec)
+      ansible.builtin.command:
+        cmd: "docker exec ircfiber-grafana wget -qO- http://127.0.0.1:3000/api/health"
       register: grafana_health
-      until: grafana_health.status == 200
+      changed_when: false
+      until: grafana_health.rc == 0 and (grafana_health.stdout | trim) != ''
       retries: 12
       delay: 5
       failed_when: false
@@ -73,6 +70,6 @@
       ansible.builtin.debug:
         msg: |
           Logging stack deployment result:
-            - Loki:   {{ 'OK' if loki_health.status == 200 else 'FAILED' }} (http://127.0.0.1:3100/ready)
-            - Grafana: {{ 'OK' if grafana_health.status == 200 else 'FAILED' }} (http://127.0.0.1:3000/api/health)
-          External URL: {{ grafana_root_url }}
+            - Loki:    {{ 'OK' if (loki_health.rc | default(-1)) == 0 else 'FAILED' }} (stdout: {{ (loki_health.stdout | default('n/a')) | trim }})
+            - Grafana: {{ 'OK' if (grafana_health.rc | default(-1)) == 0 else 'FAILED' }} (stdout: {{ (grafana_health.stdout | default('n/a')) | trim }})
+          External URL: https://{{ ircfiber_domain }}/grafana/

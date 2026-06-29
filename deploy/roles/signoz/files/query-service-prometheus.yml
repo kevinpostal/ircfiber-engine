@@ -1,0 +1,21 @@
+# my global config
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+alerting:
+  alertmanagers:
+  - static_configs:
+    - targets:
+      - alertmanager:9093
+
+rule_files:
+  - 'alerts.yml'
+
+scrape_configs: []
+
+# Remote-read must point to the same host as the clickhouse DSN.
+# The default config (tcp://clickhouse:9000) breaks when our
+# clickhouse container is named ircfiber-signoz-clickhouse.
+remote_read:
+  - url: tcp://ircfiber-signoz-clickhouse:9000/signoz_metrics

@@ -95,11 +95,13 @@
         CID=$(docker create {{ builder_image }}:latest)
         docker cp "$CID":/build/irc-fiber {{ gateway_binary }}
         docker cp "$CID":/build/irc-fiber-engine {{ engine_binary }}
+        docker cp "$CID":/build/janitor-migrate {{ host_bin_dir }}/janitor-migrate
         docker rm "$CID" >/dev/null
-        chmod 0755 {{ gateway_binary }} {{ engine_binary }}
-        strip {{ gateway_binary }} {{ engine_binary }} 2>/dev/null || true
-        echo "Gateway: $(ls -lh {{ gateway_binary }} | awk '{print $5}')"
-        echo "Engine:  $(ls -lh {{ engine_binary }} | awk '{print $5}')"
+        chmod 0755 {{ gateway_binary }} {{ engine_binary }} {{ host_bin_dir }}/janitor-migrate
+        strip {{ gateway_binary }} {{ engine_binary }} {{ host_bin_dir }}/janitor-migrate 2>/dev/null || true
+        echo "Gateway:        $(ls -lh {{ gateway_binary }} | awk '{print $5}')"
+        echo "Engine:         $(ls -lh {{ engine_binary }} | awk '{print $5}')"
+        echo "Janitor migrate: $(ls -lh {{ host_bin_dir }}/janitor-migrate | awk '{print $5}')"
       args:
         executable: /bin/bash
 
@@ -311,3 +313,74 @@
         - ircfiber_engine_id is defined
         - engine_info.exists
         - old_pid_raw.rc != 0 or sock_ready is failed or handoff_done is failed or (handoff_done is not skipped and handoff_done.stdout | default('') != 'HANDOFF_OK')
+
+    # ── Backfill TTLs on existing Redis state ────────────────────────
+    # Runs once after deploy to write TTLs onto keys that pre-date the
+    # janitor. Idempotent — second run finds zero keys to migrate.
+    # Skipped if `skip_migrate` is set (e.g. for debugging or when Redis
+    # is unreachable). The 60s settle gives the engine time to register
+    # and start heartbeating so we don't race its writes.
+    - name: Wait 60s for engine to settle (registration + heartbeat)
+      ansible.builtin.pause:
+        seconds: 60
+      when:
+        - ircfiber_engine_id is defined
+        - not (skip_migrate | default(false) | bool)
+
+    - name: Janitor-migrate dry-run (show what would be backfilled)
+      ansible.builtin.shell: |
+        echo "=== Janitor-migrate dry-run (JSMIGRATE_DRY_RUN=1) ==="
+        JSMIGRATE_DRY_RUN=1 {{ host_bin_dir }}/janitor-migrate
+      register: migrate_dry
+      changed_when: false
+      ignore_errors: true
+      when:
+        - ircfiber_engine_id is defined
+        - not (skip_migrate | default(false) | bool)
+
+    - name: Print dry-run summary
+      ansible.builtin.debug:
+        var: migrate_dry.stdout
+      when:
+        - ircfiber_engine_id is defined
+        - not (skip_migrate | default(false) | bool)
+        - migrate_dry is defined
+
+    - name: Janitor-migrate apply (write TTLs onto legacy state keys)
+      ansible.builtin.shell: |
+        echo "=== Janitor-migrate apply (JSMIGRATE_DRY_RUN=0) ==="
+        JSMIGRATE_DRY_RUN=0 {{ host_bin_dir }}/janitor-migrate
+      register: migrate_apply
+      changed_when: true
+      ignore_errors: true
+      when:
+        - ircfiber_engine_id is defined
+        - not (skip_migrate | default(false) | bool)
+
+    - name: Print apply summary
+      ansible.builtin.debug:
+        var: migrate_apply.stdout
+      when:
+        - ircfiber_engine_id is defined
+        - not (skip_migrate | default(false) | bool)
+        - migrate_apply is defined
+
+    - name: Verify janitor status after deploy + migration
+      ansible.builtin.shell: |
+        sleep 30  # give janitor one cycle
+        echo "=== Janitor status (post-deploy) ==="
+        curl -fsS http://127.0.0.1:8090/api/admin/janitor/status 2>&1 | head -30 || echo "(admin endpoint unreachable — fine if you're not authed)"
+      register: janitor_status
+      changed_when: false
+      ignore_errors: true
+      when:
+        - ircfiber_engine_id is defined
+        - not (skip_migrate | default(false) | bool)
+
+    - name: Print janitor status
+      ansible.builtin.debug:
+        var: janitor_status.stdout
+      when:
+        - ircfiber_engine_id is defined
+        - not (skip_migrate | default(false) | bool)
+        - janitor_status is defined

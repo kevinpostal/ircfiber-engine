@@ -1,0 +1,7 @@
+<clickhouse>
+    <!-- Cap server memory at 1.7 GB on a 2 GB container so the kernel
+         OOM-killer never gets involved. Default is 0 (unlimited) which
+         fights the container's hard mem_limit and triggers OOMKills
+         under load. -->
+    <max_server_memory_usage>1700000000</max_server_memory_usage>
+</clickhouse>

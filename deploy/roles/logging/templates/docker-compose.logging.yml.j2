@@ -1,14 +1,20 @@
 # {{ ansible_managed }}
-# IRC Fiber — enterprise log aggregation stack.
-# Stack: Grafana (UI) → Loki (storage) ← Promtail (collector)
-# All three run on the ircfiber_logging network (separate from ircfiber_net
-# so log traffic doesn't compete with IRC/IRCv3 control traffic).
+# IRC Fiber — enterprise observability stack.
+#
+#   Grafana          UI  → Loki (logs) ← Promtail (log shipper)
+#                       → Tempo  (traces) ← otel-collector (trace receiver)
+#                       → Prometheus (metrics — provisioned separately)
+#
+# All five run on the ircfiber_logging network (separate from ircfiber_net
+# so observability traffic doesn't compete with IRC control traffic).
 #
 # Resource budgets:
-#   Grafana:  256MB RAM, 0.5 CPU
-#   Loki:     512MB RAM, 1.0 CPU, 8GB disk (filesystem backend)
-#   Promtail: 128MB RAM, 0.5 CPU
-# Total:     ~900MB RAM, 2.0 CPU — fits well on 7.7GB/4-core VPS.
+#   Grafana:          256MB RAM, 0.5 CPU
+#   Loki:             512MB RAM, 1.0 CPU, 8GB disk (filesystem backend)
+#   Promtail:         128MB RAM, 0.5 CPU
+#   Tempo:            256MB RAM, 0.5 CPU, 5GB disk (trace store)
+#   otel-collector:   128MB RAM, 0.5 CPU
+# Total:              ~1.3GB RAM, 3.0 CPU — fits on 7.7GB/4-core VPS.
 
 x-logging-common: &logging-common
   restart: unless-stopped
@@ -17,12 +23,11 @@ x-logging-common: &logging-common
     options:
       max-size: "10m"
       max-file: "3"
+  # No global healthcheck — each service defines its own. The Grafana
+  # / Loki / Promtail images have /bin/wget; otel-collector and
+  # Prometheus are distroless and have a built-in /healthz endpoint.
   healthcheck:
-    test: ["CMD", "true"]
-    interval: 30s
-    timeout: 5s
-    retries: 3
-    start_period: 30s
+    disable: true
 
 services:
   # ────────────────────────────────────────────────────────────────────────
@@ -35,10 +40,11 @@ services:
     hostname: ircfiber-grafana
     networks:
       - ircfiber_logging
-    ports:
-      # Internal-only — Caddy proxies /grafana/* to this port.
-      # NO host port binding — Grafana is NOT exposed publicly without
-      # Caddy. This is the production-safe default.
+    # Internal-only — Caddy proxies /grafana/* to this container port.
+    # Use `expose` (not `ports`) so Docker does NOT bind a host port.
+    # Binding a host port would expose Grafana to the public network on
+    # the OVH box. Caddy is the only safe ingress.
+    expose:
       - "3000"
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
@@ -58,14 +64,29 @@ services:
       - GF_SERVER_SERVE_FROM_SUB_PATH=true
       - GF_USERS_DEFAULT_THEME=dark
       - GF_INSTALL_PLUGINS=
+      # Enable the TraceQL search panel (traces panel type).
+      - GF_FEATURE_TOGGLES_ENABLE=traceQLSearch,traces
       # Disable telemetry
       - GF_ANALYTICS_REPORTING_ENABLED=false
       - GF_ANALYTICS_CHECK_FOR_UPDATES=false
     volumes:
       - ${GRAFANA_DATA_VOLUME}:/var/lib/grafana
-      - ${GRAFANA_PROVISIONING_VOLUME}:/etc/grafana/provisioning
-      - ${GRAFANA_DASHBOARDS_VOLUME}:/var/lib/grafana/dashboards
+      # Bind-mount provisioning from the host so Ansible can update
+      # datasources.yml in place. The provisioning provider re-reads
+      # every 30s so changes land without restarting Grafana.
+      - /etc/ircfiber/grafana/provisioning:/etc/grafana/provisioning
+      # Bind-mount the dashboards directory directly from the host so
+      # Ansible's synchronize task can update dashboards in place
+      # without restarting Grafana. The provisioning provider re-reads
+      # every 30s (see grafana-dashboards.yml.j2).
+      - /etc/ircfiber/grafana/dashboards:/var/lib/grafana/dashboards
       - ${GRAFANA_ALERTING_VOLUME}:/var/lib/grafana/alerting
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health | grep -q ok || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     mem_limit: 256m
     cpus: 0.5
 
@@ -81,11 +102,21 @@ services:
       - ircfiber_logging
     # NO host port — only the internal bridge network.
     command:
-      - /usr/bin/loki
-      - --config.file=/etc/loki/loki-config.yml
+      # Image entrypoint is already /usr/bin/loki, so we only pass flags.
+      - --config.file=/etc/loki/local-config.yaml
       - --config.expand-env=true
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3100/ready | grep -q ready || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     volumes:
-      - ${LOKI_CONFIG_VOLUME}:/etc/loki:ro
+      # Bind-mount the rendered config from the host directly. Using a
+      # volume for the config caused drift where old files in the volume
+      # shadowed new templates.
+      - /etc/ircfiber/loki/loki-config.yml:/etc/loki/local-config.yaml:ro
+      - /etc/ircfiber/loki/rules:/etc/loki/rules:ro
       - ${LOKI_DATA_VOLUME}:/loki
     mem_limit: ${LOKI_MEMORY_LIMIT:-512m}
     cpus: ${LOKI_CPU_LIMIT:-1.0}
@@ -104,20 +135,120 @@ services:
     # Promtail reads /var/lib/docker/containers/*/*-json.log for each
     # matching container.
     volumes:
-      - ${PROMTAIL_CONFIG_VOLUME}:/etc/promtail:ro
+      # Same reasoning as loki: bind-mount the rendered config so it
+      # always reflects the latest template.
+      - /etc/ircfiber/promtail/promtail-config.yml:/etc/promtail/config.yml:ro
       - ${PROMTAIL_POSITIONS_VOLUME}:/tmp
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
     command:
-      - /usr/bin/promtail
-      - --config.file=/etc/promtail/promtail-config.yml
+      # Image entrypoint is already /usr/bin/promtail, so we only pass flags.
+      - --config.file=/etc/promtail/config.yml
       - --config.expand-env=true
     mem_limit: ${PROMTAIL_MEMORY_LIMIT:-128m}
     cpus: ${PROMTAIL_CPU_LIMIT:-0.5}
 
+  # ────────────────────────────────────────────────────────────────────────
+  # Tempo — distributed tracing store (Jaeger-compatible OTLP)
+  # ────────────────────────────────────────────────────────────────────────
+  tempo:
+    <<: *logging-common
+    container_name: ${TEMPO_CONTAINER_NAME:-ircfiber-tempo}
+    image: ${TEMPO_IMAGE:-grafana/tempo:2.6.1}
+    hostname: ircfiber-tempo
+    networks:
+      - ircfiber_logging
+    command:
+      - -config.file=/etc/tempo/tempo-config.yaml
+      - -config.expand-env=true
+    volumes:
+      - /etc/ircfiber/tempo/tempo-config.yaml:/etc/tempo/tempo-config.yaml:ro
+      - ${TEMPO_DATA_VOLUME}:/var/tempo
+    mem_limit: ${TEMPO_MEMORY_LIMIT:-256m}
+    cpus: ${TEMPO_CPU_LIMIT:-0.5}
+
+# ────────────────────────────────────────────────────────────────────────
+  # otel-collector — OTLP receiver → Tempo + Prometheus exporter
+  # ────────────────────────────────────────────────────────────────────────
+  # The collector receives OTLP traces from the engine (gRPC :4317,
+  # HTTP :4318), batches them, and exports to Tempo. Metrics are
+  # exported via the built-in Prometheus exporter on :8889 — Prometheus
+  # scrapes that endpoint to ingest traces_spanmetrics. Logs are
+  # dropped here — Promtail already handles Docker log shipping.
+  otel-collector:
+    <<: *logging-common
+    container_name: ${OTEL_COLLECTOR_CONTAINER_NAME:-ircfiber-otel-collector}
+    image: ${OTEL_COLLECTOR_IMAGE:-otel/opentelemetry-collector-contrib:0.155.0}
+    hostname: ircfiber-otel-collector
+    networks:
+      - ircfiber_logging
+    command:
+      - --config=/etc/otelcol-contrib/config.yaml
+    volumes:
+      - /etc/ircfiber/otelcol/config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    # Prometheus scrapes this port for traces_spanmetrics.
+    expose:
+      - "8889"
+      # Healthcheck endpoint
+      - "13133"
+    mem_limit: ${OTEL_COLLECTOR_MEMORY_LIMIT:-128m}
+    cpus: ${OTEL_COLLECTOR_CPU_LIMIT:-0.5}
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Prometheus — scrapes traces_spanmetrics from the otel-collector.
+  # ────────────────────────────────────────────────────────────────────────
+  # Drives the service graph + latency panels on the Distributed Traces
+  # dashboard. Single-host for now; add federation when we scale out.
+  prometheus:
+    <<: *logging-common
+    container_name: ${PROMETHEUS_CONTAINER_NAME:-ircfiber-prometheus}
+    image: ${PROMETHEUS_IMAGE:-prom/prometheus:v3.0.0}
+    hostname: ircfiber-prometheus
+    networks:
+      - ircfiber_logging
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    volumes:
+      - /etc/ircfiber/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ${PROMETHEUS_DATA_VOLUME}:/prometheus
+    mem_limit: ${PROMETHEUS_MEMORY_LIMIT:-256m}
+    cpus: ${PROMETHEUS_CPU_LIMIT:-0.5}
+
 networks:
   ircfiber_logging:
     name: ircfiber_logging
-    driver: bridge
-    driver_opts:
-      com.docker.network.bridge.name: br-ircfiber-logging
+    external: true
+
+# All volumes are pre-created by the logging role's
+# `community.docker.docker_volume` task and tagged external so compose
+# does NOT try to create or delete them on `down`. The full list MUST
+# match defaults/main.yml (grafana_*, loki_*, promtail_*).
+volumes:
+  ircfiber_grafana_data:
+    external: true
+  ircfiber_grafana_provisioning:
+    external: true
+  ircfiber_grafana_dashboards:
+    external: true
+  ircfiber_grafana_alerting:
+    external: true
+  ircfiber_grafana_plugins:
+    external: true
+  ircfiber_loki_data:
+    external: true
+  ircfiber_loki_config:
+    external: true
+  ircfiber_promtail_config:
+    external: true
+  ircfiber_promtail_positions:
+    external: true
+  ircfiber_tempo_data:
+    external: true
+  ircfiber_tempo_config:
+    external: true
+  ircfiber_otelcol_config:
+    external: true
+  ircfiber_prometheus_data:
+    external: true

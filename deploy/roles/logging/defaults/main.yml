@@ -23,7 +23,7 @@ grafana_disable_signup: true
 # Auto-login via Caddy reverse-proxy basic auth header — see caddy
 # templates for the matching header injection. When true, Grafana trusts
 # the X-WEBAUTH-USER header from the reverse proxy.
-grafana_auth_proxy_enabled: "{{ grafana_auth_proxy_enabled | default(true) }}"
+grafana_auth_proxy_enabled: true
 
 # Loki
 loki_container_name: ircfiber-loki
@@ -55,6 +55,30 @@ promtail_cpu_limit: 0.5
 # Which Docker containers to scrape (regex on container_name).
 # Default: all containers matching the ircfiber-* or engine names.
 promtail_container_label_regex: "^ircfiber-|^ircfiber-ircd$|^ircfiber-engine-with"
+
+# Tempo (distributed tracing storage)
+tempo_container_name: ircfiber-tempo
+tempo_image: "grafana/tempo:2.6.1"
+tempo_data_volume: ircfiber_tempo_data
+tempo_config_volume: ircfiber_tempo_config
+tempo_memory_limit: 256m
+tempo_cpu_limit: 0.5
+
+# OpenTelemetry Collector (OTLP receiver → Tempo + Prometheus)
+otelcol_container_name: ircfiber-otel-collector
+otelcol_image: "otel/opentelemetry-collector-contrib:0.155.0"
+otelcol_config_volume: ircfiber_otelcol_config
+otelcol_memory_limit: 128m
+otelcol_cpu_limit: 0.5
+
+# Prometheus — metrics scraper. Ingests traces_spanmetrics from the
+# otel-collector so the Distributed Traces dashboard can render the
+# service graph + latency percentiles.
+prometheus_container_name: ircfiber-prometheus
+prometheus_image: "prom/prometheus:v3.0.0"
+prometheus_data_volume: ircfiber_prometheus_data
+prometheus_memory_limit: 256m
+prometheus_cpu_limit: 0.5
 
 # Healthcheck endpoints (for internal monitoring)
 logging_healthcheck_interval: 30

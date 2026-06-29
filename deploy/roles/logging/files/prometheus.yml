@@ -1,0 +1,55 @@
+# {{ ansible_managed }}
+# Prometheus — metrics scraper. Ingests:
+#   - traces_spanmetrics_* from Tempo (per-service RPS, latency
+#     histograms, error rates — drives the service graph on the
+#     Distributed Traces dashboard)
+#   - otel-collector's own internal metrics (bytes received, spans
+#     sent, queue depth — useful for debugging the pipeline)
+#
+# Single-instance Prometheus is fine for IRC Fiber's single-host scale.
+# When we add the second engine host, this becomes a scrape target
+# and the second host runs its own Prometheus.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: ircfiber
+    cluster: ovh-1
+
+scrape_configs:
+  # Tempo → traces_spanmetrics_*
+  # The metrics_generator block in tempo-config.yaml emits Prometheus
+  # metrics on Tempo's main HTTP server (port 3200) at /metrics. The
+  # metric names are `traces_spanmetrics_*` and they include:
+  #   traces_spanmetrics_calls_total{service_name, span_name, span_kind,
+  #                                  status_code}
+  #   traces_spanmetrics_latency_bucket{service_name, span_name, le}
+  #   traces_spanmetrics_latency_count / _sum
+  # Plus service graphs:
+  #   traces_servicegraph_request_total{client, server}
+  - job_name: tempo
+    static_configs:
+      - targets:
+          - ircfiber-tempo:3200
+    metrics_path: /metrics
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        regex: '([^:]+):.*'
+        replacement: '$1'
+
+  # otel-collector → internal pipeline metrics
+  # (bytes received, spans sent, queue depth, exporter errors).
+  # We relabel `service_name` from resource attributes.
+  - job_name: otel-collector
+    static_configs:
+      - targets:
+          - ircfiber-otel-collector:8889
+    relabel_configs:
+      - source_labels: [__meta_resource_service_name]
+        target_label: service_name
+      - source_labels: [__address__]
+        target_label: instance
+        regex: '([^:]+):.*'
+        replacement: '$1'

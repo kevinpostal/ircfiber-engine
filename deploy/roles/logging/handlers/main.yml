@@ -17,10 +17,28 @@
     state: started
     restart: true
 
+- name: Restart tempo
+  community.docker.docker_container:
+    name: "{{ tempo_container_name }}"
+    state: started
+    restart: true
+
+- name: Restart otel-collector
+  community.docker.docker_container:
+    name: "{{ otelcol_container_name }}"
+    state: started
+    restart: true
+
+- name: Restart prometheus
+  community.docker.docker_container:
+    name: "{{ prometheus_container_name }}"
+    state: started
+    restart: true
+
 - name: Restart logging stack
   community.docker.docker_compose_v2:
     project_src: /etc/ircfiber/logging
     state: present
-    restarted: true
+    recreate: always
     env_files:
       - /etc/ircfiber/logging/logging.env

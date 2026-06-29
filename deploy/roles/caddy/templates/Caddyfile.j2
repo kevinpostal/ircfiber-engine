@@ -33,22 +33,6 @@
         respond "OK\n" 200
     }
 
-    # ── Grafana (logging dashboard) ─────────────────────────────────────
-    # Reverse-proxy to the Grafana container. Strip the /grafana prefix
-    # so Grafana sees clean URLs at root. Auth-proxy header tells Grafana
-    # the user's identity (admin-only — the container is on the private
-    # ircfiber_logging network, not directly exposed).
-    @grafana path /grafana* /grafana/*
-    handle @grafana {
-        uri strip_prefix /grafana
-        reverse_proxy ircfiber-grafana:3000 {
-            header_up X-WebAuth-User "admin"
-            header_up X-WebAuth-Email "admin@ircfiber.local"
-            header_up X-WebAuth-Groups "Admin"
-            header_up X-WebAuth-Role "Admin"
-        }
-    }
-
     reverse_proxy ircfiber-gateway:{{ gateway_http_port }} {
         # Long-lived transport for WebSockets and slow message-history fetches
         transport http {
@@ -119,3 +103,16 @@
 :{{ caddy_tunnel_port }} {
     import common_site_config
 }
+
+{% if caddy_tailscale_signoz_enabled | default(false) | bool %}
+# ── Tailscale-only SigNoz listener ──────────────────────────────────
+# SigNoz v0.130+ combined image serves the UI on port 8080 (NOT 3301).
+# No auth proxy — SigNoz handles its own authentication.
+http://{{ caddy_tailscale_logging_address | default('100.126.197.92') }}:{{ caddy_tailscale_signoz_port | default(3003) }} {
+    reverse_proxy signoz-signoz:8080 {
+        transport http {
+            dial_timeout 10s
+        }
+    }
+}
+{% endif %}

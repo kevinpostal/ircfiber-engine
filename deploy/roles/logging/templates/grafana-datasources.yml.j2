@@ -9,18 +9,52 @@ datasources:
     access: proxy
     url: http://ircfiber-loki:3100
     jsonData:
-      # Default query range — last 24h when user opens Explore.
       httpMethod: POST
       maxLines: 5000
-      # Match all derivativive series by default.
       derivedFields:
         - name: ts
           matcherRegex: '(\d+)\s+(\d{4,})'
           url: '$${__value.time}'
+        # Derived field that pivots a Loki log line containing
+        # `trace_id=...` straight to the matching Tempo trace. Only fires
+        # once the engine emits structured traces.
+        - name: traceID
+          matcherRegex: 'trace_id=([0-9a-f]{32})'
+          url: '$${__value.traceID}'
+          datasourceUid: Tempo
     editable: false
     isDefault: true
 
-# ─── Datasources for backend sources ───────────────────────────────────────
+  # ─── Traces (Grafana Tempo) ─────────────────────────────────────────
+  # Tempo stores distributed traces received via OTLP from the engine
+  # (through the otel-collector). Service graphs and span metrics
+  # come for free via the metrics_generator block in tempo-config.yaml.
+  - name: Tempo
+    type: tempo
+    access: proxy
+    url: http://ircfiber-tempo:3200
+    uid: Tempo
+    jsonData:
+      httpMethod: GET
+      # Show trace-to-logs correlation: clicking a trace span opens
+      # the matching Loki log line(s) for that trace ID.
+      tracesToLogsV2:
+        datasourceUid: Loki
+        spanStartTimeShift: -1m
+        spanEndTimeShift: 1m
+        filterByTraceID: true
+        filterBySpanID: false
+      # Show service graph from Tempo.
+      serviceMap:
+        datasourceUid: Prometheus
+      # Enable TraceQL search.
+      search:
+        hide: false
+      nodeGraph:
+        enabled: true
+    editable: false
+
+  # ─── Metrics (Prometheus) ────────────────────────────────────────────
   - name: Prometheus
     type: prometheus
     access: proxy

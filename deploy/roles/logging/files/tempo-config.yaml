@@ -1,0 +1,65 @@
+# {{ ansible_managed }}
+# Tempo — distributed tracing storage.
+#
+# Architecture:
+#   IRC Fiber engine ──OTLP──► otel-collector ──OTLP──► Tempo
+#                                                       │
+#                                                       ▼
+#                                              Grafana (Tempo datasource)
+#
+# We use a single local backend (filesystem) with WAL enabled for crash
+# recovery. Trace IDs are 128-bit so they correlate cleanly with the
+# Loki `trace_id` label emitted by `logException` once the engine is
+# OTel-instrumented.
+
+server:
+  http_listen_port: 3200
+  grpc_listen_port: 9095
+
+# Distributor — receives OTLP traces from the otel-collector.
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: "0.0.0.0:4317"
+        http:
+          endpoint: "0.0.0.0:4318"
+
+ingester:
+  # Single-instance ring configuration. By default, Tempo uses a
+  # multi-instance ring that requires a distributed KV store. For our
+  # single-process deployment we force the in-memory store on all
+  # internal lifecyclers. Without this, the metrics-generator-ring
+  # can't self-elect and the module fails to start.
+  lifecycler:
+    ring:
+      kvstore:
+        store: inmemory
+  trace_idle_period: 30s
+  max_block_duration: 5m
+
+# Storage — local filesystem with WAL.
+storage:
+  trace:
+    backend: local
+    wal:
+      path: /var/tempo/wal
+    local:
+      path: /var/tempo/blocks
+
+# Compactor — merges blocks and enforces retention.
+compactor:
+  compaction:
+    block_retention: 720h  # 30 days
+
+# Querier — reads from storage and serves Grafana's queries.
+querier:
+  frontend_worker:
+    frontend_address: tempo:9095
+
+# NOTE: metrics_generator is disabled. Single-instance Tempo can't
+# self-elect the metrics-generator-ring with in-memory KV, which means
+# traces_spanmetrics_* Prometheus metrics are not emitted. The trace
+# search + waterfall work fine — only the service graph + latency
+# p50/p90/p99 panels on the Distributed Traces dashboard are affected.

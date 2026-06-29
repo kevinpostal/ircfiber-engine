@@ -1,0 +1,24 @@
+---
+- name: Restart signoz frontend
+  community.docker.docker_container:
+    name: "{{ signoz_frontend_container }}"
+    state: started
+    restart: true
+
+- name: Restart signoz query-service
+  community.docker.docker_container:
+    name: "{{ signoz_query_service_container }}"
+    state: started
+    restart: true
+
+- name: Restart otel-collector
+  community.docker.docker_container:
+    name: "{{ signoz_otel_collector_container }}"
+    state: started
+    restart: true
+
+- name: Restart signoz stack
+  community.docker.docker_compose_v2:
+    project_src: /etc/ircfiber/signoz
+    state: present
+    recreate: always

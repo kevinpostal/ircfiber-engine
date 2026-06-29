@@ -5,7 +5,8 @@
     driver: bridge
     state: present
     driver_options:
-      com.docker.network.bridge.name: br-ircfiber-logging
+      # Linux IFNAMSIZ = 15 chars; "br-ircfiber-logging" (20) overflows.
+      com.docker.network.bridge.name: br-ircfiber-log
 
 - name: Ensure logging Docker volumes exist
   community.docker.docker_volume:
@@ -21,6 +22,32 @@
     - "{{ loki_config_volume }}"
     - "{{ promtail_config_volume }}"
     - "{{ promtail_positions_volume }}"
+    - "{{ tempo_data_volume }}"
+    - "{{ tempo_config_volume }}"
+    - "{{ otelcol_config_volume }}"
+    - "{{ prometheus_data_volume }}"
+
+- name: Ensure logging directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - /etc/ircfiber/loki
+    - /etc/ircfiber/promtail
+    - /etc/ircfiber/tempo
+    - /etc/ircfiber/otelcol
+    - /etc/ircfiber/prometheus
+    - /etc/ircfiber/grafana
+    - /etc/ircfiber/grafana/provisioning
+    - /etc/ircfiber/grafana/provisioning/datasources
+    - /etc/ircfiber/grafana/provisioning/dashboards
+    - /etc/ircfiber/grafana/dashboards
+    - /etc/ircfiber/grafana/alerting
+    - /etc/ircfiber/loki/rules
+    - /etc/ircfiber/logging
 
 - name: Render Loki config
   ansible.builtin.template:
@@ -74,6 +101,33 @@
     mode: "0644"
   notify: Restart loki
 
+- name: Render Tempo config
+  ansible.builtin.copy:
+    src: tempo-config.yaml
+    dest: "/etc/ircfiber/tempo/tempo-config.yaml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart tempo
+
+- name: Render otel-collector config
+  ansible.builtin.copy:
+    src: otelcol-config.yaml
+    dest: "/etc/ircfiber/otelcol/config.yaml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart otel-collector
+
+- name: Render Prometheus config
+  ansible.builtin.copy:
+    src: prometheus.yml
+    dest: "/etc/ircfiber/prometheus/prometheus.yml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart prometheus
+
 - name: Render docker-compose for logging stack
   ansible.builtin.template:
     src: docker-compose.logging.yml.j2
@@ -83,33 +137,23 @@
     mode: "0644"
   notify: Restart logging stack
 
-- name: Ensure logging directories exist
-  ansible.builtin.file:
-    path: "{{ item }}"
-    state: directory
+- name: Render logging env file (consumed by docker compose)
+  ansible.builtin.template:
+    src: logging.env.j2
+    dest: "/etc/ircfiber/logging/logging.env"
     owner: root
     group: root
-    mode: "0755"
-  loop:
-    - /etc/ircfiber/loki
-    - /etc/ircfiber/promtail
-    - /etc/ircfiber/grafana
-    - /etc/ircfiber/grafana/provisioning
-    - /etc/ircfiber/grafana/provisioning/datasources
-    - /etc/ircfiber/grafana/provisioning/dashboards
-    - /etc/ircfiber/grafana/dashboards
-    - /etc/ircfiber/grafana/alerting
-    - /etc/ircfiber/loki/rules
-    - /etc/ircfiber/logging
+    mode: "0600"
+  notify: Restart logging stack
 
 # ────────────────────────────────────────────────────────────────────────
 # Deploy via docker compose
 # ────────────────────────────────────────────────────────────────────────
-- name: Deploy logging stack (Loki + Promtail + Grafana)
+- name: Deploy logging stack (Loki + Promtail + Grafana + Tempo + otel-collector)
   community.docker.docker_compose_v2:
     project_src: /etc/ircfiber/logging
     state: present
-    pull: missing  # pull new image tags only
+    pull: missing
     remove_orphans: true
     env_files:
       - /etc/ircfiber/logging/logging.env
@@ -119,25 +163,44 @@
 # Post-deploy healthchecks
 # ────────────────────────────────────────────────────────────────────────
 - name: Wait for Loki to become healthy
-  ansible.builtin.uri:
-    url: "http://127.0.0.1:3100/ready"
-    status_code: 200
+  ansible.builtin.command:
+    cmd: "docker exec ircfiber-loki wget -qO- http://127.0.0.1:3100/ready"
   register: loki_ready
-  until: loki_ready.status == 200
-  retries: 10
-  delay: 3
+  changed_when: false
+  until: loki_ready.rc == 0 and (loki_ready.stdout | trim) == 'ready'
+  retries: 15
+  delay: 4
 
 - name: Wait for Grafana to become healthy
-  ansible.builtin.uri:
-    url: "http://127.0.0.1:3000/api/health"
-    status_code: 200
-    force_basic_auth: true
-    user: admin
-    password: "{{ grafana_admin_password }}"
+  ansible.builtin.command:
+    cmd: docker exec ircfiber-grafana wget -qO- http://127.0.0.1:3000/api/health
   register: grafana_ready
-  until: grafana_ready.status == 200
-  retries: 10
-  delay: 3
+  changed_when: false
+  until:
+    - grafana_ready.rc == 0
+    - grafana_ready.stdout is search("database")
+  retries: 15
+  delay: 4
+
+- name: Wait for Tempo to become healthy
+  ansible.builtin.command:
+    cmd: "docker exec ircfiber-tempo wget -qO- http://127.0.0.1:3200/ready"
+  register: tempo_ready
+  changed_when: false
+  until: tempo_ready.rc == 0
+  retries: 15
+  delay: 4
+  failed_when: false
+
+- name: Wait for otel-collector to become healthy
+  ansible.builtin.command:
+    cmd: "docker exec ircfiber-otel-collector wget -qO- http://127.0.0.1:13133/health/status"
+  register: otelcol_ready
+  changed_when: false
+  until: otelcol_ready.rc == 0
+  retries: 15
+  delay: 4
+  failed_when: false
 
 # ────────────────────────────────────────────────────────────────────────
 # Caddy integration — add Grafana proxy route

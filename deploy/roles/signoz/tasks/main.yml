@@ -1,0 +1,49 @@
+---
+- name: Ensure Signoz directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - /etc/ircfiber/signoz
+
+- name: Render ingester config
+  ansible.builtin.copy:
+    src: ingester.yaml
+    dest: "/etc/ircfiber/signoz/ingester.yaml"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Render Keeper config
+  ansible.builtin.copy:
+    src: keeper.yaml
+    dest: "/etc/ircfiber/signoz/keeper.yaml"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Render ClickHouse server overrides
+  ansible.builtin.copy:
+    src: clickhouse-server-overrides.xml
+    dest: "/etc/ircfiber/signoz/clickhouse-server-overrides.xml"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Render docker-compose
+  ansible.builtin.template:
+    src: docker-compose.signoz.yml.j2
+    dest: "/etc/ircfiber/signoz/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Deploy Signoz stack
+  community.docker.docker_compose_v2:
+    project_src: /etc/ircfiber/signoz
+    state: present
+    pull: missing
+    remove_orphans: true

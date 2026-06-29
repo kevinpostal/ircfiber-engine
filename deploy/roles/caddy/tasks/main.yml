@@ -38,8 +38,10 @@
     restart_policy: unless-stopped
     # Caddy joins the ircfiber_net bridge so it can resolve
     # 'ircfiber-gateway' (the gateway container's DNS alias on that net).
+    # It also joins ircfiber_logging so it can reach Grafana and SigNoz.
     networks:
       - name: "{{ docker_ircfiber_network }}"
+      - name: ircfiber_logging
     networks_cli_compatible: true
     command:
       - "caddy"
@@ -50,6 +52,11 @@
     ports:
       - "80:80"
       - "443:443"
+      # Tailscale-only Grafana listener.
+      - "{{ caddy_tailscale_logging_address }}:{{ caddy_tailscale_logging_port | default(3443) }}:{{ caddy_tailscale_logging_port | default(3443) }}"
+      # Tailscale-only SigNoz listener. The port is published on the
+      # Tailscale IP only — not reachable from the public internet.
+      - "{{ caddy_tailscale_logging_address }}:{{ caddy_tailscale_signoz_port | default(3003) }}:{{ caddy_tailscale_signoz_port | default(3003) }}"
     # Bind-mount tailscaled.sock so the built-in caddytls.Tailscale cert
     # manager can fetch real certs for *.ts.net hostnames. Mounted at the
     # same path inside the container (Caddy looks there by default).

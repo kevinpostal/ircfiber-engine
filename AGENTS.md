@@ -243,3 +243,104 @@ bash scripts/deploy-holder-ovh.sh  # Builds remotely (Linux x86_64) + deploys bo
 6. **Build D binaries on the target architecture** (Linux x86_64 for OVH) — local Mac ARM64 binaries won't run on Linux. Use BuildKit.
 7. **When committing new binaries to a Docker image**, the original entrypoint is preserved. Override with `--entrypoint /app/mybin` when running the new container.
 8. **DNS resolution**: use `getaddrinfo()` not `inet_pton()` if you want hostname support (IRC servers are hostnames, not IPs).
+
+---
+
+# IRC Fiber — Engine Janitor
+
+The `EngineJanitor` (in `source/ircfiber/irc/engine_janitor.d`) prevents orphan-engine garbage from accumulating in Redis after a crash. Without it, dead engines leave `irc:state:<id>:*`, `scrollback:<id>:*`, and `dedup:<id>:*` keys forever — the gateway keeps routing to a dead server while the frontend renders a frozen ghost of the channel.
+
+## How it works
+
+Four layers run automatically in **every** gateway and engine process:
+
+1. **TTL auto-expiry** — every per-engine state key gets `EXPIRE 600s`. The engine heartbeat bumps TTL every 10 s. A dead engine's state self-evicts within 10 min, even if no janitor ever runs.
+2. **Distributed janitor** — every process tries to acquire `irc:janitor:lock` via `SET NX EX 30`. Holder runs the reap; losers yield. Lua scripts make the reap atomic against late heartbeats.
+3. **Bootstrap purge** — on engine boot (skipping handoff), `purgeLocalServerNamespace(serverId)` SCANs+UNLINKs `*:<serverId>:*` so reusing a `serverId` after a crash doesn't carry garbage across epochs.
+4. **Frontend staleness** — `lastSeenAt` per network, `isNetworkStale()` helper, grey "● stale" pill in the sidebar. Buffer cache in localStorage uses a 24 h TTL guard.
+
+## Environment knobs
+
+| Env var | Default | Range | Effect |
+|---|---|---|---|
+| `IRCFIBER_STATE_TTL` | 600 | 60–86400 | TTL on per-engine state keys (seconds) |
+| `IRCFIBER_JANITOR_INTERVAL` | 60 | 5–3600 | Seconds between janitor cycles |
+| `IRCFIBER_JANITOR_LOCK_TTL` | 30 | 5–300 | Distributed lock TTL |
+| `IRCFIBER_BOOTSTRAP_PURGE` | 1 | 0/1 | Disable bootstrap-time namespace purge |
+| `JSMIGRATE_DRY_RUN` | 1 | 0/1 | Migration tool: dry-run vs. apply |
+| `IRCFIBER_MIGRATE_TTL` | 600 | 60–86400 | Migration tool TTL to apply |
+
+Invalid values fall back to defaults with a `WARN:` line at startup.
+
+## Build targets
+
+```bash
+# Run all 9 janitor tests
+./run-janitor-tests.sh
+# or
+make janitor-tests
+
+# Build the migration tool + run dry-run
+make janitor-migrate
+
+# Manually trigger / observe (admin session required)
+make janitor-status
+make janitor-audit
+make janitor-cycle
+make janitor-reap SERVER=testengine1
+```
+
+## Admin endpoints (gated behind admin session)
+
+| Endpoint | Purpose |
+|---|---|
+| `GET  /api/admin/janitor/status` | Lock holder, actor, totals, last cycle |
+| `GET  /api/admin/janitor/events?limit=100` | Recent audit events (most-recent-first) |
+| `POST /api/admin/janitor/cycle` | Force one reap cycle right now |
+| `POST /api/admin/janitor/reap/<serverId>` | Manually purge one server's namespace |
+
+Audit events look like:
+```json
+{"ts":1782703502123,"kind":"engine_reap","serverId":"testengine1","actor":"pid:19490:host=zodiac-mbp","reason":"lease_expired","keysDeleted":42}
+```
+Stored in the `irc:janitor:events` Redis LIST (capped at 1000 via `LTRIM`).
+
+## Test binaries
+
+| Binary | Config | Tests |
+|---|---|---|
+| `janitor-test` | `dub build --config=janitor-test` | purge idempotency, basic reap |
+| `janitor-lock-test` | `dub build --config=janitor-lock-test` | manualReap, lock mutual exclusion |
+| `janitor-safety-test` | `dub build --config=janitor-safety-test` | getStatus, getRecentEvents, TTL bump |
+
+`./run-janitor-tests.sh` builds all three and aggregates `[PASS]/[FAIL]/[SKIP]`.
+
+## Deploy / rollout
+
+```bash
+# 1. (Optional) Backfill TTL on existing keys locally — already done by `make update` automatically
+JSMIGRATE_DRY_RUN=1 ./janitor-migrate
+JSMIGRATE_DRY_RUN=0 ./janitor-migrate
+
+# 2. Deploy via your normal pipeline:
+make update        # full deploy (engine + frontend + handoff + janitor-migrate + verification)
+make handoff       # engine-only hot reload
+make gateway-restart  # gateway-only reload
+
+# Skip the migration step on a `make update`:
+SKIP_MIGRATE=1 make update
+
+# 3. Verify after deploy:
+curl -s http://127.0.0.1:8090/api/admin/janitor/status
+```
+
+The migration step is **idempotent** — running it again is a no-op. When invoked through `make update`, the playbook:
+1. Builds `janitor-migrate` cross-arch via BuildKit
+2. Extracts to `/opt/ircfiber/bin/janitor-migrate` on the target
+3. Waits 60 s for the new engine to register and start heartbeating
+4. Runs `JSMIGRATE_DRY_RUN=1` (dry-run) and prints the result
+5. Runs `JSMIGRATE_DRY_RUN=0` (apply) and prints the result
+6. Waits one janitor cycle, then fetches `/api/admin/janitor/status` and prints it
+
+Skipped automatically when `ircfiber_engine_id` is not defined (i.e. only the gateway is in scope).
+

@@ -58,9 +58,14 @@ RUN --mount=type=cache,target=/build/.dub \
     echo "holder: $CACHE_BUST" && \
     dub build --config=conn-holder --compiler=ldc2 --build=release --force --parallel 2>&1 | tail -5 && \
     test -f /build/ircfiber-conn-holder
+RUN --mount=type=cache,target=/build/.dub \
+    echo "janitor-migrate: $CACHE_BUST" && \
+    dub build --config=janitor-migrate --compiler=ldc2 --build=release --force --parallel 2>&1 | tail -5 && \
+    test -f /build/janitor-migrate
 RUN strip /build/irc-fiber 2>/dev/null || true
 RUN strip /build/irc-fiber-engine 2>/dev/null || true
 RUN strip /build/ircfiber-conn-holder 2>/dev/null || true
+RUN strip /build/janitor-migrate 2>/dev/null || true
 
 # Runtime stage
 FROM ubuntu:22.04

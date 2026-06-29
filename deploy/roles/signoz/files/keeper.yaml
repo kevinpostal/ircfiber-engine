@@ -1,0 +1,15 @@
+node_id: 1
+log_storage_path: /var/lib/clickhouse-keeper/log
+snapshot_storage_path: /var/lib/clickhouse-keeper/snapshots
+coordination_settings:
+  auto_forwarding: true
+  heart_beat_interval_ms: 1000
+  session_timeout_ms: 30000
+raft_configuration:
+  server:
+    id: 1
+    hostname: signoz-keeper
+    port: 9234
+    can_become_leader: true
+    priority: 1
+    start_as_follower: false

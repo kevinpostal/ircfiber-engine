@@ -1,21 +1,63 @@
 # {{ ansible_managed }}
 # Loki alerting rules — evaluated by the loki ruler.
 # Group: ircfiber_alerts
+#
+# Rules query the structured `event` label emitted by the engine.
+# Old text-based filters ("Handoff: ..." / "433" / "Started IRC client")
+# are kept as fallback paths for the legacy log lines that still appear.
 
 groups:
   - name: ircfiber_alerts
     interval: 1m
     rules:
-      # ─── Handoff stuck ──────────────────────────────────────────────────
-      # Multiple "Handoff:" events from old engine processes within
-      # 5 minutes = handoff isn't completing cleanly (zombie risk).
-      - alert: IrcfiberHandoffStuck
+
+      # ─── TLS failures spike ──────────────────────────────────────────────
+      # More than 3 TLS handshake failures in 5 minutes for any single
+      # network — usually means the IRC server rotated certs or our
+      # SNI/cipher is wrong. Check engine logs for that network.
+      - alert: IrcfiberTLSFailures
         expr: |
-          count(
+          sum by (network) (
             count_over_time(
-              {job="ircfiber_containers", container_name=~"ircfiber-engine.*"}
-                |~ "Handoff: (sent|serving|complete)"
-              [5m]
+              {job="ircfiber_containers", event="tls_fail"}[5m]
+            )
+          ) > 3
+        for: 0m
+        labels:
+          severity: warning
+          team: ircfiber-ops
+        annotations:
+          summary: "TLS handshake failures for {% raw %}$labels.network{% endraw %}"
+          description: "More than 3 TLS handshake failures in 5 minutes on network {% raw %}$labels.network{% endraw %}. Check ircfiber-engine-ovh logs and the IRC server's TLS config."
+
+      # ─── Reconnect storm ────────────────────────────────────────────────
+      # Engine is repeatedly trying to reconnect to a network — usually
+      # means the IRC server is unreachable or throttling us.
+      - alert: IrcfiberReconnectStorm
+        expr: |
+          sum by (network) (
+            count_over_time(
+              {job="ircfiber_containers", event="reconnect_scheduled"}[5m]
+            )
+          ) > 10
+        for: 0m
+        labels:
+          severity: warning
+          team: ircfiber-ops
+        annotations:
+          summary: "Reconnect storm: {% raw %}$labels.network{% endraw %}"
+          description: "More than 10 reconnect attempts in 5 minutes for network {% raw %}$labels.network{% endraw %}. The IRC server may be down or throttling. Check engine logs."
+
+      # ─── Handoff failed (TLS) ──────────────────────────────────────────
+      # TLS handoff records can't transfer FDs across the Unix socket
+      # (session keys live in userspace) so the new engine does a soft
+      # reconnect. This is expected, but if it happens for ALL networks
+      # at once, the engine may have lost state.
+      - alert: IrcfiberHandoffTLSFailures
+        expr: |
+          sum(
+            count_over_time(
+              {job="ircfiber_containers", event="handoff_fail", reason="tls"}[1m]
             )
           ) > 5
         for: 0m
@@ -23,94 +65,254 @@ groups:
           severity: warning
           team: ircfiber-ops
         annotations:
-          summary: "Excessive handoff events detected"
-          description: "More than 5 handoff events in 5 minutes — check for zombie processes in ircfiber-engine-ovh container. Run: docker exec ircfiber-engine-ovh ps aux | grep irc-fiber-engine"
+          summary: "Multiple TLS handoffs in 60s"
+          description: "More than 5 TLS handoffs in the last minute — every TLS network is briefly disconnecting. Check the IRCd's connection limit and the engine's network list."
 
-      # ─── Post-handoff cleanup failure ────────────────────────────────
-      - alert: IrcfiberHandoffCleanupFailed
+      # ─── SASL failure spike ────────────────────────────────────────────
+      - alert: IrcfiberSASLFailures
         expr: |
-          count_over_time(
-            {job="ircfiber_containers", container_name=~"ircfiber-engine.*"}
-              |= "Post-handoff cleanup failed"
-              |= "safety net"
-            [10m]
+          sum by (network, mechanism) (
+            count_over_time(
+              {job="ircfiber_containers", event="sasl_fail"}[10m]
+            )
+          ) > 2
+        for: 0m
+        labels:
+          severity: critical
+          team: ircfiber-ops
+        annotations:
+          summary: "SASL authentication failed: {% raw %}$labels.network{% endraw %} ({% raw %}$labels.mechanism{% endraw %})"
+          description: "SASL auth is failing on network {% raw %}$labels.network{% endraw %} using mechanism {% raw %}$labels.mechanism{% endraw %}. Check IRCd password config and SASL credentials in the network config."
+
+      # ─── Engine container silent ────────────────────────────────────────
+      # Zero log entries from the engine for 10 minutes means it's
+      # crashed or stuck. The heartbeat (every 10s) should keep the
+      # stream alive.
+      - alert: IrcfiberEngineSilent
+        expr: |
+          sum(
+            count_over_time(
+              {job="ircfiber_containers", container_name=~"ircfiber-engine.*"}[10m]
+            )
+          ) == 0
+        for: 5m
+        labels:
+          severity: critical
+          team: ircfiber-ops
+        annotations:
+          summary: "IRC Fiber engine container is silent"
+          description: "No log entries from ircfiber-engine-* in 10 minutes. Container may be crashed or stuck. Check: docker ps ircfiber-engine-ovh ; docker logs --tail ircfiber-engine-ovh"
+
+      # ─── Error rate spike per container ────────────────────────────────
+      - alert: IrcfiberErrorSpike
+        expr: |
+          sum by (container_name) (
+            rate({job="ircfiber_containers", level="error"}[5m])
+          ) > 1
+        for: 5m
+        labels:
+          severity: warning
+          team: ircfiber-ops
+        annotations:
+          summary: "Error spike in {% raw %}$labels.container_name{% endraw %}"
+          description: "Container {% raw %}$labels.container_name{% endraw %} is emitting more than 1 error/sec sustained for 5 minutes. Check container logs."
+
+      # ─── Legacy: text-based IRC connection drop ────────────────────────
+      # Kept as a fallback for any engine version that hasn't been
+      # hot-reloaded to the new structured logger yet.
+      - alert: IrcfiberConnectionDrop
+        expr: |
+          sum(
+            count_over_time(
+              {job="ircfiber_containers", event="disconnected"}[5m]
+            )
+          ) > 3
+        for: 1m
+        labels:
+          severity: warning
+          team: ircfiber-ops
+        annotations:
+          summary: "Multiple IRC disconnects in 5m"
+          description: "More than 3 networks disconnected in the last 5 minutes. Could be IRCd throttling, network issues, or all networks sharing one TLS failure."
+
+      # ─── User preference field has wrong JSON type ─────────────────────
+      # Fires when `pinnedChannels`, `archivedChannels`, or `networkOrder`
+      # is stored in Redis with a non-array shape (e.g. `{}` from a legacy
+      # schema, or a manual SET). The load path now self-heals by deleting
+      # the bad blob, but the alert surfaces bugs BEFORE the user notices
+      # a loss of pinned channels. Group by `field` to spot systemic vs.
+      # one-off problems.
+      - alert: IrcfiberPrefsFieldInvalid
+        expr: |
+          sum by (field, found_type) (
+            count_over_time(
+              {job="ircfiber_containers", component="prefs", event="prefs_field_invalid"}[15m]
+            )
+          ) > 0
+        for: 0m
+        labels:
+          severity: warning
+          team: ircfiber-ops
+        annotations:
+          summary: "User preference field corrupted: $labels.field (got $labels.found_type)"
+          description: |
+            Field `$labels.field` was stored as JSON type `$labels.found_type` instead of `array`.
+            The prefs loader has already self-healed by skipping the bad field, but every
+            fresh load hits this. Investigate the upstream writer (legacy schema migration,
+            direct redis-cli SET, or a saver path that bypasses `prefsRepo.save()`).
+            See source/ircfiber/db/preferences.d for the defensive parse logic.
+
+      # ─── Full preferences blob failed to load ─────────────────────────
+      # More serious than field-level warnings — the entire blob is
+      # unparseable or `fromJson()` raised an unexpected exception. The
+      # key has been auto-deleted, so prefs reset for the affected user.
+      # Spikes of this alert indicate bad writes hitting Redis (deploys
+      # with stale schemas, manual restores, etc.).
+      - alert: IrcfiberPrefsLoadFail
+        expr: |
+          sum(
+            count_over_time(
+              {job="ircfiber_containers", component="prefs", event="prefs_load_fail"}[10m]
+            )
           ) > 0
         for: 0m
         labels:
           severity: critical
           team: ircfiber-ops
         annotations:
-          summary: "Post-handoff connection cleanup failed"
-          description: "Engine failed to close connections during handoff. Old sockets may be leaking. Check ps aux for zombie processes."
+          summary: "Preferences blob failed to load (auto-deleted & reset)"
+          description: |
+            `prefs_load_fail` fired — the user's preference blob is corrupted beyond per-field
+            recovery. The key has been deleted so their next save will write a clean record,
+            but they have already lost pinned/archived/network-order state for this session.
+            Run:
+              ssh deploy@40.160.227.49 'docker logs --since=10m ircfiber-gateway 2>&1 | grep prefs_load_fail'
 
-      # ─── IRC server disconnect (any reason) ───────────────────────────
-      - alert: IrcfiberConnectionLost
+      # ─── TLS write to a live-looking but dead connection ──────────────
+      # Triggers when `connection.writeRaw()` writes to a TLS stream whose
+      # underlying TCP socket has been closed by the server but our state
+      # machine hasn't caught up yet. Causes a flood of identical
+      # warnings (one per queued message) until the next reconnect cycle.
+      # Group by `network` to spot a single bad server vs systemic TLS
+      # endpoint issues. The stream is torn down on first hit, so this
+      # alert should fire a small number of times per incident, not
+      # hundreds.
+      - alert: IrcfiberTLSWriteFail
+        expr: |
+          sum by (network) (
+            count_over_time(
+              {job="ircfiber_containers", event="tls_write_fail"}[5m]
+            )
+          ) > 0
+        for: 0m
+        labels:
+          severity: warning
+          team: ircfiber-ops
+        annotations:
+          summary: "TLS write failed on $labels.network"
+          description: |
+            Engine tried to write to a TLS stream whose TCP socket had already been closed
+            by the IRC server. The stream has been torn down; subsequent writes will use
+            the transport fallback. If the count grows quickly, look for an IRC server
+            kicking us mid-session — also check network=$labels.network logs for the
+            preceding `connection error`/`ERROR :Closing Link` event.
+
+      # ─── Command dropped due to execution failure ─────────────────────
+      # The consumer received a valid command from the gateway but the
+      # command's network call (sendRaw → writeRaw) threw. Almost always
+      # correlates 1:1 with `tls_write_fail` — grouped together in the
+      # dashboard you'll see the cascade. A spike of `cmd_exec_fail`
+      # WITHOUT concurrent `tls_write_fail` indicates a different bug
+      # (permission denied, message too long, etc.).
+      - alert: IrcfiberCmdExecFail
         expr: |
           sum(
             count_over_time(
-              {job="ircfiber_containers", container_name=~"ircfiber-engine.*"}
-                |= "DISCONNECT"
-                |= "reason"
-              [5m]
+              {job="ircfiber_containers", event="cmd_exec_fail"}[5m]
             )
-          ) > 0
+          ) > 10
         for: 1m
         labels:
           severity: warning
+          team: ircfiber-ops
         annotations:
-          summary: "IRC connection lost: $labels.network"
-          description: "Network {{ $labels.network }} disconnected at {{ $labels.container_name }}. Check engine logs."
+          summary: "Commands dropped at execution time"
+          description: |
+            $labels.counts commands from the gateway failed to execute against the IRC server
+            in the last 5 minutes. Investigate by reading the engine logs filtered by
+            event=cmd_exec_fail and the matching event=connection error events around the
+            same timestamp.
 
-      # ─── Nick collision (433) ────────────────────────────────────────
-      # If nick collisions spike, the handoff isn't releasing nicks properly.
-      - alert: IrcfiberNickCollision
+      # ─── Outbound message dropped — no active connection ───────────────
+      # Fires when `writeRaw()` is called with no live transport. The
+      # message is silently dropped (caller is the outbound queue) and
+      # an event is emitted ONCE per disconnect cycle (not per message).
+      # A sustained rate means users are typing while the engine is
+      # disconnected and their input is being lost.
+      - alert: IrcfiberCmdDroppedNoConn
         expr: |
-          sum(
+          sum by (network) (
             count_over_time(
-              {job="ircfiber_containers", container_name=~"ircfiber-engine.*"}
-                |~ "Nick change rejected|433|ERR_NICKNAMEINUSE"
-              [10m]
+              {job="ircfiber_containers", event="cmd_dropped_no_conn"}[15m]
             )
           ) > 3
         for: 0m
         labels:
           severity: warning
+          team: ircfiber-ops
         annotations:
-          summary: "Multiple nick collisions detected"
-          description: "Server rejected nick changes — handoff might not be releasing nick registrations. Check Post-handoff QUIT events."
+          summary: "Outbound messages dropped on $labels.network (no connection)"
+          description: |
+            More than 3 `cmd_dropped_no_conn` events in 15 minutes on network=$labels.network.
+            Users' outbound messages are being silently discarded because the engine has no
+            live connection. Check the IRC server status and engine logs for the disconnect
+            sequence that preceded the drops.
 
-      # ─── Engine process count anomaly ────────────────────────────────
-      # We can't query the host directly from Loki, but we CAN alert on
-      # symptoms: many "started IRC client" events from the same network
-      # in a short window indicates a reconnect loop.
-      - alert: IrcfiberReconnectLoop
+      # ─── Oversized IRC line rejected by parser ──────────────────────────
+      # Fires on `event=line_too_long` — input exceeds the 8 KiB defensive
+      # cap in `parser.d`. The line is truncated, not dropped, but the
+      # server is misbehaving (max legit is 512 bytes per RFC 2812). Groups
+      # by network to spot a single chatty server.
+      - alert: IrcfiberLineTooLong
         expr: |
-          sum(
+          sum by (network) (
             count_over_time(
-              {job="ircfiber_containers", container_name=~"ircfiber-engine.*"}
-                |= "Started IRC client"
-              [2m]
+              {job="ircfiber_containers", event="line_too_long"}[10m]
             )
-          ) > 6
+          ) > 1
         for: 0m
         labels:
           severity: warning
+          team: ircfiber-ops
         annotations:
-          summary: "IRC reconnect loop detected"
-          description: "More than 6 'Started IRC client' events in 2 minutes — engine is reconnecting repeatedly. Check connection state."
+          summary: "Server $labels.network sent oversized IRC lines"
+          description: |
+            IRC server $labels.network sent a line >8 KiB. The parser truncated it to prevent
+            a memory exhaustion attack, but a well-behaved IRC server should never exceed the
+            RFC 2812 512-byte limit. Contact the server operator if this is unexpected.
 
-      # ─── Container down (no logs) ────────────────────────────────────
-      - alert: IrcfiberContainerSilent
+      # ─── Squashed numeric+ERROR detected ───────────────────────────────
+      # Fires when `processLine()` detects a numeric reply whose trailing
+      # contains "Closing Link:" or " ERROR " — the SuperNets pattern where
+      # MOTD-end numeric and server-disconnect ERROR are crammed onto a
+      # single line. The engine correctly transitions to disconnecting
+      # but the alert surfaces that this protocol violation is happening
+      # so an operator can notify the server maintainer.
+      - alert: IrcfiberServerErrorDetected
         expr: |
-          sum(
+          sum by (network, message) (
             count_over_time(
-              {job="ircfiber_containers", container_name=~"ircfiber-engine.*"}
-              [10m]
+              {job="ircfiber_containers", event="server_error_detected"}[5m]
             )
-          ) == 0
-        for: 5m
+          ) > 0
+        for: 0m
         labels:
-          severity: critical
+          severity: warning
+          team: ircfiber-ops
         annotations:
-          summary: "IRC Fiber engine container is silent"
-          description: "No log entries from ircfiber-engine-ovh in 10 minutes. Container may be crashed or stuck."
+          summary: "Server $labels.network sent malformed numeric+ERROR line"
+          description: |
+            The engine detected a squashed `numeric ERROR :Closing Link:` line from
+            network=$labels.network (message=$labels.message). The connection state
+            machine correctly transitions to disconnecting. This is a protocol-level
+            bug in the IRC server — please report to its operators.

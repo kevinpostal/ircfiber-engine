@@ -55,6 +55,9 @@
   ansible.builtin.set_fact:
     ircfiber_networks_for_gateway:
       - name: "{{ docker_ircfiber_network }}"
+      # Join the logging network so the gateway can push OTLP traces
+      # to the otel-collector. Required for distributed tracing.
+      - name: ircfiber_logging
 
 - name: Run ircfiber-gateway
   community.docker.docker_container:

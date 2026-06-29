@@ -16,6 +16,13 @@ ircfiber_engine_admin_port: 8091
 caddy_extra_serve_hosts:
   - "ircfiber-ovh-1.tail544547.ts.net"
 
+# --- Caddy: Tailscale-only SigNoz listener ----------------------------------
+# SigNoz replaces Grafana + Loki + Tempo + Promtail + Prometheus.
+# Handles logs, traces, metrics, flamegraphs, and service maps.
+caddy_tailscale_signoz_enabled: true
+caddy_tailscale_signoz_port: 3003
+# Grafana listener removed — SigNoz is the observability UI.
+
 # --- TLS ----------------------------------------------------------------------
 ircfiber_use_lets_encrypt: true
 
