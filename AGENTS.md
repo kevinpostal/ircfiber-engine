@@ -202,6 +202,32 @@ For the **enterprise-grade zero-disconnect hot-reload** solution, see [docs/CONN
 - When engine hot-reloads, holder keeps IRC connection alive — IRC server sees ONE continuous connection.
 - Enable via `IRCFIBER_HOLDER_SOCK` env var pointing to the shared Unix socket path.
 
+## Holder mode is mandatory when configured
+
+When `IRCFIBER_HOLDER_SOCK` is set, the engine **never** falls back to direct TCP if the holder daemon becomes unreachable. The connection loop throws `"Holder transport unavailable; will retry"` on every iteration until `handleDisconnection()` rebuilds the `HolderTransport` (a fast retry — the backoff is reset for this case so a transient holder restart costs at most 10 seconds, not the normal 15-minute exponential cap).
+
+Why this matters: silently falling back to direct TCP would create a **second socket on the IRC server** that the holder still owns. Most IRC servers ghost one of the two connections, the engine would appear connected while being shadowed, and any subsequent hot-reload would have nothing to hand off (the canonical socket lives in the holder). The strict mode prevents this silent regression.
+
+Deployments without a holder (the legacy direct-TCP path) are unaffected — `useHolderMode` is set per-client based on whether `enableHolderMode()` was called at boot.
+
+## Holder health observability surface
+
+When holder mode is active but the daemon is unreachable, the engine surfaces the degradation through five layers so operations gets paged instead of staring at "Connecting...":
+
+| Surface | What it shows | Where |
+|---|---|---|
+| **Structured log** | `event:holder_missing` warning with `networkName`, `sinceMs`, `traceId`, `spanId` | `tail -f irc-fiber.log` |
+| **OTel traces** | Dedicated spans `irc.holder.attempt`, `irc.holder.rebuild`, `irc.holder.strict_mode_throw`, `irc.holder.recovered` | SigNoz flamegraphs |
+| **OTel metrics** | Counters `holder.unavailable_total`, `holder.recovered_total`, `holder.strict_mode_throws_total`; gauge `holder.missing_networks`; histogram `holder.recovery_duration_seconds` | SigNoz dashboards + alerts |
+| **Heartbeat state** | `holderUnavailableFor:[...]` array on the `irc:server:<serverId>` record | Redis |
+| **Admin API** | `GET /api/admin/servers/:id/holder-state` returns per-network holder health with `available`, `missingSince`, `lastError` | Admin SPA |
+
+Logs carry `traceId`/`spanId` so a `holder_missing` log line in SigNoz is one click away from the flamegraph of the strict-mode throws that preceded it. The metrics pipeline (`source/ircfiber/observability.d`) exports to the same OTel collector as traces via `/v1/metrics` every 10 s from the heartbeat task.
+
+Pinned tests:
+- `make observability-test` — JSON shape of counter / gauge / histogram payloads against the OTLP 1.5 spec.
+- `make connection-holder-strict-test` — JSON shape of the admin endpoint response.
+
 ## Build & test the holder
 
 ```bash
