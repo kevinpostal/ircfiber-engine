@@ -35,20 +35,38 @@
 
 {% if caddy_signoz_api_key | default('') | length > 0 %}
     # ── SigNoz reverse-proxy ──────────────────────────────────────────
-    # The admin SPA at /admin#/logs iframes this path. The browser
-    # resolves the iframe's relative API calls (e.g. fetch('/api/v1/...'))
-    # against the iframe's document URL (/signoz/logs), so the resulting
-    # request lands on /signoz/api/v1/... and Caddy strips the prefix
-    # back off before forwarding upstream. The SIGNOZ-API-KEY header
-    # is the EDITOR service-account key provisioned by the signoz_mcp
-    # role; without it, SigNoz returns 401. Strip X-Frame-Options
-    # from the upstream response so the admin SPA can actually embed it.
+    # The admin SPA at /admin#/logs iframes SigNoz at /signoz/logs.
+    # SigNoz's SPA renders <base href="/"> so relative assets resolve
+    # naturally against /signoz/ (from the iframe URL), but absolute
+    # API calls (fetch('/api/v1/...')) go to root. We proxy those
+    # root-level paths to SigNoz alongside /signoz — there is no
+    # overlap with gateway routes. The SIGNOZ-API-KEY header is the
+    # EDITOR service-account key; without it SigNoz returns 401.
+    # X-Frame-Options is stripped so the admin SPA can embed it.
     @signoz path /signoz /signoz/*
+    @signoz_api path /api/v1/* /api/v2/* /api/v3/*
+    @signoz_static path /assets/* /css/*
     handle @signoz {
-        uri strip_prefix /signoz
         reverse_proxy signoz-signoz:8080 {
             header_up SIGNOZ-API-KEY "{$SIGNOZ_API_KEY}"
             header_down -X-Frame-Options
+            transport http {
+                dial_timeout 10s
+                response_header_timeout 60s
+            }
+        }
+    }
+    handle @signoz_api {
+        reverse_proxy signoz-signoz:8080 {
+            header_up SIGNOZ-API-KEY "{$SIGNOZ_API_KEY}"
+            transport http {
+                dial_timeout 10s
+                response_header_timeout 60s
+            }
+        }
+    }
+    handle @signoz_static {
+        reverse_proxy signoz-signoz:8080 {
             transport http {
                 dial_timeout 10s
                 response_header_timeout 60s
@@ -70,7 +88,7 @@
     # Security headers — only applied to non-SigNoz responses. The
     # /signoz/* path needs no X-Frame-Options or frame-ancestors so
     # the admin SPA can iframe it.
-    @notsignoz not path /signoz /signoz/*
+    @notsignoz not path /signoz /signoz/* /api/v1/* /api/v2/* /api/v3/* /assets/* /css/*
     header @notsignoz {
         Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
         X-Content-Type-Options "nosniff"
