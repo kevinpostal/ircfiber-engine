@@ -98,7 +98,7 @@
         (signoz_mcp_service_accounts.json.data | default([]))
         | selectattr('name', 'defined')
         | selectattr('name', 'equalto', signoz_mcp_service_account_name)
-        | rejectattr('deletedAt', 'defined')
+        | rejectattr('status', 'equalto', 'deleted')
         | list
         | first
         | default(None)
@@ -144,14 +144,7 @@
 
 - name: Resolve service account id
   ansible.builtin.set_fact:
-    signoz_mcp_account_id: >-
-      {% if signoz_mcp_needs_fresh_account | default(false) and signoz_mcp_new_account.status == 200 %}
-      {{ signoz_mcp_new_account.json.data.id }}
-      {% elif signoz_mcp_needs_fresh_account | default(false) and signoz_mcp_new_account.status == 201 %}
-      {{ signoz_mcp_new_account.json.data.id }}
-      {% else %}
-      {{ signoz_mcp_existing_account.id }}
-      {% endif %}
+    signoz_mcp_account_id: "{{ (signoz_mcp_new_account.json.data.id if (signoz_mcp_needs_fresh_account | default(false)) and (signoz_mcp_new_account.status | default(0) in [200, 201]) else signoz_mcp_existing_account.id) | trim }}"
 
 - name: List existing keys for signoz-mcp service account
   ansible.builtin.uri:
