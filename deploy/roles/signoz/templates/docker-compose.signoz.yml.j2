@@ -65,6 +65,12 @@ services:
       - CLICKHOUSE_SKIP_USER_SETUP=1
     volumes:
       - {{ signoz_clickhouse_data }}:/var/lib/clickhouse
+      # Bind-mount /var/log to a host directory so the clickhouse err.log
+      # (which can hit hundreds of MB during OOM storms — observed 728 MB
+      # on ircfiber-ovh during the parts-merge spike) doesn't bloat the
+      # container's overlay layer. Logrotate on the host takes care of
+      # the rest. Container still owns the file while the process runs.
+      - /var/lib/ircfiber/signoz-clickhouse-logs:/var/log/clickhouse-server
       - /etc/ircfiber/signoz/clickhouse-cluster.xml:/etc/clickhouse-server/config.d/cluster.xml:ro
       - /etc/ircfiber/signoz/clickhouse-server-overrides.xml:/etc/clickhouse-server/config.d/server-overrides.xml:ro
     depends_on:

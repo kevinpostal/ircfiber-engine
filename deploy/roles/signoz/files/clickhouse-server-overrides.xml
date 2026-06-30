@@ -1,7 +1,54 @@
 <clickhouse>
-    <!-- Cap server memory at 1.7 GB on a 2 GB container so the kernel
-         OOM-killer never gets involved. Default is 0 (unlimited) which
-         fights the container's hard mem_limit and triggers OOMKills
-         under load. -->
-    <max_server_memory_usage>1700000000</max_server_memory_usage>
+    <!-- IRC Fiber SigNoz — 25.5.6 ClickHouse tuned for 3 GB container cap
+         on a 7.7 GB OVH host. Previous 2 GB cap / 1.7 GB internal ceiling
+         caused 80k+ failed background merges (memory limit exceeded at
+         1.59 GiB) because the parts-merge pool can spike above the cap
+         under bursty ingest. Bumped to 2.5 GB internal so the merge pool
+         has headroom, while staying well under the 3 GB container cap so
+         the kernel OOM-killer still has a 500 MB cushion for spikes. -->
+
+    <!-- Server memory ceiling. ClickHouse will throw 'memory limit exceeded'
+         from query/merge workers when RSS approaches this number. Keep
+         ~500 MB below the container's mem_limit so the kernel doesn't
+         OOM-kill the process before the soft cap fires. -->
+    <max_server_memory_usage>2500000000</max_server_memory_usage>
+
+    <!-- Background pool: cap concurrent merges/mutations so the merge
+         pool's memory footprint stays bounded. Default is 16 workers per
+         pool type — on a 3 GB cap that lets up to 16 merge workers each
+         allocate up to ~1.5 GiB simultaneously, which thrashes the
+         memory limit and floods the error log with 'memory limit
+         exceeded' (we observed 80k+ before this change).
+
+         Two constraints must hold at boot, or ClickHouse exits 36 and
+         loops forever:
+           pool_size * ratio >= number_of_free_entries_in_pool_to_execute_mutation (default 20)
+           pool_size * ratio >= number_of_free_entries_in_pool_to_execute_optimize_entire_partition (default 25)
+         With pool_size=4, ratio=8 gives 4*8=32 which satisfies both
+         (32 > 25). -->
+    <background_pool_size>4</background_pool_size>
+    <background_merges_mutations_concurrency_ratio>8</background_merges_mutations_concurrency_ratio>
+    <number_of_free_entries_in_pool_to_execute_mutation>20</number_of_free_entries_in_pool_to_execute_mutation>
+    <number_of_free_entries_in_pool_to_execute_optimize_entire_partition>25</number_of_free_entries_in_pool_to_execute_optimize_entire_partition>
+
+    <!-- Cap how many parts ClickHouse will try to merge in a single pass.
+         Default is 150 — that many small parts in one merge easily blows
+         past our memory budget. 8 is enough to make progress without
+         triggering the 1.59 GiB spike observed in ircfiber-signoz. -->
+    <max_bytes_to_merge_at_max_space_in_pool>1073741824</max_bytes_to_merge_at_max_space_in_pool>
+    <max_parts_to_merge_at_once>8</max_parts_to_merge_at_once>
+
+    <!-- Log rotation: 100 MB per file capped at 5 files = 500 MB ceiling.
+         Default behavior on 25.x writes one giant err.log (we observed
+         728 MB on ircfiber-ovh with no rotation) that eventually
+         consumes the container's writable layer. size/count are siblings
+         of <log>/<errorlog> in 25.x (NOT nested under them — that form
+         makes the daemon exit 36 with the <log> path printed as
+         "100M\n5"). -->
+    <logger>
+        <log>/var/log/clickhouse-server/clickhouse-server.log</log>
+        <errorlog>/var/log/clickhouse-server/clickhouse-server.err.log</errorlog>
+        <size>100M</size>
+        <count>5</count>
+    </logger>
 </clickhouse>

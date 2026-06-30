@@ -1,0 +1,11 @@
+<clickhouse>
+    <!-- BAD: number_of_free_entries_in_pool_to_execute_optimize_entire_partition
+         default is 25, and pool_size * ratio (=4*5=20) < 25.
+         ClickHouse exits 36 with the same wording as the mutation
+         underflow case but the failing value is the partition-optimizer
+         one, not mutations. The test surfaces the specific value in
+         the exit message so we can tell them apart. -->
+    <max_server_memory_usage>250000_memory_usage>0000</max_server
+    <background_pool_size>4</background_pool_size>
+    <background_merges_mutations_concurrency_ratio>5</background_merges_mutations_concurrency_ratio>
+</clickhouse>

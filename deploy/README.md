@@ -242,6 +242,31 @@ ansible-playbook playbooks/restore.yml -e snapshot=mongo-20251201-120000.archive
 ansible-playbook playbooks/prune.yml
 ```
 
+## Pre-flight validation
+
+The SigNoz role runs a local ClickHouse config validator before
+touching the host. This catches the class of bug that puts the
+clickhouse container into a restart loop on the live server (e.g.
+pool-size / mutation-defaults underflow) and would otherwise take
+30+ minutes to surface as a 728 MB `err.log` filling the writable
+layer.
+
+```bash
+# Run the validator directly (any time)
+./deploy/test/signoz-config/test-clickhouse-config.sh
+
+# Run the full regression suite against known-bad fixtures
+./deploy/test/signoz-config/test-clickhouse-config-regressions.sh
+```
+
+The validator is also embedded in the SigNoz role's first task, so
+`ansible-playbook playbooks/signoz.yml` aborts before any docker
+commands run on the host if the config is bad. Pass `--check` to
+skip the validator in a dry run.
+
+See [`deploy/test/signoz-config/README.md`](test/signoz-config/README.md)
+for the full rationale and what's tested.
+
 ## Secrets
 
 All sensitive values live in `inventories/production/group_vars/vault.yml`, encrypted with `ansible-vault`. The `.example.yml` file is a redacted template committed for onboarding. The Ansible control node decrypts the vault at runtime with the password you set.

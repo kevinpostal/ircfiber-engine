@@ -130,6 +130,22 @@ make engine-restart          # Hard restart (closes sockets, reconnect)
 - End-to-end handoff requires a running engine and a Linux environment (or macOS with BSD SCM_RIGHTS)
 - The `consumer.d` test runner may hang on macOS when vibe.d fiber context is required — disable via `excludedSourceFiles` in `dub.sdl` if needed
 
+## Deploy book pre-flight validation
+
+The SigNoz role runs a **local ClickHouse config validator** before touching any host. It catches the class of bug that puts `signoz-clickhouse` into a restart loop on the live server (e.g. `background_pool_size * background_merges_mutations_concurrency_ratio < 20` default mutations free entries, or `< 25` for the partition-optimizer default). The OVH server hit this in June 2026 and the bad config took 30+ minutes to surface as a 728 MB `err.log` filling the writable layer.
+
+Run **before** touching the OVH server when changing `deploy/roles/signoz/files/clickhouse-server-overrides.xml`:
+
+```bash
+# Validate the current production-equivalent config locally
+./deploy/test/signoz-config/test-clickhouse-config.sh
+
+# Run the regression suite against known-bad fixtures
+./deploy/test/signoz-config/test-clickhouse-config-regressions.sh
+```
+
+The same validator is the first task in `deploy/roles/signoz/tasks/main.yml`, so `ansible-playbook playbooks/signoz.yml` aborts before any docker commands run on the host if the config is bad. Pass `--check` to skip the validator in a dry run. See `deploy/test/signoz-config/README.md` for the full rationale and what's tested.
+
 ---
 
 # IRC Fiber — Deploy Architecture
