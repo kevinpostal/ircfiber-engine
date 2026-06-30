@@ -40,12 +40,17 @@
     # naturally against /signoz/ (from the iframe URL), but absolute
     # API calls (fetch('/api/v1/...')) go to root. We proxy those
     # root-level paths to SigNoz alongside /signoz — there is no
-    # overlap with gateway routes. The SIGNOZ-API-KEY header is the
-    # EDITOR service-account key; without it SigNoz returns 401.
-    # X-Frame-Options is stripped so the admin SPA can embed it.
+    # overlap with gateway routes.
+    #
+    # The /assets/index-* matchers scope to SigNoz's hashed bundle
+    # names (e.g. index-De9PDe8G.js). Without that prefix, /assets/*
+    # would also catch the admin SPA's bundles (admin-*.js,
+    # legacy-*.js, main-*.js) and the landing page's assets, which
+    # the gateway serves — serving them from SigNoz would return
+    # its own SPA HTML and break the admin app.
     @signoz path /signoz /signoz/*
-    @signoz_api path /api/v1/* /api/v2/* /api/v3/*
-    @signoz_static path /assets/* /css/*
+    @signoz_api path /api/v1/* /api/v2/* /api/v3/* /api/v4/* /api/v5/*
+    @signoz_static path /assets/index-* /css/*
     handle @signoz {
         reverse_proxy signoz-signoz:8080 {
             header_up SIGNOZ-API-KEY "{$SIGNOZ_API_KEY}"
@@ -88,7 +93,7 @@
     # Security headers — only applied to non-SigNoz responses. The
     # /signoz/* path needs no X-Frame-Options or frame-ancestors so
     # the admin SPA can iframe it.
-    @notsignoz not path /signoz /signoz/* /api/v1/* /api/v2/* /api/v3/* /assets/* /css/*
+    @notsignoz not path /signoz /signoz/* /api/v1/* /api/v2/* /api/v3/* /api/v4/* /api/v5/* /assets/index-* /css/*
     header @notsignoz {
         Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
         X-Content-Type-Options "nosniff"
