@@ -98,6 +98,7 @@ docker run -d \
     --name ${HOLDER_CONTAINER} \
     --restart unless-stopped \
     --init \
+    --ulimit nofile=65536:65536 \
     --network ircfiber_net \
     -v ${VOLUME_NAME}:/var/run/ircfiber \
     -e IRCFIBER_HOLDER_SOCK=/var/run/ircfiber/holder.sock \
@@ -122,7 +123,7 @@ echo ""
 echo "=== Verify holder health ==="
 ssh $OVH bash << EOF
 sleep 2
-docker exec ${HOLDER_CONTAINER} bash -c '
+docker exec ${HOLDER_CONTAINER} sh -c '
 if [ ! -S /var/run/ircfiber/holder-health.sock ]; then
     echo "FAIL: health socket not created"
     exit 1
@@ -131,35 +132,11 @@ echo "Health socket: OK"
 
 echo ""
 echo "/healthz:"
-python3 -c "
-import socket
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.connect(\"/var/run/ircfiber/holder-health.sock\")
-s.sendall(b\"GET /healthz HTTP/1.0\r\nHost: localhost\r\n\r\n\")
-data = b\"\"
-while True:
-    chunk = s.recv(4096)
-    if not chunk: break
-    data += chunk
-print(data.decode())
-s.close()
-"
+curl -fsS --unix-socket /var/run/ircfiber/holder-health.sock http://localhost/healthz || echo "(healthz failed)"
 
 echo ""
-echo "/metrics:"
-python3 -c "
-import socket
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.connect(\"/var/run/ircfiber/holder-health.sock\")
-s.sendall(b\"GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n\")
-data = b\"\"
-while True:
-    chunk = s.recv(4096)
-    if not chunk: break
-    data += chunk
-print(data.decode())
-s.close()
-"
+echo "/metrics (peers):"
+curl -fsS --unix-socket /var/run/ircfiber/holder-health.sock http://localhost/metrics 2>/dev/null | grep -E "peers|connections|up" || echo "(metrics unavailable)"
 '
 EOF
 
@@ -203,21 +180,10 @@ echo ""
 echo "=== Verify holder sees engine peer ==="
 ssh $OVH bash << EOF
 sleep 3
-docker exec ${HOLDER_CONTAINER} python3 -c "
-import socket
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.connect('/var/run/ircfiber/holder-health.sock')
-s.sendall(b'GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n')
-data = b''
-while True:
-    chunk = s.recv(4096)
-    if not chunk: break
-    data += chunk
-for line in data.decode().split('\n'):
-    if 'peers' in line or 'connections' in line or 'up' in line:
-        print(line)
-s.close()
-"
+echo "-- peers/connections from /metrics --"
+docker exec ${HOLDER_CONTAINER} sh -c '
+curl -fsS --unix-socket /var/run/ircfiber/holder-health.sock http://localhost/metrics 2>/dev/null | grep -E "peers|connections|up"
+'
 EOF
 
 echo ""

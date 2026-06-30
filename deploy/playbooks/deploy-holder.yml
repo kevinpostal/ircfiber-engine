@@ -118,6 +118,10 @@
         command: ["/app/ircfiber-conn-holder"]
         init: true
         restart_policy: unless-stopped
+        ulimits:
+          - name: nofile
+            soft_limit: 65536
+            hard_limit: 65536
         volumes:
           - "ircfiber-holder-sockets-{{ ircfiber_engine_id }}:/var/run/ircfiber"
         env:
