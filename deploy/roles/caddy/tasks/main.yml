@@ -21,6 +21,31 @@
   register: caddy_tailscale_socket_stat
   when: caddy_tailscale_socket | length > 0
 
+- name: Detect SigNoz service-account API key
+  ansible.builtin.stat:
+    path: "{{ caddy_signoz_api_key_path }}"
+  register: caddy_signoz_api_key_stat
+  when: caddy_signoz_route_enabled | bool
+
+- name: Read SigNoz API key (when present)
+  ansible.builtin.slurp:
+    src: "{{ caddy_signoz_api_key_path }}"
+  register: caddy_signoz_api_key_b64
+  no_log: true
+  when:
+    - caddy_signoz_route_enabled | bool
+    - caddy_signoz_api_key_stat.stat.exists | default(false)
+
+- name: Set SigNoz API key fact
+  ansible.builtin.set_fact:
+    caddy_signoz_api_key: >-
+      {{
+        (caddy_signoz_api_key_b64.content | b64decode | trim)
+        if (caddy_signoz_api_key_stat.stat.exists | default(false))
+        else ''
+      }}
+  no_log: true
+
 - name: Render Caddyfile
   ansible.builtin.template:
     src: Caddyfile.j2
@@ -49,6 +74,13 @@
       - "--environ"
       - "--config"
       - "/etc/caddy/Caddyfile"
+    # SigNoz API key is read from /etc/ircfiber/signoz-mcp/.api_key on
+    # the host and exposed to Caddy as SIGNOZ_API_KEY. The Caddyfile
+    # uses {$SIGNOZ_API_KEY} to inject the header on /signoz/* requests.
+    # Absent the key file the env var is empty and the /signoz route
+    # is skipped at template render time.
+    env:
+      SIGNOZ_API_KEY: "{{ caddy_signoz_api_key | default('') }}"
     ports:
       - "80:80"
       - "443:443"

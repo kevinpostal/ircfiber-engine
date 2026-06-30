@@ -43,3 +43,17 @@ caddy_tailscale_logging_port: 3443
 # don't inject X-WebAuth-User headers.
 caddy_tailscale_signoz_enabled: false
 caddy_tailscale_signoz_port: 3003
+
+# Public SigNoz reverse-proxy mounted on the main Caddy listener.
+# Exposes ircfiber.com/signoz/* (and any extra Tailscale hosts) to the
+# browser with a SIGNOZ-API-KEY header injected. Lets the admin SPA
+# iframe the SigNoz UI at /admin#/logs without asking the user to log
+# in to SigNoz separately. The key file is provisioned by the
+# signoz_mcp role; if it is missing the route is silently skipped on
+# the next caddy run (no startup failure, just no proxy).
+caddy_signoz_route_enabled: true
+# Path on the HOST where the SigNoz service-account API key was
+# written by the signoz_mcp role. Caddy reads it once at render time
+# and passes the value to the caddy container as the SIGNOZ_API_KEY
+# env var (the caddy binary is already started with --environ).
+caddy_signoz_api_key_path: /etc/ircfiber/signoz-mcp/.api_key

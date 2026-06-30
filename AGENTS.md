@@ -185,6 +185,41 @@ tar cz --no-xattrs -C public/dist . | ssh deploy@server \
 ```
 The `--no-xattrs` flag prevents macOS extended attributes from creating duplicate `file 2.ext` entries on Linux.
 
+## Admin → SigNoz logs integration
+
+The admin SPA at `ircfiber.com/admin#/logs` iframes the full SigNoz UI at `/signoz/*` so ops gets the live query builder, saved views, and live-tail without leaving the admin shell. Caddy reverse-proxies the path and injects the EDITOR `SIGNOZ-API-KEY` so the browser never sees SigNoz auth.
+
+### Flow
+1. `signoz_mcp` role provisions (or reuses) an EDITOR service-account API key, writes it to `/etc/ircfiber/signoz-mcp/.api_key` (mode 0600), then `docker exec ircfiber-caddy caddy reload` so the new value takes effect without dropping HTTPS connections.
+2. `caddy` role reads that file at render time, passes the value to the container as `SIGNOZ_API_KEY` env var, and renders a `/signoz/*` route in `Caddyfile.j2` that strips the prefix and forwards to `signoz-signoz:8080` with `header_up SIGNOZ-API-KEY "{$SIGNOZ_API_KEY}"`.
+3. If the key file is missing on first run, the route block is skipped (no startup error, just no proxy) — a subsequent `signoz_mcp` + `caddy` run enables it.
+4. `frontend/src/admin/pages/Logs.svelte` iframes `/signoz/logs`. The browser resolves the iframe's relative API calls against `/signoz/logs`, so they land on `/signoz/api/v1/...`, get prefix-stripped, and reach SigNoz at `/api/v1/...`. No cross-origin noise.
+
+### Security headers
+The Caddyfile scopes its `X-Frame-Options: DENY` and `Content-Security-Policy: frame-ancestors 'none'` to non-SigNoz responses (via `@notsignoz` matcher) so the admin SPA can actually embed `/signoz/*`. SigNoz's own `X-Frame-Options` is stripped on the way out via `header_down -X-Frame-Options` as belt-and-suspenders.
+
+### Files
+| File | Purpose |
+|---|---|
+| `deploy/roles/caddy/defaults/main.yml` | `caddy_signoz_route_enabled`, `caddy_signoz_api_key_path` |
+| `deploy/roles/caddy/tasks/main.yml` | Slurp key, set env var, run container |
+| `deploy/roles/caddy/templates/Caddyfile.j2` | `/signoz/*` route + header scoping |
+| `deploy/roles/signoz_mcp/tasks/main.yml` | Provision key + reload caddy |
+| `frontend/src/admin/pages/Logs.svelte` | iframe to `/signoz/logs` |
+
+### Rollout
+```bash
+# 1. Make sure signoz_mcp has run so the key file exists
+ansible-playbook playbooks/signoz_mcp.yml -e vault_signoz_admin_password=...
+
+# 2. Re-run caddy role to render the route + pick up the key
+ansible-playbook playbooks/site.yml --tags caddy
+
+# 3. Verify
+curl -fsS https://ircfiber.com/signoz/api/v1/services -H 'X-Requested-With: smoke' | head
+# Should return JSON with the "IRC Fiber" service inventory
+```
+
 ## Engine priority and assignment architecture
 
 `assignNetwork()` in `source/ircfiber/irc/registry.d` selects a server for new networks. Fixed from pure least-loaded to priority-aware:

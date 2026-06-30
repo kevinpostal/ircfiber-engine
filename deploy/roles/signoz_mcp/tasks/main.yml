@@ -205,6 +205,30 @@
     signoz_mcp_needs_provisioning: true
   when: not signoz_mcp_existing_key.stat.exists or signoz_mcp_key_validation.status | default(0) != 200
 
+# Caddy reads SIGNOZ_API_KEY at startup and injects it as a header on
+# /signoz/* requests via its reverse_proxy. The caddy container needs
+# to be reloaded (or restarted) after a key rotation so the new value
+# takes effect. We reload rather than restart to avoid dropping active
+# HTTPS connections. If the caddy container is not present yet (first
+# deploy before the site role has run) the reload is a no-op skipped
+# below.
+- name: Check if ircfiber-caddy container is running
+  community.docker.docker_container_info:
+    name: ircfiber-caddy
+  register: caddy_container_info
+  ignore_errors: true
+
+- name: Reload caddy to pick up the new SIGNOZ_API_KEY
+  ansible.builtin.command:
+    cmd: docker exec ircfiber-caddy caddy reload --address localhost:2019 --config /etc/caddy/Caddyfile
+  register: caddy_reload
+  changed_when: caddy_reload.rc == 0
+  failed_when: false
+  when:
+    - caddy_container_info.exists | default(false)
+    - caddy_container_info.container.State.Running | default(false)
+  no_log: true
+
 - name: Allow SigNoz MCP port from Tailscale subnet (ufw)
   community.general.ufw:
     rule: allow
