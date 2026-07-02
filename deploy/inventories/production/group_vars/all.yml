@@ -106,8 +106,12 @@ ircfiber_engine_image_name: >-
 ircfiber_engine_image_full: "{{ ircfiber_engine_image_name }}:{{ docker_image_tag }}"
 
 # --- Engine defaults ----------------------------------------------------------
-# These can be overridden in host_vars for additional engines
-ircfiber_engine_id: "{{ inventory_hostname_short }}"
+# NOTE: ircfiber_engine_id has NO default — it MUST be set per-host in
+# host_vars/<hostname>.yml or via inline inventory vars. The old default
+# of "{{ inventory_hostname_short }}" silently leaked hostnames like
+# ircfiber-ovh-1 as engine server IDs, creating duplicate registrations
+# in Redis when the correct host_vars override wasn't applied.
+# Every engine host in [ircfiber_engines] must define its own id.
 ircfiber_engine_bind_address: "0.0.0.0"
 ircfiber_engine_admin_port: 8091
 ircfiber_engine_log_level: "info"

@@ -56,9 +56,16 @@
         loop_var: item
 
     - name: Restart Engines
-      community.docker.docker_container:
-        name: "ircfiber-engine-{{ ircfiber_engine_id }}"
-        restart: true
+      ansible.builtin.shell: |
+        ctr="ircfiber-engine-{{ ircfiber_engine_id }}"
+        if [ -n "$(docker ps -a -q --filter name="$ctr")" ]; then
+          echo "Restarting $ctr"
+          docker restart --time 10 "$ctr" >/dev/null
+          echo "RESTART_OK"
+        else
+          echo "Container $ctr does not exist — skipping"
+          echo "RESTART_SKIPPED"
+        fi
       when: "'engine' in (components | split(',') | map('trim') | list)"
       loop: "{{ groups['ircfiber_engines'] | default([]) }}"
       loop_control:
@@ -68,6 +75,7 @@
       community.docker.docker_container:
         name: "ircfiber-holder-{{ hostvars[item].ircfiber_engine_id | default(inventory_hostname_short) }}"
         restart: true
+      ignore_errors: true
       when: "'holder' in (components | split(',') | map('trim') | list)"
       delegate_to: "{{ item }}"
       loop: "{{ groups['ircfiber_backend'] | default([]) }}"

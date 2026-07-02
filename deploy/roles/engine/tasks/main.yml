@@ -1,10 +1,17 @@
 ---
-- name: Preflight — IRCFIBER_SERVER_ID must be set
+- name: Preflight — IRCFIBER_SERVER_ID must be set per-host
   ansible.builtin.assert:
     that:
       - ircfiber_engine_id is defined
       - ircfiber_engine_id | length > 0
-    fail_msg: "ircfiber_engine_id must be set in host_vars or group_vars."
+      - ircfiber_engine_id != inventory_hostname
+      - ircfiber_engine_id != inventory_hostname_short
+    fail_msg: >-
+      ircfiber_engine_id must be set per-host in host_vars/<hostname>.yml
+      or via inline inventory vars. The group default was removed because
+      '{{ inventory_hostname_short }}' would leak as a bogus server ID,
+      creating duplicate engine registrations in Redis.
+      Set ircfiber_engine_id explicitly for this host (e.g. 'ovh').
 
 - name: Discover this host's Tailscale IPv4 address
   ansible.builtin.command: tailscale ip -4

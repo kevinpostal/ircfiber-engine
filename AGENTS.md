@@ -185,40 +185,102 @@ tar cz --no-xattrs -C public/dist . | ssh deploy@server \
 ```
 The `--no-xattrs` flag prevents macOS extended attributes from creating duplicate `file 2.ext` entries on Linux.
 
-## Admin → SigNoz logs integration
+## Admin -> SigNoz logs integration
 
-The admin SPA at `ircfiber.com/admin#/logs` iframes the full SigNoz UI at `/signoz/*` so ops gets the live query builder, saved views, and live-tail without leaving the admin shell. Caddy reverse-proxies the path and injects the EDITOR `SIGNOZ-API-KEY` so the browser never sees SigNoz auth.
+The admin SPA at `ircfiber.com/admin#/logs` is a **native Svelte panel** that talks to SigNoz through the existing Caddy reverse-proxy. A deep link to the Tailscale-only SigNoz listener is offered as a fallback for the features the native panel does not cover (saved views, pivots, anomalies).
 
-### Flow
-1. `signoz_mcp` role provisions (or reuses) an EDITOR service-account API key, writes it to `/etc/ircfiber/signoz-mcp/.api_key` (mode 0600), then `docker exec ircfiber-caddy caddy reload` so the new value takes effect without dropping HTTPS connections.
-2. `caddy` role reads that file at render time, passes the value to the container as `SIGNOZ_API_KEY` env var, and renders a `/signoz/*` route in `Caddyfile.j2` that strips the prefix and forwards to `signoz-signoz:8080` with `header_up SIGNOZ-API-KEY "{$SIGNOZ_API_KEY}"`.
-3. If the key file is missing on first run, the route block is skipped (no startup error, just no proxy) — a subsequent `signoz_mcp` + `caddy` run enables it.
-4. `frontend/src/admin/pages/Logs.svelte` iframes `/signoz/logs`. The browser resolves the iframe's relative API calls against `/signoz/logs`, so they land on `/signoz/api/v1/...`, get prefix-stripped, and reach SigNoz at `/api/v1/...`. No cross-origin noise.
+### Architecture decision (Option D)
 
-### Security headers
-The Caddyfile scopes its `X-Frame-Options: DENY` and `Content-Security-Policy: frame-ancestors 'none'` to non-SigNoz responses (via `@notsignoz` matcher) so the admin SPA can actually embed `/signoz/*`. SigNoz's own `X-Frame-Options` is stripped on the way out via `header_down -X-Frame-Options` as belt-and-suspenders.
+Two prior attempts to embed the SigNoz UI via iframe were abandoned:
+- `7795a73 fix(deploy): proxy SigNoz API and asset paths from root`
+- `287d089 fix(deploy): scope SigNoz static proxy to index-* bundles`
 
-### Files
+Root cause: SigNoz v0.130's combined-image React bundle bootstraps a session JWT via client-side state. A static `SIGNOZ-API-KEY` header that Caddy injects server-side cannot be replayed by the bundle. The bundle loads, `/api/v1/user` returns 401, and SigNoz renders the cloud-icon error page.
+
+A Caddy-side login proxy (POST `/api/v2/sessions` per iframe load) was considered and rejected because: (a) it would leak the admin password into the Caddyfile env, (b) it would hit session rate-limits, (c) any SigNoz version bump could break the login API contract.
+
+**Option D** (the shipped architecture) replaces the iframe with a native Svelte panel for the 95% case (filter, paginate, time range, severity, row expand) plus a fallback link to the tailnet listener for the 5% case (server-side saved views, pivots, anomalies). Full task graph, rejected options, and pre-mortem live in [`docs/plan/20260630-admin-signoz-logs-panel/plan.yaml`](docs/plan/20260630-admin-signoz-logs-panel/plan.yaml).
+
+### File layout
+
 | File | Purpose |
 |---|---|
-| `deploy/roles/caddy/defaults/main.yml` | `caddy_signoz_route_enabled`, `caddy_signoz_api_key_path` |
-| `deploy/roles/caddy/tasks/main.yml` | Slurp key, set env var, run container |
-| `deploy/roles/caddy/templates/Caddyfile.j2` | `/signoz/*` route + header scoping |
-| `deploy/roles/signoz_mcp/tasks/main.yml` | Provision key + reload caddy |
-| `frontend/src/admin/pages/Logs.svelte` | iframe to `/signoz/logs` |
+| `frontend/src/lib/signoz.ts` | REST + WS wrapper: `queryRange`, `services`, `fields`, `fieldValues`, `currentUser`, `wsUrl(orgId)`. No Svelte imports. |
+| `frontend/src/admin/stores/logsStore.ts` | UI state store: `LogsState`, debounced `runQuery` (200ms trailing), `setQuery`/`setService`/`setSeverity`/`setTimeRange`, `resetFilters`, `toggleExpandedRow`. |
+| `frontend/src/admin/stores/logsLiveTail.ts` | WS reconnect with exponential backoff (1s to 30s cap, +/-20% jitter, 10-attempt cap). 5-state status machine: `idle` / `connecting` / `open` / `reconnecting` / `closed`. |
+| `frontend/src/admin/stores/savedViews.ts` | localStorage-backed SavedView persistence. Stable interface (`listViews` / `saveView` / `loadView` / `deleteView`) is the future contract for a SigNoz SavedView backend. |
+| `frontend/src/admin/lib/signozUrl.ts` | `TAILNET_SIGNOZ_URL` + `TAILNET_SIGNOZ_LOGS_URL` constants. Single source of truth for the tailnet listener IP. |
+| `frontend/src/admin/components/logs/LogsToolbar.svelte` | Query bar + service multi-select + severity chips + time picker + live toggle + copy-as-cURL. |
+| `frontend/src/admin/components/logs/LogRow.svelte` | One row (32px fixed height, severity chip, trace link). |
+| `frontend/src/admin/components/logs/LogTable.svelte` | Offset virtualization (20-row overscan) + scroll restoration. Fixed row-height invariant. |
+| `frontend/src/admin/components/logs/JsonDrawer.svelte` | Overlay JSON viewer (absolutely-positioned, anchored to clicked row). NOT inline expansion -- preserves LogTable's row-height invariant. Dismisses on Esc / backdrop / X. |
+| `frontend/src/admin/components/logs/FilterCheatsheet.svelte` | `?` opens, `Esc` closes. Lists every supported filter field with examples. |
+| `frontend/src/admin/pages/Logs.svelte` | Page composition: header + tailnet-fallback strip + view dropdown + `<LogsToolbar>` + state machine (skeleton / error / empty / table) + `<JsonDrawer>` + `<FilterCheatsheet>`. |
+
+### Dev proxy (Vite)
+
+`frontend/vite.config.ts` proxies SigNoz paths directly to a configurable `VITE_SIGNOZ_URL` (default `http://127.0.0.1:8080`, the host port mapped from docker-compose's `signoz` service). The SigNoz rules MUST come BEFORE the catch-all `/api` rule that targets the IRC Fiber gateway -- the gateway does not speak SigNoz protocol.
+
+| Proxy rule | Target | WS |
+|---|---|---|
+| `/api/v1/` through `/api/v5/` | `VITE_SIGNOZ_URL` | no |
+| `/signoz/` | `VITE_SIGNOZ_URL` | yes (`ws:true`) |
+
+Override at run time:
+```bash
+VITE_SIGNOZ_URL=http://100.126.197.92:3003 npm run dev:local
+```
+
+If `VITE_SIGNOZ_URL` is unset and no local SigNoz is running, the panel renders a clear empty state ("SigNoz URL not configured") rather than failing silently.
+
+### Caddy (prod)
+
+`deploy/roles/caddy/templates/Caddyfile.j2` is unchanged from the prior proxy setup:
+- `/api/v1/` through `/api/v5/` -> `signoz-signoz:8080` with `header_up SIGNOZ-API-KEY "{$SIGNOZ_API_KEY}"`
+- `/signoz/ws/logs/*` -> `signoz-signoz:8080` with `flush_interval -1` for live-tail WS upgrades (dedicated `handle_path` block, separate from the document tree so the WS upgrade cannot be intercepted by SigNoz's SPA shell)
+- `/signoz/*` and `/signoz` document tree -> `signoz-signoz:8080` (kept so a future fallback link routed through Caddy resolves; not used by the native panel)
+- `@signoz_static` matcher scopes `/assets/index-*` and `/css/*` to SigNoz hashed bundles so admin SPA assets are not shadowed
+
+If `/etc/ircfiber/signoz-mcp/.api_key` is missing, the entire `{% if caddy_signoz_api_key %}` block in `Caddyfile.j2` is skipped (no startup error, just no proxy) -- re-run the `signoz_mcp` + `caddy` roles to enable.
+
+### Tailnet fallback link
+
+`Logs.svelte` renders an "Open SigNoz" link in the page header pointing to `TAILNET_SIGNOZ_LOGS_URL` (e.g. `http://100.126.197.92:3003/logs`). This is the deep link into the Tailscale-only SigNoz listener for features the native panel intentionally does not implement in v1: server-side saved views, pivots, anomaly overlays, query-builder joins. The IP literal lives only in `frontend/src/admin/lib/signozUrl.ts` -- do not hard-code it elsewhere.
+
+### Saved views (localStorage)
+
+`frontend/src/admin/stores/savedViews.ts` persists user-named query snapshots to `localStorage` under `ircfiber:admin:logs:views`. On quota error, the store prunes to the most-recent 50 views and surfaces a toast warning. The snapshot shape (`query`, `services`, `severities`, `timeRange`) deliberately matches `logsStore.ts`'s `LogsState` minus volatile fields so the future SigNoz SavedView backend swap keeps the public API stable.
 
 ### Rollout
+
 ```bash
-# 1. Make sure signoz_mcp has run so the key file exists
+# 1. Ensure signoz_mcp role has run so the API key file exists
 ansible-playbook playbooks/signoz_mcp.yml -e vault_signoz_admin_password=...
 
-# 2. Re-run caddy role to render the route + pick up the key
+# 2. Re-run the caddy role to render the route + pick up the key
 ansible-playbook playbooks/site.yml --tags caddy
 
-# 3. Verify
-curl -fsS https://ircfiber.com/signoz/api/v1/services -H 'X-Requested-With: smoke' | head
+# 3. Build + ship the frontend (make update bundles on the remote)
+make update
+
+# 4. Verify REST
+curl -fsS https://ircfiber.com/api/v1/services -H 'X-Requested-With: smoke' | head
 # Should return JSON with the "IRC Fiber" service inventory
 ```
+
+WS upgrade smoke test (should return `101 Switching Protocols`; `200` means the dedicated `/signoz/ws/logs/*` `handle_path` block in `Caddyfile.j2` is missing):
+```bash
+curl -i --http1.1 \
+  -H 'Connection: Upgrade' \
+  -H 'Upgrade: websocket' \
+  -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+  -H 'Sec-WebSocket-Version: 13' \
+  https://ircfiber.com/signoz/ws/logs/v5/default
+```
+
+### Plan reference
+
+Full task graph (18 tasks across 4 waves): [`docs/plan/20260630-admin-signoz-logs-panel/plan.yaml`](docs/plan/20260630-admin-signoz-logs-panel/plan.yaml). Wave 1 covers `signoz.ts` + `logsStore` + `savedViews` + Vite dev proxy + `signozUrl.ts`. Wave 2 covers the Svelte components (`LogRow`, `LogTable`, `JsonDrawer`, `LogsToolbar`, `FilterCheatsheet`, `Logs.svelte` rewrite). Wave 3 covers the WS preflight + `logsLiveTail` + Caddy WS audit. Wave 4 covers keyboard shortcuts, copy-as-cURL, empty/error states, and this `AGENTS.md` update.
 
 ## Engine priority and assignment architecture
 
@@ -421,3 +483,271 @@ The migration step is **idempotent** — running it again is a no-op. When invok
 
 Skipped automatically when `ircfiber_engine_id` is not defined (i.e. only the gateway is in scope).
 
+
+
+# IRC Fiber — IRC Engine vs IRC Server Parity Tests
+
+`tests/irc_parity/` holds end-to-end tests that drive the IRC Fiber engine
+against real IRC servers (ngircd, UnrealIRCd + Anope) and a custom mock IRC,
+then assert that the engine's stored state in Redis matches what the wire
+protocol says. Use these to verify parity for IRC features (JOIN, NAMES, MODE,
+kick, ban, services-style auto-op, etc.).
+
+## Layout
+
+- `tests/irc_parity/__init__.py` — `IrcClient` (minimal synchronous IRC
+  client over raw TCP), `ParsedLine` (RFC 2812 line parser with IRCv3
+  message-tag support), and `assert_user_prefix` / `wait_engine_snapshot_contains`
+  helpers.
+- `tests/irc_parity/test_irc_parity.py` — pytest scenarios. The first scenario
+  verifies that a user auto-opped on JOIN by services is correctly recorded
+  with the `@` prefix in the engine's `irc:state:<server>:<network>` Redis
+  snapshot.
+- `tests/irc_parity/fixtures/mock-irc-op/` — Dockerfile + server.py for a
+  mock IRC server that simulates Anope/Chanserv auto-op on JOIN.
+
+## Running
+
+The parity tests are integration tests, so they require the docker-compose
+stack to be running:
+
+```bash
+# Bring up redis, mongo, gateway, engine, and the IRC fixtures.
+docker compose -f docker-compose.test.yml up -d redis mongo gateway engine mock-irc-op
+
+# Port-forward mock-irc-op so the test runner (running on the docker host)
+# can also reach it as 127.0.0.1:6667.
+docker run -d --rm --name mock-irc-op \
+  --network irc_fiber_irc_network -p 6667:6667 mock-irc-op:parity
+
+pip3 install --break-system-packages pytest
+
+# Run the parity tests
+python3 -m pytest tests/irc_parity -v
+```
+
+By default the engine inside docker reaches the IRC server via the docker
+service name (`mock-irc-op`). Override with `IRC_NETWORK_HOST_FOR_ENGINE` if
+you point the engine at a different hostname.
+
+## Adding a new parity scenario
+
+```python
+from tests.irc_parity import IrcClient, assert_user_prefix, wait_engine_snapshot_contains
+
+
+def test_kick_removes_user_from_snapshot(scenario):
+    # `scenario` fixture gives you a connected network with the engine
+    # attached to the mock IRC server.
+    ...
+
+    # Wait up to 15s for the engine's snapshot to reflect the change.
+    snapshot = wait_engine_snapshot_contains(
+        redis_container="irc_fiber_redis",
+        server_id="debugengine1",
+        network_id=scenario["network_id"],
+        predicate=lambda s: scenario["username"] not in (s or ""),
+        timeout=15.0,
+    )
+```
+
+The engine writes a fresh snapshot every 10 s, so predicates that depend
+on the snapshot must allow up to ~12 s of latency.
+
+# IRC Fiber — Member List Operator Status Fix
+
+Fix for: "It does not show me as having Operator status in the members list
+when I join a channel. The members list does not update my Operator status in
+real-time, nor does it update if I hard refresh."
+
+## Root cause
+
+Three independent bugs combined to drop the IRC prefix char (`@`, `+`, `%`,
+etc.) from users' nicks stored in the member list:
+
+1. **Frontend MODE handler was parsing the wrong param.** IRCv3 wires
+   `MODE #chan +o alice` as `params = ["#chan", "+o", "alice"]`, but the
+   handler read `params[0]` as the mode string — which is the channel name.
+   This corrupted the prefix update path on every channel MODE event.
+
+2. **`normalizeUser` stripped the prefix on snapshot round-trip.** When
+   the engine sent `users: ["@alice"]` over the WebSocket, the handler
+   converted it to `{ nick: "alice", prefix: "@", ... }` and the
+   `<span class="member-nick">{member.nick}</span>` template then displayed
+   the bare nick. Hard refresh = fresh sync = bug on every reload.
+
+3. **Engine `channelUsers` dedup was exact-match.** A race between the
+   self-JOIN handler (which added `user` bare) and the server's 353
+   (which arrived as `@user` prefixed) left two entries in
+   `channelUsers`. The frontend's `updateNetworkFromSync` then deduped by
+   stripped nick and kept the FIRST one — the bare entry from JOIN —
+   dropping the op prefix.
+
+## Fixes
+
+- `frontend/src/stores/ircStore.svelte.ts`
+  - `updateChannelUsers` MODE branch now reads `params[0]` as the target
+    and `params[1]` as the mode string, with a guard so a user-mode
+    `MODE nick :+i` is a no-op for the channel user list.
+  - 353 handler now does **in-place promotion** in place of the
+    skip-if-exists path: when a NAMES entry's bare nick already exists
+    in the buffer, the existing entry's `nick` is rewritten to the
+    prefixed form and its `prefix` / `category` are updated.
+  - `normalizeUser` (the snapshot-path converter) now stores `nick: user`
+    (preserving the IRC prefix char) instead of `nick: bareNick`. The
+    `prefix` and `category` fields are still set so sorting and the
+    ops/voiced/halfop category grouping keep working.
+  - `MemberList.svelte` renders `{member.nick}` so users with a prefix
+    display their `@` / `+` / `%` / `&` / `~` / `!` indicator.
+
+- `source/ircfiber/irc/connection.d`
+  - JOIN handler now does stripped-nick dedup (was exact-match) so a
+    prior prefixed entry is not shadowed.
+  - 353 handler does stripped-nick dedup with in-place promotion to
+    the prefixed form, so a services-granted op survives the snapshot.
+  - MODE handler accepts `O` (IRC Operator) in addition to `qaohv`.
+
+## Tests
+
+- `frontend/src/stores/ircStore.mode-bug.test.ts` — 4 regression tests
+  for the MODE-handler param bug.
+- `tests/irc_parity/test_irc_parity.py` — end-to-end test that drives
+  the engine against a mock IRC server auto-opping joiners and asserts
+  the engine's `irc:state:<server>:<network>` snapshot contains `@user`
+  (single entry, no bare duplicate).
+- All existing unit tests still pass: 604 client + 379 lib vitest tests.
+
+# IRC Parity Testing — Findings and Bugs
+
+`tests/irc_parity/` holds end-to-end tests that drive the IRC Fiber engine
+against the in-repo docker-compose stack (mock-irc-op, ircd-test,
+unreal_sasl + Anope, redis, mongo, gateway, engine) and verify the engine's
+stored state matches the wire protocol.
+
+## Mock-irc-op (configurable synthetic IRCd)
+
+The mock-irc-op fixture (`tests/irc_parity/fixtures/mock-irc-op/`) is a
+Python-based IRCd that simulates Anope/Chanserv-style auto-op on JOIN.
+The mock IRC supports the full lifecycle: NICK, USER, JOIN, 353 (with
+NAMES), 366, PART, KICK, NICK change, TOPIC, MODE (channel and user),
+WHOIS (311), 433 (NICKNAMEINUSE), PING/PONG, QUIT, PRIVMSG.
+
+## Tests
+
+`tests/irc_parity/test_irc_parity.py` has 10 scenarios, 9 passing:
+
+- `TestMockIrcOperator::test_user_appears_with_prefix_after_join` — PASS
+  Mock IRC auto-ops joiner; engine shows @user in snapshot.
+- `TestKickRemovesUser::test_kick_removes_user` — PASS
+  A 2nd user kicks the engine user; engine removes them from the snapshot.
+- `TestPartRemovesUser::test_part_removes_user` — PASS
+  Engine PARTs; engine removes from the snapshot.
+- `TestModeChange::test_deop_via_mode_minus_o` — PASS
+  A 2nd user issues MODE -o on the engine user; engine updates snapshot.
+- `TestModeChange::test_voice_via_mode_plus_v` — PASS
+  MODE +v sets the engine user's voice prefix; engine updates snapshot.
+- `TestModeChange::test_multi_target_mode` — **FAIL** (bug, see below)
+- `TestTopic::test_topic_set_and_seen` — PASS
+  A 2nd user sets a channel topic; engine captures it in `topics`.
+- `TestNickChange::test_other_user_nick_change_visible_in_snapshot` — PASS
+  A 2nd user changes their nick; engine updates the snapshot with the new
+  nick.
+- `TestMultipleUsers::test_multiple_users_in_roster` — PASS
+  Multiple users in the same channel all appear in the engine's roster.
+- `TestNickInUse::test_engine_handles_433_gracefully` — PASS (trivially;
+  no negative scenario exercised).
+
+## Known bugs discovered
+
+### BUG #1: Engine doesn't track the status of users who join AFTER it
+
+When a user joins a channel where the engine is already present, the
+engine only sees the JOIN message (no NAMES list, since 353 is only sent
+to the joining user). The engine's JOIN handler at
+`source/ircfiber/irc/connection.d:2484-2522` stores the user as bare (no
+prefix):
+
+```d
+} else {
+    channelUsers[chan] ~= event.nick;  // bare nick, no prefix
+    ...
+}
+```
+
+When the server later issues a multi-target MODE like `MODE #chan +vv user1 user2`,
+the MODE handler at `source/ircfiber/irc/connection.d:2904` only updates the
+user1 entry (which has a prefix from the engine's own 353); user2 is
+stored as bare and the MODE doesn't change it.
+
+**Reproduction**: `tests/irc_parity/test_irc_parity.py::TestModeChange::test_multi_target_mode`
+The snapshot after the test shows `+engine_user, mod, helper` — the helper
+should be `+helper` but stays bare.
+
+**Fix ideas** (none implemented yet):
+1. Issue a `WHO %channel` after a JOIN broadcast to discover each user's
+   status, and re-promote the channel roster entry with the discovered
+   prefix.
+2. Issue `NAMES #chan` periodically to refresh the roster.
+3. Parse IRCv3 `extended-monitor` or `account-notify` to track which
+   nicks are services-identified, but those don't carry mode prefixes.
+4. Conservatively: when a `MODE +X` is processed and the target user is
+   stored bare, mark the target user with a placeholder so the snapshot
+   doesn't lie about who has what mode.
+
+### BUG #2 (related): Engine's MODE handler runs before the engine sees the
+   joining user's status
+
+Even with bug #1 fixed, the race is: the helper sends JOIN → mock IRC
+broadcasts the helper's JOIN to the engine → engine adds `helper` bare →
+mod sends MODE +vv engine helper → engine processes MODE.
+
+If the helper's 353 (with prefix) hasn't yet arrived at the engine when
+the MODE is processed, the engine can't apply the prefix. The
+`test_voice_via_mode_plus_v` test works only because mod joined BEFORE
+the helper and was in the roster when the MODE was processed.
+
+## Setup
+
+```bash
+docker compose -f docker-compose.test.yml up -d redis mongo gateway engine ircd-test mock-irc-op
+
+# Or start the existing stack (unreal_sasl + Anope) and use it instead of
+# ircd-test / mock-irc-op:
+docker run --rm -d --name mock-irc-op --network irc_fiber_irc_network -p 6667:6667 \
+  $(docker build -q tests/irc_parity/fixtures/mock-irc-op)
+
+docker run --rm -d --network irc_fiber_irc_network --name irc_fiber_engine \
+  -e IRCFIBER_REDIS_URL=redis://irc_fiber_redis:6379/0 \
+  -e IRCFIBER_MONGO_URL=mongodb://irc_fiber_mongo:27017/ircfiber \
+  -e IRCFIBER_LOG_LEVEL=debug \
+  -e IRCFIBER_SERVER_ID=debugengine1 \
+  irc-fiber:latest /app/irc-fiber-engine
+
+docker run -d --network irc_fiber_irc_network --name irc_fiber_gateway -p 8090:8090 \
+  -e IRCFIBER_REDIS_URL=redis://irc_fiber_redis:6379/0 \
+  -e IRCFIBER_MONGO_URL=mongodb://irc_fiber_mongo:27017/ircfiber \
+  irc-fiber:latest /app/irc-fiber
+
+# Deploy the latest frontend
+docker cp public/dist/. irc_fiber_gateway:/app/public/dist/
+
+pip3 install --break-system-packages pytest
+
+# Run the parity tests
+python3 -m pytest tests/irc_parity/test_irc_parity.py -v
+```
+
+## Using the real unreal_sasl + Anope stack
+
+The unreal_sasl container has Anope services linked. To exercise the
+auto-op-on-JOIN scenario against real services, register a nick with
+NickServ (no email confirmation needed), identify, register a channel,
+give yourself SOP, and have the engine connect with SASL PLAIN as that
+same nick. The engine's network config requires `sasl: "plain"`,
+`saslUsername: "<nick>"`, `saslPassword: "<password>"`.
+
+A reference test for this flow is sketched in
+`tests/irc_parity/test_real_services.py` (not currently runnable in
+the in-repo docker stack because the engine's SASL handshake with
+unreal_sasl needed a different password and the engine's connection
+flickered under repeated test runs; this is a work-in-progress).

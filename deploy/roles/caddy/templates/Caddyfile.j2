@@ -34,13 +34,21 @@
     }
 
 {% if caddy_signoz_api_key | default('') | length > 0 %}
+    {# WS audit 2026-07-01: /signoz/ws/logs/v5/default returned HTTP/2 200 (SigNoz SPA shell, via: 1.1 Caddy) instead of 101 Switching Protocols against prod (FAIL — added dedicated /signoz/ws/logs/* handle_path block below with flush_interval -1). Also tested /ws/logs/v1/default: same 200 HTML. #}
     # ── SigNoz reverse-proxy ──────────────────────────────────────────
     # The admin SPA at /admin#/logs iframes SigNoz at /signoz/logs.
-    # SigNoz's SPA renders <base href="/"> so relative assets resolve
-    # naturally against /signoz/ (from the iframe URL), but absolute
-    # API calls (fetch('/api/v1/...')) go to root. We proxy those
-    # root-level paths to SigNoz alongside /signoz — there is no
-    # overlap with gateway routes.
+    # SigNoz's SPA renders <base href="/"> so absolute API calls
+    # (fetch('/api/v1/...')) go to the document root, but the React
+    # bundle's bundled asset paths (./assets/index-*.js and ./*.css)
+    # also resolve against /, and the iframe document itself loads
+    # at /signoz/logs. We proxy both root-level API/asset paths and
+    # the /signoz document tree to the SigNoz upstream.
+    #
+    # handle_path (not handle) is required so the /signoz prefix is
+    # stripped before forwarding; otherwise the upstream sees
+    # /signoz/logs, which doesn't exist in the SigNoz router, and
+    # SigNoz returns its stripped SPA shell (no <script src=...>
+    # tags, no <link rel=stylesheet> tags) — the page never mounts.
     #
     # The /assets/index-* matchers scope to SigNoz's hashed bundle
     # names (e.g. index-De9PDe8G.js). Without that prefix, /assets/*
@@ -48,10 +56,39 @@
     # legacy-*.js, main-*.js) and the landing page's assets, which
     # the gateway serves — serving them from SigNoz would return
     # its own SPA HTML and break the admin app.
-    @signoz path /signoz /signoz/*
     @signoz_api path /api/v1/* /api/v2/* /api/v3/* /api/v4/* /api/v5/*
     @signoz_static path /assets/index-* /css/*
-    handle @signoz {
+    # ── SigNoz WebSocket route ──────────────────────────────────────────
+    # WS upgrade requires flush_interval -1; Caddy v2 reverse_proxy auto-
+    # handles Upgrade headers in standard config but the WS path was missing
+    # from the proxy setup. Dedicated block to avoid affecting the document/
+    # asset paths proxied by /signoz/* below.
+    handle_path /signoz/ws/logs/* {
+        reverse_proxy signoz-signoz:8080 {
+            header_up SIGNOZ-API-KEY "{$SIGNOZ_API_KEY}"
+            header_down -X-Frame-Options
+            # WS upgrade: flush bytes immediately on each chunk (the
+            # default), no periodic flush buffer that could hold back
+            # real-time log tail frames. flush_interval is a subdirective
+            # of reverse_proxy itself (NOT of transport http).
+            flush_interval -1
+            transport http {
+                dial_timeout 10s
+                response_header_timeout 60s
+            }
+        }
+    }
+    handle_path /signoz {
+        reverse_proxy signoz-signoz:8080 {
+            header_up SIGNOZ-API-KEY "{$SIGNOZ_API_KEY}"
+            header_down -X-Frame-Options
+            transport http {
+                dial_timeout 10s
+                response_header_timeout 60s
+            }
+        }
+    }
+    handle_path /signoz/* {
         reverse_proxy signoz-signoz:8080 {
             header_up SIGNOZ-API-KEY "{$SIGNOZ_API_KEY}"
             header_down -X-Frame-Options

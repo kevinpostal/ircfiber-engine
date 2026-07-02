@@ -258,6 +258,7 @@
           'IRCFIBER_RELOAD_FROM_PID={{ _engine_pid }} nohup /app/irc-fiber-engine-handoff > /tmp/ircfiber-handoff-child.log 2>&1 &'
       when:
         - ircfiber_engine_id is defined
+        - _engine_pid is defined
         - sock_ready is succeeded
       register: handoff_launched
       ignore_errors: true

@@ -100,6 +100,7 @@ AR := →
         docker-up-backend docker-down-backend docker-restart-backend docker-restart \
         docker-restart-code \
         docker-up-test docker-down-test test-server-log test-server-log-playwright \
+        docker-up-holder docker-down-holder docker-restart-holder docker-logs-holder \
         docker-shell docker-shell-engine docker-shell-redis docker-shell-mongo docker-shell-ircd ircd-up ircd-down
 .PHONY: cross-linux-x64 cross-linux-arm64 cross-linux-armv7
 .PHONY: verify precommit ci install-env
@@ -1150,10 +1151,36 @@ docker-up: ensure-colima ## Docker > Start all services with Docker Compose
 	@docker compose up -d
 	@printf '%b\n' "$(BG)$(OK) Services started$(R) $(D)(http://localhost:8090)$(R)"
 
-docker-down: ensure-colima ## Docker > Stop all Docker services
-	@printf '%b\n' "$(D)→ Stopping Docker services (docker-compose.yml)...$(R)"
-	@docker compose down
-	@printf '%b\n' "$(BG)$(OK) Services stopped$(R)"
+docker-down: ensure-colima ## Docker > Stop ALL IRC Fiber containers (3 compose stacks + loose containers)
+	@printf '%b\n' "$(D)→ Stopping test stack (docker-compose.yml)...$(R)"
+	@docker compose down --remove-orphans --timeout 10 2>/dev/null; true
+	@printf '%b\n' "$(BG)$(OK) Test stack stopped$(R)"
+	@printf '%b\n' "$(D)→ Stopping test stack (docker-compose.test.yml)...$(R)"
+	@docker compose -f docker-compose.test.yml down --timeout 10 2>/dev/null; true
+	@printf '%b\n' "$(BG)$(OK) Test stack stopped$(R)"
+	@printf '%b\n' "$(D)→ Stopping holder stack (docker-compose.holder.yml)...$(R)"
+	@docker compose -f $(HOLDER_COMPOSE) down --timeout 15 2>/dev/null; true
+	@printf '%b\n' "$(BG)$(OK) Holder stack stopped$(R)"
+	@if docker network inspect irc_fiber_irc_network >/dev/null 2>&1; then \
+		printf '%b\n' "$(D)→ Detaching any external containers from irc_fiber_irc_network...$(R)"; \
+		attached=$$(docker network inspect irc_fiber_irc_network --format '{{range .Containers}}{{.Name}} {{end}}' | tr ' ' '\n' | grep -v '^$$' | sort -u); \
+		if [ -n "$$attached" ]; then \
+			printf '%b\n' "$$attached" | while IFS= read -r name; do \
+				docker network disconnect -f irc_fiber_irc_network "$$name" 2>/dev/null; true; \
+			done; \
+		fi; \
+		docker network rm irc_fiber_irc_network 2>/dev/null; true; \
+	fi
+	@printf '%b\n' "$(D)→ Stopping any remaining IRC Fiber containers (fallback for compose-metadata drift)...$(R)"
+	@docker container ls -q 2>/dev/null \
+		| xargs -r docker inspect --format '{{.Name}} {{.Id}}' 2>/dev/null \
+		| grep -E 'irc_fiber|ircd_test|irc_engine|ircd[_-]|irc_redis|irc_mongo|anope|unreal_sasl|mock-irc-op' \
+		| awk '{print $$2}' \
+		| xargs -r docker stop --timeout 10 2>/dev/null; true
+	@printf '%b\n' "$(D)→ Removing stopped containers with IRC Fiber compose labels...$(R)"
+	@docker container prune --force --filter "label=com.docker.compose.project=irc_fiber" 2>/dev/null; true
+	@docker container prune --force --filter "label=com.docker.compose.project=ircfiber_prod" 2>/dev/null; true
+	@printf '%b\n' "$(BG)$(OK) All IRC Fiber containers stopped$(R)"
 
 docker-down-test: ensure-colima ## Docker > Stop test services (ircd + mongo + redis)
 	@printf '\n%b\n' "$(D)→ Stopping Docker test services (docker-compose.test.yml)...$(R)"
@@ -1243,6 +1270,41 @@ docker-restart-backend: ensure-colima ## Docker > Restart backend services only
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Restarting Backend Services  $(R)"
 	@docker compose up -d --build --force-recreate irc_engine redis mongo ircd
 	@printf '%b\n' "$(BG)$(OK) Backend services restarted$(R)"
+
+# ----------------------------------------------------------------------------
+# Docker — holder stack (docker-compose.holder.yml)
+# ----------------------------------------------------------------------------
+# Production-style deployment: long-lived holder daemon + exec-reloadable engine.
+# Lives in project `ircfiber_prod` (see top of docker-compose.holder.yml) so
+# `make docker-down` on the test stack can no longer touch its containers
+# as "orphans". The holder stack is included in the default `make docker-down`
+# scope; use `docker-down-holder` if you only want to stop the holder pieces.
+#
+# Targets:
+#   make docker-up-holder        # build + start holder stack
+#   make docker-down-holder      # graceful stop + remove holder stack only
+#   make docker-restart-holder   # down + up
+#   make docker-logs-holder      # tail -f holder stack logs
+HOLDER_COMPOSE := docker-compose.holder.yml
+
+docker-up-holder: ensure-colima ## Docker > Start holder stack (docker-compose.holder.yml)
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Building Docker image  $(R)"
+	@docker compose -f $(HOLDER_COMPOSE) build
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting Holder Stack  $(R)"
+	@docker compose -f $(HOLDER_COMPOSE) up -d
+	@printf '%b\n' "$(BG)$(OK) Holder stack started$(R) $(D)(http://localhost:8090)$(R)"
+
+docker-down-holder: ensure-colima ## Docker > Stop holder stack only (graceful drain + remove)
+	@printf '%b\n' "$(D)→ Stopping holder stack (docker-compose.holder.yml)...$(R)"
+	@docker compose -f $(HOLDER_COMPOSE) down --timeout 15
+	@printf '%b\n' "$(BG)$(OK) Holder stack stopped$(R)"
+
+docker-restart-holder: ensure-colima ## Docker > Rebuild + restart holder stack
+	@$(MAKE) --no-print-directory docker-down-holder
+	@$(MAKE) --no-print-directory docker-up-holder
+
+docker-logs-holder: ensure-colima ## Docker > Tail holder stack logs
+	@docker compose -f $(HOLDER_COMPOSE) logs -f
 
 # ----------------------------------------------------------------------------
 # Docker — interactive shells
@@ -1379,8 +1441,7 @@ sync-redis-to-tailnet: ## Data > Sync only local Redis → tailnet
 # Targets your production tailnet host (ircfiber-ovh-1) using the ansible
 # playbooks in deploy/. All deploy commands run from the deploy/ directory.
 #
-# Vault: by default prompts for the vault password. Set VAULT_PASS_FILE
-# to a path containing the vault password to skip the prompt:
+# Vault: by default reads deploy/.vault_pass.txt. Override with:
 #   VAULT_PASS_FILE=~/.vault_pass.txt make update
 #
 # Usage:
@@ -1395,8 +1456,9 @@ sync-redis-to-tailnet: ## Data > Sync only local Redis → tailnet
 #   TARGET=my-other-host make update
 # ----------------------------------------------------------------------------
 
-# Vault pass: use file if set, otherwise ask on every invocation.
-_vault_arg = $(if $(VAULT_PASS_FILE),--vault-password-file $(VAULT_PASS_FILE),--ask-vault-pass)
+# Vault pass: by default reads deploy/.vault_pass.txt (resolves relative to
+# the deploy/ cwd of every consuming recipe). Set VAULT_PASS_FILE to override.
+_vault_arg = --vault-password-file $(or $(VAULT_PASS_FILE),.vault_pass.txt)
 _target      = $(or $(TARGET),ircfiber-ovh-1)
 _target_ssh   = $(or $(TARGET_SSH),40.160.227.49)
 _playbook    = cd deploy && ansible-playbook -l $(_target) $(_vault_arg)
@@ -1408,10 +1470,10 @@ update: frontend build build-engine ## Deploy > Build frontend + gateway + engin
 	@tar cz --no-xattrs --format=ustar -C public/dist . | ssh deploy@$(_target_ssh) 'docker exec -i ircfiber-gateway sh -c "rm -rf /app/public/dist/ 2>/dev/null; mkdir -p /app/public/dist/ && tar xzf - -C /app/public/dist"'
 
 # Deploy engine only to the backup server.
-# Usage: make update-backup VAULT_PASS_FILE=.vault_pass.txt
+# Usage: make update-backup [VAULT_PASS_FILE=path]
 update-backup: build-engine ## Deploy > Deploy engine to backup server (ircfiber-backup-1)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Deploy engine → ircfiber-backup-1  $(R)"
-	@cd deploy && ansible-playbook -l ircfiber-backup-1 $(if $(VAULT_PASS_FILE),--vault-password-file ../$(VAULT_PASS_FILE),--vault-password-file .vault_pass.txt) playbooks/deploy-update.yml
+	@cd deploy && ansible-playbook -l ircfiber-backup-1 $(_vault_arg) playbooks/deploy-update.yml
 
 # Alias: fast path is the default
 update-fast: update ## Deploy > Force hot path (same as `make update`)
@@ -1615,7 +1677,7 @@ deploy-holder-enterprise-test: ## Holder > Run enterprise tests with health endp
 deploy-holder: ## Holder > Deploy two-container holder + engine to production
 	@bash -c 'printf "\033[1;33m  Deploying holder architecture to OVH\033[0m\n"; \
 		cd deploy && ansible-playbook -i inventories/production/hosts.ini \
-			playbooks/deploy-holder.yml \
+			playbooks/deploy-holder.yml $(_vault_arg) \
 			-l ircfiber-ovh-1 \
 			-e ircfiber_engine_id=ovh'
 

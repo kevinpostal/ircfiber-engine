@@ -25,6 +25,15 @@ signoz_mcp_container_port: 8000
 
 # Service-account role granted to the MCP server. VIEWER is the
 # safest default (read-only access to dashboards/alerts/logs/traces).
+#
+# NOTE: even with ADMIN role, /api/v2/users/me (called by the
+# SigNoz bundle during bootstrap) returns 401 because SigNoz
+# v0.130 only accepts session JWTs for user-context endpoints.
+# Changing the role from EDITOR to ADMIN therefore does NOT
+# make the embedded-iframe UI work; both roles return 401 for
+# the /users/me call. See deploy/roles/caddy/templates/Caddyfile.j2
+# and frontend/src/admin/pages/Logs.svelte for the long-term
+# fix path.
 signoz_mcp_service_account_role: "EDITOR"
 signoz_mcp_service_account_name: "signoz-mcp-{{ inventory_hostname_short | default('unknown') }}"
 

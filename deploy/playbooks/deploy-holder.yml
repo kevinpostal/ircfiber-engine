@@ -37,6 +37,9 @@
     healthcheck_retries: 30
     healthcheck_interval_seconds: 2
 
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+
   pre_tasks:
     - name: Preflight — ircfiber_engine_id is required
       ansible.builtin.assert:
@@ -115,13 +118,12 @@
       community.docker.docker_container:
         name: "{{ holder_container }}"
         image: "{{ builder_image }}:latest"
-        command: ["/app/ircfiber-conn-holder"]
+        # Builder stage places binaries in /build/, not /app/
+        command: ["/build/ircfiber-conn-holder"]
         init: true
         restart_policy: unless-stopped
         ulimits:
-          - name: nofile
-            soft_limit: 65536
-            hard_limit: 65536
+          - "nofile:65536:65536"
         volumes:
           - "ircfiber-holder-sockets-{{ ircfiber_engine_id }}:/var/run/ircfiber"
         env:
@@ -153,19 +155,33 @@
       failed_when: holder_ready.stdout != "HOLDER_READY"
       changed_when: false
 
+    # ── Discover Tailscale IP (for mongo/redis URLs) ─
+    - name: Discover this host's Tailscale IPv4 address
+      ansible.builtin.command: tailscale ip -4
+      register: tailscale_ip_raw
+      changed_when: false
+      failed_when: tailscale_ip_raw.rc != 0
+      check_mode: false
+
+    - name: Set host_tailscale_ip fact
+      ansible.builtin.set_fact:
+        host_tailscale_ip: "{{ tailscale_ip_raw.stdout | trim }}"
+
     # ── Deploy engine ────────────────────────────────────────────────
     - name: Start the engine container (with holder mode)
       community.docker.docker_container:
         name: "{{ engine_container }}"
         image: "{{ builder_image }}:latest"
-        command: ["/app/irc-fiber-engine"]
+        # Builder stage places binaries in /build/, not /app/
+        command: ["/build/irc-fiber-engine"]
         init: true
         restart_policy: unless-stopped
         volumes:
           - "ircfiber-holder-sockets-{{ ircfiber_engine_id }}:/var/run/ircfiber:ro"
         env:
-          IRCFIBER_REDIS_URL: "redis://{{ redis_container_name | default('ircfiber-redis') }}:6379/0"
-          IRCFIBER_MONGO_URL: "mongodb://{{ mongo_container_name | default('ircfiber-mongo') }}:27017/ircfiber"
+          # Redis & Mongo use host networking — reachable via Tailscale IP
+          IRCFIBER_REDIS_URL: "redis://{{ host_tailscale_ip | default('127.0.0.1') }}:{{ redis_port | default('6379') }}/0"
+          IRCFIBER_MONGO_URL: "mongodb://{{ vault_mongo_app_username | urlencode }}:{{ vault_mongo_app_password | urlencode }}@{{ host_tailscale_ip | default('127.0.0.1') }}:{{ mongo_port | default('27017') }}/{{ mongo_initdb_database | default('ircfiber') }}"
           IRCFIBER_SERVER_ID: "{{ ircfiber_engine_id }}"
           IRCFIBER_BIND_ADDRESS: "0.0.0.0"
           IRCFIBER_LOG_LEVEL: "info"
@@ -182,7 +198,7 @@
           #   1. Its PID exists
           #   2. The holder sees at least one engine peer connected
           if docker exec {{ engine_container }} pidof irc-fiber-engine >/dev/null 2>&1; then
-            PEERS=$(curl --unix-socket /var/run/ircfiber/holder.sock -s -X GET \
+            PEERS=$(curl --unix-socket /var/run/ircfiber/holder-health.sock -s -X GET \
               http://localhost/metrics 2>/dev/null | grep ircfiber_holder_engine_peers | awk '{print $2}')
             if [ "${PEERS%.*}" -ge 1 ]; then
               echo "ENGINE_READY peers=${PEERS}"
