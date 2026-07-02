@@ -1493,6 +1493,8 @@ update-assets: frontend ## Deploy > Build frontend + push public/* to running ga
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Asset push → $(_target_ssh) ($(_target))  $(R)"
 	@printf '%b\n' "$(D)  Tarring public/ → ssh → docker exec tar -xf - (clean extract)$(R)"
 	@tar cz --no-xattrs --format=ustar -C public . | ssh deploy@$(_target_ssh) 'docker exec -i ircfiber-gateway sh -c "rm -rf /app/public/dist/ /app/public/.vite/ /app/public/assets/ 2>/dev/null; tar xzf - -C /app/public"'
+	@printf '%b\n' "$(D)  Pushing views/index.dt (updated bundle hashes)$(R)"
+	@ssh deploy@$(_target_ssh) 'docker exec -i ircfiber-gateway sh -c "cat > /app/views/index.dt"' < views/index.dt
 
 # Show running container images and versions on the target.
 update-status: ## Deploy > Show running containers & image versions
