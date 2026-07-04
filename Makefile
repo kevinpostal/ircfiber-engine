@@ -101,7 +101,8 @@ AR := →
         docker-restart-code \
         docker-up-test docker-down-test test-server-log test-server-log-playwright \
         docker-up-holder docker-down-holder docker-restart-holder docker-logs-holder \
-        docker-shell docker-shell-engine docker-shell-redis docker-shell-mongo docker-shell-ircd ircd-up ircd-down
+        docker-shell docker-shell-engine docker-shell-redis docker-shell-mongo docker-shell-ircd ircd-up ircd-down \
+        local-dev-up local-dev-down local-dev-down-clean local-dev-smoke
 .PHONY: cross-linux-x64 cross-linux-arm64 cross-linux-armv7
 .PHONY: verify precommit ci install-env
 .PHONY: sync-db-to-tailnet sync-mongo-to-tailnet sync-redis-to-tailnet
@@ -1207,6 +1208,14 @@ test-server-log-playwright: docker-up-test ## Test > Run server-log timeline Pla
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Running server-log Playwright spec  $(R)"
 	@cd e2e && npx playwright test server-log-timeline.spec.js
 
+test-connection-log-timing: ## Test > Measure connection-log render timing (Playwright, requires local dev stack running with ircd)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Measuring connection-log render timing  $(R)"
+	@cd e2e && TEST_IRC_HOST=ircd npx playwright test connection-log-timing.spec.js
+
+test-connection-log-timing-local: ## Test > Same, but for local dev with native engine (ircd on localhost:6667)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Measuring connection-log render timing (local dev)  $(R)"
+	@cd e2e && TEST_IRC_HOST=127.0.0.1 npx playwright test connection-log-timing.spec.js
+
 seed-test-network: docker-up-test ## Utils > Seed a LocalIRCd network against the test stack (admin/REDACTED by default)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Seeding test network LocalIRCd  $(R)"
 	@FIBER_USERNAME=$${FIBER_USERNAME:-admin} FIBER_PASSWORD=$${FIBER_PASSWORD:-REDACTED} ./scripts/seed-test-network.sh
@@ -1409,6 +1418,24 @@ docker-restart-code: ensure-colima ## Dev > Rebuild frontend + D binaries + rest
 	@printf '%b\n' "$(BG)$(OK) Gateway + engine restarted$(R) $(D)(http://localhost:8090)$(R)"
 
 # ----------------------------------------------------------------------------
+# Dev — local compose stack
+# ----------------------------------------------------------------------------
+
+.PHONY: local-dev-up local-dev-down local-dev-down-clean local-dev-smoke
+
+local-dev-up:                               ## Dev > Bring up local SigNoz + IRC Fiber stack
+	docker compose -f deploy/local/docker-compose.yml up -d
+
+local-dev-down:                             ## Dev > Stop local stack (preserve data)
+	docker compose -f deploy/local/docker-compose.yml down
+
+local-dev-down-clean:                       ## Dev > Stop local stack and wipe all volumes (Caution: destroys ClickHouse data)
+	docker compose -f deploy/local/docker-compose.yml down -v
+
+local-dev-smoke:                            ## Dev > Run observability smoke test against local stack
+	bash tests/local-dev/smoke-observability.sh
+
+# ----------------------------------------------------------------------------
 # Data Sync — Local Docker → Tailnet
 # ----------------------------------------------------------------------------
 #
@@ -1468,12 +1495,6 @@ update: frontend build build-engine ## Deploy > Build frontend + gateway + engin
 	@$(_playbook) playbooks/deploy-update.yml $(if $(SKIP_MIGRATE),-e skip_migrate=true)
 	@printf '%b\n' "$(D)  Syncing frontend dist → ircfiber-gateway (clean extract)$(R)"
 	@tar cz --no-xattrs --format=ustar -C public/dist . | ssh deploy@$(_target_ssh) 'docker exec -i ircfiber-gateway sh -c "rm -rf /app/public/dist/ 2>/dev/null; mkdir -p /app/public/dist/ && tar xzf - -C /app/public/dist"'
-
-# Deploy engine only to the backup server.
-# Usage: make update-backup [VAULT_PASS_FILE=path]
-update-backup: build-engine ## Deploy > Deploy engine to backup server (ircfiber-backup-1)
-	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Deploy engine → ircfiber-backup-1  $(R)"
-	@cd deploy && ansible-playbook -l ircfiber-backup-1 $(_vault_arg) playbooks/deploy-update.yml
 
 # Alias: fast path is the default
 update-fast: update ## Deploy > Force hot path (same as `make update`)
@@ -1535,10 +1556,6 @@ update-exec: build-engine ## Deploy > Zero-disconnect exec-based engine hot-relo
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Zero-disconnect exec-reload engine → $(_target)  $(R)"
 	@printf '%b\n' "$(D)  OLD engine exec()s into NEW binary in-place — IRC socket survives$(R)"
 	@$(_playbook) playbooks/deploy-update-exec.yml
-
-handoff-backup: build-engine ## Deploy > Graceful engine hot-reload → backup engine
-	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Hot-reload backup engine → ircfiber-backup-1  $(R)"
-	@cd deploy && ansible-playbook -l ircfiber-backup-1 $(_vault_arg) playbooks/deploy-handoff.yml
 
 # ----------------------------------------------------------------------------
 # Cross Compilation
@@ -1704,7 +1721,7 @@ deploy-ircd: ## IRCd > Deploy Ergo IRC daemon to OVH (ports 6667 + 6697)
 #   make deploy-restart                                  # restart everything
 #   make deploy-restart COMPONENTS=gateway,engine        # selective restart
 #   make deploy-restart COMPONENTS=gateway               # gateway only
-#   make deploy-restart TARGET=ircfiber-backup-1          # different host
+#   make deploy-restart TARGET=ircfiber-ovh-1          # different host
 # Convenience: restart specific container(s) by name.
 # The color variable $(C) is taken (cyan ANSI escape), so the shorthand
 # for components is COMP or a trailing argument. Override at invocation:

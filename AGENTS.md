@@ -300,7 +300,7 @@ Engine config overrides (`priority`, `fallbackOnly`, `maxConnections`) are store
 1. Redis/Mongo start first (host network mode)
 2. Gateway + Engine containers start on `ircfiber_net` bridge network
 3. Each engine reads its assigned networks from `irc:assignments` (Redis hash)
-4. **Key fix**: During boot, if a lower-priority engine sees networks assigned to a higher-priority engine (but that engine hasn't heartbeated yet), it **defers reclaim** instead of stealing them (`bootstrap.d:216-224`). This prevents backup1 from taking over OVH's networks during a full reboot.
+4. **Key fix**: During boot, if a lower-priority engine sees networks assigned to a higher-priority engine (but that engine hasn't heartbeated yet), it **defers reclaim** instead of stealing them (`bootstrap.d:216-224`). This prevents a lower-priority engine from taking over a higher-priority engine's networks during a full reboot.
 
 All containers use `restart_policy: unless-stopped`, so `docker restart` on the host recovers everything automatically.
 
@@ -751,3 +751,167 @@ A reference test for this flow is sketched in
 the in-repo docker stack because the engine's SASL handshake with
 unreal_sasl needed a different password and the engine's connection
 flickered under repeated test runs; this is a work-in-progress).
+
+## IRC Fiber — Observability
+
+The IRC Fiber stack uses **SigNoz** as its single observability store for
+logs, traces, and metrics. Grafana is retained as a cross-data-source
+dashboard layer, configured to query SigNoz via the Infinity datasource
+plugin (`yesoreyeram-infinity-datasource`) at `signoz-signoz:8080`.
+
+### Architecture
+
+```
+┌─────────────────┐     OTLP HTTP      ┌──────────────┐
+│  Fluent Bit     │ ──────────────────► │              │
+│  (container     │     port 4318       │  signoz-     │
+│   log tailer)   │                     │  ingester    │
+└─────────────────┘                     │  (OTLP       │
+                                        │   receiver)  │
+┌─────────────────┐     OTLP HTTP      │              │
+│  IRC Fiber      │ ──────────────────► │              │
+│  Engine/Gateway │     port 4318       │              │
+│  (D processes)  │                     └──────┬───────┘
+└─────────────────┘                            │
+                                     ┌─────────▼─────────┐
+                                     │  signoz-query-     │
+                                     │  service           │
+                                     │  port 8080 (int)   │
+                                     │  port 3301 (host)  │
+                                     └──┬──────┬──────┬───┘
+                                        │      │      │
+                          ┌─────────────┘      │      └─────────────┐
+                          ▼                    ▼                    ▼
+                   ┌──────────┐        ┌────────────┐       ┌──────────────┐
+                   │ ClickHouse│        │ SigNoz     │       │ Grafana      │
+                   │ (storage) │        │ Frontend   │       │ (dashboards) │
+                   └──────────┘        └────────────┘       └──────────────┘
+```
+
+**Data paths:**
+
+| Signal | Source | Destination | Protocol |
+|---|---|---|---|
+| Logs | Fluent Bit (Docker log tailer) | signoz-ingester:4318 | OTLP HTTP |
+| Logs (Caddy access) | Bridge otel-collector (filelog/caddy receiver) | signoz-ingester:4317 | OTLP gRPC |
+| Traces | Engine/Gateway (D tracing.d) | signoz-ingester:4318 (local dev) or bridge (prod) | OTLP HTTP |
+| Metrics | Bridge otel-collector (hostmetrics + docker_stats receivers) | signoz-ingester:4317 | OTLP gRPC |
+
+In **production**, the bridge (`ircfiber-otel-collector`, deployed by the
+`signoz_bridge` role) sits on both `ircfiber_net` and `ircfiber_logging`
+networks, proxying OTLP from D services to signoz-ingester. In **local dev**
+the engine/gateway write OTLP directly to `signoz-ingester:4318`.
+
+### Port clarification
+
+| Port | Service | Bind | Purpose |
+|---|---|---|---|
+| 3301 | signoz-query-service | host:3301 | SigNoz REST API + UI access (dev) |
+| 8080 | signoz-query-service | container:8080 | Internal query-service API (no host map) |
+| 4317 | signoz-ingester | container:4317 | OTLP gRPC intake (bridge export target) |
+| 4318 | signoz-ingester | container:4318 | OTLP HTTP intake (Fluent Bit + engine) |
+| 13133 | signoz-ingester | container:13133 | Health check endpoint |
+
+### File layout
+
+| File | Purpose |
+|---|---|
+| `deploy/roles/signoz_bridge/defaults/main.yml` | Bridge container defaults (image, ports, networks, resources) |
+| `deploy/roles/signoz_bridge/tasks/main.yml` | Ansible tasks: network join, container create, healthcheck |
+| `deploy/roles/signoz_bridge/templates/otel-collector-config.yaml.j2` | OTel collector config: OTLP receivers, hostmetrics, docker_stats, filelog/caddy, transform/newrelic, redaction, batch export |
+| `deploy/roles/logging/templates/fluent-bit.conf.j2` | Production Fluent Bit config (Docker JSON log tail, engine_json parser, docker metadata enrichment, OTLP output) |
+| `deploy/local/fluent-bit.conf` | Dev Fluent Bit config (minimal — no docker socket enrichment) |
+| `deploy/roles/logging/defaults/main.yml` | Versions, container names, resource limits, alert gating |
+| `deploy/roles/logging/tasks/main.yml` | Orchestration: network/volume creation, template rendering, compose deploy, healthchecks |
+| `deploy/roles/logging/templates/docker-compose.logging.yml.j2` | SigNoz Foundry + Grafana docker-compose template (production) |
+| `deploy/roles/logging/templates/grafana-datasources.yml.j2` | Grafana SigNoz datasource via Infinity plugin |
+| `deploy/roles/logging/templates/grafana-dashboards.yml.j2` | Grafana dashboards provider config |
+| `deploy/roles/logging/files/dashboards/` | 6 Grafana dashboard JSON definitions |
+| `deploy/roles/signoz_alerts/files/alert_rules.yml` | SigNoz alert rules (7 host + container + service alerts) |
+| `deploy/roles/logging/tasks/deploy-alerts.yml` | Ansible alert deployment (gated by `deploy_signoz_alerts`) |
+| `deploy/roles/logging/tasks/cleanup-old-stack.yml` | Remove old Loki/Promtail/Tempo/otel-collector/Prometheus |
+
+### Grafana
+
+Repurposed from the old Loki+Tempo+Prometheus setup. Now uses **SigNoz**
+as its sole provisioned datasource via the Infinity plugin:
+
+```yaml
+datasources:
+  - name: SigNoz
+    type: yesoreyeram-infinity-datasource
+    url: http://signoz-signoz:8080
+```
+
+Provisioned dashboards (6):
+
+| Dashboard | Focus |
+|---|---|
+| `container-health.json` | Docker container CPU/memory/restart counts |
+| `irc-bugs-errors.json` | Error rate by service, top error messages |
+| `irc-connection-lifecycle.json` | Connection events, disconnects, reconnects |
+| `irc-distributed-traces.json` | Trace waterfall, span duration, service map |
+| `irc-handoff.json` | Handoff duration, socket counts, TLS vs plain |
+| `irc-protocol-events.json` | JOIN/PART/KICK/MODE event rates |
+
+The `GF_INSTALL_PLUGINS` env var installs `yesoreyeram-infinity-datasource`
+at Grafana boot.
+
+### Local dev
+
+Docker Compose at `deploy/local/docker-compose.yml` brings up 11 containers
+on the `ircfiber_local` bridge (172.28.0.0/16):
+
+```
+redis, mongo, signoz-clickhouse, signoz-query-service, signoz-ingester,
+signoz-frontend, signoz-alertmanager, fluent-bit, ircfiber-gateway,
+ircfiber-engine, ircd
+```
+
+Makefile targets:
+
+```bash
+# Start
+make local-dev-up           # docker compose up -d
+
+# Smoke test (gateway health + SigNoz API + OTLP ingestion + Fluent Bit)
+make local-dev-smoke
+
+# Access points:
+# - SigNoz UI/REST: http://localhost:3301
+# - Gateway health: http://localhost:8090/health
+# - Admin panel: http://localhost:5173 (via `npm run dev:local`)
+# - IRC daemon: localhost:6667
+
+# Stop
+make local-dev-down        # preserves data volumes
+make local-dev-down-clean  # wipes ClickHouse data too
+```
+
+See `deploy/local/README.md` for full instructions, prerequisites, and troubleshooting.
+
+### Alert rules
+
+14 Loki alert rules were migrated to SigNoz LOGS_BASED_ALERT rules
+(gated under `deploy_signoz_alerts: true` in the logging role).
+
+Rule definitions: `deploy/roles/logging/signoz-alerts.yml.j2`
+Deployment: `deploy/roles/logging/tasks/deploy-alerts.yml`
+
+| Rule | Filter | Threshold | Severity |
+|---|---|---|---|
+| IrcfiberTLSFailures | `attribute.event = 'tls_fail'` | >3 in 5m | warning |
+| IrcfiberReconnectStorm | `attribute.event = 'reconnect_scheduled'` | >10 in 5m | warning |
+| ... (14 total) | See signoz-alerts.yml.j2 for full table | | |
+
+### Configuration & cleanup
+
+The old Loki/Promtail/Tempo/Prometheus stack was removed in favor of
+SigNoz + Fluent Bit. The opt-in cleanup task at
+`deploy/roles/logging/tasks/cleanup-old-stack.yml` removes remaining
+containers, volumes, and config directories.
+
+### Plan reference
+
+Full task graph (14 tasks across 4 waves):
+[`docs/plan/20260701-signoz-unified-observability-and-local-docker/plan.yaml`](docs/plan/20260701-signoz-unified-observability-and-local-docker/plan.yaml)
