@@ -199,6 +199,16 @@
       when: ircfiber_engine_id is defined and engine_info.exists
 
     # ── Inject new binary into container (always — handoff + restart both need it) ──
+    # Older engine containers were built directly from the Containerfile *builder*
+    # stage (binary at /build/), so /app/ may not exist. Create it idempotently
+    # before staging. The handoff protocol requires the new binary at /app/ so
+    # the old engine can launch it via nohup.
+    - name: Ensure /app exists in engine container
+      ansible.builtin.command:
+        cmd: docker exec {{ engine_container }} mkdir -p /app
+      changed_when: false
+      when: ircfiber_engine_id is defined and engine_info.exists
+
     - name: Stage new engine binary
       ansible.builtin.command:
         cmd: docker cp {{ engine_binary }} {{ engine_container }}:/app/irc-fiber-engine-handoff
@@ -385,3 +395,19 @@
         - ircfiber_engine_id is defined
         - not (skip_migrate | default(false) | bool)
         - janitor_status is defined
+
+    # ── Disk cleanup ────────────────────────────────────────────────────
+    # Each build creates new builder image layers + build cache.
+    # Prune unused images (not referenced by running containers) and
+    # build cache to prevent /var/lib/docker from filling up 72G root.
+    - name: Prune unused Docker images and build cache
+      ansible.builtin.shell: |
+        echo "=== Pruning unused Docker images ==="
+        docker image prune -af 2>&1 | tail -5
+        echo "=== Pruning build cache ==="
+        docker builder prune -af 2>&1 | tail -5
+        echo "=== Disk after cleanup ==="
+        df -h / | tail -1
+      args:
+        executable: /bin/bash
+      changed_when: true

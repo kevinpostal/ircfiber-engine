@@ -1,37 +1,25 @@
 ---
-- name: Restart loki
-  community.docker.docker_container:
-    name: "{{ loki_container_name }}"
-    state: started
-    restart: true
-
-- name: Restart promtail
-  community.docker.docker_container:
-    name: "{{ promtail_container_name }}"
-    state: started
-    restart: true
-
 - name: Restart grafana
   community.docker.docker_container:
     name: "{{ grafana_container_name }}"
     state: started
     restart: true
 
-- name: Restart tempo
+- name: Restart fluent-bit
   community.docker.docker_container:
-    name: "{{ tempo_container_name }}"
+    name: "{{ fluent_bit_container_name }}"
     state: started
     restart: true
 
-- name: Restart otel-collector
+- name: Restart signoz-query-service
   community.docker.docker_container:
-    name: "{{ otelcol_container_name }}"
+    name: "{{ signoz_query_service_container_name }}"
     state: started
     restart: true
 
-- name: Restart prometheus
+- name: Restart signoz-ingester
   community.docker.docker_container:
-    name: "{{ prometheus_container_name }}"
+    name: "{{ signoz_ingester_container_name }}"
     state: started
     restart: true
 

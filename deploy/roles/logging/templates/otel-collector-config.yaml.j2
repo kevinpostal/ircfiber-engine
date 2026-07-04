@@ -1,0 +1,35 @@
+# {{ ansible_managed }}
+# Minimal OTel collector config for SigNoz combined image.
+# Receives OTLP HTTP on 4318 from Fluent Bit and bridge.
+# Exports logs/traces/metrics to ClickHouse bundled in signoz container.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+exporters:
+  clickhouse:
+    endpoint: tcp://clickhouse:9000
+    database: signoz_traces
+    ttl: 72h
+    username: default
+    password: ""
+    logs_table_name: signoz_logs
+    traces_table_name: signoz_traces
+    metrics_table_name: signoz_metrics
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [clickhouse]
+    metrics:
+      receivers: [otlp]
+      exporters: [clickhouse]
+    logs:
+      receivers: [otlp]
+      exporters: [clickhouse]

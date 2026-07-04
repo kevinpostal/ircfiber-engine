@@ -34,8 +34,12 @@
     host_bin_dir: /opt/ircfiber/bin
     engine_container: "{{ 'ircfiber-engine-' ~ ircfiber_engine_id }}"
     engine_binary_src: "{{ host_bin_dir }}/irc-fiber-engine"
-    engine_binary_stage: "/app/irc-fiber-engine-handoff"
-    engine_binary_dest: "/app/irc-fiber-engine"
+    # Default binary paths — overridden by the detection task below.
+    # The running engine may be at /build/irc-fiber-engine (builder image) or
+    # /app/irc-fiber-engine (gateway image). We detect the actual location
+    # by checking which path exists inside the container.
+    engine_binary_stage: "/build/irc-fiber-engine-handoff"
+    engine_binary_dest: "/build/irc-fiber-engine"
     handoff_socket: "/tmp/ircfiber-handoff-{{ ircfiber_engine_id }}.sock"
     handoff_timeout: 60
     ldc_version: "1.41.0"
@@ -121,6 +125,40 @@
       ansible.builtin.fail:
         msg: "Engine container {{ engine_container }} is not running. Deploy first."
       when: not engine_info.exists or not engine_info.container.State.Running
+
+    # ── Detect engine binary directory ──────────────────────────────
+    # The engine container may use /build/ (builder image) or /app/
+    # (gateway image). We check /build first (more common for engine-only
+    # containers), then fall back to /app. The matched path replaces the
+    # default vars set at the top of this playbook.
+    - name: Detect engine binary directory inside container
+      ansible.builtin.shell: |
+        for p in /build /app; do
+          if docker exec {{ engine_container }} test -f "$p/irc-fiber-engine" 2>/dev/null; then
+            echo "$p"
+            exit 0
+          fi
+        done
+        # Fallback: last resort
+        echo "/build"
+      args:
+        executable: /bin/bash
+      register: engine_bin_dir_raw
+      changed_when: false
+      check_mode: false  # Must run even in check mode to set engine_binary_dir correctly
+
+    - name: Set engine_binary_dir fact
+      ansible.builtin.set_fact:
+        engine_binary_dir: "{{ engine_bin_dir_raw.stdout | trim | split('\n') | first | trim }}"
+
+    - name: Update binary paths from detected directory
+      ansible.builtin.set_fact:
+        engine_binary_stage: "{{ engine_binary_dir }}/irc-fiber-engine-handoff"
+        engine_binary_dest: "{{ engine_binary_dir }}/irc-fiber-engine"
+
+    - name: Log detected engine binary path
+      ansible.builtin.debug:
+        msg: "Detected engine binary at {{ engine_binary_dir }}/irc-fiber-engine (stage={{ engine_binary_stage }}, dest={{ engine_binary_dest }})"
 
     - name: Get old engine PID
       ansible.builtin.command:

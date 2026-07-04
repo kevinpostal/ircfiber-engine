@@ -8,8 +8,7 @@
 #           (engine via ircfiber-signoz-otel alias, holder, gateway)
 #   - hostmetrics: CPU, memory, disk, network, load, processes
 #   - docker_stats: per-container CPU, memory, network, block I/O
-#   - filelog/containers: tail all Docker container JSON logs
-#     (resource set via transform processor)
+#   - filelog/caddy: tail Caddy access logs (container logs via Fluent Bit)
 #
 # Processors:
 #   - memory_limiter: hard cap to keep the collector under 256m
@@ -132,28 +131,6 @@ receivers:
       - type: add
         field: attributes["log.source"]
         value: "caddy-access"
-
-  filelog/containers:
-    include:
-      - /var/lib/docker/containers/*/*.log
-    start_at: end
-    poll_interval: 5s
-    # The filelog receiver's `resource:` block attaches these to every
-    # emitted log. Values are evaluated as OTTL string-literal expressions:
-    # a plain quoted string is the literal. This is the only place where
-    # resource attributes can be set on filelog output — context: log
-    # statements that write to `resource.*` are silently dropped in
-    # v0.119.x. See docs/OBSERVABILITY.md §"Empty resource on filelog logs"
-    # for the full analysis.
-    resource:
-      service.name: "docker"
-      service.namespace: "ircfiber"
-      deployment.environment: "production"
-      service.display_name: "IRC Fiber Docker"
-      entity.type: "container"
-    operators:
-      - type: json_parser
-        parse_to: body
 
 processors:
   memory_limiter:
@@ -300,6 +277,6 @@ service:
       exporters: [otlp/signoz]
 
     logs:
-      receivers: [otlp, filelog/caddy, filelog/containers]
+      receivers: [otlp, filelog/caddy]
       processors: [memory_limiter, resourcedetection, transform/newrelic, redaction, batch]
       exporters: [otlp/signoz]

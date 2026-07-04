@@ -3,7 +3,7 @@
 grafana_admin_password: "{{ vault_grafana_admin_password | default('CHANGE_ME_GRAPHANA_PASSWORD') }}"
 
 # Where Grafana serves. Internal container port is 3000; Caddy proxies
-# /logs/* to it on the public domain.
+# /grafana/* to it on the public domain.
 grafana_container_name: ircfiber-grafana
 grafana_image: "grafana/grafana:11.3.0"
 grafana_data_volume: ircfiber_grafana_data
@@ -15,7 +15,7 @@ grafana_plugins_volume: ircfiber_grafana_plugins
 # Must NOT clash with /api, /ws, /admin, /health, or the SPA assets.
 grafana_public_path: /grafana
 # Root URL for Grafana (full URL — required for proper redirect handling).
-grafana_root_url: "https://{{ ircfiber_domain }}{{ grafana_public_path }}/"
+grafana_root_url: "https://{{ ircfiber_domain | default('ircfiber.com') }}{{ grafana_public_path }}/"
 # Session lifetime, days
 grafana_session_lifetime_days: 7
 # Disable user signup — admin-only access.
@@ -25,60 +25,37 @@ grafana_disable_signup: true
 # the X-WEBAUTH-USER header from the reverse proxy.
 grafana_auth_proxy_enabled: true
 
-# Loki
-loki_container_name: ircfiber-loki
-loki_image: "grafana/loki:3.4.0"
-loki_data_volume: ircfiber_loki_data
-loki_config_volume: ircfiber_loki_config
-# Retention period — Loki deletes old chunks after this many days.
-loki_retention_days: 30
-# Storage backend: "filesystem" or "s3"
-loki_storage_backend: filesystem
-# S3-compatible config (used only when loki_storage_backend=s3)
-loki_s3_endpoint: ""
-loki_s3_bucketnames: ""
-loki_s3_access_key_id: ""
-loki_s3_secret_access_key: ""
-loki_s3_region: us-east-1
-# Resource limits
-loki_memory_limit: 512m
-loki_cpu_limit: 1.0
+# SigNoz combined image
+signoz_version: "latest"
+signoz_container_name: ircfiber-signoz
+signoz_data_volume: ircfiber_signoz_data
 
-# Promtail
-promtail_container_name: ircfiber-promtail
-promtail_image: "grafana/promtail:3.4.0"
-promtail_config_volume: ircfiber_promtail_config
-promtail_positions_volume: ircfiber_promtail_positions
-# Memory for promtail — small Go binary.
-promtail_memory_limit: 128m
-promtail_cpu_limit: 0.5
-# Which Docker containers to scrape (regex on container_name).
-# Default: all containers matching the ircfiber-* or engine names.
-promtail_container_label_regex: "^ircfiber-|^ircfiber-ircd$|^ircfiber-engine-with"
+# Fluent Bit — Docker log shipper for SigNoz.
+fluent_bit_version: "3.2"
+fluent_bit_container_name: ircfiber-fluent-bit
+# Host directory for Fluent Bit config (rendered from fluent-bit.conf.j2).
+fluent_bit_config_dir: /etc/ircfiber/fluent-bit
+fluent_bit_log_level: info
+fluent_bit_memory_limit: 128m
+fluent_bit_cpu_limit: 0.5
+# OTLP output target (internal service name on ircfiber_logging network).
+fluent_bit_otlp_host: signoz-ingester
+fluent_bit_otlp_port: 4318
+fluent_bit_flush: 1
+fluent_bit_mem_buf_limit: 50MB
+fluent_bit_refresh_interval: 5
 
-# Tempo (distributed tracing storage)
-tempo_container_name: ircfiber-tempo
-tempo_image: "grafana/tempo:2.6.1"
-tempo_data_volume: ircfiber_tempo_data
-tempo_config_volume: ircfiber_tempo_config
-tempo_memory_limit: 256m
-tempo_cpu_limit: 0.5
-
-# OpenTelemetry Collector (OTLP receiver → Tempo + Prometheus)
-otelcol_container_name: ircfiber-otel-collector
-otelcol_image: "otel/opentelemetry-collector-contrib:0.155.0"
-otelcol_config_volume: ircfiber_otelcol_config
-otelcol_memory_limit: 128m
-otelcol_cpu_limit: 0.5
-
-# Prometheus — metrics scraper. Ingests traces_spanmetrics from the
-# otel-collector so the Distributed Traces dashboard can render the
-# service graph + latency percentiles.
-prometheus_container_name: ircfiber-prometheus
-prometheus_image: "prom/prometheus:v3.0.0"
-prometheus_data_volume: ircfiber_prometheus_data
-prometheus_memory_limit: 256m
-prometheus_cpu_limit: 0.5
+# SigNoz Grafana API key — provisioned by signoz_mcp role.
+# Override in host_vars or vault. Empty = datasource non-functional
+# until signoz_mcp role is run.
+signoz_grafana_api_key: ""
 
 # Healthcheck endpoints (for internal monitoring)
 logging_healthcheck_interval: 30
+
+# SigNoz alert deployment (gated — set deploy_signoz_alerts: true to enable).
+# API key can come from a vault file or be set directly via signoz_api_key.
+deploy_signoz_alerts: false
+signoz_api_url: "http://signoz:8080"
+signoz_api_key: ""  # Override via vault or env
+signoz_api_key_file: "/etc/ircfiber/signoz-mcp/.api_key"

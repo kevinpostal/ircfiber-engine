@@ -1,0 +1,216 @@
+# ---------------------------------------------------------------------------
+# IRC Fiber — Local development stack with SigNoz combined image
+#
+# Brings up 7 containers on the ircfiber_local bridge (172.28.0.0/16):
+#   redis, mongo, signoz, fluent-bit, ircfiber-gateway, ircfiber-engine, ircd
+#
+# Usage:
+#   docker compose -f deploy/local/docker-compose.yml up -d
+#   docker compose -f deploy/local/docker-compose.yml down
+# ---------------------------------------------------------------------------
+services:
+
+  # -----------------------------------------------------------------------
+  # redis — session state, pub/sub, key-value store
+  # -----------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: ircfiber-redis
+    restart: unless-stopped
+    networks:
+      - ircfiber_local
+    volumes:
+      - redis_data:/data
+    command:
+      redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # -----------------------------------------------------------------------
+  # mongo — persistent storage for network config, scrollback, user prefs
+  # -----------------------------------------------------------------------
+  mongo:
+    image: mongo:7
+    container_name: ircfiber-mongo
+    restart: unless-stopped
+    networks:
+      - ircfiber_local
+    volumes:
+      - mongo_data:/data/db
+    environment:
+      MONGO_INITDB_DATABASE: ircfiber
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # -----------------------------------------------------------------------
+  # signoz — combined SigNoz image (otel-collector + query-service +
+  #          frontend + ClickHouse + alertmanager + Kafka + …)
+  # Ports: 3301 = REST API + UI, 4318 = OTLP HTTP, 4317 = OTLP gRPC
+  # -----------------------------------------------------------------------
+  signoz:
+    image: signoz/signoz:latest
+    container_name: ircfiber-signoz
+    restart: unless-stopped
+    networks:
+      - ircfiber_local
+    ports:
+      - "3301:3301"
+      - "8080:8080"
+      - "4318:4318"
+      - "4317:4317"
+    environment:
+      SIGNOZ_INITIAL_ADMIN_EMAIL: admin@ircfiber.com
+      SIGNOZ_INITIAL_ADMIN_PASSWORD: admin123
+    volumes:
+      - signoz_data:/var/lib/signoz
+      - signoz_data:/data
+      - /tmp/signoz-query:/tmp  # Prometheus query logger dir
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/api/v1/services"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
+  # -----------------------------------------------------------------------
+  # fluent-bit — container log tailer shipping to SigNoz via OTLP
+  # -----------------------------------------------------------------------
+  fluent-bit:
+    image: fluent/fluent-bit:latest
+    container_name: ircfiber-fluent-bit
+    restart: unless-stopped
+    networks:
+      - ircfiber_local
+    volumes:
+      - /var/lib/docker/containers/:/var/lib/docker/containers/:ro
+      - ./fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
+      - ./parsers.conf:/fluent-bit/etc/parsers.conf:ro
+    command:
+      ["/fluent-bit/bin/fluent-bit", "-c", "/fluent-bit/etc/fluent-bit.conf"]
+    depends_on:
+      signoz:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "pidof", "fluent-bit"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # -----------------------------------------------------------------------
+  # ircfiber-gateway — HTTP/WS frontend + admin API
+  # -----------------------------------------------------------------------
+  ircfiber-gateway:
+    build:
+      context: ../..
+      dockerfile: Containerfile
+    image: irc-fiber:local
+    container_name: ircfiber-gateway
+    restart: unless-stopped
+    networks:
+      - ircfiber_local
+    ports:
+      - "8090:8090"
+    command: ["/app/irc-fiber"]
+    environment:
+      IRCFIBER_OTEL_ENDPOINT: http://signoz:4318
+      IRCFIBER_REDIS_URL: redis://redis:6379/0
+      IRCFIBER_MONGO_URL: mongodb://mongo:27017/ircfiber
+      IRCFIBER_LOG_LEVEL: debug
+    depends_on:
+      redis:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      signoz:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8090/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # -----------------------------------------------------------------------
+  # ircfiber-engine — IRC protocol engine (connects to ircd + real servers)
+  # -----------------------------------------------------------------------
+  ircfiber-engine:
+    build:
+      context: ../..
+      dockerfile: Containerfile
+    image: irc-fiber:local
+    container_name: ircfiber-engine
+    restart: unless-stopped
+    networks:
+      - ircfiber_local
+    command: ["/app/irc-fiber-engine"]
+    environment:
+      IRCFIBER_SERVER_ID: localdev1
+      IRCFIBER_OTEL_ENDPOINT: http://signoz:4318
+      IRCFIBER_REDIS_URL: redis://redis:6379/0
+      IRCFIBER_MONGO_URL: mongodb://mongo:27017/ircfiber
+      IRCFIBER_LOG_LEVEL: debug
+    depends_on:
+      redis:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      signoz:
+        condition: service_healthy
+      ircd:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "pidof", "irc-fiber-engine"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # -----------------------------------------------------------------------
+  # ircd — local ngIRCd server for testing
+  # -----------------------------------------------------------------------
+  ircd:
+    build:
+      context: ../../docker/ircd
+      dockerfile: Dockerfile
+    image: ircd-local:latest
+    container_name: ircfiber-ircd
+    restart: unless-stopped
+    networks:
+      - ircfiber_local
+    ports:
+      - "6667:6667"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 6667"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+# ---------------------------------------------------------------------------
+# Network
+# ---------------------------------------------------------------------------
+networks:
+  ircfiber_local:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+# ---------------------------------------------------------------------------
+# Named volumes
+# ---------------------------------------------------------------------------
+volumes:
+  redis_data:
+    driver: local
+  mongo_data:
+    driver: local
+  signoz_data:
+    driver: local

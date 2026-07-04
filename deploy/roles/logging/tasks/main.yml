@@ -18,14 +18,7 @@
     - "{{ grafana_dashboards_volume }}"
     - "{{ grafana_alerting_volume }}"
     - "{{ grafana_plugins_volume }}"
-    - "{{ loki_data_volume }}"
-    - "{{ loki_config_volume }}"
-    - "{{ promtail_config_volume }}"
-    - "{{ promtail_positions_volume }}"
-    - "{{ tempo_data_volume }}"
-    - "{{ tempo_config_volume }}"
-    - "{{ otelcol_config_volume }}"
-    - "{{ prometheus_data_volume }}"
+    - "ircfiber_signoz_data"
 
 - name: Ensure logging directories exist
   ansible.builtin.file:
@@ -35,42 +28,37 @@
     group: root
     mode: "0755"
   loop:
-    - /etc/ircfiber/loki
-    - /etc/ircfiber/promtail
-    - /etc/ircfiber/tempo
-    - /etc/ircfiber/otelcol
-    - /etc/ircfiber/prometheus
+    - "{{ fluent_bit_config_dir }}"
     - /etc/ircfiber/grafana
     - /etc/ircfiber/grafana/provisioning
     - /etc/ircfiber/grafana/provisioning/datasources
     - /etc/ircfiber/grafana/provisioning/dashboards
     - /etc/ircfiber/grafana/dashboards
     - /etc/ircfiber/grafana/alerting
-    - /etc/ircfiber/loki/rules
     - /etc/ircfiber/logging
 
-- name: Render Loki config
+- name: Render Fluent Bit config
   ansible.builtin.template:
-    src: loki-config.yml.j2
-    dest: "/etc/ircfiber/loki/loki-config.yml"
+    src: fluent-bit.conf.j2
+    dest: "{{ fluent_bit_config_dir }}/fluent-bit.conf"
     owner: root
     group: root
     mode: "0644"
-  notify: Restart loki
+  notify: Restart fluent-bit
 
-- name: Render Promtail config
+- name: Render Fluent Bit parsers config
   ansible.builtin.template:
-    src: promtail-config.yml.j2
-    dest: "/etc/ircfiber/promtail/promtail-config.yml"
+    src: parsers.conf.j2
+    dest: "{{ fluent_bit_config_dir }}/parsers.conf"
     owner: root
     group: root
     mode: "0644"
-  notify: Restart promtail
+  notify: Restart fluent-bit
 
 - name: Render Grafana datasources
   ansible.builtin.template:
     src: grafana-datasources.yml.j2
-    dest: "/etc/ircfiber/grafana/provisioning/datasources/loki.yml"
+    dest: "/etc/ircfiber/grafana/provisioning/datasources/signoz.yml"
     owner: root
     group: root
     mode: "0644"
@@ -91,42 +79,6 @@
     delete: yes
   register: grafana_dashboards_deploy
   notify: Restart grafana
-
-- name: Render Loki alert rules
-  ansible.builtin.template:
-    src: loki-rules.yml.j2
-    dest: "/etc/ircfiber/loki/rules/ircfiber.yml"
-    owner: root
-    group: root
-    mode: "0644"
-  notify: Restart loki
-
-- name: Render Tempo config
-  ansible.builtin.copy:
-    src: tempo-config.yaml
-    dest: "/etc/ircfiber/tempo/tempo-config.yaml"
-    owner: root
-    group: root
-    mode: "0644"
-  notify: Restart tempo
-
-- name: Render otel-collector config
-  ansible.builtin.copy:
-    src: otelcol-config.yaml
-    dest: "/etc/ircfiber/otelcol/config.yaml"
-    owner: root
-    group: root
-    mode: "0644"
-  notify: Restart otel-collector
-
-- name: Render Prometheus config
-  ansible.builtin.copy:
-    src: prometheus.yml
-    dest: "/etc/ircfiber/prometheus/prometheus.yml"
-    owner: root
-    group: root
-    mode: "0644"
-  notify: Restart prometheus
 
 - name: Render docker-compose for logging stack
   ansible.builtin.template:
@@ -149,7 +101,7 @@
 # ────────────────────────────────────────────────────────────────────────
 # Deploy via docker compose
 # ────────────────────────────────────────────────────────────────────────
-- name: Deploy logging stack (Loki + Promtail + Grafana + Tempo + otel-collector)
+- name: Deploy logging stack (Fluent Bit + SigNoz Foundry + Grafana)
   community.docker.docker_compose_v2:
     project_src: /etc/ircfiber/logging
     state: present
@@ -162,18 +114,28 @@
 # ────────────────────────────────────────────────────────────────────────
 # Post-deploy healthchecks
 # ────────────────────────────────────────────────────────────────────────
-- name: Wait for Loki to become healthy
+- name: Wait for SigNoz to become healthy (API on :8080)
   ansible.builtin.command:
-    cmd: "docker exec ircfiber-loki wget -qO- http://127.0.0.1:3100/ready"
-  register: loki_ready
+    cmd: "docker exec {{ signoz_container_name }} wget -qO- http://localhost:8080/api/v1/services"
+  register: signoz_ready
   changed_when: false
-  until: loki_ready.rc == 0 and (loki_ready.stdout | trim) == 'ready'
-  retries: 15
+  until: signoz_ready.rc == 0
+  retries: 30
   delay: 4
+
+- name: Wait for Fluent Bit to start
+  ansible.builtin.command:
+    cmd: "docker exec {{ fluent_bit_container_name }} pidof fluent-bit"
+  register: fluent_bit_ready
+  changed_when: false
+  until: fluent_bit_ready.rc == 0
+  retries: 10
+  delay: 3
+  failed_when: false
 
 - name: Wait for Grafana to become healthy
   ansible.builtin.command:
-    cmd: docker exec ircfiber-grafana wget -qO- http://127.0.0.1:3000/api/health
+    cmd: "docker exec {{ grafana_container_name }} wget -qO- http://127.0.0.1:3000/api/health"
   register: grafana_ready
   changed_when: false
   until:
@@ -182,30 +144,24 @@
   retries: 15
   delay: 4
 
-- name: Wait for Tempo to become healthy
-  ansible.builtin.command:
-    cmd: "docker exec ircfiber-tempo wget -qO- http://127.0.0.1:3200/ready"
-  register: tempo_ready
-  changed_when: false
-  until: tempo_ready.rc == 0
-  retries: 15
-  delay: 4
-  failed_when: false
-
-- name: Wait for otel-collector to become healthy
-  ansible.builtin.command:
-    cmd: "docker exec ircfiber-otel-collector wget -qO- http://127.0.0.1:13133/health/status"
-  register: otelcol_ready
-  changed_when: false
-  until: otelcol_ready.rc == 0
-  retries: 15
-  delay: 4
-  failed_when: false
-
 # ────────────────────────────────────────────────────────────────────────
 # Caddy integration — add Grafana proxy route
 # ────────────────────────────────────────────────────────────────────────
 - name: Notify Caddy to reload after logging stack deployment
   ansible.builtin.debug:
     msg: "Caddy route for /grafana must be enabled in caddy role"
-  when: loki_ready is succeeded and grafana_ready is succeeded
+  when: signoz_ready is succeeded and grafana_ready is succeeded
+
+# ────────────────────────────────────────────────────────────────────────
+# Deploy SigNoz alert rules (gated — not on every deploy)
+# ────────────────────────────────────────────────────────────────────────
+- name: Deploy SigNoz alert rules
+  ansible.builtin.import_tasks: deploy-alerts.yml
+  when: deploy_signoz_alerts | default(false) | bool
+
+# ────────────────────────────────────────────────────────────────────────
+# Optional: Clean up old stack (Loki/Promtail/Tempo/Prometheus/legacy otelcol)
+# ────────────────────────────────────────────────────────────────────────
+- name: Clean up old observability stack
+  ansible.builtin.import_tasks: cleanup-old-stack.yml
+  when: cleanup_old_stack | default(false) | bool

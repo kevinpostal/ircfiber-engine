@@ -3,6 +3,7 @@
 # Public TLS termination in front of the irc-fiber gateway.
 # Caddy v2 automatically negotiates WebSocket upgrades for paths that
 # request them (e.g. /ws). Long timeouts are configured for the WS connection.
+{# Caddy route audit 2026-07-01: No Loki/Promtail/Tempo/Prometheus routes found — OK #}
 #
 # We use ONE site block per host (looping over ircfiber_domain + any
 # caddy_extra_serve_hosts entries) instead of a single merged block.
@@ -64,7 +65,7 @@
     # from the proxy setup. Dedicated block to avoid affecting the document/
     # asset paths proxied by /signoz/* below.
     handle_path /signoz/ws/logs/* {
-        reverse_proxy signoz-signoz:8080 {
+        reverse_proxy signoz:8080 {
             header_up SIGNOZ-API-KEY "{$SIGNOZ_API_KEY}"
             header_down -X-Frame-Options
             # WS upgrade: flush bytes immediately on each chunk (the
@@ -79,7 +80,7 @@
         }
     }
     handle_path /signoz {
-        reverse_proxy signoz-signoz:8080 {
+        reverse_proxy signoz:8080 {
             header_up SIGNOZ-API-KEY "{$SIGNOZ_API_KEY}"
             header_down -X-Frame-Options
             transport http {
@@ -89,7 +90,7 @@
         }
     }
     handle_path /signoz/* {
-        reverse_proxy signoz-signoz:8080 {
+        reverse_proxy signoz:8080 {
             header_up SIGNOZ-API-KEY "{$SIGNOZ_API_KEY}"
             header_down -X-Frame-Options
             transport http {
@@ -99,7 +100,7 @@
         }
     }
     handle @signoz_api {
-        reverse_proxy signoz-signoz:8080 {
+        reverse_proxy signoz:8080 {
             header_up SIGNOZ-API-KEY "{$SIGNOZ_API_KEY}"
             transport http {
                 dial_timeout 10s
@@ -108,7 +109,7 @@
         }
     }
     handle @signoz_static {
-        reverse_proxy signoz-signoz:8080 {
+        reverse_proxy signoz:8080 {
             transport http {
                 dial_timeout 10s
                 response_header_timeout 60s
@@ -116,6 +117,17 @@
         }
     }
 {% endif %}
+
+    # ── Grafana reverse-proxy ────────────────────────────────────────────
+    # Serves the Grafana dashboard UI at /grafana/ on the public domain.
+    # Strips the /grafana prefix before forwarding to the Grafana container.
+    handle_path /grafana/* {
+        reverse_proxy ircfiber-grafana:3000 {
+            transport http {
+                dial_timeout 10s
+            }
+        }
+    }
 
     reverse_proxy ircfiber-gateway:{{ gateway_http_port }} {
         # Long-lived transport for WebSockets and slow message-history fetches
@@ -194,10 +206,12 @@
 
 {% if caddy_tailscale_signoz_enabled | default(false) | bool %}
 # ── Tailscale-only SigNoz listener ──────────────────────────────────
-# SigNoz v0.130+ combined image serves the UI on port 8080 (NOT 3301).
-# No auth proxy — SigNoz handles its own authentication.
+# SigNoz combined image serves the full application (SPA + API) on
+# port 8080. Proxy ALL paths at the root — the image internally routes
+# /api/v1/* to its query-service and /* to the React frontend.
 http://{{ caddy_tailscale_logging_address | default('100.126.197.92') }}:{{ caddy_tailscale_signoz_port | default(3003) }} {
-    reverse_proxy signoz-signoz:8080 {
+    reverse_proxy signoz:8080 {
+        header_up SIGNOZ-API-KEY "{$SIGNOZ_API_KEY}"
         transport http {
             dial_timeout 10s
         }

@@ -1,9 +1,0 @@
-<clickhouse>
-    <!-- BAD: background_pool_size=1 means pool * ratio (1) < 20
-         (number_of_free_entries_in_pool_to_execute_mutation default).
-         ClickHouse exits 36 with "is greater than the value of
-         'background_pool_size' * 'background_merges_mutations_concurrency_ratio' (1)". -->
-    <max_server_memory_usage>2500000000</max_server_memory_usage>
-    <background_pool_size>1</background_pool_size>
-    <background_merges_mutations_concurrency_ratio>1</background_merges_mutations_concurrency_ratio>
-</clickhouse>
