@@ -915,9 +915,14 @@ holder-test: ## Test > conn_holder.protocol IPC framing defense
 	@./holder-test
 
 connection-holder-strict-test: ## Test > NetworkHolderHealth JSON contract for the admin holder-state surface
-	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Holder strict-mode contract tests  $(R)"
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Holder strict-mode contract tests  $(R)'
 	@$(DUB) build --config=connection-holder-strict-test 2>&1 | tail -3
 	@./connection-holder-strict-test
+
+connection-registration-test: ## Test > ConnectionServer.registrationUnavailableFor JSON contract for the admin registration-stuck surface
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Registration-timeout admin contract tests  $(R)'
+	@$(DUB) build --config=connection-registration-test 2>&1 | tail -3
+	@./connection-registration-test
 
 observability-test: ## Test > OTel metrics pipeline (counter/gauge/histogram JSON contract)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  OTel observability metrics tests  $(R)"
@@ -947,8 +952,8 @@ parser-fuzz-test: ## Test > parser property-based fuzz (10k random lines)
 	@$(DUB) build --config=parser-fuzz-test 2>&1 | tail -3
 	@./parser-fuzz-test
 
-test-fast: ## Test > All fast standalone test suites (prefs/parser/consumer/holder/strict/observability)
-	@for t in prefs-test parser-test consumer-test holder-test connection-holder-strict-test observability-test; do \
+test-fast: ## Test > All fast standalone test suites (prefs/parser/consumer/holder/strict/observability/registration)
+	@for t in prefs-test parser-test consumer-test holder-test connection-holder-strict-test observability-test connection-registration-test; do \
 		printf '\n%b\n' "$(_BCn)$(K)$(B)  $$t  $(R)"; \
 		$(DUB) build --config=$$t 2>&1 | tail -1 || exit 1; \
 		./$$t 2>&1 | tail -3; \
