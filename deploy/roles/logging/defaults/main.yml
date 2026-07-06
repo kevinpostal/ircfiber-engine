@@ -59,3 +59,11 @@ deploy_signoz_alerts: false
 signoz_api_url: "http://signoz:8080"
 signoz_api_key: ""  # Override via vault or env
 signoz_api_key_file: "/etc/ircfiber/signoz-mcp/.api_key"
+
+# JWT secret used to sign SigNoz session tokens. SigNoz v0.131+ refuses
+# to start serving authenticated queries without this and logs a
+# CRITICAL SECURITY ISSUE warning on every boot. Override in host_vars
+# or vault. The default below is a stable per-deployment fallback so
+# the service stays up across reboots without operator intervention;
+# production deployments should override it.
+signoz_jwt_secret: "{{ vault_signoz_jwt_secret | default('ircfiber-signoz-dev-jwt-secret-change-in-prod-9e3a7f2b') }}"

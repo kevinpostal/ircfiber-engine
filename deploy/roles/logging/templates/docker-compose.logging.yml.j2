@@ -1,23 +1,34 @@
 # {{ ansible_managed }}
 # IRC Fiber — SigNoz-native observability stack.
 #
-#   Fluent Bit → signoz (OTLP HTTP) → ClickHouse (built-in)
+#   Fluent Bit → signoz-ingester (OTLP HTTP) → signoz (combined image)
+#                  ↓
+#               clickhouse (separate, fed by the combined signoz image
+#                            via SIGNOZ_CLICKHOUSE_HOST=clickhouse:9000)
 #   Grafana reads from signoz:8080 (query-service API)
 #
-# SigNoz runs as a SINGLE combined image (signoz/signoz:latest) which
-# bundles ClickHouse + query-service + frontend + alertmanager + otel-collector.
-# This avoids the "image not found" issue with individual Foundry images
-# (signoz/otel-collector, signoz/query-service, etc. do not exist as
-# public Docker Hub images).
+# The signoz service is the signoz/signoz combined image (query-service
+# + frontend + alertmanager) — but unlike the "Foundry" builds, we run
+# ClickHouse as a SEPARATE container (the clickhouse service below) and
+# point the signoz image at it via env. This decouples ClickHouse from
+# signoz so we can back up / scale / replace the image without losing
+# telemetry data, and so the local-dev compose can use the same layout.
+#
+# The signoz-ingester is a separate otel/opentelemetry-collector-contrib
+# container that accepts OTLP from Fluent Bit + the bridge collector and
+# forwards to signoz. Running it as a sidecar lets us apply log
+# redaction / sampling / New Relic entity model transforms in one place.
 #
 # All services run on the ircfiber_logging network (separate from
 # ircfiber_net so observability traffic doesn't compete with IRC control).
 #
 # Resource budgets:
-#   Fluent Bit:         128MB RAM, 0.5 CPU
-#   Signoz (combined):  2GB  RAM, 2.0 CPU (ClickHouse + query-svc + collector)
-#   Grafana:            256MB RAM, 0.5 CPU
-# Total:                ~2.4GB RAM, 3.0 CPU — fits on 7.7GB/4-core VPS.
+#   Fluent Bit:        128MB RAM, 0.5 CPU
+#   Signoz-ingester:   256MB RAM, 0.5 CPU
+#   Signoz (combined): 1GB  RAM, 1.0 CPU (query-svc + frontend + alertmanager)
+#   ClickHouse:        1GB  RAM, 1.0 CPU
+#   Grafana:           256MB RAM, 0.5 CPU
+# Total:               ~2.6GB RAM, 3.5 CPU — fits on 7.7GB/4-core VPS.
 
 x-logging-common: &logging-common
   restart: unless-stopped
@@ -132,10 +143,24 @@ services:
     environment:
       SIGNOZ_INITIAL_ADMIN_EMAIL: admin@ircfiber.com
       SIGNOZ_INITIAL_ADMIN_PASSWORD: admin123
-      SIGNOZ_CLICKHOUSE_HOST: clickhouse
-      SIGNOZ_CLICKHOUSE_PORT: 9000
-      SIGNOZ_CLICKHOUSE_DATABASE: signoz_traces
-      STORAGE: clickhouse
+      # SigNoz v0.131+ replaced SIGNOZ_CLICKHOUSE_HOST/PORT/DATABASE with
+      # the nested telemetrystore.clickhouse.{dsn,provider} config keys,
+      # populated from env vars with the SIGNOZ_ prefix:
+      #   SIGNOZ_TELEMETRYSTORE_PROVIDER          → telemetrystore.provider
+      #   SIGNOZ_TELEMETRYSTORE_CLICKHOUSE_DSN    → telemetrystore.clickhouse.dsn
+      # The old STORAGE / ClickHouseUrl env vars are still backported by
+      # the binary for compatibility, but the per-key host/port vars are
+      # SILENTLY IGNORED — the binary falls back to its default DSN
+      # tcp://localhost:9000 which can't be reached from inside the
+      # container, breaking every query with "dial tcp [::1]:9000:
+      # connect: connection refused".
+      SIGNOZ_TELEMETRYSTORE_PROVIDER: clickhouse
+      SIGNOZ_TELEMETRYSTORE_CLICKHOUSE_DSN: tcp://clickhouse:9000
+      # Without a JWT secret the binary logs a CRITICAL SECURITY ISSUE
+      # warning and refuses to sign session tokens properly. Without
+      # this, every login attempt after a fresh deploy fails with
+      # "no signing key configured".
+      SIGNOZ_TOKENIZER_JWT_SECRET: ${SIGNOZ_JWT_SECRET}
     depends_on:
       - clickhouse
     volumes:
@@ -189,7 +214,8 @@ services:
 
   # ────────────────────────────────────────────────────────────────────────
   # signoz-ingester — OTel collector receiving OTLP from Fluent Bit & bridge
-  # Accepts OTLP HTTP on port 4318, forwards to signoz's ClickHouse (9000).
+  # Accepts OTLP gRPC on 4317 and HTTP on 4318, exports via the OTel
+  # clickhouse exporter to the clickhouse service below (port 9000).
   # ────────────────────────────────────────────────────────────────────────
   signoz-ingester:
     <<: *logging-common
@@ -207,14 +233,37 @@ services:
       - {{ fluent_bit_config_dir }}/otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
     command:
       - --config=/etc/otel-collector-config.yaml
+    # The otel/opentelemetry-collector-contrib image is **distroless** —
+    # no shell, no wget, no nc. The previous `CMD-SHELL, wget ...`
+    # healthcheck ALWAYS failed (`exec: /bin/sh: no such file`), so
+    # Docker marked the container unhealthy even when the collector was
+    # happily accepting OTLP. Docker compose v2 healthcheck only supports
+    # `CMD`, `CMD-SHELL`, and `NONE` — and the `PORT` test type isn't in
+    # any release. We use the otel-collector binary's `validate` subcommand
+    # as a config-validity probe (exit 0 if /etc/otel-collector-config.yaml
+    # parses cleanly, exit 1 otherwise). It's not a liveness probe — a
+    # real liveness check would require shelling, which the image
+    # doesn't allow. If the config is broken, we WANT the container
+    # marked unhealthy so it shows up in `docker ps`. If the collector
+    # process crashes mid-flight, `restart: unless-stopped` (via the
+    # `x-logging-common` anchor) brings it back; the bridge collector
+    # will show connection-refused if the OTLP listener is down, which
+    # is the real liveness signal at the application layer.
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:13133/health/status | grep -q SERVING || exit 1"]
-      interval: 30s
+      test: ["CMD", "/otelcol-contrib", "validate", "--config=/etc/otel-collector-config.yaml"]
+      interval: 60s
       timeout: 5s
       retries: 3
-      start_period: 15s
+      start_period: 30s
+    # Wait for clickhouse (not signoz) — the clickhouse exporter dials
+    # clickhouse:9000 directly. The exporter's retry_on_failure handles
+    # the ClickHouse init race (ClickHouse takes ~10s to be ready after
+    # the container starts). condition: service_started (not
+    # service_healthy) is enough since the clickhouse healthcheck is its
+    # own subsystem; the exporter's retry loop covers the rest.
     depends_on:
-      - signoz
+      clickhouse:
+        condition: service_started
     mem_limit: 256m
     cpus: 0.5
 
@@ -238,4 +287,6 @@ volumes:
   ircfiber_grafana_plugins:
     external: true
   ircfiber_signoz_data:
+    external: true
+  ircfiber_clickhouse_data:
     external: true
