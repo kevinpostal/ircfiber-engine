@@ -66,6 +66,47 @@ page.on('console', msg => { if (msg.text().includes('[tag]')) logs.push(msg.text
 
 The `capture_comparison.js` script also captures IRCCloud's live CSS for reference.
 
+## D Backend Test Suites (engine + shared modules)
+
+`make test-fast` runs the fast standalone D tests (no Redis, no live IRC):
+- `prefs-test`            — preference round-trip
+- `parser-test`           — IRC line parser
+- `consumer-test`         — reconnect-dedup helpers
+- `holder-test`           — conn-holder IPC framing defense
+- `connection-holder-strict-test`  — NetworkHolderHealth JSON contract
+- `connection-registration-test`   — **NEW**: ConnectionServer.registrationUnavailableFor JSON contract for the admin registration-stuck surface
+- `observability-test`    — OTel metrics pipeline
+
+For end-to-end tests that require a live IRC server, use the scripts in
+`scripts/e2e/` (see the e2e section at the bottom of this file).
+
+### Connection registration timeout (RFC 2812)
+
+`source/ircfiber/irc/connection.d` enforces a hard
+`REGISTRATION_OVERALL_TIMEOUT_SECS = 30` on the CAP + NICK + USER + SASL
+handshake. RFC 2812 §2.3 explicitly states: *"client should expect a
+reply as specified but it is not advised to wait forever for the
+reply"*. Before this, a black-holed server (open TCP, never sends 001)
+would wedge the network's join state forever and operators would see
+`Joining #channel…` with no clue why.
+
+When the timeout fires, the engine:
+1. Sets `client.registrationTimeoutSince` to unix-ms
+2. Throws to let the connection loop's exponential backoff schedule a
+   retry
+3. Emits a `ircfiber.registration.timeout` counter (tagged by
+   network / host)
+4. Surfaces the network in
+   `ConnectionServer.registrationUnavailableFor`, surfaced via
+   `GET /api/admin/servers` so the admin SPA can show "this network
+   is stuck in registration" with a real reason
+
+Run `python3 scripts/e2e/registration_timeout.py` to verify end-to-end:
+the test stands up a local Python TCP listener that accepts but never
+sends 001, configures a network pointing at it, and asserts the
+engine's `registrationUnavailableFor` array contains the network
+within 75s.
+
 ---
 
 # IRC Fiber — Graceful Engine Hot-Reload
