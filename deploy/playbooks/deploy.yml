@@ -13,7 +13,12 @@
   hosts: ircfiber
   become: false
   gather_facts: true
+  # ansible-core 2.20 doesn't auto-load group_vars when the inventory
+  # path contains spaces (see site.yml for the full explanation).
+  # Load group_vars and the vault explicitly so ircfiber_repo_root and
+  # vault_mongo_* are both resolvable.
   vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/all.yml"
     - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
   roles:
     - role: ircfiber_image
@@ -22,6 +27,7 @@
   hosts: ircfiber_gw
   become: true
   vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/all.yml"
     - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
   roles:
     - role: gateway
@@ -31,6 +37,7 @@
   become: true
   serial: 1
   vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/all.yml"
     - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
   roles:
     - role: engine

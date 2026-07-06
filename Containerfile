@@ -95,12 +95,14 @@ RUN --mount=type=cache,target=/build/.dub \
     dub build --config=engine --compiler=ldc2 --build=release --parallel && \
     dub build --config=conn-holder --compiler=ldc2 --build=release --parallel && \
     dub build --config=janitor-migrate --compiler=ldc2 --build=release --parallel && \
+    dub build --config=ircfiber-default-migrate --compiler=ldc2 --build=release --parallel && \
     test -f /build/irc-fiber && \
     test -f /build/irc-fiber-engine && \
     test -f /build/ircfiber-conn-holder && \
-    test -f /build/janitor-migrate
+    test -f /build/janitor-migrate && \
+    test -f /build/ircfiber-default-migrate
 
-# Single layer: strip all 4 binaries (one find instead of 4 RUNs).
+# Single layer: strip all 5 binaries (one find instead of 5 RUNs).
 RUN find /build -maxdepth 1 -type f -executable -exec strip {} +
 
 # ============================================================================
@@ -136,6 +138,16 @@ RUN mkdir -p /app/data /app/uploads /var/run/ircfiber && \
     chmod 0755 /var/run/ircfiber
 
 EXPOSE 8090
+
+# Operator scripts — the engine entrypoint enforces clean container
+# state (kills stale handoff processes, removes stale markers, waits
+# for holder socket) so multiple deploys in a row can't accumulate
+# zombie binaries. The healthcheck verifies the engine process is
+# alive without false negatives on transient handoff invocations.
+COPY deploy/roles/engine/files/ircfiber-engine-entrypoint.sh /usr/local/bin/ircfiber-engine-entrypoint.sh
+COPY deploy/roles/engine/files/ircfiber-engine-healthcheck.sh /usr/local/bin/ircfiber-engine-healthcheck.sh
+RUN chmod 0755 /usr/local/bin/ircfiber-engine-entrypoint.sh \
+              /usr/local/bin/ircfiber-engine-healthcheck.sh
 
 # tini as init — prevents zombie processes and allows graceful
 # handoff within a container. Without it, the engine runs as PID 1

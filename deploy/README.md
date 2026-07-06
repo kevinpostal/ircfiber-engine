@@ -259,11 +259,6 @@ layer.
 ./deploy/test/signoz-config/test-clickhouse-config-regressions.sh
 ```
 
-The validator is also embedded in the SigNoz role's first task, so
-`ansible-playbook playbooks/signoz.yml` aborts before any docker
-commands run on the host if the config is bad. Pass `--check` to
-skip the validator in a dry run.
-
 See [`deploy/test/signoz-config/README.md`](test/signoz-config/README.md)
 for the full rationale and what's tested.
 

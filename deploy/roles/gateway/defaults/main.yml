@@ -12,3 +12,8 @@ gateway_healthcheck_start_period: 40s
 # When set, the gateway's admin password is reset to this on every start
 # (overrides the source/app.d default 'REDACTED'). Empty = leave default.
 ircfiber_admin_password_reset: "{{ vault_ircfiber_admin_password | default('') }}"
+
+# Number of gateway container replicas (1 = single container named ircfiber-gateway).
+gateway_replica_count: 1
+# When true and replica_count > 1, Caddy uses ip_hash so WebSocket clients stick.
+gateway_replica_sticky: true

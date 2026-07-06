@@ -82,9 +82,49 @@ The engine supports **graceful hot-reload** (handoff) — IRC connections surviv
    - Sends `RECORD plain|tls <nidLen>:<nid>` header
    - Transfers JSON state + raw socket FD via `SCM_RIGHTS` (plain TCP only)
    - Waits for `ACK` from new engine
-5. Old engine sends `DONE <count>`, marks itself `draining:true` in Redis, exits cleanly (rc=0)
-6. New engine adopts all FDs, replays state, publishes `CONNECTED` synthetic events
-7. **TLS connections:** FD transfer is impossible (TLS session state is in userspace). The new engine does a soft-reconnect (Happy Eyeballs → TLS → CAP → SASL → JOIN) and publishes a `DISCONNECTED` synthetic event before reconnecting
+5. **TLS records (fd < 0):** queued in `pendingHandoffRecords` on the new engine. After the last ACK, the old engine calls `notifyHandoffComplete` which synchronously writes QUIT on every live TLS socket via `forcePostHandoffQuit` — this releases the nick on the IRC server BEFORE the new engine attempts registration. See "TLS nick collision fix" below for why.
+6. Old engine writes `DONE <count>`, marks itself `draining:true` in Redis, returns from `serveReload`
+7. New engine reads `DONE`, calls `startPendingHandoffReconnects()` which drains the queued TLS records. Each queued soft-reconnect runs on its own fiber with a 500ms settling delay so the IRC server has time to fully process the old engine's QUIT before the new engine's NICK hits the wire.
+8. New engine adopts all FDs (plain) or soft-reconnects (TLS), publishes `CONNECTED` synthetic events
+9. Old engine exits via the post-handoff early-check in `processEvents` (sets `isShutdownRequested=true` after seeing `postHandoffQuitAtMs > 0`, then runs cleanup + `exit(0)` if not PID 1).
+
+## TLS nick collision fix (Jul 4 2026)
+
+### The bug
+
+Before this fix, a hot reload on a TLS network produced `Zodiac_` (with trailing
+underscore) as a ghost member in every joined channel. The chain:
+
+1. OLD engine had `Zodiac` registered on the IRC server.
+2. NEW engine started `performRegistration` immediately on receiving the
+   RECORD (per-record, not after DONE).
+3. NEW engine sent `NICK Zodiac` while the OLD engine's TLS socket still
+   held the registration — 433 → fallback to `Zodiac_`.
+4. NEW engine JOINed `#ircfiber` as `Zodiac_`, racing the OLD's still-live
+   connection. The channel briefly showed both.
+5. `persistNick` saved `Zodiac_`, making the bad nick sticky across every
+   subsequent reconnect.
+
+### The fix (three layers)
+
+| Layer | Change | File |
+|---|---|---|
+| 1. Queue TLS reconnects | `adoptFromHandoff` no longer calls `addAndStartNetwork` for fd<0 records; it appends to `pendingHandoffRecords`. | `source/ircfiber/irc/manager.d` |
+| 2. Drain after DONE | `adoptFromOldEngine` calls `startPendingHandoffReconnects()` after the protocol's DONE marker, so the old engine has called `notifyHandoffComplete` first. The drain wraps each soft-reconnect in a 500ms-delayed task so the IRC server fully processes the QUIT before the new engine's NICK arrives. | `source/ircfiber/engine/reload_orchestrator.d`, `source/ircfiber/irc/manager.d` |
+| 3. Synchronous QUIT on TLS | `notifyHandoffComplete` now calls `forcePostHandoffQuit` (new method on `PersistentIRCClient`) for TLS records. It writes QUIT on the live TLS socket SYNCHRONOUSLY before the handoff protocol sends DONE — by the time the new engine reads DONE, the IRC server has freed the nick. Plain-TCP records still use `schedulePostHandoffQuit` (flag-based) since their FD was transferred via SCM_RIGHTS and the QUIT would write to a dead socket. | `source/ircfiber/irc/manager.d`, `source/ircfiber/irc/connection.d` |
+
+### The OLD-engine exit path
+
+After the pause releases in `serveReload`'s scope exit, every client's
+event-loop `processEvents()` early-check at `connection.d:2275` sees
+`postHandoffQuitAtMs > 0`, sets `isShutdownRequested = true`, closes the
+transport, and returns. The outer `runConnectionLoop` then breaks, runs
+cleanup(), and calls `exit(0)` (if not PID 1). For deployments where the
+OLD engine is supervised and needs a fast-exit signal, set
+`IRCFIBER_FORCE_EXIT_ON_HANDOFF=1` in the OLD engine's environment to
+force-exit immediately after DONE is written (defense in depth — useful
+when the connection loop is blocked in `waitForData()` with a long
+timeout).
 
 ## Wire Protocol
 
@@ -105,10 +145,9 @@ New engine →            ACK\n
 | File | Purpose |
 |---|---|
 | `source/ircfiber/engine/handoff.d` | Unix socket plumbing, SCM_RIGHTS FD transfer, JSON serde for HandoffState |
-| `source/ircfiber/engine/reload_orchestrator.d` | `adoptFromOldEngine` (client) + `serveReload` (server) + `triggerHandoff` |
-| `source/ircfiber/engine/adopted_socket.d` | Thin POSIX fd wrapper replacing `TCPConnection` for adopted sockets |
-| `source/ircfiber/irc/connection.d` | `pauseForHandoff/resumeAfterHandoff/snapshotForHandoff/adoptAndStart` |
-| `source/ircfiber/irc/manager.d` | `pauseAllForHandoff/snapshotAllForHandoff/adoptFromHandoff` |
+| `source/ircfiber/engine/reload_orchestrator.d` | `adoptFromOldEngine` (client) + `serveReload` (server) + `triggerHandoff` + DONE-time queue drain |
+| `source/ircfiber/irc/connection.d` | `pauseForHandoff/resumeAfterHandoff/snapshotForHandoff/adoptAndStart` + `forcePostHandoffQuit` (synchronous TLS QUIT) + post-handoff early exit check |
+| `source/ircfiber/irc/manager.d` | `pauseAllForHandoff/snapshotAllForHandoff/adoptFromHandoff` (queues TLS records) + `notifyHandoffComplete` (synchronous QUIT for TLS) + `startPendingHandoffReconnects` (drains queue with 500ms settling delay) |
 | `source/app_engine.d` | Two-path boot (fresh vs. handoff), PID file writing after adoption |
 
 ## Commands
@@ -144,7 +183,7 @@ Run **before** touching the OVH server when changing `deploy/roles/signoz/files/
 ./deploy/test/signoz-config/test-clickhouse-config-regressions.sh
 ```
 
-The same validator is the first task in `deploy/roles/signoz/tasks/main.yml`, so `ansible-playbook playbooks/signoz.yml` aborts before any docker commands run on the host if the config is bad. Pass `--check` to skip the validator in a dry run. See `deploy/test/signoz-config/README.md` for the full rationale and what's tested.
+The same validator is embedded as a preflight task in the `logging` role, so `ansible-playbook playbooks/logging.yml` aborts before any docker commands run on the host if the config is bad. Pass `--check` to skip the validator in a dry run. See `deploy/test/signoz-config/README.md` for the full rationale and what's tested.
 
 ---
 
@@ -751,6 +790,46 @@ A reference test for this flow is sketched in
 the in-repo docker stack because the engine's SASL handshake with
 unreal_sasl needed a different password and the engine's connection
 flickered under repeated test runs; this is a work-in-progress).
+
+# IRC Fiber — Distroless OTel collector healthcheck pattern
+
+The `ircfiber-signoz-ingester` (and the bridge `ircfiber-otel-collector`)
+both use `otel/opentelemetry-collector-contrib`, which is a **distroless**
+image: no shell, no wget, no nc, no `/bin/sh`. Docker compose v2 healthchecks
+only support `CMD`, `CMD-SHELL`, and `NONE` — and `CMD-SHELL` rewrites to
+`/bin/sh -c …` internally, which immediately fails on a distroless image
+(`exec: /bin/sh: no such file`), leaving the container marked unhealthy
+forever even when the collector is happily accepting OTLP.
+
+Right pattern for a distroless collector healthcheck:
+
+```yaml
+healthcheck:
+  test: ["CMD", "/otelcol-contrib", "validate", "--config=/etc/otel-collector-config.yaml"]
+  interval: 60s
+  timeout: 5s
+  retries: 3
+  start_period: 30s
+```
+
+This probes **config validity**, not liveness — `validate` only checks that
+the YAML parses. That's actually what we want for "container is broken":
+if the config is malformed, `validate` exits 1 and Docker marks the
+container unhealthy (visible in `docker ps`). If the collector process
+crashes mid-flight, `restart: unless-stopped` (via `x-logging-common` in
+`docker-compose.logging.yml.j2`) brings it back; the bridge collector will
+show `connection-refused` against OTLP if the listener is down, which is
+the real liveness signal at the application layer.
+
+Also: the `clickhouse` exporter in the OTel collector runs `CREATE DATABASE`
+on startup to bootstrap the schema, so it crashes once if ClickHouse
+isn't ready yet (typically ~5–15s after the container starts). Docker
+`restart: unless-stopped` handles this in 1–2 retries — no `depends_on:
+condition: service_healthy` needed, because that would require the
+healthcheck above to be live (and we just said it can't be).
+
+See `deploy/roles/logging/templates/docker-compose.logging.yml.j2` for
+the deployed config.
 
 ## IRC Fiber — Observability
 

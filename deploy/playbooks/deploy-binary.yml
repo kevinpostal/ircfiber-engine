@@ -53,7 +53,7 @@
           - "--exclude=irc-fiber"
           - "--exclude=irc-fiber-engine"
           - "--exclude=frontend/node_modules"
-          - "--exclude=public/dist"
+          
 
     - name: Build gateway via Docker BuildKit (cached LDC + incremental dub)
       ansible.builtin.shell: |
@@ -91,21 +91,28 @@
       changed_when: "'built in' in npm_out.stdout"
       timeout: 120
 
-    - name: Stop gateway container (clean state for cp)
+    - name: Build gateway replica list
+      ansible.builtin.set_fact:
+        _gw_replicas: "{{ ['ircfiber-gateway'] if (gateway_replica_count | default(1) | int) == 1 else (range(gateway_replica_count | default(1) | int) | map('regex_replace', '^', 'ircfiber-gateway-') | list) }}"
+
+    - name: Stop gateway replicas (clean state for cp)
       community.docker.docker_container:
-        name: "{{ container_name }}"
+        name: "{{ item }}"
         state: stopped
+      loop: "{{ _gw_replicas }}"
       ignore_errors: true
 
-    - name: Inject gateway binary
+    - name: Inject gateway binary into replicas
       ansible.builtin.shell: |
-        docker cp {{ host_binary }} {{ container_name }}:{{ container_binary }}
+        docker cp {{ host_binary }} {{ item }}:{{ container_binary }}
+      loop: "{{ _gw_replicas }}"
 
-    - name: Restart gateway
+    - name: Restart gateway replicas
       community.docker.docker_container:
-        name: "{{ container_name }}"
+        name: "{{ item }}"
         state: started
         restart: true
+      loop: "{{ _gw_replicas }}"
 
     - name: Stop engine container
       community.docker.docker_container:

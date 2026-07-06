@@ -64,10 +64,13 @@
         state: present
       when: docker_registry_url | length == 0
 
-    - name: Restart gateway
-      community.docker.docker_container:
-        name: "{{ gateway_container_name }}"
-        restart: true
+    - name: Restart gateway replicas
+      ansible.builtin.shell: |
+        set -o pipefail
+        for ctr in $(docker ps -a --filter name='ircfiber-gateway' --format '{{.Names}}' | sort); do
+          docker restart "$ctr" >/dev/null
+          echo "Restarted $ctr"
+        done
 
 - name: Pull/rebuild new images & roll-restart engines one at a time
   hosts: ircfiber_engines

@@ -82,7 +82,7 @@
           - "--exclude=irc-fiber"
           - "--exclude=irc-fiber-engine"
           - "--exclude=frontend/node_modules"
-          - "--exclude=public/dist"
+          
           - "--exclude=.reasonix"
           - "--exclude=.playwright-mcp"
           - "--exclude=test-results"

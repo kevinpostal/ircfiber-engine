@@ -53,7 +53,7 @@
     owner: root
     group: root
     mode: "0644"
-  notify: Reload caddy
+  notify: Restart caddy
 
 - name: Run ircfiber-caddy
   community.docker.docker_container:

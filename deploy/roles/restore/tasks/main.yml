@@ -25,10 +25,18 @@
   register: snapshot_stats
   when: item | length > 0
 
-- name: Stop the gateway
+- name: Set facts for gateway replica deployment
+  ansible.builtin.set_fact:
+    _gw_container_names: "{{ [gateway_container_name] if (gateway_replica_count | default(1) | int) == 1 else (range(gateway_replica_count | default(1) | int) | map('regex_replace', '^', 'ircfiber-gateway-') | list) }}"
+  when:
+    - restore_mongo_snapshot | length > 0 or restore_redis_snapshot | length > 0
+    - gateway_container_name is defined
+
+- name: Stop the gateway replicas
   community.docker.docker_container:
-    name: "{{ gateway_container_name }}"
+    name: "{{ item }}"
     state: stopped
+  loop: "{{ _gw_container_names | default([gateway_container_name]) }}"
   when:
     - restore_mongo_snapshot | length > 0 or restore_redis_snapshot | length > 0
     - gateway_container_name is defined
@@ -87,10 +95,11 @@
     state: absent
   when: restore_redis_snapshot | length > 0
 
-- name: Start the gateway
+- name: Start the gateway replicas
   community.docker.docker_container:
-    name: "{{ gateway_container_name }}"
+    name: "{{ item }}"
     state: started
+  loop: "{{ _gw_container_names | default([gateway_container_name]) }}"
   when:
     - gateway_container_name is defined
     - restore_mongo_snapshot | length > 0 or restore_redis_snapshot | length > 0

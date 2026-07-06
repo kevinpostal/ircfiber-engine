@@ -129,6 +129,10 @@
         }
     }
 
+    # Gateway upstream — single replica or load-balanced multi-replica.
+    # When replica_count > 1, active health checks detect dead replicas
+    # and ip_hash pins WebSocket clients to the same replica.
+    {% if (gateway_replica_count | default(1) | int) == 1 %}
     reverse_proxy ircfiber-gateway:{{ gateway_http_port }} {
         # Long-lived transport for WebSockets and slow message-history fetches
         transport http {
@@ -138,6 +142,29 @@
             write_timeout 24h
         }
     }
+    {% else %}
+    reverse_proxy{% for i in range(gateway_replica_count | int) %} ircfiber-gateway-{{ i }}:{{ gateway_http_port }}{% endfor %} {
+        # Active health checks — remove dead replicas from the pool
+        health_uri /health
+        health_interval 30s
+        health_timeout 5s
+        health_fails 3
+        health_passes 2
+{% if gateway_replica_sticky | default(true) | bool %}
+        # Sticky sessions — hash on the real client IP (trusted_proxies
+        # configured in the global options block below). Ensures WebSocket
+        # connections stay with the same replica.
+        lb_policy ip_hash
+{% endif %}
+        # Long-lived transport for WebSockets and slow message-history fetches
+        transport http {
+            dial_timeout 30s
+            response_header_timeout 60s
+            read_timeout 24h
+            write_timeout 24h
+        }
+    }
+    {% endif %}
 
     # Security headers — only applied to non-SigNoz responses. The
     # /signoz/* path needs no X-Frame-Options or frame-ancestors so
@@ -176,6 +203,14 @@
     admin localhost:2019
 {% if use_internal_ca %}
     local_certs
+{% endif %}
+{% if (gateway_replica_count | default(1) | int) > 1 %}
+    # Trusted proxies — required for correct ip_hash stickiness when
+    # behind Cloudflare Tunnel (cloudflared). Without this, Caddy hashes
+    # the cloudflared container IP instead of the real client IP.
+    servers {
+        trusted_proxies static private_ranges
+    }
 {% endif %}
 }
 

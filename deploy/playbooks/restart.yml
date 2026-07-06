@@ -45,10 +45,13 @@
       loop_control:
         loop_var: item
 
-    - name: Restart Gateway
-      community.docker.docker_container:
-        name: ircfiber-gateway
-        restart: true
+    - name: Restart Gateway replicas
+      ansible.builtin.shell: |
+        set -o pipefail
+        for ctr in $(docker ps -a --filter name='ircfiber-gateway' --format '{{.Names}}' | sort); do
+          docker restart "$ctr" >/dev/null
+          echo "Restarted $ctr"
+        done
       when: "'gateway' in (components | split(',') | map('trim') | list)"
       delegate_to: "{{ item }}"
       loop: "{{ groups['ircfiber_gw'] | default([]) }}"

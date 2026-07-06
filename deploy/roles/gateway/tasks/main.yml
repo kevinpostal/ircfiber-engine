@@ -41,7 +41,7 @@
     owner: root
     group: root
     mode: "0640"
-  notify: Restart gateway
+  notify: Restart gateway replicas
 
 - name: Ensure uploads & logs volumes exist
   community.docker.docker_volume:
@@ -59,16 +59,37 @@
       # to the otel-collector. Required for distributed tracing.
       - name: ircfiber_logging
 
-- name: Run ircfiber-gateway
+- name: Set facts for gateway replica deployment
+  ansible.builtin.set_fact:
+    _gw_container_names: "{{ ['ircfiber-gateway'] if (gateway_replica_count | int) == 1 else (range(gateway_replica_count | int) | map('regex_replace', '^', 'ircfiber-gateway-') | list) }}"
+
+# Read env_file into a dict and pass via env: (NOT env_file:) so the
+# docker_container module compares values against the running container
+# and recreates it when env content drifts. With env_file: the module
+# never compares values, which is how the gateway got stuck with a stale
+# MONGO_URL after a vault rotation on 2026-07-04 (real outage).
+- name: Slurp gateway env file from target
+  ansible.builtin.slurp:
+    src: /etc/ircfiber/gateway/env
+  register: _gateway_env_raw
+
+- name: Parse gateway env into a dict
+  vars:
+    _raw_lines: "{{ (_gateway_env_raw.content | b64decode).split('\n') | reject('match', '^\\s*#') | map('trim') | reject('equalto', '') | list }}"
+    _pairs: "{{ _raw_lines | map('split', '=', 1) | list }}"
+  ansible.builtin.set_fact:
+    _gateway_env: "{{ dict(_pairs) }}"
+
+- name: Run ircfiber-gateway replicas
   community.docker.docker_container:
-    name: "{{ gateway_container_name }}"
+    name: "{{ item }}"
     image: "{{ ircfiber_gateway_image_full }}"
     state: started
     restart_policy: unless-stopped
     command: ["/app/irc-fiber"]
     networks: "{{ ircfiber_networks_for_gateway }}"
     networks_cli_compatible: true
-    env_file: /etc/ircfiber/gateway/env
+    env: "{{ _gateway_env }}"
     volumes:
       - "{{ gateway_uploads_volume }}:/app/uploads"
       - "{{ gateway_logs_volume }}:/var/log/irc-fiber"
@@ -85,3 +106,4 @@
     labels:
       com.ircfiber.component: "gateway"
       com.ircfiber.version: "{{ ircfiber_version }}"
+  loop: "{{ _gw_container_names }}"

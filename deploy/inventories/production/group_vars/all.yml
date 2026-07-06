@@ -64,6 +64,12 @@ redis_appendonly: true
 gateway_http_port: 8090
 gateway_uploads_volume: "ircfiber_uploads"
 gateway_logs_volume: "ircfiber_logs"
+# Number of gateway container replicas (1 = single, backward-compatible name).
+# Raise to 2-4 for process-level isolation and horizontal scale on the same host.
+gateway_replica_count: 1
+# When true and replica_count > 1, Caddy uses ip_hash load balancing so
+# WebSocket clients stay pinned to the same replica.
+gateway_replica_sticky: true
 
 # --- Caddy --------------------------------------------------------------------
 caddy_data_volume: "ircfiber_caddy_data"

@@ -274,3 +274,47 @@
   annotations:
     summary: "Caddy 5xx > 1% of traffic"
     description: "More than 1% of caddy requests returning 5xx over 5 min"
+
+# 8. Gateway fiber wedge (long-running fibers > 0 for 30 consecutive seconds)
+- alert: GatewayFiberWedge
+  alertType: "METRIC_BASED_ALERT"
+  ruleType: "prometheus_rule"
+  evalInterval: "{{ signoz_alert_eval_interval_sec }}"
+  for: 30s
+  disabled: true
+  condition:
+    compositeQuery:
+      queryType: ""
+      panelType: "time_series"
+      queries:
+        - type: "builder"
+          spec:
+            name: "A"
+            signal: "metrics"
+            aggregateOperator: "max"
+            aggregateAttribute:
+              key: "gateway_long_running_fiber_seconds"
+              dataType: "float64"
+            timeAggregation: "max"
+            spaceAggregation: "max"
+            functions: []
+            filter:
+              expression: ""
+            op: "max"
+            groupBy: []
+            expression: "A"
+            disabled: false
+            having:
+              expression: "A > 0"
+              value: "0"
+            orderBy: []
+            limit: null
+            legend: "fiber wedge"
+      unit: "seconds"
+  labels:
+    severity: critical
+    service: gateway
+  annotations:
+    summary: "Gateway fiber wedge detected"
+    description: "Gateway has had a fiber running without yielding for >5s for 30 consecutive seconds. HTTP requests will time out."
+    runbook: "1. docker logs --tail 200 ircfiber-gateway -- look for FiberWatch lines. 2. curl http://localhost:8090/api/health -- check sessions.dropped. 3. docker restart ircfiber-gateway -- immediate recovery."

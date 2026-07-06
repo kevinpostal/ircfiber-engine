@@ -150,7 +150,7 @@ AR := →
 # ──────────────────────────────────────────────────────────────────────────
 
 # Tailnet connection settings (used by debug-live)
-TAILNET_MONGO_URL ?= mongodb://ircfiber:jqgwEv3GJwwizulaj3Fnbd8imqcMH4Gh@100.126.197.92:27017/ircfiber
+TAILNET_MONGO_URL ?= mongodb://ircfiber:newpass42@100.126.197.92:27017/ircfiber
 TAILNET_REDIS_URL ?= redis://100.126.197.92:6379/0
 
 # Local docker connection settings (used by debug)
@@ -741,6 +741,15 @@ janitor-migrate: ## Build > Run janitor-migrate (TTL backfill). Dry-run by defau
 	@printf '%b\n' "$(BG)$(OK) Running janitor-migrate (dry-run)$(R)"
 	@JSMIGRATE_DRY_RUN=1 ./janitor-migrate
 
+# Default-network migration — ensure every existing user has the
+# irc.ircfiber.com:6697 connection. Idempotent. Skip with DRY_RUN=0 to
+# actually write to Mongo.
+ircfiber-default-migrate: ## Build > Backfill the default IRC Fiber network for every existing user
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Building ircfiber-default-migrate  $(R)"
+	@$(DUB) build --config=ircfiber-default-migrate 2>&1 | tail -5
+	@printf '%b\n' "$(BG)$(OK) Running ircfiber-default-migrate (dry-run)$(R)"
+	@DRY_RUN=1 ./ircfiber-default-migrate --dry-run
+
 build-engine-zig-alpine: ## Build > Cross-compile Zig engine for Alpine (musl)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building Zig Engine (Alpine target)  $(R)"
 	@mkdir -p engine/zig-out/bin
@@ -884,6 +893,11 @@ prefs-test: ## Test > User-preferences defensive-parse suite (skips if Redis mis
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Prefs defensive-parse tests  $(R)"
 	@$(DUB) build --config=prefs-test 2>&1 | tail -3
 	@./prefs-test
+
+dedup-test: ## Test > REST scrollback Redis/MongoDB dedup (refresh-on-low-volume-channel regression)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Scrollback dedup tests  $(R)"
+	@$(DUB) build --config=dedup-test 2>&1 | tail -3
+	@./dedup-test
 
 parser-test: ## Test > IRC parser defensive guards + RFC 2812 coverage
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Parser defensive-parse tests  $(R)"
@@ -1048,6 +1062,13 @@ verify: lint test ## Verify > lint + test (pre-push gate)
 precommit: fmt-check lint test ## Verify > fmt-check + lint + test (pre-commit gate)
 	@printf '\n%b\n' "$(BG)$(OK) precommit passed (fmt + lint + test)$(R)"
 
+pre-deploy-gate: ## Verify > Run pre-deploy loadtest gate (p99 /health < 200ms)
+	@printf '%b\n' "$(D)  Loadtest gate...$(R)"
+	@scripts/pre-deploy-loadtest.sh
+	@printf '%b\n' "$(G)  Loadtest gate passed$(R)"
+
+pre-deploy: pre-deploy-gate ## Verify > Run all pre-deploy gates (loadtest, etc.)
+
 ci: precommit ## Verify > Full CI suite (fmt + lint + test, fail-fast)
 	@printf '\n%b\n' "$(BG)$(OK) CI pipeline passed$(R)"
 
@@ -1162,6 +1183,12 @@ docker-down: ensure-colima ## Docker > Stop ALL IRC Fiber containers (3 compose 
 	@printf '%b\n' "$(D)→ Stopping holder stack (docker-compose.holder.yml)...$(R)"
 	@docker compose -f $(HOLDER_COMPOSE) down --timeout 15 2>/dev/null; true
 	@printf '%b\n' "$(BG)$(OK) Holder stack stopped$(R)"
+	@printf '%b\n' "$(D)→ Stopping local dev stack (deploy/local/docker-compose.yml)...$(R)"
+	@if [ -f deploy/local/docker-compose.yml ]; then \
+		docker compose -f deploy/local/docker-compose.yml down --remove-orphans --timeout 15 2>/dev/null; true; \
+	else \
+		printf '%b\n' "$(D)  (skipped — deploy/local/docker-compose.yml not present)$(R)"; \
+	fi
 	@if docker network inspect irc_fiber_irc_network >/dev/null 2>&1; then \
 		printf '%b\n' "$(D)→ Detaching any external containers from irc_fiber_irc_network...$(R)"; \
 		attached=$$(docker network inspect irc_fiber_irc_network --format '{{range .Containers}}{{.Name}} {{end}}' | tr ' ' '\n' | grep -v '^$$' | sort -u); \
@@ -1172,15 +1199,31 @@ docker-down: ensure-colima ## Docker > Stop ALL IRC Fiber containers (3 compose 
 		fi; \
 		docker network rm irc_fiber_irc_network 2>/dev/null; true; \
 	fi
+	@if docker network inspect irc_fiber_local ircfiber_local ircfiber_dev_irc_network >/dev/null 2>&1; then \
+		for net in irc_fiber_local ircfiber_local ircfiber_dev_irc_network; do \
+			if docker network inspect $$net >/dev/null 2>&1; then \
+				attached=$$(docker network inspect $$net --format '{{range .Containers}}{{.Name}} {{end}}' | tr ' ' '\n' | grep -v '^$$' | sort -u); \
+				if [ -n "$$attached" ]; then \
+					printf '%b\n' "$$attached" | while IFS= read -r name; do \
+						docker network disconnect -f $$net "$$name" 2>/dev/null; true; \
+					done; \
+				fi; \
+				docker network rm $$net 2>/dev/null; true; \
+			fi; \
+		done; \
+	fi
 	@printf '%b\n' "$(D)→ Stopping any remaining IRC Fiber containers (fallback for compose-metadata drift)...$(R)"
 	@docker container ls -q 2>/dev/null \
-		| xargs -r docker inspect --format '{{.Name}} {{.Id}}' 2>/dev/null \
-		| grep -E 'irc_fiber|ircd_test|irc_engine|ircd[_-]|irc_redis|irc_mongo|anope|unreal_sasl|mock-irc-op' \
+		| xargs -r docker inspect --format '{{.Name}} {{.Id}} {{index .Config.Labels "com.docker.compose.project"}} {{index .Config.Labels "com.docker.compose.config-hash"}}' 2>/dev/null \
+		| grep -E '(irc[_-]fiber|ircd_test|irc_engine|ircd[_-]|irc_redis|irc_mongo|anope|unreal_sasl|mock-irc-op|sweet_|builder-img|ircfiber[_-])' \
 		| awk '{print $$2}' \
 		| xargs -r docker stop --timeout 10 2>/dev/null; true
 	@printf '%b\n' "$(D)→ Removing stopped containers with IRC Fiber compose labels...$(R)"
 	@docker container prune --force --filter "label=com.docker.compose.project=irc_fiber" 2>/dev/null; true
 	@docker container prune --force --filter "label=com.docker.compose.project=ircfiber_prod" 2>/dev/null; true
+	@docker container prune --force --filter "label=com.docker.compose.project=local" 2>/dev/null; true
+	@docker container prune --force --filter "label=com.docker.compose.project=ircfiber_local" 2>/dev/null; true
+	@docker container prune --force --filter "label=com.docker.compose.project=ircfiber_dev" 2>/dev/null; true
 	@printf '%b\n' "$(BG)$(OK) All IRC Fiber containers stopped$(R)"
 
 docker-down-test: ensure-colima ## Docker > Stop test services (ircd + mongo + redis)
@@ -1493,8 +1536,12 @@ _playbook    = cd deploy && ansible-playbook -l $(_target) $(_vault_arg)
 update: frontend build build-engine ## Deploy > Build frontend + gateway + engine, handoff-deploy (zero disconnect for engines)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Deploy → $(_target)  $(R)"
 	@$(_playbook) playbooks/deploy-update.yml $(if $(SKIP_MIGRATE),-e skip_migrate=true)
-	@printf '%b\n' "$(D)  Syncing frontend dist → ircfiber-gateway (clean extract)$(R)"
-	@tar cz --no-xattrs --format=ustar -C public/dist . | ssh deploy@$(_target_ssh) 'docker exec -i ircfiber-gateway sh -c "rm -rf /app/public/dist/ 2>/dev/null; mkdir -p /app/public/dist/ && tar xzf - -C /app/public/dist"'
+	# The playbook's rsync handles public/ + views/ (dist/ included since
+	# the read-only mount on the container means docker cp writes silently
+	# fail). The shell-level push below is a belt-and-suspenders fallback
+	# in case a build produced a new dist AFTER the rsync step (the
+	# `frontend` target runs first, but `inject-manifest.js` updates
+	# views/index.dt in place, so re-syncing dist/ + views/ here is safe).
 
 # Alias: fast path is the default
 update-fast: update ## Deploy > Force hot path (same as `make update`)
@@ -1507,15 +1554,20 @@ update-full: ## Deploy > Full docker image rebuild + container recreate
 
 deploy: update-full ## Deploy > Alias for update-full
 
-# Build frontend + push public/ to running gateway via SSH.
+# Build frontend + push public/ + views/ to running gateway via SSH.
 # The gateway reads these files from disk at request time, so no binary
 # change, no container restart, no reconnect. ~2-3s after build.
+#
+# Container's /app/public and /app/views are READ-ONLY bind mounts from
+# /opt/ircfiber-src/{public,views}/ on the host — the rsync inside the
+# playbook already pushes there, so the push below only matters for
+# `make update-assets` (which doesn't run the playbook).
 update-assets: frontend ## Deploy > Build frontend + push public/* to running gateway (no restart)
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Asset push → $(_target_ssh) ($(_target))  $(R)"
-	@printf '%b\n' "$(D)  Tarring public/ → ssh → docker exec tar -xf - (clean extract)$(R)"
-	@tar cz --no-xattrs --format=ustar -C public . | ssh deploy@$(_target_ssh) 'docker exec -i ircfiber-gateway sh -c "rm -rf /app/public/dist/ /app/public/.vite/ /app/public/assets/ 2>/dev/null; tar xzf - -C /app/public"'
+	@printf '%b\n' "$(D)  Tarring public/ → ssh → tar -xf (host-side mount source)$(R)"
+	@tar cz --no-xattrs --format=ustar -C public . | ssh deploy@$(_target_ssh) 'rm -rf /opt/ircfiber-src/public/dist /opt/ircfiber-src/public/.vite /opt/ircfiber-src/public/assets && mkdir -p /opt/ircfiber-src/public && tar xzf - -C /opt/ircfiber-src/public'
 	@printf '%b\n' "$(D)  Pushing views/index.dt (updated bundle hashes)$(R)"
-	@ssh deploy@$(_target_ssh) 'docker exec -i ircfiber-gateway sh -c "cat > /app/views/index.dt"' < views/index.dt
+	@scp views/index.dt deploy@$(_target_ssh):/opt/ircfiber-src/views/index.dt
 
 # Show running container images and versions on the target.
 update-status: ## Deploy > Show running containers & image versions

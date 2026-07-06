@@ -57,3 +57,9 @@ caddy_signoz_route_enabled: true
 # and passes the value to the caddy container as the SIGNOZ_API_KEY
 # env var (the caddy binary is already started with --environ).
 caddy_signoz_api_key_path: /etc/ircfiber/signoz-mcp/.api_key
+
+# Gateway replica count — must match the value in group_vars/all.yml.
+# The Caddyfile template uses this to render the correct upstream list.
+gateway_replica_count: 1
+# When true and replica_count > 1, use ip_hash sticky sessions.
+gateway_replica_sticky: true
