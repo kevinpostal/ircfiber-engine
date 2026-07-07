@@ -150,7 +150,7 @@ AR := →
 # ──────────────────────────────────────────────────────────────────────────
 
 # Tailnet connection settings (used by debug-live)
-TAILNET_MONGO_URL ?= mongodb://ircfiber:newpass42@100.126.197.92:27017/ircfiber
+TAILNET_MONGO_URL ?= mongodb://ircfiber:jqgwEv3GJwwizulaj3Fnbd8imqcMH4Gh@100.126.197.92:27017/ircfiber
 TAILNET_REDIS_URL ?= redis://100.126.197.92:6379/0
 
 # Local docker connection settings (used by debug)
@@ -259,51 +259,25 @@ debug: build build-engine ## Component > Full stack: gateway + engine (supervise
 # leaving the supervisor orphaned. We redirect to a log file instead — use
 # `make logs` in another terminal for live tailing, and the colored startup
 # banner above still prints to this terminal.
-debug-live: build build-engine ## Component > Full stack: gateway + engine (supervised), TAILNET DBs — ctrl-c to stop
+debug-live: frontend ensure-colima ## Component > Full Docker stack: redis + mongo + ircd + gateway + engine — ctrl-c to stop
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Starting Docker stack  $(R)"
+	@printf '%b\n' "$(D)  Redis, Mongo, IRCd, Gateway, Engine — all local$(R)"
+	@docker compose build irc_fiber 2>&1 | tail -1
+	@printf '%b\n' "$(C)→ Starting services...$(R)"
+	@docker compose up -d redis mongo ircd irc_fiber irc_engine 2>&1 | tail -5
 	@bash -c 'set -u; \
-		printf "\n%b\n" "$(_BCn)$(K)$(B)  Engine (supervised) → TAILNET  $(R)"; \
-		printf "%b\n" "$(D)  Mongo: $(TAILNET_MONGO_URL)$(R)"; \
-		printf "%b\n" "$(D)  Redis: $(TAILNET_REDIS_URL)$(R)"; \
-		if docker info >/dev/null 2>&1 && docker compose ps --status running irc_fiber irc_engine 2>/dev/null | tail -n +2 | grep -q .; then \
-			printf "%b\n" "$(Y)$(WR) Docker irc_fiber/irc_engine containers are running — stopping them so the local binaries can use TAILNET DBs$(R)"; \
-			docker compose stop irc_fiber irc_engine 2>/dev/null || true; \
+		printf "\n%b\n" "$(D)Waiting for gateway at http://127.0.0.1:8090/ ...$(R)"; \
+		for i in $$(seq 1 30); do \
+			if curl -fsS http://127.0.0.1:8090/health >/dev/null 2>&1; then \
+				printf "%b\n" "$(BG)$(OK) Gateway is healthy$(R)"; \
+				printf "%b\n" "$(C)  → http://127.0.0.1:8090/$(R)"; \
+				printf "%b\n" "$(Y)$(WR) ctrl-c to stop  •  make docker-down  in another terminal$(R)"; \
+				exit 0; \
+			fi; \
 			sleep 1; \
-			printf "%b\n" "$(BG)$(OK) docker containers stopped (restart later with:  make docker-up)$(R)"; \
-		fi; \
-		killall -9 irc-fiber irc-fiber-engine 2>/dev/null || true; \
-		sleep 1; \
-		rm -f "$(GATEWAY_PIDFILE)" "$(SUPERVISOR_PIDFILE)" "$(ENGINE_PIDFILE)"; \
-		: > "$(SUPERVISOR_LOGFILE)"; \
-		: > "$(GATEWAY_LOGFILE)"; \
-		IRCFIBER_MONGO_URL="$(TAILNET_MONGO_URL)" IRCFIBER_REDIS_URL="$(TAILNET_REDIS_URL)" \
-			IRCFIBER_SERVER_ID="$${IRCFIBER_SERVER_ID:-localengine}" \
-			IRCFIBER_BIND_ADDRESS="$${IRCFIBER_BIND_ADDRESS:-127.0.0.1}" \
-			ENGINE_PIDFILE="$(ENGINE_PIDFILE)" \
-			ENGINE_LOGFILE="$(ENGINE_LOGFILE)" \
-			SUPERVISOR_LOGFILE="$(SUPERVISOR_LOGFILE)" \
-			SUPERVISOR_PIDFILE="$(SUPERVISOR_PIDFILE)" \
-			CRASH_DIR="$(CRASH_DIR)" \
-			"$(SUPERVISOR_SCRIPT)" > /tmp/irc-fiber-engine.supervisor.out 2>&1 & \
-		SUP_PID=$$!; echo $$SUP_PID > "$(SUPERVISOR_PIDFILE)"; \
-		printf "%b\n" "$(C)$(AR) engine supervisor pid=$$SUP_PID (auto-restarts on crash)$(R)"; \
-		sleep 3; \
-		printf "\n%b\n" "$(_BCn)$(K)$(B)  Gateway → TAILNET  $(R)"; \
-		printf "%b\n" "$(Y)$(WR) ctrl-c to stop everything  •  tail logs:  make logs  in another terminal$(R)"; \
-		cleanup() { \
-			printf "\n%b\n" "$(Y)$(WR) stopping...$(R)"; \
-			kill -TERM "$$SUP_PID" 2>/dev/null || true; \
-			killall -9 irc-fiber irc-fiber-engine 2>/dev/null || true; \
-			rm -f "$(GATEWAY_PIDFILE)" "$(SUPERVISOR_PIDFILE)" "$(ENGINE_PIDFILE)"; \
-			printf "%b\n" "$(BG)$(OK) debug-live stopped$(R)"; \
-			exit 0; \
-		}; \
-		trap cleanup INT TERM EXIT; \
-		IRCFIBER_MONGO_URL="$(TAILNET_MONGO_URL)" IRCFIBER_REDIS_URL="$(TAILNET_REDIS_URL)" \
-			"$(GATEWAY_BIN)" >> "$(GATEWAY_LOGFILE)" 2>&1; \
-		GW_EXIT=$$?; \
-		printf "\n%b\n" "$(Y)$(WR) gateway exited (code $$GW_EXIT)$(R)"; \
-		cleanup; \
-		exit $$GW_EXIT'
+		done; \
+		printf "%b\n" "$(Y)$(WR) Gateway did not become healthy in 30s — check docker compose logs$(R)"; \
+		exit 1'
 
 # Stop everything (supervisor + gateway). Does NOT kill a Vite dev server.
 stop: ## Component > Stop engine (supervised) + gateway
