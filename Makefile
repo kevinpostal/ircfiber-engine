@@ -927,7 +927,7 @@ parser-fuzz-test: ## Test > parser property-based fuzz (10k random lines)
 	@./parser-fuzz-test
 
 test-fast: ## Test > All fast standalone test suites (prefs/parser/consumer/holder/strict/observability/registration)
-	@for t in prefs-test parser-test consumer-test holder-test connection-holder-strict-test observability-test connection-registration-test; do \
+	@for t in prefs-test parser-test consumer-test holder-test connection-holder-strict-test observability-test connection-registration-test session-queue-test oob-test; do \
 		printf '\n%b\n' "$(_BCn)$(K)$(B)  $$t  $(R)"; \
 		$(DUB) build --config=$$t 2>&1 | tail -1 || exit 1; \
 		./$$t 2>&1 | tail -3; \
