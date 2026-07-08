@@ -26,9 +26,16 @@ grafana_disable_signup: true
 grafana_auth_proxy_enabled: true
 
 # SigNoz combined image
-signoz_version: "latest"
+signoz_version: "v0.131.1"
+signoz_image: "signoz/signoz:{{ signoz_version }}"
 signoz_container_name: ircfiber-signoz
 signoz_data_volume: ircfiber_signoz_data
+# SigNoz ingester — signoz-otel-collector with bundled ClickHouse exporter
+signoz_ingester_version: "v0.144.5"
+signoz_ingester_image: "signoz/signoz-otel-collector:{{ signoz_ingester_version }}"
+# ClickHouse
+signoz_clickhouse_version: "25.8"
+signoz_clickhouse_image: "clickhouse/clickhouse-server:{{ signoz_clickhouse_version }}"
 
 # Fluent Bit — Docker log shipper for SigNoz.
 fluent_bit_version: "3.2"

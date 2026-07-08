@@ -130,7 +130,7 @@ services:
   signoz:
     <<: *logging-common
     container_name: ${SIGNOZ_CONTAINER_NAME:-ircfiber-signoz}
-    image: ${SIGNOZ_IMAGE:-signoz/signoz:latest}
+    image: ${SIGNOZ_IMAGE:-signoz/signoz:{{ signoz_version }}}
     hostname: signoz
     networks:
       ircfiber_logging:
@@ -156,6 +156,8 @@ services:
       # connect: connection refused".
       SIGNOZ_TELEMETRYSTORE_PROVIDER: clickhouse
       SIGNOZ_TELEMETRYSTORE_CLICKHOUSE_DSN: tcp://clickhouse:9000
+      # Disable telemetry / usage reporting (stats reporter).
+      TELEMETRY_ENABLED: "false"
       # Without a JWT secret the binary logs a CRITICAL SECURITY ISSUE
       # warning and refuses to sign session tokens properly. Without
       # this, every login attempt after a fresh deploy fails with
@@ -184,7 +186,7 @@ services:
   clickhouse:
     <<: *logging-common
     container_name: ${CLICKHOUSE_CONTAINER_NAME:-ircfiber-clickhouse}
-    image: ${CLICKHOUSE_IMAGE:-clickhouse/clickhouse-server:24.8}
+    image: ${CLICKHOUSE_IMAGE:-{{ signoz_clickhouse_image }}}
     hostname: clickhouse
     networks:
       ircfiber_logging:
@@ -220,7 +222,7 @@ services:
   signoz-ingester:
     <<: *logging-common
     container_name: ${SIGNOZ_INGESTER_CONTAINER_NAME:-ircfiber-signoz-ingester}
-    image: ${SIGNOZ_INGESTER_IMAGE:-otel/opentelemetry-collector-contrib:0.120.0}
+    image: ${SIGNOZ_INGESTER_IMAGE:-{{ signoz_ingester_image }}}
     hostname: signoz-ingester
     networks:
       ircfiber_logging:
@@ -249,12 +251,12 @@ services:
     # `x-logging-common` anchor) brings it back; the bridge collector
     # will show connection-refused if the OTLP listener is down, which
     # is the real liveness signal at the application layer.
+    # Distroless image — binary is /signoz-otel-collector, no shell/wget.
+    # No validate subcommand exists. restart: unless-stopped handles crashes.
+    # Application-level liveness: OTel collector shows connection-refused
+    # to OTLP if the listener is down, surfaced via the bridge logs.
     healthcheck:
-      test: ["CMD", "/otelcol-contrib", "validate", "--config=/etc/otel-collector-config.yaml"]
-      interval: 60s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
+      disable: true
     # Wait for clickhouse (not signoz) — the clickhouse exporter dials
     # clickhouse:9000 directly. The exporter's retry_on_failure handles
     # the ClickHouse init race (ClickHouse takes ~10s to be ready after

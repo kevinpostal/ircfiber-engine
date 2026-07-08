@@ -54,18 +54,10 @@
       - "no-new-privileges:true"
     memory: "{{ signoz_bridge_mem }}"
     cpus: "{{ signoz_bridge_cpus }}"
+    # Distroless image — binary is /signoz-otel-collector, no shell/wget.
+    # No validate subcommand exists. restart: unless-stopped handles crashes.
     healthcheck:
-      # Distroless image has no shell, python, or curl — we use docker
-      # network port check (test against localhost:13133) via Docker's
-      # built-in port test. This is supported in Docker 25+ via the
-      # `port` test type. If unavailable, the restart_policy handles it.
-      test: ["CMD", "/otelcol-contrib", "--config=/etc/otelcol/config.yaml", "validate"]
-      interval: 60s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-      # Note: this validates config on each restart, not liveness. For true
-      # liveness, run `make deploy-restart COMP=otel-bridge` periodically.
+      disable: true
     labels:
       com.ircfiber.component: "otel-bridge"
       com.ircfiber.version: "{{ ircfiber_version | default('0.3.0') }}"

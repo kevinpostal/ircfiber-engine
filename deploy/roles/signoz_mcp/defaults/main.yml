@@ -11,7 +11,8 @@
 # (stored in /etc/ircfiber/signoz-mcp/.api_key, mode 0600) and
 # reuses it on subsequent runs.
 
-signoz_mcp_image: "signoz/signoz-mcp-server:latest"
+# No versioned tags published by SigNoz; pinned by digest (2026-06-29 build).
+signoz_mcp_image: "signoz/signoz-mcp-server@sha256:be033303419d103fc8e334d9b7bab9e142809d07ec32630380c582a73d5b3e5b"
 signoz_mcp_container: "signoz-mcp-server"
 signoz_mcp_mem: 512m
 signoz_mcp_cpus: 0.25
@@ -40,7 +41,9 @@ signoz_mcp_service_account_name: "signoz-mcp-{{ inventory_hostname_short | defau
 # Admin login used to provision the service account + API key.
 # Pulled from existing signoz_alerts role conventions.
 signoz_mcp_admin_email: "kevindpostal@gmail.com"
-signoz_mcp_admin_org_id: "{{ vault_signoz_org_id | default('019f1235-79b1-787f-b4a9-370824295f2f') }}"
+# orgId is discovered at runtime from the DB by signoz_mcp tasks (the
+# hardcoded default is a last-resort fallback that is almost certainly wrong).
+signoz_mcp_admin_org_id: "{{ vault_signoz_org_id | default('') }}"
 signoz_mcp_admin_password_var: "vault_signoz_admin_password"
 
 # Where to mount the API key on the host.

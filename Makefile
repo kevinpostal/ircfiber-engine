@@ -213,6 +213,8 @@ dev-docker: ensure-colima ## Dev > Docker backend + Vite frontend dev (fastest f
 debug: build build-engine ## Component > Full stack: gateway + engine (supervised), local docker DBs — ctrl-c to stop
 	@$(_docker_setup)
 	@bash -c 'set -u; \
+		pkill -f irc-fiber-engine-supervisor 2>/dev/null || true; \
+		killall -9 irc-fiber irc-fiber-engine 2>/dev/null || true; \
 		printf "\n%b\n" "$(_BCn)$(K)$(B)  Engine (supervised) → local docker  $(R)"; \
 		rm -f "$(GATEWAY_PIDFILE)" "$(SUPERVISOR_PIDFILE)" "$(ENGINE_PIDFILE)"; \
 		: > "$(SUPERVISOR_LOGFILE)"; \
@@ -259,42 +261,37 @@ debug: build build-engine ## Component > Full stack: gateway + engine (supervise
 # leaving the supervisor orphaned. We redirect to a log file instead — use
 # `make logs` in another terminal for live tailing, and the colored startup
 # banner above still prints to this terminal.
-debug-live: frontend ensure-colima ## Component > Full Docker stack: redis + mongo + ircd + gateway + engine — ctrl-c to stop
-	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Starting Docker stack  $(R)"
-	@printf '%b\n' "$(D)  Redis, Mongo, IRCd, Gateway, Engine — all local$(R)"
-	@docker compose build irc_fiber 2>&1 | tail -1
-	@printf '%b\n' "$(C)→ Starting services...$(R)"
-	@docker compose up -d redis mongo ircd irc_fiber irc_engine 2>&1 | tail -5
-	@bash -c 'set -u; \
-		printf "\n%b\n" "$(D)Waiting for gateway at http://127.0.0.1:8090/ ...$(R)"; \
-		for i in $$(seq 1 30); do \
-			if curl -fsS http://127.0.0.1:8090/health >/dev/null 2>&1; then \
-				printf "%b\n" "$(BG)$(OK) Gateway is healthy$(R)"; \
-				printf "%b\n" "$(C)  → http://127.0.0.1:8090/$(R)"; \
-				printf "%b\n" "$(Y)$(WR) ctrl-c to stop  •  make docker-down  in another terminal$(R)"; \
-				exit 0; \
-			fi; \
-			sleep 1; \
-		done; \
-		printf "%b\n" "$(Y)$(WR) Gateway did not become healthy in 30s — check docker compose logs$(R)"; \
-		exit 1'
+debug-live: frontend ## Component > Gateway + engine in Docker against TAILNET DBs — ctrl-c to stop
+	@printf '\n\033[46m\033[30m\033[1m  Gateway + engine (docker) → tailnet DBs  \033[0m\n'
+	@printf '\033[2m  Mongo: %s\033[0m\n' "$(TAILNET_MONGO_URL)"
+	@printf '\033[2m  Redis: %s\033[0m\n' "$(TAILNET_REDIS_URL)"
+	@printf '\033[2m  Containerfile target: builder (compiles gateway+engine on first run)\033[0m\n'
+	@printf '\033[33m⚠ ctrl-c to stop  •  tail logs:  docker compose -p ircfiber-tailnet -f docker-compose.tailnet.yml logs -f\033[0m\n'
+	@docker compose -p ircfiber-tailnet -f docker-compose.tailnet.yml down --remove-orphans 2>/dev/null || true
+	TAILNET_MONGO_URL="$(TAILNET_MONGO_URL)" TAILNET_REDIS_URL="$(TAILNET_REDIS_URL)" IRCFIBER_SERVER_ID="$(or $(IRCFIBER_SERVER_ID),localdebug)" \
+		docker compose -p ircfiber-tailnet -f docker-compose.tailnet.yml up --build
 
-# Stop everything (supervisor + gateway). Does NOT kill a Vite dev server.
-stop: ## Component > Stop engine (supervised) + gateway
+# Stop everything (docker compose tailnet stack + native processes). Does NOT kill a Vite dev server.
+stop: ## Component > Stop debug/debug-live stack (docker + native)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Stopping everything  $(R)"; \
+	if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then \
+		docker compose -p ircfiber-tailnet -f docker-compose.tailnet.yml down --remove-orphans 2>/dev/null && \
+			printf "%b\n" "$(C)  → docker compose tailnet stack stopped$(R)" || true; \
+		docker compose stop irc_fiber irc_engine 2>/dev/null || true; \
+	fi; \
+	killall -9 irc-fiber 2>/dev/null || true; \
+	killall -9 irc-fiber-engine 2>/dev/null || true; \
+	pkill -f irc-fiber-engine-supervisor 2>/dev/null || true; \
 	for f in $(SUPERVISOR_PIDFILE) $(ENGINE_PIDFILE) $(GATEWAY_PIDFILE); do \
 		if [ -f "$$f" ]; then \
 			pid=$$(cat "$$f"); \
 			if [ -n "$$pid" ] && kill -0 "$$pid" 2>/dev/null; then \
 				kill "$$pid" 2>/dev/null || true; \
 				printf "%b\n" "$(C)  → stopped $$(basename $$f) (pid $$pid)$(R)"; \
-			}; \
+			fi; \
 			rm -f "$$f"; \
 		fi; \
 	done; \
-	killall -9 irc-fiber 2>/dev/null || true; \
-	killall -9 irc-fiber-engine 2>/dev/null || true; \
-	pkill -f irc-fiber-engine-supervisor 2>/dev/null || true; \
 	sid=$${IRCFIBER_SERVER_ID:-$(IRCFIBER_DEFAULT_SERVER_ID)}; \
 	if command -v redis-cli >/dev/null 2>&1; then \
 		redis_url=$${IRCFIBER_REDIS_URL:-$(LOCAL_REDIS_URL)}; \
@@ -1543,10 +1540,10 @@ deploy: update-full ## Deploy > Alias for update-full
 # `make update-assets` (which doesn't run the playbook).
 update-assets: frontend ## Deploy > Build frontend + push public/* to running gateway (no restart)
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Asset push → $(_target_ssh) ($(_target))  $(R)"
-	@printf '%b\n' "$(D)  Tarring public/ → ssh → tar -xf (host-side mount source)$(R)"
-	@tar cz --no-xattrs --format=ustar -C public . | ssh deploy@$(_target_ssh) 'rm -rf /opt/ircfiber-src/public/dist /opt/ircfiber-src/public/.vite /opt/ircfiber-src/public/assets && mkdir -p /opt/ircfiber-src/public && tar xzf - -C /opt/ircfiber-src/public'
+	@printf '%b\n' "$(D)  Tarring public/ → ssh → docker exec tar -xf - (clean extract)$(R)"
+	@tar cz --no-xattrs --format=ustar -C public . | ssh deploy@$(_target_ssh) 'docker exec -i ircfiber-gateway sh -c "rm -rf /app/public/dist/ /app/public/.vite/ /app/public/assets/ 2>/dev/null; tar xzf - -C /app/public"'
 	@printf '%b\n' "$(D)  Pushing views/index.dt (updated bundle hashes)$(R)"
-	@scp views/index.dt deploy@$(_target_ssh):/opt/ircfiber-src/views/index.dt
+	@ssh deploy@$(_target_ssh) 'docker exec -i ircfiber-gateway sh -c "cat > /app/views/index.dt"' < views/index.dt
 
 # Show running container images and versions on the target.
 update-status: ## Deploy > Show running containers & image versions

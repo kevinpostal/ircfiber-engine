@@ -28,6 +28,37 @@
     group: root
     mode: "0750"
 
+- name: Discover SigNoz org ID from SQLite database
+  block:
+    - name: Copy signoz.db from the running container
+      ansible.builtin.command:
+        cmd: docker cp ircfiber-signoz:/var/lib/signoz/signoz.db /tmp/signoz-mcp-orgid.db
+      changed_when: false
+      failed_when: false
+      register: signoz_mcp_db_copy
+
+    - name: Read org ID from signoz.db
+      ansible.builtin.command:
+        cmd: >
+          docker run --rm -v /tmp:/tmp alpine:3.19 sh -c '
+          apk add --no-cache sqlite >/dev/null 2>&1 &&
+          sqlite3 /tmp/signoz-mcp-orgid.db
+          "SELECT id FROM organizations ORDER BY created_at ASC LIMIT 1"'
+      changed_when: false
+      failed_when: false
+      register: signoz_mcp_orgid_result
+      when: signoz_mcp_db_copy is success
+
+    - name: Fall back to vault orgId if DB read failed
+      ansible.builtin.set_fact:
+        resolved_org_id: "{{ (signoz_mcp_orgid_result.stdout | trim) if (signoz_mcp_orgid_result is defined and signoz_mcp_orgid_result.stdout | trim | length > 0) else (signoz_mcp_admin_org_id | default('')) }}"
+  always:
+    - name: Clean up temp DB copy
+      ansible.builtin.file:
+        path: /tmp/signoz-mcp-orgid.db
+        state: absent
+      changed_when: false
+
 - name: Check if a previously provisioned API key exists
   ansible.builtin.stat:
     path: "{{ signoz_mcp_api_key_file }}"
@@ -45,7 +76,7 @@
     method: GET
     headers:
       X-Signoz-Email: "{{ signoz_mcp_admin_email }}"
-      X-Signoz-Org: "{{ signoz_mcp_admin_org_id }}"
+      X-Signoz-Org: "{{ resolved_org_id }}"
       SIGNOZ-API-KEY: "{{ (signoz_mcp_existing_key_b64.content | b64decode | trim) }}"
     status_code: [200, 401, 403]
   register: signoz_mcp_key_validation
@@ -63,7 +94,10 @@
 
 - name: Discover SigNoz API base URL
   ansible.builtin.set_fact:
-    signoz_mcp_api_base: "http://{{ caddy_tailscale_logging_address | default('100.126.197.92') }}:{{ caddy_tailscale_signoz_port | default(3003) }}"
+    # Use the host-mapped port 8080 directly — not the Tailscale Caddy proxy
+    # address. Caddy can't serve SigNoz without an API key, creating a
+    # chicken-and-egg problem when provisioning the key for the first time.
+    signoz_mcp_api_base: "http://127.0.0.1:8080"
 
 - name: Log in as admin to provision API key
   ansible.builtin.uri:
@@ -73,7 +107,7 @@
     body:
       email: "{{ signoz_mcp_admin_email }}"
       password: "{{ vault_signoz_admin_password }}"
-      orgId: "{{ signoz_mcp_admin_org_id }}"
+      orgId: "{{ resolved_org_id }}"
     status_code: 200
   register: signoz_mcp_admin_login
   no_log: true

@@ -272,9 +272,16 @@ service:
       exporters: [otlp/signoz]
 
     metrics:
-      receivers: [otlp, hostmetrics, docker_stats]
+      receivers: [otlp, hostmetrics]
       processors: [memory_limiter, resourcedetection, transform/newrelic, batch]
       exporters: [otlp/signoz]
+
+    # Docker stats metrics produce a high volume of metric names that the
+    # signoz-ingester rejects with 400. Collect but don't forward to SigNoz.
+    metrics/docker:
+      receivers: [docker_stats]
+      processors: [memory_limiter, batch]
+      exporters: [debug]
 
     logs:
       receivers: [otlp, filelog/caddy]

@@ -1,8 +1,8 @@
 # {{ ansible_managed }}
 # SigNoz MCP server — HTTP sidecar to the IRC Fiber SigNoz stack.
-# Joins the ircfiber_logging network so it can reach signoz-signoz:8080
-# via Docker DNS. Exposes its MCP listener on the host's Tailscale IP
-# only — never on the public interface.
+# Joins the ircfiber_logging network so it can reach the SigNoz
+# query-service via Docker DNS. Exposes its MCP listener on the
+# host's Tailscale IP only — never on the public interface.
 
 x-logging-common: &logging-common
   restart: unless-stopped
@@ -21,7 +21,8 @@ services:
     networks:
       - ircfiber_logging
     environment:
-      - SIGNOZ_URL=http://signoz-signoz:8080
+      # Container is named ircfiber-signoz on the logging network.
+      - SIGNOZ_URL=http://ircfiber-signoz:8080
       - SIGNOZ_API_KEY={{ signoz_mcp_api_key }}
       - TRANSPORT_MODE=http
       - MCP_SERVER_PORT={{ signoz_mcp_container_port }}
@@ -33,13 +34,9 @@ services:
     mem_limit: {{ signoz_mcp_mem }}
     cpus: {{ signoz_mcp_cpus }}
     healthcheck:
-      # /livez is the shallow liveness probe — process is up and
-      # serving HTTP. Doesn't depend on SigNoz or docs index.
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:{{ signoz_mcp_container_port }}/livez"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 20s
+      # Distroless image — no shell, no wget. NONE avoids perpetual
+      # unhealthy. restart: unless-stopped handles process crashes.
+      disable: true
 
 networks:
   ircfiber_logging:

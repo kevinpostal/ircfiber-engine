@@ -24,7 +24,9 @@
 [SERVICE]
     Flush        {{ fluent_bit_flush | default('1') }}
     Daemon       Off
-    Log_Level    {{ fluent_bit_log_level | default('info') }}
+    # info includes per-batch "HTTP status=200" output — ~2/sec of noise.
+    # warn suppresses those while keeping errors visible.
+    Log_Level    {{ fluent_bit_log_level | default('warn') }}
     Parsers_File {{ fluent_bit_parsers_file | default('/fluent-bit/etc/parsers.conf') }}
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -61,6 +63,15 @@
     Key_Name    log
     Reserve_Data On
     Preserve_Key On
+
+# 2. Drop noisy SigNoz internal diagnostic logs. These are SigNoz's own
+#    request logging (~37% of signoz container logs), metrics metadata cache
+#    misses (~39%), and query cache diagnostics (~12%). They provide no
+#    operational value and fill ClickHouse storage.
+[FILTER]
+    Name    grep
+    Match   docker.*
+    Exclude $log (failed to get active license|failed to report stats|Creating shutdown snapshot failed|sql: database is closed|RECEIVED-REQUEST|cache miss for metric metadata|no bucket cache or fingerprint|time taken to run builder queries|number of non-overlapping cached)
 
 # Note: The `docker` filter plugin (for Docker metadata enrichment) is
 # not available in the standard fluent/fluent-bit:3.2 image. Container

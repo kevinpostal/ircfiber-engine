@@ -323,6 +323,49 @@ If `VITE_SIGNOZ_URL` is unset and no local SigNoz is running, the panel renders 
 
 If `/etc/ircfiber/signoz-mcp/.api_key` is missing, the entire `{% if caddy_signoz_api_key %}` block in `Caddyfile.j2` is skipped (no startup error, just no proxy) -- re-run the `signoz_mcp` + `caddy` roles to enable.
 
+## Known issues
+
+### MCP server DNS resolution (`signoz-signoz` vs `ircfiber-signoz`)
+
+The `docker-compose.signoz-mcp.yml.j2` template sets `SIGNOZ_URL=http://signoz-signoz:8080`, but the SigNoz container is named `ircfiber-signoz` on the `ircfiber_logging` network. Docker DNS returns `SERVFAIL` for `signoz-signoz`. The correct hostname is `ircfiber-signoz`. The ansible template at `deploy/roles/signoz_mcp/templates/docker-compose.signoz-mcp.yml.j2` has been fixed.
+
+### Distroless healthchecks
+
+Both the MCP server (`signoz/signoz-mcp-server`) and the ingester (`signoz/signoz-otel-collector`) use distroless base images — no shell, `wget`, or `curl`. Healthchecks using these tools report `unhealthy` forever in `docker ps`. The correct fix is `healthcheck: disable: true` with `restart: unless-stopped` for process crash recovery. See:
+- `deploy/roles/signoz_mcp/templates/docker-compose.signoz-mcp.yml.j2`
+- `deploy/roles/logging/templates/docker-compose.logging.yml.j2` (signoz-ingester)
+- `deploy/roles/signoz_bridge/tasks/main.yml` (otel-bridge)
+
+The `signoz/signoz-otel-collector` binary is `/signoz-otel-collector` (not `/otelcol-contrib`). The `validate` subcommand does not exist in v0.144.5 — `signoz-otel-collector --help` only shows `help` and `migrate` subcommands. Using it for healthchecks fails silently.
+
+### Ingester image mismatch (template vs deployment)
+
+The logging role's `docker-compose.logging.yml.j2` template historically defaulted to
+`otel/opentelemetry-collector-contrib:0.120.0` for the `signoz-ingester`, but the
+actual running container was `signoz/signoz-otel-collector:v0.144.5`. These are
+different images — the upstream `otel/opentelemetry-collector-contrib` does not
+bundle the ClickHouse exporter that SigNoz requires. The fix pins the default to
+`signoz/signoz-otel-collector:{{ signoz_ingester_version }}` in
+`deploy/roles/logging/defaults/main.yml`.
+
+The bridge collector (`ircfiber-otel-collector`) correctly uses the upstream
+image since it only forwards OTLP and does not write to ClickHouse.
+
+### SigNoz services detail page returns 500
+
+The `/services/:name` page in SigNoz v0.131.1 fails with "Request failed with status code 500"
+because the individual service detail API endpoint (`/api/v1/services/:name`) returns the SPA HTML
+instead of JSON. The services LIST page and all other SigNoz features (logs, traces, dashboards)
+work correctly. This is a SigNoz v0.131.1 backend bug — upgrading to a newer version may fix it.
+
+### orgId provisioning (stale default UUID)
+
+The `signoz_mcp` role's admin login task relied on a hardcoded default UUID for
+`orgId` (`019f1235-79b1-787f-b4a9-370824295f2f`). If the SigNoz SQLite DB was
+ever recreated, the org ID would change and the playbook would fail with
+`user_not_found`. Fixed by adding a runtime discovery task that reads the org ID
+from the running container's `signoz.db` before provisioning the API key.
+
 ### Tailnet fallback link
 
 `Logs.svelte` renders an "Open SigNoz" link in the page header pointing to `TAILNET_SIGNOZ_LOGS_URL` (e.g. `http://100.126.197.92:3003/logs`). This is the deep link into the Tailscale-only SigNoz listener for features the native panel intentionally does not implement in v1: server-side saved views, pivots, anomaly overlays, query-builder joins. The IP literal lives only in `frontend/src/admin/lib/signozUrl.ts` -- do not hard-code it elsewhere.
@@ -477,6 +520,21 @@ Four layers run automatically in **every** gateway and engine process:
 2. **Distributed janitor** — every process tries to acquire `irc:janitor:lock` via `SET NX EX 30`. Holder runs the reap; losers yield. Lua scripts make the reap atomic against late heartbeats.
 3. **Bootstrap purge** — on engine boot (skipping handoff), `purgeLocalServerNamespace(serverId)` SCANs+UNLINKs `*:<serverId>:*` so reusing a `serverId` after a crash doesn't carry garbage across epochs.
 4. **Frontend staleness** — `lastSeenAt` per network, `isNetworkStale()` helper, grey "● stale" pill in the sidebar. Buffer cache in localStorage uses a 24 h TTL guard.
+
+# IRC Fiber — User "Clear backlog" deletes server log history
+
+The chat sidebar's right-click "Clear backlog" (server log and per-channel) actually scrubs the Redis scrollback now — it is not just a client-side filter.
+
+## Behavior
+
+| Layer | Effect |
+|---|---|
+| `ircfiber.storage.buffer.BufferManager.clearBuffer(serverId, networkId, buffer)` | `DEL` of `scrollback:<srv>:<net>:<buf>` and its paired `dedup:<srv>:<net>:<buf>` SET. Namespaced for decentralized mode; legacy single-arg overload for single-server mode. |
+| `POST /api/networks/:id/buffers/clear` (body `{"buffer":"<name>"}`) | Auth-gated + owner-checked (`networkRepo.findByIdWithUser` against `req.context["user"]`). Looks up the assigned server via `ServerRegistry.getServerForNetwork` and dispatches to either the namespaced or legacy `clearBuffer` overload. Returns `{status:"cleared", buffer, serverId}`. |
+| `frontend/src/components/{Server,Channel}ContextMenu.svelte` `clearBacklog` | `setClearedAt(...)` for immediate UI hide, then `api.clearBacklog(...)` to scrub Redis. API failures log to console but still apply the local filter (graceful degradation). |
+| `frontend/src/lib/slashCommands.ts` `/clear` | Same: `setClearedAt` + API call, so typing `/clear` in a server tab actually deletes the server log. |
+
+The localStorage `clearedAt` flag is still required because the server side has no realtime "I just cleared my buffer" message back to the open WebSocket — the local filter hides cards on the next render, while the API call scrubs Redis so a page refresh or new tab gets an empty history (rather than the cleared messages re-appearing from `CHATHISTORY`/snapshots).
 
 ## Environment knobs
 
