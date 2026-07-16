@@ -10,7 +10,7 @@
   "panels": [
     {
       "id": 1,
-      "title": "Handoff events timeline",
+      "title": "Handoff events timeline (engine + holder)",
       "type": "timeseries",
       "datasource": {"type": "loki", "uid": "Loki"},
       "gridPos": {"h": 10, "w": 24, "x": 0, "y": 0},
@@ -29,7 +29,7 @@
         {
           "refId": "A",
           "datasource": {"type": "loki", "uid": "Loki"},
-          "expr": "sum by (event) (rate({job=\"ircfiber_containers\", event=~\"handoff_prepare|handoff_send|handoff_ack|handoff_complete|handoff_fail|post_handoff_quit|adopted_socket|holder_enabled|holder_connect|holder_disconnect\"}[$__interval]))",
+          "expr": "sum by (event) (rate({job=\"ircfiber_containers\", event=~\"handoff_prepare|handoff_send|handoff_ack|handoff_complete|handoff_fail|post_handoff_quit|adopted_socket|holder_enabled|holder_connect|holder_disconnect|holder_peer_connect|holder_peer_disconnect|holder_watchdog_disconnect|holder_connect_reuse_live|holder_connect_reuse_inflight|holder_connect_reuse_mid_reconnect|holder_connect_evict_corpse|holder_remove_client|holder_register_client\"}[$__interval]))",
           "legendFormat": "{{event}}",
           "queryType": "range",
           "refId": "A"
@@ -111,6 +111,69 @@
           "datasource": {"type": "loki", "uid": "Loki"},
           "expr": "{job=\"ircfiber_containers\", event=~\"handoff.*|adopted_socket|post_handoff_quit|holder.*\"}",
           "queryType": "range",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "IRC socket preservation rate (handoff preservation)",
+      "type": "stat",
+      "datasource": {"type": "loki", "uid": "Loki"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 34},
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "value_and_name",
+        "graphMode": "area",
+        "colorMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "yellow", "value": 0.95},
+              {"color": "green", "value": 0.99}
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "loki", "uid": "Loki"},
+          "expr": "sum(rate({job=\"ircfiber_containers\", event=~\"holder_connect_reuse_.*\"}[1h])) / sum(rate({job=\"ircfiber_containers\", event=~\"holder_connect_.*\"}[1h]))",
+          "legendFormat": "Preservation rate",
+          "queryType": "randomWalk",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Holder peer lifecycle (last 24h)",
+      "type": "table",
+      "datasource": {"type": "loki", "uid": "Loki"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 34},
+      "options": {
+        "showHeader": true,
+        "sortBy": [{"displayName": "Count", "desc": true}]
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "loki", "uid": "Loki"},
+          "expr": "sum by (event) (count_over_time({job=\"ircfiber_containers\", event=~\"holder_peer_connect|holder_peer_disconnect|holder_watchdog_disconnect|holder_started|holder_shutdown\"}[24h]))",
+          "format": "table",
+          "instant": true,
+          "queryType": "instant",
           "refId": "A"
         }
       ]

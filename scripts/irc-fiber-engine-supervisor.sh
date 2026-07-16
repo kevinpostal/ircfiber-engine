@@ -131,12 +131,18 @@ trap 'log "Supervisor received signal, shutting down"; stop_engine; rm -f "$PIDF
 
 # ── Supervisor start ────────────────────────────────────────────────────────
 
-# Refuse double-start
+# Refuse double-start: verify the PID in the pidfile is actually a supervisor
+# process (not some unrelated process that reused the PID). Stale pidfiles
+# from `make debug` ctrl-c or a crash are cleaned up automatically.
 if [[ -f "$PIDFILE" ]]; then
     existing="$(cat "$PIDFILE" 2>/dev/null || true)"
     if [[ -n "$existing" ]] && kill -0 "$existing" 2>/dev/null; then
-        echo "Supervisor already running (pid=$existing). Refusing to start." >&2
-        exit 1
+        if ps -p "$existing" -o command= 2>/dev/null | grep -q "supervisor|irc-fiber-engine"; then
+            echo "Supervisor already running (pid=$existing). Refusing to start." >&2
+            exit 1
+        fi
+        # PID exists but belongs to a different process — stale pidfile, clean it
+        log "Stale pidfile: pid $existing is $(ps -p "$existing" -o command= 2>/dev/null || echo 'dead'), not a supervisor. Cleaning up."
     fi
     rm -f "$PIDFILE"
 fi

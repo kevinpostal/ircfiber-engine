@@ -94,7 +94,11 @@
           {{ src_root }} 2>&1
       args:
         executable: /bin/bash
-      timeout: 900
+      # 30-minute budget for the full LDC compilation (first build after a
+      # CACHE_BUST wipe). Incremental builds finish in 5-15s; the 1800s
+      # cap handles the worst case: a cold OVH BuildKit runner doing a
+      # full dub fetch + LDC compile of the ~280k-lines D codebase.
+      timeout: 1800
       changed_when: true
 
     # ── Extract both binaries in one shot ──────────────────────────

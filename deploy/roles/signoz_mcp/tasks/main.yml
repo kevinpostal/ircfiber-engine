@@ -179,6 +179,7 @@
 - name: Resolve service account id
   ansible.builtin.set_fact:
     signoz_mcp_account_id: "{{ (signoz_mcp_new_account.json.data.id if (signoz_mcp_needs_fresh_account | default(false)) and (signoz_mcp_new_account.status | default(0) in [200, 201]) else signoz_mcp_existing_account.id) | trim }}"
+  when: not signoz_mcp_existing_key.stat.exists or signoz_mcp_key_validation.status | default(0) != 200
 
 - name: List existing keys for signoz-mcp service account
   ansible.builtin.uri:
