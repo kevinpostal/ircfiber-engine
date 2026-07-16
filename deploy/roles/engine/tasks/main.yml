@@ -75,16 +75,6 @@
   ansible.builtin.set_fact:
     _engine_env: "{{ dict(_pairs) }}"
 
-- name: Ensure holder socket volume exists (no-op when holder isn't deployed)
-  community.docker.docker_volume:
-    name: "ircfiber-holder-sockets-{{ ircfiber_engine_id }}"
-    state: present
-  when: ircfiber_holder_enabled | default(true) | bool
-
-# Mount the holder socket volume so the engine can talk to the holder
-# daemon via /var/run/ircfiber/holder.sock. The volume is created by the
-# holder daemon on its first start (it manages the socket); we only need
-# to mount it here.
 - name: Run ircfiber-engine
   community.docker.docker_container:
     name: "{{ engine_container_name }}"
@@ -98,12 +88,7 @@
       # the otel-collector. Required for distributed tracing.
       - name: ircfiber_logging
     env: "{{ _engine_env }}"
-    volumes:
-      # Holder socket — present even when holder mode is disabled in
-      # env, because the entrypoint script waits for it before starting
-      # the engine binary. The volume is harmless if the holder daemon
-      # isn't deployed (it just stays empty).
-      - "ircfiber-holder-sockets-{{ ircfiber_engine_id }}:/var/run/ircfiber"
+    volumes: []
     security_opts:
       - "no-new-privileges:true"
     ulimits:

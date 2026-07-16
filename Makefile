@@ -82,7 +82,6 @@ AR := →
 # Component Workflows (primary user-facing targets)
 .PHONY: dev dev-docker dev-live debug debug-live stop
 .PHONY: engine engine-rebuild engine-handoff engine-handoff-redis engine-restart engine-test
-.PHONY: deploy-holder deploy-holder-test deploy-holder-enterprise-test
 .PHONY: gateway gateway-rebuild gateway-restart
 .PHONY: status logs logs-engine logs-gateway logs-supervisor crash-logs
 .PHONY: watch watch-engine watch-gateway
@@ -100,7 +99,6 @@ AR := →
         docker-up-backend docker-down-backend docker-restart-backend docker-restart \
         docker-restart-code \
         docker-up-test docker-down-test test-server-log test-server-log-playwright \
-        docker-up-holder docker-down-holder docker-restart-holder docker-logs-holder \
         docker-shell docker-shell-engine docker-shell-redis docker-shell-mongo docker-shell-ircd ircd-up ircd-down \
         local-dev-up local-dev-down local-dev-down-clean local-dev-smoke
 .PHONY: cross-linux-x64 cross-linux-arm64 cross-linux-armv7
@@ -880,18 +878,8 @@ consumer-test: ## Test > consumer reconnect-dedup helpers
 	@$(DUB) build --config=consumer-test 2>&1 | tail -3
 	@./consumer-test
 
-holder-test: ## Test > conn_holder.protocol IPC framing defense
-	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Holder IPC framing tests  $(R)"
-	@$(DUB) build --config=holder-test 2>&1 | tail -3
-	@./holder-test
-
-connection-holder-strict-test: ## Test > NetworkHolderHealth JSON contract for the admin holder-state surface
-	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Holder strict-mode contract tests  $(R)'
-	@$(DUB) build --config=connection-holder-strict-test 2>&1 | tail -3
-	@./connection-holder-strict-test
-
 connection-registration-test: ## Test > ConnectionServer.registrationUnavailableFor JSON contract for the admin registration-stuck surface
-	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Registration-timeout admin contract tests  $(R)'
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Registration-timeout admin contract tests  $(R)"
 	@$(DUB) build --config=connection-registration-test 2>&1 | tail -3
 	@./connection-registration-test
 
@@ -923,8 +911,8 @@ parser-fuzz-test: ## Test > parser property-based fuzz (10k random lines)
 	@$(DUB) build --config=parser-fuzz-test 2>&1 | tail -3
 	@./parser-fuzz-test
 
-test-fast: ## Test > All fast standalone test suites (prefs/parser/consumer/holder/strict/observability/registration)
-	@for t in prefs-test parser-test consumer-test holder-test connection-holder-strict-test observability-test connection-registration-test session-queue-test oob-test; do \
+test-fast: ## Test > All fast standalone test suites (prefs/parser/consumer/observability/registration)
+	@for t in prefs-test parser-test consumer-test observability-test connection-registration-test session-queue-test oob-test; do \
 		printf '\n%b\n' "$(_BCn)$(K)$(B)  $$t  $(R)"; \
 		$(DUB) build --config=$$t 2>&1 | tail -1 || exit 1; \
 		./$$t 2>&1 | tail -3; \
@@ -1156,9 +1144,6 @@ docker-down: ensure-colima ## Docker > Stop ALL IRC Fiber containers (3 compose 
 	@printf '%b\n' "$(D)→ Stopping test stack (docker-compose.test.yml)...$(R)"
 	@docker compose -f docker-compose.test.yml down --timeout 10 2>/dev/null; true
 	@printf '%b\n' "$(BG)$(OK) Test stack stopped$(R)"
-	@printf '%b\n' "$(D)→ Stopping holder stack (docker-compose.holder.yml)...$(R)"
-	@docker compose -f $(HOLDER_COMPOSE) down --timeout 15 2>/dev/null; true
-	@printf '%b\n' "$(BG)$(OK) Holder stack stopped$(R)"
 	@printf '%b\n' "$(D)→ Stopping local dev stack (deploy/local/docker-compose.yml)...$(R)"
 	@if [ -f deploy/local/docker-compose.yml ]; then \
 		docker compose -f deploy/local/docker-compose.yml down --remove-orphans --timeout 15 2>/dev/null; true; \
@@ -1298,41 +1283,6 @@ docker-restart-backend: ensure-colima ## Docker > Restart backend services only
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Restarting Backend Services  $(R)"
 	@docker compose up -d --build --force-recreate irc_engine redis mongo ircd
 	@printf '%b\n' "$(BG)$(OK) Backend services restarted$(R)"
-
-# ----------------------------------------------------------------------------
-# Docker — holder stack (docker-compose.holder.yml)
-# ----------------------------------------------------------------------------
-# Production-style deployment: long-lived holder daemon + exec-reloadable engine.
-# Lives in project `ircfiber_prod` (see top of docker-compose.holder.yml) so
-# `make docker-down` on the test stack can no longer touch its containers
-# as "orphans". The holder stack is included in the default `make docker-down`
-# scope; use `docker-down-holder` if you only want to stop the holder pieces.
-#
-# Targets:
-#   make docker-up-holder        # build + start holder stack
-#   make docker-down-holder      # graceful stop + remove holder stack only
-#   make docker-restart-holder   # down + up
-#   make docker-logs-holder      # tail -f holder stack logs
-HOLDER_COMPOSE := docker-compose.holder.yml
-
-docker-up-holder: ensure-colima ## Docker > Start holder stack (docker-compose.holder.yml)
-	@printf '\n%b\n' "$(_BC)$(K)$(B)  Building Docker image  $(R)"
-	@docker compose -f $(HOLDER_COMPOSE) build
-	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting Holder Stack  $(R)"
-	@docker compose -f $(HOLDER_COMPOSE) up -d
-	@printf '%b\n' "$(BG)$(OK) Holder stack started$(R) $(D)(http://localhost:8090)$(R)"
-
-docker-down-holder: ensure-colima ## Docker > Stop holder stack only (graceful drain + remove)
-	@printf '%b\n' "$(D)→ Stopping holder stack (docker-compose.holder.yml)...$(R)"
-	@docker compose -f $(HOLDER_COMPOSE) down --timeout 15
-	@printf '%b\n' "$(BG)$(OK) Holder stack stopped$(R)"
-
-docker-restart-holder: ensure-colima ## Docker > Rebuild + restart holder stack
-	@$(MAKE) --no-print-directory docker-down-holder
-	@$(MAKE) --no-print-directory docker-up-holder
-
-docker-logs-holder: ensure-colima ## Docker > Tail holder stack logs
-	@docker compose -f $(HOLDER_COMPOSE) logs -f
 
 # ----------------------------------------------------------------------------
 # Docker — interactive shells
@@ -1518,6 +1468,18 @@ update: frontend build build-engine ## Deploy > Build frontend + gateway + engin
 	# in case a build produced a new dist AFTER the rsync step (the
 	# `frontend` target runs first, but `inject-manifest.js` updates
 	# views/index.dt in place, so re-syncing dist/ + views/ here is safe).
+	# Chain the SigNoz dashboards + alerts deploys so structured
+	# log changes, new dashboards, and new alert rules all land in
+	# the same `make update` invocation. Both are idempotent (by
+	# title / by compositeKey) and safe to re-run. Skip with
+	# `SKIP_SIGNOZ=1` when you only want binary + frontend deploy.
+ifeq ($(SKIP_SIGNOZ),1)
+	@printf '%b\n' "$(Y)$(WR) SKIP_SIGNOZ=1 — skipping dashboards + alerts deploy$(R)"
+else
+	@printf '%b\n' "$(_BCn)$(K)$(B)  Deploying SigNoz dashboards + alerts  $(R)"
+	@$(_playbook) playbooks/signoz_dashboards.yml 2>&1 | tail -20
+	@$(_playbook) playbooks/signoz_alerts.yml 2>&1 | tail -20
+endif
 
 # Alias: fast path is the default
 update-fast: update ## Deploy > Force hot path (same as `make update`)
@@ -1657,10 +1619,12 @@ help: ## Utils > Show this help (use-case matrix in the source header)
 	@printf '  \033[36mI want to test engine reconnect against a real IRC server…\033[0m\n'
 	@printf '    \033[92mmake debug-live\033[0m  → open \033[36mhttp://localhost:8090\033[0m → click Reconnect\n'
 	@printf '  \033[36mI want to deploy to my tailnet server…\033[0m\n'
-	@printf '    \033[92mmake update\033[0m          (fast incremental binary deploy)\n'
+	@printf '    \033[92mmake update\033[0m          (fast incremental binary deploy + push SigNoz dashboards/alerts)\n'
+	@printf '    \033[92mSKIP_SIGNOZ=1 make update\033[0m  (skip dashboards + alerts deploy)\n'
 	@printf '    \033[92mmake update-full\033[0m      (full docker image rebuild)\n'
 	@printf '    \033[92mmake update-assets\033[0m     (asset-only: public/*, ~2-3s)\n'
 	@printf '    \033[92mmake update-status\033[0m     (show running containers)\n'
+	@printf '    \033[92mmake deploy-signoz\033[0m      (push only dashboards + alerts — for refreshing observability config without a code deploy)\n'
 	@printf '\n'
 	@awk 'BEGIN {FS = ":.*##[ \t]*"} \
 		/^[a-zA-Z0-9_-]+:.*##/ { \
@@ -1705,28 +1669,27 @@ help: ## Utils > Show this help (use-case matrix in the source header)
 			print ""; \
 		}' $(MAKEFILE_LIST)
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Connection Holder — long-lived IRC socket owner
-# ═══════════════════════════════════════════════════════════════════════════
-# Enables TRUE zero-disconnect hot-reload:
-#   1. Holder owns the IRC TCP/TLS socket (separate process/container)
-#   2. Engine exec-reloads don't touch the IRC socket (holder keeps it alive)
-#   3. Engine reconnects to holder, IRC sees ONE continuous connection
+# ── SigNoz dashboards + alerts deploy ─────────────────────────────
+# Pushes the pre-built dashboards + alert rules + notification
+# channel to the SigNoz API. Idempotent: matches by title (dashboards)
+# or by compositeKey (alerts). Both are run automatically as part
+# of `make update`; these targets are for the case where you only
+# want to refresh observability config (e.g. after editing a JSON
+# dashboard by hand).
 #
-# Build, test, deploy:
+# Usage:
+#   make deploy-signoz-dashboards
+#   make deploy-signoz-alerts
+#   make deploy-signoz              # both
+deploy-signoz-dashboards: ## SigNoz > Push pre-built dashboards (idempotent, by title)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Deploying SigNoz dashboards → $(_target)  $(R)"
+	@$(_playbook) playbooks/signoz_dashboards.yml
 
-deploy-holder-test: ## Holder > Run basic holder tests locally (~25s)
-	@./run-holder-tests.sh
+deploy-signoz-alerts: ## SigNoz > Push alert rules + notification channel (idempotent, by compositeKey)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Deploying SigNoz alerts → $(_target)  $(R)"
+	@$(_playbook) playbooks/signoz_alerts.yml
 
-deploy-holder-enterprise-test: ## Holder > Run enterprise tests with health endpoints (~30s)
-	@./run-holder-enterprise-tests.sh
-
-deploy-holder: ## Holder > Deploy two-container holder + engine to production
-	@bash -c 'printf "\033[1;33m  Deploying holder architecture to OVH\033[0m\n"; \
-		cd deploy && ansible-playbook -i inventories/production/hosts.ini \
-			playbooks/deploy-holder.yml $(_vault_arg) \
-			-l ircfiber-ovh-1 \
-			-e ircfiber_engine_id=ovh'
+deploy-signoz: deploy-signoz-dashboards deploy-signoz-alerts ## SigNoz > Push both dashboards + alerts
 
 # ── IRC daemon (Ergo) deploy ────────────────────────────────────────────────────
 # Deploys an Ergo IRC daemon to OVH for product support + testing.
@@ -1743,7 +1706,7 @@ deploy-ircd: ## IRCd > Deploy Ergo IRC daemon to OVH (ports 6667 + 6697)
 # Restart Docker containers on the remote host via Ansible. Wraps the
 # restart.yml playbook which supports selecting specific components.
 # By default restarts ALL containers (caddy, cloudflared, gateway,
-# engine, mongo, redis, holder).
+# engine, mongo, redis).
 #
 # Usage:
 #   make deploy-restart                                  # restart everything
@@ -1785,5 +1748,5 @@ deploy-restart-redis: ## Deploy > Restart Redis container only
 deploy-restart-caddy: ## Deploy > Restart Caddy container only
 	@$(MAKE) --no-print-directory deploy-restart COMP=caddy
 
-deploy-restart-holder: ## Deploy > Restart connection holder container only
-	@$(MAKE) --no-print-directory deploy-restart COMP=holder
+deploy-restart-engine: ## Deploy > Restart IRC engine container only
+	@$(MAKE) --no-print-directory deploy-restart COMP=engine

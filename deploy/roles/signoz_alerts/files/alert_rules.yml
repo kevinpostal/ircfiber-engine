@@ -317,4 +317,4 @@
   annotations:
     summary: "Gateway fiber wedge detected"
     description: "Gateway has had a fiber running without yielding for >5s for 30 consecutive seconds. HTTP requests will time out."
-    runbook: "1. docker logs --tail 200 ircfiber-gateway -- look for FiberWatch lines. 2. curl http://localhost:8090/api/health -- check sessions.dropped. 3. docker restart ircfiber-gateway -- immediate recovery."
+

@@ -6,9 +6,7 @@
 #      should never leave them, but we've seen 3+ accumulate from
 #      accumulated graceful handoff invocations).
 #   2. Remove stale handoff socket / done markers from prior runs.
-#   3. Wait for the holder socket to appear (up to 30s) so the engine
-#      can come up in holder mode without crashing.
-#   4. exec the engine binary directly (replaces the shell so signals
+#   3. exec the engine binary directly (replaces the shell so signals
 #      reach the engine process and tini reports correct PID).
 #
 # This script is built into the engine image at /usr/local/bin and is
@@ -17,7 +15,6 @@
 set -eu
 
 ENGINE_BIN=/app/irc-fiber-engine
-HOLDER_SOCK=/var/run/ircfiber/holder.sock
 
 log() { printf '[engine-entrypoint] %s\n' "$*" >&2; }
 
@@ -49,28 +46,7 @@ rm -f /tmp/ircfiber-handoff-*.sock \
       /tmp/ircfiber-handoff-done-* \
       /tmp/ircfiber-engine-handoff-child.log || true
 
-# ── 3. Wait for holder socket ───────────────────────────────────────────
-# The holder daemon container starts in parallel. If we don't see the
-# socket within 30s the engine will fall back to direct mode (or fail
-# fast, depending on IRCFIBER_HOLDER_SOCK config). Either way, the engine
-# can come up; we just give the holder time to start.
-if [ -e "$HOLDER_SOCK" ]; then
-    log "Holder socket already present: $HOLDER_SOCK"
-else
-    log "Waiting up to 30s for holder socket at $HOLDER_SOCK..."
-    for i in $(seq 1 30); do
-        if [ -e "$HOLDER_SOCK" ]; then
-            log "Holder socket appeared after ${i}s"
-            break
-        fi
-        sleep 1
-    done
-    if [ ! -e "$HOLDER_SOCK" ]; then
-        log "WARNING: holder socket not present after 30s — engine will run in direct mode"
-    fi
-fi
-
-# ── 4. Exec the engine ─────────────────────────────────────────────────
+# ── 3. Exec the engine ─────────────────────────────────────────────────
 # `exec` replaces the shell so the engine becomes PID 1's child via
 # tini — signals (SIGTERM/SIGINT) reach the engine cleanly, and the
 # container's main PID matches the engine PID. This is critical for

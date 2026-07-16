@@ -1,3 +1,126 @@
+# IRC Fiber — Server features UI overhaul
+
+The "Server features" panel in the connection-attempt timeline used
+to dump `005 (RPL_ISUPPORT)` tokens as a flat monochrome list. That
+list was hard to scan and provided no documentation — a token like
+`ACCOUNTEXTBAN=account,a` or `MAXLIST=b:250,e:250,I:250` was opaque to
+anyone who hadn't memorised RFC 2811/2812.
+
+The overhaul builds a categorised, searchable panel backed by a
+typed catalog of every well-known ISUPPORT token + IRCv3 capability,
+each entry carrying human description, RFC/IRCv3 references, and a
+click-through detail drawer modelled on the IRCv3 spec-page format
+(`https://ircv3.net/specs/extensions/away-notify.html`).
+
+## Architecture
+
+```
+Engine (D)                                  Frontend (TS)
+─────────────────────────                   ────────────────────────
+case "005": parse every token  ←───────     frontend reads `network.isupport`
+store on PersistentIRCClient               (a `Record<string,string>`
+emit ISUPPORT event mid-stream             already typed on `Network`).
+                                          categorize → CategorizedGroup[]
+synced via NetworkStateSnapshot              → ServerFeaturesPanel
+appended to handoff records                 → CategoryCard × N
+preserved across exec-reload                → click a row → IsupportDetailDrawer
+```
+
+Files:
+
+| File | Purpose |
+|---|---|
+| `frontend/src/lib/isupportCatalog.ts` | Typed DB of every well-known ISUPPORT token + IRCv3 capability (~80 entries) — name, category, kind, description, RFC/IRCv3 link |
+| `frontend/src/lib/isupportCategorize.ts` | Buckets a flat isupport map into renderable `Category × Features[]`. Stays pure: same input → same output |
+| `frontend/src/components/ServerFeaturesPanel.svelte` | Categorised grid view with search, status badges, collapse-all |
+| `frontend/src/components/IsupportDetailDrawer.svelte` | IRCv3-style detail page for each feature — title, abstract, on-this-server value, RFC/IRCv3 link |
+| `source/ircfiber/irc/connection.d` | Engine stores the full map; emits `ISUPPORT` synthetic event |
+| `source/ircfiber/models/irc_event.d` | `IRCRawEvent.makeIsupport` factory — JS-object payload |
+| `source/ircfiber/engine/handoff.d` | Handoff record carries the full map so a reloaded engine renders the panel immediately |
+| `source/ircfiber/engine/exec_reload.d` | Snapshot/restore across `exec(2)` boundaries |
+| `source/ircfiber/redis/protocol.d` | `NetworkStateSnapshot.isupport: string[string]` |
+| `source/ircfiber/engine/state.d` | Snapshot writer publishes the map with each heartbeat |
+| `source/ircfiber/api/websocket.d` | Sync payload `netObj["isupport"]` ships it to every fresh WS connection |
+| `frontend/src/lib/messageHandler.ts` | Dispatches the `ISUPPORT` event into `applyIsupportUpdate()` |
+| `frontend/src/stores/ircStore.svelte.ts` | `applyIsupportUpdate()` writes the engine's parsed map onto `net.isupport` |
+
+The legacy `ServerFeatures` struct (6 hardcoded fields:
+NETWORK, PREFIX, CHANMODES, NICKLEN, TOPICLEN, CHANLIMIT) is kept
+on the engine side for backward compatibility with code that
+pre-dated the catalog. New code consumes `isupportMap` /
+`getIsupport()`.
+
+## Why this avoided the "parse 005 in the frontend" smell
+
+Before this change, `applyIsupport` in the engine only stored 6
+ISUPPORT tokens — everything else (`DYNAMITE`, `HOOKS`, `MONITOR`,
+`CHATHISTORY`, etc.) was silently dropped at the engine level. The
+frontend had three options:
+1. Re-parse raw 005 message text from the `_server` buffer
+2. Maintain a separate ISUPPORT-derivation layer per IRCd
+3. **Have the engine emit a parsed `string[string]` map** ✅
+
+We picked option 3. The 005 handler now:
+1. Stores every token (case-insensitive, uppercased for catalog lookup)
+2. Mirrors the legacy 6 fields onto `ServerFeatures` for back-compat
+3. Emits a synthetic `ISUPPORT` WS event after the 005 stream ends
+4. Ships the map in the `NetworkStateSnapshot` for resume / handoff
+
+The frontend panel reads `network.isupport` directly. The 005 message
+parser in `isupportFromMessages` remains as a fallback for historical
+displays that surface a pre-synced server-log timeline.
+
+## Categories
+
+The catalog groups tokens into 11 buckets (see
+`ISUPPORT_CATEGORIES`):
+
+| ID | Purpose | Examples |
+|---|---|---|
+| `server-identity` | Network / case-mapping identifier | `NETWORK`, `CASEMAPPING` |
+| `channel-naming` | Prefix chars, name / topic length | `CHANTYPES`, `CHANNELLEN`, `TOPICLEN`, `KICKLEN`, `CHANLIMIT`, `STATUSMSG`, `MAXCHANNELS` |
+| `user-limits` | Nick / username / away length | `NICKLEN`, `MAXNICKLEN`, `MINNICKLEN`, `USERLEN`, `HOSTLEN`, `AWAYLEN` |
+| `case-mapping` | RFC 1459 / strict / ascii | (single token: `CASEMAPPING` — kept visible) |
+| `channel-modes` | `PREFIX`, `CHANMODES`, `MODES`, `MAXLIST` | (type categorisation) |
+| `channel-bans` | Ban / exception / invite-override tokens | `EXCEPTS`, `INVEX`, `EXCEPTSEXTBAN`, `BANWIDTH` |
+| `user-modes` | Client toggles | `USERMODES` (rare) |
+| `messages` | Server-side history / msg-id types | `CHATHISTORY`, `MSGREFTYPES`, `CLIENTTAGDENY` |
+| `capabilities` | Bare flags | `KNOCK`, `DEAF`, `BOT`, `CALLERID`, `REGNICK`, `SILENCE`, `WALLCHOPS`, `ACCEPT`, `WHOX`, `CPRIVMSG`, `SAFELIST`, `ELIST`, `UTF8ONLY`, `UTF8MAPPING`, `LANGUAGE`, `FNC`, `ETSDELIM`, `WATCH`, `MONITOR` |
+| `extensions` | IRCv3-era | (none currently — placeholder for future) |
+| `server-specific` | Catch-all for tokens we don't catalog | `DYNAMITE`, `URANIUMREFINERY`, etc. (SuperNets custom tokens) |
+
+## Quickstart for adding a new token
+
+1. Open `frontend/src/lib/isupportCatalog.ts`.
+2. Append an entry to `ISUPPORT_CATALOG`:
+   ```ts
+   {
+     key: 'WALLCHOPS',          // upper-case canonical
+     category: 'capabilities',  // pick from ISUPPORT_CATEGORIES
+     kind: 'flag',              // flag | int | string | enum | mode-list | prefix-list | pair | mask | language | time
+     title: 'WALLCHOPS command',
+     short: 'Server supports sending PRIVMSGs only to channel ops',
+     detail: 'WALLCHOPS #chan :text sends a status message to channel ops only; survives across +m / moderated / silenced normal users.',
+     rfc: 'https://…',          // optional
+     ircv3: 'https://…',        // optional
+     since: 'RFC 2812',         // or 'IRCv3 3.0'
+     status: 'extended',        // core | extended | draft | legacy | ircv3 | undefined
+   }
+   ```
+3. The panel re-renders automatically — no other code change
+   required. The catalog is the single source of truth and is
+   indexed once into a Map for `lookupIsupport()`.
+
+## Known issues / open questions
+
+| Issue | Notes |
+|---|---|
+| Engine-side `dub test` (Dub-managed) currently fails to build | Pre-existing on `main`; not related to this change. `make engine-handoff` / `dub build --config=…` works. |
+| Some custom IRCds emit unparseable 005 streams | `splitIsupportText` falls back to a single-token pass-through so the timeline at least shows *something*. The catalog marks unknowns as `server-specific` so the user knows they're nonstandard. |
+| Bare flag in concatenated text (e.g. `AWAYLEN=307KNOCK`) | Catalog ambiguity resolved via `lookupIsupport`-aware splitter — see `splitIsupportText` for the full disambiguation rules. Tested via the `splitIsupportText` unit-test suite. |
+
+---
+
 # IRC Fiber — Testing Guide
 
 ## Test Suites
@@ -66,14 +189,36 @@ page.on('console', msg => { if (msg.text().includes('[tag]')) logs.push(msg.text
 
 The `capture_comparison.js` script also captures IRCCloud's live CSS for reference.
 
-## D Backend Test Suites (engine + shared modules)
+## Jul 8 2026 bug fixes — full audit & performance pass
 
-`make test-fast` runs the fast standalone D tests (no Redis, no live IRC):
-- `prefs-test`            — preference round-trip
+Five production bugs fixed in one pass. All time-to-connect measurements taken
+from the live OVH engine against meth.cat (remote, ngircd) and IRC Fiber
+(local, ergo-2.18.0).
+
+## Direct engine IRC connection
+
+The engine opens IRC TCP/TLS sockets directly via
+`happyEyeballsConnect()` and `createTLSStreamWithTimeout()` in
+`source/ircfiber/irc/connection.d`. No holder daemon, no Unix-domain IPC.
+When the engine restarts:
+
+- **Plain TCP networks** survive via SCM_RIGHTS fd transfer in
+  `source/ircfiber/engine/handoff.d`. The new engine adopts the
+  live IRC socket; the IRC server sees one continuous connection.
+  This is the same primitive `make engine-handoff` already used
+  for engine hot-reloads.
+- **TLS networks** soft-reconnect (~1s) because the TLS session isn't
+  transferable across processes. Same behaviour as IRCCloud. Users
+  see a brief "Connecting..." card on the channel.
+
+Removing the holder was the simplification: zero-disconnect TLS across
+restarts required a daemon-grade process isolation that wasn't pulling
+its weight for our single-host deployment. The archived daemon lives
+under `archived/conn-holder/` if the requirement returns.
+
+
 - `parser-test`           — IRC line parser
 - `consumer-test`         — reconnect-dedup helpers
-- `holder-test`           — conn-holder IPC framing defense
-- `connection-holder-strict-test`  — NetworkHolderHealth JSON contract
 - `connection-registration-test`   — **NEW**: ConnectionServer.registrationUnavailableFor JSON contract for the admin registration-stuck surface
 - `observability-test`    — OTel metrics pipeline
 
@@ -256,6 +401,17 @@ scp irc-fiber deploy@server:/tmp/  # ← do not do this
 
 Key issue: `rsync delete: false` (now fixed to `delete: true`) allowed stale source files like `source/ircfiber/web/admin.d` to persist on the remote after the admin code was refactored into the `admin/` package directory. This caused `dub build` to fail with "package name conflicts with module name" — the error was hidden by `|| true` in the Containerfile's RUN command.
 
+## Build cache invalidation
+
+The Containerfile has two caching layers, both of which silently swallow code changes if not invalidated:
+
+1. **Docker layer cache.** A bare `--build-arg CACHE_BUST=$(date +%s)` is **not enough** to invalidate a `COPY source/ ./source/` layer — BuildKit keys COPY layers by source-directory contents, not by build args. The Containerfile works around this with a heredoc sentinel (`COPY <<EOF ./source/.cache_bust_$CACHE_BUST\nbust=$CACHE_BUST\nEOF`) so the source tree's bytes change with `CACHE_BUST`. The next `COPY source/` is therefore invalidated.
+2. **dub's incremental compile cache** (`/build/.dub`, mounted via `--mount=type=cache,sharing=locked`). Even if the COPY layer is fresh, LDC silently skips changed `.d` files when its module cache is warm. The Containerfile wipes `/build/.dub` when `CACHE_BUST` is non-default.
+
+**Always pass `--build-arg CACHE_BUST=$(date +%s)`** when rebuilding locally after a code change. Without it, you can edit `source/ircfiber/irc/connection.d`, push the change, watch the engine restart cleanly, and STILL see the old behaviour — the build cache hides it.
+
+This bite the author of the 432/433 nick-revert fix: the in-place mutation and dedup changes landed and worked, but the synthetic revert-event code was missing from the binary for ~20 minutes of debugging because the layer cache skipped recompilation. Symptom was `grep -ac 'Mirror the 433' /app/irc-fiber-engine` returning `0` on a freshly built image.
+
 ## Admin SPA deployment
 
 Frontend assets (`public/dist/admin.html`, `assets/*`) are pushed to the gateway container via the Makefile's SSH tar pipe AFTER the playbook completes:
@@ -428,83 +584,6 @@ Engine config overrides (`priority`, `fallbackOnly`, `maxConnections`) are store
 All containers use `restart_policy: unless-stopped`, so `docker restart` on the host recovers everything automatically.
 
 ---
-
-# IRC Fiber — Connection Holder Architecture
-
-For the **enterprise-grade zero-disconnect hot-reload** solution, see [docs/CONNECTION_HOLDER.md](docs/CONNECTION_HOLDER.md). Key points:
-
-- **Holder** (`ircfiber-conn-holder`) is a long-lived daemon owning IRC TCP/TLS sockets.
-- **Engine** (`irc-fiber-engine`) is exec-reloadable, talks to holder via Unix-domain IPC.
-- When engine hot-reloads, holder keeps IRC connection alive — IRC server sees ONE continuous connection.
-- Enable via `IRCFIBER_HOLDER_SOCK` env var pointing to the shared Unix socket path.
-
-## Holder mode is mandatory when configured
-
-When `IRCFIBER_HOLDER_SOCK` is set, the engine **never** falls back to direct TCP if the holder daemon becomes unreachable. The connection loop throws `"Holder transport unavailable; will retry"` on every iteration until `handleDisconnection()` rebuilds the `HolderTransport` (a fast retry — the backoff is reset for this case so a transient holder restart costs at most 10 seconds, not the normal 15-minute exponential cap).
-
-Why this matters: silently falling back to direct TCP would create a **second socket on the IRC server** that the holder still owns. Most IRC servers ghost one of the two connections, the engine would appear connected while being shadowed, and any subsequent hot-reload would have nothing to hand off (the canonical socket lives in the holder). The strict mode prevents this silent regression.
-
-Deployments without a holder (the legacy direct-TCP path) are unaffected — `useHolderMode` is set per-client based on whether `enableHolderMode()` was called at boot.
-
-## Holder health observability surface
-
-When holder mode is active but the daemon is unreachable, the engine surfaces the degradation through five layers so operations gets paged instead of staring at "Connecting...":
-
-| Surface | What it shows | Where |
-|---|---|---|
-| **Structured log** | `event:holder_missing` warning with `networkName`, `sinceMs`, `traceId`, `spanId` | `tail -f irc-fiber.log` |
-| **OTel traces** | Dedicated spans `irc.holder.attempt`, `irc.holder.rebuild`, `irc.holder.strict_mode_throw`, `irc.holder.recovered` | SigNoz flamegraphs |
-| **OTel metrics** | Counters `holder.unavailable_total`, `holder.recovered_total`, `holder.strict_mode_throws_total`; gauge `holder.missing_networks`; histogram `holder.recovery_duration_seconds` | SigNoz dashboards + alerts |
-| **Heartbeat state** | `holderUnavailableFor:[...]` array on the `irc:server:<serverId>` record | Redis |
-| **Admin API** | `GET /api/admin/servers/:id/holder-state` returns per-network holder health with `available`, `missingSince`, `lastError` | Admin SPA |
-
-Logs carry `traceId`/`spanId` so a `holder_missing` log line in SigNoz is one click away from the flamegraph of the strict-mode throws that preceded it. The metrics pipeline (`source/ircfiber/observability.d`) exports to the same OTel collector as traces via `/v1/metrics` every 10 s from the heartbeat task.
-
-Pinned tests:
-- `make observability-test` — JSON shape of counter / gauge / histogram payloads against the OTLP 1.5 spec.
-- `make connection-holder-strict-test` — JSON shape of the admin endpoint response.
-
-## Build & test the holder
-
-```bash
-cd frontend  # actually run from project root
-# Local fast tests (~25s)
-./run-holder-tests.sh          # 4 tests: protocol, compile, raw IPC e2e, engine integration
-./run-holder-enterprise-tests.sh  # 11 tests: health endpoints, graceful shutdown, multi-network, chaos
-```
-
-## Deploy the holder to OVH
-
-```bash
-bash scripts/deploy-holder-ovh.sh  # Builds remotely (Linux x86_64) + deploys both containers
-```
-
-## Key files
-
-| File | Purpose |
-|---|---|
-| `source/conn_holder/main.d` | Holder entry point with graceful shutdown |
-| `source/conn_holder/protocol.d` | Binary frame IPC protocol |
-| `source/conn_holder/irc_client.d` | Per-network IRC connection (raw TCP / TLS) |
-| `source/conn_holder/raw_fd_stream.d` | Vibe.d Stream wrapper for raw POSIX fd |
-| `source/conn_holder/ipc_server.d` | Unix-domain socket IPC server |
-| `source/conn_holder/client.d` | Engine-side HolderClient wrapper |
-| `source/conn_holder/health_server.d` | Health/metrics HTTP server |
-| `source/ircfiber/engine/holder_transport.d` | Engine-side IRC abstraction (same API as AdoptedSocket) |
-| `scripts/deploy-holder-ovh.sh` | OVH deployment script |
-| `docker-compose.holder.yml` | Two-container deployment |
-| `deploy/playbooks/deploy-holder.yml` | Ansible playbook |
-
-## ⚠️ Common pitfalls when modifying holder code
-
-1. **Never use `usleep()` in a vibe.d fiber** — it blocks the entire event loop thread. Use `vibe.core.core.sleep(Duration)` instead.
-2. **Never use raw `accept()`** — use non-blocking fd + `poll(timeout)` in a loop with `yield()`.
-3. **TLSStream.read with IOMode.once returns 0 if no decrypted bytes pending** — this is NOT EOF. Check `leastSize > 0` first, or use `dataAvailableForRead` + a small throwaway buffer to trigger decryption.
-4. **TLS empty read is a no-op** — pass at least 1 byte in the buffer.
-5. **Always update ALL three ConnectionManager paths** when adding holder mode: `addNetwork`, `addAndStartNetwork`, AND `adoptFromHandoff`.
-6. **Build D binaries on the target architecture** (Linux x86_64 for OVH) — local Mac ARM64 binaries won't run on Linux. Use BuildKit.
-7. **When committing new binaries to a Docker image**, the original entrypoint is preserved. Override with `--entrypoint /app/mybin` when running the new container.
-8. **DNS resolution**: use `getaddrinfo()` not `inet_pton()` if you want hostname support (IRC servers are hostnames, not IPs).
 
 ---
 

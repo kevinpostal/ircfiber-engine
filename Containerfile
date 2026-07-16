@@ -78,27 +78,54 @@ WORKDIR /build
 # ============================================================================
 FROM base AS builder
 
+# ── Build cache invalidation ─────────────────────────────────────────────
+# A bare `ARG` change is NOT enough to invalidate `COPY source/` — BuildKit
+# caches the COPY by source-directory contents. The heredoc below writes a
+# sentinel file INSIDE the source tree with content depending on CACHE_BUST;
+# changing the ARG therefore changes the source tree's bytes, invalidating
+# the next COPY and forcing a re-introduction of the fresh on-disk source.
+#
+# Without this trick, a code-only change on the host gets silently skipped:
+# the COPY is served from the Docker layer cache, and even when the next
+# RUN re-executes, dub's incremental compile cache (`/build/.dub`,
+# mounted below) hides the .d-file changes from LDC. The two together
+# produce the worst possible failure mode — code that changed but the
+# binary that didn't.
+ARG CACHE_BUST=fixed
+COPY <<EOF ./source/.cache_bust_$CACHE_BUST
+bust=$CACHE_BUST
+EOF
+
 COPY dub.sdl dub.selections.json ./
 COPY source/ ./source/
 COPY views/  ./views/
 COPY config/ ./config/
 COPY public/ ./public/
 
-ARG CACHE_BUST=0
-
-# 4 sequential `dub build` calls inside one stage. Each dub invocation
-# internally parallelizes LDC compile; the mount cache survives between
-# runs and across `docker build` invocations.
-RUN --mount=type=cache,target=/build/.dub \
+# When CACHE_BUST is non-default, nuke ALL caches dub/LDC might use:
+# - /build/.dub (dub's global cache)
+# - source/**/dub-cache.json + *.o (per-package incremental state)
+# - /root/.dub (dub's user-level cache from dub's $HOME)
+# Then pass `--force` to dub to skip its own mtime/size checks.
+# Without this, dub/LDC silently skip changed .d files even after the
+# source COPY is fresh — "I changed code but the binary still has the
+# old behaviour" is the worst kind of bug.
+RUN if [ "$CACHE_BUST" != "fixed" ]; then \
+        rm -rf /build/.dub /root/.dub && \
+        find source -name '*.o' -delete 2>/dev/null && \
+        find source -name 'dub-cache.json' -delete 2>/dev/null && \
+        DUB_FLAGS="--force" && \
+        echo "dub cache busted (CACHE_BUST=$CACHE_BUST)" ; \
+    else \
+        DUB_FLAGS="" ; \
+    fi && \
     echo "build: $CACHE_BUST" && \
-    dub build                --compiler=ldc2 --build=release --parallel && \
-    dub build --config=engine --compiler=ldc2 --build=release --parallel && \
-    dub build --config=conn-holder --compiler=ldc2 --build=release --parallel && \
-    dub build --config=janitor-migrate --compiler=ldc2 --build=release --parallel && \
-    dub build --config=ircfiber-default-migrate --compiler=ldc2 --build=release --parallel && \
+    dub build                --compiler=ldc2 --build=release --parallel $DUB_FLAGS && \
+    dub build --config=engine --compiler=ldc2 --build=release --parallel $DUB_FLAGS && \
+    dub build --config=janitor-migrate --compiler=ldc2 --build=release --parallel $DUB_FLAGS && \
+    dub build --config=ircfiber-default-migrate --compiler=ldc2 --build=release --parallel $DUB_FLAGS && \
     test -f /build/irc-fiber && \
     test -f /build/irc-fiber-engine && \
-    test -f /build/ircfiber-conn-holder && \
     test -f /build/janitor-migrate && \
     test -f /build/ircfiber-default-migrate
 
@@ -127,15 +154,13 @@ WORKDIR /app
 
 COPY --from=builder /build/irc-fiber             /app/
 COPY --from=builder /build/irc-fiber-engine      /app/
-COPY --from=builder /build/ircfiber-conn-holder  /app/
 COPY --from=builder /build/janitor-migrate       /app/
 COPY --from=builder /build/views                 /app/views
 COPY --from=builder /build/config                /app/config
 COPY --from=builder /build/public                /app/public
 
-# Data + holder socket dirs.
-RUN mkdir -p /app/data /app/uploads /var/run/ircfiber && \
-    chmod 0755 /var/run/ircfiber
+# Data dirs.
+RUN mkdir -p /app/data /app/uploads
 
 EXPOSE 8090
 
