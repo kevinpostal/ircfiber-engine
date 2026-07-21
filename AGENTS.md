@@ -1328,3 +1328,100 @@ containers, volumes, and config directories.
 
 Full task graph (14 tasks across 4 waves):
 [`docs/plan/20260701-signoz-unified-observability-and-local-docker/plan.yaml`](docs/plan/20260701-signoz-unified-observability-and-local-docker/plan.yaml)
+
+# IRC Fiber — Orphan-connection delete (admin Servers table)
+
+The admin `#/servers` Network Assignments table used to expose only
+"Disconnect / Reassign / Remove". None of those removed an orphaned
+empty-string entry that could appear in an engine's `assignedNetworks`
+array — the gateway showed it as a ghost row with no name, no host, no
+owner, and no useful buttons. This was the user-visible symptom of a
+stale engine write: a `""` networkId inserted into `irc:server:<sid>`'s
+`data.assignedNetworks` array survived every heartbeat because the
+per-engine mirror (`irc:server-assignments:<sid>`) was clean and so
+the engine's canonical reconciliation couldn't see anything to
+disconnect.
+
+The fix is three layers — the API gets a host-less full-delete path,
+the SPA gets a Delete button that demands the operator type the
+network label back, and the engine self-heals so a fresh orphan can
+never come back.
+
+## Architecture
+
+```
+Engine (D)                                Frontend (TS)
+──────────────────────────                 ────────────────────────
+bootstrap.d heartbeat:                     Servers.svelte table:
+  syncServerState(localServer)               Delete button (per row)
+    ↓                                       ↓
+  getCanonicalNetworks()                     api.post(
+    ↓                                         /api/admin/servers/
+  localServer.assignedNetworks = canonical     assignments/<id>/delete,
+    ↓                                         confirm + typed-label
+  filter!(n => n.length > 0)  ← self-heal      prompt, then submit
+    ↓
+  publishServerAssignments(mirror)
+    ↓
+  syncServerState(localServer)  ← 2nd write
+                                        api.d → apiAssignmentDelete
+                                          ↓
+                                        deleteNetworkCore:
+                                          • lpush removeNetwork
+                                            control to engine
+                                          • Mongo deleteById
+                                          • Redis: state, fail, ban
+                                          • HDEL irc:assignments
+                                          • scrub server record +
+                                            per-engine mirror
+                                          (allowEmpty=true walks
+                                           every server for orphans)
+```
+
+Files:
+
+| File | Purpose |
+|---|---|
+| `source/ircfiber/web/admin/api.d` | `deleteNetworkCore()` shared by form + JSON paths. `apiAssignmentDelete` is the new SPA-facing endpoint; `apiHostDeleteNetwork` now delegates to the core. `allowEmpty=true` lets the SPA scrub ghost rows that have no Mongo record. |
+| `source/ircfiber/web/admin/package.d` | Registers `POST /api/admin/servers/assignments/:networkId/delete` next to the existing `/remove` route. |
+| `source/ircfiber/irc/registry.d` | `assignNetwork("")` now refuses with a warning (the entry path that produced the original ghost row). `publishServerAssignments` filters empty ids as a second line of defence. |
+| `source/ircfiber/engine/bootstrap.d` | Heartbeat self-heal: filter empty ids out of `localServer.assignedNetworks`, then a second `syncServerState()` re-persists the cleaned value to the server record on the very first cycle (not the second). |
+| `frontend/src/admin/pages/Servers.svelte` | New "Delete" button on every assignment row. Two-stage confirm (`confirm()` + typed `prompt()`) so a misclick can't nuke a network. Ghost rows get a different prompt copy explaining it's a server-record scrub, not a Mongo delete. |
+| `frontend/src/admin/pages/Servers.svelte.test.ts` | 7 regression tests — covers the happy path, cancel path, typo-protection, API-error surface, ghost-row rendering, and the orphan-specific prompt copy. |
+
+## Behaviour matrix
+
+| User action | Old behaviour | New behaviour |
+|---|---|---|
+| Click "Remove" on a real network | Cleared assignment hash; engine re-asserted on next heartbeat | Same (unchanged) |
+| Click "Delete" on a real network | n/a | Engine client stopped, Mongo row deleted, Redis state scrubbed, confirm + typed label required |
+| Click "Delete" on a ghost row (empty networkId) | n/a | Walks every engine's server record + per-engine mirror, strips the orphan, no Mongo delete attempted |
+| Engine boots with dirty `assignedNetworks` | Wrote dirty state every heartbeat | First heartbeat writes dirty, but second `syncServerState()` after the empty-id filter re-persists the cleaned value within the same cycle |
+| `assignNetwork("")` called from any caller | Created a ghost row | Refused with `WARN`; returns empty serverId |
+
+## Quickstart for adding a new admin mutation
+
+1. Define the handler in `source/ircfiber/web/admin/api.d` next to the
+   existing siblings (e.g. `apiAssignmentDelete`).
+2. Register the route in
+   `source/ircfiber/web/admin/package.d` under
+   `router.post("/api/admin/...")`.
+3. Add the matching thunks in `frontend/src/admin/lib/api-client.ts`
+   (none required — `api.post` covers arbitrary URLs).
+4. Add a button in the relevant Svelte page (`Servers.svelte` in this
+   case). For destructive actions, always require a typed-label
+   confirmation via `prompt()` matching `label`. Two-stage
+   (`confirm()` + `prompt()`) is the established pattern.
+5. Add a regression test in the matching `*.svelte.test.ts`. The
+   pattern in `Servers.svelte.test.ts` is the most recent one — mocks
+   `../lib/api-client` and `../stores/ui` so the test doesn't depend on
+   the global pollingEnabled toggle.
+
+## Known issues / open questions
+
+| Issue | Notes |
+|---|---|
+| Pre-deploy ghost rows persist one heartbeat cycle | The first `syncServerState()` after deploy writes the in-memory `localServer.assignedNetworks` (which on a legacy engine contains the orphan); the second `syncServerState()` after the filter re-persists the clean state within the same cycle. Operators running the SPA during that 10 s window will see the ghost row flicker. The Delete button scrubs it instantly if needed. |
+| `deleteNetworkCore` walks every server when scrubbing an empty id | This is the correct behaviour for ghost rows that have no canonical assignment, but a malicious `networkId=""` payload could theoretically hit many servers. The endpoint is admin-gated and the prompt copy makes the action obvious; we accept the trade-off. |
+| Test framework constraints | `frontend/src/admin/pages/Servers.svelte.test.ts` uses `vitest-browser-svelte` + playwright and is therefore blocked in worktrees (symlinked `node_modules` + URL-encoded spaces in path). Run from the parent repo on macOS / Linux. The 2 unrelated failures in `ServerLogCard.test.ts` and `ircStore.svelte.test.ts` are pre-existing on main and not introduced by this change. |
+
