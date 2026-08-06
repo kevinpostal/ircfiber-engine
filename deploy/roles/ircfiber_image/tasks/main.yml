@@ -1,9 +1,9 @@
 ---
 # ircfiber_image role.
 #
-# Builds two images:
-#   - irc-fiber-gateway  (D, from Containerfile)
-#   - ircfiber-engine    (Zig, from Containerfile.zig)
+# Builds the IRC Fiber images (D engine/gateway, both from Containerfile):
+#   - irc-fiber-gateway  (D gateway, from Containerfile)
+#   - irc-fiber-engine   (D engine, from Containerfile)
 #
 # Strategies:
 #   - With a registry: build on the Ansible control node, push, target pulls.

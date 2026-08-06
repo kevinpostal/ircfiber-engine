@@ -719,38 +719,6 @@ ircfiber-default-migrate: ## Build > Backfill the default IRC Fiber network for 
 	@printf '%b\n' "$(BG)$(OK) Running ircfiber-default-migrate (dry-run)$(R)"
 	@DRY_RUN=1 ./ircfiber-default-migrate --dry-run
 
-build-engine-zig-alpine: ## Build > Cross-compile Zig engine for Alpine (musl)
-	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building Zig Engine (Alpine target)  $(R)"
-	@mkdir -p engine/zig-out/bin
-	@zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe --cache-dir engine/.zig-cache
-	@cp zig-out/bin/ircfiber-engine engine/zig-out/bin/ircfiber-engine
-	@printf '%b\n' "$(BG)$(OK) Zig engine built for Alpine$(R) $(D)($(shell ls -lh engine/zig-out/bin/ircfiber-engine | awk '{print $$5}'))$(R)"
-
-build-engine-native: ## Build > Build Zig engine for local testing (macOS)
-	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building Zig Engine (native)  $(R)"
-	@mkdir -p engine/zig-out/bin
-	@cd engine && zig build-exe src/core.zig src/redis_registration.c -O Debug -femit-bin=ircfiber-engine -lc
-	@printf '%b\n' "$(BG)$(OK) Zig engine built (native)$(R)"
-
-engine-test-local: build-engine-native ## Test > Run Zig engine against local Redis + IRC
-	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Testing Zig Engine locally  $(R)"
-	@printf '%b\n' "$(D)  Ensure redis-server is running locally (brew services start redis)$(R)"
-	@cd engine && timeout 5 ./ircfiber-engine 2>&1 || true
-	@redis-cli SMEMBERS irc:servers 2>&1
-	@redis-cli HGET irc:server:ovh isHealthy 2>&1
-	@redis-cli HGET irc:server:ovh lastHeartbeat 2>&1
-	@redis-cli DEL irc:server:ovh 2>&1
-	@redis-cli SREM irc:servers ovh 2>&1
-	@printf '%b\n' "$(BG)$(OK) Local test complete$(R)"
-
-build-engine-zig: ## Build > Build Zig engine for all targets
-	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building IRC Fiber Engine (Zig)  $(R)"
-	@cd engine && zig build -Doptimize=ReleaseSafe
-	@cd engine && zig build-exe src/core.zig -target x86_64-linux-musl -O ReleaseSafe -femit-bin=zig-out/bin/ircfiber-engine-alpine -lc
-	@cd engine && zig build-exe src/core.zig -target x86_64-linux-gnu -O ReleaseSafe -femit-bin=zig-out/bin/ircfiber-engine-linux -lc
-	@printf '\n%b\n' "$(D)  Targets: macOS (native) + Linux (glibc) + Linux (musl/Alpine)$(R)"
-	@printf '\n%b\n' "$(BG)$(OK) Zig engine build successful$(R)"
-
 build-release: ## Build > Optimized release build
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building IRC Fiber (Release)  $(R)"
 	@bash -o pipefail -c '$(DUB) build --build=release 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | tail -8'
