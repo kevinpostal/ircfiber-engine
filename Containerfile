@@ -79,60 +79,64 @@ WORKDIR /build
 FROM base AS builder
 
 # ── Build cache invalidation ─────────────────────────────────────────────
-# A bare `ARG` change is NOT enough to invalidate `COPY source/` — BuildKit
-# caches the COPY by source-directory contents. The heredoc below writes a
-# sentinel file INSIDE the source tree with content depending on CACHE_BUST;
-# changing the ARG therefore changes the source tree's bytes, invalidating
-# the next COPY and forcing a re-introduction of the fresh on-disk source.
-#
-# Without this trick, a code-only change on the host gets silently skipped:
-# the COPY is served from the Docker layer cache, and even when the next
-# RUN re-executes, dub's incremental compile cache (`/build/.dub`,
-# mounted below) hides the .d-file changes from LDC. The two together
-# produce the worst possible failure mode — code that changed but the
-# binary that didn't.
+# Same sentinel trick as before, but now one sentinel per package so editing
+# `backend/source/api/rest.d` does not force-rebuild the engine and vice versa.
+# Each heredoc writes inside its package's source tree, invalidating the
+# matching COPY below.
 ARG CACHE_BUST=fixed
-COPY <<EOF ./source/.cache_bust_$CACHE_BUST
+COPY <<EOF ./common/source/.cache_bust_$CACHE_BUST
+bust=$CACHE_BUST
+EOF
+COPY <<EOF ./backend/source/.cache_bust_$CACHE_BUST
+bust=$CACHE_BUST
+EOF
+COPY <<EOF ./engine/source/.cache_bust_$CACHE_BUST
 bust=$CACHE_BUST
 EOF
 
-COPY engine/dub.sdl engine/dub.selections.json ./
-COPY engine/source/ ./source/
-COPY engine/views/  ./views/
+COPY common/dub.sdl common/dub.selections.json ./common/
+COPY common/source/ ./common/source/
+COPY backend/dub.sdl backend/dub.selections.json ./backend/
+COPY backend/source/ ./backend/source/
+COPY backend/views/  ./backend/views/
+COPY engine/dub.sdl engine/dub.selections.json ./engine/
+COPY engine/source/ ./engine/source/
 COPY config/ ./config/
 COPY public/ ./public/
 
 # When CACHE_BUST is non-default, nuke ALL caches dub/LDC might use:
 # - /build/.dub (dub's global cache)
-# - source/**/dub-cache.json + *.o (per-package incremental state)
+# - */dub-cache.json + *.o (per-package incremental state)
 # - /root/.dub (dub's user-level cache from dub's $HOME)
 # Then pass `--force` to dub to skip its own mtime/size checks.
-# Without this, dub/LDC silently skip changed .d files even after the
-# source COPY is fresh — "I changed code but the binary still has the
-# old behaviour" is the worst kind of bug.
 RUN --mount=type=cache,target=/build/.dub,sharing=locked \
     --mount=type=cache,target=/root/.dub,sharing=locked \
     if [ "$CACHE_BUST" != "fixed" ]; then \
         rm -rf /build/.dub /root/.dub && \
-        find source -name '*.o' -delete 2>/dev/null && \
-        find source -name 'dub-cache.json' -delete 2>/dev/null && \
+        find common/source backend/source engine/source -name '*.o' -delete 2>/dev/null && \
+        find common backend engine -name 'dub-cache.json' -delete 2>/dev/null && \
         DUB_FLAGS="--force" && \
         echo "dub cache busted (CACHE_BUST=$CACHE_BUST)" ; \
     else \
         DUB_FLAGS="" ; \
     fi && \
     echo "build: $CACHE_BUST" && \
-    dub build                --compiler=ldc2 --build=release --parallel $DUB_FLAGS && \
-    dub build --config=gateway --compiler=ldc2 --build=release --parallel $DUB_FLAGS && \
-    dub build --config=engine --compiler=ldc2 --build=release --parallel $DUB_FLAGS && \
-    dub build --config=janitor-migrate --compiler=ldc2 --build=release --parallel $DUB_FLAGS && \
-    dub build --config=ircfiber-default-migrate --compiler=ldc2 --build=release --parallel $DUB_FLAGS && \
-    test -f /build/irc-fiber && \
-    (test -f /build/irc-fiber-gateway || cp /build/irc-fiber /build/irc-fiber-gateway) && \
-    test -f /build/irc-fiber-engine && \
-    test -f /build/janitor-migrate && \
-    test -f /build/ircfiber-default-migrate
-RUN find /build -maxdepth 1 -type f -executable -exec strip {} +
+    dub build --root=common --compiler=ldc2 --build=release --parallel $DUB_FLAGS && \
+    dub build --root=backend --compiler=ldc2 --build=release --parallel $DUB_FLAGS && \
+    dub build --root=backend --config=gateway --compiler=ldc2 --build=release --parallel $DUB_FLAGS && \
+    dub build --root=engine --compiler=ldc2 --build=release --parallel $DUB_FLAGS && \
+    dub build --root=engine --config=janitor-migrate --compiler=ldc2 --build=release --parallel $DUB_FLAGS && \
+    dub build --root=engine --config=ircfiber-default-migrate --compiler=ldc2 --build=release --parallel $DUB_FLAGS && \
+    cp backend/irc-fiber ./irc-fiber && \
+    cp backend/irc-fiber ./irc-fiber-gateway && \
+    cp engine/irc-fiber-engine ./irc-fiber-engine && \
+    cp engine/janitor-migrate ./janitor-migrate && \
+    cp engine/ircfiber-default-migrate ./ircfiber-default-migrate 2>/dev/null || true && \
+    cp -r backend/views ./views && \
+    test -f ./irc-fiber && \
+    test -f ./irc-fiber-engine && \
+    test -f ./janitor-migrate
+RUN find . -maxdepth 1 -type f -executable -exec strip {} +; find backend engine -maxdepth 2 -type f -executable -exec strip {} + 2>/dev/null; true
 
 # ============================================================================
 # Stage: runtime — slim Ubuntu + 4 binaries

@@ -15,11 +15,14 @@
 # Variables
 # ----------------------------------------------------------------------------
 DUB         := dub --root=engine
+DUB_COMMON  := dub --root=common
+DUB_BACKEND := dub --root=backend
+DUB_ENGINE  := dub --root=engine
 LDC         := ldc2
-APP         := engine/irc-fiber
+APP         := backend/irc-fiber
 GATEWAY_IMAGE ?= irc-fiber-gateway
 ENGINE_IMAGE  ?= irc-fiber-engine
-GATEWAY_APP := engine/irc-fiber-gateway
+GATEWAY_APP := backend/irc-fiber
 ENGINE_APP  := engine/irc-fiber-engine
 DUB_PKG     := $(HOME)/.dub/packages
 
@@ -51,10 +54,9 @@ DSCANNER := $(or $(shell which dscanner 2>/dev/null),\
                   $(shell ls -1 $(DUB_PKG)/dscanner/*/dscanner/bin/dscanner 2>/dev/null | tail -1),\
                   dub run dscanner --)
 
-# Source files
-# Engine sources moved to engine/ — enterprise layout
-SRCS        := $(shell find engine/source -name '*.d')
-DT_SRCS     := $(shell find engine/views -name '*.dt')
+# Source files — enterprise split: backend (vibe.d API), common (shared lib), engine (IRC daemon)
+SRCS        := $(shell find backend/source common/source engine/source -name '*.d' 2>/dev/null)
+DT_SRCS     := $(shell find backend/views -name '*.dt' 2>/dev/null)
 
 # Colors & icons
 R  := \033[0m
@@ -166,11 +168,10 @@ IRCFIBER_DEFAULT_SERVER_ID ?= localengine
 
 # Shared paths for supervisor / logs / pidfiles / crash dumps (relative to project root — avoids space issues)
 ENGINE_BIN          := engine/irc-fiber-engine
-GATEWAY_BIN         := engine/irc-fiber-gateway
-# Fallback for legacy `engine/irc-fiber` (pre-split). New builds produce `irc-fiber-gateway`.
-GATEWAY_BIN_FALLBACK := engine/irc-fiber
-GATEWAY_EFF_BIN      := $(or $(wildcard $(GATEWAY_BIN)),$(GATEWAY_BIN_FALLBACK))
-SUPERVISOR_SCRIPT   := ./scripts/irc-fiber-engine-supervisor.sh
+GATEWAY_BIN         := backend/irc-fiber
+# Fallback for legacy `engine/irc-fiber` (pre-split) and `engine/irc-fiber-gateway`.
+GATEWAY_BIN_FALLBACK := backend/irc-fiber
+GATEWAY_EFF_BIN      := $(or $(wildcard $(GATEWAY_BIN)),$(GATEWAY_BIN_FALLBACK),$(wildcard engine/irc-fiber),engine/irc-fiber)
 ENGINE_LOGFILE      := /tmp/irc-fiber-engine.log
 GATEWAY_LOGFILE     := /tmp/irc-fiber.log
 SUPERVISOR_LOGFILE  := /tmp/irc-fiber-engine.supervisor.log
@@ -189,6 +190,13 @@ dev: frontend-install ## Component > Frontend dev (Vite HMR) — pairs with `mak
 	@printf '%b\n' "$(D)Open http://localhost:5173 when ready$(R)"
 	@printf '%b\n' "$(D)Pair with: make debug  or  make debug-live  (in another terminal)$(R)"
 	@cd frontend && VITE_BACKEND_URL=$(EFFECTIVE_BACKEND_URL) npm run dev
+
+# Production bundle: vite build + inject-manifest (re-syncs backend/views/index.dt
+# with the content-hashed CSS/JS URLs so the gateway-rendered SPA shell never
+# references a stale bundle).
+frontend: ## Build > Production frontend bundle (dist/ + views/index.dt hashes)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building frontend bundle  $(R)"
+	@npm --prefix frontend run build
 
 # Frontend dev pointing at the tailnet gateway (no local D backend at all).
 dev-live: ## Component > Frontend dev (Vite) against the TAILNET gateway
@@ -228,10 +236,9 @@ debug: ## Component > Full stack via docker-compose: gateway (REST API) + engine
 		needs_build=0; \
 		if [ ! -f "$$stamp" ]; then needs_build=1; \
 		else \
-			if [ Containerfile -nt "$$stamp" ] || [ engine/dub.sdl -nt "$$stamp" ] || [ engine/dub.selections.json -nt "$$stamp" ]; then needs_build=1; \
-			elif find engine/source engine/views config public -type f -newer "$$stamp" 2>/dev/null | grep -q .; then needs_build=1; \
-			elif find deploy/roles/engine/files -type f -newer "$$stamp" 2>/dev/null | grep -q .; then needs_build=1; \
-			elif ! docker image inspect irc-fiber-gateway:latest >/dev/null 2>&1 || ! docker image inspect irc-fiber-engine:latest >/dev/null 2>&1; then needs_build=1; \
+			if [ Containerfile -nt "$$stamp" ] || [ engine/dub.sdl -nt "$$stamp" ] || [ engine/dub.selections.json -nt "$$stamp" ] || [ backend/dub.sdl -nt "$$stamp" ] || [ backend/dub.selections.json -nt "$$stamp" ] || [ common/dub.sdl -nt "$$stamp" ] || [ common/dub.selections.json -nt "$$stamp" ]; then needs_build=1; \
+			elif find backend/source backend/views common/source engine/source config public -type f -newer "$$stamp" 2>/dev/null | grep -q .; then needs_build=1; \
+			elif find deploy/roles/engine/files deploy/roles/gateway -type f -newer "$$stamp" 2>/dev/null | grep -q .; then needs_build=1; \
 			fi; \
 		fi; \
 		if [ "$$needs_build" = "1" ]; then \
@@ -239,7 +246,7 @@ debug: ## Component > Full stack via docker-compose: gateway (REST API) + engine
 			DOCKER_BUILDKIT=1 docker compose build ircfiber-gateway ircfiber-engine; \
 			touch "$$stamp"; \
 		else \
-			printf "\n%b\n" "$(BG)$(OK) Images up-to-date — skipping docker build (cached) $(R) $(D)(touch Containerfile or engine/source to force)$(R)"; \
+			printf "\n%b\n" "$(BG)$(OK) Images up-to-date — skipping docker build (cached) $(R) $(D)(touch Containerfile or backend/source to force)$(R)"; \
 		fi; \
 		'
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Starting gateway + engine as separate containers  $(R)"
@@ -644,9 +651,9 @@ watch-engine: ## Component > Watch engine/source/*.d — rebuild engine + hot-re
 			printf "%b\n" "$(Y)$(WR) No supervisor running. Start one first: make debug  or  make debug-live$(R)"; \
 			exit 1; \
 		fi; \
-		WATCH=$$(find engine/source -name "*.d" -type f 2>/dev/null); \
+		WATCH=$$(find engine/source common/source -name "*.d" -type f 2>/dev/null); \
 		LAST=$$(echo "$$WATCH" | xargs stat -f %m 2>/dev/null | sort -n | tail -1); \
-		printf "%b\n" "$(C)  watching engine/source/*.d …$(R)"; \
+		printf "%b\n" "$(C)  watching engine/source + common/source …$(R)"; \
 		while true; do \
 			sleep 2; \
 			CURR=$$(echo "$$WATCH" | xargs stat -f %m 2>/dev/null | sort -n | tail -1); \
@@ -660,13 +667,13 @@ watch-engine: ## Component > Watch engine/source/*.d — rebuild engine + hot-re
 	'
 
 # Watch gateway sources, rebuild + restart on change.
-watch-gateway: ## Component > Watch engine/source/*.d — rebuild gateway + relaunch on save
+watch-gateway: ## Component > Watch backend/source/*.d — rebuild gateway + relaunch on save
 	@bash -c ' \
 		printf "\n%b\n" "$(_BC)$(K)$(B)  Watching gateway sources  $(R)"; \
 		printf "%b\n" "$(D)Polls every 2s. Install fswatch for instant: brew install fswatch$(R)"; \
-		WATCH=$$(find engine/source -name "*.d" -type f 2>/dev/null); \
+		WATCH=$$(find backend/source common/source -name "*.d" -type f 2>/dev/null); \
 		LAST=$$(echo "$$WATCH" | xargs stat -f %m 2>/dev/null | sort -n | tail -1); \
-		printf "%b\n" "$(C)  watching engine/source/*.d …$(R)"; \
+		printf "%b\n" "$(C)  watching backend/source + common/source …$(R)"; \
 		while true; do \
 			sleep 2; \
 			CURR=$$(echo "$$WATCH" | xargs stat -f %m 2>/dev/null | sort -n | tail -1); \
@@ -715,7 +722,8 @@ build: build-gateway build-engine ## Build > Build the application with dub (gat
 
 build-gateway: frontend ## Build > Build the gateway binary (irc-fiber)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building IRC Fiber Gateway  $(R)"
-	@bash -o pipefail -c '$(DUB) build --config=gateway --build=release 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | tail -8'
+	@bash -o pipefail -c '$(DUB_BACKEND) build --config=gateway --build=release 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | tail -8'
+	@bash -o pipefail -c '$(DUB_BACKEND) build --build=release 2>&1 | tail -5' || true
 	@if [ -f $(GATEWAY_APP) ]; then \
 		SIZE=$$(ls -lh $(GATEWAY_APP) | awk '{print $$5}'); \
 		printf '\n%b\n' "$(BG)$(OK) Gateway build successful$(R) $(D)($$SIZE)$(R)"; \
@@ -728,25 +736,24 @@ build-gateway: frontend ## Build > Build the gateway binary (irc-fiber)
 
 build-engine: ## Build > Build the IRC engine binary
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building IRC Fiber Engine  $(R)"
-	@bash -o pipefail -c '$(DUB) build --config=engine --build=release 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | tail -8'
+	@bash -o pipefail -c '$(DUB_ENGINE) build --config=engine --build=release 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | tail -8'
 	@printf '\n%b\n' "$(BG)$(OK) Engine build successful$(R)"
-
 # Janitor migrate tool — backfills TTLs on existing Redis state/scrollback/
 # dedup keys. Default is dry-run; set JSMIGRATE_DRY_RUN=0 to actually apply.
 janitor-migrate: ## Build > Run janitor-migrate (TTL backfill). Dry-run by default.
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Building janitor-migrate  $(R)"
-	@$(DUB) build --config=janitor-migrate 2>&1 | tail -5
+	@$(DUB_ENGINE) build --config=janitor-migrate 2>&1 | tail -5
 	@printf '%b\n' "$(BG)$(OK) Running janitor-migrate (dry-run)$(R)"
-	@JSMIGRATE_DRY_RUN=1 ./janitor-migrate
+	@JSMIGRATE_DRY_RUN=1 ./engine/janitor-migrate 2>/dev/null || JSMIGRATE_DRY_RUN=1 ./janitor-migrate
 
 # Default-network migration — ensure every existing user has the
 # irc.ircfiber.com:6697 connection. Idempotent. Skip with DRY_RUN=0 to
 # actually write to Mongo.
 ircfiber-default-migrate: ## Build > Backfill the default IRC Fiber network for every existing user
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Building ircfiber-default-migrate  $(R)"
-	@$(DUB) build --config=ircfiber-default-migrate 2>&1 | tail -5
+	@$(DUB_ENGINE) build --config=ircfiber-default-migrate 2>&1 | tail -5
 	@printf '%b\n' "$(BG)$(OK) Running ircfiber-default-migrate (dry-run)$(R)"
-	@DRY_RUN=1 ./ircfiber-default-migrate --dry-run
+	@DRY_RUN=1 ./engine/ircfiber-default-migrate --dry-run 2>/dev/null || DRY_RUN=1 ./ircfiber-default-migrate --dry-run
 
 # Python gateway (Step 3 swappable API)
 api-python-up: ## Python API > Bring up Python gateway alongside D gateway (local dev)
@@ -1494,12 +1501,12 @@ _playbook    = cd deploy && ansible-playbook -l $(_target) $(_vault_arg)
 update: frontend build build-engine ## Deploy > Build frontend + gateway + engine, handoff-deploy (zero disconnect for engines)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Deploy → $(_target)  $(R)"
 	@$(_playbook) playbooks/deploy-update.yml $(if $(SKIP_MIGRATE),-e skip_migrate=true)
-	# The playbook's rsync handles public/ + engine/views/ (dist/ included since
+	# The playbook's rsync handles public/ + backend/views/ (dist/ included since
 	# the read-only mount on the container means docker cp writes silently
 	# fail). The shell-level push below is a belt-and-suspenders fallback
 	# in case a build produced a new dist AFTER the rsync step (the
 	# `frontend` target runs first, but `inject-manifest.js` updates
-	# engine/views/index.dt in place, so re-syncing dist/ + views/ here is safe).
+	# backend/views/index.dt in place, so re-syncing dist/ + views/ here is safe).
 	# Chain the SigNoz dashboards + alerts deploys so structured
 	# log changes, new dashboards, and new alert rules all land in
 	# the same `make update` invocation. Both are idempotent (by
@@ -1536,8 +1543,8 @@ update-assets: frontend ## Deploy > Build frontend + push public/* to running ga
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Asset push → $(_target_ssh) ($(_target))  $(R)"
 	@printf '%b\n' "$(D)  Tarring public/ → ssh → docker exec tar -xf - (clean extract)$(R)"
 	@tar cz --no-xattrs --format=ustar -C public . | ssh deploy@$(_target_ssh) 'docker exec -i ircfiber-gateway sh -c "rm -rf /app/public/dist/ /app/public/.vite/ /app/public/assets/ 2>/dev/null; tar xzf - -C /app/public"'
-	@printf '%b\n' "$(D)  Pushing engine/views/index.dt (updated bundle hashes)$(R)"
-	@ssh deploy@$(_target_ssh) 'docker exec -i ircfiber-gateway sh -c "cat > /app/views/index.dt"' < engine/views/index.dt
+	@printf '%b\n' "$(D)  Pushing backend/views/index.dt (updated bundle hashes)$(R)"
+	@ssh deploy@$(_target_ssh) 'docker exec -i ircfiber-gateway sh -c "cat > /app/views/index.dt"' < backend/views/index.dt
 
 # Show running container images and versions on the target.
 update-status: ## Deploy > Show running containers & image versions

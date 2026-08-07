@@ -54,26 +54,37 @@ make docker-down       # stop everything
 
 ```
 IRC_FIBER/
-├── engine/                  D backend (LDC2) — enterprise service
-│   ├── source/              D sources
-│   │   ├── ircfiber/
-│   │   │   ├── api/         REST + WebSocket endpoints
-│   │   │   ├── auth.d       Authentication / sessions
-│   │   │   ├── db/          MongoDB models (user, network, messages, prefs, pastebins, uploads)
-│   │   │   ├── engine/      Event consumer / processor / state
-│   │   │   ├── irc/         IRC client (connection, registry, manager, SASL, CHATHISTORY, reconnect)
-│   │   │   ├── models/      Domain types (IRCEvent, Message, Network, User, IRCChannel)
-│   │   │   ├── redis/       Redis protocol / client
-│   │   │   ├── storage/     Buffer / session / redis storage layer
-│   │   │   ├── upload/      Local file upload handler
-│   │   │   └── web/         HTTP routes / static / WebSocket
-│   │   ├── app.d            App entry point (gateway)
-│   │   └── app_engine.d     App entry point (IRC engine)
+├── backend/                 D vibe.d REST API — HTTP + WebSocket + Admin (gateway)
+│   ├── source/
+│   │   ├── app.d            Gateway entry point (listenHTTP + router + WS)
+│   │   └── ircfiber/
+│   │       ├── api/         REST + WebSocket + session (rest.d, websocket.d, session.d)
+│   │       ├── web/         HTTP routes + Admin SPA + Diet handlers (web/, admin/*, common.d)
+│   │       ├── auth.d       Password hashing / session auth
+│   │       ├── storage/session.d  Redis session store (14-day TTL)
+│   │       └── upload/      Local file upload handler
 │   ├── views/               Diet templates (layout, index, login, register, message_fragment, admin/*)
-│   ├── dub.sdl              D build config
-│   ├── dub.selections.json
-│   ├── genhash.d
-│   └── README.md            Engine docs
+│   ├── dub.sdl              Gateway build config (depends on ../common)
+│   └── dub.selections.json
+├── common/                  D shared library — inter-service contract + models + storage
+│   ├── source/ircfiber/
+│   │   ├── redis/protocol.d  RedisKeys, IRCCommand, ControlMessage, NetworkStateSnapshot, StateTTL
+│   │   ├── models/          Domain types (IRCEvent, Message, Network, User, IRCChannel)
+│   │   ├── db/              Mongo models (user, network, messages, prefs, pastebins, uploads)
+│   │   ├── storage/         Redis + buffer (buffer.d, redis.d) — scrollback & dedup
+│   │   ├── irc/             ServerRegistry + ConnectionServer + EngineJanitor (shared)
+│   │   ├── logging.d, tracing.d, observability.d, async.d, threadpool.d, resource.d, default_network.d
+│   │   └── ...
+│   ├── dub.sdl              Library config (targetType library)
+│   └── dub.selections.json
+├── engine/                  D IRC engine daemon — persistent IRC connections
+│   ├── source/
+│   │   ├── app_engine.d     Engine entry point (bootstrap + consumers + handoff)
+│   │   └── ircfiber/
+│   │       ├── irc/         IRC client (connection, manager, parser, SASL, CHATHISTORY, reconnect, tls_safe)
+│   │       └── engine/      Event loop (bootstrap, consumer, processor, state, handoff, reload_orchestrator)
+│   ├── dub.sdl              Engine build config (depends on ../common)
+│   └── dub.selections.json
 ├── frontend/                Svelte 5 + Vite — enterprise SPA
 │   ├── src/
 │   │   ├── components/      Svelte components (Sidebar, ChatArea, MessageRow, etc.)
@@ -95,26 +106,27 @@ IRC_FIBER/
 │   ├── tsconfig.json
 │   ├── vite.config.ts       (publicDir: ../public, outDir: ../public/dist)
 │   └── README.md            Frontend docs
-├── public/                  Static assets + built frontend output (shared)
-│   ├── dist/                Vite build output
+├── public/                  Static assets + Vite build output (served by backend)
+│   ├── dist/                Vite build output (backend serves at /public/dist + /assets/*)
 │   ├── fonts/               Source Sans Pro (woff2)
 │   └── favicon*
-├── config/                  dev.conf / prod.conf (shared)
-├── Makefile                 Top-level orchestrator (50+ targets: build, run, docker, test, dscanner, cross-compile)
-├── Containerfile            Multi-arch build (COPY engine/*)
-├── docker-compose.yml       Full stack
+├── config/                  dev.conf / prod.conf (shared by backend + engine)
+├── Makefile                 Top-level (backend + engine + common + frontend, 50+ targets)
+├── Containerfile            Multi-stage BuildKit (base → builder[common+backend+engine] → runtime-gateway + runtime-engine)
+├── docker-compose.yml       Full stack (gateway + engine + redis + mongo + ircd)
 ├── docker-compose.test.yml  Test stack
 └── README.md
 ```
 
 ## Architecture
 
-Two processes:
+Three D packages + one SPA:
 
-- **Gateway** (`app.d`) — HTTP + WebSocket server, sessions, user preferences, static frontend.
-- **Engine** (`app_engine.d`) — Maintains persistent IRC connections, parses server traffic, fans events out via Redis pub/sub.
+- **Gateway** (`backend/source/app.d`) — vibe.d HTTP + WebSocket server, sessions, user preferences, static frontend. Build with `dub --root=backend`.
+- **Common** (`common/source/ircfiber/redis/protocol.d`, `common/source/ircfiber/models/*`, `common/source/ircfiber/db/*`) — inter-service contract (`RedisKeys`, `IRCCommand`, `NetworkStateSnapshot`), shared models, storage, observability. `dub --root=common` builds a library; both gateway and engine depend on it via `path="../common"`.
+- **Engine** (`engine/source/app_engine.d`) — Maintains persistent IRC connections, parses server traffic, fans events out via Redis pub/sub. Build with `dub --root=engine`.
 
-The frontend talks to the gateway over WebSocket; the gateway forwards events to the browser, persists messages to MongoDB, and stores ephemeral state in Redis.
+The frontend (`frontend/`, Svelte 5 + Vite) talks to the gateway over WebSocket; the gateway forwards events to the browser, persists messages to MongoDB, and stores ephemeral state in Redis. Swapping the gateway language (Node, Django, etc.) only requires re-implementing the `common` contract (Redis keys + `irc:stream`/`irc:events` + `NetworkStateSnapshot` JSON) — the engine and frontend stay unchanged.
 
 ### Graceful Engine Hot-Reload
 
@@ -176,7 +188,4 @@ npx playwright test scrollback.spec.js # one spec
 make dscanner-syntax
 make dscanner-lint
 make dscanner-unused
-make dscanner-all
-```
-
-MIT —see [engine/dub.sdl](engine/dub.sdl).
+MIT — see [backend/dub.sdl](backend/dub.sdl) + [common/dub.sdl](common/dub.sdl) + [engine/dub.sdl](engine/dub.sdl).

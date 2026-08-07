@@ -7,253 +7,232 @@ license "MIT"
 compiler "ldc2"
 
 targetType "executable"
-targetName "irc-fiber"
-excludedSourceFiles "source/app_engine.d" "source/session_queue_test.d"
+targetName "irc-fiber-engine"
+sourcePaths "source"
+importPaths "source"
 
+dependency "irc-fiber-common" path="../common"
 dependency "vibe-d" version="~>0.10.0"
 dependency "vibe-d:redis" version="~>0.10.0"
 dependency "vibe-d:mongodb" version="~>0.10.0"
 dependency "diet-ng" version="~>1.8"
 
-configuration "debug" {
-	targetType "executable"
-	targetName "irc-fiber"
-	mainSourceFile "source/app.d"
-	versions "VibeUseFibers" "DietUseLive"
-	dflags "-d"
-}
-
-configuration "release" {
-	targetType "executable"
-	targetName "irc-fiber"
-	mainSourceFile "source/app.d"
-	versions "VibeUseFibers"
-	dflags "-d"
-}
-
 dependency "unit-threaded" version="~>2.2.0"
 
-configuration "unittest" {
-	targetType "executable"
-	targetName "irc-fiber-test"
-	mainSourceFile "source/app_test.d"
-	versions "VibeUseFibers" "unitThreadedLight"
-	excludedSourceFiles "source/app.d"
-}
-
-// Real-CI runner. Built with `-b unittest` so `__traits(getUnitTests)`
-// returns the per-module unittests; everything with its own `main()`
-// is excluded from this build to avoid linker conflicts. Rot-prone
-// sources that fail to compile under current LDC/vibe-d are also
-// excluded — their tests live in the per-module standalone drivers.
-configuration "unit-test-real" {
-	targetType "executable"
-	targetName "irc-fiber-test-real"
-	mainSourceFile "source/app_test_real.d"
-	versions "VibeUseFibers" "unitThreadedLight"
-	excludedSourceFiles "source/app.d" "source/app_engine.d" "source/prefs_test.d" "source/parser_test.d" "source/consumer_test.d" "source/logging_format_test.d" "source/logging_test.d" "source/handoff_test_runner.d" "source/exec_reload_test_runner.d" "source/draining_test_runner.d"
-	// NOTE: ircfiber/tracing.d is deliberately NOT excluded here
-	// even though the original intent was to keep unit-test-real
-	// lightweight. `logging.d` (compiled by every config) now
-	// imports `tracing.d` for `currentTraceId()` / `currentSpanId()`
-	// in structured logs. If tracing.d is excluded, the linker
-	// sees unresolved symbols from logging.o and fails. Keeping
-	// tracing.d in the build adds < 1s to compile time and the
-	// module has zero runtime side-effects until explicitly called.
-}
-
-configuration "prefs-test" {
-	targetType "executable"
-	targetName "prefs-test"
-	mainSourceFile "source/prefs_test.d"
-	versions "VibeUseFibers"
-	dflags "-d"
-	excludedSourceFiles "source/app.d"
-}
-
-configuration "dedup-test" {
-	targetType "executable"
-	targetName "dedup-test"
-	mainSourceFile "source/dedup_test.d"
-	versions "VibeUseFibers"
-	excludedSourceFiles "source/app.d"
-}
-
-configuration "parser-test" {
-	targetType "executable"
-	targetName "parser-test"
-	mainSourceFile "source/parser_test.d"
-	versions "VibeUseFibers"
-	excludedSourceFiles "source/app.d"
-}
-
-configuration "consumer-test" {
-	targetType "executable"
-	targetName "consumer-test"
-	mainSourceFile "source/consumer_test.d"
-	versions "VibeUseFibers"
-	excludedSourceFiles "source/app.d"
-}
-
-configuration "connection-registration-test" {
-	targetType "executable"
-	targetName "connection-registration-test"
-	mainSourceFile "source/connection_registration_test.d"
-	versions "VibeUseFibers"
-	excludedSourceFiles "source/app.d"
-}
-
-configuration "observability-test" {
-	targetType "executable"
-	targetName "observability-test"
-	mainSourceFile "source/observability_test.d"
-	versions "VibeUseFibers"
-	excludedSourceFiles "source/app.d"
-}
-
-configuration "parser-fuzz-test" {
-	targetType "executable"
-	targetName "parser-fuzz-test"
-	mainSourceFile "source/parser_fuzz_test.d"
-	versions "VibeUseFibers"
-	excludedSourceFiles "source/app.d"
-}
-
-
-configuration "gateway" {
+configuration "application" {
     targetType "executable"
-    targetName "irc-fiber-gateway"
-    mainSourceFile "source/app.d"
-    versions "VibeUseFibers" "GatewayOnly"
-    // Keep-files-in-place: defer file moves; gateway currently links full tree except engine main.
-    // This keeps `dub build --config=gateway` passing while still producing a distinct binary name.
-    excludedSourceFiles "source/app_engine.d" "source/test_runner.d" "source/session_queue_test.d"
+    targetName "irc-fiber-engine"
+    mainSourceFile "source/app_engine.d"
+    versions "VibeUseFibers"
 }
 
 configuration "engine" {
-     targetType "executable"
-     targetName "irc-fiber-engine"
-     mainSourceFile "source/app_engine.d"
-     versions "VibeUseFibers" "EngineOnly"
-     // Keep-files-in-place: defer moves; engine excludes only gateway mains. Full isolation is follow-up.
-     excludedSourceFiles "source/app.d" "source/test_runner.d" "source/session_queue_test.d"
-  }
+    targetType "executable"
+    targetName "irc-fiber-engine"
+    mainSourceFile "source/app_engine.d"
+    versions "VibeUseFibers" "EngineOnly"
+}
+
+// Kept for backwards compat — `dub --config=gateway` now lives in backend/
+// Running it from engine/ will fail fast with a clear error; use backend/.
+configuration "gateway" {
+    targetType "executable"
+    targetName "irc-fiber-gateway"
+    mainSourceFile "../backend/source/app.d"
+    versions "VibeUseFibers" "GatewayOnly"
+}
+
+configuration "debug" {
+    targetType "executable"
+    targetName "irc-fiber-engine"
+    mainSourceFile "source/app_engine.d"
+    versions "VibeUseFibers" "DietUseLive"
+    dflags "-d"
+}
+
+configuration "release" {
+    targetType "executable"
+    targetName "irc-fiber-engine"
+    mainSourceFile "source/app_engine.d"
+    versions "VibeUseFibers"
+    dflags "-d"
+}
+
+configuration "unittest" {
+    targetType "executable"
+    targetName "irc-fiber-test"
+    mainSourceFile "source/app_test.d"
+    versions "VibeUseFibers" "unitThreadedLight"
+    // app_test.d imports both engine (chathistory) and backend (auth) — needs both.
+    // For now this config is disabled in the engine package; run backend's tests or
+    // engine's focused drivers (parser-test, etc.) instead. Keep config for reference.
+    excludedSourceFiles "source/app_engine.d"
+}
+
+configuration "unit-test-real" {
+    targetType "executable"
+    targetName "irc-fiber-test-real"
+    mainSourceFile "source/app_test_real.d"
+    versions "VibeUseFibers" "unitThreadedLight"
+    excludedSourceFiles "source/app_engine.d" "source/prefs_test.d" "source/parser_test.d" "source/consumer_test.d" "source/logging_format_test.d" "source/logging_test.d" "source/handoff_test_runner.d" "source/exec_reload_test_runner.d" "source/draining_test_runner.d"
+}
+
+configuration "prefs-test" {
+    targetType "executable"
+    targetName "prefs-test"
+    mainSourceFile "source/prefs_test.d"
+    versions "VibeUseFibers"
+    dflags "-d"
+}
+
+configuration "dedup-test" {
+    targetType "executable"
+    targetName "dedup-test"
+    mainSourceFile "source/dedup_test.d"
+    versions "VibeUseFibers"
+    dependency "irc-fiber-backend" path="../backend"
+}
+
+configuration "parser-test" {
+    targetType "executable"
+    targetName "parser-test"
+    mainSourceFile "source/parser_test.d"
+    versions "VibeUseFibers"
+}
+
+configuration "consumer-test" {
+    targetType "executable"
+    targetName "consumer-test"
+    mainSourceFile "source/consumer_test.d"
+    versions "VibeUseFibers"
+}
+
+configuration "connection-registration-test" {
+    targetType "executable"
+    targetName "connection-registration-test"
+    mainSourceFile "source/connection_registration_test.d"
+    versions "VibeUseFibers"
+}
+
+configuration "observability-test" {
+    targetType "executable"
+    targetName "observability-test"
+    mainSourceFile "source/observability_test.d"
+    versions "VibeUseFibers"
+}
+
+configuration "parser-fuzz-test" {
+    targetType "executable"
+    targetName "parser-fuzz-test"
+    mainSourceFile "source/parser_fuzz_test.d"
+    versions "VibeUseFibers"
+}
+
 configuration "sync" {
-	targetType "executable"
-	targetName "sync-redis-to-mongo"
-	mainSourceFile "source/sync_redis_to_mongo.d"
-	versions "VibeUseFibers"
-	excludedSourceFiles "source/app.d" "source/app_engine.d"
+    targetType "executable"
+    targetName "sync-redis-to-mongo"
+    mainSourceFile "source/sync_redis_to_mongo.d"
+    versions "VibeUseFibers"
 }
 
 configuration "handoff-test" {
-	targetType "executable"
-	targetName "handoff-test"
-	mainSourceFile "source/handoff_test_runner.d"
-	excludedSourceFiles "source/app.d" "source/app_engine.d"
+    targetType "executable"
+    targetName "handoff-test"
+    mainSourceFile "source/handoff_test_runner.d"
 }
 
-
 configuration "exec-reload-test" {
-	targetType "executable"
-	targetName "exec-reload-test"
-	mainSourceFile "source/exec_reload_test_runner.d"
-	excludedSourceFiles "source/app.d" "source/app_engine.d"
+    targetType "executable"
+    targetName "exec-reload-test"
+    mainSourceFile "source/exec_reload_test_runner.d"
 }
 
 configuration "exec-reload-integration" {
-	targetType "executable"
-	targetName "exec-reload-integration"
-	mainSourceFile "source/exec_reload_integration.d"
-	excludedSourceFiles "source/app.d" "source/app_engine.d"
+    targetType "executable"
+    targetName "exec-reload-integration"
+    mainSourceFile "source/exec_reload_integration.d"
+    versions "VibeUseFibers"
 }
 
 configuration "draining-test" {
-	targetType "executable"
-	targetName "draining-test"
-	mainSourceFile "source/draining_test_runner.d"
-	excludedSourceFiles "source/app.d" "source/app_engine.d"
-	versions "VibeUseFibers"
+    targetType "executable"
+    targetName "draining-test"
+    mainSourceFile "source/draining_test_runner.d"
+    versions "VibeUseFibers"
 }
 
 configuration "logging-test" {
-	targetType "executable"
-	targetName "logging-test"
-	mainSourceFile "source/logging_format_test.d"
-	excludedSourceFiles "source/app.d" "source/app_engine.d"
-	versions "VibeUseFibers"
+    targetType "executable"
+    targetName "logging-test"
+    mainSourceFile "source/logging_format_test.d"
+    versions "VibeUseFibers"
 }
 
 configuration "janitor-test" {
-	targetType "executable"
-	targetName "janitor-test"
-	mainSourceFile "source/janitor_test.d"
-	excludedSourceFiles "source/app.d" "source/app_engine.d"
-	versions "VibeUseFibers"
+    targetType "executable"
+    targetName "janitor-test"
+    mainSourceFile "source/janitor_test.d"
+    versions "VibeUseFibers"
 }
 
 configuration "janitor-lock-test" {
-	targetType "executable"
-	targetName "janitor-lock-test"
-	mainSourceFile "source/janitor_lock_test.d"
-	excludedSourceFiles "source/app.d" "source/app_engine.d"
-	versions "VibeUseFibers"
+    targetType "executable"
+    targetName "janitor-lock-test"
+    mainSourceFile "source/janitor_lock_test.d"
+    versions "VibeUseFibers"
 }
 
 configuration "janitor-safety-test" {
-	targetType "executable"
-	targetName "janitor-safety-test"
-	mainSourceFile "source/janitor_safety_test.d"
-	excludedSourceFiles "source/app.d" "source/app_engine.d"
-	versions "VibeUseFibers"
+    targetType "executable"
+    targetName "janitor-safety-test"
+    mainSourceFile "source/janitor_safety_test.d"
+    versions "VibeUseFibers"
 }
 
 configuration "janitor-migrate" {
-	targetType "executable"
-	targetName "janitor-migrate"
-	mainSourceFile "source/tools/janitor_migrate.d"
-	versions "VibeUseFibers"
-	excludedSourceFiles "source/app.d" "source/app_engine.d"
+    targetType "executable"
+    targetName "janitor-migrate"
+    mainSourceFile "source/tools/janitor_migrate.d"
+    versions "VibeUseFibers"
 }
 
 configuration "ircfiber-default-migrate" {
-	targetType "executable"
-	targetName "ircfiber-default-migrate"
-	mainSourceFile "source/tools/ircfiber_default_migrate.d"
-	excludedSourceFiles "source/app.d" "source/app_engine.d" "source/ircfiber/registry.d"
+    targetType "executable"
+    targetName "ircfiber-default-migrate"
+    mainSourceFile "source/tools/ircfiber_default_migrate.d"
+    versions "VibeUseFibers"
+    excludedSourceFiles "source/ircfiber/registry.d"
 }
 
 configuration "session-queue-test" {
-	targetType "executable"
-	targetName "session-queue-test"
-	mainSourceFile "source/session_queue_test.d"
-	versions "VibeUseFibers"
-	dflags "-d"
-	excludedSourceFiles "source/app.d" "source/app_engine.d" "source/ircfiber/resource.d"
+    targetType "executable"
+    targetName "session-queue-test"
+    mainSourceFile "source/session_queue_test.d"
+    versions "VibeUseFibers"
+    dflags "-d"
+    excludedSourceFiles "source/ircfiber/resource.d"
 }
 
 configuration "oob-test" {
-	targetType "executable"
-	targetName "oob-test"
-	mainSourceFile "source/oob_test.d"
-	versions "VibeUseFibers"
-	dflags "-d"
-	excludedSourceFiles "source/app.d" "source/app_engine.d" "source/ircfiber/resource.d"
+    targetType "executable"
+    targetName "oob-test"
+    mainSourceFile "source/oob_test.d"
+    versions "VibeUseFibers"
+    dflags "-d"
+    excludedSourceFiles "source/ircfiber/resource.d"
 }
 
 configuration "threadpool-test" {
-	targetType "executable"
-	targetName "threadpool-test"
-	mainSourceFile "source/threadpool_test.d"
-	versions "VibeUseFibers"
-	excludedSourceFiles "source/app.d" "source/app_engine.d"
+    targetType "executable"
+    targetName "threadpool-test"
+    mainSourceFile "source/threadpool_test.d"
+    versions "VibeUseFibers"
 }
 
 configuration "loadtest" {
-	targetType "executable"
-	targetName "ircfiber-loadtest"
-	mainSourceFile "source/loadtest/main.d"
-	versions "VibeUseFibers"
-	excludedSourceFiles "source/app.d" "source/app_engine.d"
-	dependency "vibe-d:redis" version="~>0.10.0"
+    targetType "executable"
+    targetName "ircfiber-loadtest"
+    mainSourceFile "source/loadtest/main.d"
+    versions "VibeUseFibers"
+    dependency "vibe-d:redis" version="~>0.10.0"
 }

@@ -1,0 +1,29 @@
+name "irc-fiber-common"
+description "IRC Fiber shared library — protocol, models, db, storage, observability"
+authors "IRC Fiber Team"
+copyright "Copyright © 2026 IRC Fiber"
+license "MIT"
+
+compiler "ldc2"
+
+targetType "library"
+targetName "irc-fiber-common"
+
+sourcePaths "source"
+importPaths "source"
+
+dependency "vibe-d" version="~>0.10.0"
+dependency "vibe-d:redis" version="~>0.10.0"
+dependency "vibe-d:mongodb" version="~>0.10.0"
+dependency "diet-ng" version="~>1.8"
+
+dependency "unit-threaded" version="~>2.2.0"
+
+configuration "library" {
+    targetType "library"
+}
+
+configuration "unittest" {
+    targetType "library"
+    versions "VibeUseFibers"
+}

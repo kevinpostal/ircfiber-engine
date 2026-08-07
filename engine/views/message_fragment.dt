@@ -1,7 +1,0 @@
-- auto msg = context["msg"].get!(Json);
-.row.messageRow(data-time=msg["t"].get!string, data-id=msg["i"].get!string)
-  span.date
-    span.timestamp= msg["t"].get!string[11..19]
-  span.g &nbsp;
-  span.message
-    span.content= msg["x"].get!string
