@@ -11,8 +11,8 @@ import std.uni : toLower;
 import ircfiber.engine.bootstrap : EngineContext;
 import ircfiber.models.network : Network;
 import ircfiber.redis.protocol : RedisKeys, NetworkStateSnapshot,
-    RetryStatus, FailInfoSnapshot;
-
+    RetryStatus, FailInfoSnapshot, PROTOCOL_VERSION;
+import std.conv : to;
 private void runSafeTask(void delegate() dg) {
     runTask(() nothrow {
         try {
@@ -46,8 +46,14 @@ void writeStateSnapshots(ref EngineContext ctx) {
             logWarn("Failed to snapshot network %s: %s", net.config.name, e.msg);
         }
     }
+    // Freeze protocol version so gateways (D or future Python) can assert
+    // compatibility at startup. Not yet enforced — see docs/CONTRACT.md.
+    try {
+        ctx.redis.getDb().set(RedisKeys.protocolVersion(), PROTOCOL_VERSION.to!string);
+    } catch (Exception e) {
+        logWarn("Failed to write protocol version: %s", e.msg);
+    }
 }
-
 /// Writes a state snapshot for a network (legacy non-decentralized).
 void writeStateSnapshotForNetwork(ref EngineContext ctx, Network net) {
     // Legacy non-decentralized version

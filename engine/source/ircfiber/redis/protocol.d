@@ -149,6 +149,13 @@ struct RedisKeys {
     /// admin endpoint at GET /api/admin/janitor/events.
     static string janitorEvents() { return "irc:janitor:events"; }
 
+    /// Protocol version key. Written by engine heartbeat (see
+    /// `ircfiber.engine.state.writeStateSnapshots`). Gateways and
+    /// future Python implementations read this at startup to assert
+    /// compatibility. Not yet enforced — version 1 is the initial
+    /// frozen contract.
+    static string protocolVersion() { return "irc:protocol:version"; }
+
     /// SCAN pattern that matches every Redis key namespaced by a given
     /// serverId. Used by the janitor when reaping an orphan engine and
     /// by the bootstrap-time namespace purge.
@@ -159,6 +166,13 @@ struct RedisKeys {
         return "*:" ~ serverId ~ ":*";
     }
 }
+
+/// Inter-service protocol version. Increment when the Redis wire
+/// format (keys, JSON shapes, command envelopes) changes
+/// incompatibly. Stored as string value of `irc:protocol:version`.
+/// Gateways SHOULD assert at startup that the stored version equals
+/// this constant; mismatch MUST be surfaced as healthcheck failure.
+enum PROTOCOL_VERSION = 1;
 
 /**
  * TTL governance constants for engine-scoped state.
