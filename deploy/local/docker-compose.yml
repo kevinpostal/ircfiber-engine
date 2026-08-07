@@ -103,6 +103,9 @@ services:
     profiles: [observability]
     networks:
       - ircfiber_local
+    volumes:
+      - zookeeper_data:/data
+      - zookeeper_datalog:/datalog
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "2181"]
       interval: 10s
@@ -182,14 +185,10 @@ services:
     command:
       ["/fluent-bit/bin/fluent-bit", "-c", "/fluent-bit/etc/fluent-bit.conf"]
     depends_on:
-      signoz:
+      otel-collector:
+        condition: service_started
+      clickhouse:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD", "pidof", "fluent-bit"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
 
   # -----------------------------------------------------------------------
   # ircfiber-gateway — HTTP/WS frontend + admin API
@@ -302,4 +301,6 @@ volumes:
   clickhouse_data:
     driver: local
   zookeeper_data:
+    driver: local
+  zookeeper_datalog:
     driver: local
