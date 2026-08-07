@@ -1,9 +1,10 @@
 services:
-  irc_fiber:
+  ircfiber-gateway:
     build:
       context: .
       dockerfile: Containerfile
-    image: irc-fiber:latest
+      target: runtime-gateway
+    image: irc-fiber-gateway:latest
     container_name: irc_fiber_test
     restart: unless-stopped
     command: ["/app/irc-fiber"]
@@ -39,11 +40,12 @@ services:
       retries: 3
       start_period: 40s
 
-  irc_engine:
+  ircfiber-engine:
     build:
       context: .
       dockerfile: Containerfile
-    image: irc-fiber:latest
+      target: runtime-engine
+    image: irc-fiber-engine:latest
     container_name: irc_engine_test
     restart: unless-stopped
     command: ["/app/irc-fiber-engine"]
@@ -72,7 +74,7 @@ services:
           cpus: '0.5'
           memory: 128M
     healthcheck:
-      test: ["CMD", "pidof", "irc-fiber-engine"]
+      test: ["CMD", "/usr/local/bin/ircfiber-engine-healthcheck.sh"]
       interval: 30s
       timeout: 5s
       retries: 3

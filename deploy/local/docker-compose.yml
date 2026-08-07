@@ -197,7 +197,8 @@ services:
     build:
       context: ../..
       dockerfile: Containerfile
-    image: irc-fiber:local
+      target: runtime-gateway
+    image: irc-fiber-gateway:local
     container_name: ircfiber-gateway
     restart: unless-stopped
     networks:
@@ -230,7 +231,8 @@ services:
     build:
       context: ../..
       dockerfile: Containerfile
-    image: irc-fiber:local
+      target: runtime-engine
+    image: irc-fiber-engine:local
     container_name: ircfiber-engine
     restart: unless-stopped
     networks:
@@ -251,12 +253,11 @@ services:
       ircd:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "pidof", "irc-fiber-engine"]
+      test: ["CMD", "/usr/local/bin/ircfiber-engine-healthcheck.sh"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
-
   # -----------------------------------------------------------------------
   # ircd — local ngIRCd server for testing
   # -----------------------------------------------------------------------
