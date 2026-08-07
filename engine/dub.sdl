@@ -17,12 +17,16 @@ dependency "diet-ng" version="~>1.8"
 
 configuration "debug" {
 	targetType "executable"
+	targetName "irc-fiber"
+	mainSourceFile "source/app.d"
 	versions "VibeUseFibers" "DietUseLive"
 	dflags "-d"
 }
 
 configuration "release" {
 	targetType "executable"
+	targetName "irc-fiber"
+	mainSourceFile "source/app.d"
 	versions "VibeUseFibers"
 	dflags "-d"
 }
@@ -115,14 +119,6 @@ configuration "parser-fuzz-test" {
 	excludedSourceFiles "source/app.d"
 }
 
-configuration "common" {
-    targetType "library"
-    // Shared code: redis protocol, models, db, storage/redis, storage/buffer,
-    // auth, logging, tracing, observability, resource, threadpool, upload.
-    // Keep-files-in-place approach: common is library that excludes mains;
-    // gateway/engine configs add their own excludedSourceFiles below.
-    excludedSourceFiles "source/app.d" "source/app_engine.d" "source/app_test.d" "source/app_test_real.d" "source/prefs_test.d" "source/dedup_test.d" "source/parser_test.d" "source/consumer_test.d" "source/connection_registration_test.d" "source/observability_test.d" "source/parser_fuzz_test.d" "source/handoff_test_runner.d" "source/exec_reload_test_runner.d" "source/exec_reload_integration.d" "source/draining_test_runner.d" "source/logging_format_test.d" "source/janitor_test.d" "source/janitor_lock_test.d" "source/janitor_safety_test.d" "source/session_queue_test.d" "source/oob_test.d" "source/threadpool_test.d" "source/loadtest/main.d" "source/sync_redis_to_mongo.d" "source/tools/janitor_migrate.d" "source/tools/ircfiber_default_migrate.d" "source/test_runner.d"
-}
 
 configuration "gateway" {
     targetType "executable"
