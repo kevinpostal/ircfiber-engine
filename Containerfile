@@ -110,7 +110,9 @@ COPY public/ ./public/
 # Without this, dub/LDC silently skip changed .d files even after the
 # source COPY is fresh — "I changed code but the binary still has the
 # old behaviour" is the worst kind of bug.
-RUN if [ "$CACHE_BUST" != "fixed" ]; then \
+RUN --mount=type=cache,target=/build/.dub,sharing=locked \
+    --mount=type=cache,target=/root/.dub,sharing=locked \
+    if [ "$CACHE_BUST" != "fixed" ]; then \
         rm -rf /build/.dub /root/.dub && \
         find source -name '*.o' -delete 2>/dev/null && \
         find source -name 'dub-cache.json' -delete 2>/dev/null && \
@@ -130,7 +132,6 @@ RUN if [ "$CACHE_BUST" != "fixed" ]; then \
     test -f /build/irc-fiber-engine && \
     test -f /build/janitor-migrate && \
     test -f /build/ircfiber-default-migrate
-# Single layer: strip all 5 binaries (one find instead of 5 RUNs).
 RUN find /build -maxdepth 1 -type f -executable -exec strip {} +
 
 # ============================================================================

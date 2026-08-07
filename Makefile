@@ -210,15 +210,38 @@ dev-docker: ensure-colima ## Dev > Docker backend + Vite frontend dev (fastest f
 	@cd frontend && VITE_BACKEND_URL=http://127.0.0.1:8090 npm run dev
 
 # Full local stack — gateway + supervised engine, both against local docker DBs.
-# For when you're editing the D code and want a clean local environment.
-# Runs in the FOREGROUND — supervisor stays backgrounded for engine auto-restart,
-# gateway runs in this terminal. ctrl-c cleanly tears down both. Run
-# `make logs` in another terminal for live tailing.
-debug: build-gateway build-engine ## Component > Full stack via docker-compose: gateway (REST API) + engine (IRC) as separate containers — logs via docker
+# Uses Docker's staged builder cache (Containerfile `builder` stage):
+#   - Base layer (Ubuntu + LDC) cached via --mount=type=cache for apt
+#   - Dub incremental cache via --mount=type=cache for /build/.dub + /root/.dub
+#     so only changed .d files recompile (not the whole tree).
+#   - `docker compose build` is BuildKit-cached: no source change → instant
+#     CACHED layers; D change → only affected dub configs recompile.
+#   - Host `build-gateway`/`build-engine` are NOT needed here — the builder
+#     stage compiles inside Docker. Use `debug-host` for host-native binaries.
+#   - Stamp file `.docker-build-stamp` skips `docker compose build` entirely
+#     when no relevant source changed (instant second `make debug`).
+debug: ## Component > Full stack via docker-compose: gateway (REST API) + engine (IRC) as separate containers — logs via docker
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Starting Docker backend (redis/mongo/ircd)  $(R)"
 	@$(_docker_setup)
-	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building split images (gateway + engine)  $(R)"
-	@docker compose build ircfiber-gateway ircfiber-engine
+	@bash -c '\
+		stamp=.docker-build-stamp; \
+		needs_build=0; \
+		if [ ! -f "$$stamp" ]; then needs_build=1; \
+		else \
+			if [ Containerfile -nt "$$stamp" ] || [ engine/dub.sdl -nt "$$stamp" ] || [ engine/dub.selections.json -nt "$$stamp" ]; then needs_build=1; \
+			elif find engine/source engine/views config public -type f -newer "$$stamp" 2>/dev/null | grep -q .; then needs_build=1; \
+			elif find deploy/roles/engine/files -type f -newer "$$stamp" 2>/dev/null | grep -q .; then needs_build=1; \
+			elif ! docker image inspect irc-fiber-gateway:latest >/dev/null 2>&1 || ! docker image inspect irc-fiber-engine:latest >/dev/null 2>&1; then needs_build=1; \
+			fi; \
+		fi; \
+		if [ "$$needs_build" = "1" ]; then \
+			printf "\n%b\n" "$(_BCn)$(K)$(B)  Building split images (gateway + engine) — cached builder  $(R)"; \
+			DOCKER_BUILDKIT=1 docker compose build ircfiber-gateway ircfiber-engine; \
+			touch "$$stamp"; \
+		else \
+			printf "\n%b\n" "$(BG)$(OK) Images up-to-date — skipping docker build (cached) $(R) $(D)(touch Containerfile or engine/source to force)$(R)"; \
+		fi; \
+		'
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Starting gateway + engine as separate containers  $(R)"
 	@docker compose up -d ircfiber-gateway ircfiber-engine
 	@printf '\n%b\n' "$(BG)$(OK) Gateway+Engine running as separate containers$(R) $(D)(ircfiber-gateway:8090, ircfiber-engine)$(R)"
@@ -227,7 +250,6 @@ debug: build-gateway build-engine ## Component > Full stack via docker-compose: 
 	@printf '%b\n' "$(D)  Also: make gateway-logs / engine-logs / status$(R)"
 	@trap 'printf "\n%b\n" "$(Y)$(WR) stopping...$(R)"; docker compose stop ircfiber-gateway ircfiber-engine 2>/dev/null || true; printf "%b\n" "$(BG)$(OK) debug stopped (containers left for logs; run make down to remove)$(R)"; exit 0' INT TERM; \
 	docker compose logs -f ircfiber-gateway ircfiber-engine
-
 # Host-native debug (fast D iteration, no docker build) — keeps old supervisor+gateway host binaries
 debug-host: build-gateway build-engine ## Component > Full stack HOST-NATIVE: gateway + engine (supervised), local docker DBs — ctrl-c to stop (legacy)
 	@$(_docker_setup)
@@ -1118,14 +1140,12 @@ ensure-colima:
 	fi
 
 docker-up: ensure-colima ## Docker > Start all services with Docker Compose
-	@printf '\n%b\n' "$(D)→ Pruning stale Docker layers before start...$(R)"
-	@docker system prune -af --volumes=false 2>&1 | tail -2
-	@printf '\n%b\n' "$(_BC)$(K)$(B)  Building Docker images  $(R)"
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Building Docker images — staged cache  $(R)"
 	@# Gateway and engine now build from separate targets (runtime-gateway/engine) — build both.
-	@docker compose build ircfiber-gateway ircfiber-engine
+	@# Uses BuildKit staged cache (--mount=type=cache for apt + /build/.dub): no source change → CACHED.
+	@DOCKER_BUILDKIT=1 docker compose build ircfiber-gateway ircfiber-engine
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting Docker Services  $(R)"
 	@docker compose up -d
-
 docker-down: ensure-colima ## Docker > Stop ALL IRC Fiber containers (3 compose stacks + loose containers)
 	@printf '%b\n' "$(D)→ Stopping test stack (docker-compose.yml)...$(R)"
 	@docker compose down --remove-orphans --timeout 10 2>/dev/null; true
@@ -1603,7 +1623,7 @@ deps-check: ## Utils > Check for required dependencies
 
 clean: ## Utils > Remove build artifacts
 	@printf '%b\n' "$(D)→ Cleaning build artifacts...$(R)"
-	@rm -f $(APP) *.o
+	@rm -f $(APP) *.o .docker-build-stamp
 	@rm -rf .dub
 	@$(DUB) clean 2>/dev/null || true
 	@printf '%b\n' "$(BG)$(OK) Clean complete$(R)"
