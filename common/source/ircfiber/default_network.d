@@ -150,7 +150,7 @@ NetworkConfig ensureDefaultFiberNetwork(
                 try { networkRepo.deleteById(dups[i].id); } catch (Exception) {}
                 // Clean up Redis assignment for the deleted duplicate if it was ever assigned
                 try {
-                    auto sid = serverRegistry.getServerForNetwork(dups[i].id.toString());
+                    const sid = serverRegistry.getServerForNetwork(dups[i].id.toString());
                     if (sid.length > 0) {
                         // Best-effort: engine will also reap via janitor if missed
                     }
@@ -211,8 +211,8 @@ unittest {
     User u;
     u.id = randomUUID();
     u.username = "bob";
-    auto n1 = buildDefaultNick(u);
-    auto n2 = buildDefaultNick(u);
+    const n1 = buildDefaultNick(u);
+    const n2 = buildDefaultNick(u);
     assert(n1 == n2, "deterministic nick must be stable across calls");
 }
 
@@ -240,7 +240,7 @@ unittest {
     // Cannot exercise the Mongo/Redis side without fakes; verify the
     // early-return guard instead. (Integration of the happy path is
     // exercised by the migrate CLI tool's --self-test mode.)
-    User u; // u.id == UUID.init, u.username.length == 0
+    const User u; // u.id == UUID.init, u.username.length == 0
     // We don't actually call ensureDefaultFiberNetwork here because it
     // would hit Mongo. The contract under test is that an uninitialized
     // User does NOT raise or insert — the gate is at the top of the fn.

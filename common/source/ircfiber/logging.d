@@ -25,7 +25,7 @@ private void initLogLevel() {
     import core.stdc.string : strlen;
     auto env = getenv("IRCFIBER_LOG_LEVEL".toStringz);
     if (env !is null) {
-        auto s = env[0 .. strlen(env)];
+        const s = env[0 .. strlen(env)];
         if (s == "none")   g_logLevel = 0;
         else if (s == "error")  g_logLevel = 1;
         else if (s == "warn")   g_logLevel = 2;
@@ -139,12 +139,14 @@ void logInfoJ(string component, string msg, string network = "") {
     else
         logJsonMap("info", component, msg);
 }
+/// Convenience: tagged warn log with no extra fields beyond component.
 void logWarnJ(string component, string msg, string network = "") {
     if (network.length)
         logJsonMap("warn", component, msg, ["network": network]);
     else
         logJsonMap("warn", component, msg);
 }
+/// Convenience: tagged error log with no extra fields beyond component.
 void logErrorJ(string component, string msg, string network = "") {
     if (network.length)
         logJsonMap("error", component, msg, ["network": network]);

@@ -221,7 +221,7 @@ final class ConnectionManager {
         auto key = host ~ ":" ~ port.to!string;
         if (auto breaker = key in hostBreakers) {
             if (breaker.openedAt > 0) {
-                auto now = Clock.currTime.toUnixTime!long * 1000;
+                const now = Clock.currTime.toUnixTime!long * 1000;
                 if (now - breaker.openedAt < HOST_COOLDOWN_MS) {
                     return false;
                 }
@@ -519,7 +519,7 @@ final class ConnectionManager {
         import std.datetime : Clock;
         auto now = Clock.currTime.toUnixTime!long * 1000;
         foreach (rec; records) {
-            auto key = rec.state.config.id.toString();
+            const key = rec.state.config.id.toString();
             if (auto p = key in clients) {
                 // For TLS handoffs the FD was NOT transferred — the OLD
                 // engine's live TLS socket still holds the IRC server's
@@ -622,7 +622,7 @@ final class ConnectionManager {
                 auto db = redis.getDb();
                 db.del(RedisKeys.networkNick(cfg.id.toString()));
             } catch (Exception) {}
-            auto uid = parseUUID(s.userId.length ? s.userId : s.config.id.toString());
+            const uid = parseUUID(s.userId.length ? s.userId : s.config.id.toString());
             // Schedule the soft-reconnect on a separate fiber so we can
             // apply a brief settling delay. The OLD engine's QUIT
             // (synchronously written by `notifyHandoffComplete`) is
@@ -662,6 +662,8 @@ final class ConnectionManager {
 /// `ircfiber.engine.handoff` — that one carries raw JSON + raw FDs;
 /// this one carries parsed state ready for `adoptFromHandoff()`.
 struct HandoffRecord {
+    /// Parsed handoff state consumed by `adoptFromHandoff()`.
     HandoffState state;
-    int fd;  // -1 for TLS / soft-reconnect records
+    /// Raw file descriptor, or -1 for TLS / soft-reconnect records.
+    int fd;
 }

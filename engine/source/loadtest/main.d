@@ -77,14 +77,14 @@ private void loadtestFiber(string redisHost, ushort redisPort, string userId,
         const int batchN = 100;
         long sent = 0;
         long errors = 0;
-        auto startTime = Clock.currTime;
-        auto endAt = startTime + seconds(durationSec);
+        const startTime = Clock.currTime;
+        const endAt = startTime + seconds(durationSec);
 
         writeln("\nPublishing events to ", channel, " ...");
 
         while (Clock.currTime < endAt) {
             auto nowMs = Clock.currTime.toUnixTime!long * 1000;
-            long batchBaseEid = sent + 1;
+            const long batchBaseEid = sent + 1;
 
             auto batch = generateBatch(batchBaseEid, nowMs, batchN);
 
@@ -100,11 +100,11 @@ private void loadtestFiber(string redisHost, ushort redisPort, string userId,
             }
 
             // Rate control
-            auto elapsed = (Clock.currTime - startTime).total!"seconds";
+            const elapsed = (Clock.currTime - startTime).total!"seconds";
             if (elapsed > 0) {
-                long expectedSent = elapsed * rps;
+                const long expectedSent = elapsed * rps;
                 if (sent > expectedSent + batchN) {
-                    long overshoot = sent - expectedSent;
+                    const long overshoot = sent - expectedSent;
                     long sleepMs = (overshoot * 1000) / rps;
                     if (sleepMs > 0) {
                         sleep((sleepMs).msecs);
@@ -119,7 +119,7 @@ private void loadtestFiber(string redisHost, ushort redisPort, string userId,
         }
 
         auto elapsed = (Clock.currTime - startTime).total!"seconds";
-        long actualRps = elapsed > 0 ? sent / elapsed : 0;
+        const long actualRps = elapsed > 0 ? sent / elapsed : 0;
 
         auto result = Json.emptyObject;
         result["targetRps"] = Json(rps);

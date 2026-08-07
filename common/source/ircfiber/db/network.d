@@ -182,7 +182,7 @@ final class NetworkRepository {
             try { cfg.systemManaged = elem["systemManaged"].get!bool; } catch (Exception) {}
             // autoJoinDelaySeconds optional — 0 (join immediately) when absent.
             try {
-                auto v = elem["autoJoinDelaySeconds"].get!int;
+                const v = elem["autoJoinDelaySeconds"].get!int;
                 if (v > 0) cfg.autoJoinDelaySeconds = cast(uint) v;
             } catch (Exception) {}
             result ~= cfg;
@@ -211,7 +211,7 @@ final class NetworkRepository {
         try { cfg.systemManaged = doc["systemManaged"].get!bool; } catch (Exception) {}
         // autoJoinDelaySeconds optional — 0 (join immediately) when absent.
         try {
-            auto v = doc["autoJoinDelaySeconds"].get!int;
+            const v = doc["autoJoinDelaySeconds"].get!int;
             if (v > 0) cfg.autoJoinDelaySeconds = cast(uint) v;
         } catch (Exception) {}
         return cfg;

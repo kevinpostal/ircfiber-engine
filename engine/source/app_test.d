@@ -49,7 +49,7 @@ private bool runModuleTests(M...)() if (M.length > 0) {
 
 int main() {
     writefln("IRC Fiber unittest suite (run with -b unittest)");
-    runModuleTests!(
+    cast(void) runModuleTests!(
         ircfiber.auth,
         ircfiber.models.user,
         ircfiber.models.network,

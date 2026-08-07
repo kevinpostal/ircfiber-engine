@@ -68,15 +68,42 @@ private int runSelfTest() {
         auto cfg = buildDefaultFiberNetwork(u);
         writefln("  alice: nick=%s name=%s host=%s:%s tls=%s systemManaged=%s channels=%s",
                  cfg.nick, cfg.name, cfg.host, cfg.port, cfg.tls, cfg.systemManaged, cfg.autoJoinChannels);
-        if (cfg.name != "IRC Fiber")                                  { stderr.writeln("FAIL: alice name");           failed++; }
-        if (cfg.host != "irc.ircfiber.com")                           { stderr.writeln("FAIL: alice host");           failed++; }
-        if (cfg.port != 6697)                                         { stderr.writeln("FAIL: alice port");           failed++; }
-        if (cfg.tls != TLSMode.required)                              { stderr.writeln("FAIL: alice tls");            failed++; }
-        if (cfg.realName != "alice")                                  { stderr.writeln("FAIL: alice realName");       failed++; }
-        if (cfg.nick != "alice_" ~ u.id.toString()[0..4])             { stderr.writeln("FAIL: alice nick format");   failed++; }
-        if (!cfg.systemManaged)                                       { stderr.writeln("FAIL: alice systemManaged");  failed++; }
-        if (cfg.autoJoinChannels != ["#ircfiber", "#welcome"])        { stderr.writeln("FAIL: alice channels");       failed++; }
-        if (cfg.disabled)                                             { stderr.writeln("FAIL: alice disabled");       failed++; }
+        if (cfg.name != "IRC Fiber") {
+            stderr.writeln("FAIL: alice name");
+            failed++;
+        }
+        if (cfg.host != "irc.ircfiber.com") {
+            stderr.writeln("FAIL: alice host");
+            failed++;
+        }
+        if (cfg.port != 6697) {
+            stderr.writeln("FAIL: alice port");
+            failed++;
+        }
+        if (cfg.tls != TLSMode.required) {
+            stderr.writeln("FAIL: alice tls");
+            failed++;
+        }
+        if (cfg.realName != "alice") {
+            stderr.writeln("FAIL: alice realName");
+            failed++;
+        }
+        if (cfg.nick != "alice_" ~ u.id.toString()[0..4]) {
+            stderr.writeln("FAIL: alice nick format");
+            failed++;
+        }
+        if (!cfg.systemManaged) {
+            stderr.writeln("FAIL: alice systemManaged");
+            failed++;
+        }
+        if (cfg.autoJoinChannels != ["#ircfiber", "#welcome"]) {
+            stderr.writeln("FAIL: alice channels");
+            failed++;
+        }
+        if (cfg.disabled) {
+            stderr.writeln("FAIL: alice disabled");
+            failed++;
+        }
     }
 
     // 2. Determinism: same user → same nick across calls
@@ -84,8 +111,8 @@ private int runSelfTest() {
         User u;
         u.id = randomUUID();
         u.username = "bob";
-        auto n1 = buildDefaultNick(u);
-        auto n2 = buildDefaultNick(u);
+        const n1 = buildDefaultNick(u);
+        const n2 = buildDefaultNick(u);
         if (n1 != n2) { stderr.writeln("FAIL: deterministic nick"); failed++; }
     }
 
@@ -116,7 +143,7 @@ private int runSelfTest() {
     //    default_network.d which are compiled into every config that
     //    pulls the module).
     {
-        User empty;
+        const User empty;
         if (empty.id != UUID.init || empty.username.length != 0) {
             stderr.writeln("FAIL: User.init invariant");
             failed++;
@@ -139,7 +166,8 @@ private int runMain(string[] args) {
         "user",       &onlyUser,
     );
     if (helpInfo.helpWanted) {
-        defaultGetoptPrinter("Usage: ircfiber-default-migrate [--dry-run] [--user=NAME] [--self-test]", helpInfo.options);
+        defaultGetoptPrinter("Usage: ircfiber-default-migrate [--dry-run] " ~
+            "[--user=NAME] [--self-test]", helpInfo.options);
         return 0;
     }
 
@@ -194,7 +222,7 @@ private int runMain(string[] args) {
             foreach (c; netRepo.findByUserId(u.id))
                 if (c.host == "irc.ircfiber.com") { hadFiberBefore = true; break; }
 
-            auto cfg = ensureDefaultFiberNetwork(u, netRepo, redis, registry);
+            const cfg = ensureDefaultFiberNetwork(u, netRepo, redis, registry);
             if (cfg.id == UUID.init) { errors++; return; }
 
             // The helper either created a new config or returned the

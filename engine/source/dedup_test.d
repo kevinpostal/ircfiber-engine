@@ -19,9 +19,12 @@ static import ircfiber.api.rest;
 // Reach into the package-static dedupMessages helper via the class.
 import ircfiber.api.rest : RESTAPI;
 
+/// Tracks the number of passing checks.
 int passed;
+/// Tracks the number of failing checks.
 int failed;
 
+/// Records the outcome of a single named check.
 void check(string name)(bool cond, string msg = "") {
     if (cond) {
         ++passed;

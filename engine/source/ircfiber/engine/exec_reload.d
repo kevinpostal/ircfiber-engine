@@ -32,17 +32,25 @@ string execReloadCheckpointPath(string serverId) {
 /// network, plus a list of FD numbers that should NOT be closed by
 /// the new engine's startup code.
 struct ExecReloadSnapshot {
+    /// Per-network connection snapshots.
     ExecReloadRecord[] records;
+    /// ISO timestamp of when the snapshot was captured.
     string capturedAt;
+    /// PID of the engine that captured the snapshot.
     int capturedPid;
+    /// Server ID this snapshot belongs to.
     string serverId;
+    /// Path to the new binary the process was replaced with.
     string newBinaryPath;
 }
 
 /// One IRC connection's snapshot for exec-reload.
 struct ExecReloadRecord {
+    /// Handoff state of the connection.
     HandoffState state;
+    /// Surviving file descriptor number.
     int fd;
+    /// Whether the connection was TLS.
     bool wasTls;
 }
 
@@ -207,7 +215,7 @@ ExecReloadSnapshot snapshotFromJson(JSONValue root) {
 /// By convention, all FDs that are NOT explicitly cleared are closed
 /// by the kernel during exec.
 void preserveFdAcrossExec(int fd) {
-    int flags = fcntl(fd, F_GETFD, 0);
+    const flags = fcntl(fd, F_GETFD, 0);
     if (flags < 0) return;
     fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC);
 }
@@ -223,7 +231,7 @@ void execReload(string binaryPath, string[] argv, string[] envp) {
     immutable(char)*[] envpArr = new immutable(char)*[envp.length + 1];
     foreach (i, e; envp) envpArr[i] = cast(immutable(char)*) e.toStringz();
     envpArr[envp.length] = null;
-    auto rc = execve(binPtr, cast(char**) argvArr.ptr, cast(char**) envpArr.ptr);
+    cast(void) execve(binPtr, cast(char**) argvArr.ptr, cast(char**) envpArr.ptr);
     import std.conv : to;
     throw new Exception("execve failed: errno=" ~ errno.to!string);
 }

@@ -15,16 +15,23 @@ import ircfiber.storage.redis : RedisStorage;
 
 /// Summary of connections per IRC host for the admin dashboard.
 struct HostConnectionSummary {
+    /// IRC hostname the summary covers.
     string host;
+    /// Total connection count for the host.
     int totalConns;
+    /// Server IDs serving the host.
     string[] serverIds;
+    /// Per-server connection counts.
     int[string] serverConns;
 }
 
 /// Engine configuration override for admin UI
 struct EngineConfigOverride {
+    /// Admin routing priority (higher = preferred).
     int priority;
+    /// Admin max connections per IRC host (0 = unlimited).
     int maxConnections;
+    /// Admin flag: only assign when no other healthy server exists.
     bool fallbackOnly;
 }
 
@@ -73,6 +80,7 @@ final class ServerRegistry {
         db.hset(RedisKeys.networkAssignments(), networkId, serverId);
     }
 
+    /// Registers a new connection server in the registry.
     void registerServer(ConnectionServer server) {
         if (server.serverId.length == 0) {
             throw new Exception("Server ID must be non-empty");
@@ -223,13 +231,13 @@ final class ServerRegistry {
     ///   3. `data` JSON's `draining` bool (legacy persistence)
     bool isDraining(string serverId) {
         auto key = RedisKeys.server(serverId);
-        auto data = db.hget(key, "draining");
+        const data = db.hget(key, "draining");
         if (data.length != 0) {
             try { if (data == "true") return true; } catch (Exception) {}
         }
         // TTL key fallback — draining_test sets only this in step 2
         try {
-            auto ttl = db.get(RedisKeys.draining(serverId));
+            const ttl = db.get(RedisKeys.draining(serverId));
             if (ttl.length != 0) return true;
         } catch (Exception) {}
         // Data JSON fallback — step 3 sets only data JSON
@@ -285,7 +293,7 @@ final class ServerRegistry {
                     server.lastHeartbeat = hbStr.to!long;
                 } catch (Exception) {
                     try {
-                        auto hbJson = parseJsonString(hbStr);
+                        const hbJson = parseJsonString(hbStr);
                         if (hbJson.type == Json.Type.int_) server.lastHeartbeat = hbJson.get!long;
                         else if (hbJson.type == Json.Type.string) {
                             try { server.lastHeartbeat = hbJson.get!string.to!long; } catch (Exception) {}
@@ -392,7 +400,8 @@ final class ServerRegistry {
         }
         auto healthy = getHealthyServers();
         if (healthy.length == 0) {
-            logWarn("No healthy connection servers available for network %s — falling back to any registered server", networkId);
+            logWarn("No healthy connection servers available for network %s "
+                ~ "— falling back to any registered server", networkId);
             auto all = getAllServers();
             if (all.length == 0) {
                 logWarn("No registered servers at all, cannot assign network %s", networkId);
@@ -638,8 +647,8 @@ final class ServerRegistry {
         //      the lease should also be missing/expired. Only reassign
         //      when BOTH the server heartbeat AND lease are gone.
         foreach (na; getAllAssignments()) {
-            auto server = getServer(na.serverId);
-            auto serverIsAlive = server.serverId.length > 0
+            const server = getServer(na.serverId);
+            const serverIsAlive = server.serverId.length > 0
                 && server.isHealthy
                 && (now - server.lastHeartbeat) < 60_000;
 
@@ -796,13 +805,13 @@ final class ServerRegistry {
      * Called automatically by healthCheckAll(), or can be called independently.
      */
     void checkNetworkFailures() {
-        auto now = Clock.currTime.toUnixTime!long * 1000;
-        auto healthy = getHealthyServers();
+        const now = Clock.currTime.toUnixTime!long * 1000;
+        const healthy = getHealthyServers();
         if (healthy.length < 2) return; // need at least 2 servers to reassign
 
         foreach (na; getAllAssignments()) {
             auto failKey = RedisKeys.networkFail(na.networkId);
-            auto failCountStr = db.hget(failKey, "count");
+            const failCountStr = db.hget(failKey, "count");
             if (failCountStr.length == 0) continue;
 
             int failCount;
@@ -810,13 +819,13 @@ final class ServerRegistry {
             if (failCount < 3) continue;
 
             // Check if failure is recent (within 5 minutes)
-            auto lastFailureStr = db.hget(failKey, "lastFailure");
+            const lastFailureStr = db.hget(failKey, "lastFailure");
             long lastFailure;
             try { lastFailure = lastFailureStr.to!long; } catch (Exception) { continue; }
             if (now - lastFailure > 300_000) continue; // too old, reset
 
             // Verify the failing server is still the one assigned
-            auto failingServerId = db.hget(failKey, "serverId");
+            const failingServerId = db.hget(failKey, "serverId");
             if (failingServerId != na.serverId) continue; // already reassigned
 
             auto error = db.hget(failKey, "error");
@@ -963,7 +972,8 @@ final class ServerRegistry {
         if (raw.length == 0) {
             raw = recoverAssignmentsFromMirrors();
             if (raw.length > 0) {
-                logWarn("irc:assignments hash was empty — recovered %d network→server mapping(s) from per-engine mirrors",
+                logWarn("irc:assignments hash was empty — recovered %d "
+                    ~ "network→server mapping(s) from per-engine mirrors",
                     raw.length);
                 foreach (netId, serverId; raw) {
                     db.hset(RedisKeys.networkAssignments(), netId, serverId);
@@ -998,7 +1008,6 @@ final class ServerRegistry {
             cursor = sr.cursor;
             foreach (key; sr.keys) {
                 if (key.length <= prefixLen) continue;
-                auto sid = key[prefixLen .. $];
                 auto fields = redis.hgetAll(key);
                 foreach (netId, serverId; fields) {
                     // Trust the mirror's stored serverId; it's set by the

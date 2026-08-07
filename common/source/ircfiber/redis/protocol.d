@@ -418,6 +418,7 @@ struct NetworkStateSnapshot {
     /// assertions (plan W1-T01 section G scenario 1) require
     /// `delayMs > 0` during the active backoff.
     bool   hasRetryStatus;
+    /// Structured connection retry state (attempt count, next retry time, delay).
     RetryStatus retryStatus;
     /// W1-T01: structured disconnect reason from the engine's
     /// `parseReasonToFailInfo` parser. Shipped on disconnect and
@@ -533,7 +534,7 @@ struct NetworkStateSnapshot {
         // flip the flag so toJson() re-emits it on the next
         // round-trip.
         if (j["retryStatus"].type == Json.Type.object) {
-            auto rs = j["retryStatus"];
+            const rs = j["retryStatus"];
             if (auto a = "attemptCount" in rs)
                 if (a.type == Json.Type.int_) s.retryStatus.attemptCount = a.get!int;
             if (auto n = "nextRetryAtMs" in rs)
@@ -546,7 +547,7 @@ struct NetworkStateSnapshot {
         // when present so legacy snapshots stay valid (plan compatibility
         // constraint: schema changes must be backward-compatible).
         if (j["failInfo"].type == Json.Type.object) {
-            auto fi = j["failInfo"];
+            const fi = j["failInfo"];
             if (auto t = "type" in fi)
                 if (t.type == Json.Type.string) s.failInfo.type_ = t.get!string;
             if (auto r = "reason" in fi)
@@ -561,9 +562,9 @@ struct NetworkStateSnapshot {
                 auto sve = *svePtr;
                 if (sve.type == Json.Type.object) {
                     auto nested = Json.emptyObject;
-                    auto t = sve["type"];
+                    const t = sve["type"];
                     if (t.type == Json.Type.string) nested["type"] = t;
-                    auto e = sve["error"];
+                    const e = sve["error"];
                     if (e.type == Json.Type.string) nested["error"] = e;
                     s.failInfo.sslVerifyError = nested;
                 }

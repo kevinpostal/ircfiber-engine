@@ -28,8 +28,11 @@ import ircfiber.irc.engine_janitor : EngineJanitor;
 import ircfiber.redis.protocol : RedisKeys;
 import ircfiber.storage.redis : RedisStorage;
 
+/// Tracks the number of passing checks.
 int passed;
+/// Tracks the number of failing checks.
 int failed;
+/// Tracks the number of skipped checks.
 int skipped;
 
 /// Per-test label + lazy boolean check (matches prefs_test.d style).
@@ -76,6 +79,7 @@ void cleanupNamespace(RedisStorage redis, string sid) {
     }
 }
 
+/// Returns whether the given server id is listed in irc:servers.
 bool isInServers(RedisStorage redis, string sid) {
     try {
         auto reply = redis.getDb().smembers(RedisKeys.serverList());
@@ -84,6 +88,7 @@ bool isInServers(RedisStorage redis, string sid) {
     return false;
 }
 
+/// Returns whether the given key exists in Redis.
 bool keyExists(RedisStorage redis, string key) {
     try return redis.exists(key); catch (Exception) return false;
 }
@@ -97,6 +102,7 @@ void clearJanitorEvents(RedisStorage redis) {
     } catch (Exception) {}
 }
 
+/// Runs the reaps-orphan test scenario.
 void runEnginejanitorReapsOrphan() {
     stderr.writeln("\n[reap] orphan in registry, no irc:server:<id> → reaped");
     RedisStorage redis;
@@ -126,7 +132,7 @@ void runEnginejanitorReapsOrphan() {
         (!keyExists(redis, RedisKeys.server(sid)));
 
     auto janitor = new EngineJanitor(redis);
-    long reaped = janitor.runOnce();
+    const long reaped = janitor.runOnce();
     check!("runOnce() reports ≥1 reaped orphan")(reaped >= 1);
     check!("postcondition: sid removed from irc:servers")
         (!isInServers(redis, sid));
@@ -157,6 +163,7 @@ void runEnginejanitorReapsOrphan() {
     check!("postcondition: irc:janitor:events has engine_reap row for sid")(foundEvent);
 }
 
+/// Runs the skips-live-server test scenario.
 void runEnginejanitorSkipsLive() {
     stderr.writeln("\n[reap] live server (EXISTS=1) → never touched");
     RedisStorage redis;
@@ -183,7 +190,7 @@ void runEnginejanitorSkipsLive() {
         (keyExists(redis, RedisKeys.server(sid)));
 
     auto janitor = new EngineJanitor(redis);
-    long reaped = janitor.runOnce();
+    const long reaped = janitor.runOnce();
     // runOnce may still reap OTHER orphans from earlier tests; what matters
     // is that OUR live sid is untouched.
     check!("postcondition: live sid still in irc:servers")
@@ -218,7 +225,7 @@ int main() {
 
     void dispatch(string name)(void function() body) {
         stderr.writeln("\n--- ", name, " ---");
-        int beforeFailed = failed;
+        const int beforeFailed = failed;
         try {
             body();
             if (failed > beforeFailed)

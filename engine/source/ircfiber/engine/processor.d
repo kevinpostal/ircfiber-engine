@@ -143,7 +143,8 @@ void startEventProcessor(ref EngineContext ctx) {
                         try {
                             ctx.messageRepo.appendIRCEvent(event, serverId);
                         } catch (Exception e) {
-                            try logWarn("MongoDB write failed for event %s/%s eid=%d: %s (event still in Redis scrollback)",
+                            try logWarn("MongoDB write failed for event %s/%s eid=%d: %s " ~
+                                "(event still in Redis scrollback)",
                                 event.network, event.command, event.eid, e.msg);
                             catch (Exception) {}
                         }
@@ -310,7 +311,7 @@ string buildHeartbeatEchoPayload(ref EngineContext ctx, Network net, long now) {
     payload["ts"] = Json(now);
 
     auto bid = Json.emptyArray;
-    auto lastSeen = Json.emptyObject;
+    const lastSeen = Json.emptyObject;
     foreach (buf; ctx.connManager.getBuffersForNetwork(net.config.id)) {
         bid ~= Json(buf.name);
         // Future: populate lastSeen[buf.name] with server-tracked timestamp.

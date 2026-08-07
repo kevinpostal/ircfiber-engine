@@ -165,7 +165,9 @@ struct UserPreferences {
     /// the same `prefs_field_invalid` warning fires on every load
     /// for the lifetime of that user record.
     static struct LoadResult {
+        /// The cleaned preferences record.
         UserPreferences prefs;
+        /// Whether one or more stored fields had the wrong JSON type.
         bool needsRepair;
     }
 
@@ -501,7 +503,7 @@ unittest {
     auto j = p.toJson();
     assert(j["prefVersion"].get!long == 42, "toJson() must serialize prefVersion");
 
-    auto back = UserPreferences.fromJson(j).prefs;
+    const back = UserPreferences.fromJson(j).prefs;
     assert(back.prefVersion == 42, "fromJson() must restore prefVersion");
     assert(back.pinnedChannels == p.pinnedChannels,
         "fromJson() must preserve other fields alongside prefVersion");
@@ -514,7 +516,7 @@ unittest {
     // path doesn't fail for users with existing data.
     auto j = Json.emptyObject;
     j["pinnedChannels"] = serializeToJson(["net1:#a"]);
-    auto back = UserPreferences.fromJson(j).prefs;
+    const back = UserPreferences.fromJson(j).prefs;
     assert(back.prefVersion == 0);
     assert(back.pinnedChannels == ["net1:#a"]);
 }
@@ -534,20 +536,20 @@ unittest {
     j["archivedChannels"]  = Json.emptyObject;  // wrong type
     j["networkOrder"]      = Json.emptyObject;  // wrong type
     j["lastActiveBuffers"] = Json.emptyObject;  // correct type
-    auto r1 = UserPreferences.fromJson(j, UUID.init);
+    const r1 = UserPreferences.fromJson(j, UUID.init);
     assert(r1.needsRepair, "needsRepair must be true when array fields are wrong type");
     assert(r1.prefs.pinnedChannels.length == 0,
         "wrong-type array field must drop without crashing");
     // Sanity: object fields (correct type) don't trigger the flag.
     auto j2 = Json.emptyObject;
     j2["lastActiveBuffers"] = Json.emptyObject;
-    auto r2 = UserPreferences.fromJson(j2, UUID.init);
+    const r2 = UserPreferences.fromJson(j2, UUID.init);
     assert(!r2.needsRepair, "needsRepair must be false when only object fields are present (correct type)");
     // All-correct JSON must not need repair.
     auto j3 = Json.emptyObject;
     j3["pinnedChannels"] = serializeToJson(["net1:#a"]);
     j3["networkOrder"]   = serializeToJson(["net1"]);
-    auto r3 = UserPreferences.fromJson(j3, UUID.init);
+    const r3 = UserPreferences.fromJson(j3, UUID.init);
     assert(!r3.needsRepair, "needsRepair must be false when all fields are correct type");
 }
 
@@ -592,12 +594,12 @@ unittest {
     foreach (i; iota(N).parallel) {
         auto p = repo.load(userId);
         p.pinnedChannels ~= "net1:#parallel-" ~ i.to!string;
-        auto v = repo.save(userId, p);
+        const v = repo.save(userId, p);
         assert(v >= 1, "save() must return the bumped prefVersion");
     }
 
     // Final load must show prefVersion == N with no duplicates / skips.
-    auto saved = repo.load(userId);
+    const saved = repo.load(userId);
     assert(saved.prefVersion == N);
     assert(saved.pinnedChannels.length == N);
 }
@@ -616,7 +618,7 @@ unittest {
     j["networkOrder"]     = Json.emptyObject;    // wrong type
     j["prefVersion"]      = Json(7L);
 
-    auto back = UserPreferences.fromJson(j).prefs;
+    const back = UserPreferences.fromJson(j).prefs;
     assert(back.prefVersion == 7,
         "well-typed fields must be preserved when sibling fields are malformed");
     assert(back.pinnedChannels.length == 0,
@@ -638,7 +640,7 @@ unittest {
     j["networkOrder"] = Json(42L);
     j["prefVersion"] = Json(3L);
 
-    auto back = UserPreferences.fromJson(j).prefs;
+    const back = UserPreferences.fromJson(j).prefs;
     assert(back.pinnedChannels.length == 0);
     assert(back.archivedChannels.length == 0);
     assert(back.networkOrder.length == 0);
@@ -654,7 +656,7 @@ unittest {
     j["networkOrder"]     = serializeToJson(["net1", "net2"]);
     j["prefVersion"]      = Json(11L);
 
-    auto back = UserPreferences.fromJson(j).prefs;
+    const back = UserPreferences.fromJson(j).prefs;
     assert(back.pinnedChannels   == ["net1:#a", "net2:#b"]);
     assert(back.archivedChannels == ["net3:#old"]);
     assert(back.networkOrder     == ["net1", "net2"]);
@@ -689,7 +691,7 @@ unittest {
     assert(redis.exists(key), "precondition: bad blob must be in Redis");
 
     auto repo = new PreferencesRepository(redis);
-    auto prefs = repo.load(userId);
+    const prefs = repo.load(userId);
     assert(prefs.prefVersion == 0,
         "load() must return defaults when the blob is unparseable");
     assert(!redis.exists(key),

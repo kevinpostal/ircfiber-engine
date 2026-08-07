@@ -17,9 +17,12 @@ import ircfiber.irc.parser : parseIRCLinePublic, parseIRCLineNamed, parseIsuppor
 import ircfiber.models.network : NetworkConfig;
 import ircfiber.models.irc_event : IRCRawEvent;
 
+/// Tracks the number of passing checks.
 int passed;
+/// Tracks the number of failing checks.
 int failed;
 
+/// Records the outcome of a single named check.
 void check(string name)(bool cond, string msg = "") {
     if (cond) {
         ++passed;
@@ -30,6 +33,7 @@ void check(string name)(bool cond, string msg = "") {
     }
 }
 
+/// Builds a minimal network config for parsing tests.
 NetworkConfig mkConfig() {
     NetworkConfig cfg;
     cfg.id = randomUUID();
@@ -37,6 +41,7 @@ NetworkConfig mkConfig() {
     return cfg;
 }
 
+/// Runs the malformed-input defensive parse test scenarios.
 void runDefensiveTests() {
     stderr.writeln("\n[defensive] malformed input never throws");
     auto cfg = mkConfig();
@@ -62,7 +67,7 @@ void runDefensiveTests() {
     {
         bool threw = false;
         try {
-            auto e = parseIRCLinePublic(":server", cfg);
+            cast(void) parseIRCLinePublic(":server", cfg);
             check!("prefix-only line never throws")(true);
         } catch (Exception e) { threw = true; }
         check!("prefix-only line parses without throwing")(!threw);
@@ -99,7 +104,7 @@ void runDefensiveTests() {
     {
         bool threw = false;
         try {
-            auto e = parseIRCLinePublic("@", cfg);
+            cast(void) parseIRCLinePublic("@", cfg);
             check!("bare @ tag handles gracefully")(!threw);
         } catch (Exception e) { threw = true; }
         check!("bare @ never throws")(!threw);
@@ -109,13 +114,14 @@ void runDefensiveTests() {
     {
         bool threw = false;
         try {
-            auto e = parseIRCLinePublic("@bot :server PRIVMSG #c :hi", cfg);
+            cast(void) parseIRCLinePublic("@bot :server PRIVMSG #c :hi", cfg);
             check!("valueless tag parses")(!threw);
         } catch (Exception e) { threw = true; }
         check!("valueless tag never throws")(!threw);
     }
 }
 
+/// Runs the RFC 2812 well-formed-line test scenarios.
 void runRFC2812Tests() {
     stderr.writeln("\n[RFC 2812] well-formed lines parse cleanly");
     auto cfg = mkConfig();
@@ -146,7 +152,8 @@ void runRFC2812Tests() {
 
     // Section 3.3.1 — Private message
     {
-        auto e = parseIRCLinePublic(":Angel!angel@example.com PRIVMSG Wiz :Hello are you receiving this message ?", cfg);
+        auto e = parseIRCLinePublic(":Angel!angel@example.com PRIVMSG Wiz :" ~
+            "Hello are you receiving this message ?", cfg);
         check!("PRIVMSG: prefix")(e.prefix == "Angel!angel@example.com");
         check!("PRIVMSG: nick")(e.nick == "Angel");
         check!("PRIVMSG: hostmask")(e.hostmask == "angel@example.com");
@@ -180,6 +187,7 @@ void runRFC2812Tests() {
     }
 }
 
+/// Runs the IRCv3 tags and extended-join test scenarios.
 void runIRCv3Tests() {
     stderr.writeln("\n[IRCv3] tags + extended-join + chathistory");
     auto cfg = mkConfig();
@@ -216,6 +224,7 @@ void runIRCv3Tests() {
     }
 }
 
+/// Runs the squashed numeric+ERROR parse test scenarios.
 void runSquashedErrorTests() {
     stderr.writeln("\n[SuperNets-pattern] squashed numeric+ERROR line");
     auto cfg = mkConfig();
@@ -238,6 +247,7 @@ void runSquashedErrorTests() {
     }
 }
 
+/// Runs the ISUPPORT PREFIX and 005 rewrite test scenarios.
 void runIsupportTests() {
     stderr.writeln("\n[ISUPPORT] PREFIX parsing");
     check!("ISUPPORT: full PREFIX (qaohv)~&@%+")
@@ -262,7 +272,8 @@ void runIsupportTests() {
         // Single 005 reply with a mix of key=value and bare-key tokens,
         // plus the canonical trailer.
         auto e = parseIRCLinePublic(
-            ":irc.example.org 005 Zod CHANTYPES=#& EXCEPTS INVEX CHANMODES=b,e,I,k,l,imnpstSr :are supported by this server",
+            ":irc.example.org 005 Zod CHANTYPES=#& EXCEPTS INVEX " ~
+                "CHANMODES=b,e,I,k,l,imnpstSr :are supported by this server",
             cfg);
         check!("005: command is 005")(e.command == "005");
         check!("005: text is joined tokens, NOT trailer")

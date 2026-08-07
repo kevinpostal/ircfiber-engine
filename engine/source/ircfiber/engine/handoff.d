@@ -38,6 +38,7 @@ import ircfiber.redis.protocol : RedisKeys;
 /// versions so a new engine never inherits incompatible state from an
 /// old one.
 enum HANDOFF_MAGIC = "IRCF";
+/// Handoff protocol version — bumped on incompatible wire-format changes.
 enum HANDOFF_VERSION = 1;
 
 /// Path template for the handoff Unix socket. Each engine process
@@ -71,12 +72,19 @@ struct HandoffState {
     /// Magic + version stamp at the front so we can detect mismatched
     /// schemas. The wire format is documented in `encode`/`decode`.
     string schemaTag;            // = "IRCFv1"
+    /// Full network configuration (network_id, host, port, tls, sasl, …).
     NetworkConfig config;        // full network config (network_id, host, port, tls, sasl, …)
+    /// Owner user UUID.
     string userId;               // owner UUID
+    /// Engine serverId owning this network.
     string serverId;             // engine serverId owning this network
+    /// Current IRC nick.
     string sessionNick;          // current IRC nick
+    /// Whether the user is away.
     bool isAway;
+    /// Away message, if away.
     string awayMessage;
+    /// Cached server features snapshot.
     ServerFeaturesSnapshot serverFeatures;
     /// Full ISUPPORT map (every key=value or bare flag from the
     /// server's 005 replies). Used by the new engine to render the
@@ -84,19 +92,33 @@ struct HandoffState {
     /// 005 reply stream — the IRC server only sends 005 once per
     /// registration, so the new engine wouldn't otherwise see it.
     string[string] isupportMap;
+    /// Negotiated IRCv3 capabilities.
     string[] ackedCaps;          // negotiated IRCv3 caps
+    /// Active query PM targets.
     string[] queryBuffers;       // active query PM targets
+    /// Pre-handoff connect attempts (flushed to next CONNECT).
     string[] failureReasons;     // pre-handoff connect attempts (flushed to next CONNECT)
+    /// Lines buffered but never sent (state was disconnected).
     string[] outboundQueue;      // lines we buffered but never sent (state was disconnected)
+    /// Joined channels → "".
     string[string] channelState;        // joined channels → ""
+    /// Channel → topic.
     string[string] channelTopics;       // channel → topic
+    /// Channel → user list.
     string[][string] channelUsers;      // channel → user list
+    /// Nick → realname.
     string[string] realnames;           // nick → realname
+    /// Nick → account name (extended-join).
     string[string] accounts;            // nick → account name (extended-join)
+    /// Nick → ident / username.
     string[string] idents;              // nick → ident / username
+    /// Label → sent-at unix ms.
     long[string] pendingLabels;         // label → sent-at unix ms
+    /// Lowercased channel → latest msgid.
     string[string] channelLatestMsgid;  // lc channel → msgid
+    /// Lowercased channel → earliest msgid.
     string[string] channelEarliestMsgid;// lc channel → msgid
+    /// Lowercased channel → true (chathistory fetch in flight).
     bool[string] chathistoryInFlight;   // lc channel → true
     /// True if the underlying transport is plain TCP. False means the
     /// connection was TLS, which the new engine cannot adopt directly
@@ -106,15 +128,23 @@ struct HandoffState {
     /// the new engine should let the existing reconnect-backoff run
     /// rather than re-registering.
     bool wasConnected;
+    /// Unix-ms timestamp of when the snapshot was captured (sanity check).
     long capturedAtMs;           // unix ms; sanity check
 }
 
+/// Snapshot of the ISUPPORT-derived server features.
 struct ServerFeaturesSnapshot {
+    /// ISUPPORT NETWORK= value.
     string network;        // ISUPPORT NETWORK=
+    /// ISUPPORT PREFIX= value.
     string prefix = "@+";  // ISUPPORT PREFIX=
+    /// ISUPPORT CHANMODES= value.
     string chanModes;
+    /// ISUPPORT CHANLIMIT max channels.
     int maxChannels = 0;
+    /// ISUPPORT NICKLEN max nick length.
     int maxNickLen  = 30;
+    /// ISUPPORT TOPICLEN max topic length.
     int topicLen    = 0;
 }
 
@@ -155,6 +185,7 @@ private void writeU32LE(ref ubyte[] buf, size_t pos, uint v) {
     buf[pos+3] = cast(ubyte)((v >> 24) & 0xFF);
 }
 
+/// Reads a little-endian uint32 from `data`.
 public uint readU32LE(const(ubyte)* data) {
     return cast(uint)(data[0])
          | (cast(uint)(data[1]) << 8)
@@ -164,11 +195,12 @@ public uint readU32LE(const(ubyte)* data) {
 
 // Public stream helpers (used by reload_orchestrator.d for the
 // meta-protocol above the per-record wire format).
+/// Writes all `len` bytes from `data` to `fd`, retrying on EINTR.
 public void writeAll(int fd, const(ubyte)* data, size_t len) {
     import core.sys.posix.unistd : write;
     size_t written = 0;
     while (written < len) {
-        auto n = write(fd, data + written, len - written);
+        const n = write(fd, data + written, len - written);
         if (n < 0) {
             if (errno == 4 /* EINTR */) continue;
             throw new Exception("write failed");
@@ -178,11 +210,12 @@ public void writeAll(int fd, const(ubyte)* data, size_t len) {
     }
 }
 
+/// Reads exactly `len` bytes into `data`, retrying on EINTR.
 public void readAll(int fd, ubyte* data, size_t len) {
     import core.sys.posix.unistd : read;
     size_t total = 0;
     while (total < len) {
-        auto n = read(fd, data + total, len - total);
+        const n = read(fd, data + total, len - total);
         if (n < 0) {
             if (errno == 4) continue;
             throw new Exception("read failed");
@@ -192,6 +225,7 @@ public void readAll(int fd, ubyte* data, size_t len) {
     }
 }
 
+/// Writes a length-prefixed frame (4-byte LE length + payload) to `fd`.
 public void writeFrame(int fd, const(ubyte)[] payload) {
     import core.sys.posix.unistd : write;
     ubyte[4] hdrBuf;
@@ -201,6 +235,7 @@ public void writeFrame(int fd, const(ubyte)[] payload) {
     writeAll(fd, payload.ptr, payload.length);
 }
 
+/// Reads a length-prefixed frame from `fd`.
 public ubyte[] readFrame(int fd) {
     import core.sys.posix.unistd : read;
     ubyte[4] hdrBuf;
@@ -212,16 +247,18 @@ public ubyte[] readFrame(int fd) {
     return buf;
 }
 
+/// Writes a newline-terminated line to `fd`.
 public void writeLine(int fd, string s) {
     writeAll(fd, cast(const(ubyte)*)s.ptr, s.length);
 }
 
+/// Reads a newline-terminated line from `fd`.
 public string readLine(int fd) {
     import core.sys.posix.unistd : read;
     ubyte[1] b;
     string acc;
     while (true) {
-        auto n = read(fd, b.ptr, 1);
+        const n = read(fd, b.ptr, 1);
         if (n < 0) {
             if (errno == 4) continue;
             throw new Exception("read failed");
@@ -246,6 +283,7 @@ public int posixClose(int fd) {
 //  JSON serialisation for HandoffState
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Serializes handoff state to a JSON object.
 JSONValue toJSON(ref HandoffState s) {
     JSONValue j = JSONValue.emptyObject;
     j.object["schemaTag"] = JSONValue(s.schemaTag);
@@ -294,6 +332,7 @@ JSONValue toJSON(ref HandoffState s) {
     return j;
 }
 
+/// Serializes server features to a JSON object.
 JSONValue serverFeaturesToJSON(ref ServerFeaturesSnapshot f) {
     JSONValue j = JSONValue.emptyObject;
     j.object["network"] = JSONValue(f.network);
@@ -341,9 +380,10 @@ private JSONValue stringListMapToJSON(string[][string] m) {
     return v;
 }
 
+/// Deserializes handoff state from a JSON object.
 HandoffState fromJSON(JSONValue j) {
     HandoffState s;
-    auto root = j.object;
+    const root = j.object;
 
     if (auto p = "schemaTag" in root) s.schemaTag = p.str;
     if (auto p = "sessionNick" in root) s.sessionNick = p.str;
@@ -356,7 +396,7 @@ HandoffState fromJSON(JSONValue j) {
     if (auto p = "capturedAtMs" in root) s.capturedAtMs = p.integer;
 
     if (auto p = "config" in root) {
-        auto cfg = p.object;
+        const cfg = p.object;
         if (auto q = "id" in cfg) s.config.id = parseUUID(q.str);
         if (auto q = "name" in cfg) s.config.name = q.str;
         if (auto q = "host" in cfg) s.config.host = q.str;
@@ -375,7 +415,7 @@ HandoffState fromJSON(JSONValue j) {
     }
 
     if (auto p = "serverFeatures" in root) {
-        auto f = p.object;
+        const f = p.object;
         if (auto q = "network" in f) s.serverFeatures.network = q.str;
         if (auto q = "prefix" in f) s.serverFeatures.prefix = q.str;
         if (auto q = "chanModes" in f) s.serverFeatures.chanModes = q.str;
@@ -498,7 +538,7 @@ void sendRecordWithFds(int fd, const(ubyte)[] stateJson, int[] fds) {
     msg.msg_control = cbuf.ptr;
     msg.msg_controllen = cast(socklen_t) cbuf.length;
 
-    auto n = sendmsg(fd, &msg, 0);
+    const n = sendmsg(fd, &msg, 0);
     if (n < 0) throw new Exception("sendmsg failed: errno=" ~ errno.to!string);
     if (n == 0) throw new Exception("sendmsg: 0 bytes");
 }
@@ -532,7 +572,7 @@ WireRecord receiveRecordWithFds(int fd) {
     msg.msg_control = cbuf.ptr;
     msg.msg_controllen = cast(socklen_t) cbuf.length;
 
-    auto n = recvmsg(fd, &msg, 0);
+    const n = recvmsg(fd, &msg, 0);
     if (n < 0) throw new Exception("recvmsg failed: errno=" ~ errno.to!string);
     if (n == 0) throw new Exception("recvmsg: peer closed");
 
@@ -575,7 +615,9 @@ WireRecord receiveRecordWithFds(int fd) {
 
 /// A single record received from the handoff stream.
 struct WireRecord {
+    /// JSON payload of the record.
     const(ubyte)[] json;
+    /// File descriptors transferred with the record (empty if none).
     int[] fds;
 }
 
@@ -620,18 +662,18 @@ int createUnixListener(string path) {
     auto addrLen = cast(uint)(cast(ubyte*)&addr.sun_path[path.length] + 1 - cast(ubyte*) &addr);
     if (bind(s, cast(sockaddr*) &addr, addrLen) < 0) {
         auto e = errno;
-        posixClose(s);
+        cast(void) posixClose(s);
         throw new Exception("bind() failed: errno=" ~ e.to!string);
     }
     // Mode 0600 — owner-only. chown can relax if needed.
     import core.sys.posix.sys.stat : S_IRUSR, S_IWUSR, chmod;
-    auto st = stat(path.ptr, null);
+    const st = stat(path.ptr, null);
     if (st == 0) {
         chmod(path.ptr, S_IRUSR | S_IWUSR);
     }
     if (listen(s, 1) < 0) {
         auto e = errno;
-        posixClose(s);
+        cast(void) posixClose(s);
         throw new Exception("listen() failed: errno=" ~ e.to!string);
     }
     return s;
@@ -644,7 +686,7 @@ int connectUnix(string path) {
     sockaddr_un addr;
     addr.sun_family = cast(ushort) AF_UNIX;
     if (path.length >= addr.sun_path.length) {
-        posixClose(s);
+        cast(void) posixClose(s);
         throw new Exception("path too long");
     }
     addr.sun_path[path.length] = 0;
@@ -652,7 +694,7 @@ int connectUnix(string path) {
     auto addrLen = cast(uint)(cast(ubyte*)&addr.sun_path[path.length] + 1 - cast(ubyte*) &addr);
     if (connect(s, cast(sockaddr*) &addr, addrLen) < 0) {
         auto e = errno;
-        posixClose(s);
+        cast(void) posixClose(s);
         throw new Exception("connect() failed: errno=" ~ e.to!string);
     }
     return s;
@@ -673,7 +715,7 @@ int acceptUnix(int listener, int timeoutSeconds = 30) {
     fcntl(listener, F_SETFL, flags | O_NONBLOCK);
 
     import vibe.core.core : yield;
-    auto deadline = Clock.currTime + dur!"seconds"(timeoutSeconds);
+    const deadline = Clock.currTime + dur!"seconds"(timeoutSeconds);
     while (Clock.currTime < deadline) {
         pollfd pf;
         pf.fd = listener;
@@ -717,7 +759,7 @@ unittest {
     int[2] ctl;
     auto rc = socketpair(AF_UNIX, SOCK_STREAM, 0, ctl);
     assert(rc == 0, "socketpair(ctl) failed");
-    scope(exit) { posixClose(ctl[0]); posixClose(ctl[1]); }
+    scope(exit) { cast(void) posixClose(ctl[0]); cast(void) posixClose(ctl[1]); }
 
     // 2. Create a pipe whose read-end we'll transfer
     int[2] p;
@@ -767,15 +809,15 @@ unittest {
     assert(c.cmsg_type == SCM_RIGHTS, "wrong cmsg type");
 
     auto data = cast(int*) CMSG_DATA(c);
-    auto count = (c.cmsg_len - CMSG_LEN(0)) / int.sizeof;
+    const count = (c.cmsg_len - CMSG_LEN(0)) / int.sizeof;
     assert(count >= 1, "no FDs received");
 
-    int adoptedFd = data[0];
+    const adoptedFd = data[0];
 
     // 5. Verify we can write to the adopted FD (it's the pipe read-end)
     //    by writing to the original write-end and reading from adoptedFd
     string testMsg = "hello fd";
-    auto wn = write(p[1], testMsg.ptr, testMsg.length);
+    const wn = write(p[1], testMsg.ptr, testMsg.length);
     assert(wn == cast(ssize_t) testMsg.length, "pipe write failed");
 
     ubyte[64] readBuf;
@@ -841,7 +883,7 @@ unittest {
     socklen_t blen = cast(socklen_t) boundAddr.sizeof;
     assert(getsockname(listenFd, cast(sockaddr*) &boundAddr, &blen) == 0,
         "getsockname failed");
-    auto listenPort = ntohs(boundAddr.sin_port);
+    const listenPort = ntohs(boundAddr.sin_port);
     assert(listenPort > 0, "kernel didn't assign a port");
 
     // ── 2. Open the "OLD engine" side: connect to listener ──────────
@@ -868,7 +910,7 @@ unittest {
     socklen_t pBeforeLen = cast(socklen_t) peerBefore.sizeof;
     assert(getpeername(serverSideFd, cast(sockaddr*) &peerBefore,
         &pBeforeLen) == 0, "getpeername(before) failed");
-    auto remotePortBefore = ntohs(peerBefore.sin_port);
+    const remotePortBefore = ntohs(peerBefore.sin_port);
     assert(remotePortBefore > 0, "no remote port before handoff");
 
     // Sanity: the OLD engine can talk on its socket pre-handoff.
@@ -885,7 +927,7 @@ unittest {
     int[2] ctl;
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, ctl) == 0,
         "socketpair(ctl) failed");
-    scope(exit) { posixClose(ctl[0]); posixClose(ctl[1]); }
+    scope(exit) { cast(void) posixClose(ctl[0]); cast(void) posixClose(ctl[1]); }
 
     // OLD engine → ctl[0]: send the ircFd via SCM_RIGHTS.
     ubyte[] cbuf = buildCmsgBuffer([oldEngineFd]);
@@ -923,7 +965,7 @@ unittest {
     assert(cmsg.cmsg_level == SOL_SOCKET, "wrong cmsg level");
     assert(cmsg.cmsg_type == SCM_RIGHTS, "wrong cmsg type");
     auto fds = cast(int*) CMSG_DATA(cmsg);
-    auto count = (cmsg.cmsg_len - CMSG_LEN(0)) / int.sizeof;
+    const count = (cmsg.cmsg_len - CMSG_LEN(0)) / int.sizeof;
     assert(count == 1, "expected exactly 1 FD");
     auto newEngineFd = fds[0];
     assert(newEngineFd >= 0, "received invalid FD");
@@ -933,9 +975,9 @@ unittest {
     // fd in this process as part of the transfer — that's the SCM_RIGHTS
     // contract). Any read or write on the OLD fd must fail.
     char[1] probe;
-    auto probeRc = recv(oldEngineFd, probe.ptr, 1, 0);
+    const probeRc = recv(oldEngineFd, probe.ptr, 1, 0);
     assert(probeRc < 0, "OLD fd still readable after SCM_RIGHTS — was the FD actually transferred?");
-    posixClose(oldEngineFd);
+    cast(void) posixClose(oldEngineFd);
 
     // ── 5. Verify the NEW engine can write to the adopted FD ────────
     string postHandoff = "POST :new engine took over\r\n";
@@ -956,7 +998,7 @@ unittest {
     socklen_t pAfterLen = cast(socklen_t) peerAfter.sizeof;
     assert(getpeername(serverSideFd, cast(sockaddr*) &peerAfter,
         &pAfterLen) == 0, "getpeername(after) failed");
-    auto remotePortAfter = ntohs(peerAfter.sin_port);
+    const remotePortAfter = ntohs(peerAfter.sin_port);
 
     assert(remotePortAfter == remotePortBefore + 1,
         "TCP connection was closed and reopened during handoff " ~
@@ -986,9 +1028,9 @@ unittest {
         "JOIN data mismatch");
 
     // ── Cleanup ─────────────────────────────────────────────────────
-    posixClose(newEngineFd);
-    posixClose(serverSideFd);
-    posixClose(listenFd);
+    cast(void) posixClose(newEngineFd);
+    cast(void) posixClose(serverSideFd);
+    cast(void) posixClose(listenFd);
 }
 
 
@@ -1043,7 +1085,7 @@ unittest {
     sockaddr_in boundAddr;
     socklen_t blen = cast(socklen_t) boundAddr.sizeof;
     getsockname(listenFd, cast(sockaddr*) &boundAddr, &blen);
-    auto listenPort = ntohs(boundAddr.sin_port);
+    cast(void) ntohs(boundAddr.sin_port);
 
     auto oldEngineFd = socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in dstAddr;
@@ -1093,7 +1135,7 @@ unittest {
     // The OLD engine, after the handoff, must close its local FD.
     // This is what `schedulePostHandoffQuit` + `processEvents` does in
     // `PersistentIRCClient` once the handoff pause releases.
-    posixClose(oldEngineFd);
+    cast(void) posixClose(oldEngineFd);
 
     // Server can still talk to the (transferred) connection via the
     // server-side FD → kernel connection is still alive. This is the
@@ -1111,18 +1153,18 @@ unittest {
         "data mismatch after OLD engine fd close");
 
     // ── Now NEW engine releases its FD → connection actually closes ─
-    posixClose(newEngineFd);
+    cast(void) posixClose(newEngineFd);
 
     // Server's read should now return 0 (peer closed).
     char[1] probe;
-    auto bytesAfterClose = recv(serverSideFd, probe.ptr, 1, 0);
+    const bytesAfterClose = recv(serverSideFd, probe.ptr, 1, 0);
     assert(bytesAfterClose == 0,
         "server should see EOF after BOTH engines close their FDs, got " ~
         bytesAfterClose.to!string);
 
-    posixClose(serverSideFd);
-    posixClose(listenFd);
-    posixClose(ctl[0]);
-    posixClose(ctl[1]);
+    cast(void) posixClose(serverSideFd);
+    cast(void) posixClose(listenFd);
+    cast(void) posixClose(ctl[0]);
+    cast(void) posixClose(ctl[1]);
 }
 

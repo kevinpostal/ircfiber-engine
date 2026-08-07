@@ -286,7 +286,7 @@ void main() {
             rmsg.msg_iovlen = 1;
             rmsg.msg_control = recvBuf.ptr;
             rmsg.msg_controllen = cast(socklen_t) recvBuf.length;
-            auto recvRc = recvmsg(ctl[1], &rmsg, 0);
+            cast(void) recvmsg(ctl[1], &rmsg, 0);
             stderr.flush();
 
             auto cmsg = cast(cmsghdr*) CMSG_FIRSTHDR(&rmsg);
@@ -325,7 +325,7 @@ void main() {
         msg.msg_iovlen = 1;
         msg.msg_control = cbuf.ptr;
         msg.msg_controllen = cast(socklen_t) cbuf.length;
-        auto sendRc = sendmsg(ctl[0], &msg, 0);
+        cast(void) sendmsg(ctl[0], &msg, 0);
         stderr.flush();
         close(ctl[0]);
         // Parent reads from barrier[0]. Close the inherited write-end.

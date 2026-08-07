@@ -97,8 +97,8 @@ unittest {
         "roles": serializeToJson(["user", "admin"]),
         "signupIp": Json("192.168.1.1"),
         "lastLoginIp": Json("10.0.0.1"),
-        "lastLoginAt": Json(1700000000),
-        "createdAt": Json(1690000000),
+        "lastLoginAt": Json(1_700_000_000),
+        "createdAt": Json(1_690_000_000),
         "loginIps": serializeToJson(["192.168.1.1", "10.0.0.1"])
     ]);
 

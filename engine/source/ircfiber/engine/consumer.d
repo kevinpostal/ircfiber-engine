@@ -30,6 +30,7 @@ import core.time : seconds, Duration, msecs;
 private long[string] pendingReconnects;
 private enum RECONNECT_DEDUP_TTL_MS = 5_000;
 
+/// Returns true iff a reconnect for `networkId` is currently in flight.
 bool isReconnectInFlight(string networkId) {
     if (auto t = networkId in pendingReconnects) {
         if (Clock.currTime.toUnixTime!long * 1000 - *t < RECONNECT_DEDUP_TTL_MS)
@@ -40,10 +41,12 @@ bool isReconnectInFlight(string networkId) {
     return false;
 }
 
+/// Marks a reconnect for `networkId` as in flight.
 void markReconnectInFlight(string networkId) {
     pendingReconnects[networkId] = Clock.currTime.toUnixTime!long * 1000;
 }
 
+/// Clears the in-flight reconnect marker for `networkId`.
 void clearReconnectInFlight(string networkId) nothrow {
     pendingReconnects.remove(networkId);
 }
@@ -223,7 +226,7 @@ private void handleExecReload(ref EngineContext ctx, ControlMessage msg) {
     import ircfiber.engine.reload_orchestrator : serveExecReload;
 
     if (auto binP = "binary" in msg.config) {
-        auto binVal = *binP;
+        const binVal = *binP;
         if (binVal.type == Json.Type.string) {
             auto binary = binVal.get!string;
             logInfo("beginExecReload: target binary=%s", binary);
@@ -253,6 +256,7 @@ void startCommandConsumers(ref EngineContext ctx) {
     }
 }
 
+/// Spawns the command consumer task for the given network.
 void spawnNetworkCommandConsumer(ref EngineContext ctx, string networkId) {
     auto serverId = ctx.localServer.serverId;
     runSafeTask({
@@ -373,7 +377,7 @@ private void handleControlMessage(ref EngineContext ctx, ControlMessage msg) {
                 auto uid = parseUUID(msg.userId);
 
                 // Claim ownership in registry
-                auto sid = ctx.serverRegistry.assignNetwork(cfg.id.toString());
+                const sid = ctx.serverRegistry.assignNetwork(cfg.id.toString());
                 if (sid.length == 0) {
                     logWarn("Cannot add network %s — no healthy connection server available, will retry", cfg.name);
                 }

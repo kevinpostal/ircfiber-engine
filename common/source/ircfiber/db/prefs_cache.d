@@ -221,7 +221,7 @@ unittest {
     p2.prefVersion = 2;
     cache.set(uid, p2); // same key → in-place update
 
-    auto got = cache.get(uid);
+    const got = cache.get(uid);
     assert(!got.isNull);
     assert(got.get.prefVersion == 2, "update must replace value");
     assert(cache.length == 1, "update must not increase count");
@@ -283,12 +283,12 @@ unittest {
 @("PrefsCache: TTL is applied per-entry (not global)")
 unittest {
     // Use 1-day TTL — entries should survive a quick get.
-    auto cache = new PrefsCache(5, dur!"seconds"(86400));
+    auto cache = new PrefsCache(5, dur!"seconds"(86_400));
     auto uid = randomUUID();
 
     cache.set(uid, UserPreferences.init);
     // Immediate re-read must hit.
-    auto got = cache.get(uid);
+    const got = cache.get(uid);
     assert(!got.isNull, "entry with 1-day TTL must be accessible immediately");
     assert(cache.length == 1, "count after get must remain 1");
 }

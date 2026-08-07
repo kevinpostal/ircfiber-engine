@@ -50,6 +50,7 @@ private __gshared string serviceName     = "ircfiber-engine";
 private __gshared string serviceVersion  = "0.3.0";
 private __gshared bool g_metricsEnabled = false;
 
+/// Whether metrics are currently enabled.
 bool isMetricsEnabled() { return g_metricsEnabled; }
 void setMetricsEnabled(bool v) { g_metricsEnabled = v; }
 
@@ -78,18 +79,30 @@ void configureMetrics(string otlpEndpoint, string svcName, string svcVersion) {
 // `recordCounter()` time so the same metric name with different
 // attrs lands in different points.
 
+/// OTLP instrument kind (counter, gauge, or histogram).
 enum InstrumentKind { counter, gauge, histogram }
 
+/// A single metric data point pending export.
 struct MetricPoint {
+    /// Metric name.
     string          name;
+    /// Unit ("1" for counts, "s" for seconds).
     string          unit;        // "1" for counts, "s" for seconds
+    /// Instrument kind.
     InstrumentKind  kind;
+    /// Counter / gauge value.
     long            intValue;    // counter / gauge value
+    /// Histogram sum (microsecond precision).
     long            sumMicros;   // histogram sum (microsecond precision)
+    /// Histogram observation count.
     long            count;       // histogram observation count
+    /// Histogram bucket counts (one per bound).
     long[]          bucketCounts; // histogram bucket counts (one per bound)
+    /// Cumulative aggregation start time (monotonic).
     long            startUnixNano;  // cumulative aggregation: monotonic start
+    /// Wall-clock time the point was emitted.
     long            timeUnixNano;   // wall-clock when the point was emitted
+    /// Metric attributes.
     string[string]  attributes;
 }
 
@@ -112,10 +125,12 @@ private void initOnce() {
 // only consumer; production code paths must use recordCounter /
 // recordGauge / recordHistogram / flushAndSendMetrics.
 
+/// Builds the OTLP metrics JSON for a batch (test helper).
 string buildOtlpMetricsJsonForTest(MetricPoint[] batch) {
     return buildOtlpMetricsJson(batch);
 }
 
+/// Drains and returns all pending metric points (test helper).
 MetricPoint[] drainPendingForTest() {
     MetricPoint[] drained;
     synchronized (metricsMutex) {
@@ -144,6 +159,7 @@ void recordCounter(string name, long delta,
             attrs is null ? null : attrs.dup);
     }
 }
+/// Records a gauge observation.
 void recordGauge(string name, long value,
                 string[string] attrs = null) {
     if (!g_metricsEnabled) return;
@@ -169,6 +185,7 @@ immutable double[] HISTOGRAM_BOUNDS = [
     0.001, 0.01, 0.1, 1.0, 10.0, 30.0
 ];
 
+/// Records a histogram observation.
 void recordHistogram(string name, double valueSeconds,
                     string[string] attrs = null) {
     if (!g_metricsEnabled) return;
@@ -353,7 +370,8 @@ private string buildOtlpMetricsJson(ref MetricPoint[] batch) {
                 }
                 bucketsSink ~= "]";
                 sink ~= `,"histogram":{"dataPoints":[`;
-                sink ~= format(`{"attributes":%s,"startTimeUnixNano":"%d","timeUnixNano":"%d","count":"%d","sum":%s,"bucketCounts":%s,"explicitBounds":%s,"exemplars":[]}`,
+                sink ~= format(`{"attributes":%s,"startTimeUnixNano":"%d","timeUnixNano":"%d","count":"%d","sum":%s,`
+                    ~ `"bucketCounts":%s,"explicitBounds":%s,"exemplars":[]}`,
                     attrJson, mp.startUnixNano, mp.timeUnixNano,
                     mp.count, mp.sumMicros.to!string ~ "e-6",
                     bucketsSink.data, boundsSink.data);
@@ -396,7 +414,7 @@ unittest {
     batch ~= MetricPoint(
         "ircfiber.registration.timeout", "1", InstrumentKind.counter,
         1, 0, 0, null,
-        1782760360000_000_000L, 1782760370000_000_000L,
+        1_782_760_360_000_000_000L, 1_782_760_370_000_000_000L,
         ["network": "IRC Fiber", "host": "irc.ircfiber.com"]);
     auto json = buildOtlpMetricsJson(batch);
     assert(json.canFind(`"name":"ircfiber.registration.timeout"`));
@@ -414,7 +432,7 @@ unittest {
     batch ~= MetricPoint(
         "ircfiber.registration.timeout_networks", "1", InstrumentKind.gauge,
         3, 0, 0, null,
-        1782760360000_000_000L, 1782760370000_000_000L,
+        1_782_760_360_000_000_000L, 1_782_760_370_000_000_000L,
         ["serverId": "ovh"]);
     auto json = buildOtlpMetricsJson(batch);
     assert(json.canFind(`"gauge":{"dataPoints":[`));
@@ -431,7 +449,7 @@ unittest {
         InstrumentKind.histogram,
         0, 500_000, 1,
         [0, 0, 0, 1, 0, 0, 0],
-        1782760360000_000_000L, 1782760370000_000_000L,
+        1_782_760_360_000_000_000L, 1_782_760_370_000_000_000L,
         ["network": "IRC Fiber"]);
     auto json = buildOtlpMetricsJson(batch);
     assert(json.canFind(`"histogram":{"dataPoints":[`));
@@ -453,7 +471,7 @@ unittest {
 
 @("recordCounter / recordGauge / recordHistogram queue and flush cleanly")
 unittest {
-    bool prev = isMetricsEnabled();
+    const prev = isMetricsEnabled();
     scope (exit) setMetricsEnabled(prev);
     setMetricsEnabled(true);
     initOnce();
@@ -482,13 +500,13 @@ unittest {
 
 @("record* when disabled leaves pending[] empty and no init")
 unittest {
-    bool prev = isMetricsEnabled();
+    const prev = isMetricsEnabled();
     scope (exit) setMetricsEnabled(prev);
     // Ensure mutex is initialized so we can inspect pending safely.
     if (!mutexInitd) initOnce();
     setMetricsEnabled(false);
     // Ensure queue is empty.
-    auto drained = drainPendingForTest();
+    cast(void) drainPendingForTest();
     // These must be no-ops: no synchronized, no allocation.
     recordCounter("test.disabled.counter", 1, ["k": "v"]);
     recordGauge("test.disabled.gauge", 99, null);
@@ -504,8 +522,8 @@ unittest {
 
 @("configureMetrics empty endpoint disables metrics")
 unittest {
-    bool prev = isMetricsEnabled();
-    string prevEp = metricsEndpoint;
+    const prev = isMetricsEnabled();
+    const prevEp = metricsEndpoint;
     scope (exit) {
         setMetricsEnabled(prev);
         metricsEndpoint = prevEp;
@@ -520,7 +538,7 @@ unittest {
 
 @("flushAndSendMetrics when disabled does not attempt HTTP")
 unittest {
-    bool prev = isMetricsEnabled();
+    const prev = isMetricsEnabled();
     scope (exit) setMetricsEnabled(prev);
     setMetricsEnabled(true);
     if (!mutexInitd) initOnce();

@@ -10,22 +10,38 @@ import ircfiber.db.mongo : AppMongoConnection;
 
 /// One uploaded file reference (the bytes live on postimages.org).
 struct UploadRecord {
+    /// Upload identifier (UUID string).
     string id;               // _id (UUID string)
+    /// Owning user id.
     string userId;
+    /// Network the upload belongs to.
     string networkId;
+    /// Buffer (channel) the upload belongs to.
     string buffer;
+    /// User-edited display name.
     string filename;         // user-edited display name
+    /// Original client filename.
     string originalFilename;
+    /// MIME type.
     string mimeType;
+    /// File size in bytes.
     long size;
+    /// Image width (0 when not an image).
     long width;
+    /// Image height (0 when not an image).
     long height;
+    /// Postimages page URL.
     string pageUrl;
+    /// Direct image URL.
     string directUrl;
+    /// Thumbnail URL.
     string thumbUrl;
+    /// Creation timestamp (unix ms).
     long createdAt;          // unix ms
+    /// Soft-delete flag.
     bool deleted;
 
+    /// Serializes to Bson.
     Bson toBson() const @trusted {
         return Bson([
             "_id": Bson(id), "userId": Bson(userId), "networkId": Bson(networkId),
@@ -38,6 +54,7 @@ struct UploadRecord {
         ]);
     }
 
+    /// Deserializes from Bson.
     static UploadRecord fromBson(Bson b) @trusted {
         UploadRecord r;
         r.id = b["_id"].get!string;
@@ -63,6 +80,7 @@ struct UploadRecord {
 final class UploadRepository {
     private MongoCollection collection;
 
+    /// Constructs a repository bound to the uploads collection.
     this() {
         collection = AppMongoConnection.getDb()["uploads"];
         ensureIndexes();
@@ -76,6 +94,7 @@ final class UploadRepository {
         }
     }
 
+    /// Inserts an upload record.
     void insert(UploadRecord r) @trusted {
         collection.insertOne(r.toBson());
     }
@@ -175,12 +194,12 @@ unittest {
     r.filename = "cat.png";
     r.originalFilename = "IMG_001.png";
     r.mimeType = "image/png";
-    r.size = 12345;
+    r.size = 12_345;
     r.pageUrl = "https://postimg.cc/A";
     r.directUrl = "https://i.postimg.cc/A/cat.png";
-    r.createdAt = 1765000000000;
+    r.createdAt = 1_765_000_000_000;
     auto b = r.toBson();
-    auto back = UploadRecord.fromBson(b);
+    const back = UploadRecord.fromBson(b);
     assert(back == r);
     assert(b["deleted"].get!bool == false);
 }

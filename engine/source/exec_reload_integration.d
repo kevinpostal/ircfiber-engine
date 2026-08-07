@@ -71,7 +71,7 @@ private void runOld(string[] args) {
     auto snapshotFile = args.length > 2 ? args[2] : "/tmp/exec-reload-test.snapshot";
     auto markerFile = args.length > 3 ? args[3] : "/tmp/exec-reload-test.marker";
     auto mockHost = "127.0.0.1";
-    auto mockPort = 16667;
+    auto mockPort = 16_667;
 
     // 1. Connect to the mock IRC server.
     writeln("OLD: connecting to mock IRC at ", mockHost, ":", mockPort);
@@ -92,7 +92,7 @@ private void runOld(string[] args) {
     sockaddr_in peer;
     socklen_t plen = cast(socklen_t) peer.sizeof;
     getpeername(ircFd, cast(sockaddr*) &peer, &plen);
-    auto remotePortBefore = ntohs(peer.sin_port);
+    cast(void) ntohs(peer.sin_port);
 
     // 2. Send a PING so the mock server echoes PONG — proves the OLD
     //    engine can talk over the socket.
@@ -145,7 +145,7 @@ private void runOld(string[] args) {
     write(markerFile, snapshotFile);
 
     // 4. Clear O_CLOEXEC on the IRC FD so it survives exec.
-    int flags = fcntl(ircFd, F_GETFD, 0);
+    const int flags = fcntl(ircFd, F_GETFD, 0);
     fcntl(ircFd, F_SETFD, flags & ~FD_CLOEXEC);
     writeln("OLD: cleared O_CLOEXEC on fd ", ircFd);
 
@@ -204,7 +204,7 @@ private void runOld(string[] args) {
     writeln("OLD: passing argv to exec: ", argv);
     stdout.flush();
 
-    auto rc = execve(privatePath.ptr, cast(char**) argvArr.ptr, cast(char**) envpArr.ptr);
+    cast(void) execve(privatePath.ptr, cast(char**) argvArr.ptr, cast(char**) envpArr.ptr);
     stderr.writeln("OLD: execve failed: errno=", errno);
 }
 
@@ -226,7 +226,7 @@ private void runNew(string[] args) {
     int fd = -1;
     if (auto recsP = "records" in root.object) {
         if (recsP.type == JSONType.array && recsP.array.length > 0) {
-            auto rec = recsP.array[0];
+            const rec = recsP.array[0];
             if (auto p = "fd" in rec.object) {
                 writeln("NEW: fd field type=", p.type);
                 if (p.type == JSONType.integer) fd = cast(int) p.integer;

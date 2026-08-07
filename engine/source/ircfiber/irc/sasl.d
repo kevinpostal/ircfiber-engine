@@ -136,7 +136,7 @@ struct ScramSha256Client {
 
         // client-final-message-without-proof
         auto channelBinding    = "c=" ~ cast(string) Base64.encode(cast(ubyte[]) "n,,");
-        auto cfmWithoutProof   = channelBinding ~ ",r=" ~ serverNonce;
+        const cfmWithoutProof   = channelBinding ~ ",r=" ~ serverNonce;
 
         // AuthMessage = client-first-message-bare + "," + server-first + "," + cfm-without-proof
         auto authMessage = clientFirstMessageBare ~ "," ~ serverFirst ~ "," ~ cfmWithoutProof;

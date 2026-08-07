@@ -1071,7 +1071,7 @@ dscanner-install: ## Quality > Install D-Scanner if missing
 define _ds_rule
 dscanner-$(1): ## Quality > $(2)
 	@printf '\n%b\n' "$(D)--- D-Scanner $(2) ---$(R)"
-	@$(DSCANNER) $(3) $(SRCS) 2>/dev/null $(4)
+	@$(DSCANNER) --config dscanner.ini $(3) $(SRCS) 2>/dev/null $(4)
 endef
 
 $(eval $(call _ds_rule,syntax,syntax check,--syntaxCheck,|| true))
@@ -1084,8 +1084,10 @@ $(eval $(call _ds_rule,complexity,complexity check,--styleCheck,| grep "cyclomat
 dscanner-complexity: ## Quality > Cyclomatic complexity check
 $(eval $(call _ds_rule,imports,import analysis,--imports,|| true))
 dscanner-imports: ## Quality > Import analysis
-$(eval $(call _ds_rule,fix,auto-fix,--fixStyle,|| true))
-dscanner-fix: ## Quality > Auto-fix style issues
+# dscanner v0.15.x has no auto-fix mode (--fixStyle was never a real option).
+# Style fixes are applied by hand per `make dscanner-lint` output.
+dscanner-fix: ## Quality > Auto-fix style issues (manual: dscanner has no auto-fix)
+	@printf '%b\n' "$(Y)$(WR) dscanner v0.15 has no auto-fix mode — fix warnings from 'make dscanner-lint' by hand$(R)"
 $(eval $(call _ds_rule,size,SLOC count,--sloc,|| true))
 dscanner-size: ## Quality > SLOC count
 $(eval $(call _ds_rule,outline,outline,--outline,|| true))

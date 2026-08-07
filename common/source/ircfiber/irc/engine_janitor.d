@@ -173,6 +173,7 @@ final class EngineJanitor {
         string[] lastCycleReaped;
     }
 
+    /// Constructs a janitor bound to the given Redis storage.
     this(RedisStorage redisStorage) {
         this.redis = redisStorage;
         this.db = redisStorage.getDb();
@@ -183,6 +184,7 @@ final class EngineJanitor {
             StateTTL.JANITOR_LOCK_DEFAULT);
     }
 
+    /// Starts the janitor loop in a background task.
     void start() {
         if (running) return;
         running = true;
@@ -197,7 +199,7 @@ final class EngineJanitor {
     /// Run one cycle synchronously. Returns count of servers reaped.
     /// Used by tests + admin manual-trigger endpoint.
     long runOnce() {
-        auto startMono = MonoTime.currTime;
+        const startMono = MonoTime.currTime;
         long reaped = 0;
         lastCycleReaped.length = 0;
 
@@ -209,7 +211,7 @@ final class EngineJanitor {
             // atomic SET NX EX we use the lower-level request() API.
             db.request!string("SET", RedisKeys.janitorLock(), lockVal, "NX", "EX",
                 lockTtlSeconds.to!string);
-            auto got = db.get(RedisKeys.janitorLock());
+            const got = db.get(RedisKeys.janitorLock());
             gotLock = (got == lockVal);
         } catch (Exception e) {
             logWarn("EngineJanitor: SET NX failed: %s — skipping cycle", e.msg);

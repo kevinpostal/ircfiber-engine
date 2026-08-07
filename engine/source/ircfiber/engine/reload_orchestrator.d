@@ -57,7 +57,7 @@ struct ReloadResult {
 /// statistics so the caller can log them. Throws on protocol failure.
 ReloadResult adoptFromOldEngine(ConnectionManager mgr, string socketPath) {
     logInfo("Reload: connecting to old engine at %s", socketPath);
-    auto startedAt = Clock.currTime.toUnixTime!long * 1000;
+    const startedAt = Clock.currTime.toUnixTime!long * 1000;
 
     // Open the Unix-domain stream socket.
     int sock = connectUnix(socketPath);
@@ -103,9 +103,6 @@ ReloadResult adoptFromOldEngine(ConnectionManager mgr, string socketPath) {
         if (parts.length < 2)
             throw new Exception("reload: malformed RECORD header: " ~ line);
         string kind = parts[0];
-        string nidPart = parts[1];
-        auto colonPos = nidPart.indexOf(":");
-        string networkId = (colonPos >= 0) ? nidPart[colonPos+1..$] : nidPart;
 
         // Receive the binary frame: JSON + optional FDs via SCM_RIGHTS
         auto wire = receiveRecordWithFds(sock);
@@ -113,7 +110,7 @@ ReloadResult adoptFromOldEngine(ConnectionManager mgr, string socketPath) {
         // Parse and adopt
         auto stateJson = parseJSON(cast(string) wire.json);
         HandoffState s = fromJSON(stateJson);
-        int fd = (wire.fds.length > 0) ? wire.fds[0] : -1;
+        const fd = (wire.fds.length > 0) ? wire.fds[0] : -1;
 
         logInfo("Reload: received %s record for %s (wasConnected=%s, fd=%s)",
             kind, s.config.name, s.wasConnected,
@@ -193,7 +190,7 @@ void serveReload(EngineContext ctx, string socketPath) {
     auto snapshots = ctx.connManager.snapshotAllForHandoff();
     foreach (i, snap; snapshots) {
         auto kind = snap.state.transportWasPlain ? "plain" : "tls";
-        auto nid = snap.state.config.id.toString();
+        const nid = snap.state.config.id.toString();
         auto header = "RECORD " ~ kind ~ " " ~ nid.length.to!string ~ ":" ~ nid ~ "\n";
         writeLine(peer, header);
         auto stateJson = toJSON(snap.state);

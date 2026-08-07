@@ -19,7 +19,8 @@ import vibe.core.log;
 import vibe.core.net : connectTCP, TCPConnection;
 import vibe.core.task : Task;
 import vibe.data.json : Json;
-import vibe.stream.tls : TLSContext, TLSContextKind, TLSPeerValidationMode, TLSStream, createTLSContext, createTLSStream;
+import vibe.stream.tls : TLSContext, TLSContextKind, TLSPeerValidationMode,
+    TLSStream, createTLSContext, createTLSStream;
 import vibe.stream.operations : IOMode;
 import core.time : Duration, dur, msecs, seconds;
 
@@ -147,7 +148,7 @@ bool canConnectToHost(string host, int port) {
     auto key = host ~ ":" ~ port.to!string;
     if (auto breaker = key in _hostBreakers) {
         if (breaker.openedAt > 0) {
-            auto now = Clock.currTime.toUnixTime!long * 1000;
+            const now = Clock.currTime.toUnixTime!long * 1000;
             if (now - breaker.openedAt < HOST_COOLDOWN_MS) {
                 return false;
             }
@@ -987,7 +988,7 @@ final class PersistentIRCClient {
     /// the event loop resumes I/O. Idempotent.
     void resumeAfterHandoff() {
         import core.atomic : atomicOp, atomicLoad;
-        auto prev = atomicOp!"-="(handoffPauseCount, 1);
+        const prev = atomicOp!"-="(handoffPauseCount, 1);
         if (prev < 1) {
             // Defensive: restore so we don't underflow.
             atomicOp!"+="(handoffPauseCount, 1);
@@ -1008,7 +1009,7 @@ final class PersistentIRCClient {
     void waitForHandoffPause() {
         import core.atomic : atomicLoad;
         import core.time : msecs;
-        auto deadline = Clock.currTime.toUnixTime!long * 1000 + 2_000;
+        const deadline = Clock.currTime.toUnixTime!long * 1000 + 2_000;
         while (Clock.currTime.toUnixTime!long * 1000 < deadline) {
             // The loop drops into `yield()` only between reads. We
             // poll the count after a short sleep. If the loop is busy
@@ -1315,7 +1316,8 @@ final class PersistentIRCClient {
                     TLS_HANDSHAKE_TIMEOUT_SECONDS.seconds);
                 logInfo("adoptExecSocket: TLS handshake complete for %s on existing TCP", s.config.name);
             } catch (Exception e) {
-                logError("adoptExecSocket: TLS handshake failed for %s on existing TCP: %s — falling back to AdoptedSocket only",
+                logError("adoptExecSocket: TLS handshake failed for %s on existing TCP: %s"
+                    ~ " — falling back to AdoptedSocket only",
                     s.config.name, e.msg);
                 // Don't bail — we still have the raw TCP socket via
                 // adoptedSocket. The new engine can continue using it
@@ -1760,11 +1762,11 @@ final class PersistentIRCClient {
             auto hostKey = config.host ~ ":" ~ config.port.to!string;
             if (auto breaker = hostKey in _hostBreakers) {
                 if (breaker.openedAt > 0) {
-                    auto now = Clock.currTime.toUnixTime!long * 1000;
-                    auto elapsed = now - breaker.openedAt;
+                    const now = Clock.currTime.toUnixTime!long * 1000;
+                    const elapsed = now - breaker.openedAt;
                     if (elapsed < HOST_COOLDOWN_MS) {
                         auto remaining = HOST_COOLDOWN_MS - elapsed;
-                        auto remainingDur = dur!"msecs"(remaining);
+                        const remainingDur = dur!"msecs"(remaining);
                         if (remainingDur > delay) {
                             delay = remainingDur;
                             logWarn("Host circuit breaker active for %s — extending delay to %s",
@@ -1852,7 +1854,7 @@ final class PersistentIRCClient {
             // Sleep in 1s chunks so a concurrent stop() (isShutdownRequested)
             // is honoured within ~1s instead of waiting for the full delay.
             // This lets the user cancel a pending reconnect almost instantly.
-            auto deadline = Clock.currTime + delay;
+            const deadline = Clock.currTime + delay;
             while (Clock.currTime < deadline) {
                 if (isShutdownRequested) break;
                 sleep(1.seconds);
@@ -2008,7 +2010,7 @@ final class PersistentIRCClient {
         });
     }
 
-    private void attemptConnectionImpl(bool parentSpan) {
+    private void attemptConnectionImpl(bool) {
         // If the user clicked Disconnect (or the manager removed this client)
         // while we were waiting on the backoff timer, abort the connection
         // attempt instead of starting a new Happy Eyeballs / TLS / registration
@@ -2018,7 +2020,6 @@ final class PersistentIRCClient {
         // scheduled in 34s" still firing after they clicked Disconnect.
         if (isShutdownRequested) {
             logInfo("attemptConnection[%s]: skipped — shutdown requested", config.name);
-            ;
             throw new Exception("Shutdown requested");
         }
         state = ConnectionState.connecting;
@@ -2236,7 +2237,9 @@ final class PersistentIRCClient {
             if (nowMs - registrationStartMs > registrationOverallTimeoutMs) {
                 if (!welcomed) {
                     registrationTimeoutSince = nowMs;
-                    logWarn("PersistentIRCClient[%s] registration TIMEOUT after %ds (CAP+SASL+001 not received) — black-holed or slow server; will retry with backoff",
+                    logWarn("PersistentIRCClient[%s] registration TIMEOUT after %ds"
+                        ~ " (CAP+SASL+001 not received) — black-holed or slow"
+                        ~ " server; will retry with backoff",
                         config.name, REGISTRATION_OVERALL_TIMEOUT_SECS);
                     logJsonMap("warn", "connection",
                         "Registration timeout",
@@ -2450,7 +2453,7 @@ final class PersistentIRCClient {
                             // params[4] = "*", params[5] = realname
                             if (params.length >= 6) {
                               auto nick = params[1];
-                              auto rn   = params[5];
+                              const rn   = params[5];
                               if (nick.length > 0 && rn.length > 0 && rn != nick)
                                 realnames[nick] = rn;
                             }
@@ -2463,12 +2466,12 @@ final class PersistentIRCClient {
                             if (params.length < 2) break;
 
                             // params[0] = our nick (or *), params[1] = subcommand
-                            auto sub = params.length >= 2 ? params[1] : "";
+                            const sub = params.length >= 2 ? params[1] : "";
                             auto capLine = params.length >= 3 ? params[$ - 1] : "";
 
                             if (sub == "LS") {
                                 // Accumulate caps (multi-line uses trailing '*')
-                                bool isMultiline = (params.length >= 3 && params[2] == "*");
+                                const bool isMultiline = (params.length >= 3 && params[2] == "*");
                                 foreach (cap; capLine.split(" ")) {
                                     auto eqPos = cap.indexOf("=");
                                     auto capName = eqPos >= 0 ? cap[0 .. eqPos] : cap;
@@ -2493,7 +2496,7 @@ final class PersistentIRCClient {
                                     // to CAP END. The cap is non-essential for local
                                     // testing and this avoids a 30s registration timeout
                                     // that wedges the LocalIRCD network.
-                                    bool singleMultiPrefixOnly = serverCaps.length == 1
+                                    const bool singleMultiPrefixOnly = serverCaps.length == 1
                                         && serverCaps[0] == "multi-prefix"
                                         && toRequest.length == 1
                                         && toRequest[0] == "multi-prefix";
@@ -2611,7 +2614,8 @@ final class PersistentIRCClient {
 
                             if (config.sasl == SASLMechanism.plain) {
                                 if (challenge == "+") {
-                                    sendSaslAuthenticate(buildSaslPlainPayload(config.saslUsername, config.saslPassword));
+                                    sendSaslAuthenticate(buildSaslPlainPayload(config.saslUsername,
+                                        config.saslPassword));
                                 } else {
                                     // Unexpected challenge — abort SASL per RFC 4422 §3.5
                                     logWarn("SASL PLAIN: unexpected challenge from %s, aborting", config.host);
@@ -2645,13 +2649,15 @@ final class PersistentIRCClient {
                                     }
                                 } else {
                                     // Unexpected state — abort SASL
-                                    logWarn("SASL SCRAM: unexpected challenge (step=%s) from %s, aborting", scramStep, config.host);
+                                    logWarn("SASL SCRAM: unexpected challenge (step=%s) from %s, aborting",
+                                        scramStep, config.host);
                                     sendRaw("AUTHENTICATE *");
                                     saslDone = true;
                                 }
                             } else {
                                 // SASL mechanism not configured but server sent AUTHENTICATE — abort
-                                logWarn("SASL: unexpected AUTHENTICATE from %s (no mechanism selected), aborting", config.host);
+                                logWarn("SASL: unexpected AUTHENTICATE from %s (no mechanism selected), aborting",
+                                    config.host);
                                 sendRaw("AUTHENTICATE *");
                                 saslDone = true;
                             }
@@ -2883,7 +2889,8 @@ private void processEvents() {
 
         while (state == ConnectionState.connected) {
             auto now = Clock.currTime.toUnixTime!long;
-            if (!transportAlive) throw new Exception("Connection lost: transport not alive (adopted=" ~ (adoptedSocket !is null).to!string ~ ")");
+            if (!transportAlive) throw new Exception("Connection lost: transport not alive (adopted="
+                ~ (adoptedSocket !is null).to!string ~ ")");
 
             // Proactive disconnect probe: every N consecutive zero-reads
             // (after a successful read earlier), touch the transport to
@@ -3031,7 +3038,7 @@ private void processEvents() {
                     if (users.length == 0) continue;
                     bool needsWho = false;
                     foreach (u; users) {
-                        auto bare = stripNickPrefix(u);
+                        const bare = stripNickPrefix(u);
                         if (bare !in realnames) { needsWho = true; break; }
                     }
                     if (needsWho && (chan !in lastWhoTime || now - lastWhoTime[chan] >= 2)) {
@@ -3042,7 +3049,9 @@ private void processEvents() {
                         // Useful for debugging WHO, but not for production info level.
                         logJsonMap("debug", "protocol",
                             "WHO periodic enrichment",
-                            ["network": config.name, "channel": chan, "users": users.length.to!string, "event": "who_periodic"]);
+                            ["network": config.name, "channel": chan,
+                                "users": users.length.to!string,
+                                "event": "who_periodic"]);
                     }
                 }
             }
@@ -3195,10 +3204,10 @@ private void processEvents() {
                         // IRCv3 extended-join: extract account name from params[1]
                         // ("*" means not logged in; empty string means not provided).
                         if (params.length >= 3) {
-                          auto acct = params[1];
+                          const acct = params[1];
                           if (acct.length > 0)
                             accounts[event.nick] = acct;
-                          auto rn = params[2];
+                          const rn = params[2];
                           if (rn.length > 0 && rn != event.nick)
                             realnames[event.nick] = rn;
                         }
@@ -3221,7 +3230,7 @@ private void processEvents() {
                         // WHOX responses.
                         if (event.nick !in realnames) {
                             import std.datetime : Clock;
-                            auto whoisNow = Clock.currTime.toUnixTime!long;
+                            const whoisNow = Clock.currTime.toUnixTime!long;
                             if (whoisNow - lastWhoisTime >= 1) {
                                 sendRaw("WHOIS " ~ event.nick);
                                 lastWhoisTime = whoisNow;
@@ -3231,7 +3240,7 @@ private void processEvents() {
                         // The 352 handler promotes bare entries to their
                         // prefixed form without overwriting MODE changes.
                         import std.datetime : Clock;
-                        auto whoNow = Clock.currTime.toUnixTime!long;
+                        const whoNow = Clock.currTime.toUnixTime!long;
                         if (chan !in lastWhoTime || whoNow - lastWhoTime[chan] >= 2) {
                             sendRaw("WHO " ~ chan ~ " %tn");
                             lastWhoTime[chan] = whoNow;
@@ -3549,13 +3558,14 @@ private void processEvents() {
                     // This handles the initial NAMES burst where 366 may be delayed or missed.
                     {
                         import std.datetime : Clock;
-                        auto whoNow = Clock.currTime.toUnixTime!long;
+                        const whoNow = Clock.currTime.toUnixTime!long;
                         bool needsWho = false;
                         foreach (u; channelUsers[chan]) {
-                            auto bare = stripNickPrefix(u);
+                            const bare = stripNickPrefix(u);
                             if (bare !in realnames) { needsWho = true; break; }
                         }
-                        if (needsWho && channelUsers[chan].length > 5 && (chan !in lastWhoTime || whoNow - lastWhoTime[chan] >= 2)) {
+                        if (needsWho && channelUsers[chan].length > 5
+                            && (chan !in lastWhoTime || whoNow - lastWhoTime[chan] >= 2)) {
                             sendRaw("WHO " ~ chan);
                             lastWhoTime[chan] = whoNow;
                             logJsonMap("info", "protocol",
@@ -3580,16 +3590,20 @@ private void processEvents() {
                 if (params.length >= 2) {
                     auto chan = params[1];
                     import std.datetime : Clock;
-                    auto whoNow = Clock.currTime.toUnixTime!long;
+                    const whoNow = Clock.currTime.toUnixTime!long;
                     if (chan in channelUsers) {
                         bool needsWho = false;
                         foreach (u; channelUsers[chan]) {
-                            auto bare = stripNickPrefix(u);
+                            const bare = stripNickPrefix(u);
                             if (bare !in realnames) { needsWho = true; break; }
                         }
                         logJsonMap("info", "protocol",
                             "366 needsWho check",
-                            ["network": config.name, "channel": chan, "needsWho": needsWho?"true":"false", "users": channelUsers[chan].length.to!string, "realnames": realnames.length.to!string, "event": "rpl_endofnames_check"]);
+                            ["network": config.name, "channel": chan,
+                                "needsWho": needsWho?"true":"false",
+                                "users": channelUsers[chan].length.to!string,
+                                "realnames": realnames.length.to!string,
+                                "event": "rpl_endofnames_check"]);
                         if (needsWho && (chan !in lastWhoTime || whoNow - lastWhoTime[chan] >= 2)) {
                             sendRaw("WHO " ~ chan);
                             lastWhoTime[chan] = whoNow;
@@ -3614,7 +3628,9 @@ private void processEvents() {
                 auto mp = event.getParams();
                 logJsonMap("debug", "protocol",
                     "352 received",
-                    ["network": config.name, "params": event.getParams().join(" "), "text": event.text, "event": "rpl_whoreply"]);
+                    ["network": config.name,
+                        "params": event.getParams().join(" "), "text": event.text,
+                        "event": "rpl_whoreply"]);
                 if (mp.length >= 7) {
                     auto chan = mp[1];
                     auto nick = mp[5];
@@ -3814,7 +3830,7 @@ private void processEvents() {
                 auto params = event.getParams();
                 if (params.length >= 2) {
                     auto ref_ = params[0];
-                    auto batchType = params[1];
+                    const batchType = params[1];
                     if (ref_.startsWith("+")) {
                         activeBatchRef = ref_[1 .. $];
                         activeBatchType = batchType;
@@ -3852,7 +3868,7 @@ private void processEvents() {
                              "event": "mode_change"]);
                     }
                     if (mp.length >= 3) {
-                        auto chan = mp[0];
+                        const chan = mp[0];
                         auto modeStr = mp[1];
                         // Modifying the array through `ref` inside a foreach
                         // over `*members` (AA value pointer) can leave stale
@@ -3867,7 +3883,7 @@ private void processEvents() {
                             if (ch == '-') { adding = false; continue; }
                             if (ch == 'q' || ch == 'a' || ch == 'o' || ch == 'O' || ch == 'h' || ch == 'v') {
                                 if (targetIdx >= mp.length) break;
-                                auto targetNick = mp[targetIdx++];
+                                const targetNick = mp[targetIdx++];
                                     if (auto members = chan in channelUsers) {
                                     foreach (i, ref u; *members) {
                                         if (stripNickPrefix(u) == targetNick) {
@@ -3883,14 +3899,18 @@ private void processEvents() {
                                                     default: break;
                                                 }
                                                 if (newPrefix) {
-                                                    if (u.length > 0 && (u[0] == '~' || u[0] == '&' || u[0] == '@' || u[0] == '%' || u[0] == '+'))
+                                                    if (u.length > 0 && (u[0] == '~' || u[0] == '&'
+                                                        || u[0] == '@' || u[0] == '%'
+                                                        || u[0] == '+'))
                                                         u = newPrefix ~ u[1 .. $];
                                                     else
                                                         u = newPrefix ~ u;
                                                 }
                                             } else {
-                                                if (u.length > 0 && (u[0] == '~' || u[0] == '&' || u[0] == '@' || u[0] == '%' || u[0] == '+'))
-                                                    u = u[1 .. $];
+                                                if (u.length > 0 && (u[0] == '~' || u[0] == '&'
+                                                    || u[0] == '@' || u[0] == '%'
+                                                    || u[0] == '+'))
+                                                        u = u[1 .. $];
                                             }
                                             break;
                                         }
@@ -3925,7 +3945,7 @@ private void processEvents() {
                 // the main switch above — this guard is the symmetric
                 // protection in case a future code path bypasses that.
                 if (event.command.length == 3) {
-                    bool isHandled = (event.command == "001" || event.command == "305"
+                    const bool isHandled = (event.command == "001" || event.command == "305"
                         || event.command == "306" || event.command == "311"
                         || event.command == "354" || event.command == "376"
                         || event.command == "422" || event.command == "432"
@@ -4195,7 +4215,8 @@ private void processEvents() {
             // frozen buffer list for up to the 120 s idle-heuristic
             // window.
             if (state == ConnectionState.connected) {
-                throw new Exception("Stale connection detected: transport dead but state=connected — forcing reconnect for " ~ config.name);
+                throw new Exception("Stale connection detected: transport dead but"
+                    ~ " state=connected — forcing reconnect for " ~ config.name);
             }
         }
     }
@@ -4523,7 +4544,7 @@ private void processEvents() {
             string sslType  = "bad_cert";
             string sslError = detail;
             auto colon = detail.indexOf(':');
-            if (colon > 0 && colon < detail.length - 1) {
+            if (colon > 0 && colon + 1 < detail.length) {
                 sslType  = detail[0 .. colon].strip();
                 sslError = detail[colon + 1 .. $].strip();
             }
@@ -4569,7 +4590,7 @@ private void processEvents() {
         // previous sessionNick so the NICK handler can correlate the
         // server's echo back to us even after this optimistic change.
         if (line.startsWith("NICK ") || line.startsWith("nick ")) {
-            auto newNick = line[5 .. $].strip();
+            const newNick = line[5 .. $].strip();
             if (newNick.length > 0) {
                 optimisticNickOld = sessionNick;
                 sessionNick = newNick;
@@ -4672,7 +4693,7 @@ private void processEvents() {
     /// Drops pending labels older than `maxAgeMs` to bound the map's
     /// growth when the server never echoes (e.g. partial disconnect).
     void expireStalePendingLabels(long maxAgeMs = 30_000) {
-        auto now = Clock.currTime.toUnixTime!long * 1000;
+        const now = Clock.currTime.toUnixTime!long * 1000;
         string[] stale;
         foreach (label, sentAt; pendingLabels) {
             if (now - sentAt > maxAgeMs) stale ~= label;

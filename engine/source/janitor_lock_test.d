@@ -33,10 +33,14 @@ import ircfiber.irc.engine_janitor : EngineJanitor;
 import ircfiber.redis.protocol : RedisKeys;
 import ircfiber.storage.redis : RedisStorage;
 
+/// Tracks the number of passing checks.
 int passed;
+/// Tracks the number of failing checks.
 int failed;
+/// Tracks the number of skipped checks.
 int skipped;
 
+/// Records the outcome of a single named check.
 void check(string name)(bool cond, string msg = "") {
     if (cond) {
         ++passed;
@@ -47,12 +51,14 @@ void check(string name)(bool cond, string msg = "") {
     }
 }
 
+/// Connects to the local test Redis, throwing if unavailable.
 RedisStorage tryConnect() {
     auto redis = new RedisStorage();
     redis.connectFromUrl("redis://127.0.0.1:6379");
     return redis;
 }
 
+/// Best-effort cleanup of every key matching the server namespace.
 void cleanupNamespace(RedisStorage redis, string sid) {
     try {
         auto db = redis.getDb();
@@ -75,10 +81,12 @@ void cleanupNamespace(RedisStorage redis, string sid) {
     }
 }
 
+/// Returns whether the given key exists in Redis.
 bool keyExists(RedisStorage redis, string key) {
     try return redis.exists(key); catch (Exception) return false;
 }
 
+/// Returns whether the given server id is listed in irc:servers.
 bool isInServers(RedisStorage redis, string sid) {
     try {
         auto reply = redis.getDb().smembers(RedisKeys.serverList());
@@ -87,6 +95,7 @@ bool isInServers(RedisStorage redis, string sid) {
     return false;
 }
 
+/// Trims the janitor events list to a fresh slate.
 void clearJanitorEvents(RedisStorage redis) {
     try {
         immutable string trim = "redis.call('LTRIM', 'irc:janitor:events', 200, -1)\nreturn 1\n";
@@ -94,6 +103,7 @@ void clearJanitorEvents(RedisStorage redis) {
     } catch (Exception) {}
 }
 
+/// Runs the manual-reap-cleans-target test scenario.
 void runManualReapCleansTarget() {
     stderr.writeln("\n[manualReap] admin-driven reap of a single orphan");
     RedisStorage redis;
@@ -127,7 +137,7 @@ void runManualReapCleansTarget() {
         (keyExists(redis, RedisKeys.serverAssignments(sid)));
 
     auto janitor = new EngineJanitor(redis);
-    long n = janitor.manualReap(sid);
+    const long n = janitor.manualReap(sid);
     check!("manualReap returns ≥1 keys-deleted count")(n >= 1);
     check!("postcondition: state:net1 gone")
         (!keyExists(redis, "irc:state:" ~ sid ~ ":net1"));
@@ -158,6 +168,7 @@ void runManualReapCleansTarget() {
     check!("postcondition: engine_reap_manual audit event recorded")(foundManual);
 }
 
+/// Runs the lock-is-mutually-exclusive test scenario.
 void runLockIsMutuallyExclusive() {
     stderr.writeln("\n[lock] SET NX EX — at most one janitor runs per cycle");
     RedisStorage redis;
@@ -177,8 +188,8 @@ void runLockIsMutuallyExclusive() {
 
     // Both call runOnce(). Exactly one should perform the actual cycle.
     // Either A wins (B returns 0 from the lock check) or B wins (A=0).
-    long a = janitorA.runOnce();
-    long b = janitorB.runOnce();
+    const long a = janitorA.runOnce();
+    const long b = janitorB.runOnce();
 
     check!("at least one janitor did the work")(a + b >= 0);
     // Verify the lock is released after the cycle(s).
@@ -190,9 +201,9 @@ void runLockIsMutuallyExclusive() {
     // total between them (one of them incremented totalCycles to 1).
     auto statusA = janitorA.getStatus();
     auto statusB = janitorB.getStatus();
-    long cyclesA = statusA["totalCycles"].get!long;
-    long cyclesB = statusB["totalCycles"].get!long;
-    long total  = cyclesA + cyclesB;
+    const long cyclesA = statusA["totalCycles"].get!long;
+    const long cyclesB = statusB["totalCycles"].get!long;
+    const long total  = cyclesA + cyclesB;
     check!("exactly one cycle ran across both janitors")
         (total == 1 || total == 2);  // if lock was free when both called, both run
 
@@ -203,6 +214,7 @@ void runLockIsMutuallyExclusive() {
         (statusB["actor"].get!string.length > 0);
 }
 
+/// Runs the idempotent-reap-on-clean-state test scenario.
 void runIdempotentReapOnCleanState() {
     stderr.writeln("\n[idempotent] runOnce() on empty registry → no-op");
     RedisStorage redis;
@@ -224,10 +236,10 @@ void runIdempotentReapOnCleanState() {
     try db.del(RedisKeys.serverList()); catch (Exception) {}
 
     auto janitor = new EngineJanitor(redis);
-    long before = janitor.getStatus()["totalCycles"].get!long;
-    long n = janitor.runOnce();
-    long after  = janitor.getStatus()["totalCycles"].get!long;
-    long reaped = janitor.getStatus()["totalReaped"].get!long;
+    const long before = janitor.getStatus()["totalCycles"].get!long;
+    const long n = janitor.runOnce();
+    const long after  = janitor.getStatus()["totalCycles"].get!long;
+    const long reaped = janitor.getStatus()["totalReaped"].get!long;
 
     check!("runOnce() on empty registry returns 0 reaped")(n == 0);
     check!("totalCycles incremented by exactly 1")
@@ -243,7 +255,7 @@ int main() {
 
     void dispatch(string name)(void function() body) {
         stderr.writeln("\n--- ", name, " ---");
-        int beforeFailed = failed;
+        const int beforeFailed = failed;
         try {
             body();
             if (failed > beforeFailed)

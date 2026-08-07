@@ -17,9 +17,12 @@ import std.stdio : stderr, writeln;
 import core.time : msecs;
 import vibe.core.core : sleep;
 
+/// Tracks the number of passing checks.
 int passed;
+/// Tracks the number of failing checks.
 int failed;
 
+/// Records the outcome of a single named check.
 void check(string name)(bool cond, string msg = "") {
     if (cond) {
         ++passed;
@@ -33,6 +36,7 @@ void check(string name)(bool cond, string msg = "") {
 import ircfiber.engine.consumer : isReconnectInFlight, markReconnectInFlight,
     clearReconnectInFlight;
 
+/// Runs the reconnect-dedup idempotency test scenarios.
 void runDedupTests() {
     stderr.writeln("\n[reconnect dedup] idempotency map");
 
@@ -61,6 +65,7 @@ void runDedupTests() {
         (!isReconnectInFlight("does-not-exist"));
 }
 
+/// Runs the stale-TTL auto-expiry test scenarios.
 void runStaleTTLTests() {
     stderr.writeln("\n[reconnect dedup] stale entries auto-expire");
 

@@ -17,9 +17,12 @@ import ircfiber.db.preferences : UserPreferences, PreferencesRepository;
 import ircfiber.db.prefs_cache : PrefsCache;
 import ircfiber.storage.redis : RedisStorage;
 
+/// Tracks the number of passing checks.
 int passed;
+/// Tracks the number of failing checks.
 int failed;
 
+/// Records the outcome of a single named check.
 void check(string name)(bool cond, string msg = "") {
     if (cond) {
         ++passed;
@@ -30,6 +33,7 @@ void check(string name)(bool cond, string msg = "") {
     }
 }
 
+/// Runs the fromJson defensive-array test scenarios.
 void runFromJsonTests() {
     stderr.writeln("\n[fromJson] defensive array guards");
 
@@ -110,6 +114,7 @@ void runFromJsonTests() {
     }
 }
 
+/// Runs the corrupt-blob self-heal test scenarios.
 void runRepairTests() {
     stderr.writeln("\n[load] self-heals a corrupt blob (requires Redis)");
 
@@ -152,6 +157,7 @@ void runRepairTests() {
     }
 }
 
+/// Runs the LRU cache integration test scenarios.
 void runCacheTests() {
     stderr.writeln("\n[cache] LRU cache integration");
 

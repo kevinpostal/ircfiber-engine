@@ -152,10 +152,10 @@ EngineContext bootstrapEngine() {
     // adopted sockets keep their state.
     // Override with IRCFIBER_BOOTSTRAP_PURGE=0 to disable (debugging).
     if (environment.get("IRCFIBER_RELOAD_FROM_PID", "").length == 0) {
-        auto purgeEnv = environment.get("IRCFIBER_BOOTSTRAP_PURGE", "1");
+        const purgeEnv = environment.get("IRCFIBER_BOOTSTRAP_PURGE", "1");
         if (purgeEnv != "0" && purgeEnv != "false") {
             try {
-                long purged = purgeLocalServerNamespace(redis.getDb(), serverId);
+                const purged = purgeLocalServerNamespace(redis.getDb(), serverId);
                 if (purged > 0)
                     logInfo("Bootstrap purge: removed %d stale keys from namespace %s", purged, serverId);
                 else
@@ -219,7 +219,6 @@ EngineContext bootstrapEngine() {
     // orphaned connections from deleted accounts. Skip them at bootstrap
     // and persist the disabled flag so they don't reload on restart.
     bool[string] validUserIds;
-    int orphanCount = 0;
     try {
         auto userRepo = new UserRepository();
         foreach (id; userRepo.allUserIds()) {
@@ -238,7 +237,8 @@ EngineContext bootstrapEngine() {
     // which runs the actual network load inside a runTask after runApplication().
     logInfo("Bootstrap: network loading deferred to event loop");
 
-    return EngineContext(connManager, redis, bufferManager, messageRepo, networkRepo, eventChannel, serverRegistry, localServer);
+    return EngineContext(connManager, redis, bufferManager, messageRepo, networkRepo,
+        eventChannel, serverRegistry, localServer);
 }
 
 /// Load networks from MongoDB and start IRC clients.
@@ -280,9 +280,9 @@ void loadNetworks(ref EngineContext ctx) {
         if (assignedServer == serverId) {
             shouldLoad = true;
         } else if (assignedServer.length == 0) {
-            auto sid = ctx.serverRegistry.assignNetwork(nw.config.id.toString());
+            const sid = ctx.serverRegistry.assignNetwork(nw.config.id.toString());
             if (sid.length == 0) {
-                auto allServers = ctx.serverRegistry.getAllServers();
+                const allServers = ctx.serverRegistry.getAllServers();
                 if (allServers.length == 0) {
                     logInfo("No servers registered yet — self-assigning %s (bootstrap race fix)",
                         nw.config.name);
@@ -320,7 +320,7 @@ void loadNetworks(ref EngineContext ctx) {
         if (shouldLoad) {
             import std.uuid : UUID;
             auto uidStr = nw.userId.toString();
-            bool isZeroUser = (uidStr == "00000000-0000-0000-0000-000000000000");
+            const isZeroUser = (uidStr == "00000000-0000-0000-0000-000000000000");
             if (!isZeroUser && validUserIds.length > 0 && (uidStr.length == 0 || uidStr !in validUserIds)) {
                 logWarn("ORPHAN BOOTSTRAP: network '%s' (id=%s, host=%s, nick=%s) owner=%s not found — disabling",
                     nw.config.name, nw.config.id.toString(), nw.config.host, nw.config.nick, uidStr);
@@ -349,7 +349,8 @@ void loadNetworks(ref EngineContext ctx) {
     }
 
     if (orphanCount > 0) {
-        logWarn("Network loading: skipped %d orphaned network(s) with no valid owner (disabled in MongoDB)", orphanCount);
+        logWarn("Network loading: skipped %d orphaned network(s) with no valid owner " ~
+            "(disabled in MongoDB)", orphanCount);
     }
     logInfo("Network loading: loaded %d networks (skipped=%d disabled)", loadedCount, skippedCount);
 
@@ -598,11 +599,11 @@ void startHeartbeatTask(ref EngineContext ctx) {
 /// (heartbeat runs at 10 s — cheap).
 private long parseStateTtl() {
     import std.conv : to;
-    auto raw = environment.get("IRCFIBER_STATE_TTL", "");
+    const raw = environment.get("IRCFIBER_STATE_TTL", "");
     if (raw.length == 0) return StateTTL.DEFAULT;
     try {
         auto v = raw.to!long;
-        if (v < 30 || v > 86400) return StateTTL.DEFAULT;
+        if (v < 30 || v > 86_400) return StateTTL.DEFAULT;
         return v;
     } catch (Exception) {
         return StateTTL.DEFAULT;

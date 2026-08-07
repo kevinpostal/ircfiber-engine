@@ -33,6 +33,7 @@ import ircfiber.storage.buffer : sanitizeUtf8;
 final class MessageRepository {
     private MongoCollection collection;
 
+    /// Creates a repository bound to the messages collection.
     this() {
         collection = AppMongoConnection.getDb()["messages"];
         ensureIndexes();
@@ -123,7 +124,8 @@ final class MessageRepository {
         }
 
         auto jdoc = Json([
-            "_id": Json(serverId ~ ":" ~ networkId ~ ":" ~ channel ~ ":" ~ (eid > 0 ? to!string(eid) : (msgid.length > 0 ? msgid : to!string(ts)))),
+            "_id": Json(serverId ~ ":" ~ networkId ~ ":" ~ channel ~ ":" ~
+                (eid > 0 ? to!string(eid) : (msgid.length > 0 ? msgid : to!string(ts)))),
             "serverId": Json(serverId),
             "networkId": Json(networkId),
             "channel": Json(channel),
@@ -165,7 +167,7 @@ final class MessageRepository {
 
         Json[] out_;
         foreach (doc; collection.find(filter, options)) {
-            auto p = doc["payload"];
+            const p = doc["payload"];
             if (p.type == Bson.Type.string) {
                 auto raw = p.get!string;
                 try {
@@ -426,7 +428,7 @@ final class MessageRepository {
         ]);
         Json[] out_;
         foreach (doc; collection.find(filter, options)) {
-            auto p = doc["payload"];
+            const p = doc["payload"];
             if (p.type == Bson.Type.string) {
                 auto raw = p.get!string;
                 try {
@@ -479,9 +481,13 @@ final class MessageRepository {
 
     /// Result of a Redis→Mongo sync pass for a single buffer.
     struct SyncResult {
+        /// Entries pulled from Redis.
         long scanned;       // entries pulled from Redis
+        /// New Mongo docs written.
         long inserted;      // new Mongo docs written
+        /// Entries that already existed in Mongo.
         long duplicates;    // entries that already existed in Mongo
+        /// Entries that failed JSON parsing.
         long parseErrors;   // entries that failed JSON parsing
     }
 
@@ -513,7 +519,7 @@ final class MessageRepository {
         auto raw = db.lrange!(ubyte[])(key, 0, 5000);
         r.scanned = raw.walkLength;
 
-        long before = count(serverId, networkId, channel);
+        const long before = count(serverId, networkId, channel);
         foreach (entry; raw) {
             string s;
             try { s = () @trusted { return cast(string)entry.idup; } (); }
@@ -528,7 +534,7 @@ final class MessageRepository {
                 r.parseErrors++;
             }
         }
-        long after = count(serverId, networkId, channel);
+        const long after = count(serverId, networkId, channel);
         r.inserted = after - before;
         r.duplicates = r.scanned - r.inserted - r.parseErrors;
         if (r.duplicates < 0) r.duplicates = 0;

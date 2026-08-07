@@ -26,9 +26,12 @@ import vibe.data.json : Json;
 
 import ircfiber.irc.server : ConnectionServer;
 
+/// Tracks the number of passing checks.
 int passed;
+/// Tracks the number of failing checks.
 int failed;
 
+/// Records the outcome of a single named check.
 void ok(string name, bool cond, string msg = "") {
     if (cond) {
         ++passed;
@@ -39,6 +42,7 @@ void ok(string name, bool cond, string msg = "") {
     }
 }
 
+/// Serializes the given Json value to its string form.
 string toJsonString(scope ref Json j) { return j.toString(); }
 
 void main() {

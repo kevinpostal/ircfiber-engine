@@ -109,7 +109,7 @@ void testRedisDrainingRoundTrip() {
     // 1. Register a server normally
     auto server = ConnectionServer(
         serverId, "127.0.0.1", 8091,
-        true, 5000000, 0, [],
+        true, 5_000_000, 0, [],
         0, 0, false, false, []
     );
     db.hset(RedisKeys.server(serverId), "data", server.toJson().toString());
@@ -163,7 +163,7 @@ void testClearDrainingRemovesAllArtifacts() {
     // 1. Set up draining state (simulate markDraining)
     auto server = ConnectionServer(
         serverId, "127.0.0.1", 8091,
-        false, 5000000, 0, [],
+        false, 5_000_000, 0, [],
         0, 0, false, true, []
     );
     db.hset(RedisKeys.server(serverId), "data", server.toJson().toString());
@@ -215,7 +215,7 @@ void testUpdateHeartbeatClearsDraining() {
     // 1. Set up draining state
     auto server = ConnectionServer(
         serverId, "127.0.0.1", 8091,
-        false, 5000000, 0, [],
+        false, 5_000_000, 0, [],
         0, 0, false, true, []
     );
     db.hset(RedisKeys.server(serverId), "data", server.toJson().toString());
@@ -367,7 +367,7 @@ void testHealthCheckClearsStaleDraining() {
         "Phase 5 should set draining=false in data JSON for stale engines");
 
     // 4. The network should have been reassigned (since the server was stale)
-    auto assignedTo = db.hget(RedisKeys.networkAssignments(), networkId);
+    cast(void) db.hget(RedisKeys.networkAssignments(), networkId);
     // There are no other healthy servers, so the assignment may remain
     // on this server, or get reassigned. Both outcomes are acceptable —
     // the key test is that draining was cleared.
@@ -447,7 +447,7 @@ void main() {
     // Check Redis availability
     bool redisAvailable = false;
     try {
-        auto redis = connectRedis();
+        cast(void) connectRedis();
         // Connection succeeded — Redis is available.
         redisAvailable = true;
     } catch (Exception e) {

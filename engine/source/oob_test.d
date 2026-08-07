@@ -30,9 +30,12 @@ import std.uuid : randomUUID;
 import vibe.data.json : Json;
 import vibe.data.bson : Bson;
 
+/// Tracks the number of passing checks.
 int passed;
+/// Tracks the number of failing checks.
 int failed;
 
+/// Records the outcome of a single named check.
 void ok(string name, bool cond, string msg = "") {
     if (cond) {
         ++passed;

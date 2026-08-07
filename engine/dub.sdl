@@ -64,9 +64,8 @@ configuration "unittest" {
     mainSourceFile "source/app_test.d"
     versions "VibeUseFibers" "unitThreadedLight"
     // app_test.d imports both engine (chathistory) and backend (auth) — needs both.
-    // For now this config is disabled in the engine package; run backend's tests or
-    // engine's focused drivers (parser-test, etc.) instead. Keep config for reference.
     excludedSourceFiles "source/app_engine.d"
+    dependency "irc-fiber-backend" path="../backend" configuration="library"
 }
 
 configuration "unit-test-real" {
@@ -75,6 +74,7 @@ configuration "unit-test-real" {
     mainSourceFile "source/app_test_real.d"
     versions "VibeUseFibers" "unitThreadedLight"
     excludedSourceFiles "source/app_engine.d" "source/prefs_test.d" "source/parser_test.d" "source/consumer_test.d" "source/logging_format_test.d" "source/logging_test.d" "source/handoff_test_runner.d" "source/exec_reload_test_runner.d" "source/draining_test_runner.d"
+    dependency "irc-fiber-backend" path="../backend" configuration="library"
 }
 
 configuration "prefs-test" {
@@ -90,7 +90,7 @@ configuration "dedup-test" {
     targetName "dedup-test"
     mainSourceFile "source/dedup_test.d"
     versions "VibeUseFibers"
-    dependency "irc-fiber-backend" path="../backend"
+    dependency "irc-fiber-backend" path="../backend" configuration="library"
 }
 
 configuration "parser-test" {
@@ -211,6 +211,7 @@ configuration "session-queue-test" {
     versions "VibeUseFibers"
     dflags "-d"
     excludedSourceFiles "source/ircfiber/resource.d"
+    dependency "irc-fiber-backend" path="../backend" configuration="library"
 }
 
 configuration "oob-test" {

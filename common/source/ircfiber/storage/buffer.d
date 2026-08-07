@@ -124,6 +124,7 @@ final class BufferManager {
     /// keys, and the in-memory channel lists all agree.
     private alias normalizeChannel = ircfiber.models.network.normalizeChannelName;
 
+    /// Appends a message to the server-namespaced buffer.
     void appendMessage(string serverId, string networkId, string channel, Json message) @trusted {
         if (serverId.length == 0) {
             logError("appendMessage: serverId is empty, cannot namespace buffer");
@@ -159,7 +160,7 @@ final class BufferManager {
         auto results = db.lrange!(ubyte[])(key, 0, MAX_SCROLLBACK - 1);
         long idx;
         foreach (raw; results) {
-            auto curIdx = idx++;
+            const curIdx = idx++;
             string r;
             try {
                 r = () @trusted { return cast(string)raw.idup; } ();
@@ -233,7 +234,7 @@ final class BufferManager {
             auto results = db.lrange!(ubyte[])(key, 0, MAX_SCROLLBACK - 1);
             long idx;
             foreach (raw; results) {
-                auto curIdx = idx++;
+                const curIdx = idx++;
                 string r;
                 try {
                     r = () @trusted { return cast(string)raw.idup; } ();
@@ -242,7 +243,7 @@ final class BufferManager {
                 try {
                     auto msg = parseJson(r);
                     if (msg.type == Json.Type.object && "m" in msg) {
-                        auto msgMsgid = msg["m"].get!string;
+                        const msgMsgid = msg["m"].get!string;
                         if (beforeMsgid.length > 0 && msgMsgid == beforeMsgid && "t" in msg) {
                             beforeTs = msg["t"].get!long;
                             beforeIdx = curIdx;
@@ -292,7 +293,7 @@ final class BufferManager {
             auto results = db.lrange!(ubyte[])(key, 0, MAX_SCROLLBACK - 1);
             long idx;
             foreach (raw; results) {
-                auto curIdx = idx++;
+                const curIdx = idx++;
                 string r;
                 try {
                     r = () @trusted { return cast(string)raw.idup; } ();
@@ -301,7 +302,7 @@ final class BufferManager {
                 try {
                     auto msg = parseJson(r);
                     if (msg.type == Json.Type.object && "m" in msg) {
-                        auto msgMsgid = msg["m"].get!string;
+                        const msgMsgid = msg["m"].get!string;
                         if (beforeMsgid.length > 0 && msgMsgid == beforeMsgid && "t" in msg) {
                             beforeTs = msg["t"].get!long;
                             beforeIdx = curIdx;
@@ -446,14 +447,14 @@ final class BufferManager {
         // Build a stable string: command|channel|timestamp|sorted-params
         auto sortedParams = params.dup;
         sortedParams.sort();
-        auto combined = command ~ "|" ~ channel ~ "|" ~ timestamp.to!string ~ "|" ~ sortedParams.join("\x1f");
+        const combined = command ~ "|" ~ channel ~ "|" ~ timestamp.to!string ~ "|" ~ sortedParams.join("\x1f");
 
         // FNV-1a (64-bit), offset basis = 14695981039346656037, prime = 1099511628211
         auto bytes = cast(ubyte[])combined;
-        ulong hash = 14695981039346656037UL;
+        ulong hash = 14_695_981_039_346_656_037UL;
         foreach (b; bytes) {
             hash ^= b;
-            hash *= 1099511628211UL;
+            hash *= 1_099_511_628_211UL;
         }
         import std.format : format;
         return format!"%016x"(hash);

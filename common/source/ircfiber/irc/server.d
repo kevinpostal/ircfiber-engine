@@ -81,7 +81,8 @@ struct ConnectionServer {
         if (j["isHealthy"].type != Json.Type.undefined) s.isHealthy = j["isHealthy"].get!bool;
         if (j["lastHeartbeat"].type != Json.Type.undefined) {
             try {
-                if (j["lastHeartbeat"].type == Json.Type.string) s.lastHeartbeat = j["lastHeartbeat"].get!string.to!long;
+                if (j["lastHeartbeat"].type == Json.Type.string)
+                    s.lastHeartbeat = j["lastHeartbeat"].get!string.to!long;
                 else s.lastHeartbeat = j["lastHeartbeat"].get!long;
             } catch (Exception) {}
         }
@@ -161,7 +162,7 @@ unittest {
     // Test 5: JSON without draining field defaults to false (backward compat)
     import vibe.data.json : parseJsonString;
     auto oldJson = parseJsonString(`{"serverId":"old-server","isHealthy":true}`);
-    auto oldServer = ConnectionServer.fromJson(oldJson);
+    const oldServer = ConnectionServer.fromJson(oldJson);
     assert(oldServer.draining == false, "missing draining field should default to false");
 
     // Test 6: full round-trip preserves all fields
@@ -170,7 +171,7 @@ unittest {
         "10.0.0.1",      // bindAddress
         8091,            // port
         true,            // isHealthy
-        1000000,         // lastHeartbeat
+        1_000_000,       // lastHeartbeat
         42,              // bufferOffset
         ["net1", "net2"], // assignedNetworks
         10,              // priority
@@ -184,7 +185,7 @@ unittest {
     assert(restored.bindAddress == "10.0.0.1");
     assert(restored.port == 8091);
     assert(restored.isHealthy == true);
-    assert(restored.lastHeartbeat == 1000000);
+    assert(restored.lastHeartbeat == 1_000_000);
     assert(restored.bufferOffset == 42);
     assert(restored.assignedNetworks.length == 2);
     assert(restored.assignedNetworks[0] == "net1");

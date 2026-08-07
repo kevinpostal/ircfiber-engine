@@ -35,6 +35,7 @@ final class AdoptedSocket {
     private int m_fd;
     private bool m_closed;
 
+    /// Wraps an existing socket file descriptor.
     this(int fd) {
         m_fd = fd;
     }
@@ -96,7 +97,7 @@ final class AdoptedSocket {
         if (!connected) return false;
         size_t written = 0;
         while (written < data.length) {
-            auto n = .write_unix(m_fd, data.ptr + written, data.length - written);
+            const n = .write_unix(m_fd, data.ptr + written, data.length - written);
             if (n < 0) {
                 if (errno == 4) continue;
                 if (errno == 11 || errno == 35) {
@@ -141,7 +142,7 @@ unittest {
     import core.sys.posix.sys.socket : socketpair;
     import core.sys.posix.unistd : write;
     int[2] fds;
-    auto rc = socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+    const rc = socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
     assert(rc == 0, "socketpair failed");
 
     auto sock = new AdoptedSocket(fds[0]);
@@ -150,7 +151,7 @@ unittest {
 
     // Write through the raw fd
     string msg = "PING :keepalive";
-    auto n = write(fds[1], msg.ptr, msg.length);
+    const n = write(fds[1], msg.ptr, msg.length);
     assert(n == cast(ptrdiff_t) msg.length, "write failed");
 
     // Read through AdoptedSocket
@@ -166,7 +167,7 @@ unittest {
     import core.sys.posix.unistd : write;
     import core.time : Duration;
     int[2] fds;
-    auto rc = socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+    const rc = socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
     assert(rc == 0);
 
     auto sock = new AdoptedSocket(fds[0]);
@@ -188,7 +189,7 @@ unittest {
 unittest {
     import core.sys.posix.sys.socket : socketpair;
     int[2] fds;
-    auto rc = socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+    const rc = socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
     assert(rc == 0);
 
     auto sock = new AdoptedSocket(fds[0]);

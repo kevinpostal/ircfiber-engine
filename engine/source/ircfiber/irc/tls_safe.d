@@ -199,7 +199,7 @@ size_t safeTLSRead(TLSStream tls, ubyte[] buffer) {
 
 @("classifyTLSReadError: real error → fatal")
 unittest {
-    auto outcome = classifyTLSReadError(
+    const outcome = classifyTLSReadError(
         "OpenSSL error occured previously: ssl/record/rec_layer.c: tlsv1 alert protocol version",
         /* dataAvailableForRead */ false);
     assert(outcome == TLSReadOutcome.fatal,
@@ -208,7 +208,7 @@ unittest {
 
 @("classifyTLSReadError: ret 0 + data pending → retry")
 unittest {
-    auto outcome = classifyTLSReadError(
+    const outcome = classifyTLSReadError(
         "Reading from TLS stream was unsuccessful with ret 0",
         /* dataAvailableForRead */ true);
     assert(outcome == TLSReadOutcome.retry,
@@ -217,7 +217,7 @@ unittest {
 
 @("classifyTLSReadError: ret 0 + no data → fatal (peer closed)")
 unittest {
-    auto outcome = classifyTLSReadError(
+    const outcome = classifyTLSReadError(
         "Reading from TLS stream was unsuccessful with ret 0",
         /* dataAvailableForRead */ false);
     assert(outcome == TLSReadOutcome.fatal,
@@ -265,7 +265,7 @@ private static class FakeTLSStream {
     bool dataAvail;
     int readCalls;
 
-    size_t read(ubyte[] buf, IOMode) @safe {
+    size_t read(ubyte[], IOMode) @safe {
         readCalls++;
         if (throwOnRead) throw new Exception(throwMsg);
         // Fake: copy nothing — caller only cares about return value.
@@ -281,7 +281,7 @@ unittest {
     tls.throwOnRead = false;
 
     ubyte[64] buf;
-    auto n = safeTLSReadImpl(
+    const n = safeTLSReadImpl(
         (b) => tls.read(b, IOMode.once),
         () => tls.dataAvailableForRead,
         buf[]
@@ -298,7 +298,7 @@ unittest {
     tls.dataAvail = true;
 
     ubyte[64] buf;
-    auto n = safeTLSReadImpl(
+    const n = safeTLSReadImpl(
         (b) => tls.read(b, IOMode.once),
         () => tls.dataAvailableForRead,
         buf[]

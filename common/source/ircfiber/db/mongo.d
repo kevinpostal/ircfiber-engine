@@ -189,7 +189,7 @@ final class AppMongoConnection {
         if (limit < 1) limit = 1;
         if (limit > 100) limit = 100;
         if (maxTimeMs < 1) maxTimeMs = 2000;
-        if (maxTimeMs > 10000) maxTimeMs = 10000;
+        if (maxTimeMs > 10_000) maxTimeMs = 10_000;
         try {
             import vibe.db.mongo.impl.crud : FindOptions;
             FindOptions opts;

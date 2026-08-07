@@ -26,7 +26,7 @@ string resourceId() {
             try {
                 char[256] buf = void;
                 gethostname(buf.ptr, buf.length);
-                auto hostname = fromStringz(buf.ptr).idup;
+                const hostname = fromStringz(buf.ptr).idup;
                 g_resourceId = hostname;
             } catch (Exception e) {
                 g_resourceId = "unknown";

@@ -55,7 +55,7 @@ final class UserRepository {
     }
 
     /// Finds all users with limit and offset.
-    User[] findAll(int limit, int offset) {
+    User[] findAll(int limit, int) {
         User[] results;
         FindOptions findOpts;
         findOpts.limit = limit;

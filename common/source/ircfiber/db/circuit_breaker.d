@@ -18,23 +18,30 @@ final class MongoCircuitBreaker {
     private int state; // 0=closed, 1=open, 2=half_open
     private long coolDownMs_;
 
+    /// Constructs a breaker using the configured cooldown.
     this() {
-        auto raw = environment.get("IRCFIBER_MONGO_CIRCUIT_COOLDOWN_MS", "60000");
+        const raw = environment.get("IRCFIBER_MONGO_CIRCUIT_COOLDOWN_MS", "60000");
         coolDownMs_ = raw.to!long;
     }
 
+    /// Cooldown duration in milliseconds.
     @property long coolDownMs() const { return coolDownMs_; }
+    /// Current breaker state code (0=closed, 1=open, 2=half-open).
     @property int stateCode() const { return state; }
+    /// Consecutive failure count.
     @property int failuresCount() const { return failures; }
+    /// Whether the breaker is open.
     @property bool isOpen() const { return state == 1; }
+    /// Whether the breaker is closed.
     @property bool isClosed() const { return state == 0; }
+    /// Whether the breaker is half-open.
     @property bool isHalfOpen() const { return state == 2; }
 
     /// Returns true if the caller should attempt a Mongo request.
     bool allowRequest() {
         if (state == 0) return true;          // closed: allow
         if (state == 1) {                     // open: check if cooled down
-            auto elapsed = (Clock.currTime - openedAt).total!"msecs";
+            const elapsed = (Clock.currTime - openedAt).total!"msecs";
             if (elapsed >= coolDownMs_) {
                 state = 2;                     // half-open: allow one attempt
                 return true;

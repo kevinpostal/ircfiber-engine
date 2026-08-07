@@ -38,10 +38,14 @@ import ircfiber.irc.engine_janitor : EngineJanitor, purgeLocalServerNamespace,
 import ircfiber.redis.protocol : RedisKeys;
 import ircfiber.storage.redis : RedisStorage;
 
+/// Tracks the number of passing checks.
 int passed;
+/// Tracks the number of failing checks.
 int failed;
+/// Tracks the number of skipped checks.
 int skipped;
 
+/// Records the outcome of a single named check.
 void check(string name)(bool cond, string msg = "") {
     if (cond) {
         ++passed;
@@ -52,12 +56,14 @@ void check(string name)(bool cond, string msg = "") {
     }
 }
 
+/// Connects to the local test Redis, throwing if unavailable.
 RedisStorage tryConnect() {
     auto redis = new RedisStorage();
     redis.connectFromUrl("redis://127.0.0.1:6379");
     return redis;
 }
 
+/// Best-effort cleanup of every key matching the server namespace.
 void cleanupNamespace(RedisStorage redis, string sid) {
     try {
         auto db = redis.getDb();
@@ -80,10 +86,12 @@ void cleanupNamespace(RedisStorage redis, string sid) {
     }
 }
 
+/// Returns whether the given key exists in Redis.
 bool keyExists(RedisStorage redis, string key) {
     try return redis.exists(key); catch (Exception) return false;
 }
 
+/// Returns whether the given server id is listed in irc:servers.
 bool isInServers(RedisStorage redis, string sid) {
     try {
         auto reply = redis.getDb().smembers(RedisKeys.serverList());
@@ -92,6 +100,7 @@ bool isInServers(RedisStorage redis, string sid) {
     return false;
 }
 
+/// Trims the janitor events list to a fresh slate.
 void clearJanitorEvents(RedisStorage redis) {
     try {
         immutable string trim = "redis.call('LTRIM', 'irc:janitor:events', 200, -1)\nreturn 1\n";
@@ -99,6 +108,7 @@ void clearJanitorEvents(RedisStorage redis) {
     } catch (Exception) {}
 }
 
+/// Runs the status-reports-state test scenario.
 void runStatusReportsState() {
     stderr.writeln("\n[status] getStatus() exposes janitor snapshot");
     RedisStorage redis;
@@ -127,7 +137,7 @@ void runStatusReportsState() {
     }
 
     auto janitor = new EngineJanitor(redis);
-    long _r = janitor.runOnce();
+    const long _r = janitor.runOnce();
     auto status = janitor.getStatus();
 
     check!("status.actor is non-empty string")
@@ -156,6 +166,7 @@ void runStatusReportsState() {
     if (_r < 0) stderr.writeln("(unreachable)");
 }
 
+/// Runs the events-recorded test scenario.
 void runEventsRecorded() {
     stderr.writeln("\n[events] getRecentEvents() surfaces engine_reap entries");
     RedisStorage redis;
@@ -217,6 +228,7 @@ void runEventsRecorded() {
             (true);
 }
 
+/// Runs the purge-local-server-namespace test scenario.
 void runPurgeLocalServerNamespace() {
     stderr.writeln("\n[purge] purgeLocalServerNamespace wipes namespace atomically");
     RedisStorage redis;
@@ -242,7 +254,7 @@ void runPurgeLocalServerNamespace() {
     check!("precondition: server key present")
         (keyExists(redis, RedisKeys.server(sid)));
 
-    long deleted = purgeLocalServerNamespace(db, sid);
+    const long deleted = purgeLocalServerNamespace(db, sid);
     check!("purgeLocalServerNamespace returns ≥1 deleted")(deleted >= 1);
     check!("postcondition: state key gone")
         (!keyExists(redis, "irc:state:" ~ sid ~ ":n1"));
@@ -277,10 +289,11 @@ void runPurgeLocalServerNamespace() {
     check!("audit event of kind 'namespace_purge' recorded")(found);
 
     // Idempotency: second purge returns 0 (nothing left).
-    long second = purgeLocalServerNamespace(db, sid);
+    const long second = purgeLocalServerNamespace(db, sid);
     check!("idempotent: second purge returns 0")(second == 0);
 }
 
+/// Runs the bump-state-ttls test scenario.
 void runBumpStateTtls() {
     stderr.writeln("\n[ttl] bumpServerStateTTLs refreshes EXPIRE on namespace keys");
     RedisStorage redis;
@@ -300,7 +313,7 @@ void runBumpStateTtls() {
     db.set("dedup:" ~ sid ~ ":n1:msg1", "z");
     db.set(RedisKeys.control(sid), "ctrl");
 
-    long touched = bumpServerStateTTLs(db, sid, 600);
+    const long touched = bumpServerStateTTLs(db, sid, 600);
     check!("bumpServerStateTTLs reports ≥3 touched")
         (touched >= 3);
 
@@ -318,13 +331,13 @@ void runBumpStateTtls() {
         (cTtl > 0);
 
     // Idempotency: a second call touches the same set again.
-    long second = bumpServerStateTTLs(db, sid, 600);
+    const long second = bumpServerStateTTLs(db, sid, 600);
     check!("second bump touches ≥3 again")(second >= 3);
 
     // Zero / negative TTL is a safe no-op.
-    long noop = bumpServerStateTTLs(db, sid, 0);
+    const long noop = bumpServerStateTTLs(db, sid, 0);
     check!("ttlSeconds=0 is a no-op")(noop == 0);
-    long empty = bumpServerStateTTLs(db, "", 600);
+    const long empty = bumpServerStateTTLs(db, "", 600);
     check!("empty serverId is a no-op")(empty == 0);
 }
 
@@ -333,7 +346,7 @@ int main() {
 
     void dispatch(string name)(void function() body) {
         stderr.writeln("\n--- ", name, " ---");
-        int beforeFailed = failed;
+        const int beforeFailed = failed;
         try {
             body();
             if (failed > beforeFailed)

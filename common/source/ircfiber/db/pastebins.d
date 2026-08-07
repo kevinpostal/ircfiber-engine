@@ -10,17 +10,28 @@ import ircfiber.db.mongo : AppMongoConnection;
 
 /// One text snippet (pastebin); the body is stored inline in Mongo.
 struct PasteRecord {
+    /// Paste identifier (UUID string).
     string id;               // _id (UUID string)
+    /// Owning user id.
     string userId;
+    /// Network the paste belongs to.
     string networkId;
+    /// Buffer (channel) the paste belongs to.
     string buffer;
+    /// User-edited display name (may be empty).
     string name;             // user-edited display name (may be empty)
+    /// Ace mode value, e.g. "text", "python".
     string syntax;           // ace mode value, e.g. "text", "python"
+    /// Paste body text.
     string content;
+    /// Display line count.
     long lines;
+    /// Creation timestamp (unix ms).
     long createdAt;          // unix ms
+    /// Soft-delete flag.
     bool deleted;
 
+    /// Serializes to Bson.
     Bson toBson() const @trusted {
         return Bson([
             "_id": Bson(id), "userId": Bson(userId), "networkId": Bson(networkId),
@@ -30,6 +41,7 @@ struct PasteRecord {
         ]);
     }
 
+    /// Deserializes from Bson.
     static PasteRecord fromBson(Bson b) @trusted {
         PasteRecord r;
         r.id = b["_id"].get!string;
@@ -56,6 +68,7 @@ long countLines(string content) {
 final class PastebinRepository {
     private MongoCollection collection;
 
+    /// Constructs a repository bound to the pastebins collection.
     this() {
         collection = AppMongoConnection.getDb()["pastebins"];
         ensureIndexes();
@@ -69,6 +82,7 @@ final class PastebinRepository {
         }
     }
 
+    /// Inserts a paste record.
     void insert(PasteRecord r) @trusted {
         collection.insertOne(r.toBson());
     }
@@ -128,9 +142,9 @@ unittest {
     r.syntax = "python";
     r.content = "print('hi')\nprint('bye')";
     r.lines = 2;
-    r.createdAt = 1765000000000;
+    r.createdAt = 1_765_000_000_000;
     auto b = r.toBson();
-    auto back = PasteRecord.fromBson(b);
+    const back = PasteRecord.fromBson(b);
     assert(back == r);
     assert(b["deleted"].get!bool == false);
 }

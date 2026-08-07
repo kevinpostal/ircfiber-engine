@@ -37,12 +37,12 @@ private string envOr(string name, string fallback) {
 }
 
 private long envLong(string name, long fallback) {
-    auto raw = environment.get(name, "");
+    const raw = environment.get(name, "");
     if (raw.length == 0) return fallback;
     try {
         auto v = raw.to!long;
         if (v < 60) v = 60;
-        if (v > 86400) v = 86400;
+        if (v > 86_400) v = 86_400;
         return v;
     } catch (Exception) return fallback;
 }
@@ -135,7 +135,7 @@ void main() {
     long totalApplied = 0;
 
     foreach (pattern; patterns) {
-        long scanned = countPattern(db, pattern);
+        const long scanned = countPattern(db, pattern);
         totalScanned += scanned;
 
         string jsonKeys;

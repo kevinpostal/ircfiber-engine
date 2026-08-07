@@ -105,6 +105,7 @@ private ref FiberCtx fiberCtx() {
     return s_fiberCtx.storage;
 }
 
+/// Pushes a new span context onto the current fiber's stack.
 void pushContext(string traceId, string spanId) {
     auto ctx = &fiberCtx();
     if (ctx.depth >= ctx.stack.length) return;
@@ -113,6 +114,7 @@ void pushContext(string traceId, string spanId) {
     ctx.current = SpanContext(traceId, spanId);
 }
 
+/// Pops the current fiber's span context, restoring the previous one.
 void popContext() {
     auto ctx = &fiberCtx();
     if (ctx.depth == 0) return;
@@ -120,7 +122,9 @@ void popContext() {
     ctx.current = ctx.stack[ctx.depth];
 }
 
+/// Returns the current fiber's trace ID.
 string currentTraceId() { return fiberCtx().current.traceId; }
+/// Returns the current fiber's span ID.
 string currentSpanId() { return fiberCtx().current.spanId; }
 
 /// A single span recorded by `withSpan` and queued for export.
@@ -144,6 +148,7 @@ private __gshared string serviceName = "ircfiber-engine";
 private __gshared string serviceVersion = "0.3.0";
 private __gshared bool g_enabled = false;
 
+/// Whether distributed tracing is currently enabled.
 bool isTracingEnabled() { return g_enabled; }
 void setTracingEnabled(bool v) { g_enabled = v; }
 
@@ -158,6 +163,7 @@ bool isEnvEnabled(string key) {
     return v == "1" || v == "true" || v == "yes" || v == "on";
 }
 
+/// Configures the OTLP endpoint and service identity.
 void configureTracing(string otlpEndpoint, string svcName, string svcVersion) {
     endpoint = otlpEndpoint;
     serviceName = svcName;
@@ -165,15 +171,20 @@ void configureTracing(string otlpEndpoint, string svcName, string svcVersion) {
     g_enabled = (otlpEndpoint.length > 0 && otlpEndpoint != "disabled");
 }
 
+/// Handle to an in-flight span, passed to withSpan delegates.
 struct Span {
+    /// Underlying span record, or null when tracing is disabled.
     PendingSpan* data;
 
+    /// Records a string attribute on the span.
     void attr(string key, string value) {
         if (data) data.attributes[key] = value;
     }
+    /// Records a long attribute on the span.
     void attr(string key, long value) {
         if (data) data.attributes[key] = value.to!string;
     }
+    /// Records a named event on the span.
     void event(string name) {
         if (data) data.attributes["event." ~ name] = "1";
     }
@@ -185,6 +196,7 @@ struct Span {
     }
 }
 
+/// Runs `fn` inside a new span, queued for export when tracing is enabled.
 void withSpan(string name, string[string] attrs, scope void delegate(ref Span) fn) {
     if (!g_enabled) {
         // Pass-through when tracing disabled: no context push, no queue.
@@ -197,9 +209,9 @@ void withSpan(string name, string[string] attrs, scope void delegate(ref Span) f
         return;
     }
     if (!queueMutex) initOnce();
-    auto ctx = &fiberCtx();
-    auto parentTrace = ctx.current.traceId;
-    auto parentSpan  = ctx.current.spanId;
+    const ctx = &fiberCtx();
+    const parentTrace = ctx.current.traceId;
+    const parentSpan  = ctx.current.spanId;
     auto traceId = parentTrace.length ? parentTrace : newTraceId();
     auto spanId = newSpanId();
     pushContext(traceId, spanId);
@@ -368,6 +380,7 @@ void flushAndSendSpans() {
     if (batch.length) sendBatch(batch);
 }
 
+/// Marks the tracing exporter as started.
 void startTracingExporter() {
     if (atomicLoad(exporterStarted)) return;
     atomicStore(exporterStarted, 1);
@@ -378,6 +391,7 @@ void startTracingExporter() {
 // ── Test-only accessors ────────────────────────────────────────────────
 // Exposed so standalone tests can verify withSpan disabled path without
 // spinning up a real OTel collector.
+/// Drains and returns all queued spans (test helper).
 PendingSpan[] drainQueueForTest() {
     if (!queueMutex) return null;
     synchronized (queueMutex) {
@@ -387,6 +401,7 @@ PendingSpan[] drainQueueForTest() {
     }
 }
 
+/// Returns the number of queued spans (test helper).
 int queueLengthForTest() {
     if (!queueMutex) return 0;
     synchronized (queueMutex) {
@@ -398,11 +413,11 @@ int queueLengthForTest() {
 @("withSpan when disabled calls delegate exactly once and queues no span")
 unittest {
     // Save/restore enabled state so tests are isolated.
-    bool prev = isTracingEnabled();
+    const prev = isTracingEnabled();
     scope (exit) setTracingEnabled(prev);
     setTracingEnabled(false);
     // Ensure queue is empty before test.
-    drainQueueForTest();
+    cast(void) drainQueueForTest();
     int calls = 0;
     withSpan("test.disabled", null, (ref Span s) {
         calls++;
@@ -419,10 +434,10 @@ unittest {
 
 @("withSpan when disabled propagates exceptions via delegate but still no queue")
 unittest {
-    bool prev = isTracingEnabled();
+    const prev = isTracingEnabled();
     scope (exit) setTracingEnabled(prev);
     setTracingEnabled(false);
-    drainQueueForTest();
+    cast(void) drainQueueForTest();
     int calls = 0;
     withSpan("test.disabled.exc", null, (ref Span s) {
         calls++;
@@ -435,8 +450,8 @@ unittest {
 
 @("configureTracing empty endpoint disables tracing")
 unittest {
-    bool prev = isTracingEnabled();
-    string prevEp = endpoint;
+    const prev = isTracingEnabled();
+    const prevEp = endpoint;
     scope (exit) {
         setTracingEnabled(prev);
         endpoint = prevEp;
@@ -451,12 +466,12 @@ unittest {
 
 @("flushAndSendSpans when disabled is no-op even with queued spans")
 unittest {
-    bool prev = isTracingEnabled();
+    const prev = isTracingEnabled();
     scope (exit) setTracingEnabled(prev);
     // Enable, queue a span, then disable and flush — flush must discard without send.
     setTracingEnabled(true);
     if (!queueMutex) initOnce();
-    drainQueueForTest();
+    cast(void) drainQueueForTest();
     withSpan("test.enabled", null, (ref Span s) { s.setStatusOk(); });
     assert(queueLengthForTest() == 1, "enabled withSpan should queue");
     setTracingEnabled(false);
@@ -468,6 +483,6 @@ unittest {
     assert(!isTracingEnabled());
     // Clean up for next test.
     setTracingEnabled(true);
-    drainQueueForTest();
+    cast(void) drainQueueForTest();
     setTracingEnabled(prev);
 }

@@ -22,7 +22,7 @@ unittest
                ["network": "SuperNets", "eid": "42"]);
 
     // If we got here without crashing, basic format works.
-    assert(true, "logJsonMap must not crash");
+    // (was: assert(true, ...) — a no-op; reaching this point is the check)
 
     // ────────────────────────────────────────────────────────────────────
     // Test 2: IRCFIBER_LOG_JSON is now a no-op (JSON always emitted)
@@ -30,7 +30,7 @@ unittest
     environment["IRCFIBER_LOG_JSON"] = "0";
     logJsonMap("info", "handoff", "Always emitted now",
                ["network": "SuperNets"]);
-    assert(true, "logJsonMap must not crash when env is set to 0");
+    // (was: assert(true, ...) — no-op; reaching this point is the check)
 
     // ────────────────────────────────────────────────────────────────────
     // Test 3: Convenience functions

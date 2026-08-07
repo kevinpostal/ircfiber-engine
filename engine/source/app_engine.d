@@ -11,7 +11,8 @@ import vibe.core.core : runTask, runApplication, sleep, yield;
 import vibe.core.log;
 
 import ircfiber.logging : logException;
-import ircfiber.engine.bootstrap : bootstrapEngine, startHeartbeatTask, startOrphanReaperTask, loadNetworks, EngineContext;
+import ircfiber.engine.bootstrap : bootstrapEngine, startHeartbeatTask,
+    startOrphanReaperTask, loadNetworks, EngineContext;
 import ircfiber.tracing : configureTracing, startTracingExporter,
     isEnvEnabled, setTracingEnabled, isTracingEnabled;
 import ircfiber.observability : configureMetrics, setMetricsEnabled, isMetricsEnabled;
@@ -22,6 +23,7 @@ import ircfiber.engine.reload_orchestrator : adoptFromOldEngine, serveReload, Re
 import ircfiber.engine.state : startStateSnapshotter, writeStateSnapshots;
 import ircfiber.engine.handoff : handoffSocketPath;
 import ircfiber.redis.protocol : RedisKeys;
+/// Global engine context shared across the process.
 __gshared EngineContext g_ctx;
 
 /// Configure OTel from env. Returns true if enabled.
@@ -91,14 +93,14 @@ void main() {
     auto ctx = bootstrapEngine();
     g_ctx = ctx;
 
-    setupOtel("ircfiber-engine");
+    cast(void) setupOtel("ircfiber-engine");
 
     // Write a fresh state snapshot immediately so the frontend sees the
     // current connection state (connecting) right away, rather than stale
     // data from before the restart. Without this, there is a window where
     // the frontend shows a "Reconnect" button even though the engine is
     // actively reconnecting.
-    writeStateSnapshots(ctx);
+    cast(void) writeStateSnapshots(ctx);
 
     // Register this server in the Redis registry. Must happen after
     // runApplication() starts the vibe.d event loop because Redis
@@ -211,8 +213,8 @@ private void runHandoffEngine(string oldPidStr) {
     g_ctx = ctx;
     ctx.localServer.serverId = environment.get("IRCFIBER_SERVER_ID", "hfover");
 
-    setupOtel("ircfiber-engine");
-    writeStateSnapshots(ctx);
+    cast(void) setupOtel("ircfiber-engine");
+    cast(void) writeStateSnapshots(ctx);
     startHeartbeatTask(ctx);
     // Start orphan reaper for the handoff path too — adopted connections
     // from the old engine may include orphans. The reaper waits 60s
@@ -478,10 +480,10 @@ import ircfiber.engine.processor : startEventProcessor;
 import ircfiber.engine.state : startStateSnapshotter;
 import ircfiber.models.irc_event : IRCRawEvent;
     // OTel handled centrally via setupOtel (env-gated, no-op when disabled).
-    setupOtel("ircfiber-engine");
+    cast(void) setupOtel("ircfiber-engine");
 
     auto ctx = g_ctx;
-    writeStateSnapshots(ctx);
+    cast(void) writeStateSnapshots(ctx);
     runTask(() nothrow {
         try {
             ctx.serverRegistry.registerServer(ctx.localServer);

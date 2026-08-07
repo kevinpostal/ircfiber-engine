@@ -17,7 +17,9 @@ import vibe.core.taskpool : TaskPool;
 
 import ircfiber.threadpool;
 
+/// Tracks the number of passing checks.
 int passed;
+/// Tracks the number of failing checks.
 int failed;
 
 /// Per-test label + boolean check.
@@ -31,6 +33,7 @@ void check(string name)(bool cond, string msg = "") {
     }
 }
 
+/// Set by the worker task to prove pool execution.
 __gshared bool g_markRan;
 
 void main() {
@@ -51,6 +54,7 @@ void main() {
 
 // --- Tests ---
 
+/// Verifies the pools are null before initialization.
 void test_pools_null_before_init() {
     check!("null before init: httpPool")(g_httpPool is null);
     check!("null before init: ircPool")(g_ircPool is null);
@@ -58,6 +62,7 @@ void test_pools_null_before_init() {
     check!("null before init: stgPool")(g_stgPool is null);
 }
 
+/// Verifies the named pools are created by initThreadPools.
 void test_init_pools() {
     initThreadPools();
     scope(exit) shutdownThreadPools();
@@ -72,6 +77,7 @@ void test_init_pools() {
     check!("init: stgPool >= 1 thread")(g_stgPool.threadCount >= 1);
 }
 
+/// Verifies a task runs on the background pool.
 void test_bg_pool_execution() {
     initThreadPools();
     scope(exit) shutdownThreadPools();
@@ -82,6 +88,7 @@ void test_bg_pool_execution() {
     check!("exec: bg pool task ran")(g_markRan);
 }
 
+/// Verifies a task runs on the IRC pool.
 void test_irc_pool_execution() {
     initThreadPools();
     scope(exit) shutdownThreadPools();
@@ -100,6 +107,7 @@ private void stringUuidTask(string userId, UUID sessionId) nothrow {
         g_result = "error";
     }
 }
+/// Result written by the worker task for the caller to assert on.
 __gshared string g_result;
 
 /// Test passing string + UUID (the pattern used by irc listener dispatch).
@@ -117,6 +125,7 @@ void test_string_uuid_args() {
     check!("exec: result contains userId")(indexOf(g_result, "test-user-42") >= 0);
 }
 
+/// Verifies a second initThreadPools call is a no-op.
 void test_init_idempotent() {
     initThreadPools();
     initThreadPools();  // second call should be no-op
@@ -124,6 +133,7 @@ void test_init_idempotent() {
     shutdownThreadPools();
 }
 
+/// Verifies each named pool is a distinct instance.
 void test_pool_names() {
     initThreadPools();
     scope(exit) shutdownThreadPools();

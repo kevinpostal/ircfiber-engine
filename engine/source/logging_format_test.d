@@ -28,7 +28,7 @@ private void startCapture() {
     auto f = fopen(captureFile.toUTFz!(char*)(), "w".ptr);
     fclose(f);
     // Redirect stderr to capture file
-    auto fp = freopen(captureFile.toUTFz!(char*)(), "a", stderr.getFP);
+    const fp = freopen(captureFile.toUTFz!(char*)(), "a", stderr.getFP);
     assert(fp !is null, "freopen must succeed");
 }
 
@@ -172,7 +172,7 @@ private void runTest(string name, void delegate() testFn) {
     }
 }
 
-int main(string[] args) {
+int main(string[]) {
     writeln("═══════════════════════════════════════════════════════════════");
     writeln("IRC Fiber — Logging Format Test Suite");
     writeln("═══════════════════════════════════════════════════════════════");

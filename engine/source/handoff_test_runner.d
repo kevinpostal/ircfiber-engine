@@ -26,6 +26,7 @@ import core.sys.posix.unistd;
 
 // Re-implement the SCM_RIGHTS cmsg builder locally so we don't depend
 // on handoff.d (which pulls in vibe.d and blocks the test binary).
+/// Builds an SCM_RIGHTS cmsg buffer for the given file descriptors.
 ubyte[] buildCmsgBuffer(int[] fds) {
     if (fds.length == 0) return null;
     auto fdBytes = fds.length * int.sizeof;
@@ -108,7 +109,7 @@ void main() {
         auto data = cast(int*) CMSG_DATA(cmsg);
         assert((cmsg.cmsg_len - CMSG_LEN(0)) / int.sizeof >= 1, "no fds");
 
-        int adoptedFd = data[0];
+        const int adoptedFd = data[0];
         string testMsg = "hello fd";
         assert(write(p[1], testMsg.ptr, testMsg.length)
             == cast(ptrdiff_t) testMsg.length, "pipe write failed");
@@ -138,7 +139,7 @@ void main() {
         socklen_t blen = cast(socklen_t) boundAddr.sizeof;
         assert(getsockname(listenFd, cast(sockaddr*) &boundAddr, &blen) == 0,
             "getsockname failed");
-        auto listenPort = ntohs(boundAddr.sin_port);
+        cast(void) ntohs(boundAddr.sin_port);
 
         auto oldEngineFd = socket(AF_INET, SOCK_STREAM, 0);
         sockaddr_in dstAddr;

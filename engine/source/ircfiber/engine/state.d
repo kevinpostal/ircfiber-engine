@@ -37,6 +37,7 @@ void startStateSnapshotter(ref EngineContext ctx) {
     });
 }
 
+/// Writes state snapshots for all networks to Redis.
 void writeStateSnapshots(ref EngineContext ctx) {
     auto serverId = ctx.localServer.serverId;
     foreach (net; ctx.connManager.getNetworks()) {
@@ -74,7 +75,7 @@ void writeStateSnapshotForNetwork(ref EngineContext ctx, Network net, string ser
     snap.currentNick = net.currentNick.length ? net.currentNick : net.config.nick;
 
     // Read away status from the IRC client
-    auto clientForAway = ctx.connManager.getClient(net.config.id);
+    const clientForAway = ctx.connManager.getClient(net.config.id);
     if (clientForAway) {
         snap.isAway = clientForAway.getIsAway;
         snap.awayMessage = clientForAway.getAwayMessage;
@@ -229,7 +230,7 @@ void writeStateSnapshotForNetwork(ref EngineContext ctx, Network net, string ser
         // (race during engine restart) or lastFailInfo is empty
         // (network is healthy), we leave failInfo default-empty so
         // the WS sync payload omits the field.
-        auto fi = clientForRetry.getLastFailInfo();
+        const fi = clientForRetry.getLastFailInfo();
         if (fi.type_.length > 0 || fi.reason.length > 0) {
             auto snapFi = FailInfoSnapshot();
             snapFi.type_ = fi.type_;

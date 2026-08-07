@@ -44,9 +44,12 @@ import ircfiber.api.session : SessionManager, SessionStats,
     UserSession, createSessionJWT, verifySessionJWT, allocSharedEvent;
 import ircfiber.models.user : User;
 
+/// Tracks the number of passing checks.
 int passed;
+/// Tracks the number of failing checks.
 int failed;
 
+/// Records the outcome of a single named check.
 void check(string name)(bool cond, string msg = "") {
     if (cond) {
         ++passed;
@@ -66,16 +69,17 @@ User fakeUser(string name = "alice") {
     return u;
 }
 
+/// Runs the ring-buffer primitive test scenarios.
 void runRingBufferTests() {
     stderr.writeln("\n[RingBuffer] ring-buffer primitives");
 
     // Construction + capacity (default session capacity is 65536)
     {
-        auto q = RingBuffer!string(65536);
+        auto q = RingBuffer!string(65_536);
         check!("new queue is empty")                 (q.empty);
         check!("new queue is not full")              (!q.full);
         check!("new queue length == 0")              (q.length == 0);
-        check!("capacity matches constructor arg")   (q.capacity == 65536);
+        check!("capacity matches constructor arg")   (q.capacity == 65_536);
     }
 
     // FIFO ordering
@@ -108,6 +112,7 @@ void runRingBufferTests() {
     }
 }
 
+/// Runs the sendToSession no-drop enqueue test scenarios.
 void runSendToSessionTests() {
     stderr.writeln("\n[SessionManager.sendToSession] no-drop unbounded-ish enqueue");
 
@@ -126,7 +131,7 @@ void runSendToSessionTests() {
             id: sid,
             user: user,
             isActive: true,
-            outbound: RingBuffer!string(65536), outboundNotify: allocSharedEvent()
+            outbound: RingBuffer!string(65_536), outboundNotify: allocSharedEvent()
         );
         sm.getSessions()[sid] = sess;
 
@@ -155,7 +160,7 @@ void runSendToSessionTests() {
         auto sid = randomUUID();
         auto sess = UserSession(
             id: sid, user: user, isActive: true,
-            outbound: RingBuffer!string(65536), outboundNotify: allocSharedEvent()
+            outbound: RingBuffer!string(65_536), outboundNotify: allocSharedEvent()
         );
         sm.getSessions()[sid] = sess;
 
@@ -177,7 +182,7 @@ void runSendToSessionTests() {
         auto sid = randomUUID();
         auto sess = UserSession(
             id: sid, user: user, isActive: false,
-            outbound: RingBuffer!string(65536), outboundNotify: allocSharedEvent()
+            outbound: RingBuffer!string(65_536), outboundNotify: allocSharedEvent()
         );
         sm.getSessions()[sid] = sess;
 
@@ -217,7 +222,7 @@ void runOutboundNotifyTests() {
     auto sid = randomUUID();
     auto sess = UserSession(
         id: sid, user: user, isActive: true,
-        outbound: RingBuffer!string(65536),
+        outbound: RingBuffer!string(65_536),
         outboundNotify: allocSharedEvent()
     );
     sm.getSessions()[sid] = sess;
@@ -245,7 +250,7 @@ void runOutboundNotifyTests() {
     auto sid2 = randomUUID();
     auto sess2 = UserSession(
         id: sid2, user: user, isActive: false,
-        outbound: RingBuffer!string(65536),
+        outbound: RingBuffer!string(65_536),
         outboundNotify: allocSharedEvent()
     );
     sm.getSessions()[sid2] = sess2;
@@ -261,6 +266,7 @@ void runOutboundNotifyTests() {
     // existing `getSessions().length == 0` check above pins this).
 }
 
+/// Runs the acknowledgeEid cursor-advance test scenarios.
 void runAcknowledgeEidTests() {
     stderr.writeln("\n[SessionManager.acknowledgeEid] cursor advance");
 
@@ -269,7 +275,7 @@ void runAcknowledgeEidTests() {
     auto sid = randomUUID();
     auto sess = UserSession(
         id: sid, user: user, isActive: true,
-        outbound: RingBuffer!string(65536), outboundNotify: allocSharedEvent()
+        outbound: RingBuffer!string(65_536), outboundNotify: allocSharedEvent()
     );
     sm.getSessions()[sid] = sess;
 
@@ -305,6 +311,7 @@ void runAcknowledgeEidTests() {
         (sm.getSession(sid).lastDeliveredEid == 250);
 }
 
+/// Runs the broadcastStats aggregation test scenarios.
 void runBroadcastStatsTests() {
     stderr.writeln("\n[SessionManager.broadcastStats] multi-session aggregation (no 'dropped')");
 
@@ -316,9 +323,12 @@ void runBroadcastStatsTests() {
     auto sid2 = randomUUID();
     auto sid3 = randomUUID();
 
-    auto s1 = UserSession(id: sid1, user: user,      isActive: true, outbound: RingBuffer!string(65536), outboundNotify: allocSharedEvent());
-    auto s2 = UserSession(id: sid2, user: user,      isActive: true, outbound: RingBuffer!string(65536), outboundNotify: allocSharedEvent());
-    auto s3 = UserSession(id: sid3, user: otherUser, isActive: true, outbound: RingBuffer!string(65536), outboundNotify: allocSharedEvent());
+    auto s1 = UserSession(id: sid1, user: user, isActive: true,
+        outbound: RingBuffer!string(65_536), outboundNotify: allocSharedEvent());
+    auto s2 = UserSession(id: sid2, user: user, isActive: true,
+        outbound: RingBuffer!string(65_536), outboundNotify: allocSharedEvent());
+    auto s3 = UserSession(id: sid3, user: otherUser, isActive: true,
+        outbound: RingBuffer!string(65_536), outboundNotify: allocSharedEvent());
     sm.getSessions()[sid1] = s1;
     sm.getSessions()[sid2] = s2;
     sm.getSessions()[sid3] = s3;
@@ -356,6 +366,7 @@ void runBroadcastStatsTests() {
     // field comes back, so this assertion is a no-op but documents intent.
 }
 
+/// Runs the broadcastToUser user-id filter test scenarios.
 void runBroadcastToUserTests() {
     stderr.writeln("\n[SessionManager.broadcastToUser] user-id filter");
 
@@ -365,8 +376,10 @@ void runBroadcastToUserTests() {
 
     auto sid = randomUUID();
     auto otherSid = randomUUID();
-    auto sess = UserSession(id: sid,       user: user,      isActive: true, outbound: RingBuffer!string(65536), outboundNotify: allocSharedEvent());
-    auto other = UserSession(id: otherSid, user: otherUser, isActive: true, outbound: RingBuffer!string(65536), outboundNotify: allocSharedEvent());
+    auto sess = UserSession(id: sid, user: user, isActive: true,
+        outbound: RingBuffer!string(65_536), outboundNotify: allocSharedEvent());
+    auto other = UserSession(id: otherSid, user: otherUser, isActive: true,
+        outbound: RingBuffer!string(65_536), outboundNotify: allocSharedEvent());
     sm.getSessions()[sid]       = sess;
     sm.getSessions()[otherSid]  = other;
 
@@ -378,6 +391,7 @@ void runBroadcastToUserTests() {
         (sm.getSession(otherSid).outbound.length == 0);
 }
 
+/// Runs the JWT token round-trip test scenarios.
 void runJwtTests() {
     stderr.writeln("\n[createSessionJWT / verifySessionJWT] JWT token round-trip");
 
@@ -481,7 +495,7 @@ void runMultiTabSessionTests() {
     auto sid = randomUUID();
     auto sessA = UserSession(
         id: sid, user: user, isActive: true,
-        outbound: RingBuffer!string(65536), outboundNotify: allocSharedEvent(),
+        outbound: RingBuffer!string(65_536), outboundNotify: allocSharedEvent(),
         lastDeliveredEid: 500,  // Tab A's cursor is at eid 500
     );
     sm.getSessions()[sid] = sessA;
@@ -498,7 +512,7 @@ void runMultiTabSessionTests() {
     // a fresh session if the lookup returns non-null. Verify the
     // gate's contract here: getSession() correctly distinguishes the
     // "in memory" case so the caller can branch on it.
-    bool sessionInMemory = (sm.getSession(sid) !is null);
+    const bool sessionInMemory = (sm.getSession(sid) !is null);
     check!("JWT restore gate: session is detected as in-memory")
         (sessionInMemory);
 
@@ -509,7 +523,7 @@ void runMultiTabSessionTests() {
     auto sidB = randomUUID();
     auto sessB = UserSession(
         id: sidB, user: user, isActive: true,
-        outbound: RingBuffer!string(65536), outboundNotify: allocSharedEvent(),
+        outbound: RingBuffer!string(65_536), outboundNotify: allocSharedEvent(),
         lastDeliveredEid: 0,  // Tab B's cursor starts fresh
     );
     sm.getSessions()[sidB] = sessB;

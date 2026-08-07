@@ -87,8 +87,11 @@ auto safeFiberRun(string event_, string network,
 
 /// Per-fiber watch entry.
 struct FiberWatch {
+    /// Task identifier.
     string taskId;
+    /// Human-readable label.
     string label;
+    /// Timestamp of the last yield.
     SysTime lastYield;
 }
 
@@ -119,7 +122,7 @@ Task watchedRunTask(string label, string taskId, void delegate() dg) {
         g_yieldsTotal++;
     }
 
-    return runTask(TaskSettings(65536), &wrapped);
+    return runTask(TaskSettings(65_536), &wrapped);
 }
 
 /// Start the watchdog timer (should be called once at boot).

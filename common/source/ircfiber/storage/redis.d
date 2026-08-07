@@ -193,14 +193,14 @@ string[string][string] parseInfo(string raw) {
     foreach (line; raw.splitLines()) {
         if (line.length == 0) continue;
         if (line[0] == '#') {
-            auto trimmed = line[1 .. $].strip();
+            const trimmed = line[1 .. $].strip();
             if (trimmed.length > 0) currentSection = trimmed.idup;
             continue;
         }
         auto colonIdx = line.indexOf(':');
         if (colonIdx <= 0) continue;
         auto key = line[0 .. colonIdx].idup.strip();
-        auto val = line[colonIdx + 1 .. $].idup.strip();
+        const val = line[colonIdx + 1 .. $].idup.strip();
         result[currentSection][key] = val;
     }
     return result;
@@ -247,10 +247,13 @@ Json infoJson() @trusted {
 /// Returns (cursorString, keys[]). The next call should pass back the
 /// returned cursor (or "0" to start fresh).
 struct ScanResult {
+    /// Redis cursor for the next SCAN iteration ("0" when exhausted).
     string cursor;
+    /// Keys matched by the SCAN call.
     string[] keys;
 }
 
+/// SCAN-based key listing, returning up to `count` matching keys.
 ScanResult scanKeys(string cursor, string match, long count = 100) @trusted {
     import std.conv : to;
     ScanResult r;

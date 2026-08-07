@@ -51,12 +51,17 @@ string buildChathistoryLine(string command, string channel, string refMsgid, int
 /// Returns a tuple of (channel, command, refMsgid, limit). If the
 /// payload is malformed, `channel` is empty.
 struct ChathistoryPayload {
+    /// Channel the history request targets.
     string channel;
+    /// Chathistory sub-command (LATEST, BEFORE, AFTER, AROUND, BETWEEN, TARGETS).
     string command;
+    /// Reference message id (or comma-separated pair for BETWEEN).
     string refMsgid;
+    /// Maximum number of messages to return, clamped to [1, 1000].
     int    limit;
 }
 
+/// Parses a `channel:command:refMsgid:limit` payload into a `ChathistoryPayload`.
 ChathistoryPayload parseChathistoryPayload(string text) @safe {
     ChathistoryPayload p;
     string[] parts;
@@ -91,43 +96,43 @@ private int parseLimit(string s) @safe {
 
 @("LATEST line is built without a ref msgid")
 unittest {
-    auto line = buildChathistoryLine("LATEST", "#channel", "", 100);
+    const line = buildChathistoryLine("LATEST", "#channel", "", 100);
     assert(line == "CHATHISTORY LATEST #channel 100", line);
 }
 
 @("LATEST accepts lowercase command")
 unittest {
-    auto line = buildChathistoryLine("latest", "#channel", "", 50);
+    const line = buildChathistoryLine("latest", "#channel", "", 50);
     assert(line == "CHATHISTORY LATEST #channel 50", line);
 }
 
 @("BEFORE includes ref msgid between command and channel")
 unittest {
-    auto line = buildChathistoryLine("BEFORE", "#channel", "abc123", 25);
+    const line = buildChathistoryLine("BEFORE", "#channel", "abc123", 25);
     assert(line == "CHATHISTORY BEFORE abc123 #channel 25", line);
 }
 
 @("AFTER includes ref msgid between command and channel")
 unittest {
-    auto line = buildChathistoryLine("AFTER", "#channel", "abc123", 25);
+    const line = buildChathistoryLine("AFTER", "#channel", "abc123", 25);
     assert(line == "CHATHISTORY AFTER abc123 #channel 25", line);
 }
 
 @("AROUND includes ref msgid between command and channel")
 unittest {
-    auto line = buildChathistoryLine("AROUND", "#channel", "abc123", 25);
+    const line = buildChathistoryLine("AROUND", "#channel", "abc123", 25);
     assert(line == "CHATHISTORY AROUND abc123 #channel 25", line);
 }
 
 @("BETWEEN ref msgid is a comma-separated pair")
 unittest {
-    auto line = buildChathistoryLine("BETWEEN", "#channel", "after,before", 50);
+    const line = buildChathistoryLine("BETWEEN", "#channel", "after,before", 50);
     assert(line == "CHATHISTORY BETWEEN after,before #channel 50", line);
 }
 
 @("TARGETS doesn't need a channel or ref msgid")
 unittest {
-    auto line = buildChathistoryLine("TARGETS", "", "", 0);
+    const line = buildChathistoryLine("TARGETS", "", "", 0);
     assert(line == "CHATHISTORY TARGETS", line);
 }
 
@@ -135,7 +140,7 @@ unittest {
 unittest {
     assert(buildChathistoryLine("LATEST", "#x", "", 0) == "CHATHISTORY LATEST #x 100");
     assert(buildChathistoryLine("LATEST", "#x", "", -5) == "CHATHISTORY LATEST #x 100");
-    assert(buildChathistoryLine("LATEST", "#x", "", 99999) == "CHATHISTORY LATEST #x 1000");
+    assert(buildChathistoryLine("LATEST", "#x", "", 99_999) == "CHATHISTORY LATEST #x 1000");
     assert(buildChathistoryLine("LATEST", "#x", "", 1) == "CHATHISTORY LATEST #x 1");
     assert(buildChathistoryLine("LATEST", "#x", "", 1000) == "CHATHISTORY LATEST #x 1000");
 }
@@ -165,7 +170,7 @@ unittest {
 
 @("parseChathistoryPayload splits on colons")
 unittest {
-    auto p = parseChathistoryPayload("#chan:BEFORE:abc123:50");
+    const p = parseChathistoryPayload("#chan:BEFORE:abc123:50");
     assert(p.channel == "#chan", p.channel);
     assert(p.command == "BEFORE", p.command);
     assert(p.refMsgid == "abc123", p.refMsgid);
@@ -174,7 +179,7 @@ unittest {
 
 @("parseChathistoryPayload defaults limit to 100 when missing")
 unittest {
-    auto p = parseChathistoryPayload("#chan:LATEST:");
+    const p = parseChathistoryPayload("#chan:LATEST:");
     assert(p.channel == "#chan", p.channel);
     assert(p.command == "LATEST", p.command);
     assert(p.refMsgid == "", p.refMsgid);
@@ -195,6 +200,6 @@ unittest {
 
 @("parseChathistoryPayload handles malformed input")
 unittest {
-    auto p = parseChathistoryPayload("only:two");
+    const p = parseChathistoryPayload("only:two");
     assert(p.channel.length == 0, p.channel);
 }

@@ -428,12 +428,12 @@ unittest {
 
 @("makeConnected / makeDisconnected keep their network attribution")
 unittest {
-    auto c = IRCRawEvent.makeConnected("libera", "nid-1");
+    const c = IRCRawEvent.makeConnected("libera", "nid-1");
     assert(c.network == "libera");
     assert(c.networkId == "nid-1");
     assert(c.command == "CONNECTED");
 
-    auto d = IRCRawEvent.makeDisconnected("libera", "nid-1", "lost");
+    const d = IRCRawEvent.makeDisconnected("libera", "nid-1", "lost");
     assert(d.network == "libera");
     assert(d.networkId == "nid-1");
     assert(d.command == "DISCONNECTED");
@@ -445,7 +445,7 @@ unittest {
     // The frontend reads data.rs.{attemptCount,nextRetryAtMs,delayMs}
     // — pin the exact wire shape so the Wave 2 messageHandler
     // dispatch doesn't have to guess about field names.
-    auto e = IRCRawEvent.makeConnectionRetryStatus("libera", "nid-1", 3, 1700000005000L, 5000L);
+    auto e = IRCRawEvent.makeConnectionRetryStatus("libera", "nid-1", 3, 1_700_000_005_000L, 5000L);
     assert(e.command == "CONNECTION_RETRY_STATUS");
     assert(e.network == "libera");
     assert(e.networkId == "nid-1");
@@ -454,7 +454,7 @@ unittest {
     assert(j["c"].get!string == "CONNECTION_RETRY_STATUS");
     assert(j["rs"].type == Json.Type.object);
     assert(j["rs"]["attemptCount"].get!int == 3);
-    assert(j["rs"]["nextRetryAtMs"].get!long == 1700000005000L);
+    assert(j["rs"]["nextRetryAtMs"].get!long == 1_700_000_005_000L);
     assert(j["rs"]["delayMs"].get!long == 5000L);
 }
 

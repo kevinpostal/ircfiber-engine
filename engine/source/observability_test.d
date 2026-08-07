@@ -19,9 +19,12 @@ import ircfiber.tracing : withSpan, Span, isTracingEnabled, setTracingEnabled,
     flushAndSendSpans, configureTracing;
 import ircfiber.tracing : drainQueueForTest, queueLengthForTest;
 
+/// Tracks the number of passing checks.
 int passed;
+/// Tracks the number of failing checks.
 int failed;
 
+/// Records the outcome of a single named check.
 void ok(string name, bool cond, string msg = "") {
     if (cond) {
         ++passed;
@@ -44,6 +47,7 @@ private string buildOne(InstrumentKind kind, string name, string unit,
     return buildOtlpMetricsJsonForTest(batch);
 }
 
+/// Runs the OTLP metrics contract test scenarios.
 void runMetricsTests() {
     stderr.writeln("\n[observability] OTLP /v1/metrics JSON contract");
 
@@ -58,10 +62,10 @@ void runMetricsTests() {
         auto json = buildOne(InstrumentKind.counter,
             "ircfiber.registration.timeout", "1",
             1, 0, 0, null,
-            1782760360000_000_000L, 1782760370000_000_000L,
+            1_782_760_360_000_000_000L, 1_782_760_370_000_000_000L,
             ["network": "IRC Fiber",
              "host": "irc.ircfiber.com:6697"]);
-        bool shapeOk = json.canFind(`"name":"ircfiber.registration.timeout"`)
+        const bool shapeOk = json.canFind(`"name":"ircfiber.registration.timeout"`)
             && json.canFind(`"unit":"1"`)
             && json.canFind(`"sum":{"dataPoints":[`)
             && json.canFind(`"AGGREGATION_TEMPORALITY_CUMULATIVE"`)
@@ -80,9 +84,9 @@ void runMetricsTests() {
         auto json = buildOne(InstrumentKind.gauge,
             "ircfiber.registration.timeout_networks", "1",
             3, 0, 0, null,
-            1782760360000_000_000L, 1782760370000_000_000L,
+            1_782_760_360_000_000_000L, 1_782_760_370_000_000_000L,
             ["serverId": "ovh"]);
-        bool shapeOk = json.canFind(`"gauge":{"dataPoints":[`)
+        const bool shapeOk = json.canFind(`"gauge":{"dataPoints":[`)
             && json.canFind(`"asInt":"3"`)
             && !json.canFind(`"sum":`)
             && !json.canFind(`"histogram":`)
@@ -101,9 +105,9 @@ void runMetricsTests() {
             "ircfiber.tls_handshake.duration_seconds", "s",
             0, 500_000, 1,
             [0, 0, 0, 1, 0, 0, 0],   // +1 in 4th bucket (= [0.1, 1.0))
-            1782760360000_000_000L, 1782760370000_000_000L,
+            1_782_760_360_000_000_000L, 1_782_760_370_000_000_000L,
             ["network": "IRC Fiber"]);
-        bool shapeOk = json.canFind(`"histogram":{"dataPoints":[`)
+        const bool shapeOk = json.canFind(`"histogram":{"dataPoints":[`)
             && json.canFind(`"AGGREGATION_TEMPORALITY_DELTA"`)
             && json.canFind(`"count":"1"`)
             && json.canFind(`"sum":`)
@@ -121,7 +125,7 @@ void runMetricsTests() {
     {
         auto json = buildOne(InstrumentKind.counter,
             "test.metric", "1", 1, 0, 0, null, 1, 2, null);
-        bool shapeOk = json.canFind(`"key":"service.name"`)
+        const bool shapeOk = json.canFind(`"key":"service.name"`)
             && json.canFind(`"value":{"stringValue":"ircfiber-engine"}`)
             && json.canFind(`"key":"service.namespace"`)
             && json.canFind(`"value":{"stringValue":"ircfiber"}`)
@@ -136,7 +140,7 @@ void runMetricsTests() {
     // drains via flushAndSendMetrics.
     {
         // Enable metrics for this case (default is disabled).
-        bool prevMetrics = isMetricsEnabled();
+        const bool prevMetrics = isMetricsEnabled();
         scope (exit) setMetricsEnabled(prevMetrics);
         setMetricsEnabled(true);
         // Drain first so we measure just THIS case
@@ -176,7 +180,7 @@ void runMetricsTests() {
 
     // ── Case 7: disabled path — record* must not queue, flush must no-op.
     {
-        bool prev = isMetricsEnabled();
+        const bool prev = isMetricsEnabled();
         scope (exit) setMetricsEnabled(prev);
         setMetricsEnabled(true);
         flushAndSendMetrics();
@@ -203,7 +207,7 @@ void runMetricsTests() {
 
     // ── Case 8: tracing disabled — withSpan pass-through, no queue, no HTTP.
     {
-        bool prev = isTracingEnabled();
+        const bool prev = isTracingEnabled();
         scope (exit) setTracingEnabled(prev);
         setTracingEnabled(false);
         drainQueueForTest();

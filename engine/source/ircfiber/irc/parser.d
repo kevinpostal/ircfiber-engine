@@ -44,6 +44,7 @@ public string parseIsupportPrefix(string prefixToken) {
     return prefixToken[close + 1 .. $];
 }
 
+/// Parses a raw IRC line into an `IRCRawEvent`.
 public IRCRawEvent parseIRCLinePublic(string line, NetworkConfig config) {
     import std.algorithm : filter;
     import std.array : array;
@@ -225,7 +226,7 @@ public IRCRawEvent parseIRCLinePublic(string line, NetworkConfig config) {
 /// RPL_TRYAGAIN format (non-standard): some IRCds include a countdown in
 /// seconds as the third param, others embed it in the message text as
 /// "try again in N seconds".
-public int extractTempUnavailableCountdown(const ref IRCRawEvent event, int defaultMs = 30000) {
+public int extractTempUnavailableCountdown(const ref IRCRawEvent event, int defaultMs = 30_000) {
     if (event.command != "263") return 0;
     auto params = event.getParams();
     // Some IRCds send countdown as seconds in params[2]
