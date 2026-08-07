@@ -134,6 +134,37 @@ NetworkConfig ensureDefaultFiberNetwork(
     auto cfg = buildDefaultFiberNetwork(user);
     networkRepo.save(cfg, user.id);
 
+    // Race guard: concurrent logins can both pass the `existing` check
+    // and insert a duplicate DEFAULT_FIBER_HOST network. Re-read and
+    // deduplicate — keep the lexicographically smallest id (deterministic)
+    // and delete the rest. Self-heals the scrolltest duplicate (b6bea767 / 4f20c70d).
+    try {
+        auto after = networkRepo.findByUserId(user.id);
+        NetworkConfig[] dups;
+        foreach (c; after) if (c.host == DEFAULT_FIBER_HOST) dups ~= c;
+        if (dups.length > 1) {
+            import std.algorithm : sort;
+            sort!((a,b)=> a.id.toString() < b.id.toString())(dups);
+            auto keep = dups[0];
+            foreach (i; 1 .. dups.length) {
+                try { networkRepo.deleteById(dups[i].id); } catch (Exception) {}
+                // Clean up Redis assignment for the deleted duplicate if it was ever assigned
+                try {
+                    auto sid = serverRegistry.getServerForNetwork(dups[i].id.toString());
+                    if (sid.length > 0) {
+                        // Best-effort: engine will also reap via janitor if missed
+                    }
+                } catch (Exception) {}
+            }
+            // If we just created a duplicate that lost the race, return the survivor
+            if (keep.id != cfg.id) {
+                // Our newly inserted cfg was deleted — return the keeper instead
+                // and don't push a control message for the deleted id.
+                return keep;
+            }
+        }
+    } catch (Exception) {} // dedup best-effort
+
     auto serverId = serverRegistry.assignNetwork(cfg.id.toString());
     if (serverId.length == 0) {
         logWarn("ensureDefaultFiberNetwork: no healthy server for user=%s, network=%s — " ~

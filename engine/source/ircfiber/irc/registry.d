@@ -5,9 +5,8 @@ import std.conv : to;
 import std.datetime : Clock;
 import std.array : array, split;
 import std.algorithm : canFind, filter;
-
 import vibe.core.log;
-import vibe.data.json : Json, parseJson;
+import vibe.data.json : Json, parseJson, parseJsonString;
 import vibe.db.redis.redis : RedisDatabase;
 
 import ircfiber.irc.server : ConnectionServer, NetworkAssignment;
@@ -277,15 +276,33 @@ final class ServerRegistry {
             auto server = ConnectionServer.fromJson(parseJson(data));
 
             // Override with live heartbeat/health fields (updated separately by engine)
+            // Robust: handle both plain number string and JSON-encoded number/string
+            // (previous manual Redis edits left `lastHeartbeat` as JSON object string,
+            // causing `to!long` on "{" to spam `Failed to parse server data` every 10s)
             const hbStr = db.hget(key, "lastHeartbeat");
-            if (hbStr.length > 0) server.lastHeartbeat = hbStr.to!long;
+            if (hbStr.length > 0) {
+                try {
+                    server.lastHeartbeat = hbStr.to!long;
+                } catch (Exception) {
+                    try {
+                        auto hbJson = parseJsonString(hbStr);
+                        if (hbJson.type == Json.Type.int_) server.lastHeartbeat = hbJson.get!long;
+                        else if (hbJson.type == Json.Type.string) {
+                            try { server.lastHeartbeat = hbJson.get!string.to!long; } catch (Exception) {}
+                        }
+                    } catch (Exception) {}
+                }
+            }
 
             const healthStr = db.hget(key, "isHealthy");
             if (healthStr.length > 0) server.isHealthy = healthStr == "true";
 
             return server;
         } catch (Exception e) {
-            logWarn("Failed to parse server data for %s: %s", serverId, e.msg);
+            // Downgraded from Warn to Debug — transient parse failures during
+            // Redis RDB background save or partial HSET race should not spam
+            // SigNoz at Warn every 10s (was `Still no healthy engine` loop).
+            logDebug("Failed to parse server data for %s: %s", serverId, e.msg);
             return ConnectionServer.init;
         }
     }

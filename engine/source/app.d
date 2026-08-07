@@ -253,10 +253,15 @@ void main() {
                 router.handleRequest(req, res);
                 auto sc = res.statusCode;
                 s.attr("http.status_code", to!string(sc));
+                // Only 5xx is a server error for SLI purposes.
+                // 4xx (401/403/404/429 etc) is a client error / expected
+                // control flow (e.g. unauthenticated XHR poll hitting
+                // /api/events before login) — marking it as Error
+                // pollutes SigNoz with has_error=true spans and fires
+                // false-positive alerts. Follow OTel HTTP semconv:
+                // span status Error only for >=500.
                 if (sc >= 500)
                     s.setStatusError("server error");
-                else if (sc >= 400)
-                    s.setStatusError("client error");
                 else
                     s.setStatusOk();
             } catch (Exception e) {

@@ -284,7 +284,7 @@ private TCPConnection happyEyeballsConnect(string host, ushort port) {
     if (addrs.length == 0) throw new Exception("DNS resolution failed for " ~ host);
 
     auto interleaved = interleaveAddressFamilies(addrs);
-    logInfo("Happy Eyeballs: racing %d addresses for %s (connect timeout %ds, race timeout %ds)",
+    logDebug("Happy Eyeballs: racing %d addresses for %s (connect timeout %ds, race timeout %ds)",
         interleaved.length, host, CONNECT_TIMEOUT_SECONDS, HAPPY_EYEBALLS_RACE_TIMEOUT_SECONDS);
 
     import vibe.core.channel : createChannel;
@@ -301,7 +301,7 @@ private TCPConnection happyEyeballsConnect(string host, ushort port) {
             if (winnerCh.tryConsumeOne(winIdx, HAPPY_EYEBALLS_DELAY_MS.msecs)) {
                 if (conns[winIdx] && conns[winIdx].connected) {
                     finishHappyEyeballs(conns, tasks, winIdx);
-                    logInfo("Happy Eyeballs: winner %s for %s", interleaved[winIdx].ip, host);
+                    logDebug("Happy Eyeballs: winner %s for %s", interleaved[winIdx].ip, host);
                     return conns[winIdx];
                 }
             }
@@ -321,7 +321,7 @@ private TCPConnection happyEyeballsConnect(string host, ushort port) {
                     try { conn.close(); } catch (Exception) {}
                 }
             } catch (Exception e) {
-                logInfo("Happy Eyeballs: %s failed: %s", addrIp, e.msg);
+                logDebug("Happy Eyeballs: %s failed: %s", addrIp, e.msg);
             }
         });
 
@@ -333,7 +333,7 @@ private TCPConnection happyEyeballsConnect(string host, ushort port) {
         if (winnerCh.tryConsumeOne(winIdx, HAPPY_EYEBALLS_RACE_TIMEOUT_SECONDS.seconds)) {
             if (conns[winIdx] && conns[winIdx].connected) {
                 finishHappyEyeballs(conns, tasks, winIdx);
-                logInfo("Happy Eyeballs: winner %s for %s", interleaved[winIdx].ip, host);
+                logDebug("Happy Eyeballs: winner %s for %s", interleaved[winIdx].ip, host);
                 return conns[winIdx];
             }
         }
@@ -1627,11 +1627,16 @@ final class PersistentIRCClient {
                     break;
                 }
             } catch (Exception e) {
-                logException("connection", e,
+                // Downgraded from logException(error) with hex stack spam.
+                // `transport not alive` and `Registration timed out` are expected
+                // during normal reconnect (gangnet every 5s) — not `error`.
+                // Use warn without stack to avoid SigNoz `has_error` flood and
+                // useless `??:? [0x...]` addresses.
+                logJsonMap("warn", "connection",
                     "Connection error",
                     ["network": config.name, "host": config.host,
+                     "err": e.msg,
                      "event": "connection_error"]);
-
                 // Save the disconnect reason BEFORE handleDisconnection so
                 // it emits the DISCONNECTED event with the right text.
                 string reason = e.msg.length > 0 ? e.msg : "Connection closed unexpectedly";
@@ -2476,6 +2481,30 @@ final class PersistentIRCClient {
                                     foreach (desired; desiredCaps) {
                                         if (serverCaps.canFind(desired)) toRequest ~= desired;
                                     }
+                                    // ── ngIRCd workaround ───────────────────────────────
+                                    // ngIRCd 27 only offers `multi-prefix` and stalls if
+                                    // the client sends `CAP REQ :multi-prefix` AFTER it
+                                    // has already sent NICK/USER (which the engine does
+                                    // immediately after CAP LS). Manual test:
+                                    //   CAP LS + NICK+USER, LS=multi-prefix, REQ -> ACK but no 001
+                                    //   CAP LS + NICK+USER, LS=multi-prefix, END -> immediate 001 + MOTD
+                                    // So when the server's entire cap list is a single
+                                    // `multi-prefix` entry, skip the REQ and go straight
+                                    // to CAP END. The cap is non-essential for local
+                                    // testing and this avoids a 30s registration timeout
+                                    // that wedges the LocalIRCD network.
+                                    bool singleMultiPrefixOnly = serverCaps.length == 1
+                                        && serverCaps[0] == "multi-prefix"
+                                        && toRequest.length == 1
+                                        && toRequest[0] == "multi-prefix";
+                                    if (singleMultiPrefixOnly) {
+                                        logJsonMap("info", "connection",
+                                            "Skipping CAP REQ for single multi-prefix (ngIRCd workaround)",
+                                            ["network": config.name,
+                                             "host": config.host, "port": config.port.to!string,
+                                             "event": "cap_skipped_ngircd"]);
+                                        toRequest = [];
+                                    }
                                     if (toRequest.length > 0) {
                                         sendRaw("CAP REQ :" ~ toRequest.join(" "));
                                         capReqSent = true;
@@ -3008,7 +3037,10 @@ private void processEvents() {
                     if (needsWho && (chan !in lastWhoTime || now - lastWhoTime[chan] >= 2)) {
                         sendRaw("WHO " ~ chan);
                         lastWhoTime[chan] = now;
-                        logJsonMap("info", "protocol",
+                        // Downgraded from info to debug — 60s per channel was spamming SigNoz
+                        // with WHO periodic enrichment logs (263-user channel = 1 log/min).
+                        // Useful for debugging WHO, but not for production info level.
+                        logJsonMap("debug", "protocol",
                             "WHO periodic enrichment",
                             ["network": config.name, "channel": chan, "users": users.length.to!string, "event": "who_periodic"]);
                     }

@@ -538,8 +538,10 @@ void startHeartbeatTask(ref EngineContext ctx) {
                     ctx.localServer.fallbackOnly = cfg.fallbackOnly;
                 } catch (Exception) { }
 
-                logInfo("Heartbeat sent for server %s", ctx.localServer.serverId);
-                // Emit a periodic engine-metrics span every 60 s.
+                // Downgraded from logInfo to debug — 10s cadence was flooding SigNoz logs
+                // (8640 entries/day per engine). Heartbeat health is visible via
+                // Redis TTL + engine.heartbeat span; info logging is redundant.
+                logDebug("Heartbeat sent for server %s", ctx.localServer.serverId);
                 // Shows the number of healthy, registered networks plus
                 // server load, so the Distributed Traces view always has
                 // fresh data with actual metrics (not just "up=1").

@@ -1,10 +1,10 @@
 module ircfiber.irc.server;
 
 import std.uuid : UUID;
+import std.conv : to;
 import std.datetime : Clock;
 import std.array : split, join;
 import vibe.data.json : Json, serializeToJson;
-
 /**
  * Decentralized Connection Server Model
  * 
@@ -79,7 +79,12 @@ struct ConnectionServer {
         if (j["bindAddress"].type != Json.Type.undefined) s.bindAddress = j["bindAddress"].get!string;
         if (j["port"].type != Json.Type.undefined) s.port = cast(ushort) j["port"].get!int;
         if (j["isHealthy"].type != Json.Type.undefined) s.isHealthy = j["isHealthy"].get!bool;
-        if (j["lastHeartbeat"].type != Json.Type.undefined) s.lastHeartbeat = j["lastHeartbeat"].get!long;
+        if (j["lastHeartbeat"].type != Json.Type.undefined) {
+            try {
+                if (j["lastHeartbeat"].type == Json.Type.string) s.lastHeartbeat = j["lastHeartbeat"].get!string.to!long;
+                else s.lastHeartbeat = j["lastHeartbeat"].get!long;
+            } catch (Exception) {}
+        }
         if (j["bufferOffset"].type != Json.Type.undefined) s.bufferOffset = j["bufferOffset"].get!long;
         if (j["assignedNetworks"].type != Json.Type.undefined) {
             foreach (item; j["assignedNetworks"]) s.assignedNetworks ~= item.get!string;

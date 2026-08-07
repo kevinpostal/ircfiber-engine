@@ -58,7 +58,13 @@ private string jwtSecret() {
     auto secret = environment.get("IRCFIBER_JWT_SECRET", "");
     if (secret.length > 0) return secret;
 
-    logWarn("IRCFIBER_JWT_SECRET not set; using dev fallback. Set it in production.");
+    // Log only once per process — previously every WebSocket session
+    // restoration (4x per minute) triggered this warning, spamming SigNoz.
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        logWarn("IRCFIBER_JWT_SECRET not set; using dev fallback. Set it in production.");
+    }
     return "ircfiber-dev-jwt-secret-do-not-use-in-prod";
 }
 
