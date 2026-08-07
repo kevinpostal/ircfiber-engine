@@ -214,7 +214,22 @@ dev-docker: ensure-colima ## Dev > Docker backend + Vite frontend dev (fastest f
 # Runs in the FOREGROUND — supervisor stays backgrounded for engine auto-restart,
 # gateway runs in this terminal. ctrl-c cleanly tears down both. Run
 # `make logs` in another terminal for live tailing.
-debug: build-gateway build-engine ## Component > Full stack: gateway + engine (supervised), local docker DBs — ctrl-c to stop
+debug: build-gateway build-engine ## Component > Full stack via docker-compose: gateway (REST API) + engine (IRC) as separate containers — logs via docker
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Starting Docker backend (redis/mongo/ircd)  $(R)"
+	@$(_docker_setup)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building split images (gateway + engine)  $(R)"
+	@docker compose build ircfiber-gateway ircfiber-engine
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Starting gateway + engine as separate containers  $(R)"
+	@docker compose up -d ircfiber-gateway ircfiber-engine
+	@printf '\n%b\n' "$(BG)$(OK) Gateway+Engine running as separate containers$(R) $(D)(ircfiber-gateway:8090, ircfiber-engine)$(R)"
+	@printf '%b\n' "$(C)  ─ containers $(R)"; docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" | grep -E "ircfiber-gateway|ircfiber-engine|irc_redis|irc_mongo|ircd" | sed "s/^/    /" || true
+	@printf '\n%b\n' "$(Y)$(WR) ctrl-c to stop → make down  •  tail logs:  make logs  (docker logs -f)$(R)"
+	@printf '%b\n' "$(D)  Also: make gateway-logs / engine-logs / status$(R)"
+	@trap 'printf "\n%b\n" "$(Y)$(WR) stopping...$(R)"; docker compose stop ircfiber-gateway ircfiber-engine 2>/dev/null || true; printf "%b\n" "$(BG)$(OK) debug stopped (containers left for logs; run make down to remove)$(R)"; exit 0' INT TERM; \
+	docker compose logs -f ircfiber-gateway ircfiber-engine
+
+# Host-native debug (fast D iteration, no docker build) — keeps old supervisor+gateway host binaries
+debug-host: build-gateway build-engine ## Component > Full stack HOST-NATIVE: gateway + engine (supervised), local docker DBs — ctrl-c to stop (legacy)
 	@$(_docker_setup)
 	@bash -c 'set -u; \
 		pkill -f irc-fiber-engine-supervisor 2>/dev/null || true; \
@@ -237,7 +252,7 @@ debug: build-gateway build-engine ## Component > Full stack: gateway + engine (s
 		printf "%b\n" "$(C)$(AR) engine supervisor pid=$$SUP_PID (auto-restarts on crash)$(R)"; \
 		sleep 3; \
 		printf "\n%b\n" "$(_BCn)$(K)$(B)  Gateway → local docker  $(R)"; \
-		printf "%b\n" "$(Y)$(WR) ctrl-c to stop everything  •  tail logs:  make logs  in another terminal$(R)"; \
+		printf "%b\n" "$(Y)$(WR) ctrl-c to stop everything  •  tail logs:  make logs-host  in another terminal$(R)"; \
 		cleanup() { \
 			printf "\n%b\n" "$(Y)$(WR) stopping...$(R)"; \
 			kill -TERM "$$SUP_PID" 2>/dev/null || true; \
@@ -253,7 +268,6 @@ debug: build-gateway build-engine ## Component > Full stack: gateway + engine (s
 		printf "\n%b\n" "$(Y)$(WR) gateway exited (code $$GW_EXIT)$(R)"; \
 		cleanup; \
 		exit $$GW_EXIT'
-
 # Full local stack — gateway + supervised engine, both against TAILNET DBs.
 # For when you want to debug your local D code against the live site's data.
 # Runs in the FOREGROUND — supervisor stays backgrounded for engine auto-restart,
@@ -532,22 +546,12 @@ status: ## Component > Print running processes, ports, recent log lines
 		tail -3 $(GATEWAY_LOGFILE) 2>/dev/null | sed "s/^/    /" || printf "    (no log)\n"; \
 		printf "\n%b\n" "$(C)  ─ engine tail $(R)"; \
 		tail -3 $(ENGINE_LOGFILE) 2>/dev/null | sed "s/^/    /" || printf "    (no log)\n"; \
-		printf "\n%b\n" "$(C)  ─ supervisor tail $(R)"; \
-		tail -3 $(SUPERVISOR_LOGFILE) 2>/dev/null | sed "s/^/    /" || printf "    (no log)\n"; \
-		printf "%b\n" "$(C)  > crash dumps $(R)"; \
-		d="$(CRASH_DIR)"; \
-		mkdir -p "$$d"; \
-		count=$$(ls "$$d"crash-*.txt 2>/dev/null | wc -l | tr -d " "); \
-		if [ "$$count" -gt 0 ]; then \
-			printf "    %s crash dump(s) - view with: make crash-logs\n" "$$count"; \
-			printf "    Most recent: %s\n" "$$(ls -t "$$d"crash-*.txt 2>/dev/null | head -1)"; \
-		else \
-			printf "    (no crash dumps)\n"; \
-		fi; \
-	'
+# Logs: docker logs for split containers (gateway + engine). Use logs-host for host-native debug.
+logs: ## Component > Tail gateway + engine docker logs (split containers)
+	@docker compose logs -f ircfiber-gateway ircfiber-engine 2>&1 | sed -u "s/^\([a-z-]*\) |/$(K)[\1]$(R) /" || \
+		(printf "%b\n" "$(Y)$(WR) No docker containers — try make debug (docker) or make logs-host (host) $(R)"; exit 1)
 
-# Logs: tail all three log streams in parallel (engine / gateway / supervisor).
-logs: ## Component > Tail engine + gateway + supervisor logs in parallel
+logs-host: ## Component > Tail engine + gateway + supervisor host logs (debug-host)
 	@bash -c ' \
 		touch $(ENGINE_LOGFILE) $(GATEWAY_LOGFILE) $(SUPERVISOR_LOGFILE); \
 		trap "kill 0" INT TERM EXIT; \
@@ -557,14 +561,22 @@ logs: ## Component > Tail engine + gateway + supervisor logs in parallel
 		wait; \
 	'
 
-logs-engine: ## Component > Tail engine log only
+logs-engine: ## Component > Tail engine docker logs
+	@docker compose logs -f ircfiber-engine
+
+logs-gateway: ## Component > Tail gateway docker logs
+	@docker compose logs -f ircfiber-gateway
+
+logs-engine-host: ## Component > Tail engine host log only (debug-host)
 	@touch $(ENGINE_LOGFILE); tail -F $(ENGINE_LOGFILE)
 
-logs-gateway: ## Component > Tail gateway log only
+logs-gateway-host: ## Component > Tail gateway host log only (debug-host)
 	@touch $(GATEWAY_LOGFILE); tail -F $(GATEWAY_LOGFILE)
-
-logs-supervisor: ## Component > Tail supervisor log (crashes + restarts)
+		tail -F $(SUPERVISOR_LOGFILE) | sed -u "s/^/$(C)[sv]$(R) /" & \
+		wait; \
+logs-supervisor: ## Component > Tail supervisor log (host, debug-host only)
 	@touch $(SUPERVISOR_LOGFILE); tail -F $(SUPERVISOR_LOGFILE)
+
 
 crash-logs: ## Component > List persistent crash dumps (use CAT=1 to view latest)
 	@bash -c ' \
