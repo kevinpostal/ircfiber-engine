@@ -115,14 +115,33 @@ configuration "parser-fuzz-test" {
 	excludedSourceFiles "source/app.d"
 }
 
+configuration "common" {
+    targetType "library"
+    // Shared code: redis protocol, models, db, storage/redis, storage/buffer,
+    // auth, logging, tracing, observability, resource, threadpool, upload.
+    // Keep-files-in-place approach: common is library that excludes mains;
+    // gateway/engine configs add their own excludedSourceFiles below.
+    excludedSourceFiles "source/app.d" "source/app_engine.d" "source/app_test.d" "source/app_test_real.d" "source/prefs_test.d" "source/dedup_test.d" "source/parser_test.d" "source/consumer_test.d" "source/connection_registration_test.d" "source/observability_test.d" "source/parser_fuzz_test.d" "source/handoff_test_runner.d" "source/exec_reload_test_runner.d" "source/exec_reload_integration.d" "source/draining_test_runner.d" "source/logging_format_test.d" "source/janitor_test.d" "source/janitor_lock_test.d" "source/janitor_safety_test.d" "source/session_queue_test.d" "source/oob_test.d" "source/threadpool_test.d" "source/loadtest/main.d" "source/sync_redis_to_mongo.d" "source/tools/janitor_migrate.d" "source/tools/ircfiber_default_migrate.d" "source/test_runner.d"
+}
+
+configuration "gateway" {
+    targetType "executable"
+    targetName "irc-fiber-gateway"
+    mainSourceFile "source/app.d"
+    versions "VibeUseFibers" "GatewayOnly"
+    // Keep-files-in-place: defer file moves; gateway currently links full tree except engine main.
+    // This keeps `dub build --config=gateway` passing while still producing a distinct binary name.
+    excludedSourceFiles "source/app_engine.d" "source/test_runner.d" "source/session_queue_test.d"
+}
+
 configuration "engine" {
      targetType "executable"
      targetName "irc-fiber-engine"
      mainSourceFile "source/app_engine.d"
-     versions "VibeUseFibers"
-     excludedSourceFiles "source/app.d" "source/test_runner.d"
+     versions "VibeUseFibers" "EngineOnly"
+     // Keep-files-in-place: defer moves; engine excludes only gateway mains. Full isolation is follow-up.
+     excludedSourceFiles "source/app.d" "source/test_runner.d" "source/session_queue_test.d"
   }
-
 configuration "sync" {
 	targetType "executable"
 	targetName "sync-redis-to-mongo"

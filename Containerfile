@@ -121,14 +121,15 @@ RUN if [ "$CACHE_BUST" != "fixed" ]; then \
     fi && \
     echo "build: $CACHE_BUST" && \
     dub build                --compiler=ldc2 --build=release --parallel $DUB_FLAGS && \
+    dub build --config=gateway --compiler=ldc2 --build=release --parallel $DUB_FLAGS && \
     dub build --config=engine --compiler=ldc2 --build=release --parallel $DUB_FLAGS && \
     dub build --config=janitor-migrate --compiler=ldc2 --build=release --parallel $DUB_FLAGS && \
     dub build --config=ircfiber-default-migrate --compiler=ldc2 --build=release --parallel $DUB_FLAGS && \
     test -f /build/irc-fiber && \
+    (test -f /build/irc-fiber-gateway || cp /build/irc-fiber /build/irc-fiber-gateway) && \
     test -f /build/irc-fiber-engine && \
     test -f /build/janitor-migrate && \
     test -f /build/ircfiber-default-migrate
-
 # Single layer: strip all 5 binaries (one find instead of 5 RUNs).
 RUN find /build -maxdepth 1 -type f -executable -exec strip {} +
 
@@ -177,4 +178,80 @@ RUN chmod 0755 /usr/local/bin/ircfiber-engine-entrypoint.sh \
 # tini as init — prevents zombie processes and allows graceful
 # handoff within a container. Without it, the engine runs as PID 1
 # and exit(0) kills the entire container, defeating SCM_RIGHTS.
+ENTRYPOINT ["/usr/bin/tini", "--"]
+
+# ============================================================================
+# Stage: runtime-gateway — slim Ubuntu + gateway binary only
+# ============================================================================
+FROM ubuntu:22.04 AS runtime-gateway
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libssl3 \
+        zlib1g \
+        curl \
+        procps \
+        ca-certificates \
+        tini \
+        util-linux && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Gateway binary: accept either `irc-fiber` (legacy default) or `irc-fiber-gateway` (new).
+# The builder produces both names depending on config; copy whichever exists.
+# Use wildcard COPY with fallback: `irc-fiber-gateway` preferred for split builds.
+COPY --from=builder /build/irc-fiber-gateway /app/irc-fiber-gateway
+COPY --from=builder /build/irc-fiber /app/irc-fiber
+COPY --from=builder /build/views                 /app/views
+COPY --from=builder /build/config                /app/config
+COPY --from=builder /build/public                /app/public
+
+# Data dirs.
+RUN mkdir -p /app/data /app/uploads && \
+    if [ -f /app/irc-fiber-gateway ] && [ ! -f /app/irc-fiber ]; then \
+        cp /app/irc-fiber-gateway /app/irc-fiber; \
+    fi; \
+    if [ ! -f /app/irc-fiber ]; then echo "gateway binary missing" && exit 1; fi
+
+EXPOSE 8090
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+
+# ============================================================================
+# Stage: runtime-engine — slim Ubuntu + engine binary only (no views/public)
+# ============================================================================
+FROM ubuntu:22.04 AS runtime-engine
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libssl3 \
+        zlib1g \
+        curl \
+        procps \
+        ca-certificates \
+        tini \
+        util-linux && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /build/irc-fiber-engine      /app/irc-fiber-engine
+COPY --from=builder /build/janitor-migrate       /app/janitor-migrate
+COPY --from=builder /build/config                /app/config
+
+# Data dirs (engine needs no public/views).
+RUN mkdir -p /app/data /app/uploads
+
+# Engine entrypoint + healthcheck
+COPY deploy/roles/engine/files/ircfiber-engine-entrypoint.sh /usr/local/bin/ircfiber-engine-entrypoint.sh
+COPY deploy/roles/engine/files/ircfiber-engine-healthcheck.sh /usr/local/bin/ircfiber-engine-healthcheck.sh
+RUN chmod 0755 /usr/local/bin/ircfiber-engine-entrypoint.sh \
+              /usr/local/bin/ircfiber-engine-healthcheck.sh
+
+# tini as init — same rationale as runtime
 ENTRYPOINT ["/usr/bin/tini", "--"]

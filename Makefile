@@ -17,6 +17,10 @@
 DUB         := dub --root=engine
 LDC         := ldc2
 APP         := engine/irc-fiber
+GATEWAY_IMAGE ?= irc-fiber-gateway
+ENGINE_IMAGE  ?= irc-fiber-engine
+GATEWAY_APP := engine/irc-fiber-gateway
+ENGINE_APP  := engine/irc-fiber-engine
 DUB_PKG     := $(HOME)/.dub/packages
 
 # Dev backend selection for `make run` / `make start` / `make dev`.
@@ -78,7 +82,7 @@ AR := →
 # ----------------------------------------------------------------------------
 # Phony targets (grouped by category)
 .PHONY: all help
-.PHONY: build build-engine build-release build-debug build-ldc2 janitor-migrate frontend frontend-dev frontend-install
+.PHONY: build build-gateway build-engine build-release build-debug build-ldc2 janitor-migrate frontend frontend-dev frontend-install
 
 # Component Workflows (primary user-facing targets)
 .PHONY: dev dev-docker dev-live debug debug-live stop
@@ -672,41 +676,25 @@ all: build ## Utils > Build the default target
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
     OPENSSL_LIB := $(shell brew --prefix openssl 2>/dev/null || echo /usr/local)/lib
-else
-    OPENSSL_LIB := $(shell pkg-config --variable=libdir openssl 2>/dev/null || echo /usr/lib)
-endif
+build: build-gateway build-engine ## Build > Build the application with dub (gateway+engine)
+	@printf '\n%b\n' "$(BG)$(OK) Build complete (gateway+engine)$(R)"
 
-build: frontend ## Build > Build the application with dub
-	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building IRC Fiber  $(R)"
-	@bash -o pipefail -c '$(DUB) build 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | tail -8'
-	@if [ -f $(APP) ]; then \
+build-gateway: frontend ## Build > Build the gateway binary (irc-fiber)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building IRC Fiber Gateway  $(R)"
+	@bash -o pipefail -c '$(DUB) build --config=gateway --build=release 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | tail -8'
+	@if [ -f $(GATEWAY_APP) ]; then \
+		SIZE=$$(ls -lh $(GATEWAY_APP) | awk '{print $$5}'); \
+		printf '\n%b\n' "$(BG)$(OK) Gateway build successful$(R) $(D)($$SIZE)$(R)"; \
+	elif [ -f $(APP) ]; then \
 		SIZE=$$(ls -lh $(APP) | awk '{print $$5}'); \
-		printf '\n%b\n' "$(BG)$(OK) Build successful$(R) $(D)($$SIZE)$(R)"; \
+		printf '\n%b\n' "$(BG)$(OK) Gateway build successful (legacy $(APP))$(R) $(D)($$SIZE)$(R)"; \
 	else \
-		printf '\n%b\n' "$(BG)$(OK) Dub build complete$(R)"; \
+		printf '\n%b\n' "$(BG)$(OK) Gateway dub complete$(R)"; \
 	fi
-
-frontend: ## Build > Build Svelte 5 frontend bundle
-	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building Svelte frontend  $(R)"
-	@cd frontend && npm run build > /tmp/irc-fiber-frontend-build.log 2>&1; \
-		if [ $$? -eq 0 ]; then \
-			grep '✓ built in\|inject-manifest' /tmp/irc-fiber-frontend-build.log 2>/dev/null || true; \
-		else \
-			cat /tmp/irc-fiber-frontend-build.log; \
-			exit 1; \
-		fi
-	@node frontend/inject-manifest.js
-	@printf '\n%b\n' "$(BG)$(OK) Frontend build complete$(R)"
-
-frontend-dev: ## Build > Run Svelte frontend dev server
-	@cd frontend && npm run dev
-
-frontend-install: ## Build > Install Svelte frontend dependencies
-	@cd frontend && npm install
 
 build-engine: ## Build > Build the IRC engine binary
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building IRC Fiber Engine  $(R)"
-	@bash -o pipefail -c '$(DUB) build --config=engine 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | tail -8'
+	@bash -o pipefail -c '$(DUB) build --config=engine --build=release 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | tail -8'
 	@printf '\n%b\n' "$(BG)$(OK) Engine build successful$(R)"
 
 # Janitor migrate tool — backfills TTLs on existing Redis state/scrollback/
