@@ -301,7 +301,12 @@ private string buildOtlpMetricsJson(ref MetricPoint[] batch) {
 
         // Attributes go in the data point, not the metric, per
         // OTLP spec. Build the attribute array once.
-        string attrJson;
+        // Default to "[]" so empty-attributes points produce valid JSON.
+        // Without this, attrJson stays null/empty and the format
+        // `{"attributes":,"startTime"...}` is invalid, causing the
+        // OTLP collector to return 400 (seen as
+        // "otel-metrics: export failed status=400" every 10s).
+        string attrJson = "[]";
         if (mp.attributes !is null && mp.attributes.length > 0) {
             auto aSink = appender!string();
             aSink ~= "[";

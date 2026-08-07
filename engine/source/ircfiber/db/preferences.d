@@ -114,8 +114,13 @@ struct UserPreferences {
     /// Serializes to JSON.
     Json toJson() const {
         auto j = Json.emptyObject;
-        j["pinnedChannels"] = serializeToJson(pinnedChannels);
-        j["archivedChannels"] = serializeToJson(archivedChannels);
+        // Ensure null arrays serialize as [] not null. D's string[] init is null,
+        // and serializeToJson(null) would produce JSON null, which the Lua
+        // would have to handle. Explicitly use emptyArray for null to keep
+        // the JSON contract stable and avoid the cjson empty_table-as-object
+        // pitfall on the Redis Lua side.
+        j["pinnedChannels"] = pinnedChannels is null ? Json.emptyArray : serializeToJson(pinnedChannels);
+        j["archivedChannels"] = archivedChannels is null ? Json.emptyArray : serializeToJson(archivedChannels);
         auto lab = Json.emptyObject;
         foreach (k, v; lastActiveBuffers)
             lab[k] = Json(v);
@@ -141,7 +146,7 @@ struct UserPreferences {
         foreach (k, v; conversationsCollapsed)
             cc[k] = Json(v);
         j["conversationsCollapsed"] = cc;
-        j["networkOrder"] = serializeToJson(networkOrder);
+        j["networkOrder"] = networkOrder is null ? Json.emptyArray : serializeToJson(networkOrder);
         auto bp = Json.emptyObject;
         foreach (k, v; bufferPrefs)
             bp[k] = v;
@@ -302,6 +307,29 @@ if not ok2 or type(newDoc) ~= 'table' then
     return redis.error_reply('preferences.d: invalid JSON in ARGV[1]')
 end
 newDoc.prefVersion = newPrefVersion
+-- Fix: cjson encodes an empty Lua table as {} (object). Our payload has
+-- three array fields that must be [] when empty, not {}. After decode,
+-- an empty JSON array becomes an empty Lua table (next() == nil). Mark
+-- those tables as cjson.empty_array so encode produces [].
+-- Without this, every save of an empty pinnedChannels wrote {} to Redis,
+-- and the next load saw object != array, logged prefs_field_invalid,
+-- and triggered an infinite repair loop (seen as repeated warnings every
+-- 30s for the same user).
+if type(newDoc.pinnedChannels) == 'table' and next(newDoc.pinnedChannels) == nil then
+    newDoc.pinnedChannels = cjson.empty_array
+elseif newDoc.pinnedChannels == nil or newDoc.pinnedChannels == cjson.null then
+    newDoc.pinnedChannels = cjson.empty_array
+end
+if type(newDoc.archivedChannels) == 'table' and next(newDoc.archivedChannels) == nil then
+    newDoc.archivedChannels = cjson.empty_array
+elseif newDoc.archivedChannels == nil or newDoc.archivedChannels == cjson.null then
+    newDoc.archivedChannels = cjson.empty_array
+end
+if type(newDoc.networkOrder) == 'table' and next(newDoc.networkOrder) == nil then
+    newDoc.networkOrder = cjson.empty_array
+elseif newDoc.networkOrder == nil or newDoc.networkOrder == cjson.null then
+    newDoc.networkOrder = cjson.empty_array
+end
 redis.call('SET', KEYS[1], cjson.encode(newDoc))
 return newPrefVersion`;
 

@@ -106,7 +106,10 @@ void logJsonMap(string level, string component, string msg,
 
     JSONValue j = JSONValue.emptyObject;
     auto now = Clock.currTime.toUTC();
-    j["ts"] = JSONValue(now.toISOExtString() ~ "Z");
+    // toISOExtString() for UTC already ends with 'Z' (e.g. 2026-08-07T05:48:14.5098568Z).
+    // The old code appended another "Z" producing "...ZZ" which broke
+    // fluent-bit's time parser and SigNoz's timestamp handling.
+    j["ts"] = JSONValue(now.toISOExtString());
     j["level"] = JSONValue(level);
     j["component"] = JSONValue(component);
     j["msg"] = JSONValue(msg);
