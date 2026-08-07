@@ -167,7 +167,10 @@ IRCFIBER_DEFAULT_SERVER_ID ?= localengine
 
 # Shared paths for supervisor / logs / pidfiles / crash dumps (relative to project root — avoids space issues)
 ENGINE_BIN          := engine/irc-fiber-engine
-GATEWAY_BIN         := engine/irc-fiber
+GATEWAY_BIN         := engine/irc-fiber-gateway
+# Fallback for legacy `engine/irc-fiber` (pre-split). New builds produce `irc-fiber-gateway`.
+GATEWAY_BIN_FALLBACK := engine/irc-fiber
+GATEWAY_EFF_BIN      := $(or $(wildcard $(GATEWAY_BIN)),$(GATEWAY_BIN_FALLBACK))
 SUPERVISOR_SCRIPT   := ./scripts/irc-fiber-engine-supervisor.sh
 ENGINE_LOGFILE      := /tmp/irc-fiber-engine.log
 GATEWAY_LOGFILE     := /tmp/irc-fiber.log
@@ -198,9 +201,8 @@ dev-live: ## Component > Frontend dev (Vite) against the TAILNET gateway
 #   - Vite serves frontend with live reload on save
 #   - For D code changes: `make docker-restart-code` in another terminal
 dev-docker: ensure-colima ## Dev > Docker backend + Vite frontend dev (fastest full-stack cycle)
-	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting Docker backend  $(R)"
-	@if ! docker compose ps redis mongo ircd irc_fiber irc_engine 2>/dev/null | grep -q "healthy"; then \
-		docker compose up -d redis mongo ircd irc_fiber irc_engine; \
+	@if ! docker compose ps redis mongo ircd ircfiber-gateway ircfiber-engine 2>/dev/null | grep -q "healthy"; then \
+		docker compose up -d redis mongo ircd ircfiber-gateway ircfiber-engine; \
 		printf "%b\n" "$(BG)$(OK) Docker backend started$(R)"; \
 	else \
 		printf "%b\n" "$(BG)$(OK) Docker backend already running$(R)"; \
@@ -213,11 +215,11 @@ dev-docker: ensure-colima ## Dev > Docker backend + Vite frontend dev (fastest f
 # Runs in the FOREGROUND — supervisor stays backgrounded for engine auto-restart,
 # gateway runs in this terminal. ctrl-c cleanly tears down both. Run
 # `make logs` in another terminal for live tailing.
-debug: build build-engine ## Component > Full stack: gateway + engine (supervised), local docker DBs — ctrl-c to stop
+debug: build-gateway build-engine ## Component > Full stack: gateway + engine (supervised), local docker DBs — ctrl-c to stop
 	@$(_docker_setup)
 	@bash -c 'set -u; \
 		pkill -f irc-fiber-engine-supervisor 2>/dev/null || true; \
-		killall -9 irc-fiber irc-fiber-engine 2>/dev/null || true; \
+		killall -9 irc-fiber irc-fiber-gateway irc-fiber-engine 2>/dev/null || true; \
 		printf "\n%b\n" "$(_BCn)$(K)$(B)  Engine (supervised) → local docker  $(R)"; \
 		rm -f "$(GATEWAY_PIDFILE)" "$(SUPERVISOR_PIDFILE)" "$(ENGINE_PIDFILE)"; \
 		: > "$(SUPERVISOR_LOGFILE)"; \
@@ -240,14 +242,14 @@ debug: build build-engine ## Component > Full stack: gateway + engine (supervise
 		cleanup() { \
 			printf "\n%b\n" "$(Y)$(WR) stopping...$(R)"; \
 			kill -TERM "$$SUP_PID" 2>/dev/null || true; \
-			killall -9 irc-fiber irc-fiber-engine 2>/dev/null || true; \
+			killall -9 irc-fiber irc-fiber-gateway irc-fiber-engine 2>/dev/null || true; \
 			rm -f "$(GATEWAY_PIDFILE)" "$(SUPERVISOR_PIDFILE)" "$(ENGINE_PIDFILE)"; \
 			printf "%b\n" "$(BG)$(OK) debug stopped$(R)"; \
 			exit 0; \
 		}; \
 		trap cleanup INT TERM EXIT; \
 		IRCFIBER_MONGO_URL="$(LOCAL_MONGO_URL)" IRCFIBER_REDIS_URL="$(LOCAL_REDIS_URL)" \
-			"$(GATEWAY_BIN)" >> "$(GATEWAY_LOGFILE)" 2>&1; \
+			"$(GATEWAY_EFF_BIN)" >> "$(GATEWAY_LOGFILE)" 2>&1; \
 		GW_EXIT=$$?; \
 		printf "\n%b\n" "$(Y)$(WR) gateway exited (code $$GW_EXIT)$(R)"; \
 		cleanup; \
@@ -285,10 +287,10 @@ stop: ## Component > Stop debug/debug-live + local docker stacks (tailnet + loca
 			docker compose -f deploy/local/docker-compose.yml --profile observability down --remove-orphans --timeout 15 2>/dev/null || true; \
 			docker compose -f deploy/local/docker-compose.yml down --remove-orphans --timeout 15 2>/dev/null && \
 				printf "%b\n" "$(C)  → docker compose local stack stopped$(R)" || true; \
-		fi; \
-		docker compose stop irc_fiber irc_engine 2>/dev/null || true; \
+		docker compose stop ircfiber-gateway ircfiber-engine 2>/dev/null || true; \
+		docker compose -f deploy/local/docker-compose.yml stop ircfiber-gateway ircfiber-engine 2>/dev/null || true; \
 	fi; \
-	killall -9 irc-fiber 2>/dev/null || true; \
+	killall -9 irc-fiber irc-fiber-gateway 2>/dev/null || true; \
 	killall -9 irc-fiber-engine 2>/dev/null || true; \
 	pkill -f irc-fiber-engine-supervisor 2>/dev/null || true; \
 	for f in $(SUPERVISOR_PIDFILE) $(ENGINE_PIDFILE) $(GATEWAY_PIDFILE); do \
@@ -489,7 +491,7 @@ gateway: build ## Component > Gateway in foreground — ctrl-c to exit
 		"$(GATEWAY_BIN)"
 
 # Gateway: rebuild only.
-gateway-rebuild: build ## Component > Rebuild gateway binary (no restart)
+gateway-rebuild: build-gateway ## Component > Rebuild gateway binary (no restart)
 
 # Gateway: stop + relaunch in background (uses whatever env was set when last launched).
 gateway-restart: ## Component > Stop + relaunch gateway in background
@@ -502,13 +504,13 @@ gateway-restart: ## Component > Stop + relaunch gateway in background
 				printf "%b\n" "$(C)  → stopped gateway (pid $$pid)$(R)"; \
 			fi; \
 		fi; \
-		killall -9 irc-fiber 2>/dev/null || true; \
+		killall -9 irc-fiber irc-fiber-gateway 2>/dev/null || true; \
 		sleep 1; \
 		rm -f $(GATEWAY_PIDFILE); \
 		: > $(GATEWAY_LOGFILE); \
 		IRCFIBER_MONGO_URL=$${IRCFIBER_MONGO_URL:-$(LOCAL_MONGO_URL)} \
 		IRCFIBER_REDIS_URL=$${IRCFIBER_REDIS_URL:-$(LOCAL_REDIS_URL)} \
-			nohup "$(GATEWAY_BIN)" > $(GATEWAY_LOGFILE) 2>&1 & \
+			nohup "$(GATEWAY_EFF_BIN)" > $(GATEWAY_LOGFILE) 2>&1 & \
 		GW_PID=$$!; \
 		echo $$GW_PID > $(GATEWAY_PIDFILE); \
 		printf "%b\n" "$(C)  → started gateway (pid $$GW_PID)$(R)"; \
@@ -676,6 +678,8 @@ all: build ## Utils > Build the default target
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
     OPENSSL_LIB := $(shell brew --prefix openssl 2>/dev/null || echo /usr/local)/lib
+endif
+
 build: build-gateway build-engine ## Build > Build the application with dub (gateway+engine)
 	@printf '\n%b\n' "$(BG)$(OK) Build complete (gateway+engine)$(R)"
 
@@ -1108,12 +1112,11 @@ ensure-colima:
 docker-up: ensure-colima ## Docker > Start all services with Docker Compose
 	@printf '\n%b\n' "$(D)→ Pruning stale Docker layers before start...$(R)"
 	@docker system prune -af --volumes=false 2>&1 | tail -2
-	@printf '\n%b\n' "$(_BC)$(K)$(B)  Building Docker image  $(R)"
-	@# Build once — both irc_fiber + irc_engine share the same image tag
-	@docker compose build irc_fiber
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Building Docker images  $(R)"
+	@# Gateway and engine now build from separate targets (runtime-gateway/engine) — build both.
+	@docker compose build ircfiber-gateway ircfiber-engine
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting Docker Services  $(R)"
 	@docker compose up -d
-	@printf '%b\n' "$(BG)$(OK) Services started$(R) $(D)(http://localhost:8090)$(R)"
 
 docker-down: ensure-colima ## Docker > Stop ALL IRC Fiber containers (3 compose stacks + loose containers)
 	@printf '%b\n' "$(D)→ Stopping test stack (docker-compose.yml)...$(R)"
@@ -1172,7 +1175,7 @@ docker-down-test: ensure-colima ## Docker > Stop test services (ircd + mongo + r
 
 docker-up-test: ensure-colima ## Docker > Start full test stack (ircd + mongo + redis + gateway + engine)
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting test stack (docker-compose.test.yml)  $(R)"
-	@docker compose -f docker-compose.test.yml up -d ircd redis mongo irc_fiber irc_engine
+	@docker compose -f docker-compose.test.yml up -d ircd redis mongo ircfiber-gateway ircfiber-engine
 	@printf '\n%b\n' "$(D)Waiting for gateway health check at http://127.0.0.1:8090/health ...$(R)"
 	@for i in $$(seq 1 30); do \
 		if curl -fsS http://127.0.0.1:8090/health >/dev/null 2>&1; then \
@@ -1231,37 +1234,35 @@ docker-restart-gateway: docker-restart-web
 
 docker-up-web: ensure-colima ## Docker > Start web server only
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting Web Server (Gateway)  $(R)"
-	@docker compose up -d irc_fiber
+	@docker compose up -d ircfiber-gateway
 	@printf '%b\n' "$(BG)$(OK) Web server started$(R) $(D)(http://localhost:8090)$(R)"
 
 docker-down-web: ensure-colima ## Docker > Stop web server only
 	@printf '%b\n' "$(D)→ Stopping web server...$(R)"
-	@docker compose stop irc_fiber
+	@docker compose stop ircfiber-gateway
 	@printf '%b\n' "$(BG)$(OK) Web server stopped$(R)"
 
 docker-restart-web: ensure-colima ## Docker > Restart web server only
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Restarting Web Server (Gateway)  $(R)"
-	@docker compose build irc_fiber
-	@docker compose up -d --force-recreate irc_fiber
+	@docker compose build ircfiber-gateway
+	@docker compose up -d --force-recreate ircfiber-gateway
 	@printf '%b\n' "$(BG)$(OK) Web server restarted$(R) $(D)(http://localhost:8090)$(R)"
 
 docker-up-backend: ensure-colima ## Docker > Start backend services only
 	@printf '\n%b\n' "$(D)→ Pruning stale Docker layers...$(R)"
 	@docker system prune -af --volumes=false 2>&1 | tail -2
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting Backend Services  $(R)"
-	@docker compose up -d irc_engine redis mongo ircd
+	@docker compose up -d ircfiber-engine redis mongo ircd
 	@printf '%b\n' "$(BG)$(OK) Backend services started$(R)"
 
 docker-down-backend: ensure-colima ## Docker > Stop backend services only
 	@printf '%b\n' "$(D)→ Stopping backend services...$(R)"
-	@docker compose stop irc_engine redis mongo ircd
+	@docker compose stop ircfiber-engine redis mongo ircd
 	@printf '%b\n' "$(BG)$(OK) Backend services stopped$(R)"
 
 docker-restart-backend: ensure-colima ## Docker > Restart backend services only
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Restarting Backend Services  $(R)"
-	@docker compose up -d --build --force-recreate irc_engine redis mongo ircd
-	@printf '%b\n' "$(BG)$(OK) Backend services restarted$(R)"
-
+	@docker compose up -d --build --force-recreate ircfiber-engine redis mongo ircd
 # ----------------------------------------------------------------------------
 # Docker — interactive shells
 # ----------------------------------------------------------------------------
@@ -1356,14 +1357,12 @@ docker-restart-code: ensure-colima ## Dev > Rebuild frontend + D binaries + rest
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Rebuilding frontend (Vite)  $(R)"
 	@npm --prefix frontend run build 2>&1 | tail -3
 	@printf '%b\n' "$(BG)$(OK) Frontend built$(R)"
-	@printf '\n%b\n' "$(_BC)$(K)$(B)  Rebuilding D binary  $(R)"
-	@# Both services share image: irc-fiber:latest — build once to avoid tag collision
-	@docker compose build irc_fiber
-	@printf '%b\n' "$(BG)$(OK) Binary built$(R)"
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Rebuilding D binaries  $(R)"
+	@# Gateway and engine now use separate images/targets — build both.
+	@docker compose build ircfiber-gateway ircfiber-engine
+	@printf '%b\n' "$(BG)$(OK) Binaries built$(R)"
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Restarting gateway + engine  $(R)"
-	@docker compose up -d --force-recreate irc_fiber irc_engine
-	@printf '%b\n' "$(BG)$(OK) Gateway + engine restarted$(R) $(D)(http://localhost:8090)$(R)"
-
+	@docker compose up -d --force-recreate ircfiber-gateway ircfiber-engine
 # ----------------------------------------------------------------------------
 # Dev — local compose stack
 # ----------------------------------------------------------------------------
@@ -1742,5 +1741,3 @@ deploy-restart-redis: ## Deploy > Restart Redis container only
 deploy-restart-caddy: ## Deploy > Restart Caddy container only
 	@$(MAKE) --no-print-directory deploy-restart COMP=caddy
 
-deploy-restart-engine: ## Deploy > Restart IRC engine container only
-	@$(MAKE) --no-print-directory deploy-restart COMP=engine
