@@ -1,0 +1,354 @@
+doctype html
+html(lang="en")
+  head
+    meta(charset="utf-8")
+    meta(name="viewport", content="width=device-width, initial-scale=1")
+    meta(name="refresh", content="30")
+    title IRC Fiber — Active Sessions
+    style.
+      :root {
+        --adm-bg: #0a0e14; --adm-surface: #11161d; --adm-border: #1c2430;
+        --adm-muted: #545d6e; --adm-text: #c8d2dd; --adm-heading: #ecf2f8;
+        --adm-blue: #67e8f9; --adm-green: #4ade80; --adm-red: #f87171;
+        --adm-amber: #fbbf24; --adm-purple: #c084fc;
+        --adm-sidebar: #0d1117; --adm-card-bg: #131820;
+      }
+      * { margin:0; padding:0; box-sizing:border-box; }
+      body { font-family: Inter, -apple-system, sans-serif; background:var(--adm-bg); color:var(--adm-text); display:flex; min-height:100vh; }
+      .adm-sidebar { width:240px; min-height:100vh; background:var(--adm-sidebar); border-right:1px solid var(--adm-border); padding:20px 0; flex-shrink:0; }
+      .adm-brand { padding:0 20px 20px; font-size:15px; font-weight:600; color:var(--adm-blue); }
+      .adm-nav-item { display:block; padding:8px 20px; font-size:14px; color:var(--adm-text); text-decoration:none; }
+      .adm-nav-item:hover, .adm-nav-item.active { background:rgba(103,232,249,0.08); color:var(--adm-blue); }
+      .adm-content { flex:1; padding:24px 32px; overflow:auto; }
+      .adm-topbar { display:flex; justify-content:flex-end; padding:0 32px; border-bottom:1px solid var(--adm-border); background:var(--adm-sidebar); }
+      .adm-topbar a { padding:12px 16px; font-size:13px; color:var(--adm-muted); text-decoration:none; }
+      .adm-topbar a:hover { color:var(--adm-text); }
+      .adm-header { margin-bottom:24px; display:flex; justify-content:space-between; align-items:flex-start; gap:24px; flex-wrap:wrap; }
+      .adm-header h1 { font-size:22px; font-weight:600; color:var(--adm-heading); margin-bottom:4px; }
+      .adm-header .subtitle { font-size:13px; color:var(--adm-muted); }
+      .adm-header .subtitle .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--adm-green); margin-right:6px; vertical-align:1px; animation:pulse 2s ease-in-out infinite; }
+      @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:.4 } }
+      .adm-stat-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(170px, 1fr)); gap:14px; margin-bottom:24px; }
+      .adm-stat-card { background:var(--adm-card-bg); border:1px solid var(--adm-border); border-radius:8px; padding:16px 18px; }
+      .adm-stat-card .label { font-size:11px; color:var(--adm-muted); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:6px; display:flex; align-items:center; gap:6px; }
+      .adm-stat-card .value { font-size:26px; font-weight:700; color:var(--adm-heading); line-height:1.1; }
+      .adm-stat-card .hint { font-size:11px; color:var(--adm-muted); margin-top:4px; }
+      .adm-stat-card.green .value { color:var(--adm-green); }
+      .adm-stat-card.blue .value { color:var(--adm-blue); }
+      .adm-stat-card.purple .value { color:var(--adm-purple); }
+      .adm-stat-card.amber .value { color:var(--adm-amber); }
+      .adm-stat-card.red .value { color:var(--adm-red); }
+
+      .adm-toolbar { display:flex; align-items:center; gap:12px; margin-bottom:16px; flex-wrap:wrap; }
+      .adm-search { flex:1; min-width:240px; max-width:420px; position:relative; }
+      .adm-search input { width:100%; padding:8px 12px 8px 32px; background:var(--adm-bg); border:1px solid var(--adm-border); border-radius:6px; color:var(--adm-text); font-size:13px; outline:none; }
+      .adm-search input:focus { border-color:var(--adm-blue); }
+      .adm-search::before { content:"⌕"; position:absolute; left:10px; top:50%; transform:translateY(-50%); color:var(--adm-muted); font-size:14px; }
+      .adm-toolbar .spacer { flex:1; }
+      .adm-refresh-info { font-size:12px; color:var(--adm-muted); display:flex; align-items:center; gap:6px; }
+      .adm-refresh-info .dot { width:6px; height:6px; border-radius:50%; background:var(--adm-green); }
+      .adm-refresh-info.countdown { font-variant-numeric:tabular-nums; }
+
+      .adm-card { background:var(--adm-card-bg); border:1px solid var(--adm-border); border-radius:8px; overflow:hidden; margin-bottom:24px; }
+      .adm-card h2 { font-size:15px; font-weight:600; color:var(--adm-heading); padding:14px 20px; border-bottom:1px solid var(--adm-border); display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+      .adm-card h2 .pill { font-size:11px; font-weight:600; padding:2px 8px; border-radius:10px; background:rgba(103,232,249,0.10); color:var(--adm-blue); }
+      .adm-card h2 .right { margin-left:auto; display:flex; align-items:center; gap:8px; }
+
+      .adm-table { width:100%; border-collapse:collapse; }
+      .adm-table th { text-align:left; padding:10px 16px; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.5px; color:var(--adm-muted); border-bottom:1px solid var(--adm-border); background:rgba(13,17,23,0.4); white-space:nowrap; }
+      .adm-table td { padding:12px 16px; font-size:13px; border-bottom:1px solid rgba(28,36,48,0.5); vertical-align:middle; }
+      .adm-table tr:last-child td { border-bottom:none; }
+      .adm-table tr.is-current td { background:rgba(103,232,249,0.05); }
+      .adm-table tr:hover td { background:rgba(103,232,249,0.04); }
+      .adm-table tr.is-current:hover td { background:rgba(103,232,249,0.08); }
+      .adm-table tr.is-group-header td { background:rgba(13,17,23,0.7); padding:8px 16px; font-size:12px; color:var(--adm-muted); text-transform:uppercase; letter-spacing:0.5px; border-top:1px solid rgba(28,36,48,0.7); }
+      .adm-table tr.is-group-header td .user-summary { color:var(--adm-heading); text-transform:none; letter-spacing:normal; font-size:13px; font-weight:600; }
+      .adm-table tr.is-group-header:hover td { background:rgba(13,17,23,0.7); }
+      .adm-table .col-actions { text-align:right; white-space:nowrap; }
+
+      .adm-badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600; vertical-align:middle; }
+      .adm-badge-green { background:rgba(74,222,128,0.12); color:var(--adm-green); }
+      .adm-badge-amber { background:rgba(251,191,36,0.12); color:var(--adm-amber); }
+      .adm-badge-red { background:rgba(248,113,113,0.12); color:var(--adm-red); }
+      .adm-badge-muted { background:rgba(84,93,110,0.18); color:var(--adm-muted); }
+      .adm-badge-admin { background:rgba(192,132,252,0.12); color:var(--adm-purple); }
+      .adm-badge-user { background:rgba(139,150,164,0.12); color:var(--adm-muted); }
+      .adm-badge-blue { background:rgba(103,232,249,0.12); color:var(--adm-blue); }
+      .adm-badge-current { background:rgba(103,232,249,0.18); color:var(--adm-blue); box-shadow:0 0 0 1px rgba(103,232,249,0.25) inset; }
+
+      .adm-user-cell { display:flex; align-items:center; gap:10px; }
+      .adm-avatar { width:28px; height:28px; border-radius:50%; background:linear-gradient(135deg, var(--adm-blue), var(--adm-purple)); color:#0a0e14; display:flex; align-items:center; justify-content:center; font-weight:700; font-size:12px; flex-shrink:0; }
+      .adm-avatar.is-admin { background:linear-gradient(135deg, var(--adm-purple), var(--adm-blue)); }
+      .adm-user-cell .name { font-weight:600; color:var(--adm-heading); display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+      .adm-user-cell .sub { font-size:11px; color:var(--adm-muted); font-family:"SF Mono",monospace; }
+
+      .adm-mono { font-family:"SF Mono",ui-monospace,monospace; font-size:12px; color:var(--adm-text); }
+      .adm-mono-muted { font-family:"SF Mono",ui-monospace,monospace; font-size:12px; color:var(--adm-muted); }
+      .adm-truncate { max-width:280px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; display:inline-block; vertical-align:middle; }
+      .adm-truncate-wide { max-width:380px; }
+      .adm-session-id { cursor:help; }
+
+      .adm-relative { font-variant-numeric:tabular-nums; font-weight:600; }
+      .adm-relative.fresh { color:var(--adm-green); }
+      .adm-relative.recent { color:var(--adm-text); }
+      .adm-relative.idle { color:var(--adm-amber); }
+      .adm-relative.stale { color:var(--adm-red); }
+      .adm-relative .abs { display:block; font-size:10px; font-weight:400; color:var(--adm-muted); font-variant-numeric:normal; }
+
+      .adm-btn { display:inline-flex; align-items:center; gap:6px; padding:6px 12px; border-radius:6px; font-size:12px; font-weight:600; text-decoration:none; cursor:pointer; border:1px solid transparent; line-height:1.2; }
+      .adm-btn-primary { background:var(--adm-blue); color:#0a0e14; }
+      .adm-btn-primary:hover { opacity:0.9; }
+      .adm-btn-danger { background:rgba(248,113,113,0.10); color:var(--adm-red); border-color:rgba(248,113,113,0.25); }
+      .adm-btn-danger:hover { background:rgba(248,113,113,0.20); }
+      .adm-btn-ghost { background:transparent; color:var(--adm-muted); border-color:var(--adm-border); }
+      .adm-btn-ghost:hover { color:var(--adm-text); border-color:var(--adm-muted); }
+      .adm-btn-sm { padding:4px 10px; font-size:11px; }
+      .adm-btn-group { display:inline-flex; gap:6px; }
+
+      .adm-alert { padding:12px 20px; border-radius:6px; font-size:14px; margin-bottom:20px; }
+      .adm-alert-success { background:rgba(74,222,128,0.10); color:var(--adm-green); border:1px solid rgba(74,222,128,0.2); }
+      .adm-alert-info { background:rgba(103,232,249,0.06); color:var(--adm-blue); border:1px solid rgba(103,232,249,0.15); font-size:13px; }
+
+      .adm-empty { text-align:center; padding:48px 24px; color:var(--adm-muted); }
+      .adm-empty .icon { font-size:36px; opacity:0.4; margin-bottom:12px; }
+      .adm-empty .title { font-size:15px; color:var(--adm-text); margin-bottom:4px; font-weight:600; }
+
+      .adm-progress { height:4px; background:var(--adm-border); border-radius:2px; overflow:hidden; margin-top:6px; }
+      .adm-progress > span { display:block; height:100%; background:var(--adm-blue); transition:width 0.5s linear; }
+
+      details.adm-user-group { border-bottom:1px solid rgba(28,36,48,0.5); }
+      details.adm-user-group:last-child { border-bottom:none; }
+      details.adm-user-group[open] summary { border-bottom:1px solid var(--adm-border); }
+      details.adm-user-group summary { padding:10px 16px; background:rgba(13,17,23,0.5); cursor:pointer; list-style:none; display:flex; align-items:center; gap:12px; font-size:13px; user-select:none; }
+      details.adm-user-group summary::-webkit-details-marker { display:none; }
+      details.adm-user-group summary::before { content:"▸"; color:var(--adm-muted); transition:transform 0.15s; display:inline-block; }
+      details.adm-user-group[open] summary::before { transform:rotate(90deg); }
+      details.adm-user-group summary:hover { background:rgba(13,17,23,0.7); }
+      details.adm-user-group summary .meta { margin-left:auto; display:flex; align-items:center; gap:12px; font-size:12px; color:var(--adm-muted); }
+
+      @media (max-width: 1100px) {
+        .adm-table .col-ua, .adm-table .col-created { display:none; }
+      }
+      @media (max-width: 800px) {
+        .adm-table .col-ttl, .adm-table .col-ip { display:none; }
+      }
+  body
+    .adm-sidebar
+      .adm-brand IRC Fiber
+      a.adm-nav-item(href="/admin") Dashboard
+      a.adm-nav-item(href="/admin/servers") Servers
+      a.adm-nav-item.active(href="/admin/sessions") Sessions
+      a.adm-nav-item(href="/admin/users") Users
+      a.adm-nav-item(href="/admin/uploads") Uploads
+      a.adm-nav-item(href="/", target="_blank") View Site →
+    .adm-content
+      .adm-topbar
+        a(href="/admin/logout") Log out
+
+      .adm-header
+        div
+          h1 Active Sessions
+          .subtitle
+            span.dot
+            | Live view of all logged-in users — auto-refreshes every 30 seconds
+        .adm-toolbar(style="margin:0")
+          form(method="GET", action="/admin/sessions", style="display:flex; gap:8px; align-items:center;")
+            .adm-search
+              input(type="text", name="q", placeholder="Search username, IP, or user ID…", value=q, autocomplete="off")
+            button.adm-btn.adm-btn-ghost.adm-btn-sm(type="submit") Search
+            - if (q.length > 0)
+              a.adm-btn.adm-btn-ghost.adm-btn-sm(href="/admin/sessions") Clear
+
+      - if (message.length > 0)
+        .adm-alert.adm-alert-success #{message}
+
+      - if (q.length > 0 && filtered.length == 0)
+        .adm-alert.adm-alert-info No sessions match "#{q}". Try a partial username, IP, or user ID.
+
+      // Stat cards
+      .adm-stat-grid
+        .adm-stat-card(class=total > 0 ? "green" : "")
+          .label
+            span Active Sessions
+          .value #{total}
+          .hint All live Redis sessions
+        .adm-stat-card.blue
+          .label Unique Users
+          .value #{uniqueUsers}
+          .hint #{uniqueUsers == 1 ? "user online" : "users online"}
+        .adm-stat-card.purple
+          .label Your Sessions
+          .value #{yourSessions}
+          .hint Active tabs on your account
+        .adm-stat-card(class=adminsOnline > 0 ? "purple" : "")
+          .label Admins Online
+          .value #{adminsOnline}
+          .hint Currently authenticated admins
+        .adm-stat-card(class=idleCount > 0 ? "amber" : "green")
+          .label Idle > 1 hour
+          .value #{idleCount}
+          .hint Sessions with no recent activity
+
+      // Session list
+      .adm-card
+        h2
+          span Session List
+          - if (filtered.length > 0)
+            span.pill #{filtered.length} of #{total}
+          .right
+            - if (total > 0)
+              form(method="POST", action="/admin/sessions/clear", onsubmit="return confirm('Clear ALL sessions except your own? Every other user will be logged out.')")
+                button.adm-btn.adm-btn-danger.adm-btn-sm(type="submit") Clear All (except mine)
+
+        - if (filtered.length == 0)
+          .adm-empty
+            .icon ◌
+            - if (total == 0)
+              .title No active sessions
+              div This is unusual — check if Redis is running.
+            - else
+              .title No sessions match your filter
+              div Try clearing the search to see all #{total} session(s).
+        - else
+          table.adm-table#sessions-table
+            thead
+              tr
+                th User
+                th Session
+                th.col-ip IP Address
+                th.col-ua Browser / Client
+                th.col-created Created
+                th Last Activity
+                th.col-ttl Expires In
+                th.col-actions Actions
+            tbody#sessions-tbody
+              // Rows are rendered server-side below; JS only adds live updating of relative time + countdown.
+              - import std.datetime : Clock, SysTime, unixTimeToStdTime;
+              - import std.uni : toUpper;
+              - foreach (s; filtered)
+                - string sessIdShort = s.sessionId.length > 12 ? s.sessionId[0..12] ~ "…" : s.sessionId;
+                - string initial = s.username.length > 0 ? s.username[0..1].toUpper() : "?";
+                - string absCreated = s.createdAt > 0 ? new SysTime(unixTimeToStdTime(s.createdAt / 1000)) .toSimpleString() : "";
+                - string absAccess = s.lastAccess > 0 ? new SysTime(unixTimeToStdTime(s.lastAccess / 1000)) .toSimpleString() : "";
+                - long idleMs = s.lastAccess > 0 ? (Clock.currTime.toUnixTime() * 1000L - s.lastAccess) : 0;
+                - string idleClass = idleMs < 60_000 ? "fresh" : idleMs < 5 * 60_000 ? "recent" : idleMs < 60 * 60_000 ? "idle" : "stale";
+                - string ttlPct = s.ttlSeconds > 0 ? (cast(int)(s.ttlSeconds * 100 / (14 * 24 * 60 * 60))).to!string : "0";
+                tr(class=(s.isCurrent ? "is-current " : "") ~ "session-row", data-last-access=s.lastAccess.to!string, data-ttl=s.ttlSeconds.to!string)
+                  td
+                    .adm-user-cell
+                      .adm-avatar(class=s.isAdmin ? "is-admin" : "") #{initial}
+                      div
+                        .name
+                          | #{s.username}
+                          - if (s.isAdmin)
+                            span.adm-badge.adm-badge-admin admin
+                          - if (s.isCurrent)
+                            span.adm-badge.adm-badge-current you
+                        .sub(title=s.userId) #{s.userId.length > 16 ? s.userId[0..16] ~ "…" : s.userId}
+                  td
+                    span.adm-mono.adm-session-id(title=s.sessionKey) #{sessIdShort}
+                  td.col-ip
+                    - if (s.clientIp.length > 0)
+                      span.adm-mono #{s.clientIp}
+                    - else
+                      span.adm-mono-muted —
+                  td.col-ua
+                    - if (s.userAgent.length > 0)
+                      span.adm-truncate.adm-truncate-wide(title=s.userAgent) #{s.userAgent}
+                    - else
+                      span.adm-mono-muted unknown
+                  td.col-created
+                    - if (s.createdAt > 0)
+                      span(title=absCreated) #{absCreated}
+                    - else
+                      span.adm-mono-muted —
+                  td
+                    - if (s.lastAccess > 0)
+                      .adm-relative(class=idleClass, data-ts=s.lastAccess.to!string)
+                        span.rel —
+                        span.abs #{absAccess}
+                    - else
+                      span.adm-mono-muted never
+                  td.col-ttl
+                    - if (s.ttlSeconds > 0)
+                      - long ttlDays = s.ttlSeconds / 86400;
+                      - long ttlHours = (s.ttlSeconds % 86400) / 3600;
+                      - long ttlMins = (s.ttlSeconds % 3600) / 60;
+                      - string ttlLabel = ttlDays > 0 ? ttlDays.to!string ~ "d " ~ ttlHours.to!string ~ "h" : ttlHours > 0 ? ttlHours.to!string ~ "h " ~ ttlMins.to!string ~ "m" : ttlMins.to!string ~ "m";
+                      div.ttl-display #{ttlLabel}
+                      .adm-progress(title=ttlPct ~ "% of 14-day TTL remaining")
+                        span(style="width:" ~ ttlPct ~ "%")
+                    - else
+                      span.adm-mono-muted —
+                  td.col-actions
+                    .adm-btn-group
+                      - if (!s.isCurrent)
+                        - string clearAction = "/admin/sessions/clear/" ~ s.userId;
+                        - string clearConfirm = "return confirm('Clear all sessions for " ~ s.username ~ "?')";
+                        form(method="POST", action=clearAction, onsubmit=clearConfirm, style="display:inline")
+                          button.adm-btn.adm-btn-danger.adm-btn-sm(type="submit", title="Clear all sessions for this user") Clear user
+
+    script.
+      // Live-relative-time updates + TTL countdown. Avoids full reload flicker.
+      (function() {
+        const tbody = document.getElementById('sessions-tbody');
+        if (!tbody) return;
+        const rows = Array.from(tbody.querySelectorAll('tr.session-row'));
+
+        function fmtRelative(ms) {
+          if (ms < 0) ms = 0;
+          const s = Math.floor(ms / 1000);
+          if (s < 60)        return s + 's ago';
+          const m = Math.floor(s / 60);
+          if (m < 60)        return m + 'm ago';
+          const h = Math.floor(m / 60);
+          if (h < 24)        return h + 'h ago';
+          const d = Math.floor(h / 24);
+          if (d < 30)        return d + 'd ago';
+          const mo = Math.floor(d / 30);
+          return mo + 'mo ago';
+        }
+
+        function classifyIdle(ms) {
+          if (ms < 60_000)        return 'fresh';
+          if (ms < 5 * 60_000)    return 'recent';
+          if (ms < 60 * 60_000)   return 'idle';
+          return 'stale';
+        }
+
+        function fmtTtl(s) {
+          if (s <= 0) return '—';
+          const d = Math.floor(s / 86400);
+          const h = Math.floor((s % 86400) / 3600);
+          const m = Math.floor((s % 3600) / 60);
+          if (d > 0) return d + 'd ' + h + 'h';
+          if (h > 0) return h + 'h ' + m + 'm';
+          return m + 'm';
+        }
+
+        function tick() {
+          const now = Date.now();
+          for (const tr of rows) {
+            const la = parseInt(tr.dataset.lastAccess || '0', 10);
+            const ttl = parseInt(tr.dataset.ttl || '0', 10);
+            const rel = tr.querySelector('.adm-relative');
+            if (rel && la > 0) {
+              const idle = now - la;
+              rel.querySelector('.rel').textContent = fmtRelative(idle);
+              rel.classList.remove('fresh','recent','idle','stale');
+              rel.classList.add(classifyIdle(idle));
+            }
+            const ttlEl = tr.querySelector('.ttl-display');
+            if (ttlEl) {
+              const newTtl = Math.max(0, ttl - Math.floor((now - (tick._last || now)) / 1000));
+              ttlEl.textContent = fmtTtl(newTtl);
+              tr.dataset.ttl = String(newTtl);
+            }
+          }
+          tick._last = now;
+        }
+
+        tick._last = Date.now();
+        tick();
+        setInterval(tick, 1000);
+      })();

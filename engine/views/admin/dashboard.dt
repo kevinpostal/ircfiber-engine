@@ -1,0 +1,171 @@
+doctype html
+html(lang="en")
+  head
+    meta(charset="utf-8")
+    meta(name="viewport", content="width=device-width, initial-scale=1")
+    title IRC Fiber — Admin Dashboard
+    style.
+      :root {
+        --adm-bg: #0a0e14; --adm-surface: #11161d; --adm-border: #1c2430;
+        --adm-muted: #545d6e; --adm-text: #c8d2dd; --adm-heading: #ecf2f8;
+        --adm-blue: #67e8f9; --adm-green: #4ade80; --adm-red: #f87171;
+        --adm-amber: #fbbf24; --adm-sidebar: #0d1117; --adm-card-bg: #131820;
+      }
+      * { margin:0; padding:0; box-sizing:border-box; }
+      body { font-family: Inter, -apple-system, sans-serif; background:var(--adm-bg); color:var(--adm-text); display:flex; min-height:100vh; }
+      .adm-sidebar { width:240px; min-height:100vh; background:var(--adm-sidebar); border-right:1px solid var(--adm-border); padding:20px 0; flex-shrink:0; }
+      .adm-brand { padding:0 20px 20px; font-size:15px; font-weight:600; color:var(--adm-blue); }
+      .adm-nav-section { padding:8px 0; }
+      .adm-nav-item { display:block; padding:8px 20px; font-size:14px; color:var(--adm-text); text-decoration:none; }
+      .adm-nav-item:hover, .adm-nav-item.active { background:rgba(103,232,249,0.08); color:var(--adm-blue); }
+      .adm-content { flex:1; padding:24px 32px; overflow:auto; }
+      .adm-topbar { display:flex; justify-content:flex-end; padding:0 32px; border-bottom:1px solid var(--adm-border); background:var(--adm-sidebar); }
+      .adm-topbar a { padding:12px 16px; font-size:13px; color:var(--adm-muted); text-decoration:none; }
+      .adm-topbar a:hover { color:var(--adm-text); }
+      .adm-header h1 { font-size:22px; font-weight:600; color:var(--adm-heading); margin-bottom:24px; }
+      .adm-stat-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(180px, 1fr)); gap:16px; margin-bottom:32px; }
+      .adm-stat-card { background:var(--adm-card-bg); border:1px solid var(--adm-border); border-radius:8px; padding:20px; }
+      .adm-stat-card .label { font-size:12px; color:var(--adm-muted); text-transform:uppercase; margin-bottom:4px; }
+      .adm-stat-card .value { font-size:28px; font-weight:700; color:var(--adm-heading); }
+      .adm-stat-card.green .value { color:var(--adm-green); }
+      .adm-stat-card.amber .value { color:var(--adm-amber); }
+      .adm-stat-card.red .value { color:var(--adm-red); }
+      .adm-card { background:var(--adm-card-bg); border:1px solid var(--adm-border); border-radius:8px; overflow:hidden; margin-bottom:24px; }
+      .adm-card h2 { font-size:16px; font-weight:600; color:var(--adm-heading); padding:16px 20px; border-bottom:1px solid var(--adm-border); }
+      .adm-card h3 { font-size:14px; font-weight:600; color:var(--adm-muted); padding:12px 20px 0; text-transform:uppercase; }
+      .adm-table { width:100%; border-collapse:collapse; }
+      .adm-table th { text-align:left; padding:10px 16px; font-size:12px; font-weight:600; text-transform:uppercase; color:var(--adm-muted); border-bottom:1px solid var(--adm-border); }
+      .adm-table td { padding:10px 16px; font-size:14px; border-bottom:1px solid rgba(28,36,48,0.5); }
+      .adm-table tr:hover td { background:rgba(103,232,249,0.03); }
+      .adm-badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600; }
+      .adm-badge-admin { background:rgba(103,232,249,0.12); color:var(--adm-blue); }
+      .adm-badge-user { background:rgba(139,150,164,0.12); color:var(--adm-muted); }
+      .adm-badge-green { background:rgba(74,222,128,0.12); color:var(--adm-green); }
+      .adm-badge-red { background:rgba(248,113,113,0.12); color:var(--adm-red); }
+      .adm-badge-amber { background:rgba(251,191,36,0.12); color:var(--adm-amber); }
+      .adm-health-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:8px; }
+      .adm-health-dot.green { background:var(--adm-green); }
+      .adm-health-dot.red { background:var(--adm-red); }
+      .adm-health-row { display:flex; align-items:center; padding:10px 20px; font-size:14px; border-bottom:1px solid rgba(28,36,48,0.3); }
+      .adm-health-row:last-child { border-bottom:none; }
+      .adm-health-row .status { margin-left:auto; font-size:13px; }
+      .adm-mono { font-family:"SF Mono",monospace; font-size:12px; color:var(--adm-muted); }
+  body
+    .adm-sidebar
+      .adm-brand IRC Fiber
+      a.adm-nav-item.active(href="/admin") Dashboard
+      a.adm-nav-item(href="/admin/servers") Servers
+      a.adm-nav-item(href="/admin/sessions") Sessions
+      a.adm-nav-item(href="/admin/users") Users
+      a.adm-nav-item(href="/admin/uploads") Uploads
+      a.adm-nav-item(href="/", target="_blank") View Site →
+    .adm-content
+      .adm-topbar
+        a(href="/admin/logout") Log out
+      .adm-header
+        h1 Dashboard
+
+      // Primary stat cards
+      .adm-stat-grid
+        .adm-stat-card
+          .label Total Users
+          .value #{userCount}
+        .adm-stat-card.green
+          .label Active Sessions
+          .value #{activeSessions >= 0 ? activeSessions.to!string : "--"}
+        .adm-stat-card
+          .label Connected Networks
+          .value #{totalNetworks}
+        .adm-stat-card(class=healthyCount == engineCount ? "green" : healthyCount > 0 ? "amber" : "red")
+          .label Healthy Engines
+          .value #{healthyCount}/#{engineCount}
+        .adm-stat-card
+          .label Total Uploads
+          .value #{uploadCount >= 0 ? uploadCount.to!string : "--"}
+
+      // System health card
+      .adm-card
+        h2 System Health
+        .adm-health-row
+          span.adm-health-dot(class=engineCount > 0 ? "green" : "red")
+          span IRC Engines
+          span.status
+            - if (engineCount == 0)
+              span.adm-badge.adm-badge-red No engines
+            - else if (healthyCount == engineCount)
+              span.adm-badge.adm-badge-green All healthy
+            - else
+              span.adm-badge.adm-badge-amber #{healthyCount}/#{engineCount} healthy
+        .adm-health-row
+          span.adm-health-dot(class=activeSessions >= 0 ? "green" : "red")
+          span Redis (Sessions)
+          span.status
+            - if (activeSessions >= 0)
+              span.adm-badge.adm-badge-green OK
+            - else
+              span.adm-badge.adm-badge-red Down
+        .adm-health-row
+          span.adm-health-dot.green
+          span MongoDB
+          span.status
+            span.adm-badge.adm-badge-green OK
+
+      // Host connections overview
+      - if (hostSummary.length > 0)
+        .adm-card
+          h2 Host Connection Overview
+          table.adm-table
+            thead
+              tr
+                th IRC Host
+                th Total Conns
+                th Capacity
+            tbody
+              - foreach (hcs; hostSummary)
+                tr
+                  td
+                    span.adm-mono #{hcs.host}
+                  td #{hcs.totalConns}
+                  td
+                    - auto cap = maxConns * hcs.serverIds.length;
+                    - if (hcs.totalConns >= cap)
+                      span.adm-badge.adm-badge-red #{hcs.totalConns}/#{cap} (FULL)
+                    - else if (hcs.totalConns >= cap * 2 / 3)
+                      span.adm-badge.adm-badge-amber #{hcs.totalConns}/#{cap}
+                    - else
+                      span.adm-badge.adm-badge-green #{hcs.totalConns}/#{cap}
+          div(style="padding:12px 20px")
+            a(href="/admin/servers", style="color:var(--adm-blue); text-decoration:none; font-size:13px") View routing configuration →
+
+      // Recent Users
+      .adm-card
+        h2 Recent Users
+        - if (recentUsers.length > 0)
+          table.adm-table
+            thead
+              tr
+                th Username
+                th Email
+                th Roles
+                th Signup IP
+                th Created
+                th
+            tbody
+              - foreach (u; recentUsers)
+                tr
+                  td #{u.username}
+                  td #{u.email}
+                  td
+                    - foreach (r; u.roles)
+                      - if (r == "admin")
+                        span.adm-badge.adm-badge-admin #{r}
+                      - else
+                        span.adm-badge.adm-badge-user #{r}
+                  td
+                    span(style="font-family:monospace; font-size:12px; color:var(--adm-muted)") #{u.signupIp.length > 0 ? u.signupIp : "--"}
+                  td
+                    span(style="font-size:12px; color:var(--adm-muted)") #{u.createdAt.toUnixTime() > 0 ? u.createdAt.toSimpleString() : "--"}
+                  td
+                    a(href="/admin/users/#{u.id}", style="color:var(--adm-blue); text-decoration:none") View
+        - else
+          .adm-card(style="text-align:center; padding:40px; color:var(--adm-muted)") No users yet.

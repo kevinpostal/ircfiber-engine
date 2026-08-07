@@ -1,8 +1,13 @@
 # IRC Fiber — Local Development Stack
 
-Full local observability environment: IRC Fiber gateway + engine + SigNoz Foundry
-(ClickHouse, Query Service, OTLP Ingester, Frontend, Alertmanager) + ngIRCd test
-server. All 11 containers run on the `ircfiber_local` bridge (172.28.0.0/16).
+Full local environment: IRC Fiber gateway + engine + ngIRCd test server,
+with optional SigNoz Foundry (ClickHouse, Query Service, OTLP Ingester,
+Frontend, Alertmanager) for observability. All containers run on the
+`ircfiber_local` bridge (172.28.0.0/16).
+
+> **Observability toggle:** SigNoz is **disabled by default** (~300 MB).
+> Enable it only when debugging traces/metrics/logs (~4 GB).
+> See [Observability toggle](#observability-toggle) below.
 
 ## Prerequisites
 
@@ -63,6 +68,94 @@ server. All 11 containers run on the `ircfiber_local` bridge (172.28.0.0/16).
 | `ircfiber-gateway` | irc-fiber:local (built) | HTTP/WS frontend + admin API | 8090 |
 | `ircfiber-engine` | irc-fiber:local (built) | IRC protocol engine | — |
 | `ircfiber-ircd` | ircd-local:latest (built) | ngIRCd test server | 6667 |
+## Observability toggle
+
+SigNoz + ClickHouse + fluent-bit consume ~3.5 GB (ClickHouse 2 GB + signoz
+768 MB + postgres/keeper/ingester/bridge). The production host
+(OVH 40.160.227.49, 7.7 GB RAM) cannot afford it, so observability is
+**opt-in everywhere** and defaults to **off**.
+
+### Default (no SigNoz, ~300 MB)
+
+```bash
+docker compose -f deploy/local/docker-compose.yml up -d
+# or
+make local-up
+# or
+make local-dev-up
+```
+
+Starts only `redis`, `mongo`, `ircfiber-gateway`, `ircfiber-engine`, `ircd`.
+`signoz` and `fluent-bit` are not created (`profiles: [observability]`).
+Gateway/engine have `IRCFIBER_OTEL_ENABLED=0` by default, so `withSpan` is a
+pass-through, `recordCounter`/`recordGauge` no-op, and `flushAndSendSpans()`
+returns immediately — no 10 s `stderr` spam when the collector is absent.
+
+Verify:
+
+```bash
+docker compose -f deploy/local/docker-compose.yml ps
+# ircfiber-gateway, ircfiber-engine, redis, mongo, ircd UP; signoz absent
+curl -fsS http://localhost:8090/health  # → {"status":"ok"}
+docker logs ircfiber-gateway 2>&1 | grep -c "otel.*export failed"  # → 0
+make local-dev-smoke  # skips SigNoz checks when disabled
+```
+
+### With SigNoz (~4 GB)
+
+```bash
+IRCFIBER_OTEL_ENABLED=1 docker compose --profile observability -f deploy/local/docker-compose.yml up -d
+# or
+make local-up-observability
+# or
+make local-dev-up-observability
+```
+
+Starts all 7 containers including `signoz` + `fluent-bit`. `IRCFIBER_OTEL_ENABLED=1`
+must be set in the shell so `docker-compose.yml` passes it to gateway/engine
+(`IRCFIBER_OTEL_ENABLED: "${IRCFIBER_OTEL_ENABLED:-0}"`). `IRCFIBER_OTEL_ENDPOINT`
+defaults to `http://signoz:4318`; override with `IRCFIBER_OTEL_ENDPOINT=http://…`
+if you run a custom collector. The D code appends `/v1/traces` and `/v1/metrics`
+automatically, so both `http://signoz:4318` and `http://signoz:4318/v1/traces`
+work (empty endpoint → disabled even if flag is on, fail-safe).
+
+Verify:
+
+```bash
+docker compose --profile observability -f deploy/local/docker-compose.yml ps
+# signoz + fluent-bit UP
+sleep 90
+curl -fsS http://localhost:3301/api/v1/services | jq .
+bash tests/local-dev/smoke-observability.sh  # all checks pass
+```
+
+Stop:
+
+```bash
+docker compose --profile observability -f deploy/local/docker-compose.yml down -v
+# or
+make local-down-clean
+```
+
+### Production
+
+Production disables OTel by default. Enable only for short debugging windows:
+
+```bash
+IRCFIBER_OTEL_ENABLED=1 IRCFIBER_OTEL_ENDPOINT=http://ircfiber-otel-collector:4318 \
+  docker compose --profile observability -f docker-compose.observability.yml up -d
+# restart gateway/engine with the same env so they export
+```
+
+Without `IRCFIBER_OTEL_ENABLED=1`, the engine/gateway never attempt HTTP OTLP
+exports and `journalctl` stays clean.
+
+### Vite proxy when disabled
+
+`frontend/vite.config.ts` proxies `VITE_SIGNOZ_URL` to SigNoz. When SigNoz is
+disabled, set `VITE_SIGNOZ_URL=""` or leave it empty — the frontend shows an
+empty observability state instead of error spinners. No code change needed.
+
 
 ## Bring-up
 

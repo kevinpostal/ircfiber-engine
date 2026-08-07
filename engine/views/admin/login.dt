@@ -1,0 +1,40 @@
+doctype html
+html(lang="en")
+  head
+    meta(charset="utf-8")
+    meta(name="viewport", content="width=device-width, initial-scale=1")
+    title IRC Fiber — Admin Login
+    style.
+      :root {
+        --adm-bg: #0a0e14; --adm-surface: #11161d; --adm-border: #1c2430;
+        --adm-muted: #545d6e; --adm-text: #c8d2dd; --adm-heading: #ecf2f8;
+        --adm-blue: #67e8f9; --adm-red: #f87171; --adm-green: #4ade80;
+      }
+      * { margin:0; padding:0; box-sizing:border-box; }
+      body { font-family: Inter, -apple-system, sans-serif; background:var(--adm-bg); color:var(--adm-text); display:flex; align-items:center; justify-content:center; min-height:100vh; }
+      .login-card { width:400px; background:var(--adm-surface); border:1px solid var(--adm-border); border-radius:12px; padding:32px; }
+      .login-card h1 { font-size:20px; font-weight:600; color:var(--adm-heading); margin-bottom:8px; }
+      .login-card p { font-size:13px; color:var(--adm-muted); margin-bottom:24px; }
+      .form-group { margin-bottom:16px; }
+      .form-group label { display:block; font-size:12px; font-weight:600; color:var(--adm-muted); text-transform:uppercase; margin-bottom:4px; }
+      input { width:100%; padding:10px 12px; background:var(--adm-bg); border:1px solid var(--adm-border); border-radius:6px; color:var(--adm-text); font-size:14px; outline:none; }
+      input:focus { border-color:var(--adm-blue); }
+      button { width:100%; padding:10px; background:rgba(103,232,249,0.12); color:var(--adm-blue); border:1px solid rgba(103,232,249,0.2); border-radius:6px; font-size:14px; font-weight:600; cursor:pointer; margin-top:8px; }
+      button:hover { background:rgba(103,232,249,0.18); }
+      .error-msg { padding:10px 12px; background:rgba(248,113,113,0.08); color:var(--adm-red); border:1px solid rgba(248,113,113,0.15); border-radius:6px; font-size:13px; margin-bottom:16px; }
+  body
+    .login-card
+      h1 Admin Login
+      p Sign in to manage user accounts
+      - if (authError != "")
+        .error-msg #{authError}
+      form(method="POST", action="/admin/login")
+        - if (redirect != "")
+          input(type="hidden", name="redirect", value="#{redirect}")
+        .form-group
+          label Username
+          input(type="text", name="username", required, autofocus)
+        .form-group
+          label Password
+          input(type="password", name="password", required)
+        button(type="submit") Sign In

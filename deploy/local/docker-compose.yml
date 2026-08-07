@@ -1,12 +1,23 @@
 # ---------------------------------------------------------------------------
 # IRC Fiber — Local development stack with SigNoz combined image
 #
-# Brings up 7 containers on the ircfiber_local bridge (172.28.0.0/16):
-#   redis, mongo, signoz, fluent-bit, ircfiber-gateway, ircfiber-engine, ircd
+# Brings up 5-7 containers on the ircfiber_local bridge (172.28.0.0/16):
+#   redis, mongo, ircfiber-gateway, ircfiber-engine, ircd
+#   + optionally signoz, fluent-bit when observability profile is active
 #
 # Usage:
+#   # Without SigNoz (default, ~300 MB, safe for 7 GB prod host)
 #   docker compose -f deploy/local/docker-compose.yml up -d
+#
+#   # With SigNoz (~4 GB: ClickHouse + signoz + fluent-bit)
+#   IRCFIBER_OTEL_ENABLED=1 docker compose --profile observability -f deploy/local/docker-compose.yml up -d
+#   # or: COMPOSE_PROFILES=observability docker compose -f deploy/local/docker-compose.yml up -d
+#
 #   docker compose -f deploy/local/docker-compose.yml down
+#   # With profile: docker compose --profile observability -f deploy/local/docker-compose.yml down -v
+#
+# OTel is disabled by default (IRCFIBER_OTEL_ENABLED=0). Set to 1 to enable
+# tracing/metrics/log shipping. When disabled, gateway/engine export no-ops.
 # ---------------------------------------------------------------------------
 services:
 
@@ -50,6 +61,56 @@ services:
       start_period: 20s
 
   # -----------------------------------------------------------------------
+  # clickhouse — analytics DB for SigNoz (traces/metrics/logs)
+  # -----------------------------------------------------------------------
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.12.5
+    container_name: ircfiber-clickhouse
+    restart: unless-stopped
+    profiles: [observability]
+    networks:
+      - ircfiber_local
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse-config/cluster.xml:/etc/clickhouse-server/config.d/cluster.xml:ro
+      - ./clickhouse-config/zookeeper.xml:/etc/clickhouse-server/config.d/zookeeper.xml:ro
+      - ./clickhouse-config/macros.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+      - ./clickhouse-config/allow.xml:/etc/clickhouse-server/config.d/allow.xml:ro
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    environment:
+      CLICKHOUSE_DB: signoz
+      CLICKHOUSE_USER: signoz
+      CLICKHOUSE_PASSWORD: signoz123
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1 --user signoz --password signoz123"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # -----------------------------------------------------------------------
+  # zookeeper — required for SigNoz ClickHouse Replicated tables
+  # -----------------------------------------------------------------------
+  zookeeper:
+    image: zookeeper:3.8
+    container_name: ircfiber-zookeeper
+    restart: unless-stopped
+    profiles: [observability]
+    networks:
+      - ircfiber_local
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # -----------------------------------------------------------------------
   # signoz — combined SigNoz image (otel-collector + query-service +
   #          frontend + ClickHouse + alertmanager + Kafka + …)
   # Ports: 3301 = REST API + UI, 4318 = OTLP HTTP, 4317 = OTLP gRPC
@@ -58,16 +119,19 @@ services:
     image: signoz/signoz:latest
     container_name: ircfiber-signoz
     restart: unless-stopped
+    profiles: [observability]
     networks:
       - ircfiber_local
     ports:
-      - "3301:3301"
-      - "8080:8080"
-      - "4318:4318"
-      - "4317:4317"
+      - "3301:8080"
     environment:
       SIGNOZ_INITIAL_ADMIN_EMAIL: admin@ircfiber.com
-      SIGNOZ_INITIAL_ADMIN_PASSWORD: admin123
+      SIGNOZ_INITIAL_ADMIN_PASSWORD: Admin123!@#Str0ngPass
+      SIGNOZ_TELEMETRYSTORE_CLICKHOUSE_DSN: "tcp://signoz:signoz123@clickhouse:9000"
+      SIGNOZ_TELEMETRYSTORE_PROVIDER: "clickhouse"
+    depends_on:
+      clickhouse:
+        condition: service_healthy
     volumes:
       - signoz_data:/var/lib/signoz
       - signoz_data:/data
@@ -80,12 +144,35 @@ services:
       start_period: 120s
 
   # -----------------------------------------------------------------------
+  # -----------------------------------------------------------------------
+  # otel-collector — OTLP receiver forwarding to ClickHouse
+  # -----------------------------------------------------------------------
+  otel-collector:
+    image: signoz/signoz-otel-collector:latest
+    container_name: ircfiber-otel-collector
+    restart: unless-stopped
+    profiles: [observability]
+    networks:
+      - ircfiber_local
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    volumes:
+      - ./otel-collector/otel-collector.yaml:/etc/otel-collector-config.yaml:ro
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      zookeeper:
+        condition: service_healthy
+
   # fluent-bit — container log tailer shipping to SigNoz via OTLP
   # -----------------------------------------------------------------------
   fluent-bit:
     image: fluent/fluent-bit:latest
     container_name: ircfiber-fluent-bit
     restart: unless-stopped
+    profiles: [observability]
     networks:
       - ircfiber_local
     volumes:
@@ -120,7 +207,8 @@ services:
       - "8090:8090"
     command: ["/app/irc-fiber"]
     environment:
-      IRCFIBER_OTEL_ENDPOINT: http://signoz:4318
+      IRCFIBER_OTEL_ENABLED: "${IRCFIBER_OTEL_ENABLED:-0}"
+      IRCFIBER_OTEL_ENDPOINT: "${IRCFIBER_OTEL_ENDPOINT:-http://otel-collector:4318}"
       IRCFIBER_REDIS_URL: redis://redis:6379/0
       IRCFIBER_MONGO_URL: mongodb://mongo:27017/ircfiber
       IRCFIBER_LOG_LEVEL: debug
@@ -128,8 +216,6 @@ services:
       redis:
         condition: service_healthy
       mongo:
-        condition: service_healthy
-      signoz:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8090/health"]
@@ -153,7 +239,8 @@ services:
     command: ["/app/irc-fiber-engine"]
     environment:
       IRCFIBER_SERVER_ID: localdev1
-      IRCFIBER_OTEL_ENDPOINT: http://signoz:4318
+      IRCFIBER_OTEL_ENABLED: "${IRCFIBER_OTEL_ENABLED:-0}"
+      IRCFIBER_OTEL_ENDPOINT: "${IRCFIBER_OTEL_ENDPOINT:-http://otel-collector:4318}"
       IRCFIBER_REDIS_URL: redis://redis:6379/0
       IRCFIBER_MONGO_URL: mongodb://mongo:27017/ircfiber
       IRCFIBER_LOG_LEVEL: debug
@@ -161,8 +248,6 @@ services:
       redis:
         condition: service_healthy
       mongo:
-        condition: service_healthy
-      signoz:
         condition: service_healthy
       ircd:
         condition: service_healthy
@@ -213,4 +298,8 @@ volumes:
   mongo_data:
     driver: local
   signoz_data:
+    driver: local
+  clickhouse_data:
+    driver: local
+  zookeeper_data:
     driver: local

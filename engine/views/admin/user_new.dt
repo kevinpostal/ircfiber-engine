@@ -1,0 +1,71 @@
+doctype html
+html(lang="en")
+  head
+    meta(charset="utf-8")
+    meta(name="viewport", content="width=device-width, initial-scale=1")
+    title IRC Fiber — New User
+    style.
+      :root {
+        --adm-bg: #0a0e14; --adm-surface: #11161d; --adm-border: #1c2430;
+        --adm-muted: #545d6e; --adm-text: #c8d2dd; --adm-heading: #ecf2f8;
+        --adm-blue: #67e8f9; --adm-green: #4ade80; --adm-red: #f87171;
+        --adm-sidebar: #0d1117; --adm-card-bg: #131820;
+      }
+      * { margin:0; padding:0; box-sizing:border-box; }
+      body { font-family: Inter, -apple-system, sans-serif; background:var(--adm-bg); color:var(--adm-text); display:flex; min-height:100vh; }
+      .adm-sidebar { width:240px; min-height:100vh; background:var(--adm-sidebar); border-right:1px solid var(--adm-border); padding:20px 0; flex-shrink:0; }
+      .adm-brand { padding:0 20px 20px; font-size:15px; font-weight:600; color:var(--adm-blue); }
+      .adm-nav-item { display:block; padding:8px 20px; font-size:14px; color:var(--adm-text); text-decoration:none; }
+      .adm-nav-item:hover, .adm-nav-item.active { background:rgba(103,232,249,0.08); color:var(--adm-blue); }
+      .adm-content { flex:1; padding:24px 32px; overflow:auto; }
+      .adm-topbar { display:flex; justify-content:flex-end; padding:0 32px; border-bottom:1px solid var(--adm-border); background:var(--adm-sidebar); }
+      .adm-topbar a { padding:12px 16px; font-size:13px; color:var(--adm-muted); text-decoration:none; }
+      .adm-breadcrumbs { font-size:13px; color:var(--adm-muted); margin-bottom:8px; }
+      .adm-breadcrumbs a { color:var(--adm-blue); text-decoration:none; }
+      .adm-header { margin-bottom:24px; }
+      .adm-header h1 { font-size:22px; font-weight:600; color:var(--adm-heading); }
+      .adm-card { background:var(--adm-card-bg); border:1px solid var(--adm-border); border-radius:8px; max-width:480px; }
+      .adm-card h2 { font-size:16px; font-weight:600; color:var(--adm-heading); padding:16px 20px; border-bottom:1px solid var(--adm-border); }
+      .adm-card-body { padding:20px; }
+      .adm-form-group { margin-bottom:16px; }
+      .adm-form-group label { display:block; font-size:12px; font-weight:600; color:var(--adm-muted); text-transform:uppercase; margin-bottom:4px; }
+      .adm-input { width:100%; padding:8px 12px; background:var(--adm-bg); border:1px solid var(--adm-border); border-radius:6px; color:var(--adm-text); font-size:14px; outline:none; }
+      .adm-input:focus { border-color:var(--adm-blue); }
+      .adm-btn-primary { display:inline-block; padding:8px 16px; border-radius:6px; font-size:13px; font-weight:500; cursor:pointer; background:rgba(103,232,249,0.12); color:var(--adm-blue); border:1px solid rgba(103,232,249,0.2); }
+      .adm-alert { padding:10px 16px; border-radius:6px; font-size:13px; margin-bottom:16px; }
+      .adm-alert-error { background:rgba(248,113,113,0.08); color:var(--adm-red); border:1px solid rgba(248,113,113,0.15); }
+  body
+    .adm-sidebar
+      .adm-brand IRC Fiber
+      a.adm-nav-item(href="/admin") Dashboard
+      a.adm-nav-item(href="/admin/servers") Servers
+      a.adm-nav-item(href="/admin/sessions") Sessions
+      a.adm-nav-item.active(href="/admin/users") Users
+      a.adm-nav-item(href="/admin/uploads") Uploads
+      a.adm-nav-item(href="/", target="_blank") View Site →
+    .adm-content
+      .adm-topbar
+        a(href="/admin/logout") Log out
+      .adm-breadcrumbs
+        a(href="/admin") Dashboard
+        span  › 
+        a(href="/admin/users") Users
+        span  › New
+      .adm-header
+        h1 Create User
+      - if (message != "")
+        .adm-alert.adm-alert-error #{message}
+      .adm-card
+        h2 New User
+        .adm-card-body
+          form(method="POST", action="/admin/users/new")
+            .adm-form-group
+              label Username
+              input.adm-input(type="text", name="username", required, autofocus)
+            .adm-form-group
+              label Email
+              input.adm-input(type="email", name="email", required)
+            .adm-form-group
+              label Password
+              input.adm-input(type="password", name="password", required)
+            button.adm-btn-primary(type="submit") Create User

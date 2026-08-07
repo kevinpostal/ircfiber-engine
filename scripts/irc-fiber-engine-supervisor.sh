@@ -27,7 +27,7 @@
 # ============================================================================
 set -u
 
-ENGINE_BIN="${ENGINE_BIN:-./irc-fiber-engine}"
+ENGINE_BIN="${ENGINE_BIN:-engine/irc-fiber-engine}"
 PIDFILE="${SUPERVISOR_PIDFILE:-/tmp/irc-fiber-engine-supervisor.pid}"
 ENGINE_PIDFILE="${ENGINE_PIDFILE:-/tmp/irc-fiber-engine.pid}"
 ENGINE_LOGFILE="${ENGINE_LOGFILE:-/tmp/irc-fiber-engine.log}"

@@ -14,9 +14,9 @@
 # ----------------------------------------------------------------------------
 # Variables
 # ----------------------------------------------------------------------------
-DUB         := dub
+DUB         := dub --root=engine
 LDC         := ldc2
-APP         := irc-fiber
+APP         := engine/irc-fiber
 DUB_PKG     := $(HOME)/.dub/packages
 
 # Dev backend selection for `make run` / `make start` / `make dev`.
@@ -48,8 +48,9 @@ DSCANNER := $(or $(shell which dscanner 2>/dev/null),\
                   dub run dscanner --)
 
 # Source files
-SRCS        := $(shell find source -name '*.d')
-DT_SRCS     := $(shell find views -name '*.dt')
+# Engine sources moved to engine/ — enterprise layout
+SRCS        := $(shell find engine/source -name '*.d')
+DT_SRCS     := $(shell find engine/views -name '*.dt')
 
 # Colors & icons
 R  := \033[0m
@@ -161,8 +162,8 @@ LOCAL_REDIS_URL ?= redis://127.0.0.1:6379/0
 IRCFIBER_DEFAULT_SERVER_ID ?= localengine
 
 # Shared paths for supervisor / logs / pidfiles / crash dumps (relative to project root — avoids space issues)
-ENGINE_BIN          := ./irc-fiber-engine
-GATEWAY_BIN         := ./irc-fiber
+ENGINE_BIN          := engine/irc-fiber-engine
+GATEWAY_BIN         := engine/irc-fiber
 SUPERVISOR_SCRIPT   := ./scripts/irc-fiber-engine-supervisor.sh
 ENGINE_LOGFILE      := /tmp/irc-fiber-engine.log
 GATEWAY_LOGFILE     := /tmp/irc-fiber.log
@@ -220,6 +221,7 @@ debug: build build-engine ## Component > Full stack: gateway + engine (supervise
 		IRCFIBER_MONGO_URL="$(LOCAL_MONGO_URL)" IRCFIBER_REDIS_URL="$(LOCAL_REDIS_URL)" \
 			IRCFIBER_SERVER_ID="$${IRCFIBER_SERVER_ID:-localengine}" \
 			IRCFIBER_BIND_ADDRESS="$${IRCFIBER_BIND_ADDRESS:-127.0.0.1}" \
+			ENGINE_BIN="$(ENGINE_BIN)" \
 			ENGINE_PIDFILE="$(ENGINE_PIDFILE)" \
 			ENGINE_LOGFILE="$(ENGINE_LOGFILE)" \
 			SUPERVISOR_LOGFILE="$(SUPERVISOR_LOGFILE)" \
@@ -269,12 +271,17 @@ debug-live: frontend ## Component > Gateway + engine in Docker against TAILNET D
 	TAILNET_MONGO_URL="$(TAILNET_MONGO_URL)" TAILNET_REDIS_URL="$(TAILNET_REDIS_URL)" IRCFIBER_SERVER_ID="$(or $(IRCFIBER_SERVER_ID),localdebug)" \
 		docker compose -p ircfiber-tailnet -f docker-compose.tailnet.yml up --build
 
-# Stop everything (docker compose tailnet stack + native processes). Does NOT kill a Vite dev server.
-stop: ## Component > Stop debug/debug-live stack (docker + native)
+# Stop everything (tailnet + local docker stacks + native processes). Does NOT kill a Vite dev server.
+stop: ## Component > Stop debug/debug-live + local docker stacks (tailnet + local + native)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Stopping everything  $(R)"; \
 	if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then \
 		docker compose -p ircfiber-tailnet -f docker-compose.tailnet.yml down --remove-orphans 2>/dev/null && \
 			printf "%b\n" "$(C)  → docker compose tailnet stack stopped$(R)" || true; \
+		if [ -f deploy/local/docker-compose.yml ]; then \
+			docker compose -f deploy/local/docker-compose.yml --profile observability down --remove-orphans --timeout 15 2>/dev/null || true; \
+			docker compose -f deploy/local/docker-compose.yml down --remove-orphans --timeout 15 2>/dev/null && \
+				printf "%b\n" "$(C)  → docker compose local stack stopped$(R)" || true; \
+		fi; \
 		docker compose stop irc_fiber irc_engine 2>/dev/null || true; \
 	fi; \
 	killall -9 irc-fiber 2>/dev/null || true; \
@@ -589,7 +596,7 @@ crash-logs: ## Component > List persistent crash dumps (use CAT=1 to view latest
 # ─── AUTO-REBUILD (file watch) ──────────────────────────────────────────────
 
 # Watch engine sources, rebuild + restart on change.
-watch-engine: ## Component > Watch source/*.d — rebuild engine + hot-reload on save (preserves IRC sockets)
+watch-engine: ## Component > Watch engine/source/*.d — rebuild engine + hot-reload on save (preserves IRC sockets)
 	@bash -c ' \
 		printf "\n%b\n" "$(_BC)$(K)$(B)  Watching engine sources  $(R)"; \
 		printf "%b\n" "$(D)Polls every 2s. Install fswatch for instant: brew install fswatch$(R)"; \
@@ -598,9 +605,9 @@ watch-engine: ## Component > Watch source/*.d — rebuild engine + hot-reload on
 			printf "%b\n" "$(Y)$(WR) No supervisor running. Start one first: make debug  or  make debug-live$(R)"; \
 			exit 1; \
 		fi; \
-		WATCH=$$(find source -name "*.d" -type f 2>/dev/null); \
+		WATCH=$$(find engine/source -name "*.d" -type f 2>/dev/null); \
 		LAST=$$(echo "$$WATCH" | xargs stat -f %m 2>/dev/null | sort -n | tail -1); \
-		printf "%b\n" "$(C)  watching source/*.d …$(R)"; \
+		printf "%b\n" "$(C)  watching engine/source/*.d …$(R)"; \
 		while true; do \
 			sleep 2; \
 			CURR=$$(echo "$$WATCH" | xargs stat -f %m 2>/dev/null | sort -n | tail -1); \
@@ -614,13 +621,13 @@ watch-engine: ## Component > Watch source/*.d — rebuild engine + hot-reload on
 	'
 
 # Watch gateway sources, rebuild + restart on change.
-watch-gateway: ## Component > Watch source/*.d — rebuild gateway + relaunch on save
+watch-gateway: ## Component > Watch engine/source/*.d — rebuild gateway + relaunch on save
 	@bash -c ' \
 		printf "\n%b\n" "$(_BC)$(K)$(B)  Watching gateway sources  $(R)"; \
 		printf "%b\n" "$(D)Polls every 2s. Install fswatch for instant: brew install fswatch$(R)"; \
-		WATCH=$$(find source -name "*.d" -type f 2>/dev/null); \
+		WATCH=$$(find engine/source -name "*.d" -type f 2>/dev/null); \
 		LAST=$$(echo "$$WATCH" | xargs stat -f %m 2>/dev/null | sort -n | tail -1); \
-		printf "%b\n" "$(C)  watching source/*.d …$(R)"; \
+		printf "%b\n" "$(C)  watching engine/source/*.d …$(R)"; \
 		while true; do \
 			sleep 2; \
 			CURR=$$(echo "$$WATCH" | xargs stat -f %m 2>/dev/null | sort -n | tail -1); \
@@ -819,57 +826,57 @@ endef
 
 test: ## Test > D backend unit tests (fast)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Running D backend tests  $(R)"
-	@$(DUB) test 2>&1 | tail -20
+	@$(DUB) build --config=unittest -b unittest 2>&1 | tail -5
+	@timeout 30 ./engine/irc-fiber-test 2>&1 | tail -20; code=$${PIPESTATUS[0]}; if [ $$code -eq 124 ]; then printf '\n%b\n' "$(Y)$(WR) test binary hung (timeout 30s) — vibe eventcore leak?$(R)"; exit 1; fi; exit $$code
 
 test-real: ## Test > Real unittest driver (replaces no-op unitThreadedLight)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building real unittest driver  $(R)"
-	@$(DUB) build --config=unittest --compiler=ldc2 --build=debug -b unittest 2>&1 | tail -3
-	@./irc-fiber-test
-
+	@$(DUB) build --config=unit-test-real -b unittest 2>&1 | tail -3
+	@timeout 30 ./engine/irc-fiber-test-real 2>&1 | tail -30; code=$${PIPESTATUS[0]}; if [ $$code -eq 124 ]; then printf '\n%b\n' "$(Y)$(WR) test-real hung (timeout 30s)$(R)"; exit 1; fi; exit $$code
 prefs-test: ## Test > User-preferences defensive-parse suite (skips if Redis missing)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Prefs defensive-parse tests  $(R)"
 	@$(DUB) build --config=prefs-test 2>&1 | tail -3
-	@./prefs-test
+	@./engine/prefs-test
 
 dedup-test: ## Test > REST scrollback Redis/MongoDB dedup (refresh-on-low-volume-channel regression)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Scrollback dedup tests  $(R)"
 	@$(DUB) build --config=dedup-test 2>&1 | tail -3
-	@./dedup-test
+	@./engine/dedup-test
 
 parser-test: ## Test > IRC parser defensive guards + RFC 2812 coverage
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Parser defensive-parse tests  $(R)"
 	@$(DUB) build --config=parser-test 2>&1 | tail -3
-	@./parser-test
+	@./engine/parser-test
 
 consumer-test: ## Test > consumer reconnect-dedup helpers
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Consumer reconnect-dedup tests  $(R)"
 	@$(DUB) build --config=consumer-test 2>&1 | tail -3
-	@./consumer-test
+	@./engine/consumer-test
 
 connection-registration-test: ## Test > ConnectionServer.registrationUnavailableFor JSON contract for the admin registration-stuck surface
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Registration-timeout admin contract tests  $(R)"
 	@$(DUB) build --config=connection-registration-test 2>&1 | tail -3
-	@./connection-registration-test
+	@./engine/connection-registration-test
 
 observability-test: ## Test > OTel metrics pipeline (counter/gauge/histogram JSON contract)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  OTel observability metrics tests  $(R)"
 	@$(DUB) build --config=observability-test 2>&1 | tail -3
-	@./observability-test
+	@./engine/observability-test
 
 janitor-test: ## Test > EngineJanitor basic reap (orphan → reaped, live → skipped)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  EngineJanitor basic-reap tests  $(R)"
 	@$(DUB) build --config=janitor-test 2>&1 | tail -3
-	@./janitor-test
+	@./engine/janitor-test
 
 janitor-lock-test: ## Test > EngineJanitor distributed lock + manualReap()
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  EngineJanitor lock + manual-reap tests  $(R)"
 	@$(DUB) build --config=janitor-lock-test 2>&1 | tail -3
-	@./janitor-lock-test
+	@./engine/janitor-lock-test
 
 janitor-safety-test: ## Test > EngineJanitor status / events / purgeLocalServerNamespace / bumpServerStateTTLs
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  EngineJanitor safety + helpers tests  $(R)"
 	@$(DUB) build --config=janitor-safety-test 2>&1 | tail -3
-	@./janitor-safety-test
+	@./engine/janitor-safety-test
 
 janitor-tests: ## Test > All EngineJanitor test suites (basic + lock + safety)
 	@./run-janitor-tests.sh
@@ -877,13 +884,13 @@ janitor-tests: ## Test > All EngineJanitor test suites (basic + lock + safety)
 parser-fuzz-test: ## Test > parser property-based fuzz (10k random lines)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Parser fuzz tests  $(R)"
 	@$(DUB) build --config=parser-fuzz-test 2>&1 | tail -3
-	@./parser-fuzz-test
+	@./engine/parser-fuzz-test
 
 test-fast: ## Test > All fast standalone test suites (prefs/parser/consumer/observability/registration)
 	@for t in prefs-test parser-test consumer-test observability-test connection-registration-test session-queue-test oob-test; do \
 		printf '\n%b\n' "$(_BCn)$(K)$(B)  $$t  $(R)"; \
 		$(DUB) build --config=$$t 2>&1 | tail -1 || exit 1; \
-		./$$t 2>&1 | tail -3; \
+		./engine/$$t 2>&1 | tail -3; \
 	done
 
 # Real-CI runner. Builds with `-b unittest` so the compiler emits
@@ -896,7 +903,7 @@ test-fast: ## Test > All fast standalone test suites (prefs/parser/consumer/obse
 unit-test-real: ## Test > Real unittest driver (replaces no-op unitThreadedLight)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building real unittest driver  $(R)"
 	@$(DUB) build --config=unit-test-real --compiler=ldc2 --build=debug -b unittest 2>&1 | tail -3
-	@./irc-fiber-test-real
+	@./engine/irc-fiber-test-real
 
 test-frontend: ## Test > Svelte/Vitest frontend tests (both projects)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Running frontend tests  $(R)"
@@ -913,13 +920,12 @@ test-client: ## Test > Frontend client tests only (headless Chromium — compone
 handoff-test: ## Test > Standalone handoff SCM_RIGHTS tests (no vibe.d, no engine deps)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Handoff tests  $(R)"
 	@$(DUB) build --config=handoff-test 2>&1 | tail -3
-	@./handoff-test
+	@./engine/handoff-test
 
 exec-reload-test: ## Test > exec(2)-based hot-reload: TCP socket identity survives fork+SCM_RIGHTS
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Exec-reload tests  $(R)"
 	@$(DUB) build --config=exec-reload-test 2>&1 | tail -3
-	@./exec-reload-test
-
+	@./engine/exec-reload-test
 # Full end-to-end exec-reload integration test against a mock IRC server.
 # Spawns a Python TCP listener, opens a connection from the OLD engine
 # path, execs into the NEW engine path, and verifies the same TCP socket
@@ -927,9 +933,9 @@ exec-reload-test: ## Test > exec(2)-based hot-reload: TCP socket identity surviv
 exec-reload-it: ## Test > Full exec-reload flow: OLD engine → exec → NEW engine, mock IRC server
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Exec-reload integration test  $(R)"
 	@$(DUB) build --config=exec-reload-integration 2>&1 | tail -3
-	@chmod +x source/exec_reload_mock_irc.py
+	@chmod +x engine/source/exec_reload_mock_irc.py
 	@bash -c 'set -e; rm -f /tmp/exec-reload-test.result; \
-	  python3 source/exec_reload_mock_irc.py 16667 /tmp/exec-reload-test.result & \
+	  python3 engine/source/exec_reload_mock_irc.py 16667 /tmp/exec-reload-test.result & \
 	  MOCK_PID=$$!; \
 	  sleep 0.5; \
 	  ./exec-reload-integration old /tmp/exec-reload-test.snapshot /tmp/exec-reload-test.marker && \
@@ -970,14 +976,13 @@ lint-frontend: ## Quality > Frontend type-check (svelte-check)
 
 fmt: ## Quality > Format D sources in-place
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Formatting D sources  $(R)"
-	@find source -name "*.d" -exec dfmt -i {} \; 2>/dev/null || \
+	@find engine/source -name "*.d" -exec dfmt -i {} \; 2>/dev/null || \
 		printf '%b\n' "$(Y)$(WR) dfmt not found. Install: dub fetch dfmt$(R)"
 	@printf '%b\n' "$(BG)$(OK) D sources formatted$(R)"
 
 fmt-check: ## Quality > Verify all D sources are formatted (CI gate, no writes)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Checking D source formatting  $(R)"
-	@UNFORMATTED=$$(find source -name "*.d" -exec dfmt -c {} \; 2>&1 | grep -v "^$" || true); \
-	if [ -n "$$UNFORMATTED" ]; then \
+	@UNFORMATTED=$$(find engine/source -name "*.d" -exec dfmt -c {} \; 2>&1 | grep -v "^$" || true); \
 		printf '%b\n' "$(Y)$(WR) Unformatted sources detected:$(R)"; \
 		echo "$$UNFORMATTED"; \
 		printf '%b\n' "$(D)Fix with: make fmt$(R)"; \
@@ -1358,7 +1363,20 @@ docker-restart-code: ensure-colima ## Dev > Rebuild frontend + D binaries + rest
 # Dev — local compose stack
 # ----------------------------------------------------------------------------
 
-.PHONY: local-dev-up local-dev-down local-dev-down-clean local-dev-smoke
+.PHONY: local-dev-up local-dev-down local-dev-down-clean local-dev-smoke local-dev-up-observability
+.PHONY: local-up local-up-observability local-down local-down-clean
+
+local-up:                                 ## Local > Up without SigNoz (default, ~300 MB)
+	docker compose -f deploy/local/docker-compose.yml up -d
+
+local-up-observability:                   ## Local > Up with SigNoz (observability, ~4 GB)
+	IRCFIBER_OTEL_ENABLED=1 docker compose --profile observability -f deploy/local/docker-compose.yml up -d
+
+local-down:                               ## Local > Down (preserve data)
+	docker compose -f deploy/local/docker-compose.yml down
+
+local-down-clean:                         ## Local > Down + wipe volumes (Caution: destroys data)
+	docker compose -f deploy/local/docker-compose.yml down -v
 
 local-dev-up:                               ## Dev > Bring up local SigNoz + IRC Fiber stack
 	docker compose -f deploy/local/docker-compose.yml up -d
@@ -1368,6 +1386,9 @@ local-dev-down:                             ## Dev > Stop local stack (preserve 
 
 local-dev-down-clean:                       ## Dev > Stop local stack and wipe all volumes (Caution: destroys ClickHouse data)
 	docker compose -f deploy/local/docker-compose.yml down -v
+
+local-dev-up-observability:                 ## Dev > Bring up local stack WITH SigNoz (~4 GB)
+	IRCFIBER_OTEL_ENABLED=1 docker compose --profile observability -f deploy/local/docker-compose.yml up -d
 
 local-dev-smoke:                            ## Dev > Run observability smoke test against local stack
 	bash tests/local-dev/smoke-observability.sh
@@ -1430,12 +1451,12 @@ _playbook    = cd deploy && ansible-playbook -l $(_target) $(_vault_arg)
 update: frontend build build-engine ## Deploy > Build frontend + gateway + engine, handoff-deploy (zero disconnect for engines)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Deploy → $(_target)  $(R)"
 	@$(_playbook) playbooks/deploy-update.yml $(if $(SKIP_MIGRATE),-e skip_migrate=true)
-	# The playbook's rsync handles public/ + views/ (dist/ included since
+	# The playbook's rsync handles public/ + engine/views/ (dist/ included since
 	# the read-only mount on the container means docker cp writes silently
 	# fail). The shell-level push below is a belt-and-suspenders fallback
 	# in case a build produced a new dist AFTER the rsync step (the
 	# `frontend` target runs first, but `inject-manifest.js` updates
-	# views/index.dt in place, so re-syncing dist/ + views/ here is safe).
+	# engine/views/index.dt in place, so re-syncing dist/ + views/ here is safe).
 	# Chain the SigNoz dashboards + alerts deploys so structured
 	# log changes, new dashboards, and new alert rules all land in
 	# the same `make update` invocation. Both are idempotent (by
@@ -1472,8 +1493,8 @@ update-assets: frontend ## Deploy > Build frontend + push public/* to running ga
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Asset push → $(_target_ssh) ($(_target))  $(R)"
 	@printf '%b\n' "$(D)  Tarring public/ → ssh → docker exec tar -xf - (clean extract)$(R)"
 	@tar cz --no-xattrs --format=ustar -C public . | ssh deploy@$(_target_ssh) 'docker exec -i ircfiber-gateway sh -c "rm -rf /app/public/dist/ /app/public/.vite/ /app/public/assets/ 2>/dev/null; tar xzf - -C /app/public"'
-	@printf '%b\n' "$(D)  Pushing views/index.dt (updated bundle hashes)$(R)"
-	@ssh deploy@$(_target_ssh) 'docker exec -i ircfiber-gateway sh -c "cat > /app/views/index.dt"' < views/index.dt
+	@printf '%b\n' "$(D)  Pushing engine/views/index.dt (updated bundle hashes)$(R)"
+	@ssh deploy@$(_target_ssh) 'docker exec -i ircfiber-gateway sh -c "cat > /app/views/index.dt"' < engine/views/index.dt
 
 # Show running container images and versions on the target.
 update-status: ## Deploy > Show running containers & image versions

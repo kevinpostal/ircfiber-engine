@@ -96,9 +96,9 @@ COPY <<EOF ./source/.cache_bust_$CACHE_BUST
 bust=$CACHE_BUST
 EOF
 
-COPY dub.sdl dub.selections.json ./
-COPY source/ ./source/
-COPY views/  ./views/
+COPY engine/dub.sdl engine/dub.selections.json ./
+COPY engine/source/ ./source/
+COPY engine/views/  ./views/
 COPY config/ ./config/
 COPY public/ ./public/
 

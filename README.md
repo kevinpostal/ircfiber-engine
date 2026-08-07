@@ -54,22 +54,27 @@ make docker-down       # stop everything
 
 ```
 IRC_FIBER/
-├── source/                  D backend (LDC2)
-│   ├── ircfiber/
-│   │   ├── api/             REST + WebSocket endpoints
-│   │   ├── auth.d           Authentication / sessions
-│   │   ├── db/              MongoDB models (user, network, messages, prefs, pastebins, uploads)
-│   │   ├── engine/          Event consumer / processor / state
-│   │   ├── irc/             IRC client (connection, registry, manager, SASL, CHATHISTORY, reconnect)
-│   │   ├── models/          Domain types (IRCEvent, Message, Network, User, IRCChannel)
-│   │   ├── redis/           Redis protocol / client
-│   │   ├── storage/         Buffer / session / redis storage layer
-│   │   ├── upload/          Local file upload handler
-│   │   └── web/             HTTP routes / static / WebSocket
-│   ├── app.d                App entry point (gateway)
-│   └── app_engine.d         App entry point (IRC engine)
-├── views/                   Diet templates (layout, index, login, register, message_fragment)
-├── frontend/                Svelte 5 + Vite
+├── engine/                  D backend (LDC2) — enterprise service
+│   ├── source/              D sources
+│   │   ├── ircfiber/
+│   │   │   ├── api/         REST + WebSocket endpoints
+│   │   │   ├── auth.d       Authentication / sessions
+│   │   │   ├── db/          MongoDB models (user, network, messages, prefs, pastebins, uploads)
+│   │   │   ├── engine/      Event consumer / processor / state
+│   │   │   ├── irc/         IRC client (connection, registry, manager, SASL, CHATHISTORY, reconnect)
+│   │   │   ├── models/      Domain types (IRCEvent, Message, Network, User, IRCChannel)
+│   │   │   ├── redis/       Redis protocol / client
+│   │   │   ├── storage/     Buffer / session / redis storage layer
+│   │   │   ├── upload/      Local file upload handler
+│   │   │   └── web/         HTTP routes / static / WebSocket
+│   │   ├── app.d            App entry point (gateway)
+│   │   └── app_engine.d     App entry point (IRC engine)
+│   ├── views/               Diet templates (layout, index, login, register, message_fragment, admin/*)
+│   ├── dub.sdl              D build config
+│   ├── dub.selections.json
+│   ├── genhash.d
+│   └── README.md            Engine docs
+├── frontend/                Svelte 5 + Vite — enterprise SPA
 │   ├── src/
 │   │   ├── components/      Svelte components (Sidebar, ChatArea, MessageRow, etc.)
 │   │   ├── lib/             Utility modules (autolinker, ircFormatting, messageBuilder, …)
@@ -84,25 +89,21 @@ IRC_FIBER/
 │   │   ├── app.css
 │   │   ├── main.ts
 │   │   └── types.ts
-│   ├── e2e/                 Playwright E2E specs
 │   ├── index.html
 │   ├── package.json
 │   ├── svelte.config.js
 │   ├── tsconfig.json
-│   └── vite.config.ts
-├── public/                  Static assets + built frontend output
+│   ├── vite.config.ts       (publicDir: ../public, outDir: ../public/dist)
+│   └── README.md            Frontend docs
+├── public/                  Static assets + built frontend output (shared)
 │   ├── dist/                Vite build output
 │   ├── fonts/               Source Sans Pro (woff2)
 │   └── favicon*
-├── config/                  dev.conf / prod.conf
-├── docker/                  Dockerfiles + ngircd config
-├── e2e/                     Top-level Playwright specs
-├── data/                    Local dev data (networks.json, users.json)
-├── Makefile                 50+ targets: build, run, docker, test, dscanner, cross-compile
-├── Containerfile            Multi-arch build
+├── config/                  dev.conf / prod.conf (shared)
+├── Makefile                 Top-level orchestrator (50+ targets: build, run, docker, test, dscanner, cross-compile)
+├── Containerfile            Multi-arch build (COPY engine/*)
 ├── docker-compose.yml       Full stack
 ├── docker-compose.test.yml  Test stack
-├── dub.sdl                  D build config
 └── README.md
 ```
 
@@ -178,6 +179,4 @@ make dscanner-unused
 make dscanner-all
 ```
 
-## License
-
-MIT — see [dub.sdl](dub.sdl).
+MIT —see [engine/dub.sdl](engine/dub.sdl).
