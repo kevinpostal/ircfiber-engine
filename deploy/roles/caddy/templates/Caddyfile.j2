@@ -132,8 +132,19 @@
     # Gateway upstream — single replica or load-balanced multi-replica.
     # When replica_count > 1, active health checks detect dead replicas
     # and ip_hash pins WebSocket clients to the same replica.
-    {% if (gateway_replica_count | default(1) | int) == 1 %}
-    reverse_proxy ircfiber-gateway:{{ gateway_http_port }} {
+    # Step 3 swappable backend: when gateway_use_python is true, proxy to
+    # irc-fiber-api-py:8000 instead of ircfiber-gateway:8090 (no frontend rebuild needed).
+    {% if (gateway_use_python | default(false) | bool) %}
+    reverse_proxy {{ gateway_python_host | default('irc-fiber-api-py') }}:{{ gateway_python_port | default(8000) }} {
+        transport http {
+            dial_timeout 30s
+            response_header_timeout 60s
+            read_timeout 24h
+            write_timeout 24h
+        }
+    }
+    {% elif (gateway_replica_count | default(1) | int) == 1 %}
+    reverse_proxy {{ gateway_backend_host | default('ircfiber-gateway') }}:{{ gateway_backend_port | default(gateway_http_port) }} {
         # Long-lived transport for WebSockets and slow message-history fetches
         transport http {
             dial_timeout 30s
@@ -143,8 +154,7 @@
         }
     }
     {% else %}
-    reverse_proxy{% for i in range(gateway_replica_count | int) %} ircfiber-gateway-{{ i }}:{{ gateway_http_port }}{% endfor %} {
-        # Active health checks — remove dead replicas from the pool
+    reverse_proxy{% for i in range(gateway_replica_count | int) %} {{ gateway_backend_host | default('ircfiber-gateway') }}-{{ i }}:{{ gateway_backend_port | default(gateway_http_port) }}{% endfor %} {
         health_uri /health
         health_interval 30s
         health_timeout 5s

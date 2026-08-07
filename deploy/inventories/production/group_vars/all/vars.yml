@@ -70,7 +70,16 @@ gateway_replica_count: 1
 # When true and replica_count > 1, Caddy uses ip_hash load balancing so
 # WebSocket clients stay pinned to the same replica.
 gateway_replica_sticky: true
-
+# Swappable API backend (Step 3): D gateway (default) vs Python gateway.
+# When gateway_use_python is true, Caddy proxies /api/* and /ws to
+# irc-fiber-api-py:8000 instead of ircfiber-gateway:8090. Frontend needs
+# no rebuild — it keeps API_BASE=/api behind Caddy. Toggle via
+# `gateway_use_python: true` in host_vars or with `--extra-vars`.
+gateway_backend_host: "ircfiber-gateway"
+gateway_backend_port: "{{ gateway_http_port }}"
+gateway_use_python: false
+gateway_python_host: "irc-fiber-api-py"
+gateway_python_port: 8000
 # --- Caddy --------------------------------------------------------------------
 caddy_data_volume: "ircfiber_caddy_data"
 caddy_config_volume: "ircfiber_caddy_config"

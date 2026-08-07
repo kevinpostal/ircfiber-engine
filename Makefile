@@ -714,6 +714,23 @@ ircfiber-default-migrate: ## Build > Backfill the default IRC Fiber network for 
 	@printf '%b\n' "$(BG)$(OK) Running ircfiber-default-migrate (dry-run)$(R)"
 	@DRY_RUN=1 ./ircfiber-default-migrate --dry-run
 
+# Python gateway (Step 3 swappable API)
+api-python-up: ## Python API > Bring up Python gateway alongside D gateway (local dev)
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Python gateway up  $(R)"
+	@docker compose -f deploy/local/docker-compose.yml -f deploy/local/docker-compose.override.python.yml up -d irc-fiber-api-py
+	@printf '%b\n' "$(BG)$(OK) Python gateway running at http://127.0.0.1:8001 (health: /api/ping)$(R)"
+
+api-python-down: ## Python API > Stop Python gateway
+	@docker compose -f deploy/local/docker-compose.yml -f deploy/local/docker-compose.override.python.yml down --remove-orphans || true
+	@printf '%b\n' "$(BG)$(OK) Python gateway stopped$(R)"
+
+api-python-build: ## Python API > Build Python gateway image
+	@docker build -t irc-fiber-api-py:local api-python
+	@printf '%b\n' "$(BG)$(OK) Python image built$(R)"
+
+api-python-test: ## Python API > Run auth compat tests
+	@python3 -m pytest api-python/tests/test_auth_compat.py -v
+
 build-release: ## Build > Optimized release build
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building IRC Fiber (Release)  $(R)"
 	@bash -o pipefail -c '$(DUB) build --build=release 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | tail -8'
