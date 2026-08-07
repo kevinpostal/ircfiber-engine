@@ -88,13 +88,12 @@ AR := →
 .PHONY: dev dev-docker dev-live debug debug-live stop
 .PHONY: engine engine-rebuild engine-handoff engine-handoff-redis engine-restart engine-test
 .PHONY: gateway gateway-rebuild gateway-restart
+.PHONY: up down gateway-up gateway-down engine-up engine-down engine-logs gateway-logs
 .PHONY: status logs logs-engine logs-gateway logs-supervisor crash-logs
-.PHONY: watch watch-engine watch-gateway
 
 # Deprecated aliases (kept for back-compat — see ALIASES section at bottom)
 .PHONY: start run run-tailnet run-local run-gateway run-engine
-.PHONY: up down down-tailnet restart-web restart-engine-tailnet
-.PHONY: logs-web logs-engine-tailnet watch-web
+.PHONY: down-tailnet restart-web restart-engine-tailnet
 
 .PHONY: test test-frontend test-all test-watch test-coverage test-lib test-client handoff-test exec-reload-test exec-reload-it clean fmt fmt-check lint deps-check
 .PHONY: dscanner-install dscanner-all dscanner-syntax dscanner-lint dscanner-unused \
@@ -652,15 +651,12 @@ watch: watch-engine watch-gateway ## Component > Watch both engine + gateway sou
 # ─── DEPRECATED ALIASES (back-compat) ───────────────────────────────────────
 # Prefer the new Component Workflow names. These are kept so old docs / muscle
 # memory still work but emit a deprecation hint the first time they're used.
-
 start: dev
 run: dev
 run-tailnet: dev-live
 run-local: dev
 run-gateway: gateway
 run-engine: engine
-up: debug
-down: stop
 down-tailnet: stop
 restart-web: gateway-restart
 restart-engine-tailnet: engine-restart
@@ -1263,6 +1259,18 @@ docker-down-backend: ensure-colima ## Docker > Stop backend services only
 docker-restart-backend: ensure-colima ## Docker > Restart backend services only
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Restarting Backend Services  $(R)"
 	@docker compose up -d --build --force-recreate ircfiber-engine redis mongo ircd
+	@printf '%b\n' "$(BG)$(OK) Backend services restarted$(R)"
+# ─── Split containers: API (gateway) vs Engine — easy start/stop ─────────────
+up: docker-up ## Docker > Start both API + Engine as separate containers (split)
+down: docker-down ## Docker > Stop both
+gateway-up: docker-up-web ## Docker > Start API (gateway) container only
+gateway-down: docker-down-web ## Docker > Stop API container only
+engine-up: ## Docker > Start Engine container only
+	@docker compose up -d ircfiber-engine
+engine-down: ## Docker > Stop Engine container only
+	@docker compose stop ircfiber-engine
+engine-logs: logs-engine ## Docker > Tail engine container logs
+gateway-logs: logs-gateway ## Docker > Tail gateway container logs
 # ----------------------------------------------------------------------------
 # Docker — interactive shells
 # ----------------------------------------------------------------------------
@@ -1278,8 +1286,7 @@ docker-restart-backend: ensure-colima ## Docker > Restart backend services only
 # Both docker-compose.yml and docker-compose.test.yml use the same
 # container_name values, so `docker exec` always finds the right one.
 DOCKER_COMPOSE ?= docker-compose.yml
-SHELL_SVC ?= irc_fiber
-
+SHELL_SVC ?= ircfiber-gateway
 docker-shell: ensure-colima ## Docker > Open bash shell in the gateway container
 	@SVC=$${SVC:-$(SHELL_SVC)}; \
 		printf '\n%b\n' "$(_BCn)$(K)$(B)  Opening shell in $${SVC}  $(R)"; \

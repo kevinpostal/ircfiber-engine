@@ -5,7 +5,7 @@ services:
       dockerfile: Containerfile
       target: runtime-gateway
     image: irc-fiber-gateway:latest
-    container_name: irc_fiber_test
+    container_name: ircfiber-gateway
     restart: unless-stopped
     command: ["/app/irc-fiber"]
     networks:
@@ -46,7 +46,7 @@ services:
       dockerfile: Containerfile
       target: runtime-engine
     image: irc-fiber-engine:latest
-    container_name: irc_engine_test
+    container_name: ircfiber-engine
     restart: unless-stopped
     command: ["/app/irc-fiber-engine"]
     networks:
