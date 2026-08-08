@@ -107,8 +107,6 @@
         content: |
           # Managed by Ansible — {{ deploy_user_name }} passwordless sudo
           {{ deploy_user_name }} ALL=(ALL) NOPASSWD: ALL
-          Defaults:{{ deploy_user_name }} !requiretty
-
 - name: Collect authorized keys from various sources
   ansible.builtin.set_fact:
     resolved_authorized_keys: >-

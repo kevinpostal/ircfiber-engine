@@ -135,7 +135,6 @@
       - "--exclude=.git"
       - "--exclude=node_modules"
       - "--exclude=.dub"
-      - "--exclude=deploy"
       - "--exclude=e2e/test-results"
       - "--exclude=*.log"
       - "--exclude=frontend/node_modules"
@@ -152,6 +151,7 @@
   ansible.builtin.command: >
     docker build
     --progress=plain
+    --target runtime-gateway
     --tag {{ ircfiber_gateway_image_full }}
     {% for key, value in ircfiber_gateway_build_args.items() %}
     --build-arg {{ key }}={{ value }}
@@ -167,6 +167,7 @@
   ansible.builtin.command: >
     docker build
     --progress=plain
+    --target runtime-engine
     --tag {{ ircfiber_engine_image_full }}
     {% for key, value in ircfiber_engine_build_args.items() %}
     --build-arg {{ key }}={{ value }}

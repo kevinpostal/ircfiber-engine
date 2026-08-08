@@ -81,14 +81,12 @@
     # is skipped at template render time.
     env:
       SIGNOZ_API_KEY: "{{ caddy_signoz_api_key | default('') }}"
-    ports:
-      - "80:80"
-      - "443:443"
-      # Tailscale-only Grafana listener.
-      - "{{ caddy_tailscale_logging_address }}:{{ caddy_tailscale_logging_port | default(3443) }}:{{ caddy_tailscale_logging_port | default(3443) }}"
-      # Tailscale-only SigNoz listener. The port is published on the
-      # Tailscale IP only — not reachable from the public internet.
-      - "{{ caddy_tailscale_logging_address }}:{{ caddy_tailscale_signoz_port | default(3003) }}:{{ caddy_tailscale_signoz_port | default(3003) }}"
+    ports: >-
+      {{
+        ["80:80", "443:443"]
+        + ([caddy_tailscale_logging_address ~ ":" ~ (caddy_tailscale_logging_port | default(3443)) ~ ":" ~ (caddy_tailscale_logging_port | default(3443))] if (caddy_tailscale_logging_enabled | default(false) | bool) else [])
+        + ([caddy_tailscale_logging_address ~ ":" ~ (caddy_tailscale_signoz_port | default(3003)) ~ ":" ~ (caddy_tailscale_signoz_port | default(3003))] if (caddy_tailscale_signoz_enabled | default(false) | bool) else [])
+      }}
     # Bind-mount tailscaled.sock so the built-in caddytls.Tailscale cert
     # manager can fetch real certs for *.ts.net hostnames. Mounted at the
     # same path inside the container (Caddy looks there by default).
