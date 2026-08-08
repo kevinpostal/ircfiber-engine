@@ -1425,3 +1425,62 @@ Files:
 | `deleteNetworkCore` walks every server when scrubbing an empty id | This is the correct behaviour for ghost rows that have no canonical assignment, but a malicious `networkId=""` payload could theoretically hit many servers. The endpoint is admin-gated and the prompt copy makes the action obvious; we accept the trade-off. |
 | Test framework constraints | `frontend/src/admin/pages/Servers.svelte.test.ts` uses `vitest-browser-svelte` + playwright and is therefore blocked in worktrees (symlinked `node_modules` + URL-encoded spaces in path). Run from the parent repo on macOS / Linux. The 2 unrelated failures in `ServerLogCard.test.ts` and `ircStore.svelte.test.ts` are pre-existing on main and not introduced by this change. |
 
+---
+
+# IRC Fiber — Deploy (gateway-only, engine untouched)
+
+`ircfiber-ovh-1` (`40.160.227.49`) is the old OVH IP — DNS still points there but the live host is `vps-efb4b52d` (`203.0.113.10`, `15.204.93.5` shorthand). Inventory `deploy/inventories/production/hosts.ini` lists both; the live gateway/engine are on `203.0.113.10`.
+
+The engine (`ircfiber-engine-ovh`, PID 7) holds all IRC TCP/TLS sockets. Restarting it drops every network for ~1s (TLS soft-reconnect) and risks nick collisions. A frontend/CSS change must not touch it.
+
+## When this applies
+
+* Only `frontend/` or `backend/views/index.dt` changed (Vite content-hash). `make frontend` rewrites `public/dist/assets/main-*.js` + `backend/views/index.dt` (the Diet template that injects the hashed `<script>`). No D code changed.
+* Do **not** run `make update` / `playbooks/deploy-update.yml` — that builds `builder` → extracts both `irc-fiber` + `irc-fiber-engine` → `docker restart ircfiber-gateway` **and** engine handoff/hard-restart. Use the gateway-only path below.
+
+## Procedure (Aug 2026, verified on `vps-efb4b52d`)
+
+```bash
+# 1. Build frontend locally (deterministic hash, e.g. main-k8PJwXAF.js)
+make frontend   # vite build + inject-manifest → public/dist + backend/views/index.dt
+ls -lh public/dist/assets/ | grep main
+cat backend/views/index.dt | grep main
+
+# 2. Sync to host's build context (host builds gateway image FROM this context)
+tar cz --no-xattrs --format=ustar -C public dist | ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber deploy@203.0.113.10 'sudo sh -c "rm -rf /opt/ircfiber-src/public/dist && mkdir -p /opt/ircfiber-src/public && tar xzf - -C /opt/ircfiber-src/public"'
+cat backend/views/index.dt | ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber deploy@203.0.113.10 'sudo tee /opt/ircfiber-src/backend/views/index.dt >/dev/null'
+
+# 3. Rebuild gateway image on host (runtime-gateway never compiles engine)
+ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber deploy@203.0.113.10 'cd /opt/ircfiber-src && DOCKER_BUILDKIT=1 docker build --target runtime-gateway -t kevindpostal/irc-fiber-gateway:0.3.0 -f Containerfile .'
+
+# 4. Recreate gateway container only (engine stays PID 7)
+ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber deploy@203.0.113.10 '
+  sudo docker stop ircfiber-gateway && sudo docker rm ircfiber-gateway
+  sudo docker run -d --name ircfiber-gateway --restart unless-stopped \
+    --network ircfiber_net --network ircfiber_logging \
+    -v ircfiber_uploads:/app/uploads -v ircfiber_logs:/var/log/irc-fiber \
+    --env-file /etc/ircfiber/gateway/env -p 8090:8090 \
+    kevindpostal/irc-fiber-gateway:0.3.0 /app/irc-fiber
+  sudo docker network connect ircfiber_logging ircfiber-gateway 2>/dev/null || true
+'
+# Alternative if host still uses docker-compose for gateway:
+#   ssh deploy@203.0.113.10 'cd /opt/ircfiber-src && docker compose build ircfiber-gateway && docker compose up -d --force-recreate ircfiber-gateway'
+
+# 5. Keep old hash for 1h Cloudflare edge cache (Cache-Control: public, max-age=3600 on HTML)
+#    The new HTML references main-k8PJ..., but CF may still serve cached HTML referencing main-Dlu...
+#    for up to 1h. Without the alias the old JS 404s (edge caches 404s too — purge token lacks Zone:Cache Purge).
+ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber deploy@203.0.113.10 '
+  sudo docker exec ircfiber-gateway sh -c "cp /app/public/dist/assets/main-k8PJwXAF.js /app/public/dist/assets/main-Dlu0gYHA.js 2>/dev/null; ls -lh /app/public/dist/assets/ | grep main"
+  sudo sh -c "cp /opt/ircfiber-src/public/dist/assets/main-k8PJwXAF.js /opt/ircfiber-src/public/dist/assets/main-Dlu0gYHA.js 2>/dev/null; ls -lh /opt/ircfiber-src/public/dist/assets/ | grep main"
+'
+```
+
+Verification (`engine untouched`):
+```bash
+ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber deploy@203.0.113.10 'docker exec ircfiber-engine-ovh pidof irc-fiber-engine; docker ps --format "{{.Names}} {{.Status}}" | grep -E "gateway|engine"; docker exec ircfiber-gateway sh -c "curl -fsS http://localhost:8090/health | head -5"; curl -s -o /dev/null -w "%{http_code} " https://ircfiber.com/public/dist/assets/main-k8PJwXAF.js; echo'
+# → engine PID 7, gateway Up <1m, health healthy, 200
+curl -s https://ircfiber.com/public/dist/assets/main-k8PJwXAF.js -o /dev/null -w "%{http_code}\n"  # 200 via CF
+```
+
+* If you also need to stop the 404 for the *previous* hash immediately and the vault CF token lacks purge, add the alias as above — it costs one extra 469K file and avoids a 1h 404 window. Remove the alias on the next deploy after the edge TTL expires.*
+* Host SSH must use `-F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber` — the default `IdentityAgent` (1Password) offers too many keys and hits `Too many authentication failures`. `deploy/.vault_pass.txt` supplies the vault password for `ansible-vault view` but is not needed for this gateway-only tar+docker path.*
