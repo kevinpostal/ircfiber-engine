@@ -111,7 +111,7 @@ The catalog groups tokens into 11 buckets (see
 
 | Issue | Notes |
 |---|---|
-| Engine-side `dub test` (Dub-managed) currently fails to build | Pre-existing on `main`; not related to this change. `make engine-handoff` / `dub build --config=…` works. |
+| Engine-side `dub test` (Dub-managed) currently fails to build | Pre-existing on `main`; not related to this change. `make build --config=…` works (`engine-handoff` removed 2026-08-08). |
 | Some custom IRCds emit unparseable 005 streams | `splitIsupportText` falls back to a single-token pass-through so the timeline at least shows *something*. The catalog marks unknowns as `server-specific` so the user knows they're nonstandard. |
 | Bare flag in concatenated text (e.g. `AWAYLEN=307KNOCK`) | Catalog ambiguity resolved via `lookupIsupport`-aware splitter — see `splitIsupportText` for the full disambiguation rules. Tested via the `splitIsupportText` unit-test suite. |
 
@@ -473,21 +473,21 @@ Always build via the **remote BuildKit** (docker build on the server) or use `ma
 
 ```bash
 # Correct: builds on the remote server
-make update                        # full deploy (frontend + binaries + handoff)
-make handoff                       # engine-only handoff (builds on remote)
+make update                        # full deploy (frontend + binaries, hard restart — see Engine Lifecycle above)
+# (handoff removed 2026-08-08 — use hard restart via docker restart / make update)
 
 # WRONG: local binary won't run on x86_64
 scp irc-fiber deploy@server:/tmp/  # ← do not do this
 ```
 
-## Handoff deployment flow
+## Deploy flow (hard restart)
 
 `deploy-update.yml` builds the binary INSIDE a Docker container on the remote server using BuildKit:
 1. Rsync local source → `/opt/ircfiber-src/` on remote
 2. `docker build --target builder` — compiles D code via dub + LDC
 3. Extracts binary from builder image
 4. `docker cp` into running gateway container + restart
-5. Engine hot-reload (handoff) — no IRC disconnect
+5. Engine hard restart — brief IRC disconnect, auto-reconnect via backoff (no handoff)
 
 Key issue: `rsync delete: false` (now fixed to `delete: true`) allowed stale source files like `source/ircfiber/web/admin.d` to persist on the remote after the admin code was refactored into the `admin/` package directory. This caused `dub build` to fail with "package name conflicts with module name" — the error was hidden by `|| true` in the Containerfile's RUN command.
 
@@ -769,8 +769,8 @@ JSMIGRATE_DRY_RUN=1 ./janitor-migrate
 JSMIGRATE_DRY_RUN=0 ./janitor-migrate
 
 # 2. Deploy via your normal pipeline:
-make update        # full deploy (engine + frontend + handoff + janitor-migrate + verification)
-make handoff       # engine-only hot reload
+make update        # full deploy (engine + frontend + hard restart + janitor-migrate + verification)
+# (handoff removed 2026-08-08 — see Engine Lifecycle above)
 make gateway-restart  # gateway-only reload
 
 # Skip the migration step on a `make update`:
@@ -1369,7 +1369,7 @@ The engine (`ircfiber-engine-ovh`, PID 7) holds all IRC TCP/TLS sockets. Restart
 ## When this applies
 
 * Only `frontend/` or `backend/views/index.dt` changed (Vite content-hash). `make frontend` rewrites `public/dist/assets/main-*.js` + `backend/views/index.dt` (the Diet template that injects the hashed `<script>`). No D code changed.
-* Do **not** run `make update` / `playbooks/deploy-update.yml` — that builds `builder` → extracts both `irc-fiber` + `irc-fiber-engine` → `docker restart ircfiber-gateway` **and** engine handoff/hard-restart. Use the gateway-only path below.
+* Do **not** run `make update` / `playbooks/deploy-update.yml` — that builds `builder` → extracts both `irc-fiber` + `irc-fiber-engine` → `docker restart ircfiber-gateway` **and** engine hard-restart (handoff removed 2026-08-08). Use the gateway-only path below.
 
 ## Procedure (Aug 2026, verified on `vps-efb4b52d`)
 

@@ -163,9 +163,10 @@ assigning networks to it. No gateway changes required.
 # Fast incremental binary deploy (daily use):
 make update                     # rsync + BuildKit → restart engine + gateway
 
-# Zero-disconnect engine hot-reload (preserves IRC sockets):
-make handoff                    # new binary runs in same container as old
-make handoff-backup             # hot-reload the backup engine
+# Engine deploys are hard restart (brief disconnect, auto-reconnect). Handoff removed 2026-08-08.
+# See AGENTS.md Engine Lifecycle. Do not reintroduce SCM_RIGHTS / IRCFIBER_RELOAD_FROM_PID.
+make handoff                    # REMOVED — now hard restart (see above)
+make handoff-backup             # REMOVED
 
 # Full image rebuild (Containerfile from scratch):
 make update-full                # alias: make deploy
@@ -182,32 +183,28 @@ ansible-playbook playbooks/caddy.yml
 ansible-playbook playbooks/engine.yml
 ```
 
-### Graceful engine handoff (zero disconnect)
+### Engine deploy (hard restart)
 
-When `make handoff` runs, the new engine binary is started inside the **existing**
-Docker container alongside the old engine process. Both processes share the same
-PID and network namespace, so `SCM_RIGHTS` FD transfer works across processes
-even though they're inside a container.
+Engine deploys use hard restart (`docker restart ircfiber-engine-ovh`).
+IRC connections briefly disconnect and auto-reconnect via backoff.
+`SCM_RIGHTS` handoff (`/tmp/ircfiber-handoff-<serverId>.sock`,
+`IRCFIBER_RELOAD_FROM_PID`) was removed 2026-08-08 as legacy — see
+`AGENTS.md#Engine Lifecycle` and `engine/source/ircfiber/engine/handoff.d`
+(deprecated stub).
 
 ```
-make handoff
+make update   # gateway+engine hard restart
 ```
 
-What happens:
+What happens (hard restart):
 1. Builds the new engine binary via BuildKit (same as `make update`)
-2. Copies the new binary into the running container as `/app/irc-fiber-engine-handoff`
-3. Starts it inside the container with `IRCFIBER_RELOAD_FROM_PID=<old_pid>`
-4. Sends a `gracefulReload` control message to the old engine via `redis-cli LPUSH`
-5. Old engine pauses every IRC connection, serialises per-connection state,
-   transfers plain TCP sockets via `SCM_RIGHTS` over a Unix socket at
-   `/tmp/ircfiber-handoff-<serverId>.sock`, then exits with rc=0.
-6. New engine adopts the live sockets, replays channel/nick/cap state,
-   and continues the event loop on the same TCP socket the old engine had.
-7. The old binary is atomically replaced with the new one on disk so the
-   next `docker restart` picks up the correct version.
+2. Copies the new binary into the running container as `/app/irc-fiber-engine`
+3. Restarts the container (`docker restart ircfiber-engine-ovh`) — brief IRC
+   disconnect, auto-reconnect via engine backoff loop. DM/channel scrollback
+   survives via `storage/buffer.d` (30-day `scrollback:` keys, not FD transfer).
 
-TLS connections are soft-reconnected (1-2s CAP/SASL/JOIN), while plain TCP
-connections experience zero disruption.
+TLS connections soft-reconnect (1-2s CAP/SASL/JOIN); plain TCP also reconnects
+(previously zero-disconnect via `SCM_RIGHTS`, now same as TLS).
 
 The first run takes ~80-90s (BuildKit build). Subsequent runs take 5-15s
 (incremental recompilation via Dockers' dub cache mount).
