@@ -56,6 +56,17 @@ final class RedisStorage {
         return client;
     }
 
+    /// Closes all idle connections held by the underlying pool.
+    /// Safe to call multiple times. Use when a per-session RedisStorage
+    /// is being torn down to avoid relying on GC finalizers to reclaim
+    /// the TCP fd (see ircPoolDispatch).
+    void close() @trusted nothrow {
+        if (client) {
+            try client.releaseUnusedConnections();
+            catch (Exception) {}
+        }
+    }
+
     void setJson(string key, Json value, long ttlSeconds = 0) @trusted {
         try {
             if (ttlSeconds > 0)
