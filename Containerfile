@@ -4,23 +4,38 @@
 # ===================================
 #
 # Stage graph:
-#   base    : Ubuntu 22.04 + LDC toolchain (apt cache mounted)
-#   builder : dub build of all 4 release configs in one stage
-#             - /build/.dub mounted as cache so dep fetch + module builds
-#               survive across builds.
-#             - `dub build --parallel` parallelizes LDC compile jobs inside
-#               each config; without `--force` dub keeps its incremental
-#               module cache between configs so editing one binary
-#               recompiles only that binary.
-#   runtime : slim Ubuntu + 4 stripped binaries
+#   base             : Ubuntu 22.04 + LDC toolchain (apt cache mounted)
+#   builder-common   : dub fetch + shared `common` library build
+#   builder-backend  : gateway binary (`irc-fiber`) + views — from builder-common
+#   builder-engine   : engine binaries (`irc-fiber-engine`, `janitor-migrate`,
+#                      `ircfiber-default-migrate`) — from builder-common
+#   builder          : aggregate stage for `--target builder` deploys
+#                      (deploy-update.yml / deploy-handoff.yml extract binaries)
+#   runtime          : legacy combined image (all binaries)
+#   runtime-gateway  : slim Ubuntu + gateway binary only
+#   runtime-engine   : slim Ubuntu + engine binaries only
+#
+# Per-service split (why):
+#   The gateway and engine images used to share ONE builder RUN that compiled
+#   all six dub configs. Any change in backend/ or backend/views/ re-triggered
+#   the full ENGINE compile (and vice versa) — a frontend-only rewrite of
+#   `backend/views/index.dt` cost a ~7-minute full rebuild of BOTH images.
+#   Now `--target runtime-gateway` never compiles engine sources and
+#   `--target runtime-engine` never compiles backend sources.
+#
+# Dub incremental caching:
+#   - `/build/.dub` + `/root/.dub` are BuildKit cache mounts. dub 1.41 keeps
+#     ALL build state (fetched packages AND object files) under
+#     `$HOME/.dub/cache/`, so a re-run after a source change recompiles only
+#     modules whose content changed — BuildKit preserves source mtimes through
+#     COPY, which dub's incremental checker relies on.
 #
 # Cache invalidation:
 #   - LDC_VERSION, ARG TARGETARCH, Dockerfile changes invalidate `base`.
 #   - dub.sdl / dub.selections.json changes re-run `dub upgrade`.
-#   - source/ changes re-run `dub build` (but dub only recompiles changed
-#     modules thanks to the /build/.dub cache).
-#   - `CACHE_BUST=<n> --build-arg` (default 0) forces a clean rebuild of
-#     the builder stage when needed.
+#   - source/ changes re-run that stage's dub build (incremental).
+#   - `CACHE_BUST=<n> --build-arg` (default fixed) forces a clean rebuild of
+#     the dub steps (wipes both cache mounts in builder-common).
 
 # ============================================================================
 # Stage: base — Ubuntu + toolchain
@@ -65,81 +80,147 @@ ENV PATH="/opt/ldc2/bin:${PATH}"
 WORKDIR /build
 
 # ============================================================================
-# Stage: builder — compile all 4 release binaries
+# Stage: builder-common — fetch deps + build the shared common library.
 #
 # `dub build --parallel` parallelizes LDC compile jobs within a config
 # (dub-1.x dispatches independent modules to parallel LDC invocations).
-# Without `--force`, dub reuses incremental module cache between the 4
-# configs so editing one binary recompiles only that binary — /build/.dub
-# is mounted as cache so this even survives `docker build` cache wipes.
+# Without `--force`, dub reuses the incremental module cache in the
+# /build/.dub + /root/.dub cache mounts, so editing one file recompiles
+# only that module.
 #
-# CACHE_BUST default 0; pass `docker build --build-arg CACHE_BUST=$(date +%s)`
+# CACHE_BUST default "fixed"; pass `--build-arg CACHE_BUST=$(date +%s)`
 # to force a clean rebuild of the dub steps.
 # ============================================================================
-FROM base AS builder
+FROM base AS builder-common
+
+ARG CACHE_BUST=fixed
 
 # ── Build cache invalidation ─────────────────────────────────────────────
 # Same sentinel trick as before, but now one sentinel per package so editing
 # `backend/source/api/rest.d` does not force-rebuild the engine and vice versa.
 # Each heredoc writes inside its package's source tree, invalidating the
 # matching COPY below.
-ARG CACHE_BUST=fixed
 COPY <<EOF ./common/source/.cache_bust_$CACHE_BUST
-bust=$CACHE_BUST
-EOF
-COPY <<EOF ./backend/source/.cache_bust_$CACHE_BUST
-bust=$CACHE_BUST
-EOF
-COPY <<EOF ./engine/source/.cache_bust_$CACHE_BUST
 bust=$CACHE_BUST
 EOF
 
 COPY common/dub.sdl common/dub.selections.json ./common/
 COPY common/source/ ./common/source/
-COPY backend/dub.sdl backend/dub.selections.json ./backend/
-COPY backend/source/ ./backend/source/
-COPY backend/views/  ./backend/views/
-COPY engine/dub.sdl engine/dub.selections.json ./engine/
-COPY engine/source/ ./engine/source/
-COPY config/ ./config/
-COPY public/ ./public/
 
 # When CACHE_BUST is non-default, nuke ALL caches dub/LDC might use:
 # - /build/.dub (dub's global cache)
-# - */dub-cache.json + *.o (per-package incremental state)
-# - /root/.dub (dub's user-level cache from dub's $HOME)
+# - /root/.dub (dub's user-level cache — packages AND object files in 1.41)
 # Then pass `--force` to dub to skip its own mtime/size checks.
 RUN --mount=type=cache,target=/build/.dub,sharing=locked \
     --mount=type=cache,target=/root/.dub,sharing=locked \
     if [ "$CACHE_BUST" != "fixed" ]; then \
         rm -rf /build/.dub /root/.dub && \
-        find common/source backend/source engine/source -name '*.o' -delete 2>/dev/null && \
-        find common backend engine -name 'dub-cache.json' -delete 2>/dev/null && \
         DUB_FLAGS="--force" && \
         echo "dub cache busted (CACHE_BUST=$CACHE_BUST)" ; \
     else \
         DUB_FLAGS="" ; \
     fi && \
     echo "build: $CACHE_BUST" && \
-    dub build --root=common --compiler=ldc2 --build=release --parallel $DUB_FLAGS && \
+    dub build --root=common --compiler=ldc2 --build=release --parallel $DUB_FLAGS
+
+# ============================================================================
+# Stage: builder-backend — gateway binary only (irc-fiber + irc-fiber-gateway)
+# ============================================================================
+FROM builder-common AS builder-backend
+
+ARG CACHE_BUST=fixed
+
+COPY <<EOF ./backend/source/.cache_bust_$CACHE_BUST
+bust=$CACHE_BUST
+EOF
+
+COPY backend/dub.sdl backend/dub.selections.json ./backend/
+COPY backend/source/ ./backend/source/
+COPY backend/views/  ./backend/views/
+
+# `--config=gateway` was a second full backend compile whose output was
+# discarded (the image ships the default-config binary under both names).
+# Dropped in the split — see runtime-gateway.
+RUN --mount=type=cache,target=/build/.dub,sharing=locked \
+    --mount=type=cache,target=/root/.dub,sharing=locked \
+    if [ "$CACHE_BUST" != "fixed" ]; then \
+        DUB_FLAGS="--force" && \
+        echo "dub cache busted (CACHE_BUST=$CACHE_BUST)" ; \
+    else \
+        DUB_FLAGS="" ; \
+    fi && \
     dub build --root=backend --compiler=ldc2 --build=release --parallel $DUB_FLAGS && \
-    dub build --root=backend --config=gateway --compiler=ldc2 --build=release --parallel $DUB_FLAGS && \
+    cp backend/irc-fiber ./irc-fiber && \
+    cp backend/irc-fiber ./irc-fiber-gateway && \
+    cp -r backend/views ./views && \
+    test -f ./irc-fiber
+RUN find . -maxdepth 1 -type f -executable -exec strip {} +; find backend -maxdepth 2 -type f -executable -exec strip {} + 2>/dev/null; true
+
+# ============================================================================
+# Stage: builder-engine — engine binaries only (irc-fiber-engine + migrates)
+# ============================================================================
+FROM builder-common AS builder-engine
+
+ARG CACHE_BUST=fixed
+
+COPY <<EOF ./engine/source/.cache_bust_$CACHE_BUST
+bust=$CACHE_BUST
+EOF
+
+# dub validates EVERY declared path dependency at package load — including the
+# config-scoped `irc-fiber-backend` used only by test configs — so it needs
+# backend/dub.sdl present even though release/migrate builds never compile
+# backend sources. Only the package files, not the sources.
+COPY backend/dub.sdl backend/dub.selections.json ./backend/
+COPY engine/dub.sdl engine/dub.selections.json ./engine/
+COPY engine/source/ ./engine/source/
+
+RUN --mount=type=cache,target=/build/.dub,sharing=locked \
+    --mount=type=cache,target=/root/.dub,sharing=locked \
+    if [ "$CACHE_BUST" != "fixed" ]; then \
+        DUB_FLAGS="--force" && \
+        echo "dub cache busted (CACHE_BUST=$CACHE_BUST)" ; \
+    else \
+        DUB_FLAGS="" ; \
+    fi && \
     dub build --root=engine --compiler=ldc2 --build=release --parallel $DUB_FLAGS && \
     dub build --root=engine --config=janitor-migrate --compiler=ldc2 --build=release --parallel $DUB_FLAGS && \
     dub build --root=engine --config=ircfiber-default-migrate --compiler=ldc2 --build=release --parallel $DUB_FLAGS && \
-    cp backend/irc-fiber ./irc-fiber && \
-    cp backend/irc-fiber ./irc-fiber-gateway && \
     cp engine/irc-fiber-engine ./irc-fiber-engine && \
     cp engine/janitor-migrate ./janitor-migrate && \
     cp engine/ircfiber-default-migrate ./ircfiber-default-migrate 2>/dev/null || true && \
-    cp -r backend/views ./views && \
-    test -f ./irc-fiber && \
     test -f ./irc-fiber-engine && \
     test -f ./janitor-migrate
-RUN find . -maxdepth 1 -type f -executable -exec strip {} +; find backend engine -maxdepth 2 -type f -executable -exec strip {} + 2>/dev/null; true
+RUN find . -maxdepth 1 -type f -executable -exec strip {} +; find engine -maxdepth 2 -type f -executable -exec strip {} + 2>/dev/null; true
 
 # ============================================================================
-# Stage: runtime — slim Ubuntu + 4 binaries
+# Stage: builder — aggregate for `--target builder` extraction deploys
+# (deploy-update.yml / deploy-handoff.yml / deploy-update-exec.yml docker cp
+# /build/{irc-fiber,irc-fiber-engine,janitor-migrate,ircfiber-default-migrate}).
+#
+# Runtime-only inputs — copied AFTER the dub builds so frontend asset or
+# config changes never invalidate the D compile. `public/dist` is rewritten
+# on every `make frontend` (content-hashed bundles) and `config/` on deploy
+# tweaks; keeping these before the RUN forced a full 6-config dub rebuild
+# on every frontend-only change.
+# ============================================================================
+FROM base AS builder
+
+COPY --from=builder-backend /build/irc-fiber            /build/
+COPY --from=builder-backend /build/irc-fiber-gateway    /build/
+COPY --from=builder-backend /build/views                /build/views
+COPY --from=builder-engine  /build/irc-fiber-engine     /build/
+COPY --from=builder-engine  /build/janitor-migrate      /build/
+COPY --from=builder-engine  /build/ircfiber-default-migrate /build/
+COPY config/ ./config/
+COPY public/ ./public/
+
+RUN test -f ./irc-fiber && \
+    test -f ./irc-fiber-engine && \
+    test -f ./janitor-migrate
+
+# ============================================================================
+# Stage: runtime — slim Ubuntu + all binaries (legacy combined image)
 # ============================================================================
 FROM ubuntu:22.04 AS runtime
 
@@ -186,7 +267,10 @@ RUN chmod 0755 /usr/local/bin/ircfiber-engine-entrypoint.sh \
 ENTRYPOINT ["/usr/bin/tini", "--"]
 
 # ============================================================================
-# Stage: runtime-gateway — slim Ubuntu + gateway binary only
+# Stage: runtime-gateway — slim Ubuntu + gateway binary only.
+# COPYs come from builder-backend (never builder-engine), so building this
+# target does NOT compile engine sources. config/public come from the build
+# context so asset/config changes don't pull the aggregate `builder` stage.
 # ============================================================================
 FROM ubuntu:22.04 AS runtime-gateway
 
@@ -205,14 +289,14 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 WORKDIR /app
 
-# Gateway binary: accept either `irc-fiber` (legacy default) or `irc-fiber-gateway` (new).
-# The builder produces both names depending on config; copy whichever exists.
-# Use wildcard COPY with fallback: `irc-fiber-gateway` preferred for split builds.
-COPY --from=builder /build/irc-fiber-gateway /app/irc-fiber-gateway
-COPY --from=builder /build/irc-fiber /app/irc-fiber
-COPY --from=builder /build/views                 /app/views
-COPY --from=builder /build/config                /app/config
-COPY --from=builder /build/public                /app/public
+# Gateway binary: accept either `irc-fiber` (default) or `irc-fiber-gateway`
+# (both are the default-config binary today; the GatewayOnly config compile
+# was dropped as dead work). Copy whichever exists.
+COPY --from=builder-backend /build/irc-fiber-gateway /app/irc-fiber-gateway
+COPY --from=builder-backend /build/irc-fiber /app/irc-fiber
+COPY --from=builder-backend /build/views                 /app/views
+COPY config/ ./config/
+COPY public/ ./public/
 
 # Data dirs.
 RUN mkdir -p /app/data /app/uploads && \
@@ -226,7 +310,9 @@ EXPOSE 8090
 ENTRYPOINT ["/usr/bin/tini", "--"]
 
 # ============================================================================
-# Stage: runtime-engine — slim Ubuntu + engine binary only (no views/public)
+# Stage: runtime-engine — slim Ubuntu + engine binary only (no views/public).
+# COPYs come from builder-engine only — building this target never compiles
+# backend sources.
 # ============================================================================
 FROM ubuntu:22.04 AS runtime-engine
 
@@ -245,9 +331,9 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 WORKDIR /app
 
-COPY --from=builder /build/irc-fiber-engine      /app/irc-fiber-engine
-COPY --from=builder /build/janitor-migrate       /app/janitor-migrate
-COPY --from=builder /build/config                /app/config
+COPY --from=builder-engine /build/irc-fiber-engine      /app/irc-fiber-engine
+COPY --from=builder-engine /build/janitor-migrate       /app/janitor-migrate
+COPY config/ ./config/
 
 # Data dirs (engine needs no public/views).
 RUN mkdir -p /app/data /app/uploads

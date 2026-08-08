@@ -218,39 +218,69 @@ dev-docker: ensure-colima ## Dev > Docker backend + Vite frontend dev (fastest f
 	@cd frontend && VITE_BACKEND_URL=http://127.0.0.1:8090 npm run dev
 
 # Full local stack — gateway + supervised engine, both against local docker DBs.
-# Uses Docker's staged builder cache (Containerfile `builder` stage):
-#   - Base layer (Ubuntu + LDC) cached via --mount=type=cache for apt
-#   - Dub incremental cache via --mount=type=cache for /build/.dub + /root/.dub
-#     so only changed .d files recompile (not the whole tree).
+# The Containerfile builds the gateway and engine from SEPARATE stages
+# (builder-backend vs builder-engine), so each image compiles only its own
+# sources. This target tracks a stamp file PER IMAGE:
+#   - engine stamp  (.docker-build-stamp-engine):  engine/source + common/source
+#   - gateway stamp (.docker-build-stamp-gateway): backend/source + backend/views
+#     + common/source + config + public (+ frontend/package.json)
+# A change in one side's inputs rebuilds ONLY that image — frontend/backend
+# work never recompiles the engine, and the unchanged container stays up
+# (no IRC reconnect).
 #   - `docker compose build` is BuildKit-cached: no source change → instant
-#     CACHED layers; D change → only affected dub configs recompile.
+#     CACHED layers; D change → only affected modules recompile (dub
+#     incremental state persists via the /build/.dub + /root/.dub mounts).
 #   - Host `build-gateway`/`build-engine` are NOT needed here — the builder
-#     stage compiles inside Docker. Use `debug-host` for host-native binaries.
-#   - Stamp file `.docker-build-stamp` skips `docker compose build` entirely
-#     when no relevant source changed (instant second `make debug`).
+#     stages compile inside Docker. Use `debug-host` for host-native binaries.
 debug: ## Component > Full stack via docker-compose: gateway (REST API) + engine (IRC) as separate containers — logs via docker
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Starting Docker backend (redis/mongo/ircd)  $(R)"
 	@$(_docker_setup)
 	@bash -c '\
-		stamp=.docker-build-stamp; \
-		needs_build=0; \
-		if [ ! -f "$$stamp" ]; then needs_build=1; \
-		else \
-			if [ Containerfile -nt "$$stamp" ] || [ engine/dub.sdl -nt "$$stamp" ] || [ engine/dub.selections.json -nt "$$stamp" ] || [ backend/dub.sdl -nt "$$stamp" ] || [ backend/dub.selections.json -nt "$$stamp" ] || [ common/dub.sdl -nt "$$stamp" ] || [ common/dub.selections.json -nt "$$stamp" ]; then needs_build=1; \
-			elif find backend/source backend/views common/source engine/source config public -type f -newer "$$stamp" 2>/dev/null | grep -q .; then needs_build=1; \
-			elif find deploy/roles/engine/files deploy/roles/gateway -type f -newer "$$stamp" 2>/dev/null | grep -q .; then needs_build=1; \
-			fi; \
+		stamp_gw=.docker-build-stamp-gateway; \
+		stamp_eng=.docker-build-stamp-engine; \
+		build_gw=0; build_eng=0; \
+		# ── engine image inputs: engine + shared common sources ── \
+		if [ ! -f "$$stamp_eng" ] || \
+		   [ Containerfile -nt "$$stamp_eng" ] || \
+		   [ engine/dub.sdl -nt "$$stamp_eng" ] || [ engine/dub.selections.json -nt "$$stamp_eng" ] || \
+		   [ common/dub.sdl -nt "$$stamp_eng" ] || [ common/dub.selections.json -nt "$$stamp_eng" ]; then \
+			build_eng=1; \
+		elif find engine/source common/source deploy/roles/engine/files -type f -newer "$$stamp_eng" 2>/dev/null | grep -q .; then \
+			build_eng=1; \
 		fi; \
-		if [ "$$needs_build" = "1" ]; then \
-			printf "\n%b\n" "$(_BCn)$(K)$(B)  Building split images (gateway + engine) — cached builder  $(R)"; \
-			DOCKER_BUILDKIT=1 docker compose build ircfiber-gateway ircfiber-engine; \
-			touch "$$stamp"; \
-		else \
-			printf "\n%b\n" "$(BG)$(OK) Images up-to-date — skipping docker build (cached) $(R) $(D)(touch Containerfile or backend/source to force)$(R)"; \
+		# ── gateway image inputs: backend + views + shared common + shipped assets ── \
+		if [ ! -f "$$stamp_gw" ] || \
+		   [ Containerfile -nt "$$stamp_gw" ] || \
+		   [ backend/dub.sdl -nt "$$stamp_gw" ] || [ backend/dub.selections.json -nt "$$stamp_gw" ] || \
+		   [ common/dub.sdl -nt "$$stamp_gw" ] || [ common/dub.selections.json -nt "$$stamp_gw" ] || \
+		   [ frontend/package.json -nt "$$stamp_gw" ]; then \
+			build_gw=1; \
+		elif find backend/source backend/views common/source config public deploy/roles/gateway -type f -newer "$$stamp_gw" 2>/dev/null | grep -q .; then \
+			build_gw=1; \
 		fi; \
+		svcs=""; \
+		[ "$$build_gw" = "1" ] && svcs="$$svcs ircfiber-gateway"; \
+		[ "$$build_eng" = "1" ] && svcs="$$svcs ircfiber-engine"; \
+		if [ -n "$$svcs" ]; then \
+			printf "\n%b\n" "$(_BCn)$(K)$(B)  Building changed image(s):$$svcs  $(R)"; \
+			DOCKER_BUILDKIT=1 docker compose build $$svcs; \
+			[ "$$build_gw" = "1" ] && touch "$$stamp_gw"; \
+			[ "$$build_eng" = "1" ] && touch "$$stamp_eng"; \
+		else \
+			printf "\n%b\n" "$(BG)$(OK) Images up-to-date — skipping docker build (cached) $(R) $(D)(touch Containerfile or the relevant source tree to force)$(R)"; \
+		fi; \
+		# Only tear down containers whose image was rebuilt — the other stays up. \
+		[ "$$build_gw" = "1" ] && docker rm -f ircfiber-gateway 2>/dev/null || true; \
+		[ "$$build_eng" = "1" ] && docker rm -f ircfiber-engine 2>/dev/null || true; \
 		'
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Starting gateway + engine as separate containers  $(R)"
-	@docker compose up -d ircfiber-gateway ircfiber-engine
+	@GATEWAY_HOST_PORT=$${GATEWAY_HOST_PORT:-8090} IRCD_HOST_PORT=$${IRCD_HOST_PORT:-6667} IRCD_HOST_PORT2=$${IRCD_HOST_PORT2:-6668} REDIS_HOST_PORT=$${REDIS_HOST_PORT:-6379} MONGO_HOST_PORT=$${MONGO_HOST_PORT:-27017} \
+	docker compose up -d --remove-orphans --no-deps ircfiber-gateway ircfiber-engine || { \
+		printf "%b\n" "$(Y)$(WR) up failed — cleaning stale names and retrying$(R)"; \
+		docker rm -f ircfiber-gateway ircfiber-engine 2>/dev/null || true; \
+		GATEWAY_HOST_PORT=$${GATEWAY_HOST_PORT:-18090} IRCD_HOST_PORT=$${IRCD_HOST_PORT:-16667} IRCD_HOST_PORT2=$${IRCD_HOST_PORT2:-16668} \
+		docker compose up -d --remove-orphans --no-deps ircfiber-gateway ircfiber-engine; \
+	}
 	@printf '\n%b\n' "$(BG)$(OK) Gateway+Engine running as separate containers$(R) $(D)(ircfiber-gateway:8090, ircfiber-engine)$(R)"
 	@printf '%b\n' "$(C)  ─ containers $(R)"; docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" | grep -E "ircfiber-gateway|ircfiber-engine|irc_redis|irc_mongo|ircd" | sed "s/^/    /" || true
 	@printf '\n%b\n' "$(Y)$(WR) ctrl-c to stop → make down  •  tail logs:  make logs  (docker logs -f)$(R)"
@@ -260,6 +290,7 @@ debug: ## Component > Full stack via docker-compose: gateway (REST API) + engine
 # Host-native debug (fast D iteration, no docker build) — keeps old supervisor+gateway host binaries
 debug-host: build-gateway build-engine ## Component > Full stack HOST-NATIVE: gateway + engine (supervised), local docker DBs — ctrl-c to stop (legacy)
 	@$(_docker_setup)
+	@docker rm -f ircfiber-gateway ircfiber-engine 2>/dev/null || true
 	@bash -c 'set -u; \
 		pkill -f irc-fiber-engine-supervisor 2>/dev/null || true; \
 		killall -9 irc-fiber irc-fiber-gateway irc-fiber-engine 2>/dev/null || true; \
@@ -815,6 +846,7 @@ define _docker_setup
 	sleep 1; \
 	SERVER_ID=$${IRCFIBER_SERVER_ID:-localengine}; \
 	if docker info >/dev/null 2>&1; then \
+		docker network create signoz-network 2>/dev/null || true; \
 		docker compose exec -T redis redis-cli del irc:server:$$SERVER_ID irc:servers irc:network:assignments >/dev/null 2>&1 || true; \
 	fi; \
 	if ! docker info >/dev/null 2>&1; then \
@@ -822,9 +854,38 @@ define _docker_setup
 		printf "%b\n" "$(D)Start Docker first, or run: make docker-up-backend$(R)"; \
 		exit 1; \
 	fi; \
+	docker rm -f irc_redis_test irc_mongo_test ircd_test ircfiber-fluent-bit 2>/dev/null || true; \
+	# NOTE: ircfiber-gateway/ircfiber-engine are NOT removed here — the debug
+	# target removes each container only when its image is rebuilt, so an
+	# unchanged engine (or gateway) keeps running across make debug runs. \
+	for port in 6379 27017 6667 8090; do \
+		if lsof -i :$$port -sTCP:LISTEN >/dev/null 2>&1; then \
+			case $$port in \
+				6379) alt=16379; envvar=REDIS_HOST_PORT;; \
+				27017) alt=27018; envvar=MONGO_HOST_PORT;; \
+				6667) alt=16667; envvar=IRCD_HOST_PORT;; \
+				8090) alt=18090; envvar=GATEWAY_HOST_PORT;; \
+			esac; \
+			if ! lsof -i :$$alt -sTCP:LISTEN >/dev/null 2>&1; then \
+				printf "%b\n" "$(Y)$(WR) Port $$port in use — using $$alt for debug (export $$envvar=$$alt to override)$(R)"; \
+				export $$envvar=$$alt; \
+			else \
+				printf "%b\n" "$(Y)$(WR) Port $$port and alt $$alt both in use — compose may fail on that binding$(R)"; \
+			fi; \
+		fi; \
+	done; \
+	if docker ps --format "{{.Names}}" 2>/dev/null | grep -q "ircfiber-redis\|ircfiber-mongo\|ircfiber-.*caddy"; then \
+		printf "%b\n" "$(D)Note: other ircfiber stack detected — debug will share or use alt ports above$(R)"; \
+	fi; \
 	if ! docker compose ps mongo redis ircd 2>/dev/null | grep -q "healthy"; then \
 		printf "%b\n" "$(Y)$(WR) Backend services not running. Starting them now...$(R)"; \
-		docker compose up -d mongo redis ircd; \
+		REDIS_HOST_PORT=$${REDIS_HOST_PORT:-6379} MONGO_HOST_PORT=$${MONGO_HOST_PORT:-27017} IRCD_HOST_PORT=$${IRCD_HOST_PORT:-6667} IRCD_HOST_PORT2=$${IRCD_HOST_PORT2:-6668} \
+		docker compose up -d --remove-orphans mongo redis ircd || { \
+			printf "%b\n" "$(Y)$(WR) docker compose up failed — retrying with stale-container cleanup$(R)"; \
+			docker rm -f irc_redis_test irc_mongo_test ircd_test 2>/dev/null || true; \
+			REDIS_HOST_PORT=$${REDIS_HOST_PORT:-16379} MONGO_HOST_PORT=$${MONGO_HOST_PORT:-27018} IRCD_HOST_PORT=$${IRCD_HOST_PORT:-16667} IRCD_HOST_PORT2=$${IRCD_HOST_PORT2:-16668} \
+			docker compose up -d --remove-orphans mongo redis ircd; \
+		}; \
 		printf "%b\n" "$(C)→ Waiting for services to be ready...$(R)"; \
 		for i in 1 2 3 4 5 6 7 8 9 10; do \
 			if docker compose ps mongo redis ircd 2>/dev/null | grep -q "healthy"; then \

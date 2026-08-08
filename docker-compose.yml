@@ -27,7 +27,7 @@ services:
       - ./config/prod.conf:/config/prod.conf:ro
       - irc_fiber_logs:/var/log/irc-fiber
     ports:
-      - "8090:8090"
+      - "${GATEWAY_HOST_PORT:-8090}:8090"
     deploy:
       resources:
         limits:
@@ -104,7 +104,7 @@ services:
         limits:
           memory: 256M
     ports:
-      - "6379:6379"
+      - "${REDIS_HOST_PORT:-6379}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -126,7 +126,7 @@ services:
         limits:
           memory: 512M
     ports:
-      - "27017:27017"
+      - "${MONGO_HOST_PORT:-27017}:27017"
     healthcheck:
       test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
       interval: 10s
@@ -144,8 +144,8 @@ services:
     networks:
       - irc_network
     ports:
-      - "6667:6667"
-      - "6668:6668"
+      - "${IRCD_HOST_PORT:-6667}:6667"
+      - "${IRCD_HOST_PORT2:-6668}:6668"
     healthcheck:
       test: ["CMD", "nc", "-z", "127.0.0.1", "6667"]
       interval: 10s
@@ -172,8 +172,7 @@ networks:
       config:
         - subnet: 172.22.0.0/16
   signoz-network:
-    external: true
-    name: signoz-network
+    driver: bridge
 volumes:
   redis_data:
     driver: local
