@@ -29,17 +29,20 @@ enum SASLMechanism {
     scramSha256
 }
 
-/// Normalize an IRC channel name to canonical form (lowercase, with prefix).
-/// "Zod", "#Zod" and "#ZOD" are the same channel in IRC and all collapse
-/// to "#zod". A bare name (no channel prefix) is treated as a channel and
-/// gets a "#" prepended so dedup and equality checks work correctly.
-/// Special names like "_server" (internal server buffer) are left untouched.
+/// Normalize an IRC channel/buffer name to canonical form.
+/// Channels (`#`/`&`/`+`/`!` prefix) are case-insensitive and lowercased
+/// so `#Zod` and `#zod` collapse. Bare names (DM nick buffers like
+/// `Zodiac`, `alice`) are **not** `#`-prefixed — they must stay bare or
+/// the frontend's `normalizeChannelName` (`name[0] !== '#'? return name`)
+/// and the engine's `scrollback:<srv>:<net>:<chan>` keys diverge and DM
+/// history disappears after reload (see AGENTS.md DM invariant). `_server`
+/// is left untouched.
 string normalizeChannelName(string name) @safe {
     if (name.length == 0 || name == "_server") return name;
-    if (!name.startsWith("#") && !name.startsWith("&") && !name.startsWith("+") && !name.startsWith("!"))
-        return "#" ~ name.toLower();
-    if (name.length < 2) return name;
-    return name[0 .. 1] ~ name[1 .. $].toLower();
+    // Channel prefixes: lowercased for dedup. Bare nicks: returned as-is.
+    if (name[0] == '#' || name[0] == '&' || name[0] == '+' || name[0] == '!')
+        return name[0 .. 1] ~ name[1 .. $].toLower();
+    return name;
 }
 
 /// Deduplicate and normalize a list of IRC channel names.

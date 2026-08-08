@@ -1,6 +1,11 @@
+/**
+ * DEPRECATED — Handoff removed 2026-08-08 (AGENTS.md Engine Lifecycle).
+ * This file is kept for reference only. All deploys now use hard restart
+ * (`docker restart ircfiber-engine-ovh`). Do not reintroduce
+ * SCM_RIGHTS FD-transfer, IRCFIBER_RELOAD_FROM_PID, or handoff socket.
+ * See AGENTS.md#Engine Lifecycle and DM Persistence Invariant.
+ */
 module ircfiber.engine.handoff;
-
-import std.algorithm : filter, canFind;
 import std.array : array;
 import std.conv : to;
 import std.datetime : Clock;

@@ -204,9 +204,16 @@ final class BufferManager {
             logError("getRecent: serverId is empty");
             return [];
         }
-        channel = normalizeChannel(channel);
-        auto key = KEY_PREFIX ~ serverId ~ ":" ~ networkId ~ ":" ~ channel;
-        return _getRecentFiltered(key, count, before, after, beforeIdx);
+        auto norm = normalizeChannel(channel);
+        auto key = KEY_PREFIX ~ serverId ~ ":" ~ networkId ~ ":" ~ norm;
+        auto res = _getRecentFiltered(key, count, before, after, beforeIdx);
+        if (res.length == 0 && norm.length > 0 && norm[0] != '#' && norm[0] != '&' && norm[0] != '+' && norm[0] != '!') {
+            import std.uni : toLower;
+            auto legacyKey = KEY_PREFIX ~ serverId ~ ":" ~ networkId ~ ":" ~ ("#" ~ norm.toLower());
+            auto legacyRes = _getRecentFiltered(legacyKey, count, before, after, beforeIdx);
+            if (legacyRes.length > 0) return legacyRes;
+        }
+        return res;
     }
 
     /**
@@ -272,9 +279,16 @@ final class BufferManager {
      */
     Json[] getRecent(string networkId, string channel, long count = 50, long before = 0, long after = 0,
                      long beforeIdx = -1) @trusted {
-        channel = normalizeChannel(channel);
-        auto key = KEY_PREFIX ~ networkId ~ ":" ~ channel;
-        return _getRecentFiltered(key, count, before, after, beforeIdx);
+        auto norm = normalizeChannel(channel);
+        auto key = KEY_PREFIX ~ networkId ~ ":" ~ norm;
+        auto res = _getRecentFiltered(key, count, before, after, beforeIdx);
+        if (res.length == 0 && norm.length > 0 && norm[0] != '#' && norm[0] != '&' && norm[0] != '+' && norm[0] != '!') {
+            import std.uni : toLower;
+            auto legacyKey = KEY_PREFIX ~ networkId ~ ":" ~ ("#" ~ norm.toLower());
+            auto legacyRes = _getRecentFiltered(legacyKey, count, before, after, beforeIdx);
+            if (legacyRes.length > 0) return legacyRes;
+        }
+        return res;
     }
 
     /**

@@ -3124,6 +3124,27 @@ private void processEvents() {
         event.network   = config.name;
         event.timestampMs = resolveTimestamp(event);
 
+        // Fix DM echo channel: parser sets channel=nick for all non-channel
+        // PRIVMSG/NOTICE (correct for incoming, wrong for our own echo).
+        // When echo-message is negotiated, the server echoes our own
+        // PRIVMSG as `:ourNick!... PRIVMSG target :text`. Parser then
+        // sets channel=ourNick, but the conversation buffer should be
+        // `target` (the recipient). Detect our own nick and rewrite.
+        if ((event.command == "PRIVMSG" || event.command == "NOTICE")
+            && event.nick.length > 0 && sessionNick.length > 0) {
+            import std.uni : icmp;
+            if (icmp(event.nick, sessionNick) == 0) {
+                auto p = event.getParams();
+                if (p.length > 0 && p[0].length > 0
+                    && p[0][0] != '#' && p[0][0] != '&'
+                    && p[0][0] != '+' && p[0][0] != '!') {
+                    // Outgoing DM echo — channel should be the target nick,
+                    // not our own nick.
+                    event.channel = p[0];
+                }
+            }
+        }
+
         if (event.command == "PING") {
             auto params = event.getParams();
             sendRaw("PONG :" ~ (params.length > 0 ? params[$ - 1] : ""));
@@ -3965,9 +3986,27 @@ private void processEvents() {
                 break;
         }
 
-        // Track private query buffers
-        if (event.command == "PRIVMSG" && event.channel.length == 0) {
-            if (!queryBuffers.canFind(event.nick)) queryBuffers ~= event.nick;
+        // Track private query buffers for both incoming and outgoing DMs.
+        // The old check `channel.length==0` never fired because parser always
+        // sets channel for PRIVMSG. Instead detect DM by target not being a
+        // channel prefix.
+        if (event.command == "PRIVMSG" || event.command == "NOTICE") {
+            auto p = event.getParams();
+            if (p.length > 0 && p[0].length > 0
+                && p[0][0] != '#' && p[0][0] != '&'
+                && p[0][0] != '+' && p[0][0] != '!') {
+                string other;
+                import std.uni : icmp;
+                if (event.nick.length > 0 && sessionNick.length > 0
+                    && icmp(event.nick, sessionNick) == 0) {
+                    other = p[0];
+                } else {
+                    other = event.nick;
+                }
+                if (other.length > 0 && !queryBuffers.canFind(other)) {
+                    queryBuffers ~= other;
+                }
+            }
         }
 
         // Set channel for channel-scoped events that didn't set it explicitly.
@@ -3981,6 +4020,23 @@ private void processEvents() {
                 if (param.length > 0 && (param[0] == '#' || param[0] == '&')) {
                     event.channel = param;
                     break;
+                }
+            }
+        }
+        // DM fallback: parser no longer sets channel for non-channel PRIVMSG
+        // (see parser.d). Resolve to counterparty here session-aware.
+        if (event.channel.length == 0
+            && (event.command == "PRIVMSG" || event.command == "NOTICE")) {
+            auto p = event.getParams();
+            if (p.length > 0 && p[0].length > 0
+                && p[0][0] != '#' && p[0][0] != '&'
+                && p[0][0] != '+' && p[0][0] != '!') {
+                import std.uni : icmp;
+                if (event.nick.length > 0 && sessionNick.length > 0
+                    && icmp(event.nick, sessionNick) == 0) {
+                    event.channel = p[0];
+                } else {
+                    event.channel = event.nick;
                 }
             }
         }

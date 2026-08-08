@@ -1,5 +1,8 @@
+/**
+ * DEPRECATED — Handoff removed 2026-08-08. Hard restart only.
+ * See AGENTS.md Engine Lifecycle.
+ */
 module ircfiber.engine.exec_reload;
-
 import std.json : JSONValue, JSONType;
 import std.string : toUpper;
 import std.conv : to;

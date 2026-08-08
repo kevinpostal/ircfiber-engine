@@ -22,8 +22,8 @@ store on PersistentIRCClient               (a `Record<string,string>`
 emit ISUPPORT event mid-stream             already typed on `Network`).
                                           categorize → CategorizedGroup[]
 synced via NetworkStateSnapshot              → ServerFeaturesPanel
-appended to handoff records                 → CategoryCard × N
-preserved across exec-reload                → click a row → IsupportDetailDrawer
+persisted in Redis snapshot                  → CategoryCard × N
+survives hard restart via snapshot           → click a row → IsupportDetailDrawer
 ```
 
 Files:
@@ -36,14 +36,11 @@ Files:
 | `frontend/src/components/IsupportDetailDrawer.svelte` | IRCv3-style detail page for each feature — title, abstract, on-this-server value, RFC/IRCv3 link |
 | `source/ircfiber/irc/connection.d` | Engine stores the full map; emits `ISUPPORT` synthetic event |
 | `source/ircfiber/models/irc_event.d` | `IRCRawEvent.makeIsupport` factory — JS-object payload |
-| `source/ircfiber/engine/handoff.d` | Handoff record carries the full map so a reloaded engine renders the panel immediately |
-| `source/ircfiber/engine/exec_reload.d` | Snapshot/restore across `exec(2)` boundaries |
 | `source/ircfiber/redis/protocol.d` | `NetworkStateSnapshot.isupport: string[string]` |
 | `source/ircfiber/engine/state.d` | Snapshot writer publishes the map with each heartbeat |
 | `source/ircfiber/api/websocket.d` | Sync payload `netObj["isupport"]` ships it to every fresh WS connection |
 | `frontend/src/lib/messageHandler.ts` | Dispatches the `ISUPPORT` event into `applyIsupportUpdate()` |
 | `frontend/src/stores/ircStore.svelte.ts` | `applyIsupportUpdate()` writes the engine's parsed map onto `net.isupport` |
-
 The legacy `ServerFeatures` struct (6 hardcoded fields:
 NETWORK, PREFIX, CHANMODES, NICKLEN, TOPICLEN, CHANLIMIT) is kept
 on the engine side for backward compatibility with code that
@@ -64,8 +61,7 @@ We picked option 3. The 005 handler now:
 1. Stores every token (case-insensitive, uppercased for catalog lookup)
 2. Mirrors the legacy 6 fields onto `ServerFeatures` for back-compat
 3. Emits a synthetic `ISUPPORT` WS event after the 005 stream ends
-4. Ships the map in the `NetworkStateSnapshot` for resume / handoff
-
+4. Ships the map in the `NetworkStateSnapshot` for resume (survives hard restart via Redis)
 The frontend panel reads `network.isupport` directly. The 005 message
 parser in `isupportFromMessages` remains as a fallback for historical
 displays that surface a pre-synced server-log timeline.
@@ -356,22 +352,19 @@ from the live OVH engine against meth.cat (remote, ngircd) and IRC Fiber
 The engine opens IRC TCP/TLS sockets directly via
 `happyEyeballsConnect()` and `createTLSStreamWithTimeout()` in
 `source/ircfiber/irc/connection.d`. No holder daemon, no Unix-domain IPC.
-When the engine restarts:
+When the engine restarts (hard restart via `docker restart`):
 
-- **Plain TCP networks** survive via SCM_RIGHTS fd transfer in
-  `source/ircfiber/engine/handoff.d`. The new engine adopts the
-  live IRC socket; the IRC server sees one continuous connection.
-  This is the same primitive `make engine-handoff` already used
-  for engine hot-reloads.
-- **TLS networks** soft-reconnect (~1s) because the TLS session isn't
-  transferable across processes. Same behaviour as IRCCloud. Users
-  see a brief "Connecting..." card on the channel.
+- **All networks (plain TCP and TLS)** disconnect and auto-reconnect via
+  the engine backoff loop. Users see a brief `Connecting…` / `Reconnecting…`
+  card. This is intentional — the `SCM_RIGHTS` FD-transfer handoff
+  (`source/ircfiber/engine/handoff.d`) was removed 2026-08-08 as legacy
+  fragile code (Tailscale-bind redis bug, stale `irc:control:ovh` LPUSH
+  failures). Single-host deploys do not need zero-disconnect.
 
-Removing the holder was the simplification: zero-disconnect TLS across
-restarts required a daemon-grade process isolation that wasn't pulling
-its weight for our single-host deployment. The archived daemon lives
-under `archived/conn-holder/` if the requirement returns.
-
+The archived handoff daemon lives under `archived/conn-holder/` and the
+removed `handoff.d` / `reload_orchestrator.d` / `exec_reload.d` are kept
+only for reference — do not reintroduce `IRCFIBER_RELOAD_FROM_PID` or
+`make engine-handoff`.
 
 - `parser-test`           — IRC line parser
 - `consumer-test`         — reconnect-dedup helpers
@@ -410,107 +403,51 @@ within 75s.
 
 ---
 
-# IRC Fiber — Graceful Engine Hot-Reload
+# IRC Fiber — Engine Lifecycle (Hard Restart Only)
 
-The engine supports **graceful hot-reload** (handoff) — IRC connections survive a code change without any disconnect.
+> **Handoff removed (2026-08-08).** The previous `SCM_RIGHTS` graceful
+> hot-reload (`engine-handoff`, `reload_orchestrator.d`, `handoff.d`,
+> `exec_reload.d`, `IRCFIBER_RELOAD_FROM_PID`, Unix socket at
+> `/tmp/ircfiber-handoff-<serverId>.sock`) has been deleted. It was
+> fragile, left stale `irc:control:ovh` LPUSH failures on hosts where
+> redis binds to Tailscale IP `198.51.100.1`, and is unnecessary for a
+> single-host deployment. **All engine deploys now use hard restart:**
+> `docker restart ircfiber-engine-ovh` (+ gateway). Plain/TLS IRC
+> connections will briefly disconnect and auto-reconnect via the engine
+> backoff loop. Use `make update` (gateway+engine) or `docker restart`
+> directly — never `make handoff` / `engine-handoff`.
 
-## Flow
+The files `source/ircfiber/engine/handoff.d`,
+`reload_orchestrator.d`, `exec_reload.d` and the `pauseForHandoff` /
+`adoptAndStart` / `forcePostHandoffQuit` paths in `connection.d` /
+`manager.d` are legacy and must not be reintroduced. The deploy
+playbooks `deploy-handoff.yml` and the `handoff` Makefile target are
+removed; they previously did `redis-cli LPUSH irc:control:ovh` without
+`-h 198.51.100.1` and always failed on OVH.
 
-1. `make engine-handoff` records the old engine's PID, starts a new engine with `IRCFIBER_RELOAD_FROM_PID=$pid`
-2. New engine connects to old engine's Unix socket at `/tmp/ircfiber-handoff-<serverId>.sock`
-3. **Handshake:** `READY` → `HELLO <pid>` → `GO`
-4. For each IRC connection:
-   - Old engine pauses the event loop, captures state snapshot (channels, caps, nicks)
-   - Sends `RECORD plain|tls <nidLen>:<nid>` header
-   - Transfers JSON state + raw socket FD via `SCM_RIGHTS` (plain TCP only)
-   - Waits for `ACK` from new engine
-5. **TLS records (fd < 0):** queued in `pendingHandoffRecords` on the new engine. After the last ACK, the old engine calls `notifyHandoffComplete` which synchronously writes QUIT on every live TLS socket via `forcePostHandoffQuit` — this releases the nick on the IRC server BEFORE the new engine attempts registration. See "TLS nick collision fix" below for why.
-6. Old engine writes `DONE <count>`, marks itself `draining:true` in Redis, returns from `serveReload`
-7. New engine reads `DONE`, calls `startPendingHandoffReconnects()` which drains the queued TLS records. Each queued soft-reconnect runs on its own fiber with a 500ms settling delay so the IRC server has time to fully process the old engine's QUIT before the new engine's NICK hits the wire.
-8. New engine adopts all FDs (plain) or soft-reconnects (TLS), publishes `CONNECTED` synthetic events
-9. Old engine exits via the post-handoff early-check in `processEvents` (sets `isShutdownRequested=true` after seeing `postHandoffQuitAtMs > 0`, then runs cleanup + `exit(0)` if not PID 1).
+# IRC Fiber — DM Persistence Invariant (2026-08-08)
 
-## TLS nick collision fix (Jul 4 2026)
+**Bug:** Outgoing DM with `echo-message` cap was stored under your own
+nick, not the recipient, so refresh lost it. Root cause:
+`engine/source/ircfiber/irc/parser.d:208` did
+`event.channel = nick` for all non-channel `PRIVMSG` (correct for
+incoming, wrong for your own echo `:you!... PRIVMSG target :text` where
+`nick==sessionNick`). `bufferManager.appendIRCEvent` then wrote
+`scrollback:<srv>:<net>:#you` instead of `:#target`, and
+`GET /api/channels/:net/:target/messages` returned empty.
 
-### The bug
+**Invariant (must never regress):**
+- For `PRIVMSG`/`NOTICE` where `params[0]` is not `#[&+!`, the buffer
+  is the *counterparty*: `incoming → nick`, `outgoing echo (nick==sessionNick) → params[0]`.
+- `connection.d:processLine` rewrites `event.channel` for `nick==sessionNick`
+  before `queryBuffers` and `bufferManager` see it (see fix 2026-08-08).
+- `queryBuffers` must track both directions (not `channel.length==0`).
+- `parser.d` must not be the sole authority for DM channel — the
+  session-aware fix in `connection.d` is authoritative.
 
-Before this fix, a hot reload on a TLS network produced `Zodiac_` (with trailing
-underscore) as a ghost member in every joined channel. The chain:
-
-1. OLD engine had `Zodiac` registered on the IRC server.
-2. NEW engine started `performRegistration` immediately on receiving the
-   RECORD (per-record, not after DONE).
-3. NEW engine sent `NICK Zodiac` while the OLD engine's TLS socket still
-   held the registration — 433 → fallback to `Zodiac_`.
-4. NEW engine JOINed `#ircfiber` as `Zodiac_`, racing the OLD's still-live
-   connection. The channel briefly showed both.
-5. `persistNick` saved `Zodiac_`, making the bad nick sticky across every
-   subsequent reconnect.
-
-### The fix (three layers)
-
-| Layer | Change | File |
-|---|---|---|
-| 1. Queue TLS reconnects | `adoptFromHandoff` no longer calls `addAndStartNetwork` for fd<0 records; it appends to `pendingHandoffRecords`. | `source/ircfiber/irc/manager.d` |
-| 2. Drain after DONE | `adoptFromOldEngine` calls `startPendingHandoffReconnects()` after the protocol's DONE marker, so the old engine has called `notifyHandoffComplete` first. The drain wraps each soft-reconnect in a 500ms-delayed task so the IRC server fully processes the QUIT before the new engine's NICK arrives. | `source/ircfiber/engine/reload_orchestrator.d`, `source/ircfiber/irc/manager.d` |
-| 3. Synchronous QUIT on TLS | `notifyHandoffComplete` now calls `forcePostHandoffQuit` (new method on `PersistentIRCClient`) for TLS records. It writes QUIT on the live TLS socket SYNCHRONOUSLY before the handoff protocol sends DONE — by the time the new engine reads DONE, the IRC server has freed the nick. Plain-TCP records still use `schedulePostHandoffQuit` (flag-based) since their FD was transferred via SCM_RIGHTS and the QUIT would write to a dead socket. | `source/ircfiber/irc/manager.d`, `source/ircfiber/irc/connection.d` |
-
-### The OLD-engine exit path
-
-After the pause releases in `serveReload`'s scope exit, every client's
-event-loop `processEvents()` early-check at `connection.d:2275` sees
-`postHandoffQuitAtMs > 0`, sets `isShutdownRequested = true`, closes the
-transport, and returns. The outer `runConnectionLoop` then breaks, runs
-cleanup(), and calls `exit(0)` (if not PID 1). For deployments where the
-OLD engine is supervised and needs a fast-exit signal, set
-`IRCFIBER_FORCE_EXIT_ON_HANDOFF=1` in the OLD engine's environment to
-force-exit immediately after DONE is written (defense in depth — useful
-when the connection loop is blocked in `waitForData()` with a long
-timeout).
-
-## Wire Protocol
-
-```
-New engine →            READY\n
-          ← Old engine  HELLO <pid>\n
-          ←             GO\n
-                         ... for each record:
-          ←             RECORD plain|tls <nidLen>:<nid>\n
-          ←             [4-byte JSON length][JSON bytes]
-          ←             [4-byte FD count][SCM_RIGHTS cmsg with FDs]
-New engine →            ACK\n
-          ←             DONE <count>\n
-```
-
-## Key Files
-
-| File | Purpose |
-|---|---|
-| `source/ircfiber/engine/handoff.d` | Unix socket plumbing, SCM_RIGHTS FD transfer, JSON serde for HandoffState |
-| `source/ircfiber/engine/reload_orchestrator.d` | `adoptFromOldEngine` (client) + `serveReload` (server) + `triggerHandoff` + DONE-time queue drain |
-| `source/ircfiber/irc/connection.d` | `pauseForHandoff/resumeAfterHandoff/snapshotForHandoff/adoptAndStart` + `forcePostHandoffQuit` (synchronous TLS QUIT) + post-handoff early exit check |
-| `source/ircfiber/irc/manager.d` | `pauseAllForHandoff/snapshotAllForHandoff/adoptFromHandoff` (queues TLS records) + `notifyHandoffComplete` (synchronous QUIT for TLS) + `startPendingHandoffReconnects` (drains queue with 500ms settling delay) |
-| `source/app_engine.d` | Two-path boot (fresh vs. handoff), PID file writing after adoption |
-
-## Commands
-
-```
-make engine-handoff          # Graceful handoff (IRC sockets preserved)
-make engine-handoff-redis    # Trigger via redis-cli LPUSH (remote)
-make engine-restart          # Hard restart (closes sockets, reconnect)
-```
-
-## Admin Endpoint
-
-`GET /api/admin/handoff/status` — Returns last handoff duration, count per type (plain/TLS), draining servers.
-
-## Testing Notes
-
-- AdoptedSocket tests use raw POSIX `socketpair(2)` — no vibe.d fibers required
-- SCM_RIGHTS FD transfer test uses pipe + socketpair — works on macOS and Linux
-- End-to-end handoff requires a running engine and a Linux environment (or macOS with BSD SCM_RIGHTS)
-- The `consumer.d` test runner may hang on macOS when vibe.d fiber context is required — disable via `excludedSourceFiles` in `dub.sdl` if needed
-
+**Test:** `e2e/chat-history-persist.spec.js` — sends DM to `Zodiac` on
+`IRC Fiber`, asserts ` [role="log"]` contains it, reloads, asserts again.
+Also covers channel `#ircfiber`. This is the regression gate.
 ## Deploy book pre-flight validation
 
 The SigNoz role runs a **local ClickHouse config validator** before touching any host. It catches the class of bug that puts `signoz-clickhouse` into a restart loop on the live server (e.g. `background_pool_size * background_merges_mutations_concurrency_ratio < 20` default mutations free entries, or `< 25` for the partition-optimizer default). The OVH server hit this in June 2026 and the bad config took 30+ minutes to surface as a 728 MB `err.log` filling the writable layer.

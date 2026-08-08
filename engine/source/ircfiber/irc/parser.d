@@ -205,9 +205,10 @@ public IRCRawEvent parseIRCLinePublic(string line, NetworkConfig config) {
     if (event.command == "366" && params.length >= 2 && params[1].startsWith("#")) {
         event.channel = params[1];
     }
-    if (event.command == "PRIVMSG" && params.length > 0 && !params[0].startsWith("#")) {
-        event.channel = event.nick.length ? event.nick : params[0];
-    }
+    // PRIVMSG/NOTICE to non-channel (DM) — channel is resolved
+    // session-aware in connection.d:processLine (counterparty logic).
+    // Do NOT set event.channel = nick here; that legacy assignment
+    // broke outgoing echo with echo-message (see AGENTS.md DM invariant).
     // JOIN error numerics (471, 473, etc.) carry the target channel as
     // a non-leading parameter.
     if (event.channel.length == 0) {

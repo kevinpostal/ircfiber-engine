@@ -1,5 +1,8 @@
+/**
+ * DEPRECATED — Handoff removed 2026-08-08. Hard restart only.
+ * See AGENTS.md Engine Lifecycle.
+ */
 module ircfiber.engine.reload_orchestrator;
-
 import std.conv : to;
 import std.datetime : Clock;
 import std.json : JSONValue, parseJSON;
