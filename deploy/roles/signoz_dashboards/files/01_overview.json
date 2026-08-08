@@ -320,7 +320,7 @@
     {
       "id": "row-host",
       "panelTypes": "row",
-      "title": "OVH host (40.160.227.49)"
+      "title": "OVH host (203.0.113.10)"
     },
     {
       "id": "host-cpu",

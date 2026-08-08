@@ -1715,8 +1715,8 @@ sync-redis-to-tailnet: ## Data > Sync only local Redis → tailnet
 # Vault pass: by default reads deploy/.vault_pass.txt (resolves relative to
 # the deploy/ cwd of every consuming recipe). Set VAULT_PASS_FILE to override.
 _vault_arg = --vault-password-file $(or $(VAULT_PASS_FILE),.vault_pass.txt)
-_target      = $(or $(TARGET),ircfiber-ovh-1)
-_target_ssh   = $(or $(TARGET_SSH),40.160.227.49)
+_target      = $(or $(TARGET),vps-efb4b52d)
+_target_ssh   = $(or $(TARGET_SSH),203.0.113.10)
 _playbook    = cd deploy && ansible-playbook -l $(_target) $(_vault_arg)
 
 update: frontend build build-engine ## Deploy > Build frontend + gateway + engine, handoff-deploy (zero disconnect for engines)

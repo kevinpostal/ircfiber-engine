@@ -72,7 +72,7 @@ Frontend, Alertmanager) for observability. All containers run on the
 
 SigNoz + ClickHouse + fluent-bit consume ~3.5 GB (ClickHouse 2 GB + signoz
 768 MB + postgres/keeper/ingester/bridge). The production host
-(OVH 40.160.227.49, 7.7 GB RAM) cannot afford it, so observability is
+(OVH 203.0.113.10, 7.7 GB RAM) cannot afford it, so observability is
 **opt-in everywhere** and defaults to **off**.
 
 ### Default (no SigNoz, ~300 MB)

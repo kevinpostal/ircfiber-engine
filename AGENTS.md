@@ -531,10 +531,7 @@ The same validator is embedded as a preflight task in the `logging` role, so `an
 
 # IRC Fiber — Deploy Architecture
 
-## Architecture mismatch: local ARM64 vs remote x86_64
-
-Local dev is on Apple Silicon (ARM64). The production server `ircfiber-ovh-1` (40.160.227.49) is **x86_64**. **Never** compile D binaries locally and SCP them — they produce `exec format error` on the server.
-
+Local dev is on Apple Silicon (ARM64). The production server `vps-efb4b52d` (203.0.113.10) is **x86_64**. **Never** compile D binaries locally and SCP them — they produce `exec format error` on the server.
 Always build via the **remote BuildKit** (docker build on the server) or use `make update` which handles this automatically. The only exception is frontend dist assets (`public/dist/`) which are platform-independent JS/CSS/HTML and can be pushed directly via the SSH tar pipe in the Makefile.
 
 ```bash
@@ -1428,8 +1425,7 @@ Files:
 ---
 
 # IRC Fiber — Deploy (gateway-only, engine untouched)
-
-`ircfiber-ovh-1` (`40.160.227.49`) is the old OVH IP — DNS still points there but the live host is `vps-efb4b52d` (`203.0.113.10`, `15.204.93.5` shorthand). Inventory `deploy/inventories/production/hosts.ini` lists both; the live gateway/engine are on `203.0.113.10`.
+The live host is `vps-efb4b52d` (`203.0.113.10`). Inventory `deploy/inventories/production/hosts.ini` lists `vps-efb4b52d`; the gateway/engine both run there.
 
 The engine (`ircfiber-engine-ovh`, PID 7) holds all IRC TCP/TLS sockets. Restarting it drops every network for ~1s (TLS soft-reconnect) and risks nick collisions. A frontend/CSS change must not touch it.
 
