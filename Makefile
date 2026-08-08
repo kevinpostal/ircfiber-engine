@@ -86,10 +86,10 @@ AR := →
 .PHONY: all help
 .PHONY: build build-gateway build-engine build-release build-debug build-ldc2 janitor-migrate frontend frontend-dev frontend-install
 
-# Component Workflows (primary user-facing targets)
-.PHONY: dev dev-docker dev-live debug debug-live stop
+.PHONY: dev dev-docker dev-live debug debug-live debug-host debug-all stop
 .PHONY: engine engine-rebuild engine-handoff engine-handoff-redis engine-restart engine-test
-.PHONY: gateway gateway-rebuild gateway-restart
+.PHONY: engine-start engine-stop engine-restart-docker
+.PHONY: gateway gateway-rebuild gateway-restart gateway-start
 .PHONY: up down gateway-up gateway-down engine-up engine-down engine-logs gateway-logs
 .PHONY: status logs logs-engine logs-gateway logs-supervisor crash-logs
 
@@ -110,11 +110,17 @@ AR := →
 .PHONY: cross-linux-x64 cross-linux-arm64 cross-linux-armv7
 .PHONY: verify precommit ci install-env
 .PHONY: sync-db-to-tailnet sync-mongo-to-tailnet sync-redis-to-tailnet
-
-# ----------------------------------------------------------------------------
-# Component Workflows
-# ----------------------------------------------------------------------------
-# Pick ONE primary workflow. Compose with the component operations below.
+# Primary workflows — decoupled: engine stays up across gateway restarts.
+# Engine = IRC daemon, holds TCP/TLS + JOIN state. Gateway = vibe.d REST+WS.
+# Changing gateway code must NOT flap the engine (no IRC reconnect).
+#
+# QUICK START
+#   make engine-start   # one-time: start engine in background (detached)
+#   make debug          # gateway only, leaves engine/IRC alone
+#   make dev            # Vite HMR against gateway (http://127.0.0.1:8090)
+#   make engine-logs    # tail engine when needed
+#   make gateway-logs   # tail gateway when needed
+#   make status         # what is running
 #
 # USE-CASE MATRIX
 # ──────────────────────────────────────────────────────────────────────────
@@ -122,27 +128,31 @@ AR := →
 # ──────────────────────────────────────────────────────────────────────────
 # Change Svelte / CSS / HTML only      make dev             Vite (HMR), Vite → local gateway
 #   (no local D backend)               make dev-live        Vite (HMR), Vite → tailnet gateway
-# Change gateway D code                make debug           Gateway + engine (supervised), local DBs
-# Change engine D code                 make debug           Same; then `make engine-rebuild && make engine-restart`
-#                                       make watch-engine    Same but auto-rebuilds on save
-# Debug gateway/engine against LIVE    make debug-live      Gateway + supervised engine → tailnet DBs
+# Change gateway D code                make debug           Gateway only (docker), engine untouched
+#   (no IRC reconnect)                 make gateway-logs    Tail gateway logs
+# Change engine D code                 make engine-start    Engine (docker, detached)
+#                                       make engine-rebuild && make engine-restart  # rebuild + flap engine
+#                                       make watch-engine    Auto-rebuild on save (host supervisor)
+# Debug gateway+engine against LIVE    make debug-live      Gateway + supervised engine → tailnet DBs
 #   (prod-shaped data)
 # Run D unit tests                     make test            dub test (gateway+engine shared modules)
-#                                       make engine-test     same — engine reuses shared modules
 # Watch the engine and auto-rebuild    make watch-engine    supervisor picks up new binary on save
-# Tail logs                            make logs            all in parallel
+# Tail logs                            make logs            gateway + engine in parallel
 #                                       make logs-engine     engine only
 #                                       make logs-gateway    gateway only
-#                                       make logs-supervisor supervisor only (crashes + restarts)
+# Stop gateway only                    make gateway-down    stops gateway, engine stays
+# Stop engine only                     make engine-down     stops engine, gateway stays
 # Stop everything                      make stop            kills supervisor + gateway, leaves Vite alone
+#                                      make down            docker compose down (all stacks)
 # ──────────────────────────────────────────────────────────────────────────
 #
 # COMPOSITION
-#   Terminal 1: make debug-live
-#   Terminal 2: make dev             (HMR against the local gateway from terminal 1)
-#   Terminal 3: make logs            (live tail)
-#   Make a change to source/*.d → engine auto-rebuilds and supervisor restarts.
+#   Terminal 1: make engine-start    # engine in background, holds IRC
+#   Terminal 2: make debug           # gateway, rebuilds only gateway image
+#   Terminal 3: make dev             # Vite HMR
+#   Make a change to backend/source/*.d → make debug restarts only gateway.
 #   Make a change to frontend/src/*.svelte → Vite hot-reloads instantly.
+#   Engine IRC connection stays up across gateway restarts.
 #
 # BACKEND (for `make dev` / `make dev-live`)
 #   make dev BACKEND=local  (default; expects local gateway on :8090)
@@ -152,7 +162,6 @@ AR := →
 # TAILNET OVERRIDES
 #   make debug-live IRCFIBER_SERVER_ID=mybox   (set a unique engine id)
 # ──────────────────────────────────────────────────────────────────────────
-
 # Tailnet connection settings (used by debug-live)
 TAILNET_MONGO_URL ?= mongodb://ircfiber:jqgwEv3GJwwizulaj3Fnbd8imqcMH4Gh@100.126.197.92:27017/ircfiber
 TAILNET_REDIS_URL ?= redis://100.126.197.92:6379/0
@@ -217,77 +226,96 @@ dev-docker: ensure-colima ## Dev > Docker backend + Vite frontend dev (fastest f
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting Vite dev server  $(R)"
 	@cd frontend && VITE_BACKEND_URL=http://127.0.0.1:8090 npm run dev
 
-# Full local stack — gateway + supervised engine, both against local docker DBs.
-# The Containerfile builds the gateway and engine from SEPARATE stages
-# (builder-backend vs builder-engine), so each image compiles only its own
-# sources. This target tracks a stamp file PER IMAGE:
-#   - engine stamp  (.docker-build-stamp-engine):  engine/source + common/source
-#   - gateway stamp (.docker-build-stamp-gateway): backend/source + backend/views
-#     + common/source + config + public (+ frontend/package.json)
-# A change in one side's inputs rebuilds ONLY that image — frontend/backend
-# work never recompiles the engine, and the unchanged container stays up
-# (no IRC reconnect).
-#   - `docker compose build` is BuildKit-cached: no source change → instant
-#     CACHED layers; D change → only affected modules recompile (dub
-#     incremental state persists via the /build/.dub + /root/.dub mounts).
-#   - Host `build-gateway`/`build-engine` are NOT needed here — the builder
-#     stages compile inside Docker. Use `debug-host` for host-native binaries.
-debug: ## Component > Full stack via docker-compose: gateway (REST API) + engine (IRC) as separate containers — logs via docker
-	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Starting Docker backend (redis/mongo/ircd)  $(R)"
-	@$(_docker_setup)
-	@bash -c '\
-		stamp_gw=.docker-build-stamp-gateway; \
-		stamp_eng=.docker-build-stamp-engine; \
-		build_gw=0; build_eng=0; \
-		# ── engine image inputs: engine + shared common sources ── \
-		if [ ! -f "$$stamp_eng" ] || \
-		   [ Containerfile -nt "$$stamp_eng" ] || \
-		   [ engine/dub.sdl -nt "$$stamp_eng" ] || [ engine/dub.selections.json -nt "$$stamp_eng" ] || \
-		   [ common/dub.sdl -nt "$$stamp_eng" ] || [ common/dub.selections.json -nt "$$stamp_eng" ]; then \
-			build_eng=1; \
-		elif find engine/source common/source deploy/roles/engine/files -type f -newer "$$stamp_eng" 2>/dev/null | grep -q .; then \
-			build_eng=1; \
-		fi; \
-		# ── gateway image inputs: backend + views + shared common + shipped assets ── \
-		if [ ! -f "$$stamp_gw" ] || \
-		   [ Containerfile -nt "$$stamp_gw" ] || \
-		   [ backend/dub.sdl -nt "$$stamp_gw" ] || [ backend/dub.selections.json -nt "$$stamp_gw" ] || \
-		   [ common/dub.sdl -nt "$$stamp_gw" ] || [ common/dub.selections.json -nt "$$stamp_gw" ] || \
-		   [ frontend/package.json -nt "$$stamp_gw" ]; then \
+# Gateway only — leaves engine/IRC untouched. Fast iteration for vibe.d/REST work.
+#   - builds gateway image only when backend/source, common/source, views, config changed
+#   - does NOT touch ircfiber-engine (no rebuild, no restart, no log tail)
+#   - ensures redis/mongo are up; does NOT require ircd
+#   - detached: exits after `up -d`, engine IRC stays connected
+#   Use `make gateway-logs` to tail, `make engine-start` to bring engine up once.
+debug: ## Component > Gateway only (REST API) — leaves engine/IRC untouched — use with `make engine-start` + `make dev`
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Gateway only (engine untouched)  $(R)"
+	@if ! docker info >/dev/null 2>&1; then printf "%b\n" "$(Y)$(WR) Docker not running — run: colima start$(R)"; exit 1; fi
+	@# Ensure redis/mongo are healthy — reuse local stack if already up, else start root stack DBs
+	@if docker compose -f deploy/local/docker-compose.yml ps redis mongo 2>/dev/null | grep -q "healthy"; then \
+		printf "%b\n" "$(BG)$(OK) Reusing local DB stack (ircfiber-redis/mongo)$(R)"; \
+	elif docker ps --format "{{.Names}}" 2>/dev/null | grep -q "^ircfiber-redis$$" && docker inspect ircfiber-redis --format '{{.State.Health.Status}}' 2>/dev/null | grep -q "healthy"; then \
+		printf "%b\n" "$(BG)$(OK) Reusing local DB stack (ircfiber-redis/mongo)$(R)"; \
+	elif ! docker compose ps redis mongo 2>/dev/null | grep -q "healthy"; then \
+		printf "%b\n" "$(C)  → starting redis/mongo (gateway deps)…$(R)"; \
+		GATEWAY_HOST_PORT=$${GATEWAY_HOST_PORT:-8090} REDIS_HOST_PORT=$${REDIS_HOST_PORT:-6379} MONGO_HOST_PORT=$${MONGO_HOST_PORT:-27017} \
+		docker compose up -d --remove-orphans redis mongo 2>/dev/null || true; \
+		for i in 1 2 3 4 5 6 7 8 9 10; do docker compose ps redis mongo 2>/dev/null | grep -q "healthy" && break; sleep 1; done; \
+	fi
+	@stamp_gw=.docker-build-stamp-gateway; build_gw=0; \
+		if [ ! -f "$$stamp_gw" ] || [ Containerfile -nt "$$stamp_gw" ] || [ backend/dub.sdl -nt "$$stamp_gw" ] || [ backend/dub.selections.json -nt "$$stamp_gw" ] || [ common/dub.sdl -nt "$$stamp_gw" ] || [ common/dub.selections.json -nt "$$stamp_gw" ] || [ frontend/package.json -nt "$$stamp_gw" ]; then \
 			build_gw=1; \
 		elif find backend/source backend/views common/source config public deploy/roles/gateway -type f -newer "$$stamp_gw" 2>/dev/null | grep -q .; then \
 			build_gw=1; \
 		fi; \
-		svcs=""; \
-		[ "$$build_gw" = "1" ] && svcs="$$svcs ircfiber-gateway"; \
-		[ "$$build_eng" = "1" ] && svcs="$$svcs ircfiber-engine"; \
-		if [ -n "$$svcs" ]; then \
-			printf "\n%b\n" "$(_BCn)$(K)$(B)  Building changed image(s):$$svcs  $(R)"; \
-			DOCKER_BUILDKIT=1 docker compose build $$svcs; \
-			[ "$$build_gw" = "1" ] && touch "$$stamp_gw"; \
-			[ "$$build_eng" = "1" ] && touch "$$stamp_eng"; \
+		if [ "$$build_gw" = "1" ]; then \
+			printf "\n%b\n" "$(_BCn)$(K)$(B)  Building gateway image  $(R)"; \
+			DOCKER_BUILDKIT=1 docker compose build ircfiber-gateway; touch "$$stamp_gw"; \
 		else \
-			printf "\n%b\n" "$(BG)$(OK) Images up-to-date — skipping docker build (cached) $(R) $(D)(touch Containerfile or the relevant source tree to force)$(R)"; \
+			printf "%b\n" "$(BG)$(OK) Gateway image up-to-date — skipping build (cached)$(R) $(D)(touch Containerfile or backend/source to force)$(R)"; \
 		fi; \
-		# Only tear down containers whose image was rebuilt — the other stays up. \
-		[ "$$build_gw" = "1" ] && docker rm -f ircfiber-gateway 2>/dev/null || true; \
-		[ "$$build_eng" = "1" ] && docker rm -f ircfiber-engine 2>/dev/null || true; \
-		'
+		if [ "$$build_gw" = "1" ]; then docker rm -f ircfiber-gateway 2>/dev/null || true; fi
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Starting gateway (engine untouched)  $(R)"
+	@if ! GATEWAY_HOST_PORT=$${GATEWAY_HOST_PORT:-8090} REDIS_HOST_PORT=$${REDIS_HOST_PORT:-6379} MONGO_HOST_PORT=$${MONGO_HOST_PORT:-27017} \
+	docker compose up -d --remove-orphans --no-deps ircfiber-gateway; then \
+		printf "%b\n" "$(Y)$(WR) up failed — cleaning stale gateway name and retrying$(R)"; \
+		docker rm -f ircfiber-gateway 2>/dev/null || true; \
+		GATEWAY_HOST_PORT=$${GATEWAY_HOST_PORT:-18090} docker compose up -d --remove-orphans --no-deps ircfiber-gateway; \
+	fi
+	@if docker network inspect local_ircfiber_local >/dev/null 2>&1 && docker ps --format "{{.Names}}" 2>/dev/null | grep -q "^ircfiber-redis$$"; then \
+		if ! docker inspect ircfiber-gateway --format "{{json .NetworkSettings.Networks}}" 2>/dev/null | grep -q "local_ircfiber_local"; then \
+			printf "%b\n" "$(C)  → bridging gateway to local_ircfiber_local$(R)"; \
+			docker network connect local_ircfiber_local ircfiber-gateway 2>/dev/null || true; \
+			docker restart ircfiber-gateway >/dev/null 2>&1 || true; sleep 2; \
+		fi; \
+	fi
+	@if docker network inspect irc_fiber_irc_network >/dev/null 2>&1 && docker ps --format "{{.Names}}" 2>/dev/null | grep -q "^irc_redis_test$$"; then \
+		if ! docker inspect ircfiber-gateway --format "{{json .NetworkSettings.Networks}}" 2>/dev/null | grep -q "irc_fiber_irc_network"; then \
+			docker network connect irc_fiber_irc_network ircfiber-gateway 2>/dev/null || true; \
+		fi; \
+	fi
+	@printf '\n%b\n' "$(BG)$(OK) Gateway running (engine untouched)$(R) $(D)(http://localhost:$${GATEWAY_HOST_PORT:-8090})$(R)"
+	@printf '%b\n' "$(C)  ─ containers $(R)"; docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" | grep -E "ircfiber-gateway|ircfiber-engine|irc_redis|irc_mongo|ircd" | sed "s/^/    /" || true
+	@printf '\n%b\n' "$(D)  Engine: make engine-start (once) | make engine-logs | make engine-down  — gateway restarts do NOT flap IRC$(R)"
+	@printf '%b\n' "$(D)  Tail gateway: make gateway-logs  |  all: make logs  |  Vite: make dev$(R)"
+
+debug-all: ## Component > Full stack: gateway + engine (both) — legacy, use `make debug` + `make engine-start` instead
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Starting Docker backend (redis/mongo/ircd) — gateway + engine  $(R)"
+	@$(_docker_setup)
+	@stamp_gw=.docker-build-stamp-gateway; \
+		stamp_eng=.docker-build-stamp-engine; \
+		build_gw=0; build_eng=0; \
+		if [ ! -f "$$stamp_eng" ] || [ Containerfile -nt "$$stamp_eng" ] || [ engine/dub.sdl -nt "$$stamp_eng" ] || [ engine/dub.selections.json -nt "$$stamp_eng" ] || [ common/dub.sdl -nt "$$stamp_eng" ] || [ common/dub.selections.json -nt "$$stamp_eng" ]; then build_eng=1; \
+		elif find engine/source common/source deploy/roles/engine/files -type f -newer "$$stamp_eng" 2>/dev/null | grep -q .; then build_eng=1; fi; \
+		if [ ! -f "$$stamp_gw" ] || [ Containerfile -nt "$$stamp_gw" ] || [ backend/dub.sdl -nt "$$stamp_gw" ] || [ backend/dub.selections.json -nt "$$stamp_gw" ] || [ common/dub.sdl -nt "$$stamp_gw" ] || [ common/dub.selections.json -nt "$$stamp_gw" ] || [ frontend/package.json -nt "$$stamp_gw" ]; then build_gw=1; \
+		elif find backend/source backend/views common/source config public deploy/roles/gateway -type f -newer "$$stamp_gw" 2>/dev/null | grep -q .; then build_gw=1; fi; \
+		svcs=""; [ "$$build_gw" = "1" ] && svcs="$$svcs ircfiber-gateway"; [ "$$build_eng" = "1" ] && svcs="$$svcs ircfiber-engine"; \
+		if [ -n "$$svcs" ]; then printf "\n%b\n" "$(_BCn)$(K)$(B)  Building changed image(s):$$svcs  $(R)"; DOCKER_BUILDKIT=1 docker compose build $$svcs; [ "$$build_gw" = "1" ] && touch "$$stamp_gw"; [ "$$build_eng" = "1" ] && touch "$$stamp_eng"; \
+		else printf "\n%b\n" "$(BG)$(OK) Images up-to-date — skipping docker build (cached) $(R) $(D)(touch Containerfile or the relevant source tree to force)$(R)"; fi; \
+		[ "$$build_gw" = "1" ] && docker rm -f ircfiber-gateway 2>/dev/null || true; [ "$$build_eng" = "1" ] && docker rm -f ircfiber-engine 2>/dev/null || true;
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Starting gateway + engine as separate containers  $(R)"
-	@GATEWAY_HOST_PORT=$${GATEWAY_HOST_PORT:-8090} IRCD_HOST_PORT=$${IRCD_HOST_PORT:-6667} IRCD_HOST_PORT2=$${IRCD_HOST_PORT2:-6668} REDIS_HOST_PORT=$${REDIS_HOST_PORT:-6379} MONGO_HOST_PORT=$${MONGO_HOST_PORT:-27017} \
-	docker compose up -d --remove-orphans --no-deps ircfiber-gateway ircfiber-engine || { \
-		printf "%b\n" "$(Y)$(WR) up failed — cleaning stale names and retrying$(R)"; \
-		docker rm -f ircfiber-gateway ircfiber-engine 2>/dev/null || true; \
+	@if ! GATEWAY_HOST_PORT=$${GATEWAY_HOST_PORT:-8090} IRCD_HOST_PORT=$${IRCD_HOST_PORT:-6667} IRCD_HOST_PORT2=$${IRCD_HOST_PORT2:-6668} REDIS_HOST_PORT=$${REDIS_HOST_PORT:-6379} MONGO_HOST_PORT=$${MONGO_HOST_PORT:-27017} \
+	docker compose up -d --remove-orphans --no-deps ircfiber-gateway ircfiber-engine; then \
+		printf "%b\n" "$(Y)$(WR) up failed — cleaning stale names and retrying$(R)"; docker rm -f ircfiber-gateway ircfiber-engine 2>/dev/null || true; docker rm -f irc_redis_test irc_mongo_test ircd_test 2>/dev/null || true; \
 		GATEWAY_HOST_PORT=$${GATEWAY_HOST_PORT:-18090} IRCD_HOST_PORT=$${IRCD_HOST_PORT:-16667} IRCD_HOST_PORT2=$${IRCD_HOST_PORT2:-16668} \
 		docker compose up -d --remove-orphans --no-deps ircfiber-gateway ircfiber-engine; \
-	}
+	fi
+	@if docker network inspect local_ircfiber_local >/dev/null 2>&1 && docker ps --format "{{.Names}}" 2>/dev/null | grep -q "^ircfiber-redis$$"; then \
+		need_restart=0; for c in ircfiber-gateway ircfiber-engine; do if ! docker inspect $$c --format "{{json .NetworkSettings.Networks}}" 2>/dev/null | grep -q "local_ircfiber_local"; then printf "%b\n" "$(C)  → bridging $$c to local_ircfiber_local$(R)"; docker network connect local_ircfiber_local $$c 2>/dev/null || true; need_restart=1; fi; done; \
+		if [ "$$need_restart" = "1" ]; then printf "%b\n" "$(C)  → restarting gateway/engine to pick up bridged DNS$(R)"; docker restart ircfiber-gateway ircfiber-engine >/dev/null 2>&1 || true; sleep 2; fi; \
+	fi
+	@if docker network inspect irc_fiber_irc_network >/dev/null 2>&1 && docker ps --format "{{.Names}}" 2>/dev/null | grep -q "^irc_redis_test$$"; then \
+		for c in ircfiber-gateway ircfiber-engine; do if ! docker inspect $$c --format "{{json .NetworkSettings.Networks}}" 2>/dev/null | grep -q "irc_fiber_irc_network"; then docker network connect irc_fiber_irc_network $$c 2>/dev/null || true; fi; done; \
+	fi
 	@printf '\n%b\n' "$(BG)$(OK) Gateway+Engine running as separate containers$(R) $(D)(ircfiber-gateway:8090, ircfiber-engine)$(R)"
 	@printf '%b\n' "$(C)  ─ containers $(R)"; docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" | grep -E "ircfiber-gateway|ircfiber-engine|irc_redis|irc_mongo|ircd" | sed "s/^/    /" || true
 	@printf '\n%b\n' "$(Y)$(WR) ctrl-c to stop → make down  •  tail logs:  make logs  (docker logs -f)$(R)"
 	@printf '%b\n' "$(D)  Also: make gateway-logs / engine-logs / status$(R)"
-	@trap 'printf "\n%b\n" "$(Y)$(WR) stopping...$(R)"; docker compose stop ircfiber-gateway ircfiber-engine 2>/dev/null || true; printf "%b\n" "$(BG)$(OK) debug stopped (containers left for logs; run make down to remove)$(R)"; exit 0' INT TERM; \
-	docker compose logs -f ircfiber-gateway ircfiber-engine
-# Host-native debug (fast D iteration, no docker build) — keeps old supervisor+gateway host binaries
+	@trap 'printf "\n%b\n" "$(Y)$(WR) stopping...$(R)"; docker compose stop ircfiber-gateway ircfiber-engine 2>/dev/null || true; printf "%b\n" "$(BG)$(OK) debug stopped (containers left for logs; run make down to remove)$(R)"; exit 0' INT TERM; docker compose logs -f ircfiber-gateway ircfiber-engine
 debug-host: build-gateway build-engine ## Component > Full stack HOST-NATIVE: gateway + engine (supervised), local docker DBs — ctrl-c to stop (legacy)
 	@$(_docker_setup)
 	@docker rm -f ircfiber-gateway ircfiber-engine 2>/dev/null || true
@@ -530,7 +558,8 @@ engine-handoff-redis: ## Component > Trigger graceful handoff via redis-cli (no 
 
 # Engine: kill the current engine — supervisor respawns with the latest binary.
 # Prefer `engine-handoff` for development to avoid closing IRC sockets.
-engine-restart: ## Component > Restart engine (supervisor respawns with new binary)
+# Host supervisor variant — for `make debug-host`. Docker variant is `make engine-restart-docker`.
+engine-restart-host: ## Component > Restart engine (host supervisor)
 	@bash -c ' \
 		printf "%b\n" "$(_BCn)$(K)$(B)  Restarting engine  $(R)"; \
 		if [ ! -f $(SUPERVISOR_PIDFILE) ]; then \
@@ -550,7 +579,7 @@ engine-restart: ## Component > Restart engine (supervisor respawns with new bina
 		fi; \
 		printf "%b\n" "$(BG)$(OK) supervisor will respawn engine$(R)"; \
 	'
-
+engine-restart: engine-restart-host ## Component > Restart engine (alias — host supervisor; for docker use `make engine-restart-docker`)
 # Engine: run D unit tests (uses dub test; engine + gateway share these modules).
 engine-test: test ## Component > Run D unit tests (engine + gateway share these modules)
 
@@ -855,29 +884,46 @@ define _docker_setup
 		exit 1; \
 	fi; \
 	docker rm -f irc_redis_test irc_mongo_test ircd_test ircfiber-fluent-bit 2>/dev/null || true; \
-	# NOTE: ircfiber-gateway/ircfiber-engine are NOT removed here — the debug
-	# target removes each container only when its image is rebuilt, so an
-	# unchanged engine (or gateway) keeps running across make debug runs. \
-	for port in 6379 27017 6667 8090; do \
-		if lsof -i :$$port -sTCP:LISTEN >/dev/null 2>&1; then \
-			case $$port in \
-				6379) alt=16379; envvar=REDIS_HOST_PORT;; \
-				27017) alt=27018; envvar=MONGO_HOST_PORT;; \
-				6667) alt=16667; envvar=IRCD_HOST_PORT;; \
-				8090) alt=18090; envvar=GATEWAY_HOST_PORT;; \
-			esac; \
-			if ! lsof -i :$$alt -sTCP:LISTEN >/dev/null 2>&1; then \
-				printf "%b\n" "$(Y)$(WR) Port $$port in use — using $$alt for debug (export $$envvar=$$alt to override)$(R)"; \
-				export $$envvar=$$alt; \
-			else \
-				printf "%b\n" "$(Y)$(WR) Port $$port and alt $$alt both in use — compose may fail on that binding$(R)"; \
-			fi; \
-		fi; \
-	done; \
-	if docker ps --format "{{.Names}}" 2>/dev/null | grep -q "ircfiber-redis\|ircfiber-mongo\|ircfiber-.*caddy"; then \
-		printf "%b\n" "$(D)Note: other ircfiber stack detected — debug will share or use alt ports above$(R)"; \
+	# If local stack's gateway/engine exist on local_ircfiber_local, they
+	# conflict with root's fixed container_name. Remove stale local gateway/engine
+	# only when root's debug is about to recreate them — preserve local DBs.
+	if docker ps -a --format "{{.Names}}" 2>/dev/null | grep -q "^ircfiber-gateway$$" && docker inspect ircfiber-gateway --format '{{json .NetworkSettings.Networks}}' 2>/dev/null | grep -q "local_ircfiber_local"; then \
+		printf "%b\n" "$(Y)$(WR) Found local-stack gateway (local_ircfiber_local) — will be replaced by debug's gateway$(R)"; \
+		docker rm -f ircfiber-gateway 2>/dev/null || true; \
 	fi; \
-	if ! docker compose ps mongo redis ircd 2>/dev/null | grep -q "healthy"; then \
+	if docker ps -a --format "{{.Names}}" 2>/dev/null | grep -q "^ircfiber-engine$$" && docker inspect ircfiber-engine --format '{{json .NetworkSettings.Networks}}' 2>/dev/null | grep -q "local_ircfiber_local"; then \
+		printf "%b\n" "$(Y)$(WR) Found local-stack engine (local_ircfiber_local) — will be replaced by debug's engine$(R)"; \
+		docker rm -f ircfiber-engine 2>/dev/null || true; \
+	fi; \
+ 	# NOTE: ircfiber-gateway/ircfiber-engine are NOT removed here — the debug
+ 	# target removes each container only when its image is rebuilt, so an
+ 	# unchanged engine (or gateway) keeps running across make debug runs. \
+ 	for port in 6379 27017 6667 8090; do \
+ 		if lsof -i :$$port -sTCP:LISTEN >/dev/null 2>&1; then \
+ 			case $$port in \
+ 				6379) alt=16379; envvar=REDIS_HOST_PORT;; \
+ 				27017) alt=27018; envvar=MONGO_HOST_PORT;; \
+ 				6667) alt=16667; envvar=IRCD_HOST_PORT;; \
+ 				8090) alt=18090; envvar=GATEWAY_HOST_PORT;; \
+ 			esac; \
+ 			if ! lsof -i :$$alt -sTCP:LISTEN >/dev/null 2>&1; then \
+ 				printf "%b\n" "$(Y)$(WR) Port $$port in use — using $$alt for debug (export $$envvar=$$alt to override)$(R)"; \
+ 				export $$envvar=$$alt; \
+ 			else \
+ 				printf "%b\n" "$(Y)$(WR) Port $$port and alt $$alt both in use — compose may fail on that binding$(R)"; \
+ 			fi; \
+ 		fi; \
+ 	done; \
+ 	if docker ps --format "{{.Names}}" 2>/dev/null | grep -q "ircfiber-redis\|ircfiber-mongo\|ircfiber-.*caddy"; then \
+ 		printf "%b\n" "$(D)Note: other ircfiber stack detected — debug will share or use alt ports above$(R)"; \
+ 	fi; \
+	# Reuse local stack DBs if they're already healthy — avoids duplicate
+	# redis/mongo/ircd on different networks. Check local compose first.
+	if docker compose -f deploy/local/docker-compose.yml ps mongo redis ircd 2>/dev/null | grep -q "healthy"; then \
+		printf "%b\n" "$(BG)$(OK) Local DB stack already running (ircfiber-redis/mongo/ircd) — reusing, skipping root DB startup$(R)"; \
+	elif docker ps --format "{{.Names}}" 2>/dev/null | grep -q "^ircfiber-redis$$" && docker inspect ircfiber-redis --format '{{.State.Health.Status}}' 2>/dev/null | grep -q "healthy"; then \
+		printf "%b\n" "$(BG)$(OK) Local DB stack already running (ircfiber-redis/mongo/ircd) — reusing, skipping root DB startup$(R)"; \
+	elif ! docker compose ps mongo redis ircd 2>/dev/null | grep -q "healthy"; then \
 		printf "%b\n" "$(Y)$(WR) Backend services not running. Starting them now...$(R)"; \
 		REDIS_HOST_PORT=$${REDIS_HOST_PORT:-6379} MONGO_HOST_PORT=$${MONGO_HOST_PORT:-27017} IRCD_HOST_PORT=$${IRCD_HOST_PORT:-6667} IRCD_HOST_PORT2=$${IRCD_HOST_PORT2:-6668} \
 		docker compose up -d --remove-orphans mongo redis ircd || { \
@@ -1363,17 +1409,58 @@ docker-restart-backend: ensure-colima ## Docker > Restart backend services only
 	@docker compose up -d --build --force-recreate ircfiber-engine redis mongo ircd
 	@printf '%b\n' "$(BG)$(OK) Backend services restarted$(R)"
 # ─── Split containers: API (gateway) vs Engine — easy start/stop ─────────────
+# Gateway and Engine are independent — restarting one does NOT flap the other.
+#   make debug         → gateway only (detached), engine untouched
+#   make engine-start  → engine only (detached, holds IRC), gateway untouched
+#   make engine-logs   → tail engine
+#   make gateway-logs  → tail gateway
 up: docker-up ## Docker > Start both API + Engine as separate containers (split)
 down: docker-down ## Docker > Stop both
 gateway-up: docker-up-web ## Docker > Start API (gateway) container only
 gateway-down: docker-down-web ## Docker > Stop API container only
-engine-up: ## Docker > Start Engine container only
-	@docker compose up -d ircfiber-engine
-engine-down: ## Docker > Stop Engine container only
-	@docker compose stop ircfiber-engine
-engine-logs: logs-engine ## Docker > Tail engine container logs
+gateway-start: gateway-up ## Docker > Alias: start gateway (detached, engine untouched)
 gateway-logs: logs-gateway ## Docker > Tail gateway container logs
-# ----------------------------------------------------------------------------
+engine-up: engine-start ## Docker > Start Engine container only (alias)
+engine-start: ensure-colima ## Docker > Start Engine in background (detached) — holds IRC connection
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Engine (detached, holds IRC)  $(R)"
+	@if ! docker info >/dev/null 2>&1; then printf "%b\n" "$(Y)$(WR) Docker not running$(R)"; exit 1; fi
+	@# Ensure DBs + ircd are up (engine needs ircd, gateway does not)
+	@if docker compose -f deploy/local/docker-compose.yml ps redis mongo 2>/dev/null | grep -q "healthy"; then \
+		printf "%b\n" "$(BG)$(OK) Reusing local DB stack$(R)"; \
+	elif ! docker compose ps redis mongo ircd 2>/dev/null | grep -q "healthy"; then \
+		printf "%b\n" "$(C)  → starting redis/mongo/ircd (engine deps)…$(R)"; \
+		REDIS_HOST_PORT=$${REDIS_HOST_PORT:-6379} MONGO_HOST_PORT=$${MONGO_HOST_PORT:-27017} IRCD_HOST_PORT=$${IRCD_HOST_PORT:-6667} IRCD_HOST_PORT2=$${IRCD_HOST_PORT2:-6668} \
+		docker compose up -d --remove-orphans redis mongo ircd 2>/dev/null || true; \
+		for i in 1 2 3 4 5 6 7 8 9 10; do docker compose ps redis mongo ircd 2>/dev/null | grep -q "healthy" && break; sleep 1; done; \
+	fi
+	@stamp_eng=.docker-build-stamp-engine; build_eng=0; \
+		if [ ! -f "$$stamp_eng" ] || [ Containerfile -nt "$$stamp_eng" ] || [ engine/dub.sdl -nt "$$stamp_eng" ] || [ engine/dub.selections.json -nt "$$stamp_eng" ] || [ common/dub.sdl -nt "$$stamp_eng" ] || [ common/dub.selections.json -nt "$$stamp_eng" ]; then build_eng=1; \
+		elif find engine/source common/source deploy/roles/engine/files -type f -newer "$$stamp_eng" 2>/dev/null | grep -q .; then build_eng=1; fi; \
+		if [ "$$build_eng" = "1" ]; then printf "\n%b\n" "$(_BCn)$(K)$(B)  Building engine image  $(R)"; DOCKER_BUILDKIT=1 docker compose build ircfiber-engine; touch "$$stamp_eng"; \
+		else printf "%b\n" "$(BG)$(OK) Engine image up-to-date — skipping build (cached)$(R)"; fi; \
+		if [ "$$build_eng" = "1" ]; then docker rm -f ircfiber-engine 2>/dev/null || true; fi
+	@if ! REDIS_HOST_PORT=$${REDIS_HOST_PORT:-6379} MONGO_HOST_PORT=$${MONGO_HOST_PORT:-27017} IRCD_HOST_PORT=$${IRCD_HOST_PORT:-6667} IRCD_HOST_PORT2=$${IRCD_HOST_PORT2:-6668} \
+	docker compose up -d --remove-orphans --no-deps ircfiber-engine; then \
+		printf "%b\n" "$(Y)$(WR) up failed — cleaning stale engine name and retrying$(R)"; docker rm -f ircfiber-engine 2>/dev/null || true; \
+		REDIS_HOST_PORT=$${REDIS_HOST_PORT:-16379} MONGO_HOST_PORT=$${MONGO_HOST_PORT:-27018} IRCD_HOST_PORT=$${IRCD_HOST_PORT:-16667} IRCD_HOST_PORT2=$${IRCD_HOST_PORT2:-16668} \
+		docker compose up -d --remove-orphans --no-deps ircfiber-engine; \
+	fi
+	@if docker network inspect local_ircfiber_local >/dev/null 2>&1 && docker ps --format "{{.Names}}" 2>/dev/null | grep -q "^ircfiber-redis$$"; then \
+		if ! docker inspect ircfiber-engine --format "{{json .NetworkSettings.Networks}}" 2>/dev/null | grep -q "local_ircfiber_local"; then docker network connect local_ircfiber_local ircfiber-engine 2>/dev/null || true; docker restart ircfiber-engine >/dev/null 2>&1 || true; sleep 2; fi; \
+	fi
+	@printf '\n%b\n' "$(BG)$(OK) Engine running in background (detached)$(R) $(D)(ircfiber-engine)$(R)"
+	@printf '%b\n' "$(C)  ─ containers $(R)"; docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" | grep -E "ircfiber-engine|irc_redis|irc_mongo|ircd" | sed "s/^/    /" || true
+	@printf '%b\n' "$(D)  Tail: make engine-logs  |  restart: make engine-restart-docker  |  stop: make engine-down$(R)"
+engine-down: ## Docker > Stop Engine container only (gateway untouched)
+	@docker compose stop ircfiber-engine 2>/dev/null || docker compose -f deploy/local/docker-compose.yml stop ircfiber-engine 2>/dev/null || true
+	@printf '%b\n' "$(BG)$(OK) Engine stopped (gateway untouched)$(R)"
+engine-stop: engine-down ## Docker > Alias: stop engine
+engine-restart-docker: ## Docker > Restart engine (rebuild if needed, gateway untouched)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Restarting engine (gateway untouched)  $(R)"
+	@DOCKER_BUILDKIT=1 docker compose build ircfiber-engine 2>/dev/null || true
+	@docker compose up -d --force-recreate --no-deps ircfiber-engine
+	@printf '%b\n' "$(BG)$(OK) Engine restarted$(R)"
+engine-logs: logs-engine ## Docker > Tail engine container logs (detached engine)
 # Docker — interactive shells
 # ----------------------------------------------------------------------------
 # Usage:
@@ -1506,6 +1593,47 @@ local-dev-up-observability:                 ## Dev > Bring up local stack WITH S
 local-dev-smoke:                            ## Dev > Run observability smoke test against local stack
 	bash tests/local-dev/smoke-observability.sh
 
+# ─── SigNoz — independent, like engine-start (gateway/engine stay) ───────────
+# Start/stop observability without flapping gateway/engine. ~4 GB when up.
+#   make signoz-up    # clickhouse+zookeeper+signoz+otel-collector+fluent-bit detached
+#   make signoz-down  # stop observability, preserve ClickHouse data
+#   make signoz-logs  # tail SigNoz + collector
+# Gateway/engine auto-export OTLP when IRCFIBER_OTEL_ENABLED=1 (local-up-observability sets it).
+# If gateway already running via `make debug` (root compose), signoz-up bridges it to ircfiber_local
+# so OTLP reaches otel-collector:4318.
+.PHONY: signoz-up signoz-down signoz-logs signoz-status
+signoz-up: ensure-colima ## SigNoz > Start observability stack (detached, gateway/engine untouched)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  SigNoz up (detached, ~4 GB)  $(R)"
+	@IRCFIBER_OTEL_ENABLED=1 docker compose -f deploy/local/docker-compose.yml --profile observability up -d clickhouse zookeeper signoz otel-collector fluent-bit
+	@printf '\n%b\n' "$(BG)$(OK) SigNoz running$(R) $(D)(http://localhost:3301  OTLP:4317/4318)$(R)"
+	@printf '%b\n' "$(C)  ─ containers $(R)"; docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" | grep -E "clickhouse|zookeeper|signoz|otel-collector|fluent" | sed "s/^/    /" || true
+	@# Bridge root gateway/engine to ircfiber_local (actual compose name: local_ircfiber_local) so OTLP reaches collector
+	@if docker ps --format "{{.Names}}" 2>/dev/null | grep -q "^ircfiber-gateway$$"; then \
+		if ! docker inspect ircfiber-gateway --format "{{json .NetworkSettings.Networks}}" 2>/dev/null | grep -q "ircfiber_local"; then \
+			printf "%b\n" "$(C)  → bridging ircfiber-gateway → ircfiber_local for OTLP$(R)"; \
+			docker network connect local_ircfiber_local ircfiber-gateway 2>/dev/null || true; \
+		fi; \
+	fi
+	@if docker ps --format "{{.Names}}" 2>/dev/null | grep -q "^ircfiber-engine$$"; then \
+		if ! docker inspect ircfiber-engine --format "{{json .NetworkSettings.Networks}}" 2>/dev/null | grep -q "ircfiber_local"; then \
+			printf "%b\n" "$(C)  → bridging ircfiber-engine → ircfiber_local for OTLP$(R)"; \
+			docker network connect local_ircfiber_local ircfiber-engine 2>/dev/null || true; \
+		fi; \
+	fi
+	@printf '%b\n' "$(D)  UI: http://localhost:3301  Logs: make signoz-logs  Stop: make signoz-down$(R)"
+
+signoz-down: ## SigNoz > Stop observability stack (preserve data, gateway/engine untouched)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Stopping SigNoz  $(R)"
+	@docker compose -f deploy/local/docker-compose.yml --profile observability stop clickhouse zookeeper signoz otel-collector fluent-bit 2>/dev/null || true
+	@printf '%b\n' "$(BG)$(OK) SigNoz stopped (data preserved)$(R) $(D)(wipe with: make local-down-clean)$(R)"
+
+signoz-logs: ## SigNoz > Tail SigNoz + OTel collector logs
+	@docker compose -f deploy/local/docker-compose.yml logs -f signoz otel-collector
+
+signoz-status: ## SigNoz > Show observability containers + health
+	@printf "\n%b\n" "$(_BC)$(K)$(B)  SigNoz status  $(R)"
+	@docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" | grep -E "clickhouse|zookeeper|signoz|otel|fluent" | sed "s/^/    /" || printf "    (no observability containers running)\n"
+	@printf "\n%b\n" "$(C)  ─ health $(R)"; docker inspect --format "{{.Name}} {{.State.Health.Status}}" ircfiber-clickhouse ircfiber-signoz 2>/dev/null | sed "s/^/    /" || true
 # ----------------------------------------------------------------------------
 # Data Sync — Local Docker → Tailnet
 # ----------------------------------------------------------------------------
