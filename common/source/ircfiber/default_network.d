@@ -37,9 +37,34 @@ import ircfiber.irc.registry : ServerRegistry;
 /// Hostname of the platform-provided IRC server.
 immutable string DEFAULT_FIBER_HOST = "irc.ircfiber.com";
 
+/// Redis key for the admin toggle that controls auto-provisioning of the
+/// default Fiber network and its visibility in the sidebar. When "0"/"false"
+/// auto-provisioning is skipped and the sidebar hides the Fiber server.
+immutable string FIBER_ENABLED_KEY = "irc:config:fiberEnabled";
+
+/// Returns true if the Fiber auto-connect is enabled (default true when key
+/// is missing). Reads `FIBER_ENABLED_KEY` from Redis.
+bool isFiberEnabled(RedisStorage redis) @trusted {
+    try {
+        auto v = redis.getDb().get(FIBER_ENABLED_KEY);
+        if (v.length == 0) return true;
+        return v != "0" && v != "false" && v != "False";
+    } catch (Exception) {
+        return true;
+    }
+}
+
+/// Persists the Fiber enabled flag to Redis.
+void setFiberEnabled(RedisStorage redis, bool enabled) @trusted {
+    try {
+        redis.getDb().set(FIBER_ENABLED_KEY, enabled ? "1" : "0");
+    } catch (Exception e) {
+        logWarn("setFiberEnabled failed: %s", e.msg);
+    }
+}
+
 /// TLS port for the platform-provided IRC server.
 immutable ushort DEFAULT_FIBER_PORT = 6697;
-
 /// Human-readable name for the default network as it appears in the sidebar.
 immutable string DEFAULT_FIBER_NAME = "IRC Fiber";
 
@@ -120,6 +145,12 @@ NetworkConfig ensureDefaultFiberNetwork(
     ServerRegistry serverRegistry
 ) {
     if (user.id == UUID.init || user.username.length == 0)
+        return NetworkConfig.init;
+
+    // Global kill-switch: when admin disables Fiber, don't provision
+    // new networks. Existing networks are left as-is (admin bulk
+    // disable handles them via the dedicated endpoint).
+    if (!isFiberEnabled(redis))
         return NetworkConfig.init;
 
     // Skip if user already has a connection to irc.ircfiber.com — do not
