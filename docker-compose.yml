@@ -4,7 +4,8 @@ services:
       context: .
       dockerfile: Containerfile
       target: runtime-gateway
-    image: irc-fiber-gateway:latest
+      args:
+        CACHE_BUST: ${CACHE_BUST:-fixed}
     container_name: ircfiber-gateway
     restart: unless-stopped
     command: ["/app/irc-fiber"]
@@ -48,7 +49,8 @@ services:
       context: .
       dockerfile: Containerfile
       target: runtime-engine
-    image: irc-fiber-engine:latest
+      args:
+        CACHE_BUST: ${CACHE_BUST:-fixed}
     container_name: ircfiber-engine
     restart: unless-stopped
     command: ["/app/irc-fiber-engine"]

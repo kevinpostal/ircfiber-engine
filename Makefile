@@ -58,6 +58,26 @@ DSCANNER := $(or $(shell which dscanner 2>/dev/null),\
 SRCS        := $(shell find backend/source common/source engine/source -name '*.d' 2>/dev/null)
 DT_SRCS     := $(shell find backend/views -name '*.dt' 2>/dev/null)
 
+# ----------------------------------------------------------------------------
+# Docker context pinning
+# ----------------------------------------------------------------------------
+# Local docker targets MUST build on the native arm64 colima VM. The x86_64
+# `colima-staging` VM (QEMU-emulated) exists only for staging / ansible deploy
+# testing — D compiles there run ~10-20x slower, and a stray `docker context
+# use colima-staging` used to silently slow down every `make debug` /
+# `make gateway-up`.
+#
+# Exporting DOCKER_CONTEXT pins the docker CLI (incl. compose v2) to the
+# native profile for EVERY recipe, regardless of the configured context. To
+# deliberately target the staging VM for a single command:
+#
+#   make gateway-up DOCKER_CONTEXT=colima-staging
+#
+# Ansible deploys are unaffected — they build on the target host over SSH.
+ifeq ($(shell docker context ls --format '{{.Name}}' 2>/dev/null | grep -x colima),colima)
+export DOCKER_CONTEXT := colima
+endif
+
 # Colors & icons
 R  := \033[0m
 B  := \033[1m
@@ -100,7 +120,7 @@ AR := →
 .PHONY: test test-frontend test-all test-watch test-coverage test-lib test-client handoff-test exec-reload-test exec-reload-it clean fmt fmt-check lint deps-check
 .PHONY: dscanner-install dscanner-all dscanner-syntax dscanner-lint dscanner-unused \
         dscanner-complexity dscanner-imports dscanner-fix dscanner-size dscanner-outline
-.PHONY: ensure-colima docker-up docker-down docker-logs docker-build \
+.PHONY: ensure-colima docker-ctx docker-up docker-down docker-logs docker-build \
         docker-up-web docker-down-web docker-restart-web \
         docker-up-backend docker-down-backend docker-restart-backend docker-restart \
         docker-restart-code \
@@ -232,7 +252,7 @@ dev-docker: ensure-colima ## Dev > Docker backend + Vite frontend dev (fastest f
 #   - ensures redis/mongo are up; does NOT require ircd
 #   - detached: exits after `up -d`, engine IRC stays connected
 #   Use `make gateway-logs` to tail, `make engine-start` to bring engine up once.
-debug: ## Component > Gateway only (REST API) — leaves engine/IRC untouched — use with `make engine-start` + `make dev`
+debug: ensure-colima ## Component > Gateway only (REST API) — leaves engine/IRC untouched — use with `make engine-start` + `make dev`
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Gateway only (engine untouched)  $(R)"
 	@if ! docker info >/dev/null 2>&1; then printf "%b\n" "$(Y)$(WR) Docker not running — run: colima start$(R)"; exit 1; fi
 	@# Ensure redis/mongo are healthy — reuse local stack if already up, else start root stack DBs
@@ -283,7 +303,7 @@ debug: ## Component > Gateway only (REST API) — leaves engine/IRC untouched �
 	@printf '\n%b\n' "$(D)  Engine: make engine-start (once) | make engine-logs | make engine-down  — gateway restarts do NOT flap IRC$(R)"
 	@printf '%b\n' "$(D)  Tail gateway: make gateway-logs  |  all: make logs  |  Vite: make dev$(R)"
 
-debug-all: ## Component > Full stack: gateway + engine (both) — legacy, use `make debug` + `make engine-start` instead
+debug-all: ensure-colima ## Component > Full stack: gateway + engine (both) — legacy, use `make debug` + `make engine-start` instead
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Starting Docker backend (redis/mongo/ircd) — gateway + engine  $(R)"
 	@$(_docker_setup)
 	@stamp_gw=.docker-build-stamp-gateway; \
@@ -316,7 +336,7 @@ debug-all: ## Component > Full stack: gateway + engine (both) — legacy, use `m
 	@printf '\n%b\n' "$(Y)$(WR) ctrl-c to stop → make down  •  tail logs:  make logs  (docker logs -f)$(R)"
 	@printf '%b\n' "$(D)  Also: make gateway-logs / engine-logs / status$(R)"
 	@trap 'printf "\n%b\n" "$(Y)$(WR) stopping...$(R)"; docker compose stop ircfiber-gateway ircfiber-engine 2>/dev/null || true; printf "%b\n" "$(BG)$(OK) debug stopped (containers left for logs; run make down to remove)$(R)"; exit 0' INT TERM; docker compose logs -f ircfiber-gateway ircfiber-engine
-debug-host: build-gateway build-engine ## Component > Full stack HOST-NATIVE: gateway + engine (supervised), local docker DBs — ctrl-c to stop (legacy)
+debug-host: ensure-colima build-gateway build-engine ## Component > Full stack HOST-NATIVE: gateway + engine (supervised), local docker DBs — ctrl-c to stop (legacy)
 	@$(_docker_setup)
 	@docker rm -f ircfiber-gateway ircfiber-engine 2>/dev/null || true
 	@bash -c 'set -u; \
@@ -368,7 +388,7 @@ debug-host: build-gateway build-engine ## Component > Full stack HOST-NATIVE: ga
 # leaving the supervisor orphaned. We redirect to a log file instead — use
 # `make logs` in another terminal for live tailing, and the colored startup
 # banner above still prints to this terminal.
-debug-live: frontend ## Component > Gateway + engine in Docker against TAILNET DBs — ctrl-c to stop
+debug-live: ensure-colima frontend ## Component > Gateway + engine in Docker against TAILNET DBs — ctrl-c to stop
 	@printf '\n\033[46m\033[30m\033[1m  Gateway + engine (docker) → tailnet DBs  \033[0m\n'
 	@printf '\033[2m  Mongo: %s\033[0m\n' "$(TAILNET_MONGO_URL)"
 	@printf '\033[2m  Redis: %s\033[0m\n' "$(TAILNET_REDIS_URL)"
@@ -1254,6 +1274,16 @@ ensure-colima:
 			exit 1; \
 		fi; \
 	fi
+	@cur="$$(docker context ls 2>/dev/null | awk '/\*/{print $$1}')"; \
+	if [ -n "$$cur" ] && [ "$$cur" != "colima" ]; then \
+		printf '%b\n' "$(Y)$(WR) docker context is '$$cur' — make targets are pinned to native 'colima' (arm64)$(R)"; \
+		printf '%b\n' "$(D)  staging VM (x86_64/QEMU) is only used by ansible/deploy targets — one-off: make <target> DOCKER_CONTEXT=colima-staging$(R)"; \
+	fi
+
+docker-ctx: ## Docker > Show which docker daemon make targets are pinned to (native colima vs staging VM)
+	@printf 'effective context  : %s\n' "$$(docker context ls 2>/dev/null | awk '/\*/{print $$1}')"
+	@printf 'config file context: %s\n' "$$(docker context show 2>/dev/null)"
+	@printf 'daemon             : %s (%s)\n' "$$(docker info --format '{{.Name}}' 2>/dev/null)" "$$(docker info --format '{{.Architecture}}' 2>/dev/null)"
 
 docker-up: ensure-colima ## Docker > Start all services with Docker Compose
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Building Docker images — staged cache  $(R)"

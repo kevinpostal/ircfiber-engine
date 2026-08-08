@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
+ARG CACHE_BUST=fixed
 #
-# IRC Fiber build pipeline (BuildKit)
 # ===================================
 #
 # Stage graph:
@@ -93,8 +93,6 @@ WORKDIR /build
 # ============================================================================
 FROM base AS builder-common
 
-ARG CACHE_BUST=fixed
-
 # ── Build cache invalidation ─────────────────────────────────────────────
 # Same sentinel trick as before, but now one sentinel per package so editing
 # `backend/source/api/rest.d` does not force-rebuild the engine and vice versa.
@@ -114,21 +112,17 @@ COPY common/source/ ./common/source/
 RUN --mount=type=cache,target=/build/.dub,sharing=locked \
     --mount=type=cache,target=/root/.dub,sharing=locked \
     if [ "$CACHE_BUST" != "fixed" ]; then \
-        rm -rf /build/.dub /root/.dub && \
         DUB_FLAGS="--force" && \
-        echo "dub cache busted (CACHE_BUST=$CACHE_BUST)" ; \
+        echo "dub cache busted (CACHE_BUST=$CACHE_BUST) --force" ; \
     else \
         DUB_FLAGS="" ; \
     fi && \
     echo "build: $CACHE_BUST" && \
     dub build --root=common --compiler=ldc2 --build=release --parallel $DUB_FLAGS
-
 # ============================================================================
 # Stage: builder-backend — gateway binary only (irc-fiber + irc-fiber-gateway)
 # ============================================================================
 FROM builder-common AS builder-backend
-
-ARG CACHE_BUST=fixed
 
 COPY <<EOF ./backend/source/.cache_bust_$CACHE_BUST
 bust=$CACHE_BUST
@@ -160,8 +154,6 @@ RUN find . -maxdepth 1 -type f -executable -exec strip {} +; find backend -maxde
 # Stage: builder-engine — engine binaries only (irc-fiber-engine + migrates)
 # ============================================================================
 FROM builder-common AS builder-engine
-
-ARG CACHE_BUST=fixed
 
 COPY <<EOF ./engine/source/.cache_bust_$CACHE_BUST
 bust=$CACHE_BUST
