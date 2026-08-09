@@ -3732,8 +3732,19 @@ private void processEvents() {
             }
 
             // ── End of WHO (RPL_ENDOFWHO, 315) — no-op for state ───────────
+            // WHO reply (352) rows themselves are consumed above (realname
+            // cache + channelUsers prefix promotion) and are never
+            // published. The matching 315 terminator has no state and no
+            // UI consumer — returning here keeps it off the eventChannel
+            // and out of Redis scrollback. Without this, SuperNets
+            // (which re-WHOs every few seconds to refresh realnames)
+            // floods each channel's scrollback with one 315 row per
+            // WHO, pushing the user's actual PRIVMSGs out of the
+            // displayed window on every page load and making recent
+            // messages appear to "disappear" behind a wall of
+            // "End of WHO list" noise.
             case "315":
-                break;
+                return;
 
             // ── WHOX reply (RPL_WHOX, 354) — engine consumes nothing ──────
             // The engine issues `WHO %tn` from the JOIN handler to populate
