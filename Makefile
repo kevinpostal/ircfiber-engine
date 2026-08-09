@@ -1647,19 +1647,54 @@ update-full: ## Deploy > Full docker image rebuild + container recreate
 deploy: update-full ## Deploy > Alias for update-full
 
 # Build frontend + push public/ + views/ to running gateway via SSH.
-# The gateway reads these files from disk at request time, so no binary
-# change, no container restart, no reconnect. ~2-3s after build.
+# WARNING: this is EPHEMERAL — it writes to the running container's writable
+# layer via `docker exec`. A `docker rm -f ircfiber-gateway` or
+# `docker compose up --force-recreate ircfiber-gateway` will discard it and
+# revert to the image's baked assets. For a persistent gateway deploy that
+# survives container recreation, use `make update-gateway` (rebuilds the
+# image) or `make update` (full rsync + BuildKit).
 #
-# Container's /app/public and /app/views are READ-ONLY bind mounts from
-# /opt/ircfiber-src/{public,views}/ on the host — the rsync inside the
-# playbook already pushes there, so the push below only matters for
-# `make update-assets` (which doesn't run the playbook).
-update-assets: frontend ## Deploy > Build frontend + push public/* to running gateway (no restart)
+# The gateway image bakes `public/` and `backend/views/index.dt` at build
+# time (Containerfile `COPY public/ ./public/`). The `update` playbook
+# rsyncs the entire repo to /opt/ircfiber-src on the host before
+# `docker build --target runtime-gateway`, so the next image contains the
+# new assets. `update-assets` below is a fast-path for iteration that
+# skips the image rebuild — hence the ephemeral warning.
+update-assets: frontend ## Deploy > Build frontend + push public/* to running gateway (EPHEMERAL — lost on recreate)
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Asset push → $(_target_ssh) ($(_target))  $(R)"
-	@printf '%b\n' "$(D)  Tarring public/ → ssh → docker exec tar -xf - (clean extract)$(R)"
+	@printf '%b\n' "$(Y)$(WR)  EPHEMERAL: writes to container layer only — survives restart but NOT rm/recreate$(R)"
+	@printf '%b\n' "$(D)  For persistent deploy: make update-gateway (engine untouched)$(R)"
+	@printf '%b\n' "$(D)  1/3 Tarring public/ → ssh → docker exec tar -xf - (clean extract)$(R)"
 	@tar cz --no-xattrs --format=ustar -C public . | ssh deploy@$(_target_ssh) 'docker exec -i ircfiber-gateway sh -c "rm -rf /app/public/dist/ /app/public/.vite/ /app/public/assets/ 2>/dev/null; tar xzf - -C /app/public"'
-	@printf '%b\n' "$(D)  Pushing backend/views/index.dt (updated bundle hashes)$(R)"
+	@printf '%b\n' "$(D)  2/3 Pushing backend/views/index.dt (updated bundle hashes)$(R)"
 	@ssh deploy@$(_target_ssh) 'docker exec -i ircfiber-gateway sh -c "cat > /app/views/index.dt"' < backend/views/index.dt
+	@printf '%b\n' "$(D)  3/3 Syncing to /opt/ircfiber-src for persistence (next image build)$(R)"
+	@rsync -avz --delete -e "ssh -o StrictHostKeyChecking=no" public/ deploy@$(_target_ssh):/opt/ircfiber-src/public/ 2>&1 | tail -5
+	@rsync -avz -e "ssh -o StrictHostKeyChecking=no" backend/views/index.dt deploy@$(_target_ssh):/opt/ircfiber-src/backend/views/index.dt 2>&1 | tail -5
+	@printf '%b\n' "$(BG)$(OK) Assets pushed (ephemeral) + synced to src for next build$(R)"
+
+# Persistent gateway-only deploy — rebuilds the gateway image on the target
+# and recreates the gateway container WITHOUT touching the engine (no IRC
+# disconnect). Use this when you only changed frontend (Svelte/TS/CSS) or
+# gateway D code and want the change to survive `docker rm` / host reboot.
+#
+# Steps: frontend → rsync public/views to /opt/ircfiber-src on host →
+# docker build --target runtime-gateway on host → ansible gateway role
+# recreates ircfiber-gateway with correct env (Tailscale IP, networks).
+# Engine (ircfiber-engine-ovh) is NOT restarted — IRC connections stay up.
+update-gateway: frontend ## Deploy > Build frontend + rebuild gateway image + recreate gateway (engine untouched, persistent)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Gateway-only deploy → $(_target)  $(R)"
+	@printf '%b\n' "$(D)  1/4 Syncing public/ + views/index.dt to /opt/ircfiber-src on host$(R)"
+	@rsync -avz --delete -e "ssh -o StrictHostKeyChecking=no" public/ deploy@$(_target_ssh):/opt/ircfiber-src/public/ 2>&1 | tail -5
+	@rsync -avz -e "ssh -o StrictHostKeyChecking=no" backend/views/index.dt deploy@$(_target_ssh):/opt/ircfiber-src/backend/views/index.dt 2>&1 | tail -5
+	@printf '%b\n' "$(D)  2/4 Building runtime-gateway image on host (BuildKit, ~2-3m first time, cached after)$(R)"
+	@ssh deploy@$(_target_ssh) 'cd /opt/ircfiber-src && DOCKER_BUILDKIT=1 docker build --target runtime-gateway -t kevindpostal/irc-fiber-gateway:0.3.0 -f Containerfile . 2>&1 | tail -20'
+	@ssh deploy@$(_target_ssh) 'docker tag kevindpostal/irc-fiber-gateway:0.3.0 kevindpostal/irc-fiber-gateway:0.3.1 2>/dev/null || true'
+	@printf '%b\n' "$(D)  3/4 Recreating gateway container via Ansible (correct env, networks)$(R)"
+	@cd deploy && ansible-playbook -l $(_target) $(_vault_arg) playbooks/gateway.yml 2>&1 | tail -20
+	@printf '%b\n' "$(D)  4/4 Verifying gateway health + engine untouched$(R)"
+	@ssh deploy@$(_target_ssh) 'sleep 2; curl -fsS http://127.0.0.1:8090/health 2>&1 | head -c 200; echo ""; docker ps --format "{{.Names}} {{.Status}}" | grep -E "gateway|engine"'
+	@printf '%b\n' "$(BG)$(OK) Gateway deployed (persistent) — engine not restarted$(R)"
 
 # Show running container images and versions on the target.
 update-status: ## Deploy > Show running containers & image versions

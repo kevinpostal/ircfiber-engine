@@ -504,12 +504,38 @@ This bite the author of the 432/433 nick-revert fix: the in-place mutation and d
 
 ## Admin SPA deployment
 
-Frontend assets (`public/dist/admin.html`, `assets/*`) are pushed to the gateway container via the Makefile's SSH tar pipe AFTER the playbook completes:
+Frontend assets (`public/dist/admin.html`, `assets/*`) are **baked into the
+gateway image** at build time (`Containerfile` `COPY public/ ./public/` and
+`COPY --from=builder-backend /build/views /app/views`). Two deploy paths exist:
+
+| Command | What it does | IRC disconnect? | Survives `docker rm -f`? |
+|---|---|---|---|
+| `make update-assets` | `frontend` build + `docker exec tar` into running `ircfiber-gateway` (`/app/public`, `/app/views/index.dt`) — **ephemeral** | No | **No** — writable layer discarded on `docker rm` / `docker compose up --force-recreate` / host reboot. Use for quick iteration only. |
+| `make update-gateway` | `frontend` build + `rsync` to `/opt/ircfiber-src/public` on host + `docker build --target runtime-gateway` on host + `ansible-playbook playbooks/gateway.yml` recreates `ircfiber-gateway` via `community.docker.docker_container` (correct Tailscale env, `ircfiber_net` + `ircfiber_logging`) — **persistent** | No (engine untouched) | **Yes** — new image baked, survives recreate/reboot. |
+| `make update` | Full rsync + BuildKit `builder` + `docker cp` binary into gateway **and** engine + hard restart both — full deploy | **Yes** (brief, auto-reconnect) | Yes |
+
+**Gotcha 2026-08-09:** a frontend deploy via `make update-assets` + manual
+`docker rm -f ircfiber-gateway && docker compose up -d --no-deps ircfiber-gateway`
+wiped the `docker exec`-pushed `main-S6NCrGWT.js` (BLCKND/SUPERNETS) and left the
+SPA 404. The compose container also used the wrong `MONGO_URL`
+(`mongo:27017` vs Tailscale `198.51.100.1:27017`) and never became healthy.
+`make update-assets` now also `rsync`s to `/opt/ircfiber-src/public` for
+persistence, and `make update-gateway` was added as the correct persistent
+gateway-only path (engine stays up — `ircfiber-engine-ovh` not restarted).
+
 ```bash
-tar cz --no-xattrs -C public/dist . | ssh deploy@server \
-  'docker exec -i ircfiber-gateway sh -c "rm -rf /app/public/dist/ && mkdir -p /app/public/dist/ && tar xzf - -C /app/public/dist"'
+# Quick iteration (ephemeral, ~3s):
+make update-assets
+
+# Persistent gateway-only (survives recreate, engine untouched):
+make update-gateway
+
+# Full persistent (gateway + engine, hard restart):
+make update
 ```
-The `--no-xattrs` flag prevents macOS extended attributes from creating duplicate `file 2.ext` entries on Linux.
+
+The `--no-xattrs` flag on the `update-assets` tar pipe prevents macOS
+extended attributes from creating duplicate `file 2.ext` entries on Linux.
 
 ## Admin -> SigNoz logs integration
 

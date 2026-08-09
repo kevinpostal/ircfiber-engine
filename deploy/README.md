@@ -171,8 +171,17 @@ make handoff-backup             # REMOVED
 # Full image rebuild (Containerfile from scratch):
 make update-full                # alias: make deploy
 
-# Asset-only deploy (no binary change, no restart):
-make update-assets
+# Frontend / gateway-only deploys (engine untouched — no IRC disconnect):
+make update-assets              # EPHEMERAL — pushes public/dist via docker exec
+                                #  ~2-3s, no restart, survives `docker restart`
+                                #  but LOST on `docker rm` / `docker compose up --force-recreate`
+                                #  or host reboot. Use for quick iteration only.
+make update-gateway             # PERSISTENT — rebuilds gateway image on host
+                                #  then recreates ircfiber-gateway via Ansible.
+                                #  Engine (ircfiber-engine-ovh) NOT restarted.
+                                #  ~2-3 min first time, cached after. Survives
+                                #  container recreate and host reboot. Use for
+                                #  any frontend/assets change you want to keep.
 
 # ── Component management ──────────────────────────────────────────────
 # Deploy/redeploy a single component
@@ -182,6 +191,22 @@ ansible-playbook playbooks/gateway.yml
 ansible-playbook playbooks/caddy.yml
 ansible-playbook playbooks/engine.yml
 ```
+
+> **Gateway SPA gotcha (2026-08-09):** `public/` and `backend/views/index.dt`
+> are **baked into the gateway image** at build time (`Containerfile`
+> `COPY public/ ./public/`). `make update-assets` writes to the **running**
+> container's writable layer via `docker exec tar` — it survives
+> `docker restart` but is **discarded** on `docker rm -f ircfiber-gateway`
+> or `docker compose up --force-recreate` / host reboot, reverting the SPA
+> to the old image. `2026-08-09` incident: a frontend deploy via
+> `update-assets` + manual `docker rm` + `compose up` wiped the new
+> `main-S6NCrGWT.js` (BLCKND/SUPERNETS), leaving the SPA 404.
+> **Fix:** `make update-assets` now also `rsync`s to
+> `/opt/ircfiber-src/public/` on the host so the next image build has the
+> assets, and `make update-gateway` was added for a persistent gateway-only
+> deploy (frontend → rsync → `docker build --target runtime-gateway` →
+> `ansible-playbook playbooks/gateway.yml` — engine untouched).
+
 
 ### Engine deploy (hard restart)
 
