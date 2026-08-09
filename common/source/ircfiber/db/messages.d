@@ -33,6 +33,28 @@ import ircfiber.storage.buffer : sanitizeUtf8;
 final class MessageRepository {
     private MongoCollection collection;
 
+    /// Docs store the IRC command inside the `payload` JSON string
+    /// (`"c":"315"`). Exclude the noise commands the chat UI cannot
+    /// render (mirrors `BufferManager.isScrollbackNoiseCommand`) so the
+    /// Mongo fall-through returns REAL messages, not a wall of invisible
+    /// WHO/NAMES/TAGMSG rows that push PRIVMSGs out of the visible
+    /// window. Only applied to channel buffers — the `_server` log
+    /// needs its numerics/MOTD.
+    private static immutable string NOISE_PAYLOAD_RE =
+        `"c"\s*:\s*"(315|352|332|333|353|354|366|367|368|376|422|311|312|313|317|318|319|330|301|671|401|PONG|TAGMSG|QUIT|you_nickchange)"`;
+
+    private static Bson noisePayloadExclusion() @trusted {
+        return Bson([
+            "payload": Bson(["$not": Bson(BsonRegex(NOISE_PAYLOAD_RE, ""))])
+        ]);
+    }
+
+    private static void applyNoiseExclusion(ref Bson filter, string channel) {
+        if (channel != "_server") {
+            filter["payload"] = noisePayloadExclusion()["payload"];
+        }
+    }
+
     /// Creates a repository bound to the messages collection.
     this() {
         collection = AppMongoConnection.getDb()["messages"];
@@ -274,6 +296,7 @@ final class MessageRepository {
                 "t": Bson(["$lt": Bson(beforeTs)])
             ]);
         }
+        applyNoiseExclusion(filter, channel);
         return readPayloads(filter, count);
     }
 
@@ -329,6 +352,7 @@ final class MessageRepository {
                 "t": Bson(["$lt": Bson(beforeTs)])
             ]);
         }
+        applyNoiseExclusion(filter, channel);
         return readPayloads(filter, count);
     }
 
@@ -368,6 +392,7 @@ final class MessageRepository {
                 ]);
             }
         }
+        applyNoiseExclusion(filter, channel);
         return readPayloads(filter, count);
     }
 

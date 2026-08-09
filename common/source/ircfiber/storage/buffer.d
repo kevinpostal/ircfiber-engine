@@ -154,7 +154,31 @@ final class BufferManager {
      *   that share a similar timestamp but belong to the same batch
      *   (e.g. 353 NAMES / 366 ENDOFNAMES arriving just before a JOIN).
      */
-    private Json[] _getRecentFiltered(string key, long count, long before, long after, long beforeIdx = -1) @trusted {
+    /// Commands the chat UI cannot render (mirrors the frontend's
+    /// `isSkippedCommand` list). Reading them back from a channel's
+    /// scrollback only pushes the user's real messages out of the
+    /// visible window — a busy channel whose history is dominated by
+    /// WHO 315 / NAMES 353 / TAGMSG rows would otherwise render as
+    /// "a few messages + Load more backlog…" even though the full
+    /// conversation is sitting in Redis. The server log (`_server`)
+    /// is exempt: its timeline renders numerics/MOTD, so callers pass
+    /// filterNoise=false for it.
+    static bool isScrollbackNoiseCommand(string cmd) @safe {
+        static immutable string[] NOISE = [
+            // WHO / WHOIS / NAMES / TOPIC / MOTD / ban-list chains
+            "315", "352", "332", "333", "353", "354", "366", "367", "368",
+            "376", "422",
+            // WHOIS replies
+            "311", "312", "313", "317", "318", "319", "330",
+            // misc noise the chat UI never shows
+            "301", "671", "401", "PONG", "TAGMSG", "QUIT", "you_nickchange",
+        ];
+        import std.algorithm : canFind;
+        return NOISE.canFind(cmd);
+    }
+
+    private Json[] _getRecentFiltered(string key, long count, long before, long after,
+                                      long beforeIdx = -1, bool filterNoise = false) @trusted {
         auto db = redis.getDb();
         Json[] messages;
         auto results = db.lrange!(ubyte[])(key, 0, MAX_SCROLLBACK - 1);
@@ -181,6 +205,10 @@ final class BufferManager {
                     const ts = msg["t"].get!long;
                     if (ts <= after) continue;
                 }
+                if (filterNoise && "c" in msg) {
+                    const cmd = msg["c"].get!string;
+                    if (isScrollbackNoiseCommand(cmd)) continue;
+                }
                 messages ~= msg;
                 if (messages.length >= count) break;
             } catch (Exception e) {
@@ -205,12 +233,13 @@ final class BufferManager {
             return [];
         }
         auto norm = normalizeChannel(channel);
+        const filterNoise = norm != "_server";
         auto key = KEY_PREFIX ~ serverId ~ ":" ~ networkId ~ ":" ~ norm;
-        auto res = _getRecentFiltered(key, count, before, after, beforeIdx);
+        auto res = _getRecentFiltered(key, count, before, after, beforeIdx, filterNoise);
         if (res.length == 0 && norm.length > 0 && norm[0] != '#' && norm[0] != '&' && norm[0] != '+' && norm[0] != '!') {
             import std.uni : toLower;
             auto legacyKey = KEY_PREFIX ~ serverId ~ ":" ~ networkId ~ ":" ~ ("#" ~ norm.toLower());
-            auto legacyRes = _getRecentFiltered(legacyKey, count, before, after, beforeIdx);
+            auto legacyRes = _getRecentFiltered(legacyKey, count, before, after, beforeIdx, filterNoise);
             if (legacyRes.length > 0) return legacyRes;
         }
         return res;
@@ -266,7 +295,7 @@ final class BufferManager {
         if (beforeIdx >= 0) {
             channel = normalizeChannel(channel);
             auto key = KEY_PREFIX ~ serverId ~ ":" ~ networkId ~ ":" ~ channel;
-            return _getRecentFiltered(key, count, beforeTs, afterTs, beforeIdx);
+            return _getRecentFiltered(key, count, beforeTs, afterTs, beforeIdx, channel != "_server");
         }
         return getRecent(serverId, networkId, channel, count, beforeTs, afterTs);
     }
@@ -280,12 +309,13 @@ final class BufferManager {
     Json[] getRecent(string networkId, string channel, long count = 50, long before = 0, long after = 0,
                      long beforeIdx = -1) @trusted {
         auto norm = normalizeChannel(channel);
+        const filterNoise = norm != "_server";
         auto key = KEY_PREFIX ~ networkId ~ ":" ~ norm;
-        auto res = _getRecentFiltered(key, count, before, after, beforeIdx);
+        auto res = _getRecentFiltered(key, count, before, after, beforeIdx, filterNoise);
         if (res.length == 0 && norm.length > 0 && norm[0] != '#' && norm[0] != '&' && norm[0] != '+' && norm[0] != '!') {
             import std.uni : toLower;
             auto legacyKey = KEY_PREFIX ~ networkId ~ ":" ~ ("#" ~ norm.toLower());
-            auto legacyRes = _getRecentFiltered(legacyKey, count, before, after, beforeIdx);
+            auto legacyRes = _getRecentFiltered(legacyKey, count, before, after, beforeIdx, filterNoise);
             if (legacyRes.length > 0) return legacyRes;
         }
         return res;
@@ -332,7 +362,7 @@ final class BufferManager {
         if (beforeIdx >= 0) {
             channel = normalizeChannel(channel);
             auto key = KEY_PREFIX ~ networkId ~ ":" ~ channel;
-            return _getRecentFiltered(key, count, beforeTs, afterTs, beforeIdx);
+            return _getRecentFiltered(key, count, beforeTs, afterTs, beforeIdx, channel != "_server");
         }
         return getRecent(networkId, channel, count, beforeTs, afterTs);
     }
