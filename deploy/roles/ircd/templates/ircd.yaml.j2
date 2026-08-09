@@ -26,9 +26,9 @@ server:
         netname: "ircfiber"
 
     ip-limits:
-        count: true
+        count: false
         max-concurrent-connections: {{ ircd_ip_limits_connections }}
-        throttle: true
+        throttle: false
         window: "{{ ircd_ip_limits_duration }}"
         max-connections-per-window: 32
         cidr-len-ipv4: 32
