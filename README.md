@@ -146,7 +146,8 @@ Run `make` (or `make help`) to list all targets. Highlights:
 | Target | What it does |
 |--------|--------------|
 | `make` / `make build` | Build the D backend + Svelte frontend |
-| `make frontend` | Build the Svelte bundle only |
+| `make frontend` | Build the Svelte bundle, then rebuild the local Docker gateway so it serves the new css/js (no-op when no gateway container is running) |
+| `make frontend-build` | Build the Svelte bundle only (dist/ + views/index.dt hashes) |
 | `make frontend-dev` | Run Vite dev server with HMR |
 | `make up` | Build and start gateway + engine in background |
 | `make down` | Stop background processes |

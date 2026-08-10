@@ -104,7 +104,7 @@ AR := →
 # ----------------------------------------------------------------------------
 # Phony targets (grouped by category)
 .PHONY: all help
-.PHONY: build build-gateway build-engine build-release build-debug build-ldc2 janitor-migrate frontend frontend-dev frontend-install
+.PHONY: build build-gateway build-engine build-release build-debug build-ldc2 janitor-migrate frontend frontend-build frontend-dev frontend-install
 
 .PHONY: dev dev-docker dev-live debug debug-live debug-host debug-all stop
 .PHONY: engine engine-rebuild engine-handoff engine-handoff-redis engine-restart engine-test
@@ -223,9 +223,37 @@ dev: frontend-install ## Component > Frontend dev (Vite HMR) — pairs with `mak
 # Production bundle: vite build + inject-manifest (re-syncs backend/views/index.dt
 # with the content-hashed CSS/JS URLs so the gateway-rendered SPA shell never
 # references a stale bundle).
-frontend: ## Build > Production frontend bundle (dist/ + views/index.dt hashes)
+#
+# `frontend-build` is the pure bundle step — no deploy side effects. It is the
+# prerequisite for every target that builds or ships the gateway remotely
+# (`build-gateway`, `update`, `update-assets`, `update-gateway`, `debug-live`).
+#
+# `frontend` additionally rebuilds a RUNNING local Docker gateway so it serves
+# the new bundle. This is required because the SPA shell (`views/index.dt`,
+# with its content-hashed bundle URLs) is embedded into the gateway binary at
+# compile time (`res.render!("index.dt")`), and `/app/public/dist` is baked
+# into the image — so a bundle-only rebuild never reaches a running container.
+# The step is a no-op when no local `ircfiber-gateway` container is up (e.g.
+# on a machine that only runs remote deploys).
+frontend-build: ## Build > Production frontend bundle (dist/ + views/index.dt hashes)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building frontend bundle  $(R)"
 	@npm --prefix frontend run build
+
+frontend: frontend-build ## Build > Frontend bundle + rebuild local gateway so it serves the new css/js
+	@if docker ps --format '{{.Names}}' | grep -q '^ircfiber-gateway$$'; then \
+		printf '\n%b\n' "$(_BCn)$(K)$(B)  Rebuilding local gateway to serve the new bundle  $(R)"; \
+		compose_proj=$$(docker inspect ircfiber-gateway --format '{{index .Config.Labels "com.docker.compose.project"}}'); \
+		compose_file=$$(docker inspect ircfiber-gateway --format '{{index .Config.Labels "com.docker.compose.project.config_files"}}'); \
+		if [ -n "$$compose_proj" ] && [ -n "$$compose_file" ]; then \
+			docker compose -p "$$compose_proj" -f "$$compose_file" build ircfiber-gateway && \
+			docker compose -p "$$compose_proj" -f "$$compose_file" up -d --no-deps --force-recreate ircfiber-gateway; \
+			printf '%b\n' "$(BG)$(OK) Gateway rebuilt — refresh the browser$(R) $(D)(new bundle hash in backend/views/index.dt)$(R)"; \
+		else \
+			printf '%b\n' "$(Y)$(WR)  ircfiber-gateway is not a compose-managed container — bundle built, gateway untouched$(R)"; \
+		fi; \
+	else \
+		printf '%b\n' "$(D)  No local ircfiber-gateway container — bundle built, gateway untouched$(R)"; \
+	fi
 
 # Frontend dev pointing at the tailnet gateway (no local D backend at all).
 dev-live: ## Component > Frontend dev (Vite) against the TAILNET gateway
@@ -388,7 +416,7 @@ debug-host: ensure-colima build-gateway build-engine ## Component > Full stack H
 # leaving the supervisor orphaned. We redirect to a log file instead — use
 # `make logs` in another terminal for live tailing, and the colored startup
 # banner above still prints to this terminal.
-debug-live: ensure-colima frontend ## Component > Gateway + engine in Docker against TAILNET DBs — ctrl-c to stop
+debug-live: ensure-colima frontend-build ## Component > Gateway + engine in Docker against TAILNET DBs — ctrl-c to stop
 	@printf '\n\033[46m\033[30m\033[1m  Gateway + engine (docker) → tailnet DBs  \033[0m\n'
 	@printf '\033[2m  Mongo: %s\033[0m\n' "$(TAILNET_MONGO_URL)"
 	@printf '\033[2m  Redis: %s\033[0m\n' "$(TAILNET_REDIS_URL)"
@@ -694,7 +722,7 @@ endif
 build: build-gateway build-engine ## Build > Build the application with dub (gateway+engine)
 	@printf '\n%b\n' "$(BG)$(OK) Build complete (gateway+engine)$(R)"
 
-build-gateway: frontend ## Build > Build the gateway binary (irc-fiber)
+build-gateway: frontend-build ## Build > Build the gateway binary (irc-fiber)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building IRC Fiber Gateway  $(R)"
 	@bash -o pipefail -c '$(DUB_BACKEND) build --config=gateway --build=release 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | tail -8'
 	@bash -o pipefail -c '$(DUB_BACKEND) build --build=release 2>&1 | tail -5' || true
@@ -1613,7 +1641,7 @@ _target      = $(or $(TARGET),vps-efb4b52d)
 _target_ssh   = $(or $(TARGET_SSH),203.0.113.10)
 _playbook    = cd deploy && ansible-playbook -l $(_target) $(_vault_arg)
 
-update: frontend build build-engine ## Deploy > Build frontend + gateway + engine, handoff-deploy (zero disconnect for engines)
+update: frontend-build build build-engine ## Deploy > Build frontend + gateway + engine, handoff-deploy (zero disconnect for engines)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Deploy → $(_target)  $(R)"
 	@$(_playbook) playbooks/deploy-update.yml $(if $(SKIP_MIGRATE),-e skip_migrate=true)
 	# The playbook's rsync handles public/ + backend/views/ (dist/ included since
@@ -1660,7 +1688,7 @@ deploy: update-full ## Deploy > Alias for update-full
 # `docker build --target runtime-gateway`, so the next image contains the
 # new assets. `update-assets` below is a fast-path for iteration that
 # skips the image rebuild — hence the ephemeral warning.
-update-assets: frontend ## Deploy > Build frontend + push public/* to running gateway (EPHEMERAL — lost on recreate)
+update-assets: frontend-build ## Deploy > Build frontend + push public/* to running gateway (EPHEMERAL — lost on recreate)
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Asset push → $(_target_ssh) ($(_target))  $(R)"
 	@printf '%b\n' "$(Y)$(WR)  EPHEMERAL: writes to container layer only — survives restart but NOT rm/recreate$(R)"
 	@printf '%b\n' "$(D)  For persistent deploy: make update-gateway (engine untouched)$(R)"
@@ -1682,7 +1710,7 @@ update-assets: frontend ## Deploy > Build frontend + push public/* to running ga
 # docker build --target runtime-gateway on host → ansible gateway role
 # recreates ircfiber-gateway with correct env (Tailscale IP, networks).
 # Engine (ircfiber-engine-ovh) is NOT restarted — IRC connections stay up.
-update-gateway: frontend ## Deploy > Build frontend + rebuild gateway image + recreate gateway (engine untouched, persistent)
+update-gateway: frontend-build ## Deploy > Build frontend + rebuild gateway image + recreate gateway (engine untouched, persistent)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Gateway-only deploy → $(_target)  $(R)"
 	@printf '%b\n' "$(D)  1/4 Syncing public/ + views/index.dt to /opt/ircfiber-src on host$(R)"
 	@rsync -avz --delete -e "ssh -o StrictHostKeyChecking=no" public/ deploy@$(_target_ssh):/opt/ircfiber-src/public/ 2>&1 | tail -5

@@ -1401,7 +1401,9 @@ The engine (`ircfiber-engine-ovh`, PID 7) holds all IRC TCP/TLS sockets. Restart
 
 ```bash
 # 1. Build frontend locally (deterministic hash, e.g. main-k8PJwXAF.js)
-make frontend   # vite build + inject-manifest → public/dist + backend/views/index.dt
+make frontend-build   # vite build + inject-manifest → public/dist + backend/views/index.dt
+#    (use `make frontend` when a LOCAL dev gateway container is running —
+#     it additionally rebuilds that container so 127.0.0.1:8090 serves the bundle)
 ls -lh public/dist/assets/ | grep main
 cat backend/views/index.dt | grep main
 
