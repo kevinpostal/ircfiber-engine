@@ -181,7 +181,54 @@ final class UploadRepository {
         return res.deletedCount > 0;
     }
 
+    /// Updates filename and size for an existing upload (content is written to disk by caller).
+    /// Returns false if not found or not owned.
+    bool updateContent(string userId, string id, string newContent, string newFilename, long newSize) @trusted {
+        auto doc = collection.findOne(Bson(["_id": Bson(id), "userId": Bson(userId)]));
+        if (doc.isNull) return false;
+        auto upd = Bson(["$set": Bson(["filename": Bson(newFilename), "size": Bson(newSize)])]);
+        auto res = collection.updateOne(Bson(["_id": Bson(id)]), upd);
+        return res.modifiedCount > 0;
+    }
 
+
+}
+
+@("UploadRepository.updateContent updates file content")
+unittest {
+    if (!AppMongoConnection.isConnected) {
+        try AppMongoConnection.connect();
+        catch (Throwable) {}
+        if (!AppMongoConnection.isConnected) return;
+    }
+    try {
+        auto repo = new UploadRepository();
+        UploadRecord r;
+        r.id = randomUUID().toString();
+        r.userId = randomUUID().toString();
+        r.filename = "test.py";
+        r.mimeType = "text/x-python";
+        r.size = 10;
+        r.directUrl = "http://localhost:8090/uploads/abc.py";
+        r.createdAt = Clock.currTime.toUnixTime * 1000;
+        repo.insert(r);
+        bool ok = repo.updateContent(r.userId, r.id, "new content", "new.py", 11);
+        assert(ok);
+        auto fetched = repo.getById(r.userId, r.id);
+        assert(fetched.filename == "new.py");
+        assert(fetched.size == 11);
+        // Verify ownership check: wrong user should not update
+        bool wrong = repo.updateContent(randomUUID().toString(), r.id, "x", "x.py", 1);
+        assert(!wrong);
+        // Cleanup
+        repo.hardDelete(r.userId, r.id);
+    } catch (Throwable e) {
+        import core.exception : AssertError;
+        if (cast(AssertError) e) throw e;
+        // Mongo operation failed for other reason - treat as skip when not connected
+        if (!AppMongoConnection.isConnected) return;
+        throw e;
+    }
 }
 
 @("UploadRecord round-trips through Bson")
