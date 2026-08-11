@@ -1516,10 +1516,24 @@ docker-restart-code: ensure-colima ## Dev > Rebuild frontend + D binaries + rest
 # ----------------------------------------------------------------------------
 
 .PHONY: local-dev-up local-dev-down local-dev-down-clean local-dev-smoke local-dev-up-observability
-.PHONY: local-up local-up-observability local-down local-down-clean
-
+.PHONY: local-up local-up-observability local-down local-down-clean local-ircd
 local-up:                                 ## Local > Up without SigNoz (default, ~300 MB)
 	docker compose -f deploy/local/docker-compose.yml up -d
+
+local-ircd: ensure-colima                  ## Local > Up + seed LocalIRCD (ircd:6667) → /irc/LocalIRCD
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  LocalIRCD — stack + network  $(R)"
+	@if lsof -i :6667 >/dev/null 2>&1 && docker ps --format '{{.Names}}' | grep -qx 'ircd_test'; then \
+		printf '%b\n' "$(Y)$(WR)  Port 6667 taken by ircd_test — local ircd will use host 16667 (engine still dials ircd:6667 internally)$(R)"; \
+		IRCD_HOST_PORT=16667 docker compose -f deploy/local/docker-compose.yml up -d; \
+	else \
+		docker compose -f deploy/local/docker-compose.yml up -d; \
+	fi
+	@for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do \
+		if curl -fsS http://127.0.0.1:8090/health >/dev/null 2>&1; then break; fi; \
+		sleep 2; \
+	done
+	@bash scripts/seed-local-ircd.sh
+	@printf '\n%b\n' "$(BG)$(OK) Done — open http://127.0.0.1:8090/irc/LocalIRCD $(R)"
 
 local-up-observability:                   ## Local > Up with SigNoz (observability, ~4 GB)
 	IRCFIBER_OTEL_ENABLED=1 docker compose --profile observability -f deploy/local/docker-compose.yml up -d

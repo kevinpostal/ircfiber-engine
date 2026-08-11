@@ -206,6 +206,11 @@ services:
     ports:
       - "8090:8090"
     command: ["/app/irc-fiber"]
+    volumes:
+      # Persist uploaded files across container recreates — without this,
+      # every `docker compose up -d` wipes /app/uploads and all shared
+      # image/text-file URLs 404.
+      - uploads_data:/app/uploads
     environment:
       IRCFIBER_OTEL_ENABLED: "${IRCFIBER_OTEL_ENABLED:-0}"
       IRCFIBER_OTEL_ENDPOINT: "${IRCFIBER_OTEL_ENDPOINT:-http://otel-collector:4318}"
@@ -271,14 +276,13 @@ services:
     networks:
       - ircfiber_local
     ports:
-      - "6667:6667"
+      - "${IRCD_HOST_PORT:-6667}:6667"
     healthcheck:
       test: ["CMD-SHELL", "nc -z 127.0.0.1 6667"]
       interval: 10s
       timeout: 3s
       retries: 5
       start_period: 5s
-
 # ---------------------------------------------------------------------------
 # Network
 # ---------------------------------------------------------------------------
@@ -304,4 +308,6 @@ volumes:
   zookeeper_data:
     driver: local
   zookeeper_datalog:
+    driver: local
+  uploads_data:
     driver: local
