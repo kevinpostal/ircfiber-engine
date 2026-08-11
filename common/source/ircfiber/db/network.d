@@ -123,13 +123,22 @@ final class NetworkRepository {
                 "realName": Bson(config.realName),
                 "disabled": Bson(config.disabled),
                 "systemManaged": Bson(config.systemManaged),
-                "autoJoinDelaySeconds": Bson(config.autoJoinDelaySeconds)
+                "autoJoinDelaySeconds": Bson(config.autoJoinDelaySeconds),
+                "egressNodeId": Bson(config.egressNodeId)
             ])
         ]);
         UpdateOptions options;
         options.upsert = true;
         collection.updateOne(selector, update, options);
     }
+
+    /// Sets the egress selection on a network without rewriting the full record.
+    void setEgressNodeId(UUID id, string egressNodeId) {
+        auto selector = Bson(["id": Bson(id.toString())]);
+        auto update = Bson(["$set": Bson(["egressNodeId": Bson(egressNodeId)])]);
+        collection.updateOne(selector, update);
+    }
+
 
     /// Sets the disabled flag on a network without rewriting the full record.
     /// Used by admin disconnect/reconnect to persist the disabled state.
@@ -185,6 +194,7 @@ final class NetworkRepository {
                 const v = elem["autoJoinDelaySeconds"].get!int;
                 if (v > 0) cfg.autoJoinDelaySeconds = cast(uint) v;
             } catch (Exception) {}
+            try { cfg.egressNodeId = elem["egressNodeId"].get!string; } catch (Exception) {}
             result ~= cfg;
         }
         return result;
@@ -214,6 +224,7 @@ final class NetworkRepository {
             const v = doc["autoJoinDelaySeconds"].get!int;
             if (v > 0) cfg.autoJoinDelaySeconds = cast(uint) v;
         } catch (Exception) {}
+        try { cfg.egressNodeId = doc["egressNodeId"].get!string; } catch (Exception) {}
         return cfg;
     }
 }

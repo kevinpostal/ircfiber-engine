@@ -75,6 +75,32 @@
   ansible.builtin.set_fact:
     _engine_env: "{{ dict(_pairs) }}"
 
+- name: Run Mullvad sidecars (tailscale userspace SOCKS5, scalable 2→5)
+  when: mullvad_sidecars | length > 0
+  community.docker.docker_container:
+    name: "tailscale-mullvad-{{ item.name }}"
+    image: "{{ mullvad_sidecar_image }}"
+    state: started
+    restart_policy: unless-stopped
+    # Userspace: no NET_ADMIN needed; SOCKS5 on :1055 for engine to dial via
+    env:
+      TS_AUTHKEY: "{{ vault_tailscale_authkey }}"
+      TS_HOSTNAME: "ovh-mullvad-{{ item.name }}"
+      TS_EXTRA_ARGS: "--exit-node={{ item.exit_node }} --exit-node-allow-lan-access=true --advertise-tags={{ tailscale_tags }}"
+      TS_USERSPACE: "true"
+      TS_SOCKS5_SERVER: ":{{ item.port | default(mullvad_sidecar_socks_port) }}"
+      TS_STATE_DIR: "/var/lib/tailscale"
+    volumes:
+      - "mullvad-{{ item.name }}-state:/var/lib/tailscale"
+    networks:
+      - name: "{{ docker_ircfiber_network }}"
+    labels:
+      com.ircfiber.component: "mullvad-sidecar"
+      com.ircfiber.mullvad_name: "{{ item.name }}"
+  loop: "{{ mullvad_sidecars }}"
+  loop_control:
+    label: "{{ item.name }}"
+
 - name: Run ircfiber-engine
   community.docker.docker_container:
     name: "{{ engine_container_name }}"

@@ -1,11 +1,10 @@
 module ircfiber.irc.connection;
 
 import std.array : join;
-import std.string : toUpper;
+import std.string : toUpper, toStringz, indexOf, lastIndexOf, split, startsWith, strip, stripLeft;
 import std.base64 : Base64;
 import std.conv : to;
 import std.datetime : Clock, SysTime;
-import std.string : indexOf, lastIndexOf, split, startsWith, strip, stripLeft;
 import std.uni : toLower;
 import std.algorithm : canFind, countUntil, remove;
 import std.socket : getAddress, AddressFamily;
@@ -207,6 +206,133 @@ private enum REGISTRATION_WARN_AT_FRACTION_2     = 75;
 
 private enum HAPPY_EYEBALLS_DELAY_MS = 250;
 
+// ── Mullvad egress (SOCKS5) pool ─────────────────────────────────────────────
+// 2 sidecars on 1 VPS, scalable to 5 via IRCFIBER_MULLVAD_POOL env.
+// Each entry is socks5://host:port (resolve locally → CONNECT <ip>:<port>).
+// Egress selection per NetworkConfig.egressNodeId: "" = random healthy,
+// else label pin (e.g. "se"/"us"). Advisory: per-connection round-robin,
+// no per-host sticky; circuit-breaker marks proxy dead 30s after 3 fails.
+private struct MullvadProxy {
+    string host;
+    ushort port;
+    string label;
+    int failCount;
+    long deadUntilMs;
+}
+private __gshared MullvadProxy[] mullvadPool;
+private __gshared size_t mullvadRR;
+private __gshared bool mullvadPoolLoaded;
+
+private string mullvadLabelFromHost(string h) {
+    auto base = h.split(":")[0];
+    auto dash = base.lastIndexOf("-");
+    if (dash >= 0 && dash+1 < base.length) return base[dash+1 .. $].toLower();
+    auto dot = base.indexOf(".");
+    if (dot > 0) return base[0 .. dot].toLower();
+    return base.toLower();
+}
+
+private void loadMullvadPool() {
+    if (mullvadPoolLoaded) return;
+    mullvadPoolLoaded = true;
+    import std.process : environment;
+    auto raw = environment.get("IRCFIBER_MULLVAD_POOL", "");
+    if (raw.length == 0) return;
+    foreach (entry; raw.split(",")) {
+        auto e = entry.strip();
+        if (e.length == 0) continue;
+        auto p = e.indexOf("://");
+        if (p >= 0) e = e[p+3 .. $];
+        auto colon = e.lastIndexOf(":");
+        string host; ushort port = 1080;
+        if (colon >= 0) {
+            host = e[0 .. colon].strip();
+            try { port = e[colon+1 .. $].strip().to!ushort; } catch (Exception) {}
+        } else host = e;
+        if (host.length == 0) continue;
+        auto label = mullvadLabelFromHost(host);
+        mullvadPool ~= MullvadProxy(host, port, label, 0, 0);
+        logInfo("Mullvad pool: %s → %s:%d (label=%s)", entry, host, port, label);
+    }
+}
+
+private MullvadProxy* pickMullvadProxy(string egressNodeId) {
+    loadMullvadPool();
+    if (mullvadPool.length == 0) return null;
+    const now = Clock.currTime.toUnixTime!long * 1000;
+    foreach (ref pr; mullvadPool) if (pr.deadUntilMs != 0 && now >= pr.deadUntilMs) { pr.failCount = 0; pr.deadUntilMs = 0; }
+    if (egressNodeId.length > 0) {
+        foreach (ref pr; mullvadPool) if (pr.label == egressNodeId.toLower()) {
+            if (pr.deadUntilMs != 0 && now < pr.deadUntilMs) {
+                logWarn("Mullvad pinned %s is dead until %d, falling back to random healthy", egressNodeId, pr.deadUntilMs);
+                break;
+            }
+            return &pr;
+        }
+        logWarn("Mullvad pinned egress '%s' not found in pool, using random healthy", egressNodeId);
+    }
+    import std.random : uniform;
+    MullvadProxy*[] healthy;
+    foreach (ref pr; mullvadPool) if (pr.deadUntilMs == 0 || now >= pr.deadUntilMs) healthy ~= &pr;
+    if (healthy.length == 0) return null;
+    if (healthy.length == 1) return healthy[0];
+    return healthy[uniform(0, healthy.length)];
+}
+
+private void recordMullvadSuccess(string label) {
+    foreach (ref pr; mullvadPool) if (pr.label == label) { pr.failCount = 0; pr.deadUntilMs = 0; break; }
+}
+private void recordMullvadFailure(string label) {
+    foreach (ref pr; mullvadPool) if (pr.label == label) {
+        pr.failCount++;
+        if (pr.failCount >= 3) {
+            pr.deadUntilMs = Clock.currTime.toUnixTime!long * 1000 + 30_000;
+            logWarn("Mullvad proxy %s (%s:%d) marked dead for 30s after 3 fails", label, pr.host, pr.port);
+        }
+        break;
+    }
+}
+
+// SOCKS5 → TLS handoff: connectTCP to sidecar, handshake on same TCPConnection,
+// then return it for createTLSStreamWithTimeout (avoids private TCPConnection(fd) ctor).
+private TCPConnection socks5ConnectViaProxy(MullvadProxy* proxy, string targetIp, ushort targetPort, AddressFamily fam) {
+    import core.sys.posix.arpa.inet : inet_pton;
+    import core.sys.posix.sys.socket : AF_INET, AF_INET6;
+    auto proxyConn = connectTCP(proxy.host, proxy.port, null, 0, CONNECT_TIMEOUT_SECONDS.seconds);
+    scope(failure) try { proxyConn.close(); } catch (Exception) {}
+    ubyte[3] greet = [0x05, 0x01, 0x00];
+    proxyConn.write(greet[]);
+    ubyte[2] greetResp;
+    proxyConn.read(greetResp[]);
+    if (greetResp[0] != 0x05 || greetResp[1] != 0x00) throw new Exception("SOCKS5 proxy auth failed");
+    ubyte[] req;
+    req ~= cast(ubyte)0x05; req ~= cast(ubyte)0x01; req ~= cast(ubyte)0x00;
+    if (fam == AddressFamily.INET) {
+        req ~= cast(ubyte)0x01;
+        ubyte[4] ip4;
+        if (inet_pton(AF_INET, targetIp.toStringz, ip4.ptr) != 1) throw new Exception("SOCKS5 bad IPv4 " ~ targetIp);
+        req ~= ip4[];
+    } else if (fam == AddressFamily.INET6) {
+        req ~= cast(ubyte)0x04;
+        ubyte[16] ip6;
+        if (inet_pton(AF_INET6, targetIp.toStringz, ip6.ptr) != 1) throw new Exception("SOCKS5 bad IPv6 " ~ targetIp);
+        req ~= ip6[];
+    } else throw new Exception("SOCKS5 unknown family");
+    req ~= cast(ubyte)(targetPort >> 8); req ~= cast(ubyte)(targetPort & 0xFF);
+    proxyConn.write(req);
+    ubyte[4] hdr;
+    proxyConn.read(hdr[]);
+    if (hdr[0] != 0x05 || hdr[1] != 0x00) throw new Exception("SOCKS5 CONNECT failed rep=" ~ hdr[1].to!string);
+    ubyte atyp = hdr[3];
+    size_t remain = 0;
+    if (atyp == 0x01) remain = 4 + 2;
+    else if (atyp == 0x04) remain = 16 + 2;
+    else if (atyp == 0x03) { ubyte l; proxyConn.read((&l)[0 .. 1]); remain = l + 2; }
+    else throw new Exception("SOCKS5 bad ATYP");
+    if (remain > 0) { ubyte[] tmp = new ubyte[remain]; proxyConn.read(tmp); }
+    return proxyConn;
+}
+
 private struct ResolvedAddr {
     string ip;
     AddressFamily family;
@@ -280,7 +406,9 @@ private ResolvedAddr[] interleaveAddressFamilies(ResolvedAddr[] addrs) {
     return out_;
 }
 
-private TCPConnection happyEyeballsConnect(string host, ushort port) {
+private TCPConnection happyEyeballsConnect(string host, ushort port, string egressNodeId = "") {
+    auto proxy = pickMullvadProxy(egressNodeId);
+    if (proxy !is null) logInfo("Mullvad egress %s (%s:%d) for %s:%d (raw=%s)", proxy.label, proxy.host, proxy.port, host, port, egressNodeId.length ? egressNodeId : "random");
     auto addrs = resolveAllAddresses(host, port);
     if (addrs.length == 0) throw new Exception("DNS resolution failed for " ~ host);
 
@@ -310,9 +438,22 @@ private TCPConnection happyEyeballsConnect(string host, ushort port) {
 
         auto connIdx = idx;
         auto addrIp  = addr.ip;
+        auto addrFam = addr.family;
+        auto proxyForTask = proxy;
         safeFiberRun("happy_eyeballs_attempt", host, {
             try {
-                auto conn = connectTCP(addrIp, port, null, 0, CONNECT_TIMEOUT_SECONDS.seconds);
+                TCPConnection conn;
+                if (proxyForTask !is null) {
+                    try {
+                        conn = socks5ConnectViaProxy(proxyForTask, addrIp, port, addrFam);
+                        recordMullvadSuccess(proxyForTask.label);
+                    } catch (Exception se) {
+                        recordMullvadFailure(proxyForTask.label);
+                        throw se;
+                    }
+                } else {
+                    conn = connectTCP(addrIp, port, null, 0, CONNECT_TIMEOUT_SECONDS.seconds);
+                }
                 if (done) {
                     try { conn.close(); } catch (Exception) {}
                     return;
@@ -325,6 +466,7 @@ private TCPConnection happyEyeballsConnect(string host, ushort port) {
                 logDebug("Happy Eyeballs: %s failed: %s", addrIp, e.msg);
             }
         });
+
 
     }
 
@@ -1704,20 +1846,49 @@ final class PersistentIRCClient {
                 } catch (Exception) {}
             }
 
-            // If the server throttled us, apply a minimum delay so we don't
-            // reconnect too fast and hit the same limit again. The flag is
-            // cleared on successful connection (backoff.reset) or after the
-            // throttle window expires.
+            // If the server throttled or banned us, wait out the window
+            // BEFORE computing the exponential backoff. Previously this
+            // sleep happened with state==disconnected and no retryStatus,
+            // so the UI showed a frozen "Disconnected:" banner for up to
+            // 5 min (throttle) or 30 min (ZLINE ban) with no countdown.
+            // Now we surface the same waiting_to_retry + queued line that
+            // the normal backoff path uses, so the banner shows
+            // "Reconnecting in 300s (Nth attempt)" and the user can
+            // still hit "Reconnect" to bypass via /reconnect.
             if (throttledUntil > 0) {
                 const now = Clock.currTime.toUnixTime!long * 1000;
                 if (now < throttledUntil) {
                     auto remaining = throttledUntil - now;
-                    logWarn("Server throttled, waiting %s before retrying %s", remaining.msecs, config.host);
-                    emitLog("warn",
-                        "Server throttle window active — waiting "
-                        ~ (remaining.msecs / 1000).to!string
-                        ~ "s before next attempt.");
-                    sleep(remaining.msecs);
+                    logWarn("Server throttled/banned, waiting %s before retrying %s", remaining.msecs, config.host);
+                    // Surface as retry so the frontend doesn't freeze.
+                    state = ConnectionState.waiting_to_retry;
+                    // Use the next attempt number for the countdown label.
+                    // backoff.currentAttempt() is 0 before the first
+                    // nextDelay(), so bump to 1 for the first visible try.
+                    int displayAttempt = backoff.currentAttempt();
+                    if (displayAttempt == 0) displayAttempt = 1;
+                    attemptCount = displayAttempt;
+                    nextRetryAtMs = throttledUntil;
+                    activeRetryDelayMs = remaining;
+                    emitLog("queued",
+                        "Server " ~ (isBanError(lastEmittedReason) ? "ban" : "throttle")
+                        ~ " window active — retry in "
+                        ~ (remaining / 1000).to!string ~ "s.");
+                    try eventChannel.put(IRCRawEvent.makeConnectionRetryStatus(
+                        config.name, config.id.toString(),
+                        attemptCount, nextRetryAtMs, activeRetryDelayMs));
+                    catch (Exception e) logWarn("Failed to publish throttled retry status: %s", e.msg);
+                    // Chunked sleep so stop() / isShutdownRequested is
+                    // honoured within 1s and the countdown stays live.
+                    const deadline = Clock.currTime + remaining.msecs;
+                    while (Clock.currTime < deadline) {
+                        if (isShutdownRequested) break;
+                        sleep(1.seconds);
+                    }
+                    if (isShutdownRequested) {
+                        throttledUntil = 0;
+                        break;
+                    }
                 }
                 throttledUntil = 0;
             }
@@ -2040,9 +2211,9 @@ final class PersistentIRCClient {
              "event": "reconnect_attempt"]);
 
         withSpan("irc.tcp_connect",
-            ["network": config.name, "host": config.host, "port": config.port.to!string],
+            ["network": config.name, "host": config.host, "port": config.port.to!string, "egress": config.egressNodeId],
             (ref Span ts) {
-            connection = happyEyeballsConnect(config.host, config.port);
+            connection = happyEyeballsConnect(config.host, config.port, config.egressNodeId);
             ts.setStatusOk();
         });
         emitLog("tcp_open",
@@ -2117,7 +2288,7 @@ final class PersistentIRCClient {
                 if (connection && connection.connected) {
                     try { connection.close(); } catch (Exception) {}
                 }
-                connection = happyEyeballsConnect(config.host, config.port);
+                connection = happyEyeballsConnect(config.host, config.port, config.egressNodeId);
                 emitLog("tcp_open",
                     "Re-established plain-text TCP connection to " ~ config.host ~ ".");
                 logJsonMap("info", "connection",
@@ -3101,8 +3272,33 @@ private void processEvents() {
     /// detector in `processLine`.
     private void handleServerError(string text) {
         lastErrorText = text;
-        if (isThrottleError(text)) {
+        // Ban (ZLINE/GLINE/KLINE) takes precedence over throttle — it needs
+        // a much longer pause and a different FailInfo so the UI doesn't
+        // spin a 5s retry loop that immediately re-hits the same wall.
+        if (isBanError(text)) {
+            // 30 min ban window. The server's ZLINE will still be in
+            // place after 5 min, so a short throttle would just hammer.
+            // The reconnect loop's HostCircuitBreaker (5 min) + this
+            // window together give a 30 min visible countdown; the user
+            // can still click "Reconnect" to force a retry earlier.
+            throttledUntil = Clock.currTime.toUnixTime!long * 1000 + 30 * 60 * 1000;
+            // Surface as connection_blocked so the banner renders
+            // "Connections to this server have been blocked" + the raw
+            // ban text in the server log, not an empty "Disconnected:".
+            lastDisconnectReason = text;
+            emitConnectionFail(text, text);
+            logJsonMap("error", "connection",
+                "Server BAN detected (ZLINE/GLINE) — 30m backoff",
+                ["network": config.name, "message": text, "event": "server_ban_detected"]);
+        } else if (isThrottleError(text)) {
             throttledUntil = Clock.currTime.toUnixTime!long * 1000 + 300_000; // 5 min
+            lastDisconnectReason = text;
+            emitConnectionFail(text, text);
+        } else {
+            // Non-throttle ERROR still benefits from a structured
+            // disconnect reason so the banner doesn't render empty.
+            lastDisconnectReason = text;
+            emitConnectionFail(text, text);
         }
         state = ConnectionState.disconnecting;
         // Emit DISCONNECTED immediately so the frontend sees the
@@ -4420,12 +4616,40 @@ private void processEvents() {
         "slow down", "you are banned", "temporary ban",
     ];
 
+    /// Keywords that indicate a hard ban (ZLINE/GLINE/KLINE/ELINE) — the
+    /// server has explicitly rejected this IP/nick and will keep rejecting
+    /// until the ban expires (often hours/days). We treat this as a
+    /// non-retriable block with a much longer backoff so we don't hammer
+    /// and don't freeze the UI on a 5s loop that immediately re-hits the
+    /// same wall and then parks for 5 min with no countdown.
+    private static immutable string[] BAN_KEYWORDS = [
+        "z-lined", "z:lined", "zline", "z:line",
+        "g-lined", "g:lined", "gline", "g:line",
+        "k-lined", "k:lined", "kline", "k:line",
+        "e-lined", "e:lined", "eline",
+        "enter the void",
+        "you are banned",
+        "banned from",
+        "permanently banned",
+    ];
+
     /// Returns `true` if `text` contains any throttle-related keywords.
     private static bool isThrottleError(string text) {
         if (text.length == 0) return false;
         import std.string : toLower;
         auto lower = toLower(text);
         foreach (kw; THROTTLE_KEYWORDS) {
+            if (lower.indexOf(kw) >= 0) return true;
+        }
+        return false;
+    }
+
+    /// Returns `true` if `text` indicates a hard ban.
+    private static bool isBanError(string text) {
+        if (text.length == 0) return false;
+        import std.string : toLower;
+        auto lower = toLower(text);
+        foreach (kw; BAN_KEYWORDS) {
             if (lower.indexOf(kw) >= 0) return true;
         }
         return false;
@@ -4537,6 +4761,24 @@ private void processEvents() {
         { "crash",                  "connecting_failed", "crash"                 },
         { "tls_read_error_post_001","connecting_failed", "ssl_error"             },
         { "welcome_timeout",        "connecting_failed", "etimedout"             },
+        // Ban family — ZLINE/GLINE/KLINE/ELINE. Must come before the
+        // generic "banned" catch so the specific ban type is preserved.
+        // The frontend renders these as `connection_blocked` ("Connections
+        // to this server have been blocked") which is the correct UX for
+        // a ban: no countdown spin, just a clear blocked headline until
+        // the ban expires or the user changes nick/IP.
+        { "z-lined",                "connection_blocked", "zlined"               },
+        { "z:lined",                "connection_blocked", "zlined"               },
+        { "zline",                  "connection_blocked", "zlined"               },
+        { "enter the void",         "connection_blocked", "zlined"               },
+        { "g-lined",                "connection_blocked", "glined"               },
+        { "g:lined",                "connection_blocked", "glined"               },
+        { "gline",                  "connection_blocked", "glined"               },
+        { "k-lined",                "connection_blocked", "klined"               },
+        { "k:lined",                "connection_blocked", "klined"               },
+        { "kline",                  "connection_blocked", "klined"               },
+        { "e-lined",                "connection_blocked", "elined"               },
+        { "eline",                  "connection_blocked", "elined"               },
         // Killed family — server actively disconnected us. The exact
         // reason key on the wire is "killed" so the frontend's
         // renderReasons.ts table can dispatch cleanly.

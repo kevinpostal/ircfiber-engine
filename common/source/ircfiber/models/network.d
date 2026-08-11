@@ -112,7 +112,10 @@ struct NetworkConfig {
     /// IRC Fiber network is provisioned this way so every user has a working
     /// connection to the hosted IRC server out of the box.
     bool systemManaged = false;
-
+    /// Mullvad egress selection: "" = random from healthy pool,
+    /// else label like "se" / "us" pinning to a specific sidecar SOCKS proxy.
+    /// Maps to IRCFIBER_MULLVAD_POOL entries.
+    string egressNodeId = "";
     /// Serialize to JSON
     Json toJson() const {
         return Json([
@@ -133,7 +136,8 @@ struct NetworkConfig {
             "commands": Json(commands),
             "serverPass": Json(serverPass),
             "systemManaged": Json(systemManaged),
-            "autoJoinDelaySeconds": Json(autoJoinDelaySeconds)
+            "autoJoinDelaySeconds": Json(autoJoinDelaySeconds),
+            "egressNodeId": Json(egressNodeId)
         ]);
     }
 }
