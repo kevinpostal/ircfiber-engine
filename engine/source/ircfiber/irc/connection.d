@@ -338,22 +338,56 @@ private struct ResolvedAddr {
     AddressFamily family;
 }
 
+private string stripHostBrackets(string host) @safe pure {
+    host = host.strip();
+    // Handle full ircs:// / irc:// URLs pasted into host field
+    auto schemeSep = host.indexOf("://");
+    if (schemeSep >= 0) {
+        host = host[schemeSep + 3 .. $];
+        auto slash = host.indexOf("/");
+        if (slash >= 0) host = host[0 .. slash];
+        auto bracketClose = host.indexOf("]");
+        if (bracketClose >= 0) {
+            auto open = host.indexOf("[");
+            if (open >= 0) host = host[open .. bracketClose + 1];
+            else host = host[0 .. bracketClose + 1];
+        } else {
+            auto colon = host.lastIndexOf(":");
+            if (colon >= 0) {
+                auto after = host[colon + 1 .. $];
+                bool allDigits = after.length > 0;
+                foreach (c; after) if (c < '0' || c > '9') { allDigits = false; break; }
+                bool looksLikeIPv6 = host.canFind("::") || host.countUntil(":") != host.lastIndexOf(":");
+                if (allDigits && !looksLikeIPv6) host = host[0 .. colon];
+            }
+        }
+        host = host.strip();
+    }
+    // Standalone bracketed IPv6 literal, with or without trailing :port (no scheme)
+    // e.g. "[2001:db8::1]" or "[2001:db8::1]:6697"
+    if (host.length >= 2 && host[0] == '[') {
+        auto close = host.indexOf("]");
+        if (close > 0) return host[1 .. close];
+    }
+    return host;
+}
+
 private __gshared ResolvedAddr[][string] dnsCache;
 private __gshared long[string]           dnsCacheTime;
 
 private ResolvedAddr[] resolveAllAddresses(string host, ushort port) {
     import std.datetime : Clock;
     const now = Clock.currTime.toUnixTime!long * 1000;
-    if (auto t = host in dnsCacheTime) {
+    auto normalizedHost = stripHostBrackets(host);
+    auto cacheKey = normalizedHost;
+    if (auto t = cacheKey in dnsCacheTime) {
         if (now - *t < DNS_CACHE_TTL_MS) {
-            if (auto cached = host in dnsCache) return *cached;
+            if (auto cached = cacheKey in dnsCache) return *cached;
         }
     }
-
     import vibe.core.core : runWorkerTask;
     import vibe.core.channel : createChannel;
     import core.time : seconds;
-
     auto ch = createChannel!string();
     runWorkerTask((string h, ushort p, Channel!string c) nothrow {
         try {
@@ -368,8 +402,7 @@ private ResolvedAddr[] resolveAllAddresses(string host, ushort port) {
         } catch (Exception) {
             try { c.put(""); } catch (Exception) {}
         }
-    }, host, port, ch);
-
+    }, normalizedHost, port, ch);
     string encoded;
     if (ch.tryConsumeOne(encoded, 5.seconds) && encoded.length > 0) {
         ResolvedAddr[] result;
@@ -383,12 +416,23 @@ private ResolvedAddr[] resolveAllAddresses(string host, ushort port) {
             }
         }
         if (result.length > 0) {
-            dnsCache[host]     = result;
-            dnsCacheTime[host] = now;
+            dnsCache[cacheKey]     = result;
+            dnsCacheTime[cacheKey] = now;
             return result;
         }
     }
-    return [ResolvedAddr(host, AddressFamily.INET)];
+    auto fam = AddressFamily.INET;
+    if (normalizedHost.canFind(":")) {
+        auto colonCount = 0;
+        foreach (c; normalizedHost) if (c == ':') colonCount++;
+        if (colonCount >= 2 || normalizedHost.canFind("::")) fam = AddressFamily.INET6;
+        else {
+            bool isIPv6 = true;
+            foreach (c; normalizedHost) if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') || c == ':')) { isIPv6 = false; break; }
+            if (isIPv6 && colonCount >= 1) fam = AddressFamily.INET6;
+        }
+    }
+    return [ResolvedAddr(normalizedHost, fam)];
 }
 
 private ResolvedAddr[] interleaveAddressFamilies(ResolvedAddr[] addrs) {
@@ -1454,7 +1498,7 @@ final class PersistentIRCClient {
             try {
                 auto ctx = createTLSContext(TLSContextKind.client);
                 ctx.peerValidationMode = TLSPeerValidationMode.none;
-                tlsStream = createTLSStreamWithTimeout(connection, ctx, config.host,
+                tlsStream = createTLSStreamWithTimeout(connection, ctx, stripHostBrackets(config.host),
                     TLS_HANDSHAKE_TIMEOUT_SECONDS.seconds);
                 logInfo("adoptExecSocket: TLS handshake complete for %s on existing TCP", s.config.name);
             } catch (Exception e) {
@@ -2240,7 +2284,7 @@ final class PersistentIRCClient {
                  "port": config.port.to!string, "sni": config.host],
                 (ref Span tls) {
             try {
-                tlsStream = createTLSStreamWithTimeout(connection, ctx, config.host,
+                tlsStream = createTLSStreamWithTimeout(connection, ctx, stripHostBrackets(config.host),
                     TLS_HANDSHAKE_TIMEOUT_SECONDS.seconds);
                 tlsOk = true;
                 logInfo("Connected to %s:%s with TLS", config.host, config.port);
