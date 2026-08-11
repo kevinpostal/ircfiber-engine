@@ -112,6 +112,16 @@ struct IRCRawEvent {
         if (phase.length) j["phase"] = Json(phase);
         auto selfEcho = getTag("self_echo");
         if (selfEcho.length) j["se"] = Json(selfEcho);
+        // IRCv3 typing indicator (message-tags ext): TAGMSG events carry
+        // +typing=active|done. Ship the value so the frontend can clear
+        // the indicator on `done` instead of treating every TAGMSG as
+        // fresh activity (which kept "X is typing" alive for another
+        // 6.5s after the other client stopped). The long-form `toJson`
+        // already carries the full tag map; this covers the realtime
+        // compact path only. Tag name keeps its `+` prefix verbatim
+        // from the wire (see parser.d tag loop).
+        auto typingTag = getTag("+typing");
+        if (typingTag.length) j["typing"] = Json(typingTag);
         // W1-T08: temp_unavailable event carries countdown_ms + serverTs
         if (command == "temp_unavailable") {
             auto cd = getTag("countdown_ms");
