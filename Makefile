@@ -226,7 +226,7 @@ dev: frontend-install ## Component > Frontend dev (Vite HMR) — pairs with `mak
 #
 # `frontend-build` is the pure bundle step — no deploy side effects. It is the
 # prerequisite for every target that builds or ships the gateway remotely
-# (`build-gateway`, `update`, `update-assets`, `update-gateway`, `debug-live`).
+# (`build-gateway`, `update`, `update-gateway`, `debug-live`).
 #
 # `frontend` additionally rebuilds a RUNNING local Docker gateway so it serves
 # the new bundle. This is required because the SPA shell (`views/index.dt`,
@@ -1639,12 +1639,11 @@ sync-redis-to-tailnet: ## Data > Sync only local Redis → tailnet
 # Usage:
 #   make update           # fast incremental binary deploy (rsync + BuildKit)
 #   make update-full      # full docker image rebuild (Containerfile, all layers)
-#   make update-assets    # asset-only: just public/* (no build, no restart)
 #   make update-status    # show running images on the target
 #   make update-clean     # nuke builder cache on the target (forces cold path)
 #   make deploy           # alias for update-full
-#
 # Override target host:
+#
 #   TARGET=my-other-host make update
 # ----------------------------------------------------------------------------
 
@@ -1687,34 +1686,7 @@ update-full: ## Deploy > Full docker image rebuild + container recreate
 	@$(_playbook) playbooks/deploy.yml $(if $(SKIP_MIGRATE),-e skip_migrate=true)
 
 deploy: update-full ## Deploy > Alias for update-full
-
-# Build frontend + push public/ + views/ to running gateway via SSH.
-# WARNING: this is EPHEMERAL — it writes to the running container's writable
-# layer via `docker exec`. A `docker rm -f ircfiber-gateway` or
-# `docker compose up --force-recreate ircfiber-gateway` will discard it and
-# revert to the image's baked assets. For a persistent gateway deploy that
-# survives container recreation, use `make update-gateway` (rebuilds the
-# image) or `make update` (full rsync + BuildKit).
 #
-# The gateway image bakes `public/` and `backend/views/index.dt` at build
-# time (Containerfile `COPY public/ ./public/`). The `update` playbook
-# rsyncs the entire repo to /opt/ircfiber-src on the host before
-# `docker build --target runtime-gateway`, so the next image contains the
-# new assets. `update-assets` below is a fast-path for iteration that
-# skips the image rebuild — hence the ephemeral warning.
-update-assets: frontend-build ## Deploy > Build frontend + push public/* to running gateway (EPHEMERAL — lost on recreate)
-	@printf '\n%b\n' "$(_BC)$(K)$(B)  Asset push → $(_target_ssh) ($(_target))  $(R)"
-	@printf '%b\n' "$(Y)$(WR)  EPHEMERAL: writes to container layer only — survives restart but NOT rm/recreate$(R)"
-	@printf '%b\n' "$(D)  For persistent deploy: make update-gateway (engine untouched)$(R)"
-	@printf '%b\n' "$(D)  1/3 Tarring public/ → ssh → docker exec tar -xf - (clean extract)$(R)"
-	@tar cz --no-xattrs --format=ustar -C public . | ssh deploy@$(_target_ssh) 'docker exec -i ircfiber-gateway sh -c "rm -rf /app/public/dist/ /app/public/.vite/ /app/public/assets/ 2>/dev/null; tar xzf - -C /app/public"'
-	@printf '%b\n' "$(D)  2/3 Pushing backend/views/index.dt (updated bundle hashes)$(R)"
-	@ssh deploy@$(_target_ssh) 'docker exec -i ircfiber-gateway sh -c "cat > /app/views/index.dt"' < backend/views/index.dt
-	@printf '%b\n' "$(D)  3/3 Syncing to /opt/ircfiber-src for persistence (next image build)$(R)"
-	@rsync -avz --delete -e "ssh -o StrictHostKeyChecking=no" public/ deploy@$(_target_ssh):/opt/ircfiber-src/public/ 2>&1 | tail -5
-	@rsync -avz -e "ssh -o StrictHostKeyChecking=no" backend/views/index.dt deploy@$(_target_ssh):/opt/ircfiber-src/backend/views/index.dt 2>&1 | tail -5
-	@printf '%b\n' "$(BG)$(OK) Assets pushed (ephemeral) + synced to src for next build$(R)"
-
 # Persistent gateway-only deploy — rebuilds the gateway image on the target
 # and recreates the gateway container WITHOUT touching the engine (no IRC
 # disconnect). Use this when you only changed frontend (Svelte/TS/CSS) or
@@ -1853,7 +1825,6 @@ help: ## Utils > Show this help (use-case matrix in the source header)
 	@printf '    \033[92mmake update\033[0m          (fast incremental binary deploy + push SigNoz dashboards/alerts)\n'
 	@printf '    \033[92mSKIP_SIGNOZ=1 make update\033[0m  (skip dashboards + alerts deploy)\n'
 	@printf '    \033[92mmake update-full\033[0m      (full docker image rebuild)\n'
-	@printf '    \033[92mmake update-assets\033[0m     (asset-only: public/*, ~2-3s)\n'
 	@printf '    \033[92mmake update-status\033[0m     (show running containers)\n'
 	@printf '    \033[92mmake deploy-signoz\033[0m      (push only dashboards + alerts — for refreshing observability config without a code deploy)\n'
 	@printf '\n'

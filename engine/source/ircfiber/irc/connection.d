@@ -2093,8 +2093,15 @@ final class PersistentIRCClient {
             });
             if (!tlsOk) {
                 string tlsError = "TLS handshake failed";
-                // tlsStream is null on failure, fall back or abort
-                if (config.tls == TLSMode.required) {
+                // TLS-only ports must not fall back to plain even when config says "enabled".
+                // 6697/6698/7000 are de-facto TLS ports — plain on them gets 0 bytes
+                // and leads to "Registration timed out → transport not alive" loop.
+                // Treat enabled+TLS-port as required by default.
+                bool isTlsOnlyPort = config.port == 6697 || config.port == 6698
+                    || config.port == 7000 || config.port == 6699;
+                bool mustRequireTls = config.tls == TLSMode.required
+                    || (config.tls == TLSMode.enabled && isTlsOnlyPort);
+                if (mustRequireTls) {
                     if (connection && connection.connected) {
                         try { connection.close(); } catch (Exception) {}
                     }
