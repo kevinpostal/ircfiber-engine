@@ -1698,9 +1698,12 @@ deploy: update-full ## Deploy > Alias for update-full
 # Engine (ircfiber-engine-ovh) is NOT restarted — IRC connections stay up.
 update-gateway: frontend-build ## Deploy > Build frontend + rebuild gateway image + recreate gateway (engine untouched, persistent)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Gateway-only deploy → $(_target)  $(R)"
-	@printf '%b\n' "$(D)  1/4 Syncing public/ + views/index.dt to /opt/ircfiber-src on host$(R)"
+	@printf '%b\n' "$(D)  1/4 Syncing frontend + gateway D source to /opt/ircfiber-src on host$(R)"
 	@rsync -avz --delete -e "ssh -o StrictHostKeyChecking=no" public/ deploy@$(_target_ssh):/opt/ircfiber-src/public/ 2>&1 | tail -5
-	@rsync -avz -e "ssh -o StrictHostKeyChecking=no" backend/views/index.dt deploy@$(_target_ssh):/opt/ircfiber-src/backend/views/index.dt 2>&1 | tail -5
+	@rsync -avz --delete -e "ssh -o StrictHostKeyChecking=no" backend/ deploy@$(_target_ssh):/opt/ircfiber-src/backend/ 2>&1 | tail -5
+	@rsync -avz --delete -e "ssh -o StrictHostKeyChecking=no" common/ deploy@$(_target_ssh):/opt/ircfiber-src/common/ 2>&1 | tail -5
+	@rsync -avz -e "ssh -o StrictHostKeyChecking=no" Containerfile deploy@$(_target_ssh):/opt/ircfiber-src/Containerfile 2>&1 | tail -5
+	@rsync -avz --delete -e "ssh -o StrictHostKeyChecking=no" config/ deploy@$(_target_ssh):/opt/ircfiber-src/config/ 2>&1 | tail -5
 	@printf '%b\n' "$(D)  2/4 Building runtime-gateway image on host (BuildKit, ~2-3m first time, cached after)$(R)"
 	@ssh deploy@$(_target_ssh) 'cd /opt/ircfiber-src && DOCKER_BUILDKIT=1 docker build --target runtime-gateway -t kevindpostal/irc-fiber-gateway:0.3.0 -f Containerfile . 2>&1 | tail -20'
 	@ssh deploy@$(_target_ssh) 'docker tag kevindpostal/irc-fiber-gateway:0.3.0 kevindpostal/irc-fiber-gateway:0.3.1 2>/dev/null || true'
@@ -1709,7 +1712,6 @@ update-gateway: frontend-build ## Deploy > Build frontend + rebuild gateway imag
 	@printf '%b\n' "$(D)  4/4 Verifying gateway health + engine untouched$(R)"
 	@ssh deploy@$(_target_ssh) 'sleep 2; curl -fsS http://127.0.0.1:8090/health 2>&1 | head -c 200; echo ""; docker ps --format "{{.Names}} {{.Status}}" | grep -E "gateway|engine"'
 	@printf '%b\n' "$(BG)$(OK) Gateway deployed (persistent) — engine not restarted$(R)"
-
 # Show running container images and versions on the target.
 update-status: ## Deploy > Show running containers & image versions
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Deploy status → $(_target)  $(R)"
