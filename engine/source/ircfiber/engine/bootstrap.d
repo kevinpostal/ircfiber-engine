@@ -195,6 +195,8 @@ EngineContext bootstrapEngine() {
     localServer.gitBranch = GIT_BRANCH;
     localServer.buildTime = BUILD_TIME;
     localServer.version_ = VERSION;
+    localServer.gitMessage = GIT_MESSAGE;
+    localServer.gitCommitUrl = GIT_COMMIT_URL;
     localServer.assignedNetworks = [];
 
     // Apply admin-saved engine config overrides from Redis.

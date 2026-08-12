@@ -15,6 +15,13 @@ BRANCH=$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown
 TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "unknown")
 HOST=$(hostname 2>/dev/null || echo "unknown")
 VERSION="0.3.0"
+# Commit subject for admin display (escaped for D/TS string literals)
+RAW_MSG=$(git -C "$ROOT" log -1 --pretty=%s 2>/dev/null || echo "unknown")
+# Escape backslashes and double quotes for D/TS string
+ESC_MSG=$(printf '%s' "$RAW_MSG" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\r\n')
+if [ "$ESC_MSG" = "" ]; then ESC_MSG="unknown"; fi
+COMMIT_URL=""
+if [ "$HASH" != "unknown" ] && [ "$HASH" != "" ]; then COMMIT_URL="https://github.com/kevinpostal/IRC_FIBER/commit/$HASH"; fi
 
 cat > "$OUT" <<EOF
 module ircfiber.build_version;
@@ -27,8 +34,10 @@ enum GIT_BRANCH = "$BRANCH";
 enum BUILD_TIME = "$TIME";
 enum BUILD_HOST = "$HOST";
 enum VERSION = "$VERSION";
+enum GIT_MESSAGE = "$ESC_MSG";
+enum GIT_COMMIT_URL = "$COMMIT_URL";
 EOF
-echo "version.d: $SHORT ($DESCRIBE) @ $BRANCH built $TIME"
+echo "version.d: $SHORT ($DESCRIBE) @ $BRANCH built $TIME — $ESC_MSG"
 
 # Frontend build info (for admin version display — same commit, separate builtAt)
 FRONT_OUT="$ROOT/frontend/src/lib/buildInfo.ts"
@@ -42,6 +51,8 @@ export const BUILD_INFO = {
   builtAt: "$TIME",
   builtHost: "$HOST",
   version: "$VERSION",
+  message: "$ESC_MSG",
+  commitUrl: "$COMMIT_URL",
 } as const;
 EOF
-echo "buildInfo.ts: $SHORT ($DESCRIBE) @ $BRANCH"
+echo "buildInfo.ts: $SHORT ($DESCRIBE) @ $BRANCH — $ESC_MSG"

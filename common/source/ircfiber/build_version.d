@@ -9,3 +9,5 @@ enum GIT_BRANCH = "unknown";
 enum BUILD_TIME = "unknown";
 enum BUILD_HOST = "unknown";
 enum VERSION = "0.3.0";
+enum GIT_MESSAGE = "unknown";
+enum GIT_COMMIT_URL = "";

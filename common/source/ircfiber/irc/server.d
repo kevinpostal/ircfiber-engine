@@ -66,6 +66,10 @@ struct ConnectionServer {
     string buildTime;
     /// Version string (e.g. 0.3.0).
     string version_;
+    /// Git commit subject message.
+    string gitMessage;
+    /// GitHub commit URL.
+    string gitCommitUrl;
     /// Serializes to JSON.
     Json toJson() const {
         auto j = Json.emptyObject;
@@ -87,6 +91,8 @@ struct ConnectionServer {
         if (gitBranch.length) j["gitBranch"] = Json(gitBranch);
         if (buildTime.length) j["buildTime"] = Json(buildTime);
         if (version_.length) j["version"] = Json(version_);
+        if (gitMessage.length) j["gitMessage"] = Json(gitMessage);
+        if (gitCommitUrl.length) j["gitCommitUrl"] = Json(gitCommitUrl);
         return j;
     }
 
@@ -122,6 +128,8 @@ struct ConnectionServer {
         if (j["buildTime"].type != Json.Type.undefined) s.buildTime = j["buildTime"].get!string;
         if (j["version"].type != Json.Type.undefined) s.version_ = j["version"].get!string;
         else if (j["version_"].type != Json.Type.undefined) s.version_ = j["version_"].get!string;
+        if (j["gitMessage"].type != Json.Type.undefined) s.gitMessage = j["gitMessage"].get!string;
+        if (j["gitCommitUrl"].type != Json.Type.undefined) s.gitCommitUrl = j["gitCommitUrl"].get!string;
         return s;
     }
 }
