@@ -6,6 +6,7 @@ import std.process : environment;
 import std.string : toStringz, lastIndexOf;
 
 import core.time : msecs, seconds;
+import std.datetime : Clock;
 import core.sys.posix.unistd : getpid;
 import vibe.core.core : runTask, runApplication, sleep, yield;
 import vibe.core.log;
@@ -113,6 +114,7 @@ void main() {
             logInfo("Server registered via event loop: %s@%s",
                 ctx.localServer.serverId, ctx.localServer.bindAddress);
             try {
+                ctx.localServer.lastHeartbeat = Clock.currTime.toUnixTime!long * 1000;
                 ctx.serverRegistry.updateHeartbeat(ctx.localServer.serverId);
             } catch (Exception e) {
                 logWarn("Initial heartbeat failed: %s", e.msg);

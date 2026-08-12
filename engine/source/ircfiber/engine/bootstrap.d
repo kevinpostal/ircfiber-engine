@@ -415,6 +415,7 @@ void startHeartbeatTask(ref EngineContext ctx) {
                     }
                 }
 
+                ctx.localServer.lastHeartbeat = Clock.currTime.toUnixTime!long * 1000;
                 ctx.serverRegistry.updateHeartbeat(ctx.localServer.serverId);
 
                 // Layer 1: TTL bump. Extend the lifetime of every state
@@ -542,8 +543,8 @@ void startHeartbeatTask(ref EngineContext ctx) {
                 // Downgraded from logInfo to debug — 10s cadence was flooding SigNoz logs
                 // (8640 entries/day per engine). Heartbeat health is visible via
                 // Redis TTL + engine.heartbeat span; info logging is redundant.
-                logDebug("Heartbeat sent for server %s", ctx.localServer.serverId);
-                // Shows the number of healthy, registered networks plus
+                // Re-enabled to logInfo for 0/1 debugging — will downgrade again after fix verified.
+                logInfo("Heartbeat sent for server %s (beat=%d, assigned=%d)", ctx.localServer.serverId, beat, ctx.localServer.assignedNetworks.length);
                 // server load, so the Distributed Traces view always has
                 // fresh data with actual metrics (not just "up=1").
                 // Guarded by isTracingEnabled() to avoid allocating a

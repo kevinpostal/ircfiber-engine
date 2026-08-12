@@ -195,9 +195,8 @@ final class ServerRegistry {
     void updateHeartbeat(string serverId) {
         auto key = RedisKeys.server(serverId);
         auto now = Clock.currTime.toUnixTime!long * 1000;
-
+        logInfo("updateHeartbeat: %s -> %s", serverId, now);
         db.hset(key, "lastHeartbeat", now.to!string);
-        db.hset(key, "isHealthy", "true");
         db.sadd(RedisKeys.serverList(), serverId);
         // Heartbeat implies the engine is alive — clear stale draining
         // flags so a previously-draining engine that recovers becomes
