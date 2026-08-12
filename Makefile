@@ -1711,7 +1711,7 @@ update-gateway: version frontend-build ## Deploy > Build frontend + rebuild gate
 	@rsync -avz -e "ssh -o StrictHostKeyChecking=no" Containerfile deploy@$(_target_ssh):/opt/ircfiber-src/Containerfile 2>&1 | tail -5
 	@rsync -avz --delete -e "ssh -o StrictHostKeyChecking=no" config/ deploy@$(_target_ssh):/opt/ircfiber-src/config/ 2>&1 | tail -5
 	@printf '%b\n' "$(D)  2/4 Building runtime-gateway image on host (BuildKit, ~2-3m first time, cached after)$(R)"
-	@ssh deploy@$(_target_ssh) 'cd /opt/ircfiber-src && DOCKER_BUILDKIT=1 docker build --target runtime-gateway -t kevindpostal/irc-fiber-gateway:0.3.0 -f Containerfile . 2>&1 | tail -20'
+	@ssh deploy@$(_target_ssh) 'cd /opt/ircfiber-src && DOCKER_BUILDKIT=1 docker build --target runtime-gateway --build-arg CACHE_BUST=$(date +%s) -t kevindpostal/irc-fiber-gateway:0.3.0 -f Containerfile . 2>&1 | tail -20'
 	@ssh deploy@$(_target_ssh) 'docker tag kevindpostal/irc-fiber-gateway:0.3.0 kevindpostal/irc-fiber-gateway:0.3.1 2>/dev/null || true'
 	@printf '%b\n' "$(D)  3/4 Recreating gateway container via Ansible (correct env, networks)$(R)"
 	@cd deploy && ansible-playbook -l $(_target) $(_vault_arg) playbooks/gateway.yml 2>&1 | tail -20

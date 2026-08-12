@@ -266,8 +266,12 @@ ENTRYPOINT ["/usr/bin/tini", "--"]
 # ============================================================================
 FROM ubuntu:22.04 AS runtime-gateway
 
+ARG CACHE_BUST=fixed
+COPY <<EOF ./.cache_bust_$CACHE_BUST
+bust=$CACHE_BUST
+EOF
+
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && \
     apt-get install -y --no-install-recommends \
         libssl3 \
