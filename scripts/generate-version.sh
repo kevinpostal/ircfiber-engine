@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # generate-version.sh — write common/source/ircfiber/build_version.d with current git info
-set -euo pipefail
+set -eo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/common/source/ircfiber/build_version.d"
 
