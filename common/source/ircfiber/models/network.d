@@ -2,11 +2,11 @@ module ircfiber.models.network;
 
 import std.algorithm : canFind, uniq, map, startsWith;
 import std.array : array;
+import std.string : strip;
 import std.uuid;
 import std.uni : toLower;
 import vibe.data.json;
 import std.conv;
-
 /// TLS mode options
 enum TLSMode {
     /// TLS disabled
@@ -45,14 +45,29 @@ string normalizeChannelName(string name) @safe {
     return name;
 }
 
-/// Deduplicate and normalize a list of IRC channel names.
+/// Normalize a channel name for the auto-join list — ensures a leading `#`.
+/// Bare names like `testing` or `MyChan` become `#testing` / `#mychan`.
+/// Already-prefixed names (`#foo`, `&foo`, `+foo`, `!foo`) are just lowercased.
+/// `_server` is left untouched (should never appear in auto-join, but be safe).
+string normalizeAutoJoinChannel(string name) @safe {
+    if (name.length == 0 || name == "_server") return name;
+    auto trimmed = name.strip();
+    if (trimmed.length == 0) return "";
+    if (trimmed[0] == '#' || trimmed[0] == '&' || trimmed[0] == '+' || trimmed[0] == '!')
+        return trimmed[0 .. 1] ~ trimmed[1 .. $].toLower();
+    return "#" ~ trimmed.toLower();
+}
+
+/// Deduplicate and normalize a list of IRC channel names for auto-join.
 /// Case-insensitive: "#Zod" and "#ZOD" collapse to one entry.
+/// Bare names are auto-prefixed with `#` so `testing` → `#testing` and
+/// never gets misrouted as a PRIVMSG to a nick (user-reported bug).
 string[] dedupChannels(string[] channels) @safe {
     if (channels.length == 0) return channels;
     string[] outArr;
     bool[string] seen;
     foreach (ch; channels) {
-        auto norm = normalizeChannelName(ch);
+        auto norm = normalizeAutoJoinChannel(ch);
         if (norm.length > 0 && norm !in seen) {
             seen[norm] = true;
             outArr ~= norm;

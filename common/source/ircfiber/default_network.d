@@ -94,7 +94,7 @@ NetworkConfig buildDefaultFiberNetwork(User user) @safe {
     cfg.port = DEFAULT_FIBER_PORT;
     cfg.tls = TLSMode.required;
     cfg.sasl = SASLMechanism.none;
-    cfg.nick = buildDefaultNick(user);
+    cfg.nick = user.username;
     cfg.realName = user.username;
     cfg.autoJoinChannels = DEFAULT_FIBER_CHANNELS.dup;
     cfg.disabled = false;
@@ -232,8 +232,7 @@ unittest {
     assert(cfg.disabled == false);
     assert(cfg.autoJoinChannels == ["#ircfiber", "#welcome"]);
     assert(cfg.realName == "alice");
-    assert(cfg.nick.startsWith("alice_"));
-    assert(cfg.nick.length == "alice_".length + DEFAULT_FIBER_NICK_SUFFIX_LEN);
+    assert(cfg.nick == "alice");
 }
 
 @("buildDefaultNick is deterministic per user")

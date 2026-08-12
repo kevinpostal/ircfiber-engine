@@ -26,6 +26,7 @@ services:
       IRCFIBER_OTEL_ENDPOINT: "${IRCFIBER_OTEL_ENDPOINT:-http://otel-collector:4318}"
     volumes:
       - ./config/prod.conf:/config/prod.conf:ro
+      - ircfiber_uploads:/app/uploads
       - irc_fiber_logs:/var/log/irc-fiber
     ports:
       - "${GATEWAY_HOST_PORT:-8090}:8090"
@@ -189,4 +190,6 @@ volumes:
   mongo_data:
     driver: local
   irc_fiber_logs:
+    driver: local
+  ircfiber_uploads:
     driver: local

@@ -3038,7 +3038,14 @@ final class PersistentIRCClient {
             }
         }
 
-        foreach (chan; config.autoJoinChannels) sendRaw("JOIN " ~ chan);
+        foreach (chan; config.autoJoinChannels) {
+            string ch = chan.strip();
+            if (ch.length == 0) continue;
+            if (ch[0] != '#' && ch[0] != '&' && ch[0] != '+' && ch[0] != '!')
+                ch = "#" ~ ch;
+            ch = ch[0 .. 1] ~ ch[1 .. $].toLower();
+            sendRaw("JOIN " ~ ch);
+        }
 
         // ── Post-registration commands ─────────────────────────────────────
         // NickServ IDENTIFY (if configured) — sent BEFORE user-supplied
@@ -5170,8 +5177,13 @@ private void processEvents() {
         return (toLower(channel) in chathistoryInFlight) !is null;
     }
 
-    /// Sends a JOIN command.
+    /// Sends a JOIN command. Ensures leading `#` so bare names like `testing`
+    /// never become a PRIVMSG target (auto-join normalization defense).
     void joinChannel(string channel) {
+        channel = channel.strip();
+        if (channel.length > 0 && channel[0] != '#' && channel[0] != '&' && channel[0] != '+' && channel[0] != '!')
+            channel = "#" ~ channel;
+        if (channel.length > 0) channel = channel[0 .. 1] ~ channel[1 .. $].toLower();
         sendRaw("JOIN " ~ channel);
     }
 
