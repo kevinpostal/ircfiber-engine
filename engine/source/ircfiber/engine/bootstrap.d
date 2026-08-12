@@ -17,8 +17,7 @@ import ircfiber.observability : flushAndSendMetrics, recordGauge, isMetricsEnabl
 import ircfiber.db.circuit_breaker : exportMongoCircuitMetrics;
 import vibe.core.log;
 import core.time : seconds;
-
-import ircfiber.version;
+import ircfiber.build_version;
 import ircfiber.models.irc_event : IRCRawEvent;
 import ircfiber.irc.manager : ConnectionManager;
 import ircfiber.irc.server : ConnectionServer;

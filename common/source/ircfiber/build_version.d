@@ -1,4 +1,4 @@
-module ircfiber.version;
+module ircfiber.build_version;
 
 // Generated at build time by scripts/generate-version.sh
 // Fallback values for local dev without generation
