@@ -111,6 +111,12 @@ struct UserPreferences {
     /// handled by `localStorage` storage events on the frontend).
     long prefVersion;
 
+    /// Whether to show mode-prefix glyphs (@, +, %, etc.) in the member
+    /// list. Default true so existing users keep their current view.
+    /// Synced cross-tab via localStorage + cross-device via pref_update
+    /// (stat_user boot + live WS broadcast).
+    bool showMemberPrefixes = true;
+
     /// Serializes to JSON.
     Json toJson() const {
         auto j = Json.emptyObject;
@@ -152,6 +158,7 @@ struct UserPreferences {
             bp[k] = v;
         j["bufferPrefs"] = bp;
         j["prefVersion"] = Json(prefVersion);
+        j["showMemberPrefixes"] = Json(showMemberPrefixes);
         return j;
     }
 
@@ -259,6 +266,14 @@ struct UserPreferences {
         if (auto pv = "prefVersion" in json) {
             if (pv.type == Json.Type.int_)
                 p.prefVersion = pv.get!long;
+        }
+        if (auto smp = "showMemberPrefixes" in json) {
+            if (smp.type == Json.Type.bool_)
+                p.showMemberPrefixes = smp.get!bool;
+            else {
+                logFieldInvalid(userId, "showMemberPrefixes", smp.type, "bool");
+                needsRepair = true;
+            }
         }
         return LoadResult(p, needsRepair);
     }
