@@ -1675,7 +1675,9 @@ else
 	@$(_playbook) playbooks/signoz_dashboards.yml 2>&1 | tail -20
 	@$(_playbook) playbooks/signoz_alerts.yml 2>&1 | tail -20
 endif
-
+	@printf '%b\n' "$(_BCn)$(K)$(B)  Recording deploy hashes on host  $(R)"
+	@ssh -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no deploy@$(_target_ssh) "mkdir -p /opt/ircfiber /opt/ircfiber-src && echo $$(./scripts/engine-fingerprint.sh) > /opt/ircfiber/.engine-deploy-hash && cp /opt/ircfiber/.engine-deploy-hash /opt/ircfiber-src/.engine-deploy-hash && echo $$(git rev-parse HEAD) > /opt/ircfiber/.frontend-deploy-hash && cp /opt/ircfiber/.frontend-deploy-hash /opt/ircfiber-src/.frontend-deploy-hash && echo $$(git rev-parse --short HEAD):$$(date +%Y%m%d-%H%M%S) > /opt/ircfiber/.deploy-hash && cp /opt/ircfiber/.deploy-hash /opt/ircfiber-src/.deploy-hash && cat /opt/ircfiber/.engine-deploy-hash /opt/ircfiber/.frontend-deploy-hash" 2>&1 | tail -5 || true
+	@printf '%b\n' "$(BG)$(OK) Deploy hashes recorded$(R)"
 # Alias: fast path is the default
 update-fast: update ## Deploy > Force hot path (same as `make update`)
 
@@ -1711,18 +1713,31 @@ update-gateway: frontend-build ## Deploy > Build frontend + rebuild gateway imag
 	@cd deploy && ansible-playbook -l $(_target) $(_vault_arg) playbooks/gateway.yml 2>&1 | tail -20
 	@printf '%b\n' "$(D)  4/4 Verifying gateway health + engine untouched$(R)"
 	@ssh deploy@$(_target_ssh) 'sleep 2; curl -fsS http://127.0.0.1:8090/health 2>&1 | head -c 200; echo ""; docker ps --format "{{.Names}} {{.Status}}" | grep -E "gateway|engine"'
+	@ssh -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no deploy@$(_target_ssh) "mkdir -p /opt/ircfiber /opt/ircfiber-src && echo $$(git rev-parse HEAD) > /opt/ircfiber/.frontend-deploy-hash && cp /opt/ircfiber/.frontend-deploy-hash /opt/ircfiber-src/.frontend-deploy-hash && echo $$(git rev-parse --short HEAD):$$(date +%Y%m%d-%H%M%S) > /opt/ircfiber/.deploy-hash && cp /opt/ircfiber/.deploy-hash /opt/ircfiber-src/.deploy-hash && cat /opt/ircfiber/.frontend-deploy-hash" 2>&1 | tail -5 || true
 	@printf '%b\n' "$(BG)$(OK) Gateway deployed (persistent) — engine not restarted$(R)"
 # Show running container images and versions on the target.
 update-status: ## Deploy > Show running containers & image versions
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Deploy status → $(_target)  $(R)"
 	@$(_playbook) playbooks/status.yml
+	@printf '\n%b\n' "$(_BC)$(K)$(B)  Deploy tracking — engine/frontend hashes  $(R)"
+	@./scripts/check-deploy.sh 2>&1 | tail -20 || true
+
+engine-hash: ## Deploy > Show engine fingerprint (last engine-touch commit)
+	@./scripts/engine-fingerprint.sh && echo "  (short: $$(./scripts/engine-fingerprint.sh --short))"
+
+deploy-check: ## Deploy > Check if engine/frontend need deploy (local vs OVH)
+	@./scripts/check-deploy.sh
+
+deploy-mark: ## Deploy > Mark current HEAD as deployed (writes hashes to OVH)
+	@printf '%b\n' "$(_BCn)$(K)$(B)  Marking $(_target) as deployed at $$(git rev-parse --short HEAD)  $(R)"
+	@ssh -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no deploy@$(_target_ssh) "mkdir -p /opt/ircfiber /opt/ircfiber-src && echo $$(./scripts/engine-fingerprint.sh) > /opt/ircfiber/.engine-deploy-hash && cp /opt/ircfiber/.engine-deploy-hash /opt/ircfiber-src/.engine-deploy-hash && echo $$(git rev-parse HEAD) > /opt/ircfiber/.frontend-deploy-hash && cp /opt/ircfiber/.frontend-deploy-hash /opt/ircfiber-src/.frontend-deploy-hash && echo $$(git rev-parse --short HEAD) > /opt/ircfiber/.deploy-hash && cp /opt/ircfiber/.deploy-hash /opt/ircfiber-src/.deploy-hash && cat /opt/ircfiber/.engine-deploy-hash /opt/ircfiber/.frontend-deploy-hash /opt/ircfiber/.deploy-hash"
+	@printf '%b\n' "$(BG)$(OK) Marked$(R)"
 
 # Nuke BuildKit cache + builder image on the target.
 # Forces cold rebuild: full dub download + compile next update.
 update-clean: ## Deploy > Nuke BuildKit cache + builder image on target
 	@printf '\n%b\n' "$(_BY)$(K)$(B)  Cleaning builder cache → $(_target_ssh) ($(_target))  $(R)"
 	@ssh deploy@$(_target_ssh) 'docker rmi ircfiber-builder:latest 2>/dev/null; docker builder prune --force 2>/dev/null; echo "Builder cache cleared"'
-
 # ── Graceful engine handoff deploy ────────────────────────────────────────
 # Hot-reloads the engine binary WITHOUT closing IRC sockets. The new binary
 # is started inside the existing container alongside the old engine. The old
