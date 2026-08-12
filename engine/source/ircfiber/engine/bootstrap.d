@@ -18,6 +18,7 @@ import ircfiber.db.circuit_breaker : exportMongoCircuitMetrics;
 import vibe.core.log;
 import core.time : seconds;
 
+import ircfiber.version;
 import ircfiber.models.irc_event : IRCRawEvent;
 import ircfiber.irc.manager : ConnectionManager;
 import ircfiber.irc.server : ConnectionServer;
@@ -189,6 +190,12 @@ EngineContext bootstrapEngine() {
     localServer.isHealthy = true;
     localServer.lastHeartbeat = Clock.currTime.toUnixTime!long * 1000;
     localServer.bufferOffset = 0; // Registry will set proper offset
+    localServer.gitHash = GIT_HASH;
+    localServer.gitShort = GIT_SHORT;
+    localServer.gitDescribe = GIT_DESCRIBE;
+    localServer.gitBranch = GIT_BRANCH;
+    localServer.buildTime = BUILD_TIME;
+    localServer.version_ = VERSION;
     localServer.assignedNetworks = [];
 
     // Apply admin-saved engine config overrides from Redis.

@@ -54,6 +54,18 @@ struct ConnectionServer {
     /// `ConnectionManager.networksAwaitingRegistration()`.
     string[] registrationUnavailableFor;
 
+    /// Git commit hash of the code this server is running (40 hex).
+    string gitHash;
+    /// Short git hash (7-12 hex).
+    string gitShort;
+    /// Git describe (e.g. 5b35f90-dirty, v0.3.0-12-gd8b3d21).
+    string gitDescribe;
+    /// Git branch.
+    string gitBranch;
+    /// Build time ISO8601 UTC.
+    string buildTime;
+    /// Version string (e.g. 0.3.0).
+    string version_;
     /// Serializes to JSON.
     Json toJson() const {
         auto j = Json.emptyObject;
@@ -69,6 +81,12 @@ struct ConnectionServer {
         j["fallbackOnly"] = Json(fallbackOnly);
         j["draining"] = Json(draining);
         j["registrationUnavailableFor"] = serializeToJson(registrationUnavailableFor);
+        if (gitHash.length) j["gitHash"] = Json(gitHash);
+        if (gitShort.length) j["gitShort"] = Json(gitShort);
+        if (gitDescribe.length) j["gitDescribe"] = Json(gitDescribe);
+        if (gitBranch.length) j["gitBranch"] = Json(gitBranch);
+        if (buildTime.length) j["buildTime"] = Json(buildTime);
+        if (version_.length) j["version"] = Json(version_);
         return j;
     }
 
@@ -97,6 +115,13 @@ struct ConnectionServer {
         if (j["registrationUnavailableFor"].type != Json.Type.undefined) {
             foreach (item; j["registrationUnavailableFor"]) s.registrationUnavailableFor ~= item.get!string;
         }
+        if (j["gitHash"].type != Json.Type.undefined) s.gitHash = j["gitHash"].get!string;
+        if (j["gitShort"].type != Json.Type.undefined) s.gitShort = j["gitShort"].get!string;
+        if (j["gitDescribe"].type != Json.Type.undefined) s.gitDescribe = j["gitDescribe"].get!string;
+        if (j["gitBranch"].type != Json.Type.undefined) s.gitBranch = j["gitBranch"].get!string;
+        if (j["buildTime"].type != Json.Type.undefined) s.buildTime = j["buildTime"].get!string;
+        if (j["version"].type != Json.Type.undefined) s.version_ = j["version"].get!string;
+        else if (j["version_"].type != Json.Type.undefined) s.version_ = j["version_"].get!string;
         return s;
     }
 }

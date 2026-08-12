@@ -105,6 +105,7 @@ AR := →
 # Phony targets (grouped by category)
 .PHONY: all help
 .PHONY: build build-gateway build-engine build-release build-debug build-ldc2 janitor-migrate frontend frontend-build frontend-dev frontend-install
+.PHONY: version
 
 .PHONY: dev dev-docker dev-live debug debug-live debug-host debug-all stop
 .PHONY: engine engine-rebuild engine-handoff engine-handoff-redis engine-restart engine-test
@@ -235,6 +236,9 @@ dev: frontend-install ## Component > Frontend dev (Vite HMR) — pairs with `mak
 # into the image — so a bundle-only rebuild never reaches a running container.
 # The step is a no-op when no local `ircfiber-gateway` container is up (e.g.
 # on a machine that only runs remote deploys).
+version: ## Build > Generate git version file (common/source/ircfiber/version.d)
+	@./scripts/generate-version.sh
+
 frontend-build: ## Build > Production frontend bundle (dist/ + views/index.dt hashes)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building frontend bundle  $(R)"
 	@npm --prefix frontend run build
@@ -719,10 +723,10 @@ ifeq ($(UNAME_S),Darwin)
     OPENSSL_LIB := $(shell brew --prefix openssl 2>/dev/null || echo /usr/local)/lib
 endif
 
-build: build-gateway build-engine ## Build > Build the application with dub (gateway+engine)
+build: version build-gateway build-engine ## Build > Build the application with dub (gateway+engine)
 	@printf '\n%b\n' "$(BG)$(OK) Build complete (gateway+engine)$(R)"
 
-build-gateway: frontend-build ## Build > Build the gateway binary (irc-fiber)
+build-gateway: version frontend-build ## Build > Build the gateway binary (irc-fiber)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building IRC Fiber Gateway  $(R)"
 	@bash -o pipefail -c '$(DUB_BACKEND) build --config=gateway --build=release 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | tail -8'
 	@bash -o pipefail -c '$(DUB_BACKEND) build --build=release 2>&1 | tail -5' || true
@@ -736,10 +740,10 @@ build-gateway: frontend-build ## Build > Build the gateway binary (irc-fiber)
 		printf '\n%b\n' "$(BG)$(OK) Gateway dub complete$(R)"; \
 	fi
 
-build-engine: ## Build > Build the IRC engine binary
+build-engine: version ## Build > Build the IRC engine binary
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building IRC Fiber Engine  $(R)"
 	@bash -o pipefail -c '$(DUB_ENGINE) build --config=engine --build=release 2>&1 | grep -v "Compiling Diet" | grep -v "\.dt$$" | grep -v "deployment version" | tail -8'
-	@printf '\n%b\n' "$(BG)$(OK) Engine build successful$(R)"
+	@printf '%b\n' "$(BG)$(OK) Engine build successful$(R)"
 # Janitor migrate tool — backfills TTLs on existing Redis state/scrollback/
 # dedup keys. Default is dry-run; set JSMIGRATE_DRY_RUN=0 to actually apply.
 janitor-migrate: ## Build > Run janitor-migrate (TTL backfill). Dry-run by default.
@@ -1654,7 +1658,7 @@ _target      = $(or $(TARGET),vps-efb4b52d)
 _target_ssh   = $(or $(TARGET_SSH),203.0.113.10)
 _playbook    = cd deploy && ansible-playbook -l $(_target) $(_vault_arg)
 
-update: frontend-build build build-engine ## Deploy > Build frontend + gateway + engine, handoff-deploy (zero disconnect for engines)
+update: version frontend-build build build-engine ## Deploy > Build frontend + gateway + engine, handoff-deploy (zero disconnect for engines)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Deploy → $(_target)  $(R)"
 	@$(_playbook) playbooks/deploy-update.yml $(if $(SKIP_MIGRATE),-e skip_migrate=true)
 	# The playbook's rsync handles public/ + backend/views/ (dist/ included since
@@ -1698,7 +1702,7 @@ deploy: update-full ## Deploy > Alias for update-full
 # docker build --target runtime-gateway on host → ansible gateway role
 # recreates ircfiber-gateway with correct env (Tailscale IP, networks).
 # Engine (ircfiber-engine-ovh) is NOT restarted — IRC connections stay up.
-update-gateway: frontend-build ## Deploy > Build frontend + rebuild gateway image + recreate gateway (engine untouched, persistent)
+update-gateway: version frontend-build ## Deploy > Build frontend + rebuild gateway image + recreate gateway (engine untouched, persistent)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Gateway-only deploy → $(_target)  $(R)"
 	@printf '%b\n' "$(D)  1/4 Syncing frontend + gateway D source to /opt/ircfiber-src on host$(R)"
 	@rsync -avz --delete -e "ssh -o StrictHostKeyChecking=no" public/ deploy@$(_target_ssh):/opt/ircfiber-src/public/ 2>&1 | tail -5
