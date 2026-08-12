@@ -8,9 +8,8 @@ HASH=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo "unknown")
 SHORT=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo "unknown")
 # describe without dirty, then add dirty suffix only if non-build_version/buildInfo files are dirty
 DESCRIBE_BASE=$(git -C "$ROOT" describe --always --long 2>/dev/null || echo "$SHORT")
-DIRTY=""
-if ! git -C "$ROOT" diff --quiet -- ':!common/source/ircfiber/build_version.d' ':!frontend/src/lib/buildInfo.ts' 2>/dev/null; then DIRTY="-dirty"; fi
-if ! git -C "$ROOT" diff --cached --quiet -- ':!common/source/ircfiber/build_version.d' ':!frontend/src/lib/buildInfo.ts' 2>/dev/null; then DIRTY="-dirty"; fi
+if ! git -C "$ROOT" diff --quiet -- ':!common/source/ircfiber/build_version.d' ':!frontend/src/lib/buildInfo.ts' ':!public/dist' ':!backend/views/index.dt' 2>/dev/null; then DIRTY="-dirty"; fi
+if ! git -C "$ROOT" diff --cached --quiet -- ':!common/source/ircfiber/build_version.d' ':!frontend/src/lib/buildInfo.ts' ':!public/dist' ':!backend/views/index.dt' 2>/dev/null; then DIRTY="-dirty"; fi
 DESCRIBE="${DESCRIBE_BASE}${DIRTY}"
 BRANCH=$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
 TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "unknown")
