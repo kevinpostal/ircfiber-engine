@@ -400,6 +400,7 @@ void startHeartbeatTask(ref EngineContext ctx) {
         import core.time : msecs;
 
         while (true) {
+            logInfo("Heartbeat loop: top beat=%d", beat);
             try {
                 // On the first cycle, explicitly clear stale draining.
                 if (firstCycle) {
@@ -416,13 +417,16 @@ void startHeartbeatTask(ref EngineContext ctx) {
                 }
 
                 ctx.localServer.lastHeartbeat = Clock.currTime.toUnixTime!long * 1000;
+                logInfo("Heartbeat step: updateHeartbeat start beat=%d", beat);
                 ctx.serverRegistry.updateHeartbeat(ctx.localServer.serverId);
+                logInfo("Heartbeat step: updateHeartbeat done");
 
                 // Layer 1: TTL bump. Extend the lifetime of every state
                 // key (irc:state, scrollback, dedup) so a dead engine
                 // self-evicts within STATE_TTL even without a janitor.
                 // Read TTL from env at startup; configurable per-deployment.
                 auto stateTtl = parseStateTtl();
+                logInfo("Heartbeat step: bump TTL start ttl=%d", stateTtl);
                 if (stateTtl > 0) {
                     try {
                         auto touched = bumpServerStateTTLs(
@@ -432,14 +436,15 @@ void startHeartbeatTask(ref EngineContext ctx) {
                         if (touched > 0 && beat == 0)
                             logInfo("Heartbeat: bumped TTL on %d state keys (%ds)",
                                 touched, stateTtl);
+                        logInfo("Heartbeat step: bump TTL done touched=%d", touched);
                     } catch (Exception e) {
                         logDebug("Heartbeat: TTL bump failed: %s", e.msg);
                     }
                 }
-
                 // Ensure the local server struct never perpetuates a
                 // draining state across heartbeats — the heartbeat is
                 // the signal that draining has ended.
+                logInfo("Heartbeat step: draining=false");
                 ctx.localServer.draining = false;
 
                 // Surface per-network registration-timeout markers so the
@@ -450,24 +455,32 @@ void startHeartbeatTask(ref EngineContext ctx) {
                 // to wait forever for the reply"; when the engine
                 // enforces that and the server never replied, the network
                 // gets a per-network stuck marker.
+                logInfo("Heartbeat step: registrationUnavailableFor start");
                 ctx.localServer.registrationUnavailableFor =
                     ctx.connManager.networksAwaitingRegistration();
                 recordGauge(
                     "ircfiber.registration.timeout_networks",
                     cast(long)ctx.localServer.registrationUnavailableFor.length,
                     ["serverId":   ctx.localServer.serverId]);
+                logInfo("Heartbeat step: syncServerState start");
                 ctx.serverRegistry.syncServerState(ctx.localServer.serverId, ctx.localServer);
+                logInfo("Heartbeat step: syncServerState done");
 
                 // Read canonical assignments from irc:assignments (the
                 // gateway's source of truth). This is the authoritative
                 // list of networks this server should be connected to.
+                logInfo("Heartbeat step: getCanonicalNetworks start");
                 auto canonical = ctx.serverRegistry.getCanonicalNetworks(ctx.localServer.serverId);
+                logInfo("Heartbeat step: getCanonicalNetworks done count=%d", canonical.length);
 
                 // Renew leases for networks still assigned to us. The
                 // gateway detects orphaned engines via lease expiry.
+                logInfo("Heartbeat step: renewLease start count=%d", canonical.length);
                 foreach (netId; canonical) {
                     ctx.serverRegistry.renewLease(netId);
                 }
+                logInfo("Heartbeat step: renewLease done");
+
 
                 // Reconcile connManager against canonical: add any
                 // missing networks (load from Mongo if needed), remove
@@ -493,6 +506,7 @@ void startHeartbeatTask(ref EngineContext ctx) {
                 // hash. This avoids the race where the engine's local view
                 // (connManager) is briefly out of sync with Redis, which
                 // used to cause spurious "no longer assigned" disconnects.
+                logInfo("Heartbeat step: assignedNetworks = canonical count=%d", canonical.length);
                 ctx.localServer.assignedNetworks = canonical;
 
                 // Self-heal: a past bug could leave the engine's
@@ -504,11 +518,13 @@ void startHeartbeatTask(ref EngineContext ctx) {
                 // re-persists the cleaned value to the server record;
                 // the first syncServerState() (earlier in this loop)
                 // wrote whatever localServer had at that point.
+                logInfo("Heartbeat step: filter empty assignedNetworks");
                 import std.algorithm : filter;
                 import std.array : array;
                 ctx.localServer.assignedNetworks = ctx.localServer.assignedNetworks
                     .filter!(n => n.length > 0)
                     .array;
+                logInfo("Heartbeat step: publishServerAssignments count=%d", ctx.localServer.assignedNetworks.length);
 
                 // Mirror assignedNetworks into a per-engine hash so
                 // getAllAssignments() can recover if `irc:assignments` is
@@ -519,6 +535,7 @@ void startHeartbeatTask(ref EngineContext ctx) {
                 ctx.serverRegistry.publishServerAssignments(
                     ctx.localServer.serverId,
                     ctx.localServer.assignedNetworks);
+                logInfo("Heartbeat step: publishServerAssignments done");
 
                 // Persist the now-clean assignedNetworks back to the
                 // server record. The earlier syncServerState() call
@@ -527,18 +544,22 @@ void startHeartbeatTask(ref EngineContext ctx) {
                 // ghost "" entry from the orphan-empty-string bug. This
                 // second write ensures the server record on Redis is
                 // scrubbed on the very first cycle, not the second.
+                logInfo("Heartbeat step: second syncServerState start");
                 ctx.serverRegistry.syncServerState(
                     ctx.localServer.serverId, ctx.localServer);
+                logInfo("Heartbeat step: second syncServerState done");
 
                 // Re-read engine config from Redis so admin changes to
                 // priority, maxConnections, or fallbackOnly take effect
                 // within ~10 seconds without an engine restart.
+                logInfo("Heartbeat step: getEngineConfig start");
                 try {
                     auto cfg = ctx.serverRegistry.getEngineConfig(ctx.localServer.serverId);
                     if (cfg.priority != 0) ctx.localServer.priority = cfg.priority;
                     if (cfg.maxConnections != 0) ctx.localServer.maxConnections = cfg.maxConnections;
                     ctx.localServer.fallbackOnly = cfg.fallbackOnly;
                 } catch (Exception) { }
+                logInfo("Heartbeat step: getEngineConfig done");
 
                 // Downgraded from logInfo to debug — 10s cadence was flooding SigNoz logs
                 // (8640 entries/day per engine). Heartbeat health is visible via
@@ -590,8 +611,10 @@ void startHeartbeatTask(ref EngineContext ctx) {
             // Normal cadence — only when the try block completed
             // without throwing. The catch branch above uses `continue`
             // to skip this sleep and instead applies its own backoff.
+            logInfo("Heartbeat loop: sleeping 10s for next beat=%d", beat);
             try sleep(10.seconds);
             catch (Exception) { /* nothrow lambda — swallow */ }
+            logInfo("Heartbeat loop: woke for beat=%d", beat);
         }
     });
 }

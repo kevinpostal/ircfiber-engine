@@ -122,6 +122,14 @@ final class PastebinRepository {
         return res.matchedCount > 0;
     }
 
+    /// Updates name, syntax, body and lines. Returns false if not found/not theirs.
+    bool updateFull(string userId, string id, string name, string syntax, string content) @trusted {
+        auto res = collection.updateOne(
+            Bson(["_id": Bson(id), "userId": Bson(userId), "deleted": Bson(false)]),
+            Bson(["$set": Bson(["name": Bson(name), "syntax": Bson(syntax), "content": Bson(content), "lines": Bson(countLines(content))])]));
+        return res.matchedCount > 0;
+    }
+
     /// Soft-deletes one of the user's snippets. Returns false if not found/not theirs.
     bool softDelete(string userId, string id) @trusted {
         auto res = collection.updateOne(

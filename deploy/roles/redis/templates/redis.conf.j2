@@ -1,11 +1,9 @@
 # {{ ansible_managed }}
 # IRC Fiber — Redis configuration
-# Bound to Tailscale IP only; auth required.
+# Bound to all interfaces for resilience; Tailscale may flap but loopback/bridge stay.
+# Protected-mode off, no password — network-level isolation via firewall + Tailscale ACL.
 
-bind {{ redis_bind_ip }}
-# Protected mode disabled: the IRC Fiber D client can't pass a password,
-# and protected mode rejects no-password connections from non-loopback.
-# The container is bound to the host's Tailscale interface only, so
+bind 0.0.0.0
 # network-level isolation provides the security boundary.
 protected-mode no
 port {{ redis_port }}

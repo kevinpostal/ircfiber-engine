@@ -27,8 +27,9 @@
 - name: Resolve backend Tailscale IP (where mongo & redis live)
   ansible.builtin.set_fact:
     backend_tailscale_ip: >-
-      {{ hostvars[groups['ircfiber_backend'][0]]['host_tailscale_ip']
-         | default(host_tailscale_ip) }}
+      {{ hostvars[groups['ircfiber_backend'][0]]['backend_tailscale_ip']
+         | default(hostvars[groups['ircfiber_backend'][0]]['host_tailscale_ip']
+            | default(host_tailscale_ip)) }}
 
 - name: Pull ircfiber-engine image (registry configured)
   community.docker.docker_image:

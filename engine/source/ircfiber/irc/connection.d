@@ -279,6 +279,16 @@ private MullvadProxy* pickMullvadProxy(string egressNodeId) {
     return healthy[uniform(0, healthy.length)];
 }
 
+private MullvadProxy*[] getHealthyProxies() {
+    loadMullvadPool();
+    if (mullvadPool.length == 0) return [];
+    const now = Clock.currTime.toUnixTime!long * 1000;
+    foreach (ref pr; mullvadPool) if (pr.deadUntilMs != 0 && now >= pr.deadUntilMs) { pr.failCount = 0; pr.deadUntilMs = 0; }
+    MullvadProxy*[] healthy;
+    foreach (ref pr; mullvadPool) if (pr.deadUntilMs == 0 || now >= pr.deadUntilMs) healthy ~= &pr;
+    return healthy;
+}
+
 private void recordMullvadSuccess(string label) {
     foreach (ref pr; mullvadPool) if (pr.label == label) { pr.failCount = 0; pr.deadUntilMs = 0; break; }
 }
@@ -450,9 +460,8 @@ private ResolvedAddr[] interleaveAddressFamilies(ResolvedAddr[] addrs) {
     return out_;
 }
 
-private TCPConnection happyEyeballsConnect(string host, ushort port, string egressNodeId = "") {
-    auto proxy = pickMullvadProxy(egressNodeId);
-    if (proxy !is null) logInfo("Mullvad egress %s (%s:%d) for %s:%d (raw=%s)", proxy.label, proxy.host, proxy.port, host, port, egressNodeId.length ? egressNodeId : "random");
+private TCPConnection happyEyeballsConnectWithProxy(string host, ushort port, MullvadProxy* proxy) {
+    if (proxy !is null) logInfo("Mullvad egress %s (%s:%d) for %s:%d", proxy.label, proxy.host, proxy.port, host, port);
     auto addrs = resolveAllAddresses(host, port);
     if (addrs.length == 0) throw new Exception("DNS resolution failed for " ~ host);
 
@@ -529,6 +538,34 @@ private TCPConnection happyEyeballsConnect(string host, ushort port, string egre
     finishHappyEyeballs(conns, tasks, -1);
     throw new Exception("All connection attempts failed for " ~ host ~ ":" ~ port.to!string);
 }
+
+private TCPConnection happyEyeballsConnect(string host, ushort port, string egressNodeId = "") {
+    // Try pinned/primary, then other healthy Mullvad proxies, then direct.
+    // This ensures Docker or a single Mullvad exit going down doesn't drop IRC.
+    MullvadProxy*[] toTry;
+    auto primary = pickMullvadProxy(egressNodeId);
+    if (primary !is null) toTry ~= primary;
+    auto healthy = getHealthyProxies();
+    foreach (p; healthy) {
+        bool already = false;
+        foreach (q; toTry) if (q is p) { already = true; break; }
+        if (!already) toTry ~= p;
+    }
+    toTry ~= null; // direct fallback
+    Exception lastErr;
+    foreach (proxy; toTry) {
+        try {
+            return happyEyeballsConnectWithProxy(host, port, proxy);
+        } catch (Exception e) {
+            lastErr = e;
+            logWarn("happyEyeballsConnect via %s failed for %s:%d: %s, trying next egress", proxy ? proxy.label : "direct", host, port, e.msg);
+            // recordMullvadFailure already done inside WithProxy for socks failures
+            continue;
+        }
+    }
+    throw lastErr ? lastErr : new Exception("All connection attempts failed for " ~ host ~ ":" ~ port.to!string);
+}
+
 
 /**
  * Clean up Happy Eyeballs loser tasks and connections.

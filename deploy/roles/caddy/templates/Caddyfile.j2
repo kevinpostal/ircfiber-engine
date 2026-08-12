@@ -179,7 +179,7 @@
     # Security headers — only applied to non-SigNoz responses. The
     # /signoz/* path needs no X-Frame-Options or frame-ancestors so
     # the admin SPA can iframe it.
-    @notsignoz not path /signoz /signoz/* /api/v1/* /api/v2/* /api/v3/* /api/v4/* /api/v5/* /assets/index-* /css/*
+    @notsignoz not path /signoz /signoz/* /api/v1/* /api/v2/* /api/v3/* /api/v4/* /api/v5/* /assets/index-* /css/* /uploads/*
     header @notsignoz {
         Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
         X-Content-Type-Options "nosniff"
