@@ -130,6 +130,7 @@ AR := →
         local-dev-up local-dev-down local-dev-down-clean local-dev-smoke
 .PHONY: cross-linux-x64 cross-linux-arm64 cross-linux-armv7
 .PHONY: verify precommit ci install-env
+.PHONY: gateway-fix-assets fix-gateway-assets update-frontend
 .PHONY: sync-db-to-tailnet sync-mongo-to-tailnet sync-redis-to-tailnet
 # Primary workflows — decoupled: engine stays up across gateway restarts.
 # Engine = IRC daemon, holds TCP/TLS + JOIN state. Gateway = vibe.d REST+WS.
@@ -1719,6 +1720,104 @@ update-gateway: version frontend-build ## Deploy > Build frontend + rebuild gate
 	@ssh deploy@$(_target_ssh) 'sleep 2; curl -fsS http://127.0.0.1:8090/health 2>&1 | head -c 200; echo ""; docker ps --format "{{.Names}} {{.Status}}" | grep -E "gateway|engine"'
 	@ssh -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no deploy@$(_target_ssh) "mkdir -p /opt/ircfiber /opt/ircfiber-src && echo $$(git rev-parse HEAD) > /opt/ircfiber/.frontend-deploy-hash && cp /opt/ircfiber/.frontend-deploy-hash /opt/ircfiber-src/.frontend-deploy-hash && echo $$(git rev-parse --short HEAD):$$(date +%Y%m%d-%H%M%S) > /opt/ircfiber/.deploy-hash && cp /opt/ircfiber/.deploy-hash /opt/ircfiber-src/.deploy-hash && cat /opt/ircfiber/.frontend-deploy-hash" 2>&1 | tail -5 || true
 	@printf '%b\n' "$(BG)$(OK) Gateway deployed (persistent) — engine not restarted$(R)"
+# ── Gateway asset fix — one-command repair for stale css/js (hash mismatch) ─
+# Symptom: live site (ircfiber.com) 404s on /public/dist/assets/main-*.js|css
+# because the gateway container's /app/views/index.dt references a hash that
+# does NOT exist in /app/public/dist/assets (frontend built but gateway image
+# not rebuilt, or host /opt/ircfiber-src not synced). The SPA shell then
+# loads no css/js — blank page after Cloudflare.
+#
+# Root cause leaf: `public/dist/.vite/manifest.json` → `backend/views/index.dt`
+# injection succeeded locally, but the running gateway still bakes the old
+# hash (views) and old assets (public). The engine is NOT involved — gateway
+# only.
+#
+# This target is the documented one-command fix (used 2026-08-13 live incident):
+#   make gateway-fix-assets              # → vps-efb4b52d (default)
+#   make gateway-fix-assets TARGET=foo   # → alternate host
+#
+# Steps (engine untouched, hard-restart-free):
+#   1. frontend-build               — vite build + inject-manifest (re-syncs
+#      backend/views/index.dt with public/dist/.vite/manifest.json).
+#   2. capture old hash on host      — so we can alias it for 1h Cloudflare edge
+#   3. rsync public/backend/common/Containerfile/config to /opt/ircfiber-src
+#      on host (explicit -i ~/.ssh/id_ed25519_ircfiber; 1Password agent hits
+#      Too many authentication failures otherwise).
+#   4. docker build --target runtime-gateway --build-arg CACHE_BUST=$(date +%s)
+#      on host (forces backend dub rebuild so /app/views gets new hash).
+#   5. recreate gateway via ansible gateway role (correct env, networks,
+#      volumes, Tailscale IP) — fallback to raw docker run if ansible absent.
+#   6. alias old hash → new hash inside container + host src (so cached HTML
+#      referencing the old hash still 200s until CF max-age=3600 expires).
+#   7. verify: gateway health, new asset 200 via Caddy, engine PID unchanged.
+#
+# See AGENTS.md "Deploy (gateway-only, engine untouched)" for the manual
+# equivalent and the `make update-gateway` fast path (same build but without
+# the old-hash alias and pre-flight validation).
+gateway-fix-assets: version frontend-build ## Deploy > Fix live css/js 404 — rebuild frontend, sync, rebuild gateway image, recreate gateway (engine untouched)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Gateway asset fix → $(_target)  $(R)"
+	@printf '%b\n' "$(D)  Preflight: validating local manifest ↔ index.dt coherence$(R)"
+	@if [ ! -f public/dist/.vite/manifest.json ]; then printf '%b\n' "$(Y)$(WR) public/dist/.vite/manifest.json missing — frontend-build failed$(R)"; exit 1; fi
+	@MANIFEST_JS=$$(python3 -c "import json; m=json.load(open('public/dist/.vite/manifest.json')); print(m.get('index.html',{}).get('file',''))" 2>/dev/null); \
+		if [ -z "$$MANIFEST_JS" ]; then printf '%b\n' "$(Y)$(WR) manifest has no index.html entry$(R)"; exit 1; fi; \
+		DT_JS=$$(grep -o 'main-[^"]*\.js' backend/views/index.dt | head -1); \
+		if [ "$$MANIFEST_JS" != "assets/$$DT_JS" ]; then printf '%b\n' "$(Y)$(WR) index.dt ($$DT_JS) ≠ manifest ($$MANIFEST_JS) — inject-manifest did not run$(R)"; exit 1; fi; \
+		if [ ! -f "public/dist/assets/$$DT_JS" ]; then printf '%b\n' "$(Y)$(WR) public/dist/assets/$$DT_JS missing$(R)"; exit 1; fi; \
+		printf '%b\n' "$(BG)$(OK) Local bundle coherent: $$DT_JS$(R) $(D)(manifest ↔ index.dt ↔ dist)$(R)"
+	@OLD_JS=$$(ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no deploy@$(_target_ssh) "grep -oE 'main-[A-Za-z0-9._-]+\.js' /opt/ircfiber-src/backend/views/index.dt 2>/dev/null | head -1"); \
+		OLD_CSS=$$(ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no deploy@$(_target_ssh) "grep -oE 'main-[A-Za-z0-9._-]+\.css' /opt/ircfiber-src/backend/views/index.dt 2>/dev/null | head -1"); \
+		ENGINE_PID_BEFORE=$$(ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no deploy@$(_target_ssh) 'docker exec ircfiber-engine-ovh pidof irc-fiber-engine 2>/dev/null || echo "?"'); \
+		NEW_JS=$$(grep -o 'main-[^"]*\.js' backend/views/index.dt | head -1); \
+		NEW_CSS=$$(grep -o 'main-[^"]*\.css' backend/views/index.dt | head -1); \
+		echo "$$OLD_JS" > /tmp/ircfiber-fix-old-js; echo "$$OLD_CSS" > /tmp/ircfiber-fix-old-css; echo "$$ENGINE_PID_BEFORE" > /tmp/ircfiber-fix-pid-before; echo "$$NEW_JS" > /tmp/ircfiber-fix-new-js; echo "$$NEW_CSS" > /tmp/ircfiber-fix-new-css; \
+		printf '%b\n' "$(D)  Host old: $${OLD_JS:-none} / $${OLD_CSS:-none} → local new: $$NEW_JS / $$NEW_CSS  (engine PID before: $$ENGINE_PID_BEFORE)$(R)"
+	@printf '%b\n' "$(D)  1/4 Syncing public + backend + common + Containerfile + config to /opt/ircfiber-src$(R)"
+	@tar cz --no-xattrs --format=ustar -C public dist 2>&1 | ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no deploy@$(_target_ssh) 'sudo sh -c "rm -rf /opt/ircfiber-src/public/dist && mkdir -p /opt/ircfiber-src/public && tar xzf - -C /opt/ircfiber-src/public && echo public-synced"' 2>&1 | tail -5
+	@rsync -avz --delete -e "ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no" backend/ deploy@$(_target_ssh):/opt/ircfiber-src/backend/ 2>&1 | tail -5
+	@rsync -avz --delete -e "ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no" common/ deploy@$(_target_ssh):/opt/ircfiber-src/common/ 2>&1 | tail -5
+	@rsync -avz -e "ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no" Containerfile deploy@$(_target_ssh):/opt/ircfiber-src/Containerfile 2>&1 | tail -5
+	@rsync -avz --delete -e "ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no" config/ deploy@$(_target_ssh):/opt/ircfiber-src/config/ 2>&1 | tail -5
+	@NEW_JS=$$(cat /tmp/ircfiber-fix-new-js); NEW_CSS=$$(cat /tmp/ircfiber-fix-new-css); \
+		ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no deploy@$(_target_ssh) "grep -oE 'main-[A-Za-z0-9._-]+\.js' /opt/ircfiber-src/backend/views/index.dt | head -1 | grep -q \"$$NEW_JS\" && grep -oE 'main-[A-Za-z0-9._-]+\.css' /opt/ircfiber-src/backend/views/index.dt | head -1 | grep -q \"$$NEW_CSS\" || (echo \"host index.dt mismatch after rsync\"; exit 1)" && \
+		ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no deploy@$(_target_ssh) "ls /opt/ircfiber-src/public/dist/assets/$$NEW_JS >/dev/null 2>&1 && ls /opt/ircfiber-src/public/dist/assets/$$NEW_CSS >/dev/null 2>&1 || (echo \"host dist missing new hash\"; exit 1)" && \
+		printf '%b\n' "$(BG)$(OK) Host synced and coherent: $$NEW_JS / $$NEW_CSS$(R)"
+	@printf '%b\n' "$(D)  2/4 Building runtime-gateway image on host (BuildKit, ~2-3m first time, cached after)$(R)"
+	@ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no deploy@$(_target_ssh) 'cd /opt/ircfiber-src && DOCKER_BUILDKIT=1 docker build --target runtime-gateway --build-arg CACHE_BUST=$$(date +%s) -t kevindpostal/irc-fiber-gateway:0.3.0 -f Containerfile . 2>&1 | tail -20'
+	@ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no deploy@$(_target_ssh) 'docker tag kevindpostal/irc-fiber-gateway:0.3.0 kevindpostal/irc-fiber-gateway:0.3.1 2>/dev/null || true'
+	@printf '%b\n' "$(D)  3/4 Recreating gateway container (engine untouched)$(R)"
+	@if cd deploy 2>/dev/null && [ -f inventories/production/hosts.ini ] && ansible-playbook --version >/dev/null 2>&1; then \
+			printf '%b\n' "$(D)  → via Ansible gateway role (correct env, networks)$(R)"; \
+			cd deploy && ansible-playbook -l $(_target) $(_vault_arg) playbooks/gateway.yml 2>&1 | tail -20; \
+		else \
+			printf '%b\n' "$(Y)$(WR) Ansible unavailable — falling back to raw docker run (engine untouched)$(R)"; \
+			ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no deploy@$(_target_ssh) '\
+				set -e; \
+				docker stop ircfiber-gateway 2>/dev/null || true; \
+				docker rm ircfiber-gateway 2>/dev/null || true; \
+				docker run -d --name ircfiber-gateway --restart unless-stopped --network ircfiber_net -v ircfiber_uploads:/app/uploads -v ircfiber_logs:/var/log/irc-fiber --env-file /etc/ircfiber/gateway/env kevindpostal/irc-fiber-gateway:0.3.0 /app/irc-fiber >/dev/null; \
+				docker network connect ircfiber_logging ircfiber-gateway 2>/dev/null || true; \
+				echo "gateway recreated via docker run"; \
+				docker ps --format "{{.Names}} {{.Status}}" | grep gateway'; \
+		fi
+	@printf '%b\n' "$(D)  4/4 Verifying gateway health + asset serving + engine untouched$(R)"
+	@OLD_JS=$$(cat /tmp/ircfiber-fix-old-js); NEW_JS=$$(cat /tmp/ircfiber-fix-new-js); OLD_CSS=$$(cat /tmp/ircfiber-fix-old-css); NEW_CSS=$$(cat /tmp/ircfiber-fix-new-css); \
+		ENGINE_PID_BEFORE=$$(cat /tmp/ircfiber-fix-pid-before); \
+		if [ -n "$$OLD_JS" ] && [ "$$OLD_JS" != "$$NEW_JS" ]; then \
+			printf '%b\n' "$(D)  → aliasing old JS $$OLD_JS → $$NEW_JS for 1h Cloudflare edge (max-age=3600)$(R)"; \
+			ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no deploy@$(_target_ssh) "docker exec ircfiber-gateway sh -c \"cp /app/public/dist/assets/$$NEW_JS /app/public/dist/assets/$$OLD_JS 2>/dev/null && echo alias-JS-OK || echo alias-JS-skip\" 2>&1 | tail -1"; \
+			ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no deploy@$(_target_ssh) "sudo sh -c \"cp /opt/ircfiber-src/public/dist/assets/$$NEW_JS /opt/ircfiber-src/public/dist/assets/$$OLD_JS 2>/dev/null && echo host-alias-JS-OK || echo host-alias-JS-skip\" 2>&1 | tail -1"; \
+		fi; \
+		if [ -n "$$OLD_CSS" ] && [ "$$OLD_CSS" != "$$NEW_CSS" ]; then \
+			printf '%b\n' "$(D)  → aliasing old CSS $$OLD_CSS → $$NEW_CSS$(R)"; \
+			ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no deploy@$(_target_ssh) "docker exec ircfiber-gateway sh -c \"cp /app/public/dist/assets/$$NEW_CSS /app/public/dist/assets/$$OLD_CSS 2>/dev/null && echo alias-CSS-OK || echo alias-CSS-skip\" 2>&1 | tail -1"; \
+			ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no deploy@$(_target_ssh) "sudo sh -c \"cp /opt/ircfiber-src/public/dist/assets/$$NEW_CSS /opt/ircfiber-src/public/dist/assets/$$OLD_CSS 2>/dev/null && echo host-alias-CSS-OK || echo host-alias-CSS-skip\" 2>&1 | tail -1"; \
+		fi; \
+		sleep 2; \
+		ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no deploy@$(_target_ssh) "echo \"gateway assets:\"; docker exec ircfiber-gateway sh -c \"ls -lh /app/public/dist/assets/main-* 2>&1 | head -5; grep -oE 'main-[A-Za-z0-9._-]+\.js' /app/views/index.dt | head -1\" 2>&1 | head -10; echo \"--- curl health (gateway) ---\"; docker exec ircfiber-gateway sh -c \"curl -fsS http://127.0.0.1:8090/health 2>&1 | head -c 200\"; echo \"\"; echo \"--- curl asset via Caddy (internal) ---\"; docker exec ircfiber-caddy sh -c \"wget -qO- http://ircfiber-gateway:8090/public/dist/assets/$$NEW_JS 2>&1 | head -c 30; echo\" 2>&1 | head -5; echo \"--- outer CF asset ---\"; curl -ks -A \"Mozilla/5.0\" https://ircfiber.com/public/dist/assets/$$NEW_JS -o /dev/null -w \"%{http_code} %{size_download}\n\" 2>&1 | head -1; echo \"--- engine PID ---\"; ENGINE_PID_AFTER=\$$(docker exec ircfiber-engine-ovh pidof irc-fiber-engine 2>/dev/null || echo \"?\"); echo \"before=$$ENGINE_PID_BEFORE after=$$ENGINE_PID_AFTER\"; if [ \"$$ENGINE_PID_BEFORE\" != \"?\" ] && [ \"$$ENGINE_PID_AFTER\" != \"?\" ] && [ \"$$ENGINE_PID_BEFORE\" != \"$$ENGINE_PID_AFTER\" ]; then echo \"WARN: engine PID changed (was $$ENGINE_PID_BEFORE, now $$ENGINE_PID_AFTER) — expected untouched\"; else echo \"engine untouched (PID $$ENGINE_PID_AFTER)\"; fi; docker ps --format \"{{.Names}} {{.Status}}\" | grep -E \"gateway|engine\"" 2>&1 | sed "s/^/    /"
+	@NEW_JS=$$(cat /tmp/ircfiber-fix-new-js); ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no deploy@$(_target_ssh) "mkdir -p /opt/ircfiber /opt/ircfiber-src && echo $$(git rev-parse HEAD) > /opt/ircfiber/.frontend-deploy-hash && cp /opt/ircfiber/.frontend-deploy-hash /opt/ircfiber-src/.frontend-deploy-hash && echo $$(git rev-parse --short HEAD):$$(date +%Y%m%d-%H%M%S) > /opt/ircfiber/.deploy-hash && cp /opt/ircfiber/.deploy-hash /opt/ircfiber-src/.deploy-hash && cat /opt/ircfiber/.frontend-deploy-hash" 2>&1 | tail -3 || true
+	@printf '%b\n' "$(BG)$(OK) Gateway asset fix complete — engine not restarted (refresh https://ircfiber.com)$(R)"
+fix-gateway-assets: gateway-fix-assets ## Deploy > Alias for gateway-fix-assets
+update-frontend: gateway-fix-assets ## Deploy > Update frontend only (alias for gateway-fix-assets — rebuilds frontend + gateway image, engine untouched)
 # Show running container images and versions on the target.
 update-status: ## Deploy > Show running containers & image versions
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Deploy status → $(_target)  $(R)"
