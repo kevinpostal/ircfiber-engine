@@ -60,6 +60,8 @@
         src: "{{ playbook_dir }}/../../"
         dest: "{{ src_root }}"
         delete: true
+        owner: false
+        group: false
         rsync_opts:
           - "--exclude=.git"
           - "--exclude=node_modules"
