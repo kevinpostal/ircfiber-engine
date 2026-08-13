@@ -38,7 +38,11 @@ struct IRCRawEvent {
     this(string network, string command) {
         this.network = network;
         this.command = command;
-        this.timestampMs = Clock.currTime.toUnixTime!long * 1000;
+        // Use millisecond precision (not second-truncated) so rapid
+        // same-text sends (e.g. spamming "a" 10× in 1s) get distinct
+        // timestampMs values and don't collide in BufferManager's
+        // content-hash dedup fallback.
+        this.timestampMs = cast(long)((Clock.currTime - SysTime.fromUnixTime(0)).total!"msecs");
         import std.uuid;
         this.id = randomUUID().toString();
         this.paramsJson = "[]";

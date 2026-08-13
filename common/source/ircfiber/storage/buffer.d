@@ -472,10 +472,16 @@ final class BufferManager {
             // Also include the phase tag so engine-emitted server-log
             // events (tcp_open, info, registering, welcome) that share
             // the same timestamp don't collide and get dropped as dupes.
+            // Include the labeled-response label when present so rapid
+            // same-text PRIVMSGs (e.g. spamming "a") that share a
+            // second-precision timestamp don't collide — each label is a
+            // unique UUID and makes the hash distinct.
             auto phaseKey = event.getTag("phase");
-            key = "h:" ~ contentHash(event.command ~ "|" ~ phaseKey, channel, event.timestampMs, params);
+            auto labelKey = event.getTag("label");
+            string hashInput = event.command ~ "|" ~ phaseKey;
+            if (labelKey.length > 0) hashInput ~= "|" ~ labelKey;
+            key = "h:" ~ contentHash(hashInput, channel, event.timestampMs, params);
         }
-
         auto db = redis.getDb();
         auto added = db.sadd(dedupKey, key);
         db.expire(dedupKey, DEDUP_TTL_SECS);
