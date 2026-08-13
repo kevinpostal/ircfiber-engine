@@ -493,11 +493,46 @@ void startHeartbeatTask(ref EngineContext ctx) {
                 // Reconcile connManager against canonical: add any
                 // missing networks (load from Mongo if needed), remove
                 // any networks that no longer belong to us.
-                import std.algorithm : canFind, map;
+                import std.algorithm : canFind, filter, map;
                 import std.array : array;
                 import std.uuid : UUID;
                 auto currentNetIds = ctx.connManager.getNetworks()
                     .map!(n => n.config.id.toString()).array;
+
+                // Guard: if canonical is empty but we have local networks,
+                // this is likely a transient Redis wipe (assignments hash
+                // evicted) — not a legitimate admin reassignment. Disconnecting
+                // all networks would drop every IRC session. Instead, keep
+                // the local networks and try to repopulate the canonical
+                // hash from the local state so the next heartbeat recovers.
+                if (canonical.length == 0 && currentNetIds.length > 0) {
+                    auto allAssignments = ctx.serverRegistry.getAllAssignments();
+                    if (allAssignments.length == 0) {
+                        logError("CRITICAL: canonical empty (0) but local has %d networks and getAllAssignments also 0 — Redis wipe suspected, not disconnecting. Attempting to repopulate canonical from local state.", currentNetIds.length);
+                        foreach (netId; currentNetIds) {
+                            try {
+                                ctx.serverRegistry.selfAssignNetwork(netId, ctx.localServer.serverId);
+                                logInfo("Repopulated assignment %s -> %s from local state", netId, ctx.localServer.serverId);
+                            } catch (Exception e) {
+                                logError("Failed to repopulate %s: %s", netId, e.msg);
+                            }
+                        }
+                        // Re-read canonical after repopulation
+                        canonical = ctx.serverRegistry.getCanonicalNetworks(ctx.localServer.serverId);
+                        logInfo("After repopulation, canonical count=%d", canonical.length);
+                        if (canonical.length == 0) {
+                            logWarn("Still 0 canonical after repopulation — skipping disconnect this cycle to avoid mass drop");
+                            // Skip the disconnect loop this cycle; keep assignedNetworks as current
+                            // and let the next heartbeat retry. We still need to avoid wiping the mirror
+                            // with 0, so set canonical to current for this cycle's publish.
+                            canonical = currentNetIds.dup;
+                        }
+                    } else {
+                        logWarn("Canonical 0 but getAllAssignments has %d entries and local has %d — canonical may be stale, not disconnecting this cycle", allAssignments.length, currentNetIds.length);
+                        // Use the recovered assignments as canonical for this cycle
+                        canonical = allAssignments.filter!(na => na.serverId == ctx.localServer.serverId).map!(na => na.networkId).array;
+                    }
+                }
 
                 // Disconnect networks no longer in canonical.
                 foreach (netId; currentNetIds) {

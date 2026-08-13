@@ -980,6 +980,17 @@ janitor-safety-test: ## Test > EngineJanitor status / events / purgeLocalServerN
 
 janitor-tests: ## Test > All EngineJanitor test suites (basic + lock + safety)
 	@./run-janitor-tests.sh
+fix-assignments: ## Operational > Rebuild irc:assignments from MongoDB (emergency recovery — does not disconnect IRC sessions)
+	@bash scripts/fix-assignments.sh $(HOST)
+
+fix-assignments-restart: ## Operational > Rebuild assignments and restart engine for immediate reconnect
+	@bash scripts/fix-assignments.sh $(HOST) --restart
+
+check-assignments: ## Operational > Check irc:assignments health (count vs mongo, empty warning)
+	@bash scripts/check-assignments.sh $(HOST)
+
+assignments-status: check-assignments ## Operational > Alias for check-assignments
+
 
 parser-fuzz-test: ## Test > parser property-based fuzz (10k random lines)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Parser fuzz tests  $(R)"

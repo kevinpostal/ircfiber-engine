@@ -166,6 +166,21 @@ final class ServerRegistry {
     /// fix/orphan-connection-delete change.
     void publishServerAssignments(string serverId, string[] networkIds) {
         auto key = RedisKeys.serverAssignments(serverId);
+        // Guard: never wipe the mirror with an empty list when the mirror
+        // already holds assignments. This prevents the destructive feedback
+        // loop where an empty canonical (irc:assignments) -> 0 canonical
+        // -> publish 0 -> wipes mirror -> recovery via mirrors also 0.
+        // Keep the last good mirror so getAllAssignments() can still
+        // recover until the canonical is rebuilt from Mongo.
+        if (networkIds.length == 0) {
+            try {
+                auto existing = db.hlen(key);
+                if (existing > 0) {
+                    logWarn("publishServerAssignments: refusing to wipe mirror %s (%d entries) with empty list — keeping last good state", key, existing);
+                    return;
+                }
+            } catch (Exception e) {}
+        }
         // Replace atomically: delete the mirror and re-populate. A short
         // window where the mirror is empty is acceptable because the
         // canonical hash is the primary source; the mirror only matters
@@ -979,6 +994,8 @@ final class ServerRegistry {
                 }
             }
         }
+
+
 
         foreach (netId, serverId; raw) {
             NetworkAssignment na;
