@@ -2834,9 +2834,44 @@ final class PersistentIRCClient {
                                     recordCounter("ircfiber.cap.negotiated", 1,
                                         ["network": config.name, "host": config.host,
                                          "port": config.port.to!string]);
+                                } else if (!saslDone && config.sasl != SASLMechanism.none
+                                    && !ackedCaps.get("sasl", false)) {
+                                    // The server granted caps but NOT sasl — it does
+                                    // not support SASL on this connection. Fall back to
+                                    // no-SASL registration instead of deadlocking waiting
+                                    // for an AUTHENTICATE that will never come (the
+                                    // 2026-08-12 BLCKND outage: sasl configured, server
+                                    // never granted it, CAP END never sent, server closed
+                                    // with "Registration Timeout" after ~40s, forever).
+                                    logWarn("SASL not granted by %s (server does not offer sasl) — proceeding without SASL",
+                                        config.host);
+                                    saslDone = true;
+                                    if (!capEndSent) {
+                                        sendRaw("CAP END");
+                                        capEndSent = true;
+                                        logJsonMap("info", "connection",
+                                            "CAP negotiation complete",
+                                            ["network": config.name,
+                                             "host": config.host, "port": config.port.to!string,
+                                             "acks": capLine,
+                                             "sasl": "not-granted",
+                                             "event": "cap_negotiated"]);
+                                        recordCounter("ircfiber.cap.negotiated", 1,
+                                            ["network": config.name, "host": config.host,
+                                             "port": config.port.to!string]);
+                                    }
                                 }
                             } else if (sub == "NAK") {
-                                // Ignore NAK'd caps; they just won't be used
+                                // Ignore NAK'd caps; they just won't be used. If the
+                                // server NAK'd the whole request while we configured
+                                // SASL, the server does not offer it — proceed without
+                                // SASL so registration cannot deadlock (BLCKND outage).
+                                if (!saslDone && config.sasl != SASLMechanism.none
+                                    && capLine.canFind("sasl")) {
+                                    logWarn("SASL NAK'd by %s (server does not offer sasl) — proceeding without SASL",
+                                        config.host);
+                                    saslDone = true;
+                                }
                                 if (saslDone && !capEndSent) {
                                     sendRaw("CAP END");
                                     capEndSent = true;
