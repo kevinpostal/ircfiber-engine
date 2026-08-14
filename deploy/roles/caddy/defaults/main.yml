@@ -33,7 +33,7 @@ caddy_tunnel_port: 8080
 # default to avoid adding an extra listener when logs aren't deployed.
 caddy_tailscale_logging_enabled: false
 # Tailscale IP of the host. Override per host in host_vars/.
-caddy_tailscale_logging_address: "100.126.197.92"
+caddy_tailscale_logging_address: "198.51.100.1"
 # Port the Tailscale-only Grafana listener binds to on the Tailscale
 # interface. Default 3443 keeps it distinct from the main Caddy listener
 # on 443 and Tailscale's admin UI on 8443.

@@ -20,7 +20,7 @@ signoz_mcp_cpus: 0.25
 # Host port for the MCP endpoint. Bound to the Tailscale IP so
 # the service is reachable only via the tailnet. Override per
 # host in inventories/production/host_vars/<hostname>.yml.
-signoz_mcp_bind_address: "{{ caddy_tailscale_logging_address | default('100.126.197.92') }}"
+signoz_mcp_bind_address: "{{ caddy_tailscale_logging_address | default('198.51.100.1') }}"
 signoz_mcp_port: 3004
 signoz_mcp_container_port: 8000
 

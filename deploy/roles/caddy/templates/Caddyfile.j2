@@ -254,7 +254,7 @@
 # SigNoz combined image serves the full application (SPA + API) on
 # port 8080. Proxy ALL paths at the root — the image internally routes
 # /api/v1/* to its query-service and /* to the React frontend.
-http://{{ caddy_tailscale_logging_address | default('100.126.197.92') }}:{{ caddy_tailscale_signoz_port | default(3003) }} {
+http://{{ caddy_tailscale_logging_address | default('198.51.100.1') }}:{{ caddy_tailscale_signoz_port | default(3003) }} {
     reverse_proxy signoz:8080 {
         header_up SIGNOZ-API-KEY "{$SIGNOZ_API_KEY}"
         transport http {

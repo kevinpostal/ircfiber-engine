@@ -28,7 +28,7 @@ DUB_PKG     := $(HOME)/.dub/packages
 
 # Dev backend selection for `make run` / `make start` / `make dev`.
 # Default is `tailnet` — points the Vite dev server at the tailnet
-# gateway (https://ircfiber-ovh-1.tail544547.ts.net). Override per-call:
+# gateway (https://vps-efb4b52d.tail544547.ts.net). Override per-call:
 #
 #   make run                      # tailnet (default)
 #   make run-tailnet              # explicit tailnet
@@ -38,10 +38,10 @@ DUB_PKG     := $(HOME)/.dub/packages
 #
 # For the D backend runner (the previous `make run`), use `make run-gateway`.
 BACKEND ?= local
-VITE_BACKEND_URL ?= https://ircfiber-ovh-1.tail544547.ts.net
+VITE_BACKEND_URL ?= https://vps-efb4b52d.tail544547.ts.net
 
 ifeq ($(BACKEND),tailnet)
-  EFFECTIVE_BACKEND_URL := https://ircfiber-ovh-1.tail544547.ts.net
+  EFFECTIVE_BACKEND_URL := https://vps-efb4b52d.tail544547.ts.net
 else ifeq ($(BACKEND),local)
   EFFECTIVE_BACKEND_URL := http://127.0.0.1:8090
 else
@@ -185,8 +185,8 @@ AR := →
 #   make debug-live IRCFIBER_SERVER_ID=mybox   (set a unique engine id)
 # ──────────────────────────────────────────────────────────────────────────
 # Tailnet connection settings (used by debug-live)
-TAILNET_MONGO_URL ?= mongodb://ircfiber:jqgwEv3GJwwizulaj3Fnbd8imqcMH4Gh@100.126.197.92:27017/ircfiber
-TAILNET_REDIS_URL ?= redis://100.126.197.92:6379/0
+TAILNET_MONGO_URL ?= mongodb://ircfiber:jqgwEv3GJwwizulaj3Fnbd8imqcMH4Gh@198.51.100.1:27017/ircfiber
+TAILNET_REDIS_URL ?= redis://198.51.100.1:6379/0
 
 # Local docker connection settings (used by debug)
 LOCAL_MONGO_URL ?= mongodb://127.0.0.1:27017/ircfiber
@@ -216,6 +216,12 @@ CRASH_DIR           := $(HOME)/.ircfiber/crashes/
 
 # Frontend-only dev (Vite). Pairs with `debug` or `debug-live` for a gateway.
 dev: frontend-install ## Component > Frontend dev (Vite HMR) — pairs with `make debug*` for backend
+	@if lsof -ti :5173 -sTCP:LISTEN >/dev/null 2>&1; then \
+		vites=$$(lsof -ti :5173 -sTCP:LISTEN 2>/dev/null); \
+		printf '%b\n' "$(Y)$(WR) Killing existing Vite on :5173 (pid $$vites)$(R)"; \
+		kill $$vites 2>/dev/null || true; sleep 1; \
+		if lsof -ti :5173 -sTCP:LISTEN >/dev/null 2>&1; then kill -9 $$(lsof -ti :5173 -sTCP:LISTEN 2>/dev/null) 2>/dev/null || true; sleep 1; fi; \
+	fi
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Frontend dev (Vite)  $(R)"
 	@printf '%b\n' "$(D)Backend: $(BACKEND)  →  $(EFFECTIVE_BACKEND_URL)$(R)"
 	@printf '%b\n' "$(D)Open http://localhost:5173 when ready$(R)"

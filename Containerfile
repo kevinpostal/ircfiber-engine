@@ -226,7 +226,6 @@ WORKDIR /build
 COPY frontend/package.json frontend/package-lock.json frontend/bun.lock* frontend/tsconfig.json frontend/svelte.config.js frontend/vite.config.ts frontend/index.html frontend/inject-manifest.js ./frontend/
 COPY frontend/src ./frontend/src/
 COPY frontend/wasm-img2irc ./frontend/wasm-img2irc/
-COPY frontend/public ./frontend/public/
 COPY public/ ./public/
 COPY backend/views/ ./backend/views/
 RUN cd frontend && npm ci --ignore-scripts 2>&1 | tail -5 && npm run build 2>&1 | tail -20 && node inject-manifest.js 2>&1 | tail -5 && ls -lh ../public/dist/assets/ 2>&1 | tail -5
