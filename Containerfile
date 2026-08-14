@@ -221,6 +221,10 @@ RUN test -f ./irc-fiber && \
 # `public/dist` is a normal ext4 directory.
 # ============================================================================
 FROM node:20-bookworm AS frontend-builder
+ARG CACHE_BUST=fixed
+COPY <<EOF ./frontend/.cache_bust_$CACHE_BUST
+bust=$CACHE_BUST
+EOF
 WORKDIR /build
 # Leverage Docker layer cache: copy package files first, then npm ci
 COPY frontend/package.json frontend/package-lock.json frontend/bun.lock* frontend/tsconfig.json frontend/svelte.config.js frontend/vite.config.ts frontend/index.html frontend/inject-manifest.js ./frontend/

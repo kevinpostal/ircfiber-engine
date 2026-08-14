@@ -462,7 +462,6 @@ final class BufferManager {
         if (msgid.length > 0) {
             // Preferred path: msgid is globally unique per IRC server.
             key = "m:" ~ msgid;
-        } else {
             // Fallback for numeric replies and other messages without
             // msgid. Hash (command, channel, sorted params, timestamp).
             // Sorting params keeps e.g. 353 (NAMES) from a different
@@ -476,10 +475,22 @@ final class BufferManager {
             // same-text PRIVMSGs (e.g. spamming "a") that share a
             // second-precision timestamp don't collide — each label is a
             // unique UUID and makes the hash distinct.
+            // BUGFIX: include nick + text so two PRIVMSGs to the same
+            // channel in the same second from different nicks (e.g.
+            // !wordle → pyylmao reply <200ms) don't hash-collide via
+            // second-precision timestamp and get dropped as dupes. The
+            // previous hash was command|channel|timestamp|params only,
+            // so "PRIVMSG|#tclmafia|177...000|#tclmafia" was identical
+            // for both messages despite different nicks/text. Until refresh
+            // the WS live path was deduped, but REST/Mongo fallback
+            // re-surfaced it.
             auto phaseKey = event.getTag("phase");
             auto labelKey = event.getTag("label");
             string hashInput = event.command ~ "|" ~ phaseKey;
             if (labelKey.length > 0) hashInput ~= "|" ~ labelKey;
+            // Include nick + text to distinguish distinct PRIVMSGs that
+            // share channel/params/timestamp (fast bot replies).
+            hashInput ~= "|" ~ event.nick ~ "|" ~ event.text;
             key = "h:" ~ contentHash(hashInput, channel, event.timestampMs, params);
         }
         auto db = redis.getDb();

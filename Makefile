@@ -1720,7 +1720,7 @@ deploy: update-full ## Deploy > Alias for update-full
 # docker build --target runtime-gateway on host → ansible gateway role
 # recreates ircfiber-gateway with correct env (Tailscale IP, networks).
 # Engine (ircfiber-engine-ovh) is NOT restarted — IRC connections stay up.
-update-gateway: version ## Deploy > Build frontend + rebuild gateway image + recreate gateway (engine untouched, persistent)
+update-gateway: version frontend-build ## Deploy > Build frontend + rebuild gateway image + recreate gateway (engine untouched, persistent)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Gateway-only deploy → $(_target)  $(R)"
 	@printf '%b\n' "$(D)  1/4 Syncing frontend + gateway D source to /opt/ircfiber-src on host$(R)"
 	@rsync -avz --delete --exclude=node_modules --exclude=.vite --exclude=dist --exclude=.turbo -e "ssh -o StrictHostKeyChecking=no" frontend/ deploy@$(_target_ssh):/opt/ircfiber-src/frontend/ 2>&1 | tail -5
@@ -1728,10 +1728,11 @@ update-gateway: version ## Deploy > Build frontend + rebuild gateway image + rec
 	@rsync -avz --delete -e "ssh -o StrictHostKeyChecking=no" backend/ deploy@$(_target_ssh):/opt/ircfiber-src/backend/ 2>&1 | tail -5
 	@rsync -avz --delete -e "ssh -o StrictHostKeyChecking=no" common/ deploy@$(_target_ssh):/opt/ircfiber-src/common/ 2>&1 | tail -5
 	@rsync -avz -e "ssh -o StrictHostKeyChecking=no" Containerfile deploy@$(_target_ssh):/opt/ircfiber-src/Containerfile 2>&1 | tail -5
+	@rsync -avz -e "ssh -o StrictHostKeyChecking=no" .dockerignore deploy@$(_target_ssh):/opt/ircfiber-src/.dockerignore 2>&1 | tail -5
 	@rsync -avz --delete -e "ssh -o StrictHostKeyChecking=no" config/ deploy@$(_target_ssh):/opt/ircfiber-src/config/ 2>&1 | tail -5
 	@printf '%b\n' "$(D)  2/4 Building runtime-gateway image on host (BuildKit, ~2-3m first time, cached after)$(R)"
 	@ssh deploy@$(_target_ssh) 'cd /opt/ircfiber-src && DOCKER_BUILDKIT=1 docker build --target runtime-gateway --build-arg CACHE_BUST=$(date +%s) -t kevindpostal/irc-fiber-gateway:0.3.0 -f Containerfile . 2>&1 | tail -20'
-	@ssh deploy@$(_target_ssh) 'docker tag kevindpostal/irc-fiber-gateway:0.3.0 kevindpostal/irc-fiber-gateway:0.3.1 2>/dev/null || true'
+	@ssh deploy@$(_target_ssh) 'docker tag kevindpostal/irc-fiber-gateway:0.3.0 kevindpostal/irc-fiber-gateway:0.3.1 2>/dev/null || true; docker tag kevindpostal/irc-fiber-gateway:0.3.0 irc-fiber-gateway:latest 2>/dev/null || true; docker tag kevindpostal/irc-fiber-gateway:0.3.0 irc-fiber-gateway:0.3.0 2>/dev/null || true'
 	@printf '%b\n' "$(D)  3/4 Recreating gateway container via Ansible (correct env, networks)$(R)"
 	@cd deploy && ansible-playbook -l $(_target) $(_vault_arg) playbooks/gateway.yml 2>&1 | tail -20
 	@printf '%b\n' "$(D)  4/4 Verifying gateway health + engine untouched$(R)"
@@ -1791,9 +1792,11 @@ gateway-fix-assets: version frontend-build ## Deploy > Fix live css/js 404 — r
 		printf '%b\n' "$(D)  Host old: $${OLD_JS:-none} / $${OLD_CSS:-none} → local new: $$NEW_JS / $$NEW_CSS  (engine PID before: $$ENGINE_PID_BEFORE)$(R)"
 	@printf '%b\n' "$(D)  1/4 Syncing public + backend + common + Containerfile + config to /opt/ircfiber-src$(R)"
 	@tar cz --no-xattrs --format=ustar -C public dist 2>&1 | ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no deploy@$(_target_ssh) 'sudo sh -c "rm -rf /opt/ircfiber-src/public/dist && mkdir -p /opt/ircfiber-src/public && tar xzf - -C /opt/ircfiber-src/public && echo public-synced"' 2>&1 | tail -5
+	@rsync -avz --delete --exclude=node_modules --exclude=.vite --exclude=dist --exclude=.turbo -e "ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no" frontend/ deploy@$(_target_ssh):/opt/ircfiber-src/frontend/ 2>&1 | tail -5
 	@rsync -avz --delete -e "ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no" backend/ deploy@$(_target_ssh):/opt/ircfiber-src/backend/ 2>&1 | tail -5
 	@rsync -avz --delete -e "ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no" common/ deploy@$(_target_ssh):/opt/ircfiber-src/common/ 2>&1 | tail -5
 	@rsync -avz -e "ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no" Containerfile deploy@$(_target_ssh):/opt/ircfiber-src/Containerfile 2>&1 | tail -5
+	@rsync -avz -e "ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no" .dockerignore deploy@$(_target_ssh):/opt/ircfiber-src/.dockerignore 2>&1 | tail -5
 	@rsync -avz --delete -e "ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no" config/ deploy@$(_target_ssh):/opt/ircfiber-src/config/ 2>&1 | tail -5
 	@NEW_JS=$$(cat /tmp/ircfiber-fix-new-js); NEW_CSS=$$(cat /tmp/ircfiber-fix-new-css); \
 		ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no deploy@$(_target_ssh) "grep -oE 'main-[A-Za-z0-9._-]+\.js' /opt/ircfiber-src/backend/views/index.dt | head -1 | grep -q \"$$NEW_JS\" && grep -oE 'main-[A-Za-z0-9._-]+\.css' /opt/ircfiber-src/backend/views/index.dt | head -1 | grep -q \"$$NEW_CSS\" || (echo \"host index.dt mismatch after rsync\"; exit 1)" && \
@@ -1801,7 +1804,7 @@ gateway-fix-assets: version frontend-build ## Deploy > Fix live css/js 404 — r
 		printf '%b\n' "$(BG)$(OK) Host synced and coherent: $$NEW_JS / $$NEW_CSS$(R)"
 	@printf '%b\n' "$(D)  2/4 Building runtime-gateway image on host (BuildKit, ~2-3m first time, cached after)$(R)"
 	@ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no deploy@$(_target_ssh) 'cd /opt/ircfiber-src && DOCKER_BUILDKIT=1 docker build --target runtime-gateway --build-arg CACHE_BUST=$$(date +%s) -t kevindpostal/irc-fiber-gateway:0.3.0 -f Containerfile . 2>&1 | tail -20'
-	@ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no deploy@$(_target_ssh) 'docker tag kevindpostal/irc-fiber-gateway:0.3.0 kevindpostal/irc-fiber-gateway:0.3.1 2>/dev/null || true'
+	@ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no deploy@$(_target_ssh) 'docker tag kevindpostal/irc-fiber-gateway:0.3.0 kevindpostal/irc-fiber-gateway:0.3.1 2>/dev/null || true; docker tag kevindpostal/irc-fiber-gateway:0.3.0 irc-fiber-gateway:latest 2>/dev/null || true; docker tag kevindpostal/irc-fiber-gateway:0.3.0 irc-fiber-gateway:0.3.0 2>/dev/null || true'
 	@printf '%b\n' "$(D)  3/4 Recreating gateway container (engine untouched)$(R)"
 	@if cd deploy 2>/dev/null && [ -f inventories/production/hosts.ini ] && ansible-playbook --version >/dev/null 2>&1; then \
 			printf '%b\n' "$(D)  → via Ansible gateway role (correct env, networks)$(R)"; \

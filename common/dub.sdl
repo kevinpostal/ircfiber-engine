@@ -22,8 +22,17 @@ dependency "unit-threaded" version="~>2.2.0"
 configuration "library" {
     targetType "library"
 }
-
 configuration "unittest" {
     targetType "library"
+    versions "VibeUseFibers"
+    sourcePaths "source" "tests"
+    importPaths "source" "tests"
+}
+
+configuration "buffer-dedup-test" {
+    targetType "executable"
+    sourcePaths "tests" "source"
+    importPaths "source" "tests"
+    mainSourceFile "tests/buffer_dedup_test.d"
     versions "VibeUseFibers"
 }

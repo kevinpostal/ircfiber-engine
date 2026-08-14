@@ -4488,7 +4488,10 @@ private void processEvents() {
                 return st.toUnixTime!long * 1000 + st.fracSecs.total!"msecs";
             } catch (Exception) {}
         }
-        return Clock.currTime.toUnixTime!long * 1000;
+        // Use ms-precision wall clock, not second-precision (toUnixTime*1000
+        // truncates ms and makes two PRIVMSGs in the same second hash-collide
+        // in BufferManager's dedup fallback). See buffer.d hasDedupKey fix.
+        return (Clock.currTime - SysTime.fromUnixTime(0)).total!"msecs";
     }
 
     // ── Outbound queue ────────────────────────────────────────────────────────
