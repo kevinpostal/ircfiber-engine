@@ -96,6 +96,20 @@ private enum TLS_RETRY_SENTINEL = "was unsuccessful with ret 0";
  */
 TLSReadOutcome classifyTLSReadError(string exceptionMsg, bool dataAvailableForRead) nothrow @safe {
     try {
+        // SSL_ERROR_WANT_READ. vibe.d formats this as
+        //   "Reading from TLS stream returned an error: Need to block for read"
+        // (vibe-stream openssl.d checkSSLRet: enforce(ret >= 0, ...) with
+        // processSSLError(SSL_ERROR_WANT_READ) == "Need to block for read").
+        // This is the NORMAL non-blocking-TLS "no data yet" state: the
+        // underlying socket has no complete TLS record ready. It is NEVER
+        // fatal - the caller should yield and retry (the peer will either
+        // send the record or close, which surfaces as the "ret 0" case
+        // below). Treating it as fatal tore down perfectly healthy
+        // connections whenever a server spread its registration burst
+        // (CAP LS + PING + ACK + 001 + MOTD) across multiple TLS records -
+        // the exact BLCKND outage of 2026-08-12.
+        if (exceptionMsg.canFind("Need to block for read"))
+            return TLSReadOutcome.retry;
         // vibe-stream 1.3.0 openssl.d:548
         //     enforce(ret != 0, format("%s was unsuccessful with ret 0", what));
         // where `what` is "Reading from TLS stream" or "Writing from TLS stream".
@@ -204,6 +218,29 @@ unittest {
         /* dataAvailableForRead */ false);
     assert(outcome == TLSReadOutcome.fatal,
         "real SSL error must be fatal, got " ~ outcome.to!string);
+}
+
+// Regression: 2026-08-12 BLCKND outage. SSL_ERROR_WANT_READ surfaces from
+// vibe.d as "...returned an error: Need to block for read". This is the
+// NORMAL non-blocking-TLS "no data yet" state and must be retry, never
+// fatal — before the fix the engine tore down connections whenever a
+// server spread its registration burst across multiple TLS records.
+@("classifyTLSReadError: WANT_READ (Need to block for read) → retry")
+unittest {
+    const outcome = classifyTLSReadError(
+        "Reading from TLS stream returned an error: Need to block for read",
+        /* dataAvailableForRead */ false);
+    assert(outcome == TLSReadOutcome.retry,
+        "SSL_ERROR_WANT_READ must be retry, got " ~ outcome.to!string);
+}
+
+@("classifyTLSReadError: WANT_READ even with data pending → retry")
+unittest {
+    const outcome = classifyTLSReadError(
+        "Reading from TLS stream returned an error: Need to block for read",
+        /* dataAvailableForRead */ true);
+    assert(outcome == TLSReadOutcome.retry,
+        "SSL_ERROR_WANT_READ with pending data must be retry, got " ~ outcome.to!string);
 }
 
 @("classifyTLSReadError: ret 0 + data pending → retry")

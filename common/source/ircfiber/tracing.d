@@ -201,11 +201,14 @@ void withSpan(string name, string[string] attrs, scope void delegate(ref Span) f
     if (!g_enabled) {
         // Pass-through when tracing disabled: no context push, no queue.
         Span s = Span(null);
-        try {
-            fn(s);
-        } catch (Exception e) {
-            // Swallow — tracing disabled means we don't record status.
-        }
+        // A span wrapper must never swallow exceptions from the wrapped
+        // code: withSpan is a transparent observability pass-through, and
+        // exceptions (registration timeouts, TLS failures) belong to the
+        // caller. Before 2026-08-14 this caught-and-ignored, so a failed
+        // IRC registration was reported as "registration complete" and the
+        // engine flipped to connected on a dead socket, then disconnected
+        // and reconnected forever (the BLCKND outage).
+        fn(s);
         return;
     }
     if (!queueMutex) initOnce();
@@ -225,6 +228,7 @@ void withSpan(string name, string[string] attrs, scope void delegate(ref Span) f
     span.startUnixNano = nowUnixNanos();
     span.attributes = attrs.dup;
     span.statusCode = 0;
+    Exception caught;
     Span s = Span(&span);
     try {
         fn(s);
@@ -232,12 +236,16 @@ void withSpan(string name, string[string] attrs, scope void delegate(ref Span) f
     } catch (Exception e) {
         span.statusCode = 2;
         span.statusMessage = e.msg;
+        caught = e;
     }
     span.endUnixNano = nowUnixNanos();
 
     synchronized (queueMutex) {
         queue ~= span;
     }
+
+    // Record the failure on the span, then rethrow so the caller sees it.
+    if (caught !is null) throw caught;
 }
 
 /// Wipe the current fiber's span context back to empty. Call this

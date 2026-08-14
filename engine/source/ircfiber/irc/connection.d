@@ -4672,7 +4672,24 @@ private void processEvents() {
     }
 
     private size_t readFromStream(ubyte[] buffer, Duration timeout = 0.seconds) {
-        if (tlsStream !is null) return safeTLSRead(tlsStream, buffer);
+        if (tlsStream !is null) {
+            // TLS path: safeTLSRead has no timeout of its own (it is a
+            // thin wrapper over SSL_read), so gate on the underlying
+            // socket's waitForData with the caller's timeout first. This
+            // keeps the registration read loop paced at
+            // REGISTRATION_READ_TIMEOUT_MS even when the peer is silent —
+            // without it a read could block indefinitely and the
+            // registration timeout / 400-read cap never fire (regression
+            // from the BLCKND outage: the loop stalled in a blocked read
+            // while safeTLSRead's WANT_READ handling was broken).
+            if (timeout > 0.seconds) {
+                if (tlsStream.leastSize == 0) {
+                    if (!connection.waitForData(timeout))
+                        return 0;
+                }
+            }
+            return safeTLSRead(tlsStream, buffer);
+        }
         if (adoptedSocket !is null) return adoptedSocket.read(buffer);
         // Plain TCP: gate on waitForData() with a (potentially zero) timeout.
         // Calling connection.read(IOMode.once) with no data available causes
