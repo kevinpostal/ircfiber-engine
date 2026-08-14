@@ -462,6 +462,7 @@ final class BufferManager {
         if (msgid.length > 0) {
             // Preferred path: msgid is globally unique per IRC server.
             key = "m:" ~ msgid;
+        } else {
             // Fallback for numeric replies and other messages without
             // msgid. Hash (command, channel, sorted params, timestamp).
             // Sorting params keeps e.g. 353 (NAMES) from a different

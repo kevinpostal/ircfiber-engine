@@ -34,8 +34,8 @@ server:
         cidr-len-ipv4: 32
         cidr-len-ipv6: 64
         exempted:
+            - "172.30.0.0/16"
             - "localhost"
-
     motd: "{{ ircd_data_mount }}/motd"
     motd-formatting: true
     proxy-allowed-from:
@@ -51,7 +51,7 @@ accounts:
         enabled: {{ ircd_allow_registration | lower }}
         allow-before-connect: true
         throttling:
-            enabled: true
+            enabled: false
             duration: 10m
             max-attempts: 30
         bcrypt-cost: 4
@@ -60,13 +60,13 @@ accounts:
             enabled: false
             sender: "{{ ircd_admins[0].email if ircd_admins | length > 0 else 'admin@ircfiber.com' }}"
     login-throttling:
-        enabled: true
+        enabled: false
         duration: 1m
-        max-attempts: 3
     login-via-pass-command: true
     require-sasl:
         enabled: {{ ircd_require_sasl | lower }}
         exempted:
+            - "172.30.0.0/16"
             - "localhost"
     nick-reservation:
         enabled: true
@@ -158,7 +158,7 @@ debug:
     recover-from-errors: true
 
 fakelag:
-    enabled: true
+    enabled: false
     window: 1s
     burst-limit: 5
     messages-per-window: 2
