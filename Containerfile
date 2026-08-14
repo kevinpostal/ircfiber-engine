@@ -212,6 +212,26 @@ RUN test -f ./irc-fiber && \
     test -f ./janitor-migrate
 
 # ============================================================================
+# Stage: frontend-builder — vite build on server (avoids iCloud Mobile Documents hang)
+# The local `make frontend-build` does `vite build` on the Mac, which hangs
+# when the repo lives inside `~/Library/Mobile Documents` (bird sync).
+# Building the frontend inside the container avoids iCloud entirely:
+# the build context is sent via `rsync` to `/opt/ircfiber-src` and then
+# `docker build` runs `vite build` inside the Linux container where
+# `public/dist` is a normal ext4 directory.
+# ============================================================================
+FROM node:20-bookworm AS frontend-builder
+WORKDIR /build
+# Leverage Docker layer cache: copy package files first, then npm ci
+COPY frontend/package.json frontend/package-lock.json frontend/bun.lock* frontend/tsconfig.json frontend/svelte.config.js frontend/vite.config.ts frontend/index.html frontend/inject-manifest.js ./frontend/
+COPY frontend/src ./frontend/src/
+COPY frontend/wasm-img2irc ./frontend/wasm-img2irc/
+COPY frontend/public ./frontend/public/
+COPY public/ ./public/
+COPY backend/views/ ./backend/views/
+RUN cd frontend && npm ci --ignore-scripts 2>&1 | tail -5 && npm run build 2>&1 | tail -20 && node inject-manifest.js 2>&1 | tail -5 && ls -lh ../public/dist/assets/ 2>&1 | tail -5
+
+# ============================================================================
 # Stage: runtime — slim Ubuntu + all binaries (legacy combined image)
 # ============================================================================
 FROM ubuntu:22.04 AS runtime
@@ -291,9 +311,9 @@ WORKDIR /app
 COPY --from=builder-backend /build/irc-fiber-gateway /app/irc-fiber-gateway
 COPY --from=builder-backend /build/irc-fiber /app/irc-fiber
 COPY --from=builder-backend /build/views                 /app/views
+COPY --from=frontend-builder /build/public ./public/
+COPY --from=frontend-builder /build/backend/views ./views/
 COPY config/ ./config/
-COPY public/ ./public/
-
 # Data dirs.
 RUN mkdir -p /app/data /app/uploads && \
     if [ -f /app/irc-fiber-gateway ] && [ ! -f /app/irc-fiber ]; then \
