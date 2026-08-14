@@ -4209,7 +4209,7 @@ private void processEvents() {
             // ── Channel mode (ban/quiet/op/voice/etc.) ───────────────────────
             case "MODE":
                 auto mp = event.getParams();
-                if (mp.length > 0 && (mp[0].startsWith("#") || mp[0].startsWith("&"))) {
+                if (mp.length > 0 && (mp[0].startsWith("#") || mp[0].startsWith("&") || mp[0].startsWith("!") || mp[0].startsWith("+"))) {
                     event.channel = mp[0];
                     // Sync channelUsers with MODE changes so periodic
                     // snapshots preserve the correct prefixes. Without this,
@@ -4242,9 +4242,11 @@ private void processEvents() {
                             if (ch == 'q' || ch == 'a' || ch == 'o' || ch == 'O' || ch == 'h' || ch == 'v') {
                                 if (targetIdx >= mp.length) break;
                                 const targetNick = mp[targetIdx++];
-                                    if (auto members = chan in channelUsers) {
+                                bool found = false;
+                                if (auto members = chan in channelUsers) {
                                     foreach (i, ref u; *members) {
                                         if (stripNickPrefix(u) == targetNick) {
+                                            found = true;
                                             if (adding) {
                                                 char newPrefix;
                                                 switch (ch) {
@@ -4273,6 +4275,36 @@ private void processEvents() {
                                             break;
                                         }
                                     }
+                                    if (!found && adding) {
+                                        char newPrefix;
+                                        switch (ch) {
+                                            case 'q': newPrefix = '~'; break;
+                                            case 'a': newPrefix = '&'; break;
+                                            case 'o': newPrefix = '@'; break;
+                                            case 'O': newPrefix = '@'; break;
+                                            case 'h': newPrefix = '%'; break;
+                                            case 'v': newPrefix = '+'; break;
+                                            default: break;
+                                        }
+                                        if (newPrefix) {
+                                            *members ~= newPrefix ~ targetNick;
+                                        } else {
+                                            *members ~= targetNick;
+                                        }
+                                    }
+                                } else if (adding) {
+                                    char newPrefix;
+                                    switch (ch) {
+                                        case 'q': newPrefix = '~'; break;
+                                        case 'a': newPrefix = '&'; break;
+                                        case 'o': newPrefix = '@'; break;
+                                        case 'O': newPrefix = '@'; break;
+                                        case 'h': newPrefix = '%'; break;
+                                        case 'v': newPrefix = '+'; break;
+                                        default: break;
+                                    }
+                                    string newUser = newPrefix ? newPrefix ~ targetNick : targetNick;
+                                    channelUsers[chan] = [newUser];
                                 }
                             }
                         }
