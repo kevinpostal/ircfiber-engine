@@ -58,9 +58,9 @@ final class NetworkRepository {
         try {
             NetworkConfig[] result;
             foreach (doc; collection.find(["userId": userId.toString()])) {
-                result ~= docToConfig(doc);
+                try { result ~= docToConfig(doc); }
+                catch (Exception e) { logWarn("NetworkRepository.findByUserId: skipping broken doc %s: %s", doc["id"].toString(), e.msg); }
             }
-            mongoRecordSuccess();
 
             // Cache in Redis (60s TTL) so frequent reads don't hammer Mongo.
             // The cache is invalidated on every create/update/delete of a network.
@@ -79,7 +79,11 @@ final class NetworkRepository {
     NetworkWithUser[] findAll() {
         NetworkWithUser[] result;
         foreach (doc; collection.find()) {
-            result ~= NetworkWithUser(docToConfig(doc), parseUUID(doc["userId"].get!string));
+            try {
+                result ~= NetworkWithUser(docToConfig(doc), parseUUID(doc["userId"].get!string));
+            } catch (Exception e) {
+                logWarn("NetworkRepository.findAll: skipping broken doc %s: %s", doc["id"].toString(), e.msg);
+            }
         }
         return result;
     }
@@ -202,29 +206,29 @@ final class NetworkRepository {
 
     private NetworkConfig docToConfig(const(Bson) doc) {
         NetworkConfig cfg;
-        cfg.id = parseUUID(doc["id"].get!string);
-        cfg.name = doc["name"].get!string;
-        cfg.host = doc["host"].get!string;
-        cfg.port = cast(ushort)doc["port"].get!int;
-        cfg.tls = doc["tls"].get!string.to!TLSMode;
-        cfg.sasl = doc["sasl"].get!string.to!SASLMechanism;
-        cfg.saslUsername = doc["saslUsername"].get!string;
-        cfg.saslPassword = doc["saslPassword"].get!string;
-        cfg.autoJoinChannels = deserializeBson!(string[])(doc["autoJoinChannels"]);
+        try { cfg.id = parseUUID(doc["id"].get!string); } catch (Exception) {}
+        try { cfg.name = doc["name"].get!string; } catch (Exception) {}
+        try { cfg.host = doc["host"].get!string; } catch (Exception) {}
+        try { cfg.port = cast(ushort)doc["port"].get!int; } catch (Exception) {}
+        try { cfg.tls = doc["tls"].get!string.to!TLSMode; } catch (Exception) {}
+        try { cfg.sasl = doc["sasl"].get!string.to!SASLMechanism; } catch (Exception) {}
+        try { cfg.saslUsername = doc["saslUsername"].get!string; } catch (Exception) {}
+        try { cfg.saslPassword = doc["saslPassword"].get!string; } catch (Exception) {}
+        try { cfg.autoJoinChannels = deserializeBson!(string[])(doc["autoJoinChannels"]); } catch (Exception) {}
         if (doc["partedChannels"].type == Bson.Type.array)
-            cfg.partedChannels = deserializeBson!(string[])(doc["partedChannels"]);
-        cfg.nick = doc["nick"].get!string;
-        cfg.realName = doc["realName"].get!string;
+            try { cfg.partedChannels = deserializeBson!(string[])(doc["partedChannels"]); } catch (Exception) {}
+        try { cfg.nick = doc["nick"].get!string; } catch (Exception) {}
+        try { cfg.realName = doc["realName"].get!string; } catch (Exception) {}
         try { cfg.disabled = doc["disabled"].get!bool; } catch (Exception) {}
-        // systemManaged is optional in older records (added July 2026).
-        // Default to false for backwards compatibility with existing networks.
         try { cfg.systemManaged = doc["systemManaged"].get!bool; } catch (Exception) {}
-        // autoJoinDelaySeconds optional — 0 (join immediately) when absent.
         try {
             const v = doc["autoJoinDelaySeconds"].get!int;
             if (v > 0) cfg.autoJoinDelaySeconds = cast(uint) v;
         } catch (Exception) {}
         try { cfg.egressNodeId = doc["egressNodeId"].get!string; } catch (Exception) {}
+        try { cfg.nspass = doc["nspass"].get!string; } catch (Exception) {}
+        try { cfg.commands = doc["commands"].get!string; } catch (Exception) {}
+        try { cfg.serverPass = doc["serverPass"].get!string; } catch (Exception) {}
         return cfg;
     }
 }
