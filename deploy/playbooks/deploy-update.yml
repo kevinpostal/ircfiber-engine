@@ -62,7 +62,9 @@
         delete: true
         owner: false
         group: false
+        times: false
         rsync_opts:
+          - "--omit-dir-times"
           - "--exclude=.git"
           - "--exclude=node_modules"
           - "--exclude=.dub"
@@ -74,14 +76,14 @@
           - "--exclude=.playwright-mcp"
           - "--exclude=test-results"
           - "--exclude=e2e/test-results"
+          - "--exclude=e2e/e2e"
           - "--exclude=*.log"
           - "--exclude=.worktrees"
           - "--exclude=.nosync"
           - "--exclude=.DS_Store"
           - "--exclude=*\\ 2.html"
           - "--exclude=*\\ 2.*"
-    # ── BuildKit build (incremental via cache mounts) ─────────────────
-    # BuildKit retains the --mount=type=cache across builds as long as
+      failed_when: false
     # the BuildKit daemon is alive. Dub's .dub/ directory lives in this
     # cache mount, so packages + .o files survive container rm.
     #
