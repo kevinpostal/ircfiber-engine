@@ -147,16 +147,20 @@
     # Blue/green: ircfiber-gateway (blue) + ircfiber-gateway-green with
     # active health checks. Either can be absent — health check marks it
     # down and Caddy routes to the healthy one, so `docker rm` is zero-downtime.
+    # Tuned for fast failover: 5s interval + 2 fails = max 10s to mark dead,
+    # lb_try_duration 10s ensures retries to healthy upstream during flap
+    # (rename window). Without this, `no upstreams available` 503 flaps for
+    # ~20s after `docker rename gateway-green gateway`.
     reverse_proxy {{ gateway_backend_host | default('ircfiber-gateway') }}:{{ gateway_backend_port | default(gateway_http_port) }} {{ gateway_backend_host | default('ircfiber-gateway') }}-green:{{ gateway_backend_port | default(gateway_http_port) }} {
         health_uri /health
-        health_interval 10s
-        health_timeout 5s
+        health_interval 5s
+        health_timeout 3s
         health_fails 2
         health_passes 1
-        lb_try_duration 5s
+        lb_try_duration 10s
         lb_try_interval 100ms
         transport http {
-            dial_timeout 30s
+            dial_timeout 5s
             response_header_timeout 60s
             read_timeout 24h
             write_timeout 24h

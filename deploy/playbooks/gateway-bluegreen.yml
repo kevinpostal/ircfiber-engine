@@ -136,6 +136,41 @@
           com.ircfiber.component: "gateway"
           com.ircfiber.version: "{{ ircfiber_version | default('unknown') }}"
 
+    - name: Reload Caddy to clear DNS cache and re-resolve gateway IP
+      ansible.builtin.shell: |
+        # After `docker rename green gateway`, Caddy's active health checker
+        # caches the old IP for `gateway` and marks both upstreams down for
+        # up to health_interval*health_fails (10s). Reload forces re-resolution
+        # and eliminates the 503 window seen 2026-08-15.
+        docker exec ircfiber-caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1 | head -n 20 || \
+        docker exec ircfiber-caddy caddy reload --config /etc/caddy/Caddyfile 2>&1 | head -n 20 || \
+        echo "caddy reload fallback: kill -USR1"
+        docker kill --signal=USR1 ircfiber-caddy 2>/dev/null || true
+      register: caddy_reload
+      failed_when: false
+      changed_when: false
+
+    - name: Brief pause for Caddy to re-probe upstreams
+      ansible.builtin.pause:
+        seconds: 3
+
+    - name: Verify Caddy proxy is serving gateway (no 503)
+      ansible.builtin.shell: |
+        for i in 1 2 3 4 5; do
+          if curl -fsS -H "Host: ircfiber.com" http://127.0.0.1:80/health >/dev/null 2>&1 || \
+             curl -kfsS --resolve ircfiber.com:443:127.0.0.1 https://ircfiber.com/health >/dev/null 2>&1; then
+            echo "caddy proxy ok"; exit 0;
+          fi
+          sleep 1
+        done
+        echo "caddy proxy failed - checking logs"; docker logs --tail 20 ircfiber-caddy 2>&1 | tail -n 20; exit 1
+      register: caddy_proxy_check
+      retries: 3
+      delay: 2
+      until: caddy_proxy_check.rc == 0
+      failed_when: false
+      changed_when: false
+
     - name: Verify gateway health (inside container)
       ansible.builtin.command: docker exec {{ gateway_container_name }} sh -c "curl -fsS http://127.0.0.1:{{ gateway_http_port }}/health"
       register: health_check
