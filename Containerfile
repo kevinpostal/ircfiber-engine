@@ -92,6 +92,10 @@ WORKDIR /build
 # to force a clean rebuild of the dub steps.
 # ============================================================================
 FROM base AS builder-common
+ARG GIT_HASH=unknown
+ARG GIT_SHORT=unknown
+ARG GIT_DESCRIBE=unknown
+ARG GIT_BRANCH=unknown
 
 # ── Build cache invalidation ─────────────────────────────────────────────
 # Same sentinel trick as before, but now one sentinel per package so editing
@@ -104,6 +108,28 @@ EOF
 
 COPY common/dub.sdl common/dub.selections.json ./common/
 COPY common/source/ ./common/source/
+
+# If GIT_HASH was passed via --build-arg (from deploy-update.yml's local git),
+# override the rsynced build_version.d so the binary embeds the correct version
+# even when .git was excluded from rsync or rsync's checksum was stale. This
+# is the safety net for the 6daa040 → caf2887 drift seen when times:false + no checksum
+# left build_version.d unchanged despite a new commit. The file size is identical
+# for different hashes, so size-only rsync would skip it.
+RUN if [ "$GIT_HASH" != "unknown" ] && [ "$GIT_HASH" != "" ]; then \
+      echo "builder-common: using GIT_HASH=$GIT_HASH GIT_SHORT=$GIT_SHORT"; \
+      mkdir -p common/source/ircfiber; \
+      printf 'module ircfiber.build_version;\n\n// Generated via Docker build-arg at %s\n// docker build --build-arg GIT_HASH=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$GIT_HASH" > common/source/ircfiber/build_version.d; \
+      printf 'enum GIT_HASH = "%s";\n' "$GIT_HASH" >> common/source/ircfiber/build_version.d; \
+      printf 'enum GIT_SHORT = "%s";\n' "${GIT_SHORT:-$GIT_HASH}" >> common/source/ircfiber/build_version.d; \
+      printf 'enum GIT_DESCRIBE = "%s";\n' "${GIT_DESCRIBE:-$GIT_SHORT}" >> common/source/ircfiber/build_version.d; \
+      printf 'enum GIT_BRANCH = "%s";\n' "${GIT_BRANCH:-unknown}" >> common/source/ircfiber/build_version.d; \
+      printf 'enum BUILD_TIME = "%s";\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> common/source/ircfiber/build_version.d; \
+      printf 'enum BUILD_HOST = "docker-builder";\n' >> common/source/ircfiber/build_version.d; \
+      printf 'enum VERSION = "0.3.0";\n' >> common/source/ircfiber/build_version.d; \
+      printf 'enum GIT_MESSAGE = "via build-arg";\n' >> common/source/ircfiber/build_version.d; \
+      printf 'enum GIT_COMMIT_URL = "https://github.com/kevinpostal/IRC_FIBER/commit/%s";\n' "$GIT_HASH" >> common/source/ircfiber/build_version.d; \
+      cat common/source/ircfiber/build_version.d; \
+    fi
 
 # When CACHE_BUST is non-default, nuke ALL caches dub/LDC might use:
 # - /build/.dub (dub's global cache)
@@ -222,6 +248,9 @@ RUN test -f ./irc-fiber && \
 # ============================================================================
 FROM node:20-bookworm AS frontend-builder
 ARG CACHE_BUST=fixed
+ARG GIT_HASH=unknown
+ARG GIT_SHORT=unknown
+ARG GIT_DESCRIBE=unknown
 COPY <<EOF ./frontend/.cache_bust_$CACHE_BUST
 bust=$CACHE_BUST
 EOF
@@ -232,6 +261,23 @@ COPY frontend/src ./frontend/src/
 COPY frontend/wasm-img2irc ./frontend/wasm-img2irc/
 COPY public/ ./public/
 COPY backend/views/ ./backend/views/
+RUN if [ "$GIT_HASH" != "unknown" ] && [ "$GIT_HASH" != "" ]; then \
+      echo "frontend-builder: using GIT_HASH=$GIT_HASH"; \
+      mkdir -p frontend/src/lib; \
+      printf '// Generated via Docker build-arg GIT_HASH=%s\n' "$GIT_HASH" > frontend/src/lib/buildInfo.ts; \
+      printf 'export const BUILD_INFO = {\n' >> frontend/src/lib/buildInfo.ts; \
+      printf '  commit: "%s",\n' "$GIT_HASH" >> frontend/src/lib/buildInfo.ts; \
+      printf '  short: "%s",\n' "${GIT_SHORT:-$GIT_HASH}" >> frontend/src/lib/buildInfo.ts; \
+      printf '  describe: "%s",\n' "${GIT_DESCRIBE:-$GIT_SHORT}" >> frontend/src/lib/buildInfo.ts; \
+      printf '  branch: "unknown",\n' >> frontend/src/lib/buildInfo.ts; \
+      printf '  builtAt: "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> frontend/src/lib/buildInfo.ts; \
+      printf '  builtHost: "docker-builder",\n' >> frontend/src/lib/buildInfo.ts; \
+      printf '  version: "0.3.0",\n' >> frontend/src/lib/buildInfo.ts; \
+      printf '  message: "via build-arg",\n' >> frontend/src/lib/buildInfo.ts; \
+      printf '  commitUrl: "https://github.com/kevinpostal/IRC_FIBER/commit/%s",\n' "$GIT_HASH" >> frontend/src/lib/buildInfo.ts; \
+      printf '} as const;\n' >> frontend/src/lib/buildInfo.ts; \
+      cat frontend/src/lib/buildInfo.ts; \
+    fi
 RUN cd frontend && npm ci --ignore-scripts 2>&1 | tail -5 && npm run build 2>&1 | tail -20 && node inject-manifest.js 2>&1 | tail -5 && ls -lh ../public/dist/assets/ 2>&1 | tail -5
 
 # ============================================================================

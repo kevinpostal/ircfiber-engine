@@ -62,7 +62,8 @@
         delete: true
         owner: false
         group: false
-        times: false
+        times: true
+        checksum: true
         rsync_opts:
           - "--omit-dir-times"
           - "--exclude=.git"
@@ -84,6 +85,30 @@
           - "--exclude=*\\ 2.html"
           - "--exclude=*\\ 2.*"
       failed_when: false
+    - name: Get local git hash for version (host)
+      delegate_to: localhost
+      become: false
+      ansible.builtin.command: git -C {{ playbook_dir }}/../../ rev-parse HEAD
+      register: _local_git_hash
+      changed_when: false
+      failed_when: false
+
+    - name: Get local git short for version
+      delegate_to: localhost
+      become: false
+      ansible.builtin.command: git -C {{ playbook_dir }}/../../ rev-parse --short HEAD
+      register: _local_git_short
+      changed_when: false
+      failed_when: false
+
+    - name: Get local git describe for version
+      delegate_to: localhost
+      become: false
+      ansible.builtin.command: git -C {{ playbook_dir }}/../../ describe --always --long
+      register: _local_git_describe
+      changed_when: false
+      failed_when: false
+
     # the BuildKit daemon is alive. Dub's .dub/ directory lives in this
     # cache mount, so packages + .o files survive container rm.
     #
@@ -96,6 +121,9 @@
           --target builder \
           --build-arg LDC_VERSION={{ ldc_version }} \
           --build-arg CACHE_BUST=$(date +%s) \
+          --build-arg GIT_HASH={{ _local_git_hash.stdout | default('unknown') }} \
+          --build-arg GIT_SHORT={{ _local_git_short.stdout | default('unknown') }} \
+          --build-arg GIT_DESCRIBE={{ _local_git_describe.stdout | default('unknown') }} \
           -t {{ builder_image }}:latest \
           -f {{ src_root }}/Containerfile \
           {{ src_root }} 2>&1
