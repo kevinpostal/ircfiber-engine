@@ -114,6 +114,15 @@ final class PastebinRepository {
         return PasteRecord.fromBson(doc);
     }
 
+    /// Public fetch by id regardless of owner (for shared viewer). Returns init if deleted/not found.
+    PasteRecord getByIdPublic(string id) @trusted {
+        auto doc = collection.findOne(Bson([
+            "_id": Bson(id), "deleted": Bson(false),
+        ]));
+        if (doc.isNull) return PasteRecord.init;
+        return PasteRecord.fromBson(doc);
+    }
+
     /// Updates name and syntax of the user's snippet. Returns false if not found/not theirs.
     bool updateMeta(string userId, string id, string name, string syntax) @trusted {
         auto res = collection.updateOne(
