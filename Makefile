@@ -1686,7 +1686,9 @@ update: version frontend-build build build-engine ## Deploy > Build frontend + g
 	@rsync -avz --checksum --delete -e "ssh -o StrictHostKeyChecking=no" common/ deploy@$(_target_ssh):/opt/ircfiber-src/common/ 2>&1 | tail -5
 	@ssh deploy@$(_target_ssh) 'cd /opt/ircfiber-src && DOCKER_BUILDKIT=1 docker build --target runtime-gateway --build-arg CACHE_BUST=$(date +%s) --build-arg GIT_HASH=$(shell git rev-parse HEAD) --build-arg GIT_SHORT=$(shell git rev-parse --short HEAD) --build-arg GIT_DESCRIBE=$(shell git describe --always --long 2>/dev/null || echo $(shell git rev-parse --short HEAD)) -t kevindpostal/irc-fiber-gateway:0.3.0 -f Containerfile . 2>&1 | tail -20'
 	@ssh deploy@$(_target_ssh) 'docker tag kevindpostal/irc-fiber-gateway:0.3.0 kevindpostal/irc-fiber-gateway:0.3.1 2>/dev/null || true; docker tag kevindpostal/irc-fiber-gateway:0.3.0 irc-fiber-gateway:latest 2>/dev/null || true'
-	@cd deploy && ansible-playbook -l $(_target) $(_vault_arg) playbooks/gateway.yml 2>&1 | tail -20
+	@printf '%b\n' "$(D)  Ensuring Caddy dual-upstream for blue/green$(R)"
+	@cd deploy && ansible-playbook -l $(_target) $(_vault_arg) playbooks/caddy.yml 2>&1 | tail -10
+	@cd deploy && ansible-playbook -l $(_target) $(_vault_arg) playbooks/gateway-bluegreen.yml 2>&1 | tail -30
 	# The playbook's rsync handles public/ + backend/views/ (dist/ included since
 	# the read-only mount on the container means docker cp writes silently
 	# fail). The shell-level push below is a belt-and-suspenders fallback
