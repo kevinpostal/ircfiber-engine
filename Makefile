@@ -1731,7 +1731,7 @@ deploy: update-full ## Deploy > Alias for update-full
 # Steps: frontend → rsync public/views to /opt/ircfiber-src on host →
 # docker build --target runtime-gateway on host → ansible gateway role
 # recreates ircfiber-gateway with correct env (Tailscale IP, networks).
-# Engine (ircfiber-engine-ovh) is NOT restarted — IRC connections stay up.
+update-gateway: version frontend-build ## Deploy > Build frontend + rebuild gateway image + recreate gateway (engine untouched, persistent)
 	@printf '%b\n' "$(D)  1/4 Syncing frontend + gateway D source to /opt/ircfiber-src on host$(R)"
 	@rsync -avz --checksum --delete --exclude=node_modules --exclude=.vite --exclude=".vite*" --exclude=dist --exclude=".turbo" --exclude="* 2" --exclude="* 2/**" -e "ssh -o StrictHostKeyChecking=no" frontend/ deploy@$(_target_ssh):/opt/ircfiber-src/frontend/ 2>&1 | tail -5
 	@rm -rf public/dist/.vite* 2>/dev/null; find public/dist -depth -name "* 2*" -exec rm -rf {} + 2>/dev/null || true
