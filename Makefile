@@ -1747,6 +1747,39 @@ update-gateway: version frontend-build ## Deploy > Build frontend + rebuild gate
 	@ssh deploy@$(_target_ssh) 'sleep 2; curl -fsS http://127.0.0.1:8090/health 2>&1 | head -c 200; echo ""; docker ps --format "{{.Names}} {{.Status}}" | grep -E "gateway|engine"'
 	@ssh -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no deploy@$(_target_ssh) "mkdir -p /opt/ircfiber /opt/ircfiber-src && echo $$(git rev-parse HEAD) > /opt/ircfiber/.frontend-deploy-hash && cp /opt/ircfiber/.frontend-deploy-hash /opt/ircfiber-src/.frontend-deploy-hash && echo $$(git rev-parse --short HEAD):$$(date +%Y%m%d-%H%M%S) > /opt/ircfiber/.deploy-hash && cp /opt/ircfiber/.deploy-hash /opt/ircfiber-src/.deploy-hash && cat /opt/ircfiber/.frontend-deploy-hash" 2>&1 | tail -5 || true
 	@printf '%b\n' "$(BG)$(OK) Gateway deployed (persistent) — engine not restarted$(R)"
+
+# ── Blue/green gateway deploy — zero-downtime (engine untouched) ─────────────
+# Same as update-gateway but with active health-checked dual upstream and
+# a green→blue swap. No 502 window:
+#   1. frontend-build + rsync + docker build (old gateway still serving)
+#   2. ansible caddy (dual upstream: gateway + gateway-green, health_uri /health)
+#   3. ansible gateway-bluegreen (start green, wait /health healthy, stop blue, rename green→gateway)
+#   4. verify health + engine PID unchanged
+# Usage:
+#   make update-gateway-bluegreen              # → vps-efb4b52d
+#   make update-gateway-bluegreen TARGET=foo   # → alternate host
+update-gateway-bluegreen: version frontend-build ## Deploy > Blue/green gateway (zero-downtime, engine untouched)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Blue/green gateway deploy → $(_target)  $(R)"
+	@printf '%b\n' "$(D)  1/5 Syncing frontend + gateway D source to /opt/ircfiber-src$(R)"
+	@rsync -avz --checksum --delete --exclude=node_modules --exclude=.vite --exclude=dist --exclude=.turbo -e "ssh -o StrictHostKeyChecking=no" frontend/ deploy@$(_target_ssh):/opt/ircfiber-src/frontend/ 2>&1 | tail -5
+	@tar cz --no-xattrs --format=ustar -C public dist 2>&1 | ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no deploy@$(_target_ssh) 'sudo sh -c "rm -rf /opt/ircfiber-src/public/dist && mkdir -p /opt/ircfiber-src/public && tar xzf - -C /opt/ircfiber-src/public && echo public-synced"' 2>&1 | tail -5
+	@rsync -avz --checksum --delete -e "ssh -o StrictHostKeyChecking=no" backend/ deploy@$(_target_ssh):/opt/ircfiber-src/backend/ 2>&1 | tail -5
+	@rsync -avz --checksum --delete -e "ssh -o StrictHostKeyChecking=no" common/ deploy@$(_target_ssh):/opt/ircfiber-src/common/ 2>&1 | tail -5
+	@rsync -avz -e "ssh -o StrictHostKeyChecking=no" Containerfile deploy@$(_target_ssh):/opt/ircfiber-src/Containerfile 2>&1 | tail -5
+	@rsync -avz -e "ssh -o StrictHostKeyChecking=no" .dockerignore deploy@$(_target_ssh):/opt/ircfiber-src/.dockerignore 2>&1 | tail -5
+	@rsync -avz --delete -e "ssh -o StrictHostKeyChecking=no" config/ deploy@$(_target_ssh):/opt/ircfiber-src/config/ 2>&1 | tail -5
+	@rsync -avz -e "ssh -o StrictHostKeyChecking=no" deploy/ deploy@$(_target_ssh):/opt/ircfiber-src/deploy/ 2>&1 | tail -5
+	@printf '%b\n' "$(D)  2/5 Building runtime-gateway image on host (old still serving)$(R)"
+	@ssh deploy@$(_target_ssh) 'cd /opt/ircfiber-src && DOCKER_BUILDKIT=1 docker build --target runtime-gateway --build-arg CACHE_BUST=$$(date +%s) --build-arg GIT_HASH=$$(git rev-parse HEAD 2>/dev/null || echo unknown) --build-arg GIT_SHORT=$$(git rev-parse --short HEAD 2>/dev/null || echo unknown) -t kevindpostal/irc-fiber-gateway:0.3.0 -f Containerfile . 2>&1 | tail -20'
+	@ssh deploy@$(_target_ssh) 'docker tag kevindpostal/irc-fiber-gateway:0.3.0 kevindpostal/irc-fiber-gateway:0.3.1 2>/dev/null || true; docker tag kevindpostal/irc-fiber-gateway:0.3.0 irc-fiber-gateway:latest 2>/dev/null || true; docker tag kevindpostal/irc-fiber-gateway:0.3.0 irc-fiber-gateway:0.3.0 2>/dev/null || true'
+	@printf '%b\n' "$(D)  3/5 Ensuring Caddy is in blue/green dual-upstream mode$(R)"
+	@cd deploy && ansible-playbook -l $(_target) $(_vault_arg) playbooks/caddy.yml 2>&1 | tail -10
+	@printf '%b\n' "$(D)  4/5 Blue/green swap: start green → wait healthy → stop blue → rename$(R)"
+	@cd deploy && ansible-playbook -l $(_target) $(_vault_arg) playbooks/gateway-bluegreen.yml 2>&1 | tail -30
+	@printf '%b\n' "$(D)  5/5 Verifying gateway health + engine untouched$(R)"
+	@ssh deploy@$(_target_ssh) 'sleep 2; docker exec ircfiber-gateway sh -c "curl -fsS http://127.0.0.1:8090/health 2>&1 | head -c 200"; echo ""; docker ps --format "{{.Names}} {{.Status}}" | grep -E "gateway|engine"; docker exec ircfiber-engine-ovh pidof irc-fiber-engine 2>&1 | head -1 | xargs -I {} echo "engine PID {} (unchanged if same as before)"'
+	@ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no deploy@$(_target_ssh) "mkdir -p /opt/ircfiber /opt/ircfiber-src && echo $$(git rev-parse HEAD) > /opt/ircfiber/.frontend-deploy-hash && cp /opt/ircfiber/.frontend-deploy-hash /opt/ircfiber-src/.frontend-deploy-hash && echo $$(git rev-parse --short HEAD):$$(date +%Y%m%d-%H%M%S) > /opt/ircfiber/.deploy-hash && cp /opt/ircfiber/.deploy-hash /opt/ircfiber-src/.deploy-hash && cat /opt/ircfiber/.frontend-deploy-hash" 2>&1 | tail -5 || true
+	@printf '%b\n' "$(BG)$(OK) Blue/green gateway deployed — zero downtime, engine not restarted$(R)"
 # ── Gateway asset fix — one-command repair for stale css/js (hash mismatch) ─
 # Symptom: live site (ircfiber.com) 404s on /public/dist/assets/main-*.js|css
 # because the gateway container's /app/views/index.dt references a hash that
