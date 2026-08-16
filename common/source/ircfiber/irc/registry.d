@@ -488,7 +488,7 @@ final class ServerRegistry {
      * Returns: Empty string if not assigned.
      */
     string getServerForNetwork(string networkId) {
-        return db.hget(RedisKeys.networkAssignments(), networkId);
+        return db.hget(RedisKeys.networkAssignments(), networkId.idup);
     }
 
     /**
