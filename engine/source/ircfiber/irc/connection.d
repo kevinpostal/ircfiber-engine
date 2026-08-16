@@ -541,8 +541,9 @@ private TCPConnection happyEyeballsConnectWithProxy(string host, ushort port, Mu
 
 private TCPConnection happyEyeballsConnect(string host, ushort port, string egressNodeId = "") {
     // Gang Net's Mullvad exits (se, us) are G-lined on irc.gangnet.org — use direct.
-    // TODO: remove when G-line expires or when de/ch sidecars are healthy.
-    if (host == "irc.gangnet.org") {
+    // Use case-insensitive check and log for debugging.
+    auto hostLower = host.toLower();
+    if (hostLower == "irc.gangnet.org" || hostLower.endsWith(".gangnet.org")) {
         logInfo("Gang Net direct fix: bypassing Mullvad for %s:%d, using direct", host, port);
         return happyEyeballsConnectWithProxy(host, port, null);
     }
