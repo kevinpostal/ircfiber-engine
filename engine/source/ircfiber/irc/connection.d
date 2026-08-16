@@ -207,11 +207,13 @@ private enum REGISTRATION_WARN_AT_FRACTION_2     = 75;
 private enum HAPPY_EYEBALLS_DELAY_MS = 250;
 
 // ── Mullvad egress (SOCKS5) pool ─────────────────────────────────────────────
-// 2 sidecars on 1 VPS, scalable to 5 via IRCFIBER_MULLVAD_POOL env.
-// Each entry is socks5://host:port (resolve locally → CONNECT <ip>:<port>).
-// Egress selection per NetworkConfig.egressNodeId: "" = random healthy,
-// else label pin (e.g. "se"/"us"). Advisory: per-connection round-robin,
-// no per-host sticky; circuit-breaker marks proxy dead 30s after 3 fails.
+// Sidecars on 1 VPS, scalable to N via IRCFIBER_MULLVAD_POOL env (e.g. 6:
+// de/ch/nl/gb/se/us). Each entry is socks5://host:port (resolve locally →
+// CONNECT <ip>:<port>). Egress selection per NetworkConfig.egressNodeId:
+// "" = random healthy for this host, else label pin (e.g. "se"/"us").
+// Smart picker is host-aware: when a server G/K/Z-lines an egress, that
+// egress is auto-banned for that host for 12 h (no hostname hardcode).
+// Global circuit-breaker still marks proxy dead 30 s after 3 generic fails.
 private struct MullvadProxy {
     string host;
     ushort port;
@@ -222,7 +224,13 @@ private struct MullvadProxy {
 private __gshared MullvadProxy[] mullvadPool;
 private __gshared size_t mullvadRR;
 private __gshared bool mullvadPoolLoaded;
-
+// Per-host egress ban: hostLower -> label -> expiryMs. When a server
+// G/K/Z-lines an egress IP, we remember that egress is banned for that
+// host for HOST_EGRESS_BAN_MS so future connects to the same host
+// skip that egress without hardcoding any hostname in the binary.
+private enum HOST_EGRESS_BAN_MS = 12 * 60 * 60 * 1000L; // 12 h
+private __gshared long[string][string] hostEgressBanUntil;
+private __gshared string mullvadLastUsedLabel;
 private string mullvadLabelFromHost(string h) {
     auto base = h.split(":")[0];
     auto dash = base.lastIndexOf("-");
@@ -303,6 +311,45 @@ private void recordMullvadFailure(string label) {
     }
 }
 
+private bool isEgressBannedForHost(string hostLower, string label) {
+    if (hostLower.length == 0 || label.length == 0) return false;
+    if (auto outer = hostLower in hostEgressBanUntil) {
+        if (auto expiry = label in *outer) {
+            const now = Clock.currTime.toUnixTime!long * 1000;
+            if (now < *expiry) return true;
+            (*outer).remove(label);
+            if ((*outer).length == 0) hostEgressBanUntil.remove(hostLower);
+        }
+    }
+    return false;
+}
+
+private void banEgressForHost(string host, string label) {
+    if (host.length == 0 || label.length == 0) return;
+    import std.string : toLower;
+    auto hl = host.toLower();
+    const exp = Clock.currTime.toUnixTime!long * 1000 + HOST_EGRESS_BAN_MS;
+    hostEgressBanUntil[hl][label.toLower()] = exp;
+    logWarn("Mullvad host-ban: egress %s banned for %s for %d ms (until %d)", label, hl, HOST_EGRESS_BAN_MS, exp);
+}
+
+private MullvadProxy*[] getHealthyProxiesForHost(string hostLower) {
+    auto healthy = getHealthyProxies();
+    if (hostLower.length == 0) return healthy;
+    const now = Clock.currTime.toUnixTime!long * 1000;
+    if (auto outer = hostLower in hostEgressBanUntil) {
+        string[] dead;
+        foreach (lbl, exp; *outer) if (now >= exp) dead ~= lbl;
+        foreach (lbl; dead) {
+            (*outer).remove(lbl);
+            logInfo("Mullvad host-ban expired: %s for %s", lbl, hostLower);
+        }
+        if ((*outer).length == 0) hostEgressBanUntil.remove(hostLower);
+    }
+    MullvadProxy*[] out_;
+    foreach (p; healthy) if (!isEgressBannedForHost(hostLower, p.label)) out_ ~= p;
+    return out_;
+}
 // SOCKS5 → TLS handoff: connectTCP to sidecar, handshake on same TCPConnection,
 // then return it for createTLSStreamWithTimeout (avoids private TCPConnection(fd) ctor).
 private TCPConnection socks5ConnectViaProxy(MullvadProxy* proxy, string targetIp, ushort targetPort, AddressFamily fam) {
@@ -540,65 +587,52 @@ private TCPConnection happyEyeballsConnectWithProxy(string host, ushort port, Mu
 }
 
 private TCPConnection happyEyeballsConnect(string host, ushort port, string egressNodeId = "") {
-    // Gang Net's Mullvad exits (se, us) and OVH direct are G-lined on irc.gangnet.org.
-    // Smartly try de/ch/nl/gb (new, not yet G-lined) first, then us/se, then direct.
+    import std.string : toLower;
     auto hostLower = host.toLower();
-    if (hostLower == "irc.gangnet.org" || hostLower.endsWith(".gangnet.org")) {
-        logInfo("Gang Net smart egress: trying de/ch/nl/gb for %s:%d", host, port);
-        string[] preferred = ["de", "ch", "nl", "gb"];
-        MullvadProxy*[] toTryGang;
-        foreach (label; preferred) {
-            auto p = pickMullvadProxy(label);
-            if (p !is null) {
-                const now = Clock.currTime.toUnixTime!long * 1000;
-                if (p.deadUntilMs == 0 || now >= p.deadUntilMs) toTryGang ~= p;
-            }
-        }
-        auto healthy = getHealthyProxies();
-        foreach (p; healthy) {
-            bool already = false;
-            foreach (q; toTryGang) if (q is p) { already = true; break; }
-            if (!already) toTryGang ~= p;
-        }
-        toTryGang ~= null;
-        Exception lastErr;
-        foreach (proxy; toTryGang) {
-            try {
-                logInfo("Gang Net trying egress %s for %s:%d", proxy ? proxy.label : "direct", host, port);
-                auto conn = happyEyeballsConnectWithProxy(host, port, proxy);
-                if (proxy !is null) recordMullvadSuccess(proxy.label);
-                return conn;
-            } catch (Exception e) {
-                lastErr = e;
-                logWarn("Gang Net egress %s failed for %s:%d: %s", proxy ? proxy.label : "direct", host, port, e.msg);
-                if (proxy !is null) recordMullvadFailure(proxy.label);
-                continue;
-            }
-        }
-        throw lastErr ? lastErr : new Exception("All Gang Net egress attempts failed for " ~ host);
-    }
-    // Try pinned/primary, then other healthy Mullvad proxies, then direct.
+    // Generic host-aware egress picker: no per-hostname hardcode.
+    // - Globally dead proxies (failCount >= 3) are already filtered by
+    //   getHealthyProxies() / getHealthyProxiesForHost().
+    // - Per-host G/K/Z bans learned via banEgressForHost() are filtered
+    //   by getHealthyProxiesForHost(hostLower) so a G-lined exit for one
+    //   host never blocks it for another.
+    auto healthyForHost = getHealthyProxiesForHost(hostLower);
     MullvadProxy*[] toTry;
-    auto primary = pickMullvadProxy(egressNodeId);
-    if (primary !is null) toTry ~= primary;
-    auto healthy = getHealthyProxies();
-    foreach (p; healthy) {
+    if (egressNodeId.length > 0) {
+        auto pinnedLabel = egressNodeId.toLower();
+        MullvadProxy* pinned = null;
+        foreach (ref pr; mullvadPool) if (pr.label == pinnedLabel) { pinned = &pr; break; }
+        if (pinned !is null) {
+            if (isEgressBannedForHost(hostLower, pinned.label)) {
+                logWarn("Mullvad pinned %s is host-banned for %s, falling back to other healthy egresses", pinned.label, hostLower);
+            } else if (pinned.deadUntilMs != 0) {
+                logWarn("Mullvad pinned %s is globally dead, falling back to other healthy egresses", pinned.label);
+            } else {
+                toTry ~= pinned;
+            }
+        } else {
+            logWarn("Mullvad pinned egress '%s' not found in pool, using random healthy", egressNodeId);
+        }
+    }
+    foreach (p; healthyForHost) {
         bool already = false;
         foreach (q; toTry) if (q is p) { already = true; break; }
         if (!already) toTry ~= p;
     }
-    toTry ~= null; // direct fallback
+    toTry ~= null; // direct fallback — the sidecars are egress, not a proxy mesh; bare OVH IP is last resort
     Exception lastErr;
     foreach (proxy; toTry) {
         try {
-            return happyEyeballsConnectWithProxy(host, port, proxy);
+            auto conn = happyEyeballsConnectWithProxy(host, port, proxy);
+            mullvadLastUsedLabel = proxy ? proxy.label : "";
+            if (proxy !is null) recordMullvadSuccess(proxy.label);
+            return conn;
         } catch (Exception e) {
             lastErr = e;
             logWarn("happyEyeballsConnect via %s failed for %s:%d: %s, trying next egress", proxy ? proxy.label : "direct", host, port, e.msg);
-            // recordMullvadFailure already done inside WithProxy for socks failures
             continue;
         }
     }
+    mullvadLastUsedLabel = "";
     throw lastErr ? lastErr : new Exception("All connection attempts failed for " ~ host ~ ":" ~ port.to!string);
 }
 
@@ -1065,8 +1099,12 @@ final class PersistentIRCClient {
         /// Last DISCONNECT reason surfaced to the UI. Mirrors the loop-local
         /// lastEmittedReason so JSON lifecycle logs (disconnected /
         /// reconnect_scheduled) can attribute the reason even after the
-        /// loop-local variable goes out of scope.
         string              lastDisconnectReason;
+        /// Label of the SOCKS egress that won the current TCP connect (""
+        /// = direct). Used by handleServerError() to host-ban the egress
+        /// when the server later G/K/Z-lines us — generic, no hostname
+        /// hardcode.
+        string              activeEgressLabel;
 
         // ── Handoff support ───────────────────────────────────────────────────
         /// When non-zero, the connection's event loop will not perform any
@@ -2331,17 +2369,20 @@ final class PersistentIRCClient {
             ["network": config.name, "host": config.host, "port": config.port.to!string, "egress": config.egressNodeId],
             (ref Span ts) {
             connection = happyEyeballsConnect(config.host, config.port, config.egressNodeId);
+            activeEgressLabel = mullvadLastUsedLabel;
             ts.setStatusOk();
         });
+        logInfo("TCP via egress '%s' to %s:%d", activeEgressLabel.length ? activeEgressLabel : "direct", config.host, config.port);
         emitLog("tcp_open",
-            "TCP connection established to " ~ config.host ~ ":" ~ config.port.to!string ~ ".");
+            "TCP connection established to " ~ config.host ~ ":" ~ config.port.to!string
+            ~ (activeEgressLabel.length ? " via " ~ activeEgressLabel : " (direct)") ~ ".");
         logJsonMap("info", "connection",
             "TCP open",
             ["network": config.name, "host": config.host,
              "port": config.port.to!string,
+             "egress": activeEgressLabel.length ? activeEgressLabel : "direct",
              "tls": (config.tls != TLSMode.disabled) ? "true" : "false",
              "event": "tcp_open"]);
-
         if (config.tls != TLSMode.disabled) {
             emitLog("tls",
                 "Starting TLS handshake with " ~ config.host ~ "...");
@@ -2397,22 +2438,17 @@ final class PersistentIRCClient {
                     throw new Exception(tlsError);
                 }
 
-                logWarn("TLS handshake failed for %s, falling back to plain text",
-                    config.host);
-                emitLog("warn",
-                    "TLS handshake failed — falling back to plain text as configured.");
-
+                logWarn("TLS handshake failed for %s, falling back to plain text", config.host);
+                emitLog("warn", "TLS handshake failed — falling back to plain text as configured.");
                 if (connection && connection.connected) {
                     try { connection.close(); } catch (Exception) {}
                 }
                 connection = happyEyeballsConnect(config.host, config.port, config.egressNodeId);
-                emitLog("tcp_open",
-                    "Re-established plain-text TCP connection to " ~ config.host ~ ".");
-                logJsonMap("info", "connection",
-                    "TLS handshake failed; fell back to plain text",
-                    ["network": config.name, "host": config.host,
-                     "event": "tls_plain_fallback"]);
-                logInfo("Connected to %s:%s without TLS", config.host, config.port);
+                activeEgressLabel = mullvadLastUsedLabel;
+                logInfo("Plain fallback TCP via egress '%s' to %s:%d", activeEgressLabel.length ? activeEgressLabel : "direct", config.host, config.port);
+                emitLog("tcp_open", "Re-established plain-text TCP connection to " ~ config.host ~ " via " ~ (activeEgressLabel.length ? activeEgressLabel : "direct") ~ ".");
+                logJsonMap("info", "connection", "TLS handshake failed; fell back to plain text", ["network": config.name, "host": config.host, "egress": activeEgressLabel.length ? activeEgressLabel : "direct", "event": "tls_plain_fallback"]);
+                logInfo("Connected to %s:%s without TLS via %s", config.host, config.port, activeEgressLabel.length ? activeEgressLabel : "direct");
             }
         } else {
             emitLog("info",
@@ -3047,11 +3083,20 @@ final class PersistentIRCClient {
                             emitLog("sasl_done", "SASL already authenticated (907)");
                             break;
 
+                        case "465": // ERR_YOUREBANNEDCREEP — server ban during registration
+                            lastErrorText = evt.text;
+                            if (isBanError(evt.text)) {
+                                if (activeEgressLabel.length > 0) banEgressForHost(config.host, activeEgressLabel);
+                                throttledUntil = Clock.currTime.toUnixTime!long * 1000 + 30 * 60 * 1000;
+                            } else if (isThrottleError(evt.text)) throttledUntil = Clock.currTime.toUnixTime!long * 1000 + 300_000;
+                            evt.network = config.name; evt.timestampMs = resolveTimestamp(evt); eventChannel.put(evt);
+                            throw new Exception("Server banned connection during registration: " ~ evt.text);
                         case "ERROR":
                             lastErrorText = evt.text;
-                            if (isThrottleError(evt.text)) {
-                                throttledUntil = Clock.currTime.toUnixTime!long * 1000 + 300_000;
-                            }
+                            if (isBanError(evt.text)) {
+                                if (activeEgressLabel.length > 0) banEgressForHost(config.host, activeEgressLabel);
+                                throttledUntil = Clock.currTime.toUnixTime!long * 1000 + 30 * 60 * 1000;
+                            } else if (isThrottleError(evt.text)) throttledUntil = Clock.currTime.toUnixTime!long * 1000 + 300_000;
                             evt.network     = config.name;
                             evt.timestampMs = resolveTimestamp(evt);
                             eventChannel.put(evt);
@@ -3431,35 +3476,23 @@ private void processEvents() {
     /// detector in `processLine`.
     private void handleServerError(string text) {
         lastErrorText = text;
-        // Ban (ZLINE/GLINE/KLINE) takes precedence over throttle — it needs
-        // a much longer pause and a different FailInfo so the UI doesn't
-        // spin a 5s retry loop that immediately re-hits the same wall.
         if (isBanError(text)) {
-            // 30 min ban window. The server's ZLINE will still be in
-            // place after 5 min, so a short throttle would just hammer.
-            // The reconnect loop's HostCircuitBreaker (5 min) + this
-            // window together give a 30 min visible countdown; the user
-            // can still click "Reconnect" to force a retry earlier.
             throttledUntil = Clock.currTime.toUnixTime!long * 1000 + 30 * 60 * 1000;
-            // Surface as connection_blocked so the banner renders
-            // "Connections to this server have been blocked" + the raw
-            // ban text in the server log, not an empty "Disconnected:".
             lastDisconnectReason = text;
             emitConnectionFail(text, text);
-            logJsonMap("error", "connection",
-                "Server BAN detected (ZLINE/GLINE) — 30m backoff",
-                ["network": config.name, "message": text, "event": "server_ban_detected"]);
+            if (activeEgressLabel.length > 0) {
+                banEgressForHost(config.host, activeEgressLabel);
+                logJsonMap("warn", "connection", "Egress host-banned after G/K/Z-line", ["network": config.name, "host": config.host, "egress": activeEgressLabel, "event": "egress_host_ban"]);
+            }
+            logJsonMap("error", "connection", "Server BAN detected (ZLINE/GLINE) — 30m backoff", ["network": config.name, "message": text, "egress": activeEgressLabel, "event": "server_ban_detected"]);
         } else if (isThrottleError(text)) {
             throttledUntil = Clock.currTime.toUnixTime!long * 1000 + 300_000; // 5 min
             lastDisconnectReason = text;
             emitConnectionFail(text, text);
         } else {
-            // Non-throttle ERROR still benefits from a structured
-            // disconnect reason so the banner doesn't render empty.
             lastDisconnectReason = text;
             emitConnectionFail(text, text);
         }
-        state = ConnectionState.disconnecting;
         // Emit DISCONNECTED immediately so the frontend sees the
         // state transition even when the caller (processEvents'
         // data loop) exits without throwing (squashed ERROR path).
@@ -3713,6 +3746,10 @@ private void processEvents() {
                 break;
 
                         case "ERROR":
+                            handleServerError(event.text);
+                            break;
+
+                        case "465": // ERR_YOUREBANNEDCREEP — treat as host-ban like ERROR
                             handleServerError(event.text);
                             break;
 
