@@ -546,8 +546,8 @@ private TCPConnection happyEyeballsConnect(string host, ushort port, string egre
         return happyEyeballsConnectWithProxy(host, port, null);
     }
     // Try pinned/primary, then other healthy Mullvad proxies, then direct.
+    MullvadProxy*[] toTry;
     auto primary = pickMullvadProxy(egressNodeId);
-    if (primary !is null) toTry ~= primary;
     auto healthy = getHealthyProxies();
     foreach (p; healthy) {
         bool already = false;
