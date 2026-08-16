@@ -543,6 +543,7 @@ private TCPConnection happyEyeballsConnect(string host, ushort port, string egre
     // Gang Net's Mullvad exits (se, us) are G-lined on irc.gangnet.org — use direct.
     // TODO: remove when G-line expires or when de/ch sidecars are healthy.
     if (host == "irc.gangnet.org") {
+        logInfo("Gang Net direct fix: bypassing Mullvad for %s:%d, using direct", host, port);
         return happyEyeballsConnectWithProxy(host, port, null);
     }
     // Try pinned/primary, then other healthy Mullvad proxies, then direct.
