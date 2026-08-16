@@ -540,9 +540,12 @@ private TCPConnection happyEyeballsConnectWithProxy(string host, ushort port, Mu
 }
 
 private TCPConnection happyEyeballsConnect(string host, ushort port, string egressNodeId = "") {
+    // Gang Net's Mullvad exits (se, us) are G-lined on irc.gangnet.org — use direct.
+    // TODO: remove when G-line expires or when de/ch sidecars are healthy.
+    if (host == "irc.gangnet.org") {
+        return happyEyeballsConnectWithProxy(host, port, null);
+    }
     // Try pinned/primary, then other healthy Mullvad proxies, then direct.
-    // This ensures Docker or a single Mullvad exit going down doesn't drop IRC.
-    MullvadProxy*[] toTry;
     auto primary = pickMullvadProxy(egressNodeId);
     if (primary !is null) toTry ~= primary;
     auto healthy = getHealthyProxies();
