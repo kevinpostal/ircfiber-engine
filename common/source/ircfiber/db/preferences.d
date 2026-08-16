@@ -114,9 +114,20 @@ struct UserPreferences {
     /// Whether to show mode-prefix glyphs (@, +, %, etc.) in the member
     /// list. Default true so existing users keep their current view.
     /// Synced cross-tab via localStorage + cross-device via pref_update
-    /// (stat_user boot + live WS broadcast).
+    /// (`showMemberPrefixes` key) + `stat_user` boot seed. The setter writes
+    /// to localStorage immediately so a fast refresh (<500ms debounce) keeps
+    /// the choice; the Settings UI also POSTs to
+    /// `/api/me/show-member-prefixes` which then fans out via WS.
     bool showMemberPrefixes = true;
 
+    /// Global notification preferences — flat bools keep `prefVersion` fan-out
+    /// uniform (one counter for all prefs) and avoid a nested `notificationPrefs`
+    /// object migration. Cross-device via `pref_update` key `notificationPrefs`
+    /// + `stat_user` boot seed. Mirrors `showMemberPrefixes` handling.
+    bool desktopNotifications = true;
+    bool notificationSound = true;
+    bool autoDismissNotifs = true;
+    bool muteAll = false;
     /// Serializes to JSON.
     Json toJson() const {
         auto j = Json.emptyObject;
@@ -159,9 +170,12 @@ struct UserPreferences {
         j["bufferPrefs"] = bp;
         j["prefVersion"] = Json(prefVersion);
         j["showMemberPrefixes"] = Json(showMemberPrefixes);
+        j["desktopNotifications"] = Json(desktopNotifications);
+        j["notificationSound"] = Json(notificationSound);
+        j["autoDismissNotifs"] = Json(autoDismissNotifs);
+        j["muteAll"] = Json(muteAll);
         return j;
     }
-
     /// Deserializes from JSON. The optional `userId` enables structured
     /// per-field warnings when individual fields have the wrong JSON type
     /// (e.g. an object where an array is expected). When omitted, malformed
@@ -272,6 +286,38 @@ struct UserPreferences {
                 p.showMemberPrefixes = smp.get!bool;
             else {
                 logFieldInvalid(userId, "showMemberPrefixes", smp.type, "bool");
+                needsRepair = true;
+            }
+        }
+        if (auto v = "desktopNotifications" in json) {
+            if (v.type == Json.Type.bool_)
+                p.desktopNotifications = v.get!bool;
+            else {
+                logFieldInvalid(userId, "desktopNotifications", v.type, "bool");
+                needsRepair = true;
+            }
+        }
+        if (auto v = "notificationSound" in json) {
+            if (v.type == Json.Type.bool_)
+                p.notificationSound = v.get!bool;
+            else {
+                logFieldInvalid(userId, "notificationSound", v.type, "bool");
+                needsRepair = true;
+            }
+        }
+        if (auto v = "autoDismissNotifs" in json) {
+            if (v.type == Json.Type.bool_)
+                p.autoDismissNotifs = v.get!bool;
+            else {
+                logFieldInvalid(userId, "autoDismissNotifs", v.type, "bool");
+                needsRepair = true;
+            }
+        }
+        if (auto v = "muteAll" in json) {
+            if (v.type == Json.Type.bool_)
+                p.muteAll = v.get!bool;
+            else {
+                logFieldInvalid(userId, "muteAll", v.type, "bool");
                 needsRepair = true;
             }
         }
