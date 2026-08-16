@@ -1,7 +1,7 @@
 module ircfiber.irc.connection;
 
 import std.array : join;
-import std.string : toUpper, toStringz, indexOf, lastIndexOf, split, startsWith, strip, stripLeft;
+import std.string : toUpper, toStringz, indexOf, lastIndexOf, split, startsWith, endsWith, strip, stripLeft;
 import std.base64 : Base64;
 import std.conv : to;
 import std.datetime : Clock, SysTime;
