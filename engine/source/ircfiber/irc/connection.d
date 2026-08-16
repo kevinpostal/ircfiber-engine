@@ -540,16 +540,44 @@ private TCPConnection happyEyeballsConnectWithProxy(string host, ushort port, Mu
 }
 
 private TCPConnection happyEyeballsConnect(string host, ushort port, string egressNodeId = "") {
-    // Gang Net's Mullvad exits (se, us) are G-lined on irc.gangnet.org — use direct.
-    // Use case-insensitive check and log for debugging.
+    // Gang Net's Mullvad exits (se, us) and OVH direct are G-lined on irc.gangnet.org.
+    // Smartly try de/ch/nl/gb (new, not yet G-lined) first, then us/se, then direct.
     auto hostLower = host.toLower();
     if (hostLower == "irc.gangnet.org" || hostLower.endsWith(".gangnet.org")) {
-        logInfo("Gang Net direct fix: bypassing Mullvad for %s:%d, using direct", host, port);
-        return happyEyeballsConnectWithProxy(host, port, null);
+        logInfo("Gang Net smart egress: trying de/ch/nl/gb for %s:%d", host, port);
+        string[] preferred = ["de", "ch", "nl", "gb"];
+        MullvadProxy*[] toTryGang;
+        foreach (label; preferred) {
+            auto p = pickMullvadProxy(label);
+            if (p !is null) {
+                const now = Clock.currTime.toUnixTime!long * 1000;
+                if (p.deadUntilMs == 0 || now >= p.deadUntilMs) toTryGang ~= p;
+            }
+        }
+        auto healthy = getHealthyProxies();
+        foreach (p; healthy) {
+            bool already = false;
+            foreach (q; toTryGang) if (q is p) { already = true; break; }
+            if (!already) toTryGang ~= p;
+        }
+        toTryGang ~= null;
+        Exception lastErr;
+        foreach (proxy; toTryGang) {
+            try {
+                logInfo("Gang Net trying egress %s for %s:%d", proxy ? proxy.label : "direct", host, port);
+                auto conn = happyEyeballsConnectWithProxy(host, port, proxy);
+                if (proxy !is null) recordMullvadSuccess(proxy.label);
+                return conn;
+            } catch (Exception e) {
+                lastErr = e;
+                logWarn("Gang Net egress %s failed for %s:%d: %s", proxy ? proxy.label : "direct", host, port, e.msg);
+                if (proxy !is null) recordMullvadFailure(proxy.label);
+                continue;
+            }
+        }
+        throw lastErr ? lastErr : new Exception("All Gang Net egress attempts failed for " ~ host);
     }
     // Try pinned/primary, then other healthy Mullvad proxies, then direct.
-    MullvadProxy*[] toTry;
-    auto primary = pickMullvadProxy(egressNodeId);
     auto healthy = getHealthyProxies();
     foreach (p; healthy) {
         bool already = false;
