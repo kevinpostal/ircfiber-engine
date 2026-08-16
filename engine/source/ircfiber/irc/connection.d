@@ -578,6 +578,9 @@ private TCPConnection happyEyeballsConnect(string host, ushort port, string egre
         throw lastErr ? lastErr : new Exception("All Gang Net egress attempts failed for " ~ host);
     }
     // Try pinned/primary, then other healthy Mullvad proxies, then direct.
+    MullvadProxy*[] toTry;
+    auto primary = pickMullvadProxy(egressNodeId);
+    if (primary !is null) toTry ~= primary;
     auto healthy = getHealthyProxies();
     foreach (p; healthy) {
         bool already = false;
