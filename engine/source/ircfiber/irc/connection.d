@@ -231,6 +231,8 @@ private __gshared bool mullvadPoolLoaded;
 private enum HOST_EGRESS_BAN_MS = 12 * 60 * 60 * 1000L; // 12 h
 private __gshared long[string][string] hostEgressBanUntil;
 private __gshared string mullvadLastUsedLabel;
+private __gshared string mullvadLastUsedHost;
+private __gshared string mullvadLastUsedIp;
 private string mullvadLabelFromHost(string h) {
     auto base = h.split(":")[0];
     auto dash = base.lastIndexOf("-");
@@ -624,7 +626,23 @@ private TCPConnection happyEyeballsConnect(string host, ushort port, string egre
         try {
             auto conn = happyEyeballsConnectWithProxy(host, port, proxy);
             mullvadLastUsedLabel = proxy ? proxy.label : "";
-            if (proxy !is null) recordMullvadSuccess(proxy.label);
+            mullvadLastUsedHost = proxy ? proxy.host ~ ":" ~ proxy.port.to!string : "";
+            mullvadLastUsedIp = "";
+            if (proxy !is null) {
+                // Best-effort resolve Tailnet IP for admin display.
+                try {
+                    auto addrs = resolveAllAddresses(proxy.host, proxy.port);
+                    if (addrs.length > 0) mullvadLastUsedIp = addrs[0].ip;
+                } catch (Exception) {}
+                if (mullvadLastUsedIp.length == 0) {
+                    try {
+                        import vibe.core.net : resolveHost;
+                        auto a = getAddress(proxy.host, proxy.port);
+                        if (a.length > 0) mullvadLastUsedIp = a[0].toAddrString();
+                    } catch (Exception) {}
+                }
+                recordMullvadSuccess(proxy.label);
+            }
             return conn;
         } catch (Exception e) {
             lastErr = e;
@@ -633,6 +651,8 @@ private TCPConnection happyEyeballsConnect(string host, ushort port, string egre
         }
     }
     mullvadLastUsedLabel = "";
+    mullvadLastUsedHost = "";
+    mullvadLastUsedIp = "";
     throw lastErr ? lastErr : new Exception("All connection attempts failed for " ~ host ~ ":" ~ port.to!string);
 }
 
@@ -1105,6 +1125,10 @@ final class PersistentIRCClient {
         /// when the server later G/K/Z-lines us — generic, no hostname
         /// hardcode.
         string              activeEgressLabel;
+        /// Full proxy host that won (e.g. "tailscale-mullvad-de:1055").
+        string              activeEgressHost;
+        /// Resolved Tailnet IP of the active proxy (e.g. "100.117.47.8").
+        string              activeEgressIp;
 
         // ── Handoff support ───────────────────────────────────────────────────
         /// When non-zero, the connection's event loop will not perform any
@@ -1829,7 +1853,11 @@ final class PersistentIRCClient {
     @property FailInfo getLastFailInfo() const {
         return lastFailInfo;
     }
-
+    /// Mullvad egress actually used for the live TCP connection.
+    /// "" = direct (no SOCKS), else label like "de"/"se".
+    @property string getActiveEgressLabel() const { return activeEgressLabel; }
+    @property string getActiveEgressHost() const { return activeEgressHost; }
+    @property string getActiveEgressIp() const { return activeEgressIp; }
     /// Whether a given IRCv3 capability was negotiated.
     bool hasCap(string cap) const { return (cap in ackedCaps) !is null && ackedCaps[cap]; }
 
@@ -2370,17 +2398,21 @@ final class PersistentIRCClient {
             (ref Span ts) {
             connection = happyEyeballsConnect(config.host, config.port, config.egressNodeId);
             activeEgressLabel = mullvadLastUsedLabel;
+            activeEgressHost = mullvadLastUsedHost;
+            activeEgressIp = mullvadLastUsedIp;
             ts.setStatusOk();
         });
-        logInfo("TCP via egress '%s' to %s:%d", activeEgressLabel.length ? activeEgressLabel : "direct", config.host, config.port);
+        logInfo("TCP via egress '%s' (%s/%s) to %s:%d", activeEgressLabel.length ? activeEgressLabel : "direct", activeEgressHost.length ? activeEgressHost : "direct", activeEgressIp.length ? activeEgressIp : "-", config.host, config.port);
         emitLog("tcp_open",
             "TCP connection established to " ~ config.host ~ ":" ~ config.port.to!string
-            ~ (activeEgressLabel.length ? " via " ~ activeEgressLabel : " (direct)") ~ ".");
+            ~ (activeEgressLabel.length ? " via " ~ activeEgressLabel ~ " (" ~ activeEgressHost ~ (activeEgressIp.length ? "/" ~ activeEgressIp : "") ~ ")" : " (direct)") ~ ".");
         logJsonMap("info", "connection",
             "TCP open",
             ["network": config.name, "host": config.host,
              "port": config.port.to!string,
              "egress": activeEgressLabel.length ? activeEgressLabel : "direct",
+             "egressHost": activeEgressHost,
+             "egressIp": activeEgressIp,
              "tls": (config.tls != TLSMode.disabled) ? "true" : "false",
              "event": "tcp_open"]);
         if (config.tls != TLSMode.disabled) {
@@ -2445,9 +2477,11 @@ final class PersistentIRCClient {
                 }
                 connection = happyEyeballsConnect(config.host, config.port, config.egressNodeId);
                 activeEgressLabel = mullvadLastUsedLabel;
-                logInfo("Plain fallback TCP via egress '%s' to %s:%d", activeEgressLabel.length ? activeEgressLabel : "direct", config.host, config.port);
-                emitLog("tcp_open", "Re-established plain-text TCP connection to " ~ config.host ~ " via " ~ (activeEgressLabel.length ? activeEgressLabel : "direct") ~ ".");
-                logJsonMap("info", "connection", "TLS handshake failed; fell back to plain text", ["network": config.name, "host": config.host, "egress": activeEgressLabel.length ? activeEgressLabel : "direct", "event": "tls_plain_fallback"]);
+                activeEgressHost = mullvadLastUsedHost;
+                activeEgressIp = mullvadLastUsedIp;
+                logInfo("Plain fallback TCP via egress '%s' (%s/%s) to %s:%d", activeEgressLabel.length ? activeEgressLabel : "direct", activeEgressHost.length ? activeEgressHost : "direct", activeEgressIp.length ? activeEgressIp : "-", config.host, config.port);
+                emitLog("tcp_open", "Re-established plain-text TCP connection to " ~ config.host ~ " via " ~ (activeEgressLabel.length ? activeEgressLabel ~ " (" ~ activeEgressHost ~ (activeEgressIp.length ? "/" ~ activeEgressIp : "") ~ ")" : "direct") ~ ".");
+                logJsonMap("info", "connection", "TLS handshake failed; fell back to plain text", ["network": config.name, "host": config.host, "egress": activeEgressLabel.length ? activeEgressLabel : "direct", "egressHost": activeEgressHost, "egressIp": activeEgressIp, "event": "tls_plain_fallback"]);
                 logInfo("Connected to %s:%s without TLS via %s", config.host, config.port, activeEgressLabel.length ? activeEgressLabel : "direct");
             }
         } else {

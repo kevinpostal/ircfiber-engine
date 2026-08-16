@@ -399,6 +399,13 @@ struct NetworkStateSnapshot {
     /// Schema is identical to `Network.isupport` on the frontend:
     /// every key=value or bare flag the server sent, keyed upper-case.
     string[string] isupport;
+    /// Active Mullvad egress actually used for this network's live TCP
+    /// connection. "" = direct, else label like "de"/"se".
+    string activeEgressLabel;
+    /// SOCKS proxy host that won (e.g. "tailscale-mullvad-de:1055").
+    string activeEgressHost;
+    /// Resolved Tailnet IP of active SOCKS proxy (e.g. "100.117.47.8").
+    string activeEgressIp;
     /// Channels the user has parted (for inactive sidebar)
     string[] partedChannels;
     /// W1-T01-rev1: structured retry state surfaced from the engine's
@@ -466,6 +473,9 @@ struct NetworkStateSnapshot {
             foreach (c; partedChannels) arr ~= Json(c);
             j["partedChannels"] = arr;
         }
+        if (activeEgressLabel.length) j["activeEgressLabel"] = Json(activeEgressLabel);
+        if (activeEgressHost.length) j["activeEgressHost"] = Json(activeEgressHost);
+        if (activeEgressIp.length) j["activeEgressIp"] = Json(activeEgressIp);
         // W1-T01-rev1: structured retry / fail info payload. The
         // retry status is omitted from the wire entirely when
         // `hasRetryStatus` is false so the frontend sees an absent
@@ -526,8 +536,10 @@ struct NetworkStateSnapshot {
                 if (c.type == Json.Type.string) s.partedChannels ~= c.get!string;
             }
         }
+        if (j["activeEgressLabel"].type == Json.Type.string) s.activeEgressLabel = j["activeEgressLabel"].get!string;
+        if (j["activeEgressHost"].type == Json.Type.string) s.activeEgressHost = j["activeEgressHost"].get!string;
+        if (j["activeEgressIp"].type == Json.Type.string) s.activeEgressIp = j["activeEgressIp"].get!string;
         // W1-T01-rev1: structured retry status. Default to "absent"
-        // (hasRetryStatus = false) so legacy snapshots without this
         // field still deserialise cleanly — the frontend treats a
         // missing field as "no retry scheduled", exactly like the
         // previous zero-valued payload. When the field is present,

@@ -180,21 +180,20 @@ void writeStateSnapshotForNetwork(ref EngineContext ctx, Network net, string ser
     // from structured data instead of re-parsing the 005 message
     // stream. Empty during the brief window between connect-start and
     // welcome — the frontend falls back to its own parsing during that
-    // interval.
     auto clientForIsupport = ctx.connManager.getClient(net.config.id);
     if (clientForIsupport) {
         snap.isupport = clientForIsupport.getIsupport();
     }
+    // Active Mullvad egress that won the Happy Eyeballs race for this
+    // network. Surfaced to admin "which IP per IRC server".
+    auto clientForEgress = ctx.connManager.getClient(net.config.id);
+    if (clientForEgress) {
+        snap.activeEgressLabel = clientForEgress.getActiveEgressLabel();
+        snap.activeEgressHost = clientForEgress.getActiveEgressHost();
+        snap.activeEgressIp = clientForEgress.getActiveEgressIp();
+    }
 
     // W1-T01-rev1: structured retry + fail info from the engine's
-    // reconnect loop. Populated every heartbeat cycle (10s) so a
-    // fresh WS sync arriving on a stalled network still sees the
-    // current attempt count + next-retry deadline. The
-    // `processor.d` event loop also triggers an immediate snapshot
-    // write on every CONNECTION_RETRY_STATUS / CONNECTION_FAIL event
-    // for real-time updates without waiting for the next heartbeat.
-    //
-    // Retry status is nullable on the engine getter
     // (PersistentIRCClient.getRetryStatus returns
     // `Nullable!RetryStatus`) and on the snapshot
     // (NetworkStateSnapshot.retryStatus is gated by
