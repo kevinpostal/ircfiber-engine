@@ -590,6 +590,7 @@ private TCPConnection happyEyeballsConnectWithProxy(string host, ushort port, Mu
 
 private TCPConnection happyEyeballsConnect(string host, ushort port, string egressNodeId = "") {
     import std.string : toLower;
+    import std.random : uniform;
     auto hostLower = host.toLower();
     // Generic host-aware egress picker: no per-hostname hardcode.
     // - Globally dead proxies (failCount >= 3) are already filtered by
@@ -598,6 +599,16 @@ private TCPConnection happyEyeballsConnect(string host, ushort port, string egre
     //   by getHealthyProxiesForHost(hostLower) so a G-lined exit for one
     //   host never blocks it for another.
     auto healthyForHost = getHealthyProxiesForHost(hostLower);
+    // Randomize healthy list so random egress (empty egressNodeId) spreads
+    // across the pool instead of always hitting the first entry (de).
+    if (healthyForHost.length > 1) {
+        for (size_t i = healthyForHost.length - 1; i > 0; --i) {
+            size_t j = uniform(0, i + 1);
+            auto tmp = healthyForHost[i];
+            healthyForHost[i] = healthyForHost[j];
+            healthyForHost[j] = tmp;
+        }
+    }
     MullvadProxy*[] toTry;
     if (egressNodeId.length > 0) {
         auto pinnedLabel = egressNodeId.toLower();
