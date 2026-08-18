@@ -256,7 +256,7 @@ bust=$CACHE_BUST
 EOF
 WORKDIR /build
 # Leverage Docker layer cache: copy package files first, then npm ci
-COPY frontend/package.json frontend/package-lock.json frontend/bun.lock* frontend/tsconfig.json frontend/svelte.config.js frontend/vite.config.ts frontend/index.html frontend/inject-manifest.js ./frontend/
+COPY frontend/package.json frontend/package-lock.json frontend/bun.lock* frontend/tsconfig.json frontend/svelte.config.js frontend/vite.config.ts frontend/index.html frontend/admin.html frontend/inject-manifest.js ./frontend/
 COPY frontend/src ./frontend/src/
 COPY frontend/wasm-img2irc ./frontend/wasm-img2irc/
 COPY public/ ./public/
