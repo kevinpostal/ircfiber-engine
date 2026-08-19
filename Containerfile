@@ -251,6 +251,7 @@ ARG CACHE_BUST=fixed
 ARG GIT_HASH=unknown
 ARG GIT_SHORT=unknown
 ARG GIT_DESCRIBE=unknown
+ARG GIT_BRANCH=unknown
 COPY <<EOF ./frontend/.cache_bust_$CACHE_BUST
 bust=$CACHE_BUST
 EOF
@@ -262,14 +263,14 @@ COPY frontend/wasm-img2irc ./frontend/wasm-img2irc/
 COPY public/ ./public/
 COPY backend/views/ ./backend/views/
 RUN if [ "$GIT_HASH" != "unknown" ] && [ "$GIT_HASH" != "" ]; then \
-      echo "frontend-builder: using GIT_HASH=$GIT_HASH"; \
+      echo "frontend-builder: using GIT_HASH=$GIT_HASH GIT_BRANCH=$GIT_BRANCH"; \
       mkdir -p frontend/src/lib; \
       printf '// Generated via Docker build-arg GIT_HASH=%s\n' "$GIT_HASH" > frontend/src/lib/buildInfo.ts; \
       printf 'export const BUILD_INFO = {\n' >> frontend/src/lib/buildInfo.ts; \
       printf '  commit: "%s",\n' "$GIT_HASH" >> frontend/src/lib/buildInfo.ts; \
       printf '  short: "%s",\n' "${GIT_SHORT:-$GIT_HASH}" >> frontend/src/lib/buildInfo.ts; \
       printf '  describe: "%s",\n' "${GIT_DESCRIBE:-$GIT_SHORT}" >> frontend/src/lib/buildInfo.ts; \
-      printf '  branch: "unknown",\n' >> frontend/src/lib/buildInfo.ts; \
+      printf '  branch: "%s",\n' "${GIT_BRANCH:-unknown}" >> frontend/src/lib/buildInfo.ts; \
       printf '  builtAt: "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> frontend/src/lib/buildInfo.ts; \
       printf '  builtHost: "docker-builder",\n' >> frontend/src/lib/buildInfo.ts; \
       printf '  version: "0.3.0",\n' >> frontend/src/lib/buildInfo.ts; \
