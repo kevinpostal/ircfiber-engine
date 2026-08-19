@@ -25,6 +25,7 @@
 module ircfiber.async;
 
 import core.stdc.stdlib : malloc, free;
+import core.sync.mutex : Mutex;
 import core.time : seconds;
 import std.datetime : Clock, SysTime;
 import std.stdio : stderr;
@@ -32,7 +33,6 @@ import vibe.core.core : runTask, sleep;
 import vibe.core.log;
 import vibe.core.task : Task, TaskSettings;
 import ircfiber.logging : logJsonMap;
-
 /// Same arglist as `runTask`, but the closure may throw freely. Returns
 /// the `Task` handle from `runTask` so callers can interrupt. The
 /// `event_` and `network` tags surface in the structured log line if
@@ -54,7 +54,7 @@ auto safeFiberRun(string event_, string network,
         // the caller will see a null-Task sentinel.
         try stderr.writeln("async: out of memory scheduling ",
             event_, " on ", network);
-        catch (Exception) {}
+        catch (Throwable) {}
         return Task.init;
     }
     (cast(Trampoline*) mem)[0] = Trampoline(event_, network, dg);
@@ -63,26 +63,25 @@ auto safeFiberRun(string event_, string network,
         scope(exit) free(mem);
         auto t = cast(Trampoline*) mem;
         try t.dg();
-        catch (Exception e) {
-            // logJsonMap is not declared `nothrow` but is in practice
-            // side-effect-only. If something exceptional happens during
-            // the log call we swallow it inside the nothrow boundary —
-            // the alternative is what crashed builds before this helper
-            // existed.
-            try logJsonMap("error", "async",
-                "Background task crashed",
-                [
-                    "network": t.network,
-                    "event":   t.event_,
-                    "error":   e.msg
-                ]);
-            catch (Exception) {}
+        catch (Throwable e) {
+            // Enterprise: catch Throwable (SyncError) — previously only Exception,
+            // so SyncError killed the fiber as FATAL (cnTb-fin 2026-08-17).
+            // Log and swallow so the connection loop's own catch handles recovery.
+            try {
+                string m;
+                try { m = e.msg; } catch (Throwable) { m = "unknown"; }
+                logJsonMap("error", "async",
+                    "Background task crashed",
+                    [
+                        "network": t.network,
+                        "event":   t.event_,
+                        "error":   m
+                    ]);
+            } catch (Throwable) {}
         }
     }
     return runTask(&wrapped);
 }
-
-// NOTE: FiberWatch only tracks fibers started via watchedRunTask.
 // Native HTTP handler fibers (listenHTTP internal) are invisible.
 
 /// Per-fiber watch entry.
@@ -95,71 +94,133 @@ struct FiberWatch {
     SysTime lastYield;
 }
 
-/// Global registry of watched fibers.
+/// Global registry of watched fibers — __gshared, guarded by mutex for enterprise safety.
 private __gshared FiberWatch[] s_watchedFibers;
 private __gshared bool s_watchdogStarted;
 private __gshared int g_longRunningFiberCount;
 private __gshared int g_yieldsTotal;
+private __gshared Mutex gWatchdogMutex;
+shared static this() {
+    try { gWatchdogMutex = new Mutex(); } catch (Throwable) {}
+}
 
 /// Wrapper around runTask that registers the task with the watchdog.
 /// Automatically records lastYield before and after the task body.
 /// Usage: watchedRunTask("label", "id", { ... });
 Task watchedRunTask(string label, string taskId, void delegate() dg) {
-    auto idx = s_watchedFibers.length;
+    size_t idx;
+    // Use nothrow-safe raw lock_nothrow: synchronized is not nothrow.
+    bool locked = false;
+    if (gWatchdogMutex !is null) {
+        try { gWatchdogMutex.lock_nothrow(); locked = true; } catch (Throwable) {}
+    }
+    // Critical section — copy under lock, keep logic minimal.
+    idx = s_watchedFibers.length;
     s_watchedFibers ~= FiberWatch(taskId, label, Clock.currTime);
+    if (locked) try { gWatchdogMutex.unlock_nothrow(); } catch (Throwable) {}
 
     void wrapped() nothrow {
-        s_watchedFibers[idx].lastYield = Clock.currTime;
-        g_yieldsTotal++;
-
-        try dg();
-        catch (Exception e) {
-            try logWarn("watchedRunTask '%s' (%s) crashed: %s", taskId, label, e.msg);
-            catch (Exception) {}
+        bool l = false;
+        if (gWatchdogMutex !is null) {
+            try { gWatchdogMutex.lock_nothrow(); l = true; } catch (Throwable) {}
+        }
+        if (l) {
+            if (idx < s_watchedFibers.length) s_watchedFibers[idx].lastYield = Clock.currTime;
+            g_yieldsTotal++;
+            try { gWatchdogMutex.unlock_nothrow(); l = false; } catch (Throwable) {}
+        } else {
+            if (idx < s_watchedFibers.length) s_watchedFibers[idx].lastYield = Clock.currTime;
+            g_yieldsTotal++;
         }
 
-        s_watchedFibers[idx].lastYield = Clock.currTime;
-        g_yieldsTotal++;
+        try dg();
+        catch (Throwable e) {
+            try {
+                string m;
+                try { m = e.msg; } catch (Throwable) { m = "unknown"; }
+                logWarn("watchedRunTask '%s' (%s) crashed: %s", taskId, label, m);
+            } catch (Throwable) {}
+        }
+
+        if (gWatchdogMutex !is null) {
+            try { gWatchdogMutex.lock_nothrow(); l = true; } catch (Throwable) {}
+        }
+        if (l) {
+            if (idx < s_watchedFibers.length) s_watchedFibers[idx].lastYield = Clock.currTime;
+            g_yieldsTotal++;
+            try { gWatchdogMutex.unlock_nothrow(); } catch (Throwable) {}
+        } else {
+            if (idx < s_watchedFibers.length) s_watchedFibers[idx].lastYield = Clock.currTime;
+            g_yieldsTotal++;
+        }
     }
 
     return runTask(TaskSettings(65_536), &wrapped);
 }
-
 /// Start the watchdog timer (should be called once at boot).
 /// Polls every 5s and logs any fiber that hasn't yielded in >5s.
 void startFiberWatchdog() {
-    if (s_watchdogStarted) return;
-    s_watchdogStarted = true;
+    bool already;
+    if (gWatchdogMutex !is null) synchronized (gWatchdogMutex) {
+        already = s_watchdogStarted;
+        if (!already) s_watchdogStarted = true;
+    } else {
+        already = s_watchdogStarted;
+        if (!already) s_watchdogStarted = true;
+    }
+    if (already) return;
 
     runTask(TaskSettings(100), () nothrow {
         while (true) {
             try {
                 auto now = Clock.currTime;
                 int count = 0;
-                foreach (ref fw; s_watchedFibers) {
-                    if (now - fw.lastYield > 5.seconds) {
-                        count++;
-                        logWarn("FIBER_WATCHDOG: Task '%s' (%s) has not yielded for >5s (last:%s)",
-                            fw.taskId, fw.label, fw.lastYield);
+                if (gWatchdogMutex !is null) synchronized (gWatchdogMutex) {
+                    foreach (ref fw; s_watchedFibers) {
+                        if (now - fw.lastYield > 5.seconds) {
+                            count++;
+                            logWarn("FIBER_WATCHDOG: Task '%s' (%s) has not yielded for >5s (last:%s)",
+                                fw.taskId, fw.label, fw.lastYield);
+                        }
                     }
+                    g_longRunningFiberCount = count;
+                } else {
+                    foreach (ref fw; s_watchedFibers) {
+                        if (now - fw.lastYield > 5.seconds) {
+                            count++;
+                            logWarn("FIBER_WATCHDOG: Task '%s' (%s) has not yielded for >5s (last:%s)",
+                                fw.taskId, fw.label, fw.lastYield);
+                        }
+                    }
+                    g_longRunningFiberCount = count;
                 }
-                g_longRunningFiberCount = count;
-            } catch (Exception e) {
-                // Don't crash the watchdog
+            } catch (Throwable e) {
+                // Don't crash the watchdog — also catch SyncError.
             }
-            try { sleep(5.seconds); } catch (Exception) { break; }
+            try { sleep(5.seconds); } catch (Throwable) { break; }
         }
     });
 }
 
 /// Current count of fibers running >5s without yield.
-@property int longRunningFiberCount() { return g_longRunningFiberCount; }
+@property int longRunningFiberCount() {
+    if (gWatchdogMutex !is null) synchronized (gWatchdogMutex) return g_longRunningFiberCount;
+    return g_longRunningFiberCount;
+}
 
 /// Total yield checkpoints hit since boot.
-@property int yieldsTotal() { return g_yieldsTotal; }
+@property int yieldsTotal() {
+    if (gWatchdogMutex !is null) synchronized (gWatchdogMutex) return g_yieldsTotal;
+    return g_yieldsTotal;
+}
 
 /// Reset counters (useful for tests).
 void resetWatchdogCounters() {
+    if (gWatchdogMutex !is null) synchronized (gWatchdogMutex) {
+        g_longRunningFiberCount = 0;
+        g_yieldsTotal = 0;
+        return;
+    }
     g_longRunningFiberCount = 0;
     g_yieldsTotal = 0;
 }

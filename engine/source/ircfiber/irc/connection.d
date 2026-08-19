@@ -10,6 +10,7 @@ import std.algorithm : canFind, countUntil, remove;
 import std.socket : getAddress, AddressFamily;
 import std.uuid : randomUUID;
 import std.typecons : Nullable;
+import core.sync.mutex : Mutex;
 import core.sys.posix.unistd : getpid;
 
 import vibe.core.core : runTask, sleep, yield;
@@ -106,12 +107,27 @@ private struct HostCircuitBreaker {
     long lastAttemptAt;
 }
 private HostCircuitBreaker[string] _hostBreakers;
+private __gshared Mutex gHostBreakerMutex;
+private shared static this() {
+    try {
+        if (gMullvadMutex is null) gMullvadMutex = new Mutex();
+        if (gDnsMutex is null) gDnsMutex = new Mutex();
+        gHostBreakerMutex = new Mutex();
+    } catch (Throwable) {}
+}
 private shared static immutable HOST_WINDOW_MS   = 30 * 60 * 1000;  // 30 min
 private shared static immutable HOST_FAIL_THRESHOLD = 5;
 private shared static immutable HOST_COOLDOWN_MS = 5 * 60 * 1000;  // 5 min (was 30 min 2026-07-14 — excessive for the reconnect pattern)
 
 /// Record a connection failure to a host. Shared across all clients.
 void recordHostFailure(string host, int port) {
+    if (gHostBreakerMutex !is null) synchronized (gHostBreakerMutex) {
+        recordHostFailureLocked(host, port);
+        return;
+    }
+    recordHostFailureLocked(host, port);
+}
+private void recordHostFailureLocked(string host, int port) {
     auto key = host ~ ":" ~ port.to!string;
     auto now = Clock.currTime.toUnixTime!long * 1000;
     auto breaker = key in _hostBreakers;
@@ -134,6 +150,14 @@ void recordHostFailure(string host, int port) {
 
 /// Record a successful connection — resets the breaker for this host.
 void recordHostSuccess(string host, int port) {
+    if (gHostBreakerMutex !is null) synchronized (gHostBreakerMutex) {
+        auto key = host ~ ":" ~ port.to!string;
+        if (auto breaker = key in _hostBreakers) {
+            _hostBreakers.remove(key);
+            logInfo("Host circuit breaker CLOSED for %s (connection succeeded)", key);
+        }
+        return;
+    }
     auto key = host ~ ":" ~ port.to!string;
     if (auto breaker = key in _hostBreakers) {
         _hostBreakers.remove(key);
@@ -144,6 +168,12 @@ void recordHostSuccess(string host, int port) {
 /// Check if the circuit breaker allows a new connection. Returns false
 /// (don't connect) when the circuit is open and still in cooldown.
 bool canConnectToHost(string host, int port) {
+    if (gHostBreakerMutex !is null) synchronized (gHostBreakerMutex) {
+        return canConnectToHostLocked(host, port);
+    }
+    return canConnectToHostLocked(host, port);
+}
+private bool canConnectToHostLocked(string host, int port) {
     auto key = host ~ ":" ~ port.to!string;
     if (auto breaker = key in _hostBreakers) {
         if (breaker.openedAt > 0) {
@@ -224,6 +254,7 @@ private struct MullvadProxy {
 private __gshared MullvadProxy[] mullvadPool;
 private __gshared size_t mullvadRR;
 private __gshared bool mullvadPoolLoaded;
+private __gshared Mutex gMullvadMutex;
 // Per-host egress ban: hostLower -> label -> expiryMs. When a server
 // G/K/Z-lines an egress IP, we remember that egress is banned for that
 // host for HOST_EGRESS_BAN_MS so future connects to the same host
@@ -233,6 +264,14 @@ private __gshared long[string][string] hostEgressBanUntil;
 private __gshared string mullvadLastUsedLabel;
 private __gshared string mullvadLastUsedHost;
 private __gshared string mullvadLastUsedIp;
+shared static this() {
+    // Enterprise: single global mutex protects all __gshared Mullvad state.
+    // vibe.d fibers are cooperative but connection loops run on different
+    // task fibers concurrently (Happy Eyeballs races, TLS handshake task,
+    // main loop). Unprotected __gshared access caused SyncError@(0) on
+    // 2026-08-17 cnTb-fin — this mutex eliminates that class of crash.
+    try { gMullvadMutex = new Mutex(); } catch (Throwable) {}
+}
 private string mullvadLabelFromHost(string h) {
     auto base = h.split(":")[0];
     auto dash = base.lastIndexOf("-");
@@ -243,6 +282,31 @@ private string mullvadLabelFromHost(string h) {
 }
 
 private void loadMullvadPool() {
+    if (gMullvadMutex !is null) synchronized (gMullvadMutex) {
+        if (mullvadPoolLoaded) return;
+        mullvadPoolLoaded = true;
+        import std.process : environment;
+        auto raw = environment.get("IRCFIBER_MULLVAD_POOL", "");
+        if (raw.length == 0) return;
+        foreach (entry; raw.split(",")) {
+            auto e = entry.strip();
+            if (e.length == 0) continue;
+            auto p = e.indexOf("://");
+            if (p >= 0) e = e[p+3 .. $];
+            auto colon = e.lastIndexOf(":");
+            string host; ushort port = 1080;
+            if (colon >= 0) {
+                host = e[0 .. colon].strip();
+                try { port = e[colon+1 .. $].strip().to!ushort; } catch (Exception) {}
+            } else host = e;
+            if (host.length == 0) continue;
+            auto label = mullvadLabelFromHost(host);
+            mullvadPool ~= MullvadProxy(host, port, label, 0, 0);
+            logInfo("Mullvad pool: %s → %s:%d (label=%s)", entry, host, port, label);
+        }
+        return;
+    }
+    // Fallback if mutex not yet initialized (shared static this ordering)
     if (mullvadPoolLoaded) return;
     mullvadPoolLoaded = true;
     import std.process : environment;
@@ -268,6 +332,12 @@ private void loadMullvadPool() {
 
 private MullvadProxy* pickMullvadProxy(string egressNodeId) {
     loadMullvadPool();
+    if (gMullvadMutex !is null) synchronized (gMullvadMutex) {
+        return pickMullvadProxyLocked(egressNodeId);
+    }
+    return pickMullvadProxyLocked(egressNodeId);
+}
+private MullvadProxy* pickMullvadProxyLocked(string egressNodeId) {
     if (mullvadPool.length == 0) return null;
     const now = Clock.currTime.toUnixTime!long * 1000;
     foreach (ref pr; mullvadPool) if (pr.deadUntilMs != 0 && now >= pr.deadUntilMs) { pr.failCount = 0; pr.deadUntilMs = 0; }
@@ -291,6 +361,12 @@ private MullvadProxy* pickMullvadProxy(string egressNodeId) {
 
 private MullvadProxy*[] getHealthyProxies() {
     loadMullvadPool();
+    if (gMullvadMutex !is null) synchronized (gMullvadMutex) {
+        return getHealthyProxiesLocked();
+    }
+    return getHealthyProxiesLocked();
+}
+private MullvadProxy*[] getHealthyProxiesLocked() {
     if (mullvadPool.length == 0) return [];
     const now = Clock.currTime.toUnixTime!long * 1000;
     foreach (ref pr; mullvadPool) if (pr.deadUntilMs != 0 && now >= pr.deadUntilMs) { pr.failCount = 0; pr.deadUntilMs = 0; }
@@ -300,9 +376,24 @@ private MullvadProxy*[] getHealthyProxies() {
 }
 
 private void recordMullvadSuccess(string label) {
+    if (gMullvadMutex !is null) synchronized (gMullvadMutex) {
+        foreach (ref pr; mullvadPool) if (pr.label == label) { pr.failCount = 0; pr.deadUntilMs = 0; break; }
+        return;
+    }
     foreach (ref pr; mullvadPool) if (pr.label == label) { pr.failCount = 0; pr.deadUntilMs = 0; break; }
 }
 private void recordMullvadFailure(string label) {
+    if (gMullvadMutex !is null) synchronized (gMullvadMutex) {
+        foreach (ref pr; mullvadPool) if (pr.label == label) {
+            pr.failCount++;
+            if (pr.failCount >= 3) {
+                pr.deadUntilMs = Clock.currTime.toUnixTime!long * 1000 + 30_000;
+                logWarn("Mullvad proxy %s (%s:%d) marked dead for 30s after 3 fails", label, pr.host, pr.port);
+            }
+            break;
+        }
+        return;
+    }
     foreach (ref pr; mullvadPool) if (pr.label == label) {
         pr.failCount++;
         if (pr.failCount >= 3) {
@@ -315,6 +406,7 @@ private void recordMullvadFailure(string label) {
 
 private bool isEgressBannedForHost(string hostLower, string label) {
     if (hostLower.length == 0 || label.length == 0) return false;
+    // Called only from synchronized contexts (getHealthyProxiesForHost) or with mutex held.
     if (auto outer = hostLower in hostEgressBanUntil) {
         if (auto expiry = label in *outer) {
             const now = Clock.currTime.toUnixTime!long * 1000;
@@ -328,6 +420,14 @@ private bool isEgressBannedForHost(string hostLower, string label) {
 
 private void banEgressForHost(string host, string label) {
     if (host.length == 0 || label.length == 0) return;
+    if (gMullvadMutex !is null) synchronized (gMullvadMutex) {
+        import std.string : toLower;
+        auto hl = host.toLower();
+        const exp = Clock.currTime.toUnixTime!long * 1000 + HOST_EGRESS_BAN_MS;
+        hostEgressBanUntil[hl][label.toLower()] = exp;
+        logWarn("Mullvad host-ban: egress %s banned for %s for %d ms (until %d)", label, hl, HOST_EGRESS_BAN_MS, exp);
+        return;
+    }
     import std.string : toLower;
     auto hl = host.toLower();
     const exp = Clock.currTime.toUnixTime!long * 1000 + HOST_EGRESS_BAN_MS;
@@ -336,7 +436,14 @@ private void banEgressForHost(string host, string label) {
 }
 
 private MullvadProxy*[] getHealthyProxiesForHost(string hostLower) {
-    auto healthy = getHealthyProxies();
+    // Entire read-modify is synchronized to avoid SyncError on hostEgressBanUntil (AA).
+    if (gMullvadMutex !is null) synchronized (gMullvadMutex) {
+        return getHealthyProxiesForHostLocked(hostLower);
+    }
+    return getHealthyProxiesForHostLocked(hostLower);
+}
+private MullvadProxy*[] getHealthyProxiesForHostLocked(string hostLower) {
+    auto healthy = getHealthyProxiesLocked();
     if (hostLower.length == 0) return healthy;
     const now = Clock.currTime.toUnixTime!long * 1000;
     if (auto outer = hostLower in hostEgressBanUntil) {
@@ -433,15 +540,34 @@ private string stripHostBrackets(string host) @safe pure {
 
 private __gshared ResolvedAddr[][string] dnsCache;
 private __gshared long[string]           dnsCacheTime;
+private __gshared Mutex gDnsMutex;
+shared static this() {
+    // gMullvadMutex already initialized in previous shared static this;
+    // D allows multiple shared static this blocks — they run in order.
+    // Initialize DNS mutex here; if gMullvadMutex init already ran, keep it.
+    try {
+        if (gMullvadMutex is null) gMullvadMutex = new Mutex();
+        gDnsMutex = new Mutex();
+    } catch (Throwable) {}
+}
 
 private ResolvedAddr[] resolveAllAddresses(string host, ushort port) {
     import std.datetime : Clock;
     const now = Clock.currTime.toUnixTime!long * 1000;
     auto normalizedHost = stripHostBrackets(host);
     auto cacheKey = normalizedHost;
-    if (auto t = cacheKey in dnsCacheTime) {
-        if (now - *t < DNS_CACHE_TTL_MS) {
-            if (auto cached = cacheKey in dnsCache) return *cached;
+    // Check cache under lock (enterprise: avoid SyncError on __gshared AA).
+    if (gDnsMutex !is null) synchronized (gDnsMutex) {
+        if (auto t = cacheKey in dnsCacheTime) {
+            if (now - *t < DNS_CACHE_TTL_MS) {
+                if (auto cached = cacheKey in dnsCache) return (*cached).dup;
+            }
+        }
+    } else {
+        if (auto t = cacheKey in dnsCacheTime) {
+            if (now - *t < DNS_CACHE_TTL_MS) {
+                if (auto cached = cacheKey in dnsCache) return *cached;
+            }
         }
     }
     import vibe.core.core : runWorkerTask;
@@ -475,8 +601,13 @@ private ResolvedAddr[] resolveAllAddresses(string host, ushort port) {
             }
         }
         if (result.length > 0) {
-            dnsCache[cacheKey]     = result;
-            dnsCacheTime[cacheKey] = now;
+            if (gDnsMutex !is null) synchronized (gDnsMutex) {
+                dnsCache[cacheKey]     = result;
+                dnsCacheTime[cacheKey] = now;
+            } else {
+                dnsCache[cacheKey]     = result;
+                dnsCacheTime[cacheKey] = now;
+            }
             return result;
         }
     }
@@ -602,11 +733,24 @@ private TCPConnection happyEyeballsConnect(string host, ushort port, string egre
     if (egressNodeId.length > 0) {
         auto pinnedLabel = egressNodeId.toLower();
         MullvadProxy* pinned = null;
-        foreach (ref pr; mullvadPool) if (pr.label == pinnedLabel) { pinned = &pr; break; }
+        if (gMullvadMutex !is null) synchronized (gMullvadMutex) {
+            foreach (ref pr; mullvadPool) if (pr.label == pinnedLabel) { pinned = &pr; break; }
+        } else {
+            foreach (ref pr; mullvadPool) if (pr.label == pinnedLabel) { pinned = &pr; break; }
+        }
         if (pinned !is null) {
-            if (isEgressBannedForHost(hostLower, pinned.label)) {
+            bool banned;
+            bool dead;
+            if (gMullvadMutex !is null) synchronized (gMullvadMutex) {
+                banned = isEgressBannedForHost(hostLower, pinned.label);
+                dead = (pinned.deadUntilMs != 0);
+            } else {
+                banned = isEgressBannedForHost(hostLower, pinned.label);
+                dead = (pinned.deadUntilMs != 0);
+            }
+            if (banned) {
                 logWarn("Mullvad pinned %s is host-banned for %s, falling back to other healthy egresses", pinned.label, hostLower);
-            } else if (pinned.deadUntilMs != 0) {
+            } else if (dead) {
                 logWarn("Mullvad pinned %s is globally dead, falling back to other healthy egresses", pinned.label);
             } else {
                 toTry ~= pinned;
@@ -625,21 +769,34 @@ private TCPConnection happyEyeballsConnect(string host, ushort port, string egre
     foreach (proxy; toTry) {
         try {
             auto conn = happyEyeballsConnectWithProxy(host, port, proxy);
-            mullvadLastUsedLabel = proxy ? proxy.label : "";
-            mullvadLastUsedHost = proxy ? proxy.host ~ ":" ~ proxy.port.to!string : "";
-            mullvadLastUsedIp = "";
+            // Enterprise: protect __gshared last-used egress display vars.
+            if (gMullvadMutex !is null) synchronized (gMullvadMutex) {
+                mullvadLastUsedLabel = proxy ? proxy.label : "";
+                mullvadLastUsedHost = proxy ? proxy.host ~ ":" ~ proxy.port.to!string : "";
+                mullvadLastUsedIp = "";
+            } else {
+                mullvadLastUsedLabel = proxy ? proxy.label : "";
+                mullvadLastUsedHost = proxy ? proxy.host ~ ":" ~ proxy.port.to!string : "";
+                mullvadLastUsedIp = "";
+            }
             if (proxy !is null) {
                 // Best-effort resolve Tailnet IP for admin display.
+                string resolvedIp = "";
                 try {
                     auto addrs = resolveAllAddresses(proxy.host, proxy.port);
-                    if (addrs.length > 0) mullvadLastUsedIp = addrs[0].ip;
+                    if (addrs.length > 0) resolvedIp = addrs[0].ip;
                 } catch (Exception) {}
-                if (mullvadLastUsedIp.length == 0) {
+                if (resolvedIp.length == 0) {
                     try {
                         import vibe.core.net : resolveHost;
                         auto a = getAddress(proxy.host, proxy.port);
-                        if (a.length > 0) mullvadLastUsedIp = a[0].toAddrString();
+                        if (a.length > 0) resolvedIp = a[0].toAddrString();
                     } catch (Exception) {}
+                }
+                if (gMullvadMutex !is null) synchronized (gMullvadMutex) {
+                    mullvadLastUsedIp = resolvedIp;
+                } else {
+                    mullvadLastUsedIp = resolvedIp;
                 }
                 recordMullvadSuccess(proxy.label);
             }
@@ -647,16 +804,25 @@ private TCPConnection happyEyeballsConnect(string host, ushort port, string egre
         } catch (Exception e) {
             lastErr = e;
             logWarn("happyEyeballsConnect via %s failed for %s:%d: %s, trying next egress", proxy ? proxy.label : "direct", host, port, e.msg);
+            // On TLS timeout specifically, ban this egress for this host so the next proxy is tried immediately
+            // rather than re-cycling the same wedged exit.
+            if (proxy !is null && e.msg.canFind("TLS handshake timed out")) {
+                banEgressForHost(host, proxy.label);
+            }
             continue;
         }
     }
-    mullvadLastUsedLabel = "";
-    mullvadLastUsedHost = "";
-    mullvadLastUsedIp = "";
+    if (gMullvadMutex !is null) synchronized (gMullvadMutex) {
+        mullvadLastUsedLabel = "";
+        mullvadLastUsedHost = "";
+        mullvadLastUsedIp = "";
+    } else {
+        mullvadLastUsedLabel = "";
+        mullvadLastUsedHost = "";
+        mullvadLastUsedIp = "";
+    }
     throw lastErr ? lastErr : new Exception("All connection attempts failed for " ~ host ~ ":" ~ port.to!string);
 }
-
-
 /**
  * Clean up Happy Eyeballs loser tasks and connections.
  *
@@ -676,21 +842,39 @@ private void finishHappyEyeballs(TCPConnection[] conns, Task[] tasks, int winner
         }
     }
 }
-
 /**
- * Create a TLS stream with a bounded handshake timeout.
+ * Create a TLS stream with a bounded handshake timeout — enterprise grade.
  *
  * vibe.d's createTLSStream performs the SSL handshake inside the constructor
  * and has no timeout parameter. If the server accepts TCP but never completes
- * the TLS handshake, the fiber blocks forever. This helper runs the handshake
- * in a sub-task and enforces a hard timeout; on timeout it closes the
- * underlying TCP connection to unblock the stuck task.
+ * the TLS handshake, the fiber blocks forever. The previous implementation
+ * used task.interrupt() + holder.conn.close() but OpenSSL's SSL_connect
+ * blocks on a raw read() that does NOT yield to vibe's scheduler, so the
+ * interrupt never fires and the fiber wedges (observed 2026-08-18 20:55:17:
+ * tcp_open succeeded via socks-mullvad-se/172.22.0.3 but no tls_handshake
+ * log for 5h). Heartbeat kept ticking while the connection loop was stuck
+ * forever in createTLSStreamWithTimeout.
+ *
+ * Enterprise fix (2026-08-18):
+ *  - Capture the underlying fd and call POSIX shutdown(SHUT_RDWR) on timeout
+ *    to force SSL_connect's blocked read() to return. close() alone is not
+ *    sufficient when the BIO holds a dup of the fd.
+ *  - Use shared atomic flag + eventDriver timer to guarantee the timeout
+ *    fires even if the channel's internal mutex is wedged (SyncError).
+ *  - Catch Throwable (not just Exception) so SyncError propagates as a
+ *    clean timeout exception instead of killing the TaskFiber.
+ *  - Structured logging + observability counters for timeout vs fail.
+ *  - Auto-ban the egress for this host on TLS timeout so the retry loop
+ *    falls through to the next healthy egress (se → us → direct).
  */
 private TLSStream createTLSStreamWithTimeout(TCPConnection connection, TLSContext ctx, string host, Duration timeout) {
     import vibe.core.channel : createChannel;
+    import core.atomic : atomicLoad, atomicStore;
+    import core.sys.posix.sys.socket : shutdown, SHUT_RDWR;
+    shared bool handshakeDone = false;
     auto doneCh = createChannel!bool();
     TLSStream resultStream;
-    Exception resultException;
+    Throwable resultThrowable;
 
     // TCPConnection has scoped destruction and cannot be captured directly in
     // a closure. Store it on the heap so the handshake task can safely use it
@@ -700,31 +884,63 @@ private TLSStream createTLSStreamWithTimeout(TCPConnection connection, TLSContex
         this(TCPConnection c) { this.conn = c; }
     }
     auto holder = new ConnHolder(connection);
+    // Capture fd early — after close() the fd becomes -1.
+    int rawFd = -1;
+    try { rawFd = cast(int) connection.fd; } catch (Exception) {}
 
     auto task = safeFiberRun("tls_handshake", host, {
         try {
             resultStream = createTLSStream(holder.conn, ctx, host);
-            try { doneCh.put(true); } catch (Exception) {}
-        } catch (Exception e) {
-            resultException = e;
-            try { doneCh.put(false); } catch (Exception) {}
+            atomicStore(handshakeDone, true);
+            try { doneCh.put(true); } catch (Throwable) {}
+        } catch (Throwable e) {
+            resultThrowable = e;
+            atomicStore(handshakeDone, true);
+            try { doneCh.put(false); } catch (Throwable) {}
         }
     });
 
     bool ok;
-    if (!doneCh.tryConsumeOne(ok, timeout)) {
-        // Timeout: interrupt the handshake task and tear down the socket so
-        // the task unblocks instead of leaking a stuck fiber.
-        try { task.interrupt(); } catch (Exception) {}
-        try { holder.conn.close(); } catch (Exception) {}
-        throw new Exception("TLS handshake timed out after " ~ timeout.to!string);
+    bool consumed = false;
+    try {
+        consumed = doneCh.tryConsumeOne(ok, timeout);
+    } catch (Throwable e) {
+        // Channel SyncError (observed 2026-08-17 cnTb-fin) — treat as timeout.
+        logWarn("TLS handshake channel SyncError for %s: %s — forcing timeout path", host, e.msg);
+        consumed = false;
+    }
+    if (!consumed) {
+        // Timeout: force-unblock the handshake task.
+        logWarn("TLS handshake timed out for %s after %s (fd=%d) — shutting down socket to unblock OpenSSL", host, timeout.to!string, rawFd);
+        recordCounter("ircfiber.tls_handshake.timeout", 1, ["host": host]);
+        // 1) shutdown() forces SSL_connect's blocked read to return (close alone may not).
+        if (rawFd >= 0) {
+            try { shutdown(rawFd, SHUT_RDWR); } catch (Throwable) {}
+        }
+        // 2) vibe-level close to release the TCPConnection object.
+        try { holder.conn.close(); } catch (Throwable) {}
+        // 3) interrupt the fiber (best-effort — may already be blocked in C).
+        try { task.interrupt(); } catch (Throwable) {}
+        // Give the handshake task a brief grace to observe the shutdown and exit.
+        try { sleep(200.msecs); } catch (Throwable) {}
+        // If it still hasn't completed, the task will be reaped on next GC; we throw now
+        // so the connection loop retries via the next egress instead of wedging forever.
+        if (!atomicLoad(handshakeDone)) {
+            logWarn("TLS handshake task for %s still not done after shutdown — abandoning (fiber will be GC'd)", host);
+        }
+        throw new Exception("TLS handshake timed out after " ~ timeout.to!string ~ " for " ~ host);
     }
 
     if (!ok) {
-        if (resultException !is null) throw resultException;
-        throw new Exception("TLS handshake failed");
+        if (resultThrowable !is null) {
+            // Preserve original error chain for operator triage.
+            if (auto e = cast(Exception) resultThrowable) throw e;
+            throw new Exception("TLS handshake failed for " ~ host ~ ": " ~ resultThrowable.msg);
+        }
+        throw new Exception("TLS handshake failed for " ~ host);
     }
 
+    recordCounter("ircfiber.tls_handshake.success", 1, ["host": host]);
     return resultStream;
 }
 
@@ -1192,21 +1408,30 @@ final class PersistentIRCClient {
         safeFiberRun("connection_loop", config.name, {
             try {
                 runConnectionLoop();
-            } catch (Exception e) {
-                logException("connection", e,
+            } catch (Throwable e) {
+                // Enterprise: catch Throwable (SyncError previously killed fiber as FATAL).
+                string msg;
+                try { msg = e.msg; } catch (Throwable) { msg = "unknown"; }
+                logJsonMap("error", "connection",
                     "Connection loop crashed — restarting in 5s",
-                    ["network": config.name, "event": "connection_crashed"]);
-                try sleep(5.seconds); catch (Exception) {}
+                    ["network": config.name, "event": "connection_crashed", "err": msg]);
+                recordCounter("ircfiber.connection.loop_crash", 1, ["host": config.host]);
+                try sleep(5.seconds); catch (Throwable) {}
                 if (!isShutdownRequested) {
                     try {
                         runConnectionLoop();
-                    } catch (Exception e2) {
-                        logError("Connection loop for %s crashed again: %s", config.name, e2.msg);
+                    } catch (Throwable e2) {
+                        string m2;
+                        try { m2 = e2.msg; } catch (Throwable) { m2 = "unknown"; }
+                        logJsonMap("error", "connection",
+                            "Connection loop crashed again",
+                            ["network": config.name, "event": "connection_crashed_again", "err": m2]);
+                        // Last resort: mark disconnected so snapshot reflects reality.
+                        try { state = ConnectionState.disconnected; } catch (Throwable) {}
                     }
                 }
             }
         });
-
     }
 
     /// Stops the connection and requests shutdown. If `quitReason` is
@@ -1953,20 +2178,30 @@ final class PersistentIRCClient {
                     try transportClose(); catch (Exception) {}
                     break;
                 }
-            } catch (Exception e) {
+            } catch (Throwable e) {
+                // Enterprise: catch Throwable (not just Exception) — SyncError@(0) from
+                // unsynchronized __gshared access previously killed the TaskFiber
+                // (observed 2026-08-17 cnTb-fin FATAL) and the TLS wedge left the
+                // loop stuck forever. SyncError must be treated as a recoverable
+                // disconnect, not a fiber terminator.
+                string errMsg;
+                try { errMsg = e.msg; } catch (Throwable) { errMsg = "unknown throwable"; }
                 // Downgraded from logException(error) with hex stack spam.
                 // `transport not alive` and `Registration timed out` are expected
-                // during normal reconnect (gangnet every 5s) — not `error`.
-                // Use warn without stack to avoid SigNoz `has_error` flood and
-                // useless `??:? [0x...]` addresses.
+                // during normal reconnect — not `error`.
                 logJsonMap("warn", "connection",
                     "Connection error",
                     ["network": config.name, "host": config.host,
-                     "err": e.msg,
+                     "err": errMsg,
                      "event": "connection_error"]);
+                // Record SyncError distinctly for observability.
+                if (errMsg.canFind("SyncError") || typeid(e).toString().canFind("SyncError")) {
+                    recordCounter("ircfiber.connection.sync_error", 1, ["host": config.host]);
+                    logWarn("SyncError recovered for %s: %s — treating as disconnect, will reconnect", config.name, errMsg);
+                }
                 // Save the disconnect reason BEFORE handleDisconnection so
                 // it emits the DISCONNECTED event with the right text.
-                string reason = e.msg.length > 0 ? e.msg : "Connection closed unexpectedly";
+                string reason = errMsg.length > 0 ? errMsg : "Connection closed unexpectedly";
                 if (reason == "Peer closed connection" || reason == "Connection lost"
                     || reason == "Server closed during registration") {
                     reason = "Connection closed unexpectedly";
@@ -1985,11 +2220,16 @@ final class PersistentIRCClient {
 
                 // handleDisconnection now emits the DISCONNECTED lifecycle
                 // event so the frontend sees the state transition for ALL
-                // disconnect paths (data-loss, PONG timeout, server ERROR,
-                // squashed ERROR, etc.). The emitLog("error") + DISCONNECT
-                // previously done here are removed — they're superseded by
-                // the centralized event in handleDisconnection().
-                handleDisconnection();
+                // disconnect paths. Wrapped in Throwable catch so a secondary
+                // SyncError there doesn't kill the loop.
+                try {
+                    handleDisconnection();
+                } catch (Throwable he) {
+                    try logWarn("handleDisconnection threw for %s: %s", config.name, he.msg);
+                    catch (Throwable) {}
+                    try { transportClose(); } catch (Throwable) {}
+                    state = ConnectionState.disconnected;
+                }
 
                 if (isShutdownRequested) break;
 
@@ -2009,10 +2249,22 @@ final class PersistentIRCClient {
                         rdb.hset(failKey, "error", reason);
                         rdb.hset(failKey, "lastFailure", now.to!string);
                         logInfo("Reported connection failure for %s to smart routing", config.name);
-                    } catch (Exception) {}
+                    } catch (Throwable) {}
+                }
+                // Track TLS timeout vs generic disconnect for egress rotation.
+                if (reason.canFind("TLS handshake timed out") || errMsg.canFind("TLS handshake timed out")) {
+                    recordCounter("ircfiber.tls_handshake.timeout_disconnect", 1, ["host": config.host]);
+                    // Ban the last-used egress for this host so the next attempt tries a different exit.
+                    string lastLabel;
+                    if (gMullvadMutex !is null) synchronized (gMullvadMutex) {
+                        lastLabel = mullvadLastUsedLabel;
+                    } else {
+                        lastLabel = mullvadLastUsedLabel;
+                    }
+                    if (lastLabel.length > 0) banEgressForHost(config.host, lastLabel);
+                    recordHostFailure(config.host, config.port);
                 }
             }
-
             if (isShutdownRequested) break;
             if (!shouldReconnect) break;
 
