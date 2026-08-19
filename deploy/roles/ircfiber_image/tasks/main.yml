@@ -125,13 +125,30 @@
   when: docker_registry_url | length > 0
 
 # ---- Without registry: build on each target host ---------------------------
+- name: Ensure /opt/ircfiber-src ownership (fix 501 rsync set-times)
+  ansible.builtin.file:
+    path: /opt/ircfiber-src
+    state: directory
+    owner: deploy
+    group: deploy
+    mode: "0755"
+    recurse: true
+  become: true
+  when: docker_registry_url | length == 0
+
 - name: Rsync irc-fiber repo to the target host (no-registry mode)
   ansible.posix.synchronize:
     src: "{{ ircfiber_repo_root }}/"
     dest: "/opt/ircfiber-src/"
     delete: false
     recursive: true
+    owner: false
+    group: false
+    checksum: true
+    times: true
     rsync_opts:
+      - "--omit-dir-times"
+      - "--no-perms"
       - "--exclude=.git"
       - "--exclude=node_modules"
       - "--exclude=.dub"
@@ -144,9 +161,12 @@
       - "--exclude=e2e/test-results"
       - "--exclude=*.log"
       - "--exclude=.worktrees"
+      - "--exclude=.nosync"
+      - "--exclude=.DS_Store"
+      - "--exclude=*\\ 2.html"
+      - "--exclude=*\\ 2.*"
   when: docker_registry_url | length == 0
   throttle: 1
-
 - name: Build gateway image on the target host (no-registry mode)
   ansible.builtin.command: >
     docker build
