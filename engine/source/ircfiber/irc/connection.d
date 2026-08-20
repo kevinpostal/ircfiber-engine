@@ -436,6 +436,11 @@ private void banEgressForHost(string host, string label) {
 }
 
 private MullvadProxy*[] getHealthyProxiesForHost(string hostLower) {
+    // The host-aware path skips the unlocked getHealthyProxies() wrapper, so
+    // it must load the pool itself (the wrapper is the only other caller of
+    // loadMullvadPool). Without this the pool stays empty and every network
+    // falls back to direct egress.
+    loadMullvadPool();
     // Entire read-modify is synchronized to avoid SyncError on hostEgressBanUntil (AA).
     if (gMullvadMutex !is null) synchronized (gMullvadMutex) {
         return getHealthyProxiesForHostLocked(hostLower);
