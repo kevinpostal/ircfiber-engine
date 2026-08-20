@@ -11,6 +11,9 @@ COOLDOWN_ENGINE=/tmp/ircfiber-monitor-engine-cooldown
 COOLDOWN_GATEWAY=/tmp/ircfiber-monitor-gateway-cooldown
 FAIL=0
 REASON=""
+STALE_STATE=/tmp/ircfiber-monitor-engine-stale
+STALE_THRESHOLD_S=120
+STALE_STRIKES=3
 exec 9>"$LOCK" 2>/dev/null || exec 9>/tmp/ircfiber-monitor.lock
 flock -n 9 || { echo "[$TIMESTAMP] SKIP overlapping run" | logger -t ircfiber-monitor; exit 0; }
 mkdir -p /var/log/ircfiber 2>/dev/null || true
@@ -37,7 +40,29 @@ HLEN=$(retry_redis_hlen)
 if ! [[ "$HLEN" =~ ^[0-9]+$ ]]; then HLEN=""; fi
 HB=$(docker exec $REDIS_DOCKER redis-cli --raw hget "irc:server:ovh" "lastHeartbeat" 2>&1 | tr -d "\r" | head -n1)
 AGE_S=""
-if [[ "$HB" =~ ^[0-9]+$ ]] && [ "$HB" -gt 0 ] 2>/dev/null; then NOW=$(date +%s000); AGE_MS=$((NOW - HB)); AGE_S=$((AGE_MS / 1000)); if [ "$AGE_S" -gt 90 ]; then FAIL=1; REASON="${REASON} heartbeat_stale_${AGE_S}s"; fi; else FAIL=1; REASON="${REASON} heartbeat_missing"; AGE_S="?"; fi
+STRIKES=0
+if [[ "$HB" =~ ^[0-9]+$ ]] && [ "$HB" -gt 0 ] 2>/dev/null; then
+  NOW=$(date +%s000); AGE_MS=$((NOW - HB)); AGE_S=$((AGE_MS / 1000))
+  if [ "$AGE_S" -gt "$STALE_THRESHOLD_S" ]; then
+    STRIKES=$(cat "$STALE_STATE" 2>/dev/null | tr -cd '0-9'); [ -z "$STRIKES" ] && STRIKES=0
+    STRIKES=$((STRIKES + 1)); echo "$STRIKES" > "$STALE_STATE"
+    if [ "$STRIKES" -ge "$STALE_STRIKES" ]; then
+      FAIL=1; REASON="${REASON} heartbeat_stale_${AGE_S}s_x${STRIKES}"
+    else
+      logger -t ircfiber-monitor "WARN heartbeat_stale ${AGE_S}s strike=${STRIKES}/${STALE_STRIKES} (deferring restart)"
+    fi
+  else
+    rm -f "$STALE_STATE" 2>/dev/null || true
+  fi
+else
+  STRIKES=$(cat "$STALE_STATE" 2>/dev/null | tr -cd '0-9'); [ -z "$STRIKES" ] && STRIKES=0
+  STRIKES=$((STRIKES + 1)); echo "$STRIKES" > "$STALE_STATE"
+  if [ "$STRIKES" -ge "$STALE_STRIKES" ]; then
+    FAIL=1; REASON="${REASON} heartbeat_missing_x${STRIKES}"; AGE_S="?"
+  else
+    logger -t ircfiber-monitor "WARN heartbeat_missing strike=${STRIKES}/${STALE_STRIKES} (deferring restart)"
+  fi
+fi
 if [ -z "$HLEN" ] || [ "$HLEN" -eq 0 ] 2>/dev/null; then if [[ "$AGE_S" =~ ^[0-9]+$ ]] && [ "$AGE_S" -lt 60 ]; then echo "[$TIMESTAMP] WARN assignments_empty but heartbeat fresh ${AGE_S}s — not restarting engine (transient)" | tee -a "$LOG" 2>/dev/null || logger -t ircfiber-monitor "WARN assignments_empty hb_age=${AGE_S}s hlen=$HLEN"; else FAIL=1; REASON="${REASON} assignments_empty"; fi; fi
 FD=""; GW_PID=$(docker exec $GATEWAY sh -c "pidof irc-fiber 2>/dev/null || pgrep -f irc-fiber 2>/dev/null | head -n1" 2>&1 | tr -d "\r" | xargs)
 if [ -n "$GW_PID" ] && [[ "$GW_PID" =~ ^[0-9]+$ ]]; then FD=$(docker exec $GATEWAY sh -c "ls /proc/$GW_PID/fd 2>&1 | wc -l" 2>&1 | tr -d "\r" | xargs); else FD=$(docker exec $GATEWAY sh -c "ls /proc/1/fd 2>&1 | wc -l" 2>&1 | tr -d "\r" | xargs); fi
