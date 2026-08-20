@@ -29,9 +29,13 @@ appendfsync everysec
 save 3600 1 300 100
 {% endif %}
 
-# Memory
+# Memory — volatile-lru protects critical non-TTL keys (irc:assignments,
+# irc:servers, irc:server:ovh) from eviction. Only TTL keys (state,
+# scrollback, dedup, leases) are evictable. Prior allkeys-lru evicted the
+# assignments hash at 19:55Z 2026-08-20 (canonical 0 + mirror 20 => monitor
+# killed engine). See monitor assignments_empty fix.
 maxmemory {{ redis_maxmemory }}
-maxmemory-policy allkeys-lru
+maxmemory-policy volatile-lru
 
 # Logging
 loglevel notice
