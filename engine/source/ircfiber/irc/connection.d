@@ -285,33 +285,32 @@ private void loadMullvadPool() {
     if (gMullvadMutex !is null) synchronized (gMullvadMutex) {
         if (mullvadPoolLoaded) return;
         mullvadPoolLoaded = true;
-        import std.process : environment;
-        auto raw = environment.get("IRCFIBER_MULLVAD_POOL", "");
-        if (raw.length == 0) return;
-        foreach (entry; raw.split(",")) {
-            auto e = entry.strip();
-            if (e.length == 0) continue;
-            auto p = e.indexOf("://");
-            if (p >= 0) e = e[p+3 .. $];
-            auto colon = e.lastIndexOf(":");
-            string host; ushort port = 1080;
-            if (colon >= 0) {
-                host = e[0 .. colon].strip();
-                try { port = e[colon+1 .. $].strip().to!ushort; } catch (Exception) {}
-            } else host = e;
-            if (host.length == 0) continue;
-            auto label = mullvadLabelFromHost(host);
-            mullvadPool ~= MullvadProxy(host, port, label, 0, 0);
-            logInfo("Mullvad pool: %s → %s:%d (label=%s)", entry, host, port, label);
-        }
+        loadMullvadPoolUnlocked();
         return;
     }
     // Fallback if mutex not yet initialized (shared static this ordering)
     if (mullvadPoolLoaded) return;
     mullvadPoolLoaded = true;
-    import std.process : environment;
-    auto raw = environment.get("IRCFIBER_MULLVAD_POOL", "");
-    if (raw.length == 0) return;
+    loadMullvadPoolUnlocked();
+}
+
+// Reads IRCFIBER_MULLVAD_POOL directly via getenv. std.process.environment
+// returned an empty string in the deployed binary despite the variable being
+// present in /proc/self/environ, leaving the pool empty at runtime. Caller
+// holds gMullvadMutex and has set mullvadPoolLoaded = true.
+private void loadMullvadPoolUnlocked() {
+    import core.stdc.stdlib : getenv;
+    import core.stdc.string : strlen;
+    auto envp = getenv(toStringz("IRCFIBER_MULLVAD_POOL"));
+    if (envp is null) {
+        logWarn("Mullvad pool: IRCFIBER_MULLVAD_POOL not set (getenv null)");
+        return;
+    }
+    auto raw = envp[0 .. strlen(envp)].idup;
+    if (raw.length == 0) {
+        logWarn("Mullvad pool: IRCFIBER_MULLVAD_POOL is empty");
+        return;
+    }
     foreach (entry; raw.split(",")) {
         auto e = entry.strip();
         if (e.length == 0) continue;
@@ -328,6 +327,7 @@ private void loadMullvadPool() {
         mullvadPool ~= MullvadProxy(host, port, label, 0, 0);
         logInfo("Mullvad pool: %s → %s:%d (label=%s)", entry, host, port, label);
     }
+    logInfo("Mullvad pool loaded: %d proxies", cast(int) mullvadPool.length);
 }
 
 private MullvadProxy* pickMullvadProxy(string egressNodeId) {
