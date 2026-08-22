@@ -41,7 +41,7 @@ BACKEND ?= local
 VITE_BACKEND_URL ?= https://vps-efb4b52d.tail544547.ts.net
 
 ifeq ($(BACKEND),tailnet)
-  EFFECTIVE_BACKEND_URL := https://vps-efb4b52d.tail544547.ts.net
+  EFFECTIVE_BACKEND_URL := http://127.0.0.1:8090
 else ifeq ($(BACKEND),local)
   EFFECTIVE_BACKEND_URL := http://127.0.0.1:8090
 else
