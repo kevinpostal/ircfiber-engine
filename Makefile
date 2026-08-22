@@ -39,9 +39,10 @@ DUB_PKG     := $(HOME)/.dub/packages
 # For the D backend runner (the previous `make run`), use `make run-gateway`.
 BACKEND ?= local
 VITE_BACKEND_URL ?= https://vps-efb4b52d.tail544547.ts.net
+TAILNET_GATEWAY_PORT ?= 18090
 
 ifeq ($(BACKEND),tailnet)
-  EFFECTIVE_BACKEND_URL := http://127.0.0.1:8090
+  EFFECTIVE_BACKEND_URL := http://127.0.0.1:$(TAILNET_GATEWAY_PORT)
 else ifeq ($(BACKEND),local)
   EFFECTIVE_BACKEND_URL := http://127.0.0.1:8090
 else
@@ -107,7 +108,7 @@ AR := →
 .PHONY: build build-gateway build-engine build-release build-debug build-ldc2 janitor-migrate frontend frontend-build frontend-dev frontend-install
 .PHONY: version
 
-.PHONY: dev dev-docker dev-live debug debug-live debug-host debug-all stop
+.PHONY: dev dev-docker dev-live dev-live-tunnel debug debug-live debug-host debug-all stop
 .PHONY: engine engine-rebuild engine-handoff engine-handoff-redis engine-restart engine-test
 .PHONY: engine-start engine-stop engine-restart-docker
 .PHONY: gateway gateway-rebuild gateway-restart gateway-start
@@ -265,12 +266,32 @@ frontend: frontend-build ## Build > Frontend bundle + rebuild local gateway so i
 	else \
 		printf '%b\n' "$(D)  No local ircfiber-gateway container — bundle built, gateway untouched$(R)"; \
 	fi
-
-# Frontend dev pointing at the tailnet gateway (no local D backend at all).
-dev-live: ## Component > Frontend dev (Vite) against the TAILNET gateway
+# Frontend dev pointing at the live DBs via the TAILNET gateway (port $(TAILNET_GATEWAY_PORT)).
+# Two ways to provide the live gateway on http://127.0.0.1:$(TAILNET_GATEWAY_PORT):
+#   1. `make debug-live` in another terminal — builds a local gateway+engine that talk to the
+#      tailnet Redis/Mongo (OVH data) and publishes on :$(TAILNET_GATEWAY_PORT). Preferred when
+#      you're iterating on D code against live data.
+#   2. `make dev-live-tunnel` — ssh -L from OVH's gateway :8090 to local :$(TAILNET_GATEWAY_PORT).
+#      No docker build, just a tunnel. Preferred for pure frontend work.
+# `make dev-live` itself only starts Vite; it exits with a hint if nothing is listening on
+# :$(TAILNET_GATEWAY_PORT).
+dev-live: ## Component > Frontend dev (Vite) against LIVE DBs (tailnet) — needs debug-live or dev-live-tunnel
+	@if ! lsof -ti :$(TAILNET_GATEWAY_PORT) -sTCP:LISTEN >/dev/null 2>&1 && ! nc -z 127.0.0.1 $(TAILNET_GATEWAY_PORT) 2>/dev/null; then \
+		printf '\n\033[33m⚠ Nothing listening on :$(TAILNET_GATEWAY_PORT) — dev-live will hit live DB only via:\033[0m\n'; \
+		printf '  \033[2m• make debug-live              # docker gateway+engine → tailnet Redis/Mongo (live data, local build)\033[0m\n'; \
+		printf '  \033[2m• make dev-live-tunnel         # ssh -L tunnel → OVH gateway (live data, no build)\033[0m\n'; \
+		printf '  \033[2m  (starting Vite anyway — it will proxy to local :8090 data until one of the above is up)\033[0m\n'; \
+	fi
 	@$(MAKE) --no-print-directory dev BACKEND=tailnet
 
-# Docker + Vite dev — starts Docker backend (redis/mongo/ircd/gateway/engine)
+dev-live-tunnel: ## Component > ssh -L tunnel OVH gateway (172.30.0.2:8090) → local :$(TAILNET_GATEWAY_PORT) for dev-live (no docker build)
+	@port=$(TAILNET_GATEWAY_PORT); gw_ip=$$(ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o ConnectTimeout=5 deploy@203.0.113.10 'sudo docker inspect -f "{{.NetworkSettings.Networks.ircfiber_net.IPAddress}}" ircfiber-gateway 2>/dev/null || echo 172.30.0.2'); \
+	if lsof -ti :$$port -sTCP:LISTEN >/dev/null 2>&1; then echo "Port :$$port already in use — kill the owner or run: lsof -ti :$$port | xargs kill"; exit 1; fi; \
+	if [ -z "$$gw_ip" ]; then gw_ip=172.30.0.2; fi; echo "OVH gateway IP: $$gw_ip"; \
+	printf '\n\033[46m\033[30m\033[1m  Tunnel OVH gateway $$gw_ip:8090 → 127.0.0.1:$$port  \033[0m\n'; \
+	printf '\033[2m  ssh -L $$port:$$gw_ip:8090 deploy@203.0.113.10 (via -F /dev/null -i ~/.ssh/id_ed25519_ircfiber)\033[0m\n'; \
+	printf '\033[33m⚠ Keep this terminal open — ctrl-c closes the tunnel. In another terminal: make dev-live\033[0m\n'; \
+	ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -L $$port:$$gw_ip:8090 -N deploy@203.0.113.10
 # then launches the Vite dev server with HMR. Fastest full-stack dev cycle:
 #   - Docker runs backend
 #   - Vite serves frontend with live reload on save
@@ -431,10 +452,11 @@ debug-live: ensure-colima frontend-build ## Component > Gateway + engine in Dock
 	@printf '\n\033[46m\033[30m\033[1m  Gateway + engine (docker) → tailnet DBs  \033[0m\n'
 	@printf '\033[2m  Mongo: %s\033[0m\n' "$(TAILNET_MONGO_URL)"
 	@printf '\033[2m  Redis: %s\033[0m\n' "$(TAILNET_REDIS_URL)"
+	@printf '\033[2m  Gateway: http://127.0.0.1:$(TAILNET_GATEWAY_PORT)  (Vite: make dev-live)\033[0m\n'
 	@printf '\033[2m  Containerfile target: builder (compiles gateway+engine on first run)\033[0m\n'
 	@printf '\033[33m⚠ ctrl-c to stop  •  tail logs:  docker compose -p ircfiber-tailnet -f docker-compose.tailnet.yml logs -f\033[0m\n'
 	@docker compose -p ircfiber-tailnet -f docker-compose.tailnet.yml down --remove-orphans 2>/dev/null || true
-	TAILNET_MONGO_URL="$(TAILNET_MONGO_URL)" TAILNET_REDIS_URL="$(TAILNET_REDIS_URL)" IRCFIBER_SERVER_ID="$(or $(IRCFIBER_SERVER_ID),localdebug)" \
+	TAILNET_GATEWAY_PORT="$(TAILNET_GATEWAY_PORT)" TAILNET_MONGO_URL="$(TAILNET_MONGO_URL)" TAILNET_REDIS_URL="$(TAILNET_REDIS_URL)" IRCFIBER_SERVER_ID="$(or $(IRCFIBER_SERVER_ID),localdebug)" \
 		docker compose -p ircfiber-tailnet -f docker-compose.tailnet.yml up --build
 
 # Stop everything (tailnet + local docker stacks + native processes). Does NOT kill a Vite dev server.
