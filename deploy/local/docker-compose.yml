@@ -250,6 +250,7 @@ services:
       IRCFIBER_REDIS_URL: redis://redis:6379/0
       IRCFIBER_MONGO_URL: mongodb://mongo:27017/ircfiber
       IRCFIBER_LOG_LEVEL: debug
+      IRCFIBER_MULLVAD_POOL: socks5://tailscale-mullvad-de:1055,socks5://tailscale-mullvad-ch:1055,socks5://tailscale-mullvad-nl:1055
     depends_on:
       redis:
         condition: service_healthy

@@ -107,12 +107,12 @@ private struct HostCircuitBreaker {
     long lastAttemptAt;
 }
 private HostCircuitBreaker[string] _hostBreakers;
-private __gshared Mutex gHostBreakerMutex;
+private __gshared Object gHostBreakerLock;
 private shared static this() {
     try {
-        if (gMullvadMutex is null) gMullvadMutex = new Mutex();
-        if (gDnsMutex is null) gDnsMutex = new Mutex();
-        gHostBreakerMutex = new Mutex();
+        if (gMullvadLock is null) gMullvadLock = new Object();
+        if (gDnsLock is null) gDnsLock = new Object();
+        gHostBreakerLock = new Object();
     } catch (Throwable) {}
 }
 private shared static immutable HOST_WINDOW_MS   = 30 * 60 * 1000;  // 30 min
@@ -121,7 +121,7 @@ private shared static immutable HOST_COOLDOWN_MS = 5 * 60 * 1000;  // 5 min (was
 
 /// Record a connection failure to a host. Shared across all clients.
 void recordHostFailure(string host, int port) {
-    if (gHostBreakerMutex !is null) synchronized (gHostBreakerMutex) {
+    if (gHostBreakerLock !is null) synchronized (gHostBreakerLock) {
         recordHostFailureLocked(host, port);
         return;
     }
@@ -150,7 +150,7 @@ private void recordHostFailureLocked(string host, int port) {
 
 /// Record a successful connection — resets the breaker for this host.
 void recordHostSuccess(string host, int port) {
-    if (gHostBreakerMutex !is null) synchronized (gHostBreakerMutex) {
+    if (gHostBreakerLock !is null) synchronized (gHostBreakerLock) {
         auto key = host ~ ":" ~ port.to!string;
         if (auto breaker = key in _hostBreakers) {
             _hostBreakers.remove(key);
@@ -168,7 +168,7 @@ void recordHostSuccess(string host, int port) {
 /// Check if the circuit breaker allows a new connection. Returns false
 /// (don't connect) when the circuit is open and still in cooldown.
 bool canConnectToHost(string host, int port) {
-    if (gHostBreakerMutex !is null) synchronized (gHostBreakerMutex) {
+    if (gHostBreakerLock !is null) synchronized (gHostBreakerLock) {
         return canConnectToHostLocked(host, port);
     }
     return canConnectToHostLocked(host, port);
@@ -254,7 +254,7 @@ private struct MullvadProxy {
 private __gshared MullvadProxy[] mullvadPool;
 private __gshared size_t mullvadRR;
 private __gshared bool mullvadPoolLoaded;
-private __gshared Mutex gMullvadMutex;
+private __gshared Object gMullvadLock;
 // Per-host egress ban: hostLower -> label -> expiryMs. When a server
 // G/K/Z-lines an egress IP, we remember that egress is banned for that
 // host for HOST_EGRESS_BAN_MS so future connects to the same host
@@ -270,7 +270,7 @@ shared static this() {
     // task fibers concurrently (Happy Eyeballs races, TLS handshake task,
     // main loop). Unprotected __gshared access caused SyncError@(0) on
     // 2026-08-17 cnTb-fin — this mutex eliminates that class of crash.
-    try { gMullvadMutex = new Mutex(); } catch (Throwable) {}
+    try { gMullvadLock = new Object(); } catch (Throwable) {}
 }
 private string mullvadLabelFromHost(string h) {
     auto base = h.split(":")[0];
@@ -282,7 +282,7 @@ private string mullvadLabelFromHost(string h) {
 }
 
 private void loadMullvadPool() {
-    if (gMullvadMutex !is null) synchronized (gMullvadMutex) {
+    if (gMullvadLock !is null) synchronized (gMullvadLock) {
         if (mullvadPoolLoaded) return;
         mullvadPoolLoaded = true;
         loadMullvadPoolUnlocked();
@@ -297,7 +297,7 @@ private void loadMullvadPool() {
 // Reads IRCFIBER_MULLVAD_POOL directly via getenv. std.process.environment
 // returned an empty string in the deployed binary despite the variable being
 // present in /proc/self/environ, leaving the pool empty at runtime. Caller
-// holds gMullvadMutex and has set mullvadPoolLoaded = true.
+// holds gMullvadLock and has set mullvadPoolLoaded = true.
 private void loadMullvadPoolUnlocked() {
     import core.stdc.stdlib : getenv;
     import core.stdc.string : strlen;
@@ -332,7 +332,7 @@ private void loadMullvadPoolUnlocked() {
 
 private MullvadProxy* pickMullvadProxy(string egressNodeId) {
     loadMullvadPool();
-    if (gMullvadMutex !is null) synchronized (gMullvadMutex) {
+    if (gMullvadLock !is null) synchronized (gMullvadLock) {
         return pickMullvadProxyLocked(egressNodeId);
     }
     return pickMullvadProxyLocked(egressNodeId);
@@ -361,7 +361,7 @@ private MullvadProxy* pickMullvadProxyLocked(string egressNodeId) {
 
 private MullvadProxy*[] getHealthyProxies() {
     loadMullvadPool();
-    if (gMullvadMutex !is null) synchronized (gMullvadMutex) {
+    if (gMullvadLock !is null) synchronized (gMullvadLock) {
         return getHealthyProxiesLocked();
     }
     return getHealthyProxiesLocked();
@@ -376,14 +376,14 @@ private MullvadProxy*[] getHealthyProxiesLocked() {
 }
 
 private void recordMullvadSuccess(string label) {
-    if (gMullvadMutex !is null) synchronized (gMullvadMutex) {
+    if (gMullvadLock !is null) synchronized (gMullvadLock) {
         foreach (ref pr; mullvadPool) if (pr.label == label) { pr.failCount = 0; pr.deadUntilMs = 0; break; }
         return;
     }
     foreach (ref pr; mullvadPool) if (pr.label == label) { pr.failCount = 0; pr.deadUntilMs = 0; break; }
 }
 private void recordMullvadFailure(string label) {
-    if (gMullvadMutex !is null) synchronized (gMullvadMutex) {
+    if (gMullvadLock !is null) synchronized (gMullvadLock) {
         foreach (ref pr; mullvadPool) if (pr.label == label) {
             pr.failCount++;
             if (pr.failCount >= 3) {
@@ -420,7 +420,7 @@ private bool isEgressBannedForHost(string hostLower, string label) {
 
 private void banEgressForHost(string host, string label) {
     if (host.length == 0 || label.length == 0) return;
-    if (gMullvadMutex !is null) synchronized (gMullvadMutex) {
+    if (gMullvadLock !is null) synchronized (gMullvadLock) {
         import std.string : toLower;
         auto hl = host.toLower();
         const exp = Clock.currTime.toUnixTime!long * 1000 + HOST_EGRESS_BAN_MS;
@@ -442,7 +442,7 @@ private MullvadProxy*[] getHealthyProxiesForHost(string hostLower) {
     // falls back to direct egress.
     loadMullvadPool();
     // Entire read-modify is synchronized to avoid SyncError on hostEgressBanUntil (AA).
-    if (gMullvadMutex !is null) synchronized (gMullvadMutex) {
+    if (gMullvadLock !is null) synchronized (gMullvadLock) {
         return getHealthyProxiesForHostLocked(hostLower);
     }
     return getHealthyProxiesForHostLocked(hostLower);
@@ -545,14 +545,14 @@ private string stripHostBrackets(string host) @safe pure {
 
 private __gshared ResolvedAddr[][string] dnsCache;
 private __gshared long[string]           dnsCacheTime;
-private __gshared Mutex gDnsMutex;
+private __gshared Object gDnsLock;
 shared static this() {
-    // gMullvadMutex already initialized in previous shared static this;
+    // gMullvadLock already initialized in previous shared static this;
     // D allows multiple shared static this blocks — they run in order.
-    // Initialize DNS mutex here; if gMullvadMutex init already ran, keep it.
+    // Initialize DNS mutex here; if gMullvadLock init already ran, keep it.
     try {
-        if (gMullvadMutex is null) gMullvadMutex = new Mutex();
-        gDnsMutex = new Mutex();
+        if (gMullvadLock is null) gMullvadLock = new Object();
+        gDnsLock = new Object();
     } catch (Throwable) {}
 }
 
@@ -562,7 +562,7 @@ private ResolvedAddr[] resolveAllAddresses(string host, ushort port) {
     auto normalizedHost = stripHostBrackets(host);
     auto cacheKey = normalizedHost;
     // Check cache under lock (enterprise: avoid SyncError on __gshared AA).
-    if (gDnsMutex !is null) synchronized (gDnsMutex) {
+    if (gDnsLock !is null) synchronized (gDnsLock) {
         if (auto t = cacheKey in dnsCacheTime) {
             if (now - *t < DNS_CACHE_TTL_MS) {
                 if (auto cached = cacheKey in dnsCache) return (*cached).dup;
@@ -606,7 +606,7 @@ private ResolvedAddr[] resolveAllAddresses(string host, ushort port) {
             }
         }
         if (result.length > 0) {
-            if (gDnsMutex !is null) synchronized (gDnsMutex) {
+            if (gDnsLock !is null) synchronized (gDnsLock) {
                 dnsCache[cacheKey]     = result;
                 dnsCacheTime[cacheKey] = now;
             } else {
@@ -738,7 +738,7 @@ private TCPConnection happyEyeballsConnect(string host, ushort port, string egre
     if (egressNodeId.length > 0) {
         auto pinnedLabel = egressNodeId.toLower();
         MullvadProxy* pinned = null;
-        if (gMullvadMutex !is null) synchronized (gMullvadMutex) {
+        if (gMullvadLock !is null) synchronized (gMullvadLock) {
             foreach (ref pr; mullvadPool) if (pr.label == pinnedLabel) { pinned = &pr; break; }
         } else {
             foreach (ref pr; mullvadPool) if (pr.label == pinnedLabel) { pinned = &pr; break; }
@@ -746,7 +746,7 @@ private TCPConnection happyEyeballsConnect(string host, ushort port, string egre
         if (pinned !is null) {
             bool banned;
             bool dead;
-            if (gMullvadMutex !is null) synchronized (gMullvadMutex) {
+            if (gMullvadLock !is null) synchronized (gMullvadLock) {
                 banned = isEgressBannedForHost(hostLower, pinned.label);
                 dead = (pinned.deadUntilMs != 0);
             } else {
@@ -775,7 +775,7 @@ private TCPConnection happyEyeballsConnect(string host, ushort port, string egre
         try {
             auto conn = happyEyeballsConnectWithProxy(host, port, proxy);
             // Enterprise: protect __gshared last-used egress display vars.
-            if (gMullvadMutex !is null) synchronized (gMullvadMutex) {
+            if (gMullvadLock !is null) synchronized (gMullvadLock) {
                 mullvadLastUsedLabel = proxy ? proxy.label : "";
                 mullvadLastUsedHost = proxy ? proxy.host ~ ":" ~ proxy.port.to!string : "";
                 mullvadLastUsedIp = "";
@@ -798,7 +798,7 @@ private TCPConnection happyEyeballsConnect(string host, ushort port, string egre
                         if (a.length > 0) resolvedIp = a[0].toAddrString();
                     } catch (Exception) {}
                 }
-                if (gMullvadMutex !is null) synchronized (gMullvadMutex) {
+                if (gMullvadLock !is null) synchronized (gMullvadLock) {
                     mullvadLastUsedIp = resolvedIp;
                 } else {
                     mullvadLastUsedIp = resolvedIp;
@@ -817,7 +817,7 @@ private TCPConnection happyEyeballsConnect(string host, ushort port, string egre
             continue;
         }
     }
-    if (gMullvadMutex !is null) synchronized (gMullvadMutex) {
+    if (gMullvadLock !is null) synchronized (gMullvadLock) {
         mullvadLastUsedLabel = "";
         mullvadLastUsedHost = "";
         mullvadLastUsedIp = "";
@@ -2261,7 +2261,7 @@ final class PersistentIRCClient {
                     recordCounter("ircfiber.tls_handshake.timeout_disconnect", 1, ["host": config.host]);
                     // Ban the last-used egress for this host so the next attempt tries a different exit.
                     string lastLabel;
-                    if (gMullvadMutex !is null) synchronized (gMullvadMutex) {
+                    if (gMullvadLock !is null) synchronized (gMullvadLock) {
                         lastLabel = mullvadLastUsedLabel;
                     } else {
                         lastLabel = mullvadLastUsedLabel;
