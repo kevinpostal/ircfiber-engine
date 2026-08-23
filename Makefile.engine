@@ -56,7 +56,7 @@ DSCANNER := $(or $(shell which dscanner 2>/dev/null),\
                   dub run dscanner --)
 
 # Source files — enterprise split: backend (vibe.d API), common (shared lib), engine (IRC daemon)
-SRCS        := $(shell find backend/source common/source engine/source -name '*.d' 2>/dev/null)
+SRCS        := $(shell find engine/source common/source -name '*.d' 2>/dev/null)
 DT_SRCS     := $(shell find backend/views -name '*.dt' 2>/dev/null)
 
 # ----------------------------------------------------------------------------
