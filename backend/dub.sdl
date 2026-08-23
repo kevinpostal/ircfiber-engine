@@ -1,0 +1,55 @@
+name "irc-fiber-backend"
+description "IRC Fiber backend — vibe.d REST API + WebSocket + Admin"
+authors "IRC Fiber Team"
+copyright "Copyright © 2026 IRC Fiber"
+license "MIT"
+
+compiler "ldc2"
+
+targetType "executable"
+targetName "irc-fiber"
+sourcePaths "source"
+importPaths "source"
+
+dependency "irc-fiber-common" path="../common"
+dependency "vibe-d" version="~>0.10.0"
+dependency "vibe-d:redis" version="~>0.10.0"
+dependency "vibe-d:mongodb" version="~>0.10.0"
+dependency "diet-ng" version="~>1.8"
+
+configuration "application" {
+    targetType "executable"
+    targetName "irc-fiber"
+    mainSourceFile "source/app.d"
+    versions "VibeUseFibers"
+}
+
+configuration "debug" {
+    targetType "executable"
+    targetName "irc-fiber"
+    mainSourceFile "source/app.d"
+    versions "VibeUseFibers" "DietUseLive"
+    dflags "-d"
+}
+
+configuration "release" {
+    targetType "executable"
+    targetName "irc-fiber"
+    mainSourceFile "source/app.d"
+    versions "VibeUseFibers"
+    dflags "-d"
+}
+
+configuration "gateway" {
+    targetType "executable"
+    targetName "irc-fiber-gateway"
+    mainSourceFile "source/app.d"
+    versions "VibeUseFibers" "GatewayOnly"
+}
+
+// Library config for engine test configs that import backend modules
+// (ircfiber.api.rest / ircfiber.api.session / ircfiber.auth etc.) after the
+// split. Executable configs cannot be consumed as module sources by dub.
+configuration "library" {
+    targetType "library"
+}
