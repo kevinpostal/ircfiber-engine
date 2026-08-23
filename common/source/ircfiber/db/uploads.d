@@ -1,0 +1,252 @@
+module ircfiber.db.uploads;
+
+import std.datetime : Clock;
+import std.uuid : randomUUID;
+import vibe.db.mongo.mongo;
+import vibe.db.mongo.cursor;
+import vibe.data.bson;
+import vibe.core.log;
+import ircfiber.db.mongo : AppMongoConnection;
+
+/// One uploaded file reference (the bytes live on postimages.org).
+struct UploadRecord {
+    /// Upload identifier (UUID string).
+    string id;               // _id (UUID string)
+    /// Owning user id.
+    string userId;
+    /// Network the upload belongs to.
+    string networkId;
+    /// Buffer (channel) the upload belongs to.
+    string buffer;
+    /// User-edited display name.
+    string filename;         // user-edited display name
+    /// Original client filename.
+    string originalFilename;
+    /// MIME type.
+    string mimeType;
+    /// File size in bytes.
+    long size;
+    /// Image width (0 when not an image).
+    long width;
+    /// Image height (0 when not an image).
+    long height;
+    /// Postimages page URL.
+    string pageUrl;
+    /// Direct image URL.
+    string directUrl;
+    /// Thumbnail URL.
+    string thumbUrl;
+    /// Creation timestamp (unix ms).
+    long createdAt;          // unix ms
+    /// Soft-delete flag.
+    bool deleted;
+
+    /// Serializes to Bson.
+    Bson toBson() const @trusted {
+        return Bson([
+            "_id": Bson(id), "userId": Bson(userId), "networkId": Bson(networkId),
+            "buffer": Bson(buffer), "filename": Bson(filename),
+            "originalFilename": Bson(originalFilename), "mimeType": Bson(mimeType),
+            "size": Bson(size), "width": Bson(width), "height": Bson(height),
+            "pageUrl": Bson(pageUrl), "directUrl": Bson(directUrl),
+            "thumbUrl": Bson(thumbUrl), "createdAt": Bson(createdAt),
+            "deleted": Bson(deleted),
+        ]);
+    }
+
+    /// Deserializes from Bson.
+    static UploadRecord fromBson(Bson b) @trusted {
+        UploadRecord r;
+        r.id = b["_id"].get!string;
+        r.userId = b["userId"].get!string;
+        r.networkId = b["networkId"].get!string;
+        r.buffer = b["buffer"].get!string;
+        r.filename = b["filename"].get!string;
+        r.originalFilename = b["originalFilename"].get!string;
+        r.mimeType = b["mimeType"].get!string;
+        r.size = b["size"].get!long;
+        r.width = b["width"].get!long;
+        r.height = b["height"].get!long;
+        r.pageUrl = b["pageUrl"].get!string;
+        r.directUrl = b["directUrl"].get!string;
+        r.thumbUrl = b["thumbUrl"].get!string;
+        r.createdAt = b["createdAt"].get!long;
+        r.deleted = b["deleted"].get!bool;
+        return r;
+    }
+}
+
+/// Persistence for upload references; collection `uploads`.
+final class UploadRepository {
+    private MongoCollection collection;
+
+    /// Constructs a repository bound to the uploads collection.
+    this() {
+        collection = AppMongoConnection.getDb()["uploads"];
+        ensureIndexes();
+    }
+
+    private void ensureIndexes() @trusted {
+        try {
+            collection.createIndex(Bson(["userId": Bson(1), "createdAt": Bson(-1)]));
+        } catch (Exception e) {
+            logWarn("Failed to create uploads index: %s", e.msg);
+        }
+    }
+
+    /// Inserts an upload record.
+    void insert(UploadRecord r) @trusted {
+        collection.insertOne(r.toBson());
+    }
+
+    /// Newest-first page of a user's non-deleted uploads.
+    UploadRecord[] listByUser(string userId, long beforeMs, int limit) @trusted {
+        auto query = Bson([
+            "userId": Bson(userId),
+            "deleted": Bson(false),
+            "createdAt": Bson(["$lt": Bson(beforeMs)]),
+        ]);
+        FindOptions opts;
+        opts.sort = Bson(["createdAt": Bson(-1)]);
+        opts.limit = limit;
+        UploadRecord[] result;
+        foreach (doc; collection.find(query, opts)) result ~= UploadRecord.fromBson(doc);
+        return result;
+    }
+
+    /// Offset-paginated page of a user's non-deleted uploads.
+    UploadRecord[] pageByUser(string userId, int offset, int limit) @trusted {
+        auto query = Bson(["userId": Bson(userId), "deleted": Bson(false)]);
+        FindOptions opts;
+        opts.sort = Bson(["createdAt": Bson(-1)]);
+        opts.skip = offset;
+        opts.limit = limit;
+        UploadRecord[] result;
+        foreach (doc; collection.find(query, opts)) result ~= UploadRecord.fromBson(doc);
+        return result;
+    }
+
+    /// Count of a user's non-deleted uploads (for pagination).
+    long countByUser(string userId) @trusted {
+        auto query = Bson(["userId": Bson(userId), "deleted": Bson(false)]);
+        return collection.countDocuments(query);
+    }
+
+    /// Fetches a single upload record by id, scoped to userId.
+    /// Returns UploadRecord.init if not found or not owned by the user.
+    /// Includes deleted records so callers can inspect URLs before hard-deleting.
+    UploadRecord getById(string userId, string id) @trusted {
+        auto doc = collection.findOne(Bson(["_id": Bson(id), "userId": Bson(userId)]));
+        if (doc.isNull) return UploadRecord.init;
+        return UploadRecord.fromBson(doc);
+    }
+
+    /// Count of ALL user uploads (including soft-deleted), for admin cleanup.
+    long countAllByUser(string userId) @trusted {
+        return collection.countDocuments(Bson(["userId": Bson(userId)]));
+    }
+
+    /// Returns ALL uploads for a user regardless of deleted status (admin use).
+    UploadRecord[] listAllByUser(string userId) @trusted {
+        auto query = Bson(["userId": Bson(userId)]);
+        FindOptions opts;
+        opts.sort = Bson(["createdAt": Bson(-1)]);
+        UploadRecord[] result;
+        foreach (doc; collection.find(query, opts)) result ~= UploadRecord.fromBson(doc);
+        return result;
+    }
+
+    /// Paginated list of ALL uploads across all users (admin use).
+    UploadRecord[] listAll(int offset, int limit) @trusted {
+        FindOptions opts;
+        opts.sort = Bson(["createdAt": Bson(-1)]);
+        opts.skip = offset;
+        opts.limit = limit;
+        UploadRecord[] result;
+        foreach (doc; collection.find(Bson.emptyObject, opts)) result ~= UploadRecord.fromBson(doc);
+        return result;
+    }
+
+    /// Count all uploads across all users (admin use).
+    long countAll() @trusted {
+        return collection.countDocuments(Bson.emptyObject);
+    }
+
+    /// Permanently removes the upload document from MongoDB.
+    /// Returns false if the document wasn't found or didn't belong to the user.
+    /// Note: callers should remove the local file BEFORE calling this.
+    bool hardDelete(string userId, string id) @trusted {
+        auto res = collection.deleteOne(
+            Bson(["_id": Bson(id), "userId": Bson(userId)]));
+        return res.deletedCount > 0;
+    }
+
+    /// Updates filename and size for an existing upload (content is written to disk by caller).
+    /// Returns false if not found or not owned.
+    bool updateContent(string userId, string id, string newContent, string newFilename, long newSize) @trusted {
+        auto doc = collection.findOne(Bson(["_id": Bson(id), "userId": Bson(userId)]));
+        if (doc.isNull) return false;
+        auto upd = Bson(["$set": Bson(["filename": Bson(newFilename), "size": Bson(newSize)])]);
+        auto res = collection.updateOne(Bson(["_id": Bson(id)]), upd);
+        return res.modifiedCount > 0;
+    }
+
+
+}
+
+@("UploadRepository.updateContent updates file content")
+unittest {
+    if (!AppMongoConnection.isConnected) {
+        try AppMongoConnection.connect();
+        catch (Throwable) {}
+        if (!AppMongoConnection.isConnected) return;
+    }
+    try {
+        auto repo = new UploadRepository();
+        UploadRecord r;
+        r.id = randomUUID().toString();
+        r.userId = randomUUID().toString();
+        r.filename = "test.py";
+        r.mimeType = "text/x-python";
+        r.size = 10;
+        r.directUrl = "http://localhost:8090/uploads/abc.py";
+        r.createdAt = Clock.currTime.toUnixTime * 1000;
+        repo.insert(r);
+        bool ok = repo.updateContent(r.userId, r.id, "new content", "new.py", 11);
+        assert(ok);
+        auto fetched = repo.getById(r.userId, r.id);
+        assert(fetched.filename == "new.py");
+        assert(fetched.size == 11);
+        // Verify ownership check: wrong user should not update
+        bool wrong = repo.updateContent(randomUUID().toString(), r.id, "x", "x.py", 1);
+        assert(!wrong);
+        // Cleanup
+        repo.hardDelete(r.userId, r.id);
+    } catch (Throwable e) {
+        import core.exception : AssertError;
+        if (cast(AssertError) e) throw e;
+        // Mongo operation failed for other reason - treat as skip when not connected
+        if (!AppMongoConnection.isConnected) return;
+        throw e;
+    }
+}
+
+@("UploadRecord round-trips through Bson")
+unittest {
+    UploadRecord r;
+    r.id = randomUUID().toString();
+    r.userId = randomUUID().toString();
+    r.networkId = "net1";
+    r.buffer = "#chan";
+    r.filename = "cat.png";
+    r.originalFilename = "IMG_001.png";
+    r.mimeType = "image/png";
+    r.size = 12_345;
+    r.pageUrl = "https://postimg.cc/A";
+    r.directUrl = "https://i.postimg.cc/A/cat.png";
+    r.createdAt = 1_765_000_000_000;
+    auto b = r.toBson();
+    const back = UploadRecord.fromBson(b);
+    assert(back == r);
+    assert(b["deleted"].get!bool == false);
+}
