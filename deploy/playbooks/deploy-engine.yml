@@ -33,10 +33,6 @@
           - "--exclude=.dub"
           - "--exclude=*.o"
           - "--exclude=.worktrees"
-    - name: Update common submodule on host
-      ansible.builtin.command: git -C {{ src_root }} submodule update --init --recursive
-      changed_when: false
-      failed_when: false
     - name: Build engine image (engine only)
       ansible.builtin.shell: |
         DOCKER_BUILDKIT=1 docker build           --target runtime-engine           --build-arg GIT_HASH={{ lookup('pipe', 'git -C ' + playbook_dir + '/../../ rev-parse HEAD') | default('unknown') }}           -t kevindpostal/irc-fiber-engine:0.3.0           -f {{ src_root }}/Containerfile.engine           {{ src_root }} 2>&1
