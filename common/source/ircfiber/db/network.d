@@ -134,6 +134,12 @@ final class NetworkRepository {
         UpdateOptions options;
         options.upsert = true;
         collection.updateOne(selector, update, options);
+        // Invalidate per-user cache so findByUserId doesn't return stale [] for 60s
+        // after a new network is provisioned (e.g. ensureDefaultFiberNetwork on register).
+        if (g_redis !is null) {
+            try g_redis.del(RedisKeys.userNetworks(userId.toString()));
+            catch (Exception) {}
+        }
     }
 
     /// Sets the egress selection on a network without rewriting the full record.
