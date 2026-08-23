@@ -133,7 +133,7 @@ ircfiber_engine_log_level: "info"
 
 # --- Gateway defaults ---------------------------------------------------------
 ircfiber_gateway_log_level: "info"
-ircfiber_admin_password: "REDACTED"   # initial seed; rotate via Vault & config push
+ircfiber_admin_password: "{{ vault_ircfiber_admin_password }}"  # set in vault.yml — no default
 
 # --- IRCd (Ergo) defaults ------------------------------------------------------
 ircd_port_plain: 6667
