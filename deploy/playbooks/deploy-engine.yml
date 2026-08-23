@@ -1,0 +1,50 @@
+---
+# Engine deploy — engine only, never touches gateway
+# Replaces deploy-update.yml engine half. Engine owns /opt/ircfiber-engine
+# Usage: ansible-playbook deploy/playbooks/deploy-engine.yml -l vps-efb4b52d
+- name: Deploy engine
+  hosts: "{{ target | default('ircfiber_engines') }}"
+  become: true
+  gather_facts: false
+  vars_files:
+    - "{{ playbook_dir }}/../inventories/production/group_vars/all.yml"
+    - "{{ playbook_dir }}/../inventories/production/group_vars/vault.yml"
+  vars:
+    src_root: /opt/ircfiber-engine
+    builder_image: ircfiber-builder-engine
+    host_bin_dir: /opt/ircfiber/bin
+    engine_container: "{{ ('ircfiber-engine-' ~ ircfiber_engine_id) if ircfiber_engine_id is defined else 'ircfiber-engine-ovh' }}"
+    ldc_version: "1.41.0"
+  tasks:
+    - name: Preflight — engine deploy targets engine hosts only
+      ansible.builtin.assert:
+        that: "'ircfiber_engines' in group_names or 'ircfiber_engine' in group_names or ircfiber_engine_id is defined"
+        fail_msg: "Engine deploy must target engine hosts"
+    - name: rsync engine source → {{ src_root }}
+      become: false
+      ansible.posix.synchronize:
+        src: "{{ playbook_dir }}/../../"
+        dest: "{{ src_root }}"
+        delete: true
+        checksum: true
+        rsync_opts:
+          - "--omit-dir-times"
+          - "--exclude=.git"
+          - "--exclude=.dub"
+          - "--exclude=*.o"
+          - "--exclude=.worktrees"
+    - name: Update common submodule on host
+      ansible.builtin.command: git -C {{ src_root }} submodule update --init --recursive
+      changed_when: false
+      failed_when: false
+    - name: Build engine image (engine only)
+      ansible.builtin.shell: |
+        DOCKER_BUILDKIT=1 docker build           --target runtime-engine           --build-arg GIT_HASH={{ lookup('pipe', 'git -C ' + playbook_dir + '/../../ rev-parse HEAD') | default('unknown') }}           -t kevindpostal/irc-fiber-engine:0.3.0           -f {{ src_root }}/Containerfile.engine           {{ src_root }} 2>&1
+      args:
+        executable: /bin/bash
+      timeout: 1800
+    - name: Restart engine container (hard, no handoff)
+      community.docker.docker_container:
+        name: "{{ engine_container }}"
+        state: started
+        restart: true
