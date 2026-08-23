@@ -1,3 +1,5 @@
+> Monorepo split 2026-08-23 — site: kevinpostal/ircfiber-site, engine: kevinpostal/ircfiber-engine, common: kevinpostal/ircfiber-common (Option B submodule). Archive: kevinpostal/IRC_FIBER pre-split tag pre-split-2026-08-23.
+
 # IRC Fiber — Server features UI overhaul
 
 The "Server features" panel in the connection-attempt timeline used
