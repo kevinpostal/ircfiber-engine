@@ -85,6 +85,7 @@
   roles:
     - role: common
     - role: docker
+    - role: conntrack
     - role: tailscale
     - role: registry_login
     - role: firewall
