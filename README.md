@@ -14,6 +14,8 @@
 ![Ansible](https://img.shields.io/badge/Ansible-decoupled-E00)
 [![Hits](https://hits.dwyl.com/kevinpostal/ircfiber-engine.svg)](https://hits.dwyl.com/kevinpostal/ircfiber-engine)
 
+<p align="center"><a href="https://skillicons.dev"><img src="https://skillicons.dev/icons?i=d,redis,py&perline=5" alt="Skills" /></a></p>
+
 ## Why this matters for hiring
 
 At **Rabl** I ran `Celery` + `RabbitMQ` (10K+ jobs/day) and at **National Services Group** I fixed memory leaks via profiling/caching. This daemon is the same — but for IRC:
