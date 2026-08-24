@@ -35,12 +35,13 @@
           - "--exclude=.worktrees"
     - name: Build engine image (engine only)
       ansible.builtin.shell: |
-        DOCKER_BUILDKIT=1 docker build           --target runtime-engine           --build-arg GIT_HASH={{ lookup('pipe', 'git -C ' + playbook_dir + '/../../ rev-parse HEAD') | default('unknown') }}           -t kevindpostal/irc-fiber-engine:0.3.0           -f {{ src_root }}/Containerfile.engine           {{ src_root }} 2>&1
+        DOCKER_BUILDKIT=1 docker build           --target runtime-engine           --build-arg GIT_HASH={{ lookup('pipe', 'git -C ' + playbook_dir + '/../../ rev-parse HEAD') | default('unknown') }}           --build-arg GIT_SHORT={{ lookup('pipe', 'git -C ' + playbook_dir + '/../../ rev-parse --short HEAD') | default('unknown') }}           --build-arg GIT_DESCRIBE={{ lookup('pipe', 'git -C ' + playbook_dir + '/../../ describe --always --long') | default('unknown') }}           --build-arg GIT_BRANCH={{ lookup('pipe', 'git -C ' + playbook_dir + '/../../ rev-parse --abbrev-ref HEAD') | default('unknown') }}           -t kevindpostal/irc-fiber-engine:0.3.0           -f {{ src_root }}/Containerfile.engine           {{ src_root }} 2>&1
       args:
         executable: /bin/bash
       timeout: 1800
-    - name: Restart engine container (hard, no handoff)
-      community.docker.docker_container:
-        name: "{{ engine_container }}"
-        state: started
-        restart: true
+    - name: Recreate engine container with new image
+      ansible.builtin.shell: |
+        docker stop {{ engine_container }} 2>/dev/null || true
+        docker rm {{ engine_container }} 2>/dev/null || true
+        docker run -d --name {{ engine_container }} --restart unless-stopped --network ircfiber_net --network ircfiber_logging --env-file /etc/ircfiber/engine/env-{{ ircfiber_engine_id }} kevindpostal/irc-fiber-engine:0.3.0 /usr/local/bin/ircfiber-engine-entrypoint.sh
+      changed_when: true
