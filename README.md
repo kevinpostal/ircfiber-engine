@@ -12,6 +12,7 @@
 ![vibe.d](https://img.shields.io/badge/vibe.d-0.10-8B0000)
 ![Redis](https://img.shields.io/badge/Redis-7-DC382D)
 ![Ansible](https://img.shields.io/badge/Ansible-decoupled-E00)
+[![Hits](https://hits.dwyl.com/kevinpostal/ircfiber-engine.svg)](https://hits.dwyl.com/kevinpostal/ircfiber-engine)
 
 ## Why this matters for hiring
 
