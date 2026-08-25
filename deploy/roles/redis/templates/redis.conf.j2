@@ -1,11 +1,11 @@
 # {{ ansible_managed }}
 # IRC Fiber — Redis configuration
-# Bound to all interfaces for resilience; Tailscale may flap but loopback/bridge stay.
-# Protected-mode off, no password — network-level isolation via firewall + Tailscale ACL.
+# Enterprise hardened: volatile-lru + firewall + renamed dangerous commands
+# Bind to loopback + docker bridges only (not 0.0.0.0) to avoid internet FLUSHALL.
+# If host firewall bypassed, FLUSHALL/FLUSHDB are renamed to "" (disabled).
 
-bind 0.0.0.0
-# network-level isolation provides the security boundary.
-protected-mode no
+bind 127.0.0.1 172.30.0.1 172.18.0.1
+protected-mode yes
 port {{ redis_port }}
 tcp-backlog 511
 timeout 0
@@ -13,10 +13,9 @@ tcp-keepalive 60
 
 # Auth disabled: the IRC Fiber D client (vibe-d RedisStorage) calls
 # connectRedis(host, port) without an auth parameter, so it can't pass
-# a password. The container is bound only to the host's Tailscale
-# interface, so network-level isolation provides the security boundary.
-# If you need stronger auth, either patch the D code to call db.auth()
-# after connect, or run a sidecar that strips the AUTH command.
+# a password. Network-level isolation (bind + firewall + Tailscale ACL)
+# provides the security boundary. If you enable requirepass, patch
+# RedisStorage.connect() to call db.auth() after connect.
 #
 # requirepass {{ vault_redis_password }}
 
@@ -37,10 +36,15 @@ save 3600 1 300 100
 maxmemory {{ redis_maxmemory }}
 maxmemory-policy volatile-lru
 
-# Logging
-loglevel notice
-logfile ""
-
-# Misc
+# Security — disable dangerous commands that can wedge or wipe prod.
+# FLUSHALL/FLUSHDB wiped irc:assignments at 07:28:06Z 2026-08-25 via external
+# 36.134.27.91 (host redis bound 0.0.0.0 protected-mode no). Rename to "" disables.
+rename-command FLUSHALL ""
+rename-command FLUSHDB ""
+rename-command DEBUG ""
+rename-command MONITOR ""
+rename-command CONFIG "CONFIG_b8358f7a3c14"
+client-output-buffer-limit normal 32mb 8mb 60
+client-output-buffer-limit pubsub 32mb 8mb 60
 databases 16
 always-show-logo no

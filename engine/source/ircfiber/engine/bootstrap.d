@@ -638,8 +638,16 @@ void startHeartbeatTask(ref EngineContext ctx) {
                 // Cycle succeeded — clear backoff so the next failure
                 // starts from the short end of the curve again.
                 backoffMs = 0;
-            } catch (Exception e) {
-                logError("Heartbeat failed: %s", e.msg);
+            } catch (Throwable e) {
+                // Enterprise: catch Throwable (covers SyncError, AssertError)
+                // Previously only Exception, so SyncError from vibe-d's
+                // __gshared/Mutex robust path killed the heartbeat fiber
+                // as FATAL (futex_do_wait wedge at 07:29:53 beat=0).
+                // Now log and backoff so the next beat recovers.
+                string msg;
+                try { msg = e.msg; } catch (Throwable) { msg = "unknown throwable"; }
+                try logError("Heartbeat failed (throwable): %s", msg);
+                catch (Throwable) {}
                 // Exponential backoff: 1s, 2s, 4s, ... capped at 60s.
                 // Doubles on each consecutive failure; reset to 0 on
                 // success above. Without this backoff a Redis outage
@@ -648,18 +656,15 @@ void startHeartbeatTask(ref EngineContext ctx) {
                 if (backoffMs == 0) backoffMs = 1_000;
                 else backoffMs = min(backoffMs * 2, 60_000L);
                 try sleep(backoffMs.msecs);
-                catch (Exception) { /* nothrow lambda — swallow */ }
+                catch (Throwable) { /* nothrow lambda — swallow */ }
                 continue;
-            }
             // Normal cadence — only when the try block completed
             // without throwing. The catch branch above uses `continue`
             // to skip this sleep and instead applies its own backoff.
             logInfo("Heartbeat loop: sleeping 10s for next beat=%d", beat);
             try sleep(10.seconds);
-            catch (Exception) { /* nothrow lambda — swallow */ }
+            catch (Throwable) { /* nothrow lambda — swallow */ }
             logInfo("Heartbeat loop: woke for beat=%d", beat);
-        }
-    });
 }
 
 /// Read IRCFIBER_STATE_TTL env var with sensible bounds. Cached per-call

@@ -38,24 +38,60 @@ retry_redis_hlen() {
 # and we can auto-heal without killing the engine.
 mirror_hlen() {
   local total=0
-  local keys
-  # SCAN for mirrors; use redis-cli --scan if available, else KEYS (small set)
-  keys=$(docker exec $REDIS_DOCKER redis-cli --raw keys "irc:server-assignments:*" 2>&1 | tr -d "\r")
-  if [ -z "$keys" ]; then echo "0"; return 0; fi
-  while IFS= read -r k; do
-    [ -z "$k" ] && continue
-    local hl
-    hl=$(docker exec $REDIS_DOCKER redis-cli --raw hlen "$k" 2>&1 | tr -d "\r" | head -n1)
-    if [[ "$hl" =~ ^[0-9]+$ ]]; then total=$((total + hl)); fi
-  done <<< "$keys"
+  local cursor="0"
+  while true; do
+    local out
+    out=$(docker exec $REDIS_DOCKER redis-cli --raw scan "$cursor" match "irc:server-assignments:*" count 100 2>&1 | tr -d "\r")
+    if [ -z "$out" ]; then echo "0"; return 0; fi
+    local next_cursor
+    next_cursor=$(echo "$out" | head -n1)
+    local keys
+    keys=$(echo "$out" | tail -n +2)
+    if [ -n "$keys" ]; then
+      while IFS= read -r k; do
+        [ -z "$k" ] && continue
+        local hl
+        hl=$(docker exec $REDIS_DOCKER redis-cli --raw hlen "$k" 2>&1 | tr -d "\r" | head -n1)
+        if [[ "$hl" =~ ^[0-9]+$ ]]; then total=$((total + hl)); fi
+      done <<< "$keys"
+    fi
+    cursor="$next_cursor"
+    if [ "$cursor" = "0" ]; then break; fi
+  done
   echo "$total"
 }
+API_STALE_STATE=/tmp/ircfiber-monitor-api-stale
+SERVERS_STALE_STATE=/tmp/ircfiber-monitor-servers-stale
+API_STRIKES=3
+SERVERS_STRIKES=3
 api_ok=0
 for i in 1 2; do if docker exec $GATEWAY curl --max-time 4 -s http://127.0.0.1:8090/api/version 2>&1 | grep -q "engines"; then api_ok=1; break; fi; sleep 2; done
-if [ $api_ok -eq 0 ]; then FAIL=1; REASON="${REASON} api_version_fail"; fi
+if [ $api_ok -eq 0 ]; then
+  ASTRIKES=$(cat "$API_STALE_STATE" 2>/dev/null | tr -cd '0-9'); [ -z "$ASTRIKES" ] && ASTRIKES=0
+  ASTRIKES=$((ASTRIKES + 1)); echo "$ASTRIKES" > "$API_STALE_STATE"
+  if [ "$ASTRIKES" -ge "$API_STRIKES" ]; then
+    FAIL=1; REASON="${REASON} api_version_fail_x${ASTRIKES}"
+    logger -t ircfiber-monitor "FAIL api_version_fail strike=${ASTRIKES}/${API_STRIKES}"
+  else
+    logger -t ircfiber-monitor "WARN api_version_fail strike=${ASTRIKES}/${API_STRIKES} (deferring restart)"
+  fi
+else
+  rm -f "$API_STALE_STATE" 2>/dev/null || true
+fi
 servers_ok=0
 for i in 1 2; do if docker exec $REDIS_DOCKER redis-cli --raw smembers "irc:servers" 2>&1 | grep -q "ovh"; then servers_ok=1; break; fi; sleep 1; done
-if [ $servers_ok -eq 0 ]; then FAIL=1; REASON="${REASON} redis_servers_empty"; fi
+if [ $servers_ok -eq 0 ]; then
+  SSTRIKES=$(cat "$SERVERS_STALE_STATE" 2>/dev/null | tr -cd '0-9'); [ -z "$SSTRIKES" ] && SSTRIKES=0
+  SSTRIKES=$((SSTRIKES + 1)); echo "$SSTRIKES" > "$SERVERS_STALE_STATE"
+  if [ "$SSTRIKES" -ge "$SERVERS_STRIKES" ]; then
+    FAIL=1; REASON="${REASON} redis_servers_empty_x${SSTRIKES}"
+    logger -t ircfiber-monitor "FAIL redis_servers_empty strike=${SSTRIKES}/${SERVERS_STRIKES}"
+  else
+    logger -t ircfiber-monitor "WARN redis_servers_empty strike=${SSTRIKES}/${SERVERS_STRIKES} (deferring restart)"
+  fi
+else
+  rm -f "$SERVERS_STALE_STATE" 2>/dev/null || true
+fi
 HLEN=$(retry_redis_hlen)
 if ! [[ "$HLEN" =~ ^[0-9]+$ ]]; then HLEN=""; fi
 HB=$(docker exec $REDIS_DOCKER redis-cli --raw hget "irc:server:ovh" "lastHeartbeat" 2>&1 | tr -d "\r" | head -n1)
