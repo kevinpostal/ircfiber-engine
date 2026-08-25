@@ -5,7 +5,7 @@
 # If host firewall bypassed, FLUSHALL/FLUSHDB are renamed to "" (disabled).
 
 bind 127.0.0.1 172.30.0.1 172.18.0.1
-protected-mode yes
+protected-mode no
 port {{ redis_port }}
 tcp-backlog 511
 timeout 0
