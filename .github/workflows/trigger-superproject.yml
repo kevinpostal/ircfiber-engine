@@ -1,0 +1,14 @@
+name: Trigger superproject bump (engine)
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch bump-engine
+        run: |
+          if [ -z "${{ secrets.SUPERPROJECT_PAT }}" ]; then echo "No SUPERPROJECT_PAT — skipping"; exit 0; fi
+          curl -X POST -H "Authorization: token ${{ secrets.SUPERPROJECT_PAT }}" -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/kevinpostal/irc-fiber/dispatches -d '{"event_type":"bump-engine","client_payload":{"ref":"'"$GITHUB_REF"'","sha":"'"$GITHUB_SHA"'"}}'

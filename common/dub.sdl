@@ -3,6 +3,7 @@ description "IRC Fiber shared library — protocol, models, db, storage, observa
 authors "IRC Fiber Team"
 copyright "Copyright © 2026 IRC Fiber"
 license "MIT"
+version "0.3.0"
 
 compiler "ldc2"
 

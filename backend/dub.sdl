@@ -11,7 +11,7 @@ targetName "irc-fiber"
 sourcePaths "source"
 importPaths "source"
 
-dependency "irc-fiber-common" path="../common"
+dependency "irc-fiber-common" version="~>0.3.0"
 dependency "vibe-d" version="~>0.10.0"
 dependency "vibe-d:redis" version="~>0.10.0"
 dependency "vibe-d:mongodb" version="~>0.10.0"
