@@ -10,20 +10,6 @@ ircfiber_engine_id: "localengine"
 ircfiber_engine_bind_address: "0.0.0.0"
 ircfiber_engine_admin_port: 8091
 
-# --- Mullvad egress pool — 6 exits for SuperNets session-limit spreading ---
-# Each sidecar is a Tailscale userspace SOCKS5 ( :1055 ) with --exit-node
-# pointing at a different Mullvad relay. Smart routing in
-# engine/source/ircfiber/irc/connection.d rotates startIdx via mullvadRR
-# so 6 SuperNets networks (same host) spread 1 per IP, staying under
-# SuperNets' 32/10m per-IP unknown-connections limit. Previously 3 exits
-# meant 2x herd per IP → "Too many unknown connections" → all 3 banned.
-mullvad_sidecars:
-  - { name: "de", exit_node: "de-ber-wg-003.mullvad.ts.net" }
-  - { name: "ch", exit_node: "ch-zrh-wg-503.mullvad.ts.net" }
-  - { name: "nl", exit_node: "nl-ams-wg-201.mullvad.ts.net" }
-  - { name: "se", exit_node: "se-sto-wg-201.mullvad.ts.net" }
-  - { name: "gb", exit_node: "gb-lon-wg-001.mullvad.ts.net" }
-  - { name: "us", exit_node: "us-atl-wg-001.mullvad.ts.net" }
 
 
 # --- Caddy: extra public-facing hostnames -----------------------------------
