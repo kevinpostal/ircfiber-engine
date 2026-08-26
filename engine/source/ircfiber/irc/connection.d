@@ -749,6 +749,27 @@ private TCPConnection happyEyeballsConnect(string host, ushort port, string egre
     //   by getHealthyProxiesForHost(hostLower) so a G-lined exit for one
     //   host never blocks it for another.
     auto healthyForHost = getHealthyProxiesForHost(hostLower);
+    // Smart routing: spread load for hosts with many networks (e.g. 6x SuperNets)
+    // by rotating the healthy list per call via global round-robin. Without this,
+    // all 6 networks for irc.supernets.org would try de first at the same time,
+    // hammering that exit's 32/10m limit and getting "Too many unknown connections".
+    // With rotation, they try de, ch, nl, se, gb, us respectively, spreading 6 conns
+    // across 6 exits (1 per IP) and staying under per-IP limits. Session-limit
+    // throttling (isThrottleError) already bans the hammered exit for 12h via
+    // banEgressForHost, but rotation prevents the initial herd.
+    if (healthyForHost.length > 1 && egressNodeId.length == 0) {
+        size_t startIdx = 0;
+        if (gMullvadLock !is null) synchronized (gMullvadLock) {
+            startIdx = mullvadRR++ % healthyForHost.length;
+        } else {
+            startIdx = mullvadRR++ % healthyForHost.length;
+        }
+        if (startIdx != 0) {
+            auto rotated = healthyForHost[startIdx .. $] ~ healthyForHost[0 .. startIdx];
+            healthyForHost = rotated;
+        }
+        logDebug("Mullvad smart routing for %s: startIdx=%d", hostLower, startIdx);
+    }
     MullvadProxy*[] toTry;
     if (egressNodeId.length > 0) {
         auto pinnedLabel = egressNodeId.toLower();
