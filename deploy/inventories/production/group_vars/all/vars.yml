@@ -135,12 +135,12 @@ ircfiber_engine_log_level: "info"
 # See engine/deploy/roles/engine/defaults/main.yml for docs. This overrides
 # the empty default so prod gets 6 SOCKS sidecars (1 per SuperNets net).
 mullvad_sidecars:
-  - { name: "de", exit_node: "de-ber-wg-003.mullvad.ts.net" }
-  - { name: "ch", exit_node: "ch-zrh-wg-503.mullvad.ts.net" }
-  - { name: "nl", exit_node: "nl-ams-wg-201.mullvad.ts.net" }
-  - { name: "se", exit_node: "se-sto-wg-201.mullvad.ts.net" }
-  - { name: "gb", exit_node: "gb-lon-wg-001.mullvad.ts.net" }
-  - { name: "us", exit_node: "us-atl-wg-001.mullvad.ts.net" }
+  - { name: "de", exit_node: "100.117.47.8" } # de-ber-wg-003
+  - { name: "ch", exit_node: "100.104.110.13" } # ch-zrh-wg-503
+  - { name: "nl", exit_node: "100.123.199.85" } # nl-ams-wg-201
+  - { name: "se", exit_node: "100.84.2.120" } # se-sto-wg-201
+  - { name: "gb", exit_node: "100.68.61.54" } # gb-lon-wg-001
+  - { name: "us", exit_node: "100.126.111.61" } # us-atl-wg-001
 
 # --- Gateway defaults ---------------------------------------------------------
 ircfiber_gateway_log_level: "info"
