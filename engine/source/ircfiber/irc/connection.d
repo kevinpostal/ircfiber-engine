@@ -727,6 +727,21 @@ private TCPConnection happyEyeballsConnectWithProxy(string host, ushort port, Mu
 private TCPConnection happyEyeballsConnect(string host, ushort port, string egressNodeId = "") {
     import std.string : toLower;
     auto hostLower = host.toLower();
+    // Fast-path for the local Ergo instance (irc.ircfiber.com):
+    // On prod the host resolves via Docker alias to 172.30.0.5 internally.
+    // Trying Mullvad first wastes 12s (3 exits × 4s) and hits the public
+    // hairpin, which is flaky. Try direct first; fall back to Mullvad only
+    // if the internal path fails. This is what fixed the 2026-08-26 outage
+    // where every Mullvad exit was throttled and direct via public IP
+    // also failed, but direct via internal alias succeeded.
+    if (hostLower == "irc.ircfiber.com" && egressNodeId.length == 0) {
+        try {
+            auto directConn = happyEyeballsConnectWithProxy(host, port, null);
+            return directConn;
+        } catch (Exception e) {
+            logWarn("happyEyeballsConnect direct to %s failed (%s), trying Mullvad pool", host, e.msg);
+        }
+    }
     // Generic host-aware egress picker: no per-hostname hardcode.
     // - Globally dead proxies (failCount >= 3) are already filtered by
     //   getHealthyProxies() / getHealthyProxiesForHost().

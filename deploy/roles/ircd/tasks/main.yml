@@ -79,6 +79,9 @@
     # No custom command needed — run.sh handles everything.
     networks:
       - name: "{{ docker_ircfiber_network }}"
+        aliases:
+          - "irc.ircfiber.com"
+          - "{{ ircd_server_name }}"
     networks_cli_compatible: true
     ports:
       - "{{ ircd_port_plain }}:{{ ircd_port_plain }}"

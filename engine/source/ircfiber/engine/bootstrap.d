@@ -658,6 +658,7 @@ void startHeartbeatTask(ref EngineContext ctx) {
                 try sleep(backoffMs.msecs);
                 catch (Throwable) { /* nothrow lambda — swallow */ }
                 continue;
+            }
             // Normal cadence — only when the try block completed
             // without throwing. The catch branch above uses `continue`
             // to skip this sleep and instead applies its own backoff.
@@ -665,8 +666,9 @@ void startHeartbeatTask(ref EngineContext ctx) {
             try sleep(10.seconds);
             catch (Throwable) { /* nothrow lambda — swallow */ }
             logInfo("Heartbeat loop: woke for beat=%d", beat);
+        }
+    });
 }
-
 /// Read IRCFIBER_STATE_TTL env var with sensible bounds. Cached per-call
 /// (heartbeat runs at 10 s — cheap).
 private long parseStateTtl() {
