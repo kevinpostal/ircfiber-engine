@@ -6,7 +6,7 @@
 # This is the combined gateway + backend + engine host (single-VM deployment).
 
 # --- Engine (combined with gateway on this VM) ------------------------------
-ircfiber_engine_id: "localengine"
+ircfiber_engine_id: "ovh"
 ircfiber_engine_bind_address: "0.0.0.0"
 ircfiber_engine_admin_port: 8091
 
@@ -39,3 +39,13 @@ ircfiber_use_lets_encrypt: true
 # `tailscale netcheck`; override here if the host's public IP ever
 # changes (e.g. new VM, IP swap).
 cloudflare_target_ip: "47.236.247.169"
+
+# --- Observability: Signoz OTel (production) ---------------------------------
+# Gateway/engine traces/logs/metrics -> k3s Signoz via Tailscale MagicDNS.
+# k3s collector is at otel.ubuntu-docker.tail544547.ts.net (Traefik 443, TLS) and
+# also at 100.94.116.56:4318 via NodePort/Tailscale IP. For k8s-internal pods
+# keep using http://signoz-otel-collector.signoz.svc.cluster.local:4318 (no TLS).
+IRCFIBER_OTEL_ENABLED: "1"
+IRCFIBER_OTEL_ENDPOINT: "http://100.94.116.56:4318"
+OTEL_RESOURCE_ATTRIBUTES: "k8s.cluster.name=ubuntu-docker,service.name=ircfiber-engine,deployment.environment=prod"
+# Alt via Ingress (TLS, needs DNS): "https://otel.ubuntu-docker.tail544547.ts.net"

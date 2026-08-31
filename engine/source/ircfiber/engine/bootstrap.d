@@ -11,7 +11,7 @@ import std.uuid : UUID;
 import core.sys.posix.unistd : getpid;
 import vibe.core.core : runTask, sleep, runApplication;
 import vibe.core.channel : Channel, createChannel;
-import ircfiber.logging : logJsonMap, logException;
+import ircfiber.logging : logJsonMap, logException, flushAndSendLogs;
 import ircfiber.tracing : withSpan, flushAndSendSpans, Span, isTracingEnabled;
 import ircfiber.observability : flushAndSendMetrics, recordGauge, isMetricsEnabled;
 import ircfiber.db.circuit_breaker : exportMongoCircuitMetrics;
@@ -632,9 +632,12 @@ void startHeartbeatTask(ref EngineContext ctx) {
                 // timeout) and the heartbeat
                 // (registration.timeout_networks gauge). Same 10s cadence
                 // as the trace flush — every dashboard panel sees a
-                // fresh data point at the same wall-clock boundary.
                 exportMongoCircuitMetrics();
                 flushAndSendMetrics();
+                // Structured heartbeat log for SigNoz — visible as service.name=ircfiber-engine + component=heartbeat.
+                import std.exception : collectException;
+                collectException(logJsonMap("info", "heartbeat", "Heartbeat", ["serverId": ctx.localServer.serverId, "beat": beat.to!string, "assigned": ctx.localServer.assignedNetworks.length.to!string]));
+                flushAndSendLogs();
                 // Cycle succeeded — clear backoff so the next failure
                 // starts from the short end of the curve again.
                 backoffMs = 0;

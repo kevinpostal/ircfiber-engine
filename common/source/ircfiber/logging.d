@@ -6,6 +6,10 @@ import std.datetime : Clock, SysTime;
 import std.conv : to;
 import std.string : strip, toStringz;
 import std.format : format;
+import std.array : appender;
+import core.sync.mutex : Mutex;
+import core.time : seconds;
+import core.atomic : atomicLoad, atomicStore;
 
 /// Module-level log threshold. Messages below this level are suppressed.
 /// Controlled by `IRCFIBER_LOG_LEVEL` env var:
@@ -130,6 +134,11 @@ void logJsonMap(string level, string component, string msg,
     }
     stderr.writeln(j.toString(JSONOptions.doNotEscapeSlashes));
     stderr.flush();
+    // OTLP logs enqueue — mirrors stderr JSON but as OTLP logRecord
+    // with severity, trace correlation, and attributes. Cheap when
+    // disabled (g_logsEnabled check in enqueueLog).
+    try { enqueueLog(level, component, msg, fields, traceId, spanId); }
+    catch (Exception) {}
 }
 
 /// Convenience: tagged info log with no extra fields beyond component.
@@ -184,4 +193,203 @@ void logException(string component,
         try stderr.writeln("logException failed: ", secondary.msg);
         catch (Exception) {}
     }
+}
+// ── OTLP Logs export ──────────────────────────────────────────────────────
+//
+// Mirrors tracing.d / observability.d but for logs. Every call to
+// `logJsonMap()` (which is every structured log line) optionally enqueues
+// a PendingLog that is flushed every 10s via `flushAndSendLogs()` from
+// the heartbeat task. The wire format is OTLP/HTTP JSON to /v1/logs:
+//
+//   {"resourceLogs":[{"resource":{"attributes":[...]},"scopeLogs":[{"scope":{"name":"ircfiber.logging"},"logRecords":[...]}]}]}
+//
+// Kat: OTLP logs use severityNumber per spec (TRACE=1, DEBUG=5, INFO=9,
+// WARN=13, ERROR=17, FATAL=21). SigNoz's UI groups by severity_text.
+
+private struct PendingLog {
+    long timeUnixNano;
+    long observedTimeUnixNano;
+    string severityText; // INFO, WARN, ERROR, DEBUG
+    int severityNumber;
+    string body;         // msg
+    string traceId;      // hex 32, may be empty
+    string spanId;       // hex 16, may be empty
+    uint traceFlags;
+    string[string] attributes; // component + custom fields
+}
+
+private __gshared shared(Mutex) logsMutex;
+private __gshared PendingLog[] logQueue;
+private __gshared string logsEndpoint = "http://ircfiber-otel-collector:4318/v1/logs";
+private __gshared string logsServiceName = "ircfiber-engine";
+private __gshared string logsServiceVersion = "0.3.0";
+private __gshared bool g_logsEnabled = false;
+private __gshared bool logsMutexInitd;
+
+private void initLogsOnce() {
+    if (logsMutexInitd) return;
+    logsMutex = new shared Mutex();
+    synchronized (logsMutex) {} // init
+    logsMutexInitd = true;
+}
+
+/// Whether OTLP logs are enabled.
+bool isLoggingEnabled() { return g_logsEnabled; }
+void setLoggingEnabled(bool v) { g_logsEnabled = v; }
+
+/// Configure OTLP logs endpoint + service identity.
+void configureLogging(string otlpEndpoint, string svcName, string svcVersion) {
+    logsEndpoint = otlpEndpoint;
+    logsServiceName = svcName;
+    logsServiceVersion = svcVersion;
+    g_logsEnabled = (otlpEndpoint.length > 0 && otlpEndpoint != "disabled");
+    if (g_logsEnabled) initLogsOnce();
+}
+
+private int severityNumberFor(string level) {
+    if (level == "debug") return 5;
+    if (level == "info")  return 9;
+    if (level == "warn")  return 13;
+    if (level == "error") return 17;
+    return 9;
+}
+
+private string severityTextFor(string level) {
+    if (level == "debug") return "DEBUG";
+    if (level == "info")  return "INFO";
+    if (level == "warn")  return "WARN";
+    if (level == "error") return "ERROR";
+    return "INFO";
+}
+
+private void enqueueLog(string level, string component, string msg,
+                        string[string] fields,
+                        string traceId, string spanId) {
+    if (!g_logsEnabled) return;
+    if (!logsMutexInitd) initLogsOnce();
+    auto now = Clock.currTime.toUTC();
+    long nano = now.toUnixTime() * 1_000_000_000L + now.fracSecs.total!"nsecs";
+    PendingLog rec;
+    rec.timeUnixNano = nano;
+    rec.observedTimeUnixNano = nano;
+    rec.severityText = severityTextFor(level);
+    rec.severityNumber = severityNumberFor(level);
+    rec.body = msg;
+    rec.traceId = traceId;
+    rec.spanId = spanId;
+    rec.traceFlags = traceId.length ? 1 : 0;
+    // Build attributes map: component + custom fields + level
+    string[string] attrs;
+    attrs["component"] = component;
+    attrs["level"] = level;
+    if (fields !is null) foreach (k, v; fields) attrs[k] = v;
+    rec.attributes = attrs;
+    synchronized (logsMutex) {
+        logQueue ~= rec;
+        // Cap queue to avoid unbounded memory if collector down — drop oldest
+        if (logQueue.length > 4096) logQueue = logQueue[$ - 4096 .. $];
+    }
+}
+
+/// Drain and POST pending logs to OTLP /v1/logs. Called from heartbeat every 10s.
+void flushAndSendLogs() {
+    if (!g_logsEnabled) return;
+    if (!logsMutexInitd) initLogsOnce();
+    PendingLog[] batch;
+    synchronized (logsMutex) {
+        if (logQueue.length == 0) return;
+        batch = logQueue;
+        logQueue = null;
+    }
+    if (batch.length) sendLogsBatch(batch);
+}
+
+private string logsJsonEscape(string s) {
+    auto sink = appender!string();
+    foreach (c; s) {
+        switch (c) {
+            case '"':  sink ~= "\\\""; break;
+            case '\\': sink ~= "\\\\"; break;
+            case '\n': sink ~= "\\n"; break;
+            case '\r': sink ~= "\\r"; break;
+            case '\t': sink ~= "\\t"; break;
+            default:
+                if (c < 0x20) sink ~= format("\\u%04x", c);
+                else sink ~= cast(char)c;
+        }
+    }
+    return sink.data;
+}
+
+private string buildOtlpLogsJson(ref PendingLog[] batch) {
+    auto sink = appender!string();
+    sink ~= `{"resourceLogs":[{"resource":{"attributes":[`;
+    bool first = true;
+    void addRes(string k, string v) {
+        if (!first) sink ~= ",";
+        first = false;
+        sink ~= format(`{"key":"%s","value":{"stringValue":"%s"}}`, k, logsJsonEscape(v));
+    }
+    addRes("service.name", logsServiceName);
+    addRes("service.version", logsServiceVersion);
+    addRes("deployment.environment", "production");
+    addRes("service.namespace", "ircfiber");
+    sink ~= `]},"scopeLogs":[{"scope":{"name":"ircfiber.logging","version":"`;
+    sink ~= logsServiceVersion;
+    sink ~= `"},"logRecords":[`;
+    bool firstRec = true;
+    foreach (ref r; batch) {
+        if (!firstRec) sink ~= ",";
+        firstRec = false;
+        sink ~= format(`{"timeUnixNano":"%d","observedTimeUnixNano":"%d","severityNumber":%d,"severityText":"%s","body":{"stringValue":"%s"}`,
+                       r.timeUnixNano, r.observedTimeUnixNano, r.severityNumber, r.severityText, logsJsonEscape(r.body));
+        if (r.traceId.length) sink ~= format(`,"traceId":"%s"`, r.traceId);
+        if (r.spanId.length)  sink ~= format(`,"spanId":"%s"`, r.spanId);
+        if (r.traceFlags)     sink ~= format(`,"flags":%d`, r.traceFlags);
+        sink ~= `,"attributes":[`;
+        bool firstAttr = true;
+        foreach (k, v; r.attributes) {
+            if (!firstAttr) sink ~= ",";
+            firstAttr = false;
+            sink ~= format(`{"key":"%s","value":{"stringValue":"%s"}}`, logsJsonEscape(k), logsJsonEscape(v));
+        }
+        sink ~= `]}`;
+    }
+    sink ~= `]}]}]}`;
+    return sink.data;
+}
+
+private void sendLogsBatch(ref PendingLog[] batch) {
+    if (!g_logsEnabled) return;
+    if (batch.length == 0) return;
+    auto json = buildOtlpLogsJson(batch);
+    try {
+        import vibe.http.client : requestHTTP, HTTPMethod;
+        requestHTTP(logsEndpoint,
+            (scope req) {
+                req.method = HTTPMethod.POST;
+                req.writeBody(cast(const ubyte[])json, "application/json");
+            },
+            (res) {
+                if (res.statusCode >= 400)
+                    stderr.writeln("otel-logs: export failed status=", res.statusCode);
+            });
+    } catch (Exception e) {
+        stderr.writeln("otel-logs: export error: ", e.msg);
+    }
+}
+
+// Test helpers
+PendingLog[] drainLogQueueForTest() {
+    if (!logsMutexInitd) return null;
+    synchronized (logsMutex) {
+        auto d = logQueue;
+        logQueue = null;
+        return d;
+    }
+}
+
+int logQueueLengthForTest() {
+    if (!logsMutexInitd) return 0;
+    synchronized (logsMutex) return cast(int)logQueue.length;
 }

@@ -11,7 +11,7 @@ import core.sys.posix.unistd : getpid;
 import vibe.core.core : runTask, runApplication, sleep, yield;
 import vibe.core.log;
 
-import ircfiber.logging : logException;
+import ircfiber.logging : logException, configureLogging, setLoggingEnabled, isLoggingEnabled;
 import ircfiber.engine.bootstrap : bootstrapEngine, startHeartbeatTask,
     startOrphanReaperTask, loadNetworks, EngineContext;
 import ircfiber.tracing : configureTracing, startTracingExporter,
@@ -34,6 +34,7 @@ private bool setupOtel(string svcName) {
     if (!enabled || raw.length == 0) {
         setTracingEnabled(false);
         setMetricsEnabled(false);
+        setLoggingEnabled(false);
         logInfo("OTel disabled for %s (IRCFIBER_OTEL_ENABLED=%s, endpoint='%s')",
             svcName, enabled ? "1 (empty endpoint)" : "0", raw);
         return false;
@@ -43,9 +44,12 @@ private bool setupOtel(string svcName) {
         base = base[0 .. $-1];
     string tracesEp;
     string metricsEp;
+    string logsEp;
     if (base.canFind("/v1/traces")) {
         tracesEp = base;
     } else if (base.canFind("/v1/metrics")) {
+        tracesEp = base[0 .. base.lastIndexOf("/v1/")] ~ "/v1/traces";
+    } else if (base.canFind("/v1/logs")) {
         tracesEp = base[0 .. base.lastIndexOf("/v1/")] ~ "/v1/traces";
     } else {
         tracesEp = base ~ "/v1/traces";
@@ -54,16 +58,29 @@ private bool setupOtel(string svcName) {
         metricsEp = base;
     } else if (base.canFind("/v1/traces")) {
         metricsEp = base[0 .. base.lastIndexOf("/v1/")] ~ "/v1/metrics";
+    } else if (base.canFind("/v1/logs")) {
+        metricsEp = base[0 .. base.lastIndexOf("/v1/")] ~ "/v1/metrics";
     } else {
         metricsEp = base ~ "/v1/metrics";
     }
+    if (base.canFind("/v1/logs")) {
+        logsEp = base;
+    } else if (base.canFind("/v1/traces")) {
+        logsEp = base[0 .. base.lastIndexOf("/v1/")] ~ "/v1/logs";
+    } else if (base.canFind("/v1/metrics")) {
+        logsEp = base[0 .. base.lastIndexOf("/v1/")] ~ "/v1/logs";
+    } else {
+        logsEp = base ~ "/v1/logs";
+    }
     configureTracing(tracesEp, svcName, "0.3.0");
     configureMetrics(metricsEp, svcName, "0.3.0");
+    configureLogging(logsEp, svcName, "0.3.0");
     // configure* sets enabled flag; be explicit for clarity.
     setTracingEnabled(true);
     setMetricsEnabled(true);
+    setLoggingEnabled(true);
     startTracingExporter();
-    logInfo("OTel enabled for %s: traces=%s metrics=%s", svcName, tracesEp, metricsEp);
+    logInfo("OTel enabled for %s: traces=%s metrics=%s logs=%s", svcName, tracesEp, metricsEp, logsEp);
     return true;
 }
 
