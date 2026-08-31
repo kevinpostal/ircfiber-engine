@@ -75,7 +75,6 @@
     _pairs: "{{ _raw_lines | map('split', '=', 1) | list }}"
   ansible.builtin.set_fact:
     _engine_env: "{{ dict(_pairs) }}"
-
 - name: Run Mullvad sidecars (tailscale userspace SOCKS5, scalable 2→5)
   when: mullvad_sidecars | length > 0
   community.docker.docker_container:
@@ -91,6 +90,8 @@
       TS_USERSPACE: "true"
       TS_SOCKS5_SERVER: ":{{ item.port | default(mullvad_sidecar_socks_port) }}"
       TS_STATE_DIR: "/var/lib/tailscale"
+    ports:
+      - "{{ item.host_port | default(1079 + item.index | int) }}:{{ item.port | default(mullvad_sidecar_socks_port) }}"
     volumes:
       - "mullvad-{{ item.name }}-state:/var/lib/tailscale"
     networks:
@@ -101,6 +102,7 @@
   loop: "{{ mullvad_sidecars }}"
   loop_control:
     label: "{{ item.name }}"
+    index_var: index
 
 - name: Run ircfiber-engine
   community.docker.docker_container:
