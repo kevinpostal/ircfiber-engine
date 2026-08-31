@@ -91,7 +91,7 @@
       TS_SOCKS5_SERVER: ":{{ item.port | default(mullvad_sidecar_socks_port) }}"
       TS_STATE_DIR: "/var/lib/tailscale"
     ports:
-      - "{{ item.host_port | default(1079 + item.index | int) }}:{{ item.port | default(mullvad_sidecar_socks_port) }}"
+      - "{{ item.host_port | default(1079 + index | int) }}:{{ item.port | default(mullvad_sidecar_socks_port) }}"
     volumes:
       - "mullvad-{{ item.name }}-state:/var/lib/tailscale"
     networks:
