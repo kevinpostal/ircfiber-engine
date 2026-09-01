@@ -188,10 +188,17 @@ void logException(string component,
         if (fields["stack"].length > 8192)
             fields["stack"] = fields["stack"][0 .. 8192] ~ "\n... (truncated)";
         logJsonMap("error", component, context.length ? context : e.msg, fields);
-    } catch (Exception secondary) {
+        // Best-effort immediate flush so a crash that kills the heartbeat
+        // still ships the error record. The periodic heartbeat flush remains
+        // the primary path; this just eliminates the 10s window.
+        try flushAndSendLogs(); catch (Throwable) {}
+    } catch (Throwable secondary) {
         // We are already in an error path — never throw from here.
-        try stderr.writeln("logException failed: ", secondary.msg);
-        catch (Exception) {}
+        try {
+            string m;
+            try { m = secondary.msg; } catch (Throwable) { m = "unknown"; }
+            stderr.writeln("logException failed: ", m);
+        } catch (Throwable) {}
     }
 }
 // ── OTLP Logs export ──────────────────────────────────────────────────────
@@ -228,9 +235,12 @@ private __gshared bool logsMutexInitd;
 
 private void initLogsOnce() {
     if (logsMutexInitd) return;
-    logsMutex = new shared Mutex();
-    synchronized (logsMutex) {} // init
-    logsMutexInitd = true;
+    synchronized (typeid(typeof(logsMutex))) {
+        if (logsMutexInitd) return;
+        logsMutex = new shared Mutex();
+        synchronized (logsMutex) {} // init lazy mutex
+        logsMutexInitd = true;
+    }
 }
 
 /// Whether OTLP logs are enabled.
@@ -292,16 +302,19 @@ private void enqueueLog(string level, string component, string msg,
 }
 
 /// Drain and POST pending logs to OTLP /v1/logs. Called from heartbeat every 10s.
-void flushAndSendLogs() {
-    if (!g_logsEnabled) return;
-    if (!logsMutexInitd) initLogsOnce();
-    PendingLog[] batch;
-    synchronized (logsMutex) {
-        if (logQueue.length == 0) return;
-        batch = logQueue;
-        logQueue = null;
-    }
-    if (batch.length) sendLogsBatch(batch);
+/// Also safe to call from error paths — never throws (catches Throwable).
+void flushAndSendLogs() nothrow {
+    try {
+        if (!g_logsEnabled) return;
+        if (!logsMutexInitd) initLogsOnce();
+        PendingLog[] batch;
+        try synchronized (logsMutex) {
+            if (logQueue.length == 0) return;
+            batch = logQueue;
+            logQueue = null;
+        } catch (Throwable) { return; }
+        if (batch.length) try sendLogsBatch(batch); catch (Throwable) {}
+    } catch (Throwable) {}
 }
 
 private string logsJsonEscape(string s) {
@@ -374,8 +387,14 @@ private void sendLogsBatch(ref PendingLog[] batch) {
                 if (res.statusCode >= 400)
                     stderr.writeln("otel-logs: export failed status=", res.statusCode);
             });
-    } catch (Exception e) {
-        stderr.writeln("otel-logs: export error: ", e.msg);
+    } catch (Throwable e) {
+        // Catch Throwable (SyncError, AssertError) — the OTLP path must never
+        // kill the heartbeat fiber. Previously only Exception was caught, so
+        // a SyncError from vibe's mutex left the heartbeat dead at beat=0.
+        string m;
+        try { m = e.msg; } catch (Throwable) { m = "unknown"; }
+        try stderr.writeln("otel-logs: export error: ", m);
+        catch (Throwable) {}
     }
 }
 

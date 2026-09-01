@@ -1,18 +1,21 @@
 # {{ ansible_managed }}
 # Parsers for Fluent Bit — referenced by fluent-bit.conf via Parsers_File.
-# Separate file required because Fluent Bit 3.x rejects inline [PARSER]
-# sections in the main configuration (they must be in parsers_file).
+# Engine JSON ts is 2026-08-07T06:07:47.2434928Z (7 digits, single Z).
+# Docker json-file time is 2026-08-07T06:07:50.589360811Z (9 digits, Z).
+# Fluent Bit %L handles both; trailing Z is UTC without explicit %Z.
+# Previous prod template used %L%z and %Lz which expects +0000 and broke
+# SigNoz timestamp parsing ("invalid time format" → fallback to ingestion time).
 
 [PARSER]
     Name        docker
     Format      json
     Time_Key    time
-    Time_Format %Y-%m-%dT%H:%M:%S.%L%z
+    Time_Format %Y-%m-%dT%H:%M:%S.%L
     Time_Keep   On
 
 [PARSER]
     Name        engine_json
     Format      json
     Time_Key    time
-    Time_Format %Y-%m-%dT%H:%M:%S.%Lz
+    Time_Format %Y-%m-%dT%H:%M:%S.%L
     Time_Keep   On

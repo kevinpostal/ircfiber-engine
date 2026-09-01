@@ -19,6 +19,7 @@
     - "{{ grafana_alerting_volume }}"
     - "{{ grafana_plugins_volume }}"
     - "ircfiber_signoz_data"
+    - "ircfiber_clickhouse_data"
 
 - name: Ensure logging directories exist
   ansible.builtin.file:
@@ -79,6 +80,15 @@
     delete: yes
   register: grafana_dashboards_deploy
   notify: Restart grafana
+
+- name: Render SigNoz ingester OTel collector config
+  ansible.builtin.template:
+    src: otel-collector-config.yaml.j2
+    dest: "{{ fluent_bit_config_dir }}/otel-collector-config.yaml"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart logging stack
 
 - name: Render docker-compose for logging stack
   ansible.builtin.template:

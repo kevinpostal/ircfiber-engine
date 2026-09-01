@@ -275,7 +275,109 @@
     summary: "Caddy 5xx > 1% of traffic"
     description: "More than 1% of caddy requests returning 5xx over 5 min"
 
-# 8. Gateway fiber wedge (long-running fibers > 0 for 30 consecutive seconds)
+# 8. Engine down — no heartbeat logs from ircfiber-engine for 2 min (crash loop)
+- name: "engine_down"
+  alertType: "LOGS_BASED_ALERT"
+  ruleType: "logs"
+  evalInterval: "{{ signoz_alert_eval_interval_sec }}"
+  condition:
+    compositeQuery:
+      queryType: ""
+      panelType: "list"
+      queries:
+        - type: "builder"
+          spec:
+            name: "A"
+            signal: "logs"
+            filter:
+              expression: "service.name = 'ircfiber-engine' OR container.name CONTAINS 'ircfiber-engine'"
+            op: "count"
+            having:
+              expression: "A = 0"
+              value: "0"
+            orderBy: []
+            limit: null
+            selectFields: []
+            groupBy: []
+      unit: "short"
+      step: "120s"
+  labels:
+    severity: "critical"
+    service: "engine"
+  annotations:
+    summary: "Engine silent >2 min"
+    description: "No logs from ircfiber-engine in 2 min — crash loop, OOM, or Fluent Bit down. Check `docker ps; docker logs ircfiber-engine-ovh --tail 100; docker inspect`."
+    runbook: "ssh deploy@15.204.93.54 'docker ps --filter name=engine; docker logs ircfiber-engine-ovh --tail 200'"
+
+# 9. Engine boot failure — Mongo/Redis connection errors in logs
+- name: "engine_boot_failure"
+  alertType: "LOGS_BASED_ALERT"
+  ruleType: "logs"
+  evalInterval: "{{ signoz_alert_eval_interval_sec }}"
+  condition:
+    compositeQuery:
+      queryType: ""
+      panelType: "list"
+      queries:
+        - type: "builder"
+          spec:
+            name: "A"
+            signal: "logs"
+            filter:
+              expression: "body CONTAINS 'MongoDB connection failed' OR body CONTAINS 'Redis connection failed' OR body CONTAINS 'db name must be at most' OR body CONTAINS 'Connection loop crashed'"
+            op: "count"
+            having:
+              expression: "A > 0"
+              value: "0"
+            orderBy: []
+            limit: null
+            selectFields: []
+            groupBy: []
+      unit: "short"
+      step: "60s"
+  labels:
+    severity: "critical"
+    service: "engine"
+  annotations:
+    summary: "Engine boot failure"
+    description: "Engine logged Mongo/Redis connection failure or crash — likely replicaSet dbName bug or Tailscale IP drift. Check IR CFIBER_MONGO_URL / IR CFIBER_REDIS_URL."
+    runbook: "Check /etc/ircfiber/engine/env-ovh, `docker exec ircfiber-mongo mongosh --eval rs.status()`, `redis-cli ping`"
+
+# 10. Logging pipeline down — Fluent Bit not shipping any logs for 5 min
+- name: "fluent_bit_pipeline_down"
+  alertType: "LOGS_BASED_ALERT"
+  ruleType: "logs"
+  evalInterval: "{{ signoz_alert_eval_interval_sec }}"
+  condition:
+    compositeQuery:
+      queryType: ""
+      panelType: "list"
+      queries:
+        - type: "builder"
+          spec:
+            name: "A"
+            signal: "logs"
+            filter:
+              expression: "body CONTAINS 'fluent-bit' OR service.name = 'fluent-bit'"
+            op: "count"
+            having:
+              expression: "A = 0"
+              value: "0"
+            orderBy: []
+            limit: null
+            selectFields: []
+            groupBy: []
+      unit: "short"
+      step: "300s"
+  labels:
+    severity: "warning"
+    service: "logging"
+  annotations:
+    summary: "Fluent Bit pipeline silent"
+    description: "No Fluent Bit logs in 5 min — log shipper down, Docker json-file driver misconfigured, or SIGNOZ queue full. Check `docker logs ircfiber-fluent-bit`."
+    runbook: "ssh deploy@15.204.93.54 'docker logs ircfiber-fluent-bit --tail 100; docker ps --filter name=fluent'"
+
+# 11. Gateway fiber wedge (long-running fibers > 0 for 30 consecutive seconds)
 - alert: GatewayFiberWedge
   alertType: "METRIC_BASED_ALERT"
   ruleType: "prometheus_rule"

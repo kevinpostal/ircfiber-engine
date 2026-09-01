@@ -85,6 +85,21 @@ private bool setupOtel(string svcName) {
 }
 
 void main() {
+    // Global crash handler: ensure buffered OTLP logs are shipped even if
+    // the process terminates via an uncaught Throwable. vibe.d's event loop
+    // normally swallows fiber exceptions, but a top-level Error (e.g.
+    // AssertError from a data race) would otherwise kill the process with
+    // pending logs still in queue.
+    scope (failure) {
+        try {
+            import ircfiber.logging : flushAndSendLogs;
+            import ircfiber.tracing : flushAndSendSpans;
+            import ircfiber.observability : flushAndSendMetrics;
+            try flushAndSendLogs(); catch (Throwable) {}
+            try flushAndSendSpans(); catch (Throwable) {}
+            try flushAndSendMetrics(); catch (Throwable) {}
+        } catch (Throwable) {}
+    }
     // ── Bootstrap ─────────────────────────────────────────────────
     // Three startup paths:
     //   1. Fresh boot — read Mongo, start consumers, run normally.
@@ -111,7 +126,15 @@ void main() {
     auto ctx = bootstrapEngine();
     g_ctx = ctx;
 
-    cast(void) setupOtel("ircfiber-engine");
+    // OTel must be configured AFTER bootstrap so any bootstrap failures
+    // (Mongo/Redis unreachable) are still captured to stderr. bootstrap
+    // itself does not emit OTLP — it only uses vibe.core.log which goes
+    // to stderr unconditionally.
+    try cast(void) setupOtel("ircfiber-engine");
+    catch (Throwable e) {
+        string m; try { m = e.msg; } catch (Throwable) { m = "unknown"; }
+        try logError("setupOtel failed: %s", m); catch (Throwable) {}
+    }
 
     // Write a fresh state snapshot immediately so the frontend sees the
     // current connection state (connecting) right away, rather than stale
@@ -133,17 +156,13 @@ void main() {
             try {
                 ctx.localServer.lastHeartbeat = Clock.currTime.toUnixTime!long * 1000;
                 ctx.serverRegistry.updateHeartbeat(ctx.localServer.serverId);
-            } catch (Exception e) {
-                logWarn("Initial heartbeat failed: %s", e.msg);
+            } catch (Throwable e) {
+                string m; try { m = e.msg; } catch (Throwable) { m = "unknown"; }
+                try logWarn("Initial heartbeat failed: %s", m); catch (Throwable) {}
             }
-            // Load networks here — runs after registration but inside the same
-            // task so Redis operations (HGET, SMEMBERS, HSET) are not concurrent
-            // with the heartbeat task. On Linux (epoll driver), concurrent Redis
-            // operations from different tasks can cause fiber scheduling issues
-            // that hang SMEMBERS/SCAN responses.
             loadNetworks(ctx);
-        } catch (Exception e) {
-            logError("Registration task failed: %s", e.msg);
+        } catch (Throwable e) {
+            logException("registration", e, "Registration task failed");
         }
     });
     startHeartbeatTask(ctx);
@@ -167,21 +186,20 @@ void main() {
         runTask(() nothrow {
             try {
                 dg();
-            } catch (Exception e) {
-                // logException captures e.toString() + D stack trace.
+            } catch (Throwable e) {
                 logException("runtime", e, "Task crashed");
             }
         });
     };
 
     runSafe({ try { startEventProcessor(ctx); }
-              catch (Exception e) { logException("event_processor", e, "Event processor crashed"); } });
+              catch (Throwable e) { logException("event_processor", e, "Event processor crashed"); } });
     runSafe({ try { startControlConsumer(ctx); }
-              catch (Exception e) { logException("control_consumer", e, "Control consumer crashed"); } });
+              catch (Throwable e) { logException("control_consumer", e, "Control consumer crashed"); } });
     runSafe({ try { startCommandConsumers(ctx); }
-              catch (Exception e) { logException("command_consumers", e, "Command consumers crashed"); } });
+              catch (Throwable e) { logException("command_consumers", e, "Command consumers crashed"); } });
     runSafe({ try { startStateSnapshotter(ctx); }
-              catch (Exception e) { logException("state_snapshotter", e, "State snapshotter crashed"); } });
+              catch (Throwable e) { logException("state_snapshotter", e, "State snapshotter crashed"); } });
 
     logInfo("IRC Fiber Engine (Decentralized) running on server=%s", ctx.localServer.serverId);
     runApplication();

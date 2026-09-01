@@ -112,9 +112,12 @@ private __gshared MetricPoint[] pending;
 private __gshared bool mutexInitd;
 private void initOnce() {
     if (mutexInitd) return;
-    metricsMutex = new shared Mutex();
-    synchronized (metricsMutex) {} // init lazy mutex
-    mutexInitd = true;
+    synchronized (typeid(typeof(metricsMutex))) {
+        if (mutexInitd) return;
+        metricsMutex = new shared Mutex();
+        synchronized (metricsMutex) {} // init lazy mutex
+        mutexInitd = true;
+    }
 }
 
 // ── Test-only accessors ─────────────────────────────────────────────────
@@ -218,22 +221,19 @@ void recordHistogram(string name, double valueSeconds,
 
 /// Drain the pending metrics queue and POST a single OTLP/HTTP
 /// batch to `/v1/metrics`. Called from the heartbeat task every
-/// 10s alongside `flushAndSendSpans()`. Idempotent — calling with
-void flushAndSendMetrics() {
-    if (!g_metricsEnabled) return;
-    // initOnce is idempotent and cheap; calling it here means the
-    // heartbeat task can flush even if no record* call has ever run
-    // (e.g. on a quiet process). Without this, the first call to
-    // `synchronized (metricsMutex)` would NPE because `metricsMutex`
-    // is `shared Mutex.init`.
-    if (!mutexInitd) initOnce();
-    MetricPoint[] batch;
-    synchronized (metricsMutex) {
-        if (pending.length == 0) return;
-        batch = pending;
-        pending = null;
-    }
-    if (batch.length) sendMetricsBatch(batch);
+/// 10s alongside `flushAndSendSpans()`. Idempotent and never throws.
+void flushAndSendMetrics() nothrow {
+    try {
+        if (!g_metricsEnabled) return;
+        if (!mutexInitd) initOnce();
+        MetricPoint[] batch;
+        try synchronized (metricsMutex) {
+            if (pending.length == 0) return;
+            batch = pending;
+            pending = null;
+        } catch (Throwable) { return; }
+        if (batch.length) try sendMetricsBatch(batch); catch (Throwable) {}
+    } catch (Throwable) {}
 }
 private long nowUnixNanos() {
     SysTime t = Clock.currTime.toUTC();
@@ -270,8 +270,11 @@ private void sendMetricsBatch(ref MetricPoint[] batch) {
                 if (res.statusCode >= 400)
                     stderr.writeln("otel-metrics: export failed status=", res.statusCode);
             });
-    } catch (Exception e) {
-        stderr.writeln("otel-metrics: export error: ", e.msg);
+    } catch (Throwable e) {
+        string m;
+        try { m = e.msg; } catch (Throwable) { m = "unknown"; }
+        try stderr.writeln("otel-metrics: export error: ", m);
+        catch (Throwable) {}
     }
 }
 

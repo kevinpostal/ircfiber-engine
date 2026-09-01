@@ -41,10 +41,18 @@ ircfiber_use_lets_encrypt: true
 cloudflare_target_ip: "47.236.247.169"
 
 # --- Observability: Signoz OTel (production) ---------------------------------
-# Gateway/engine traces/logs/metrics -> k3s Signoz via Tailscale MagicDNS.
-# k3s collector is at otel.ubuntu-docker.tail544547.ts.net (Traefik 443, TLS) and
-# also at 100.94.116.56:4318 via NodePort/Tailscale IP. For k8s-internal pods
-# keep using http://signoz-otel-collector.signoz.svc.cluster.local:4318 (no TLS).
+# Gateway/engine traces/logs/metrics ship to the LOCAL signoz-ingester on
+# this host via the ircfiber_logging Docker bridge (fluent-bit tails the
+# engine's JSON stderr AND the engine's OTLP endpoint is signoz-ingester:4318).
+# The k3s collector at 100.94.116.56:4318 is for k3s pods only (they use
+# http://signoz-otel-collector.signoz.svc.cluster.local:4318 internally).
+# Do NOT use the Tailscale IP here — the prod VM's own collector is
+# signoz-ingester on ircfiber_logging; Tailscale round-trip adds latency
+# and a single point of failure (ubuntu-docker host down = blind engine).
+IRCFIBER_OTEL_ENABLED: "1"
+IRCFIBER_OTEL_ENDPOINT: "http://signoz-ingester:4318"
+OTEL_RESOURCE_ATTRIBUTES: "k8s.cluster.name=ircfiber-prod-1,service.name=ircfiber-engine,deployment.environment=prod"
+
 # --- Mullvad egress pool (6 exits for SuperNets session-limit) ----------------
 mullvad_sidecars:
   - { name: "de", exit_node: "100.117.47.8", host_port: 1080 } # de-ber-wg-003

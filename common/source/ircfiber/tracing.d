@@ -269,10 +269,15 @@ private long nowUnixNanos() {
     return t.toUnixTime() * 1_000_000_000L + t.fracSecs.total!"nsecs";
 }
 
+private __gshared bool queueMutexInitd;
 private void initOnce() {
-    queueMutex = new shared Mutex();
-    // Start unlocked by default — synchronized { } will lock it.
-    synchronized (queueMutex) {} // dummy lock/unlock to init
+    if (queueMutexInitd) return;
+    synchronized (typeid(typeof(queueMutex))) {
+        if (queueMutexInitd) return;
+        queueMutex = new shared Mutex();
+        synchronized (queueMutex) {} // dummy lock/unlock to init
+        queueMutexInitd = true;
+    }
 }
 
 /// Build the OTLP/HTTP JSON request body manually — using string
@@ -369,23 +374,28 @@ private void sendBatch(ref PendingSpan[] batch) {
                 if (res.statusCode >= 400)
                     stderr.writeln("otel: export failed status=", res.statusCode);
             });
-    } catch (Exception e) {
-        stderr.writeln("otel: export error: ", e.msg);
+    } catch (Throwable e) {
+        string m;
+        try { m = e.msg; } catch (Throwable) { m = "unknown"; }
+        try stderr.writeln("otel: export error: ", m);
+        catch (Throwable) {}
     }
 }
 /// Drain the span queue and send to otel-collector.
 /// Called from the heartbeat task (every 10s) — safe to call
-/// multiple times; no-ops if the queue is empty.
-void flushAndSendSpans() {
-    if (!g_enabled) return;
-    if (!queueMutex) return;
-    PendingSpan[] batch;
-    synchronized (queueMutex) {
-        if (queue.length == 0) return;
-        batch = queue;
-        queue = null;
-    }
-    if (batch.length) sendBatch(batch);
+/// multiple times; no-ops if the queue is empty. Never throws.
+void flushAndSendSpans() nothrow {
+    try {
+        if (!g_enabled) return;
+        if (!queueMutex) return;
+        PendingSpan[] batch;
+        try synchronized (queueMutex) {
+            if (queue.length == 0) return;
+            batch = queue;
+            queue = null;
+        } catch (Throwable) { return; }
+        if (batch.length) try sendBatch(batch); catch (Throwable) {}
+    } catch (Throwable) {}
 }
 
 /// Marks the tracing exporter as started.
@@ -447,11 +457,20 @@ unittest {
     setTracingEnabled(false);
     cast(void) drainQueueForTest();
     int calls = 0;
-    withSpan("test.disabled.exc", null, (ref Span s) {
-        calls++;
-        throw new Exception("test exception");
-    });
-    // Disabled path swallows exception inside withSpan's catch, but still counts call.
+    bool threw = false;
+    try {
+        withSpan("test.disabled.exc", null, (ref Span s) {
+            calls++;
+            throw new Exception("test exception");
+        });
+    } catch (Exception e) {
+        threw = true;
+        assert(e.msg == "test exception");
+    }
+    // Disabled path is a transparent pass-through — it must NOT swallow
+    // the exception (otherwise registration timeouts are reported as
+    // "registration complete" and the engine wedges on a dead socket).
+    assert(threw, "withSpan disabled must propagate delegate exception");
     assert(calls == 1);
     assert(queueLengthForTest() == 0);
 }
