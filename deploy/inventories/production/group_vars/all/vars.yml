@@ -53,7 +53,11 @@ firewall_open_engine_admin: true
 mongo_data_volume: "ircfiber_mongo_data"
 mongo_initdb_database: "ircfiber"
 mongo_port: 27017
-
+mongo_replica_init: true
+mongo_replica_members:
+  - host: "{{ host_tailscale_ip }}"
+    port: "{{ mongo_port }}"
+    priority: 10
 # --- Redis --------------------------------------------------------------------
 redis_data_volume: "ircfiber_redis_data"
 redis_port: 6379
@@ -131,16 +135,13 @@ ircfiber_engine_bind_address: "0.0.0.0"
 ircfiber_engine_admin_port: 8091
 ircfiber_engine_log_level: "info"
 
-# --- Mullvad egress pool — 6 exits for SuperNets session-limit spreading ---
-# See engine/deploy/roles/engine/defaults/main.yml for docs. This overrides
-# the empty default so prod gets 6 SOCKS sidecars (1 per SuperNets net).
+# --- Mullvad egress pool — 3 exits on ubuntu-docker host (root netns) ---
+# The k3s sidecars run in cni0 netns where Tailscale filters 100.64.0.0/10.
+# ubuntu-docker (100.94.116.56) runs in root netns and sees all Mullvad exits.
 mullvad_sidecars:
-  - { name: "de", exit_node: "100.117.47.8" } # de-ber-wg-003
-  - { name: "ch", exit_node: "100.104.110.13" } # ch-zrh-wg-503
-  - { name: "nl", exit_node: "100.123.199.85" } # nl-ams-wg-201
-  - { name: "se", exit_node: "100.84.2.120" } # se-sto-wg-201
-  - { name: "gb", exit_node: "100.68.61.54" } # gb-lon-wg-001
-  - { name: "us", exit_node: "100.126.111.61" } # us-atl-wg-001
+  - { name: "de", host: "100.94.116.56", port: 1080 } # de-ber-wg-003
+  - { name: "ch", host: "100.94.116.56", port: 1081 } # ch-zrh-wg-503
+  - { name: "us", host: "100.94.116.56", port: 1082 } # us-atl-wg-001
 
 # --- Gateway defaults ---------------------------------------------------------
 ircfiber_gateway_log_level: "info"

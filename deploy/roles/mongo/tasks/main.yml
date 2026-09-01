@@ -37,6 +37,48 @@
     name: "{{ mongo_data_volume }}"
     state: present
 
+# KeyFile for replica set internal auth (shared across all members)
+# If vault_mongo_keyfile is set, use it; otherwise generate a random 1024-char base64 key.
+- name: Check if mongo keyFile exists on host
+  ansible.builtin.stat:
+    path: /etc/mongo-keyfile
+  register: mongo_keyfile_stat
+
+- name: Generate mongo keyFile content (when not using vault-provided key)
+  ansible.builtin.set_fact:
+    _mongo_keyfile_content: "{{ vault_mongo_keyfile | default('') }}"
+  when: vault_mongo_keyfile is defined and vault_mongo_keyfile | length > 0
+
+- name: Generate random mongo keyFile when vault key not set
+  ansible.builtin.command: openssl rand -base64 756
+  register: _mongo_keyfile_gen
+  when: not mongo_keyfile_stat.stat.exists and (vault_mongo_keyfile is not defined or vault_mongo_keyfile | length == 0)
+  changed_when: true
+  no_log: true
+
+- name: Write mongo keyFile to host
+  ansible.builtin.copy:
+    content: "{{ _mongo_keyfile_content | default(_mongo_keyfile_gen.stdout | default('')) }}"
+    dest: /etc/mongo-keyfile
+    owner: root
+    group: root
+    mode: "0600"
+  when: not mongo_keyfile_stat.stat.exists
+  no_log: true
+
+- name: Ensure mongo keyFile permissions
+  ansible.builtin.file:
+    path: /etc/mongo-keyfile
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Ensure mongo keyFile owned by mongodb user for Docker
+  ansible.builtin.file:
+    path: /etc/mongo-keyfile
+    owner: "999"
+    group: "999"
+    mode: "0600"
 # Config files
 - name: Render mongod.conf
   ansible.builtin.template:
@@ -73,11 +115,11 @@
     env:
       MONGO_INITDB_ROOT_USERNAME: "{{ vault_mongo_root_username }}"
       MONGO_INITDB_ROOT_PASSWORD: "{{ vault_mongo_root_password }}"
-      MONGO_INITDB_DATABASE: "{{ mongo_initdb_database }}"
     volumes:
       - "{{ mongo_data_volume }}:/data/db"
       - "/etc/ircfiber/mongod.conf:/etc/mongod.conf:ro"
       - "/etc/ircfiber/mongo-init.js:/docker-entrypoint-initdb.d/00-init.js:ro"
+      - "/etc/mongo-keyfile:/etc/mongo-keyfile:ro"
     security_opts:
       - "no-new-privileges:true"
     ulimits:
@@ -100,3 +142,63 @@
     labels:
       com.ircfiber.component: "mongo"
       com.ircfiber.version: "{{ ircfiber_version }}"
+
+- name: Wait for MongoDB to be ready
+  ansible.builtin.command: >
+    docker exec {{ mongo_container_name }} mongosh --quiet
+    --host {{ mongo_bind_ip }}
+    -u {{ vault_mongo_app_username }}
+    -p {{ vault_mongo_app_password }}
+    --authenticationDatabase {{ mongo_initdb_database }}
+    --eval 'db.adminCommand({ping:1}).ok'
+  register: mongo_ping
+  until: mongo_ping.stdout is search("1")
+  retries: 12
+  delay: 5
+  changed_when: false
+
+- name: Initiate MongoDB replica set rs0 (idempotent)
+  ansible.builtin.command: >
+    docker exec {{ mongo_container_name }} mongosh --quiet
+    -u {{ vault_mongo_root_username }}
+    -p {{ vault_mongo_root_password }}
+    --authenticationDatabase admin
+    --host {{ mongo_bind_ip }}
+    --eval '
+      try {
+        const s = rs.status();
+        if (s.ok == 1) {
+          print("rs already initiated");
+        }
+      } catch(e) {
+        if (e.codeName == "NoReplicationEnabled" || e.message.includes("not yet initiated") || e.message.includes("no replset config")) {
+          const cfg = { _id: "rs0", members: [{ _id: 0, host: "{{ host_tailscale_ip }}:{{ mongo_port }}", priority: 10 }] };
+          print("initiating rs0 with " + JSON.stringify(cfg));
+          rs.initiate(cfg);
+        } else {
+          throw e;
+        }
+      }'
+  register: mongo_rs_initiate
+  changed_when: mongo_rs_initiate.stdout is search("initiating rs0")
+  failed_when: false
+  when: mongo_replica_init | default(true) | bool
+  retries: 5
+  delay: 3
+  until: mongo_rs_initiate.rc == 0
+
+- name: Wait for replica set PRIMARY
+  ansible.builtin.command: >
+    docker exec {{ mongo_container_name }} mongosh --quiet
+    -u {{ vault_mongo_root_username }}
+    -p {{ vault_mongo_root_password }}
+    --authenticationDatabase admin
+    --host {{ mongo_bind_ip }}
+    --eval 'JSON.stringify(rs.status().members.map(m=>m.stateStr))'
+  register: mongo_rs_status
+  until: mongo_rs_status.stdout is search("PRIMARY")
+  retries: 12
+  delay: 5
+  changed_when: false
+  when: mongo_replica_init | default(true) | bool
+  failed_when: false

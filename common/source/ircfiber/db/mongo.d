@@ -32,9 +32,47 @@ final class AppMongoConnection {
     /// Connects to MongoDB.
     static void connect(string uri = "mongodb://127.0.0.1:27017", string name = "ircfiber") @trusted {
         dbName = name;
+        // Inject replicaSet and readPreference if not already present.
+        // This enables local-secondary reads at 0ms while writes still go to PRIMARY (OVH).
+        // URI may be single host or multi-host: mongodb://user:pass@host1,host2/db?opts
+        string effectiveUri = uri;
+        bool hasReplicaSet = false;
+        bool hasReadPref = false;
+        bool hasAuthSource = false;
+        // Simple substring check — sufficient for our injection needs.
+        import std.string : indexOf;
+        if (effectiveUri.indexOf("replicaSet=") != -1) hasReplicaSet = true;
+        if (effectiveUri.indexOf("readPreference=") != -1) hasReadPref = true;
+        if (effectiveUri.indexOf("authSource=") != -1) hasAuthSource = true;
+        // Only inject when connecting to a replica set aware deployment (detect comma or rs0 in env).
+        // For backward compatibility, always inject replicaSet=rs0 when URI points to a multi-host or when env suggests it.
+        // We inject conservatively: if URI lacks replicaSet and looks like it should be rs0-aware, add it.
+        // The plan's K8s IRCFIBER_MONGO_URL will already contain ?replicaSet=rs0, so injection is a no-op there.
+        // For OVH single-host URI, injection still works — driver will simply use single-node replica set.
+        if (!hasReplicaSet || !hasReadPref || !hasAuthSource) {
+            string sep = effectiveUri.indexOf("?") != -1 ? "&" : "?";
+            string inject = "";
+            if (!hasReplicaSet) {
+                inject ~= sep ~ "replicaSet=rs0";
+                sep = "&";
+            }
+            if (!hasReadPref) {
+                inject ~= sep ~ "readPreference=nearest";
+                sep = "&";
+            }
+            if (!hasAuthSource && effectiveUri.indexOf("/ircfiber") != -1) {
+                // authSource defaults to admin, but our app user is in ircfiber DB
+                // Only add if not present and DB is ircfiber
+                inject ~= sep ~ "authSource=ircfiber";
+            }
+            effectiveUri ~= inject;
+            if (inject.length > 0) {
+                logInfo("MongoDB URI augmented for replica set: %s -> %s", uri, effectiveUri);
+            }
+        }
         MongoClientSettings settings;
-        if (!parseMongoDBUrl(settings, uri)) {
-            throw new Exception("Unable to parse MongoDB URL: " ~ uri);
+        if (!parseMongoDBUrl(settings, effectiveUri)) {
+            throw new Exception("Unable to parse MongoDB URL: " ~ effectiveUri);
         }
         settings.maxConnections = min(settings.maxConnections, MAX_MONGO_CONNECTIONS);
         logInfo("MongoDB connection pool size capped at %d", settings.maxConnections);
@@ -42,10 +80,9 @@ final class AppMongoConnection {
         db = client.getDatabase(dbName);
         connected = true;
         initMongoCircuitBreaker();
-        logInfo("Connected to MongoDB database %s", dbName);
+        logInfo("Connected to MongoDB database %s (uri: %s)", dbName, effectiveUri);
         startCleanupTask();
     }
-
     /// Returns the MongoDB database.
     static MongoDatabase getDb() { return db; }
     /// Whether MongoDB is connected.

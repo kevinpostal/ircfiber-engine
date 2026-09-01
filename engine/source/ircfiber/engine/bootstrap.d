@@ -95,8 +95,10 @@ EngineContext bootstrapEngine() {
     auto mongoSlash = mongoUrl.lastIndexOf("/");
     if (mongoSlash > "mongodb://".length) {
         mongoDbName = mongoUrl[mongoSlash + 1 .. $];
+        auto qIdx = mongoDbName.indexOf("?");
+        if (qIdx >= 0) mongoDbName = mongoDbName[0 .. qIdx];
+        if (mongoDbName.length == 0) mongoDbName = "ircfiber";
     }
-    // During handoff boot, the new engine doesn't need Mongo — it
     // adopts live connections from the old engine. The 30-second
     // retry delay would cause the handoff protocol to time out.
     // We try once and warn on failure instead.

@@ -76,7 +76,7 @@
   ansible.builtin.set_fact:
     _engine_env: "{{ dict(_pairs) }}"
 - name: Run Mullvad sidecars (tailscale userspace SOCKS5, scalable 2→5)
-  when: mullvad_sidecars | length > 0
+  when: mullvad_sidecars | length > 0 and inventory_hostname not in groups['ircfiber_engines']
   community.docker.docker_container:
     name: "tailscale-mullvad-{{ item.name }}"
     image: "{{ mullvad_sidecar_image }}"
