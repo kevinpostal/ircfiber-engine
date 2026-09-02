@@ -43,12 +43,29 @@
     # Without `--ulimit nofile` the container inherited dockerd's 1024 soft
     # limit; on 2026-09-02 the engine exhausted it after ~8 h (fd leak) and
     # lost DNS/Redis/Mongo/IRC until ircfiber-monitor restarted it.
-    - name: Recreate engine container with new image
+    # IPv6: when ircfiber_ipv6_prefix is set, use host network to preserve per-user source IP.
+    - name: Recreate engine container with new image (bridge, IPv6 disabled)
+      when: ircfiber_ipv6_prefix is not defined or ircfiber_ipv6_prefix | length == 0
       ansible.builtin.shell: |
         docker stop {{ engine_container }} 2>/dev/null || true
         docker rm {{ engine_container }} 2>/dev/null || true
         docker run -d --name {{ engine_container }} --restart unless-stopped \
           --network ircfiber_net --network ircfiber_logging \
+          --env-file /etc/ircfiber/engine/env-{{ ircfiber_engine_id }} \
+          --ulimit nofile=65536:65536 \
+          --security-opt no-new-privileges:true \
+          --label com.ircfiber.component=engine \
+          --label com.ircfiber.engine_id={{ ircfiber_engine_id }} \
+          kevindpostal/irc-fiber-engine:0.3.0 /usr/local/bin/ircfiber-engine-entrypoint.sh
+      changed_when: true
+
+    - name: Recreate engine container with new image (host, IPv6 enabled)
+      when: ircfiber_ipv6_prefix is defined and ircfiber_ipv6_prefix | length > 0
+      ansible.builtin.shell: |
+        docker stop {{ engine_container }} 2>/dev/null || true
+        docker rm {{ engine_container }} 2>/dev/null || true
+        docker run -d --name {{ engine_container }} --restart unless-stopped \
+          --network host \
           --env-file /etc/ircfiber/engine/env-{{ ircfiber_engine_id }} \
           --ulimit nofile=65536:65536 \
           --security-opt no-new-privileges:true \
