@@ -1887,7 +1887,7 @@ gateway-fix-assets: version frontend-build ## Deploy > Fix live css/js 404 — r
 				set -e; \
 				docker stop ircfiber-gateway 2>/dev/null || true; \
 				docker rm ircfiber-gateway 2>/dev/null || true; \
-				docker run -d --name ircfiber-gateway --restart unless-stopped --network ircfiber_net -v ircfiber_uploads:/app/uploads -v ircfiber_logs:/var/log/irc-fiber --env-file /etc/ircfiber/gateway/env kevindpostal/irc-fiber-gateway:0.3.0 /app/irc-fiber >/dev/null; \
+				docker run -d --name ircfiber-gateway --restart unless-stopped --ulimit nofile=65536:65536 --security-opt no-new-privileges:true --network ircfiber_net -v ircfiber_uploads:/app/uploads -v ircfiber_logs:/var/log/irc-fiber --env-file /etc/ircfiber/gateway/env kevindpostal/irc-fiber-gateway:0.3.0 /app/irc-fiber >/dev/null; \
 				docker network connect ircfiber_logging ircfiber-gateway 2>/dev/null || true; \
 				echo "gateway recreated via docker run"; \
 				docker ps --format "{{.Names}} {{.Status}}" | grep gateway'; \

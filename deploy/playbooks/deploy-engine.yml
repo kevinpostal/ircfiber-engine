@@ -39,9 +39,20 @@
       args:
         executable: /bin/bash
       timeout: 1800
+    # Mirrors roles/engine/tasks/main.yml (ulimits, security_opts, labels).
+    # Without `--ulimit nofile` the container inherited dockerd's 1024 soft
+    # limit; on 2026-09-02 the engine exhausted it after ~8 h (fd leak) and
+    # lost DNS/Redis/Mongo/IRC until ircfiber-monitor restarted it.
     - name: Recreate engine container with new image
       ansible.builtin.shell: |
         docker stop {{ engine_container }} 2>/dev/null || true
         docker rm {{ engine_container }} 2>/dev/null || true
-        docker run -d --name {{ engine_container }} --restart unless-stopped --network ircfiber_net --network ircfiber_logging --env-file /etc/ircfiber/engine/env-{{ ircfiber_engine_id }} kevindpostal/irc-fiber-engine:0.3.0 /usr/local/bin/ircfiber-engine-entrypoint.sh
+        docker run -d --name {{ engine_container }} --restart unless-stopped \
+          --network ircfiber_net --network ircfiber_logging \
+          --env-file /etc/ircfiber/engine/env-{{ ircfiber_engine_id }} \
+          --ulimit nofile=65536:65536 \
+          --security-opt no-new-privileges:true \
+          --label com.ircfiber.component=engine \
+          --label com.ircfiber.engine_id={{ ircfiber_engine_id }} \
+          kevindpostal/irc-fiber-engine:0.3.0 /usr/local/bin/ircfiber-engine-entrypoint.sh
       changed_when: true

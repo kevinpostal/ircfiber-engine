@@ -41,7 +41,11 @@ final class MessageRepository {
     /// window. Only applied to channel buffers — the `_server` log
     /// needs its numerics/MOTD.
     private static immutable string NOISE_PAYLOAD_RE =
-        `"c"\s*:\s*"(315|352|332|333|353|354|366|367|368|376|422|311|312|313|317|318|319|330|301|671|401|PONG|TAGMSG|QUIT|you_nickchange)"`;
+        `"c"\s*:\s*"(315|352|332|333|353|354|366|367|368|376|422|311|312|313|317|318|319|330|301|671|401|324|329|303|PONG|TAGMSG|QUIT|you_nickchange)"`;
+
+    /// Positive match for chat rows only (bouncer playback / CHATHISTORY):
+    /// the limit must apply to PRIVMSG/NOTICE, not to JOIN/MODE churn.
+    private static immutable string CHAT_PAYLOAD_RE = `"c"\s*:\s*"(PRIVMSG|NOTICE)"`;
 
     private static Bson noisePayloadExclusion() @trusted {
         return Bson([
@@ -354,6 +358,71 @@ final class MessageRepository {
         }
         applyNoiseExclusion(filter, channel);
         return readPayloads(filter, count);
+    }
+
+    /**
+     * IRCv3 CHATHISTORY-style window query (used by the bouncer).
+     *
+     * Returns up to `count` chat rows with `afterTs < t < beforeTs`
+     * (either bound 0 = unbounded), taken from the newest end of the
+     * window (`fromNewest`, for LATEST/BEFORE) or the oldest end (AFTER).
+     * Always oldest-first. Only PRIVMSG/NOTICE rows count towards `count`
+     * (the `phase` filter is still the caller's job).
+     */
+    Json[] getWindow(string serverId, string networkId, string channel,
+                     long afterTs, long beforeTs, int count, bool fromNewest) @trusted {
+        channel = normalizeChannel(channel);
+        if (count <= 0) count = 50;
+        if (count > 1000) count = 1000;
+
+        Bson filter = serverId.length > 0
+            ? Bson(["serverId": Bson(serverId), "networkId": Bson(networkId), "channel": Bson(channel)])
+            : Bson(["networkId": Bson(networkId), "channel": Bson(channel)]);
+        if (afterTs > 0 || beforeTs > 0) {
+            Bson range = Bson.emptyObject;
+            if (afterTs > 0) range["$gt"] = Bson(afterTs);
+            if (beforeTs > 0) range["$lt"] = Bson(beforeTs);
+            filter["t"] = range;
+        }
+        // `$regex` operator form: a bare BsonRegex value in a top-level
+        // filter field matched nothing through vibe.d 0.10.3 in practice.
+        filter["payload"] = Bson(["$regex": Bson(CHAT_PAYLOAD_RE)]);
+        if (fromNewest) return readPayloads(filter, count);
+
+        FindOptions options;
+        options.sort = Bson(["t": Bson(1)]);
+        options.limit = cast(long) count;
+        Json[] out_;
+        foreach (doc; collection.find(filter, options)) {
+            const p = doc["payload"];
+            if (p.type != Bson.Type.string) continue;
+            try out_ ~= parseJsonString(p.get!string);
+            catch (Exception e) logWarn("Failed to parse stored message payload: %s", e.msg);
+        }
+        return out_;
+    }
+
+    /// Timestamp (unix ms) of the row with `msgid` in a buffer, or 0 when unknown.
+    long timestampOfMsgid(string serverId, string networkId, string channel, string msgid) @trusted {
+        channel = normalizeChannel(channel);
+        Bson filter = serverId.length > 0
+            ? Bson(["serverId": Bson(serverId), "networkId": Bson(networkId), "channel": Bson(channel), "msgid": Bson(msgid)])
+            : Bson(["networkId": Bson(networkId), "channel": Bson(channel), "msgid": Bson(msgid)]);
+        auto doc = collection.findOne(filter);
+        return doc.isNull ? 0 : readBsonTimestamp(doc["t"]);
+    }
+
+    /// Timestamp (unix ms) of the newest chat row of a buffer inside
+    /// `afterTs < t < beforeTs` (0 = unbounded), or 0 when there is none.
+    /// Backs CHATHISTORY TARGETS.
+    long latestTimestamp(string serverId, string networkId, string channel,
+                         long afterTs, long beforeTs) @trusted {
+        auto rows = getWindow(serverId, networkId, channel, afterTs, beforeTs, 1, true);
+        foreach (ev; rows) {
+            if (ev.type != Json.Type.object) continue;
+            if (auto t = "t" in ev) if (t.type == Json.Type.int_) return t.get!long;
+        }
+        return 0;
     }
 
     /// Fetch older messages using a timestamp cursor (fallback when

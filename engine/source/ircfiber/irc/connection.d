@@ -105,6 +105,9 @@ private struct HostCircuitBreaker {
     int failCount;
     long openedAt;   // 0 = closed
     long lastAttemptAt;
+    /// How many times the breaker has opened without a successful
+    /// connection in between; drives the escalating cooldown.
+    int openCount;
 }
 private HostCircuitBreaker[string] _hostBreakers;
 private __gshared Object gHostBreakerLock;
@@ -117,7 +120,18 @@ private shared static this() {
 }
 private shared static immutable HOST_WINDOW_MS   = 30 * 60 * 1000;  // 30 min
 private shared static immutable HOST_FAIL_THRESHOLD = 5;
-private shared static immutable HOST_COOLDOWN_MS = 5 * 60 * 1000;  // 5 min (was 30 min 2026-07-14 — excessive for the reconnect pattern)
+private shared static immutable HOST_COOLDOWN_MS = 5 * 60 * 1000;  // first cooldown; doubles per re-open
+private shared static immutable HOST_COOLDOWN_MAX_MS = 60 * 60 * 1000;
+
+/// Cooldown for the Nth opening of a host breaker: 5, 10, 20, 40, 60 min.
+private long hostCooldownMs(int openCount) @safe pure nothrow @nogc {
+    long ms = HOST_COOLDOWN_MS;
+    foreach (i; 1 .. openCount) {
+        ms *= 2;
+        if (ms >= HOST_COOLDOWN_MAX_MS) return HOST_COOLDOWN_MAX_MS;
+    }
+    return ms;
+}
 
 /// Record a connection failure to a host. Shared across all clients.
 void recordHostFailure(string host, int port) {
@@ -135,16 +149,18 @@ private void recordHostFailureLocked(string host, int port) {
         if (now - breaker.lastAttemptAt > HOST_WINDOW_MS) {
             breaker.failCount = 0;
             breaker.openedAt = 0;
+            breaker.openCount = 0;
         }
         breaker.failCount++;
         breaker.lastAttemptAt = now;
         if (breaker.failCount >= HOST_FAIL_THRESHOLD && breaker.openedAt == 0) {
             breaker.openedAt = now;
-            logWarn("Host circuit breaker OPENED for %s after %d failures (cooling down %d ms)",
-                key, breaker.failCount, HOST_COOLDOWN_MS);
+            breaker.openCount++;
+            logWarn("Host circuit breaker OPENED for %s after %d failures (opening #%d, cooling down %d ms)",
+                key, breaker.failCount, breaker.openCount, hostCooldownMs(breaker.openCount));
         }
     } else {
-        _hostBreakers[key] = HostCircuitBreaker(1, 0, now);
+        _hostBreakers[key] = HostCircuitBreaker(1, 0, now, 0);
     }
 }
 
@@ -178,7 +194,7 @@ private bool canConnectToHostLocked(string host, int port) {
     if (auto breaker = key in _hostBreakers) {
         if (breaker.openedAt > 0) {
             const now = Clock.currTime.toUnixTime!long * 1000;
-            if (now - breaker.openedAt < HOST_COOLDOWN_MS) {
+            if (now - breaker.openedAt < hostCooldownMs(breaker.openCount)) {
                 return false;
             }
             _hostBreakers.remove(key);
@@ -583,9 +599,17 @@ private ResolvedAddr[] resolveAllAddresses(string host, ushort port) {
         try {
             auto addrs = getAddress(h, p);
             string encoded;
+            // getaddrinfo without a socktype hint returns one entry per
+            // (address, socktype) — the same IP three times (STREAM, DGRAM,
+            // RAW). Dedupe so Happy Eyeballs does not race three identical
+            // connects and then wait three race timeouts for the same host.
+            bool[string] seen;
             foreach (addr; addrs) {
+                auto key = addr.toAddrString();
+                if (key in seen) continue;
+                seen[key] = true;
                 if (encoded.length > 0) encoded ~= "|";
-                encoded ~= addr.toAddrString()
+                encoded ~= key
                     ~ (addr.addressFamily == AddressFamily.INET6 ? "/6" : "/4");
             }
             try { c.put(encoded); } catch (Exception) {}
@@ -645,14 +669,51 @@ private ResolvedAddr[] interleaveAddressFamilies(ResolvedAddr[] addrs) {
     return out_;
 }
 
-private TCPConnection happyEyeballsConnectWithProxy(string host, ushort port, MullvadProxy* proxy) {
+/// User-visible connect progress sink: `(phase, text)` lands in the
+/// network's `_server` buffer via `PersistentIRCClient.emitLog`. Optional
+/// (null → silent) so the module-level helpers stay usable without a client.
+alias ConnectProgress = void delegate(string phase, string text) nothrow;
+
+private void report(ConnectProgress progress, string phase, string text) nothrow {
+    if (progress !is null) progress(phase, text);
+}
+
+/// Shortens a vibe/eventcore connect error to something a user can act on.
+private string shortConnectError(string msg) @safe {
+    import std.string : toLower;
+    const l = msg.toLower();
+    if (l.canFind("timed out") || l.canFind("timeout")) return "timed out after " ~ CONNECT_TIMEOUT_SECONDS.to!string ~ "s";
+    if (l.canFind("refused")) return "connection refused";
+    if (l.canFind("unreachable")) return "network unreachable";
+    if (l.canFind("reset")) return "connection reset";
+    if (l.canFind("socks")) return "SOCKS egress error: " ~ msg;
+    return msg.length > 90 ? msg[0 .. 90] ~ "…" : msg;
+}
+
+private TCPConnection happyEyeballsConnectWithProxy(string host, ushort port, MullvadProxy* proxy,
+                                                    ConnectProgress progress = null) {
     if (proxy !is null) logInfo("Mullvad egress %s (%s:%d) for %s:%d", proxy.label, proxy.host, proxy.port, host, port);
+    const egressLabel = proxy !is null ? "Mullvad exit " ~ proxy.label : "direct";
     auto addrs = resolveAllAddresses(host, port);
-    if (addrs.length == 0) throw new Exception("DNS resolution failed for " ~ host);
+    if (addrs.length == 0) {
+        report(progress, "attempt_fail", "DNS lookup for " ~ host ~ " returned no addresses.");
+        throw new Exception("DNS resolution failed for " ~ host);
+    }
 
     auto interleaved = interleaveAddressFamilies(addrs);
+    {
+        string list;
+        foreach (i, a; interleaved) {
+            if (i >= 4) { list ~= ", …"; break; }
+            if (i) list ~= ", ";
+            list ~= a.ip;
+        }
+        report(progress, "dns", "Resolved " ~ host ~ " → " ~ interleaved.length.to!string
+            ~ (interleaved.length == 1 ? " address" : " addresses") ~ " (" ~ list ~ "), connecting via " ~ egressLabel ~ ".");
+    }
     logDebug("Happy Eyeballs: racing %d addresses for %s (connect timeout %ds, race timeout %ds)",
         interleaved.length, host, CONNECT_TIMEOUT_SECONDS, HAPPY_EYEBALLS_RACE_TIMEOUT_SECONDS);
+    immutable raceStartMs = Clock.currTime.toUnixTime!long * 1000;
 
     import vibe.core.channel : createChannel;
 
@@ -660,13 +721,17 @@ private TCPConnection happyEyeballsConnectWithProxy(string host, ushort port, Mu
     auto conns = new TCPConnection[interleaved.length];
     auto tasks = new Task[interleaved.length];
     bool done = false;
+    size_t failed = 0;
 
     foreach (idx, addr; interleaved) {
         // Before launching the next attempt, see if an earlier one already won.
         if (idx > 0) {
             int winIdx;
             if (winnerCh.tryConsumeOne(winIdx, HAPPY_EYEBALLS_DELAY_MS.msecs)) {
-                if (conns[winIdx] && conns[winIdx].connected) {
+                if (winIdx < 0) {
+                    failed++;
+                } else if (conns[winIdx] && conns[winIdx].connected) {
+                    done = true;
                     finishHappyEyeballs(conns, tasks, winIdx);
                     logDebug("Happy Eyeballs: winner %s for %s", interleaved[winIdx].ip, host);
                     return conns[winIdx];
@@ -678,7 +743,10 @@ private TCPConnection happyEyeballsConnectWithProxy(string host, ushort port, Mu
         auto addrIp  = addr.ip;
         auto addrFam = addr.family;
         auto proxyForTask = proxy;
+        report(progress, "attempt", "Trying " ~ addrIp ~ ":" ~ port.to!string ~ " via " ~ egressLabel
+            ~ " (up to " ~ CONNECT_TIMEOUT_SECONDS.to!string ~ "s)…");
         safeFiberRun("happy_eyeballs_attempt", host, {
+            immutable attemptStartMs = Clock.currTime.toUnixTime!long * 1000;
             try {
                 TCPConnection conn;
                 if (proxyForTask !is null) {
@@ -702,32 +770,51 @@ private TCPConnection happyEyeballsConnectWithProxy(string host, ushort port, Mu
                 }
             } catch (Exception e) {
                 logDebug("Happy Eyeballs: %s failed: %s", addrIp, e.msg);
+                if (!done) {
+                    const tookMs = Clock.currTime.toUnixTime!long * 1000 - attemptStartMs;
+                    report(progress, "attempt_fail", addrIp ~ " via " ~ egressLabel ~ ": "
+                        ~ shortConnectError(e.msg) ~ " (" ~ (tookMs / 1000).to!string ~ "s).");
+                    // -1 = "one attempt failed": lets the race loop below give
+                    // up as soon as every address has failed instead of
+                    // sleeping out HAPPY_EYEBALLS_RACE_TIMEOUT per address
+                    // (45 s of silence for a 3-address host that refuses
+                    // within 10 s).
+                    try { winnerCh.put(-1); } catch (Exception) {}
+                }
             }
         });
 
 
     }
 
-    // Wait for a winner, one address at a time, up to the race timeout.
-    foreach (_; 0 .. interleaved.length) {
+    // Wait for a winner. Each attempt reports either its index (success) or
+    // -1 (failure); the race ends on the first success, once every attempt
+    // has failed, or when the per-address race timeout expires.
+    while (failed < interleaved.length) {
         int winIdx;
-        if (winnerCh.tryConsumeOne(winIdx, HAPPY_EYEBALLS_RACE_TIMEOUT_SECONDS.seconds)) {
-            if (conns[winIdx] && conns[winIdx].connected) {
-                finishHappyEyeballs(conns, tasks, winIdx);
-                logDebug("Happy Eyeballs: winner %s for %s", interleaved[winIdx].ip, host);
-                return conns[winIdx];
-            }
+        if (!winnerCh.tryConsumeOne(winIdx, HAPPY_EYEBALLS_RACE_TIMEOUT_SECONDS.seconds)) break;
+        if (winIdx < 0) { failed++; continue; }
+        if (conns[winIdx] && conns[winIdx].connected) {
+            done = true;
+            finishHappyEyeballs(conns, tasks, winIdx);
+            logDebug("Happy Eyeballs: winner %s for %s", interleaved[winIdx].ip, host);
+            return conns[winIdx];
         }
     }
 
+    done = true;
     finishHappyEyeballs(conns, tasks, -1);
+    const tookMs = Clock.currTime.toUnixTime!long * 1000 - raceStartMs;
+    report(progress, "attempt_fail", "No address for " ~ host ~ " answered via " ~ egressLabel
+        ~ " (" ~ (tookMs / 1000).to!string ~ "s).");
     throw new Exception("All connection attempts failed for " ~ host ~ ":" ~ port.to!string);
 }
 
-private TCPConnection happyEyeballsConnect(string host, ushort port, string egressNodeId = "") {
+private TCPConnection happyEyeballsConnect(string host, ushort port, string egressNodeId = "",
+                                           ConnectProgress progress = null) {
     import std.string : toLower;
     auto hostLower = host.toLower();
-    // Fast-path for the local Ergo instance (irc.ircfiber.com):
+    // Fast-path for the first-party InspIRCd instance (irc.ircfiber.com):
     // On prod the host resolves via Docker alias to 172.30.0.5 internally.
     // Trying Mullvad first wastes 12s (3 exits × 4s) and hits the public
     // hairpin, which is flaky. Try direct first; fall back to Mullvad only
@@ -736,7 +823,7 @@ private TCPConnection happyEyeballsConnect(string host, ushort port, string egre
     // also failed, but direct via internal alias succeeded.
     if (hostLower == "irc.ircfiber.com" && egressNodeId.length == 0) {
         try {
-            auto directConn = happyEyeballsConnectWithProxy(host, port, null);
+            auto directConn = happyEyeballsConnectWithProxy(host, port, null, progress);
             return directConn;
         } catch (Exception e) {
             logWarn("happyEyeballsConnect direct to %s failed (%s), trying Mullvad pool", host, e.msg);
@@ -809,7 +896,7 @@ private TCPConnection happyEyeballsConnect(string host, ushort port, string egre
     Exception lastErr;
     foreach (proxy; toTry) {
         try {
-            auto conn = happyEyeballsConnectWithProxy(host, port, proxy);
+            auto conn = happyEyeballsConnectWithProxy(host, port, proxy, progress);
             // Enterprise: protect __gshared last-used egress display vars.
             if (gMullvadLock !is null) synchronized (gMullvadLock) {
                 mullvadLastUsedLabel = proxy ? proxy.label : "";
@@ -1278,6 +1365,12 @@ final class PersistentIRCClient {
         // `attemptCount` / `nextRetryAtMs` so a successful reconnect
         // clears the disconnect copy too — see `emitZeroRetryStatus`.
         FailInfo            lastFailInfo;
+        /// One DISCONNECTED lifecycle event per drop. Set by whichever path
+        /// emits first (handleServerError on a server ERROR, or
+        /// handleDisconnection) and cleared when the next attempt starts, so
+        /// the `_server` timeline no longer shows two or three
+        /// "Disconnected" rows for a single disconnect.
+        bool                disconnectedEmitted;
 
         // IRC state
         string              sessionNick;
@@ -2403,16 +2496,50 @@ final class PersistentIRCClient {
 
             auto delay = backoff.nextDelay();
 
+            // Give up after a week of uninterrupted failure (see
+            // ExponentialBackoff): the host is not coming back on its own.
+            // Park the loop (like the admin-disabled path) until the user
+            // hits Reconnect — that control message replaces this client
+            // with a fresh one — or the engine restarts.
+            if (delay == Duration.max) {
+                const streak = backoff.failingFor();
+                const summary = "Gave up reconnecting to " ~ config.host ~ ":" ~ config.port.to!string
+                    ~ " after " ~ backoff.currentAttempt().to!string ~ " attempts over "
+                    ~ (streak.total!"hours").to!string ~ " h ("
+                    ~ (lastEmittedReason.length > 0 ? lastEmittedReason : "connection_lost")
+                    ~ "). Use Reconnect to try again.";
+                logWarn("%s: %s", config.name, summary);
+                logJsonMap("warn", "connection", "Reconnect budget exhausted — parking network",
+                    ["network": config.name, "host": config.host, "port": config.port.to!string,
+                     "attempts": backoff.currentAttempt().to!string,
+                     "streakHours": (streak.total!"hours").to!string,
+                     "reason": lastEmittedReason.length > 0 ? lastEmittedReason : "connection_lost",
+                     "event": "reconnect_gave_up"]);
+                recordCounter("ircfiber.reconnect.gave_up", 1,
+                    ["network": config.name, "host": config.host]);
+                state = ConnectionState.disconnected;
+                emitZeroRetryStatus();
+                lastDisconnectReason = summary;
+                emitLog("error", summary);
+                try eventChannel.put(IRCRawEvent.makeDisconnected(config.name, config.id.toString(), summary));
+                catch (Exception) {}
+                while (!isShutdownRequested) sleep(5.seconds);
+                break;
+            }
+
             // Per-host circuit breaker: after N consecutive failures to the
             // same host, extend the delay to the remaining cooldown so we
             // don't keep hammering a server that's clearly rejecting us.
+            // The cooldown doubles every time the breaker re-opens
+            // (5 → 10 → 20 → 40 → 60 min) — see hostCooldownMs().
             auto hostKey = config.host ~ ":" ~ config.port.to!string;
             if (auto breaker = hostKey in _hostBreakers) {
                 if (breaker.openedAt > 0) {
                     const now = Clock.currTime.toUnixTime!long * 1000;
                     const elapsed = now - breaker.openedAt;
-                    if (elapsed < HOST_COOLDOWN_MS) {
-                        auto remaining = HOST_COOLDOWN_MS - elapsed;
+                    const cooldown = hostCooldownMs(breaker.openCount);
+                    if (elapsed < cooldown) {
+                        auto remaining = cooldown - elapsed;
                         const remainingDur = dur!"msecs"(remaining);
                         if (remainingDur > delay) {
                             delay = remainingDur;
@@ -2420,9 +2547,13 @@ final class PersistentIRCClient {
                                 hostKey, delay);
                         }
                     } else {
-                        // Cooldown expired — close the circuit
-                        _hostBreakers.remove(hostKey);
-                        logInfo("Host circuit breaker reset for %s (cooldown expired)", hostKey);
+                        // Cooldown expired — half-open: allow attempts again but
+                        // remember how often this host has tripped so the next
+                        // opening cools down for longer.
+                        breaker.openedAt = 0;
+                        breaker.failCount = 0;
+                        logInfo("Host circuit breaker reset for %s (cooldown expired, opened %d× so far)",
+                            hostKey, breaker.openCount);
                     }
                 }
             }
@@ -2670,6 +2801,7 @@ final class PersistentIRCClient {
             throw new Exception("Shutdown requested");
         }
         state = ConnectionState.connecting;
+        disconnectedEmitted = false;
         ackedCaps.clear();
         serverFeatures = ServerFeatures.init;
         // Drop any tokens leftover from the previous connection attempt;
@@ -2689,7 +2821,7 @@ final class PersistentIRCClient {
         withSpan("irc.tcp_connect",
             ["network": config.name, "host": config.host, "port": config.port.to!string, "egress": config.egressNodeId],
             (ref Span ts) {
-            connection = happyEyeballsConnect(config.host, config.port, config.egressNodeId);
+            connection = happyEyeballsConnect(config.host, config.port, config.egressNodeId, &emitLog);
             activeEgressLabel = mullvadLastUsedLabel;
             activeEgressHost = mullvadLastUsedHost;
             activeEgressIp = mullvadLastUsedIp;
@@ -2768,7 +2900,7 @@ final class PersistentIRCClient {
                 if (connection && connection.connected) {
                     try { connection.close(); } catch (Exception) {}
                 }
-                connection = happyEyeballsConnect(config.host, config.port, config.egressNodeId);
+                connection = happyEyeballsConnect(config.host, config.port, config.egressNodeId, &emitLog);
                 activeEgressLabel = mullvadLastUsedLabel;
                 activeEgressHost = mullvadLastUsedHost;
                 activeEgressIp = mullvadLastUsedIp;
@@ -2927,6 +3059,9 @@ final class PersistentIRCClient {
             if (registrationLastWarnMs < registrationWarnThresholdMs1
                 && elapsedMs >= registrationWarnThresholdMs1) {
                 registrationLastWarnMs = elapsedMs;
+                emitLog("registering", "Still waiting for the server to accept the registration ("
+                    ~ (elapsedMs / 1000).to!string ~ "s) — servers often stall here on ident/hostname lookups; giving up at "
+                    ~ REGISTRATION_OVERALL_TIMEOUT_SECS.to!string ~ "s.");
                 logWarn("PersistentIRCClient[%s] registration slow — %dms elapsed, still waiting for 001",
                     config.name, cast(int) elapsedMs);
                 logJsonMap("warn", "connection",
@@ -2943,6 +3078,8 @@ final class PersistentIRCClient {
             } else if (registrationLastWarnMs < registrationWarnThresholdMs2
                 && elapsedMs >= registrationWarnThresholdMs2) {
                 registrationLastWarnMs = elapsedMs;
+                emitLog("registering", "No welcome after " ~ (elapsedMs / 1000).to!string
+                    ~ "s — the server accepted the TCP/TLS connection but has not completed registration.");
                 logWarn("PersistentIRCClient[%s] registration very slow — %dms elapsed",
                     config.name, cast(int) elapsedMs);
                 logJsonMap("warn", "connection",
@@ -3826,7 +3963,8 @@ private void processEvents() {
         // Without this, the old attempt card stays "Connected" while
         // a new reconnect cycle silently opens a second card.
         import core.atomic : atomicLoad;
-        if (atomicLoad(postHandoffQuitAtMs) == 0) {
+        if (atomicLoad(postHandoffQuitAtMs) == 0 && !disconnectedEmitted) {
+            disconnectedEmitted = true;
             try eventChannel.put(IRCRawEvent.makeDisconnected(
                 config.name, config.id.toString(), text));
             catch (Exception) {}
@@ -5075,7 +5213,8 @@ private void processEvents() {
             // happens outside the catch block (e.g. processEvents data-loss
             // detection or handleServerError squashed ERROR).
             import core.atomic : atomicLoad;
-            if (atomicLoad(postHandoffQuitAtMs) == 0) {
+            if (atomicLoad(postHandoffQuitAtMs) == 0 && !disconnectedEmitted) {
+                disconnectedEmitted = true;
                 try eventChannel.put(IRCRawEvent.makeDisconnected(
                     config.name, config.id.toString(),
                     lastDisconnectReason.length > 0 ? lastDisconnectReason : "Connection lost"));

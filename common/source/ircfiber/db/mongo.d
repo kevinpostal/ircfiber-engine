@@ -2,7 +2,6 @@ module ircfiber.db.mongo;
 
 import vibe.db.mongo.mongo;
 import vibe.core.log;
-import vibe.core.core : setTimer, Timer;
 import vibe.data.bson : Bson;
 import std.algorithm : min;
 import std.conv : to;
@@ -10,16 +9,12 @@ import std.typecons : Nullable;
 import core.time : seconds, Duration;
 import ircfiber.db.circuit_breaker : initMongoCircuitBreaker;
 
-/// Default cap on simultaneous open MongoDB connections per process.
+/// Cap on simultaneous open MongoDB connections per process.
 ///
 /// vibe.d's `ConnectionPool` defaults to `uint.max` (effectively unlimited)
-/// and only ever shrinks when `cleanupConnections()` is called. With many
-/// concurrent fibers, the pool grows unbounded — easy to exhaust Mongo's
-/// max incoming connections and hit `connection refused` on the next call.
+/// and only shrinks via `cleanupConnections()`. The pool is therefore kept
+/// bounded by this cap and is never evicted (see `cleanupConnections`).
 private enum uint MAX_MONGO_CONNECTIONS = 50;
-
-/// How often to drop idle connections from the pool.
-private enum Duration CLEANUP_INTERVAL = 60.seconds;
 
 /// MongoDB connection manager.
 final class AppMongoConnection {
@@ -27,42 +22,34 @@ final class AppMongoConnection {
     private static MongoDatabase db;
     private static bool connected;
     private static string dbName;
-    private static Timer cleanupTimer;
 
     /// Connects to MongoDB.
     static void connect(string uri = "mongodb://127.0.0.1:27017", string name = "ircfiber") @trusted {
         dbName = name;
-        // Inject replicaSet and readPreference if not already present.
-        // This enables local-secondary reads at 0ms while writes still go to PRIMARY (OVH).
+        // Inject replicaSet/authSource if not already present. vibe-d's
+        // driver does not implement readPreference (settings.d: "Unknown
+        // MongoDB option") — every process start logged that warning and
+        // the option never had any effect, so it is not injected.
         // URI may be single host or multi-host: mongodb://user:pass@host1,host2/db?opts
         string effectiveUri = uri;
         bool hasReplicaSet = false;
-        bool hasReadPref = false;
         bool hasAuthSource = false;
         // Simple substring check — sufficient for our injection needs.
         import std.string : indexOf;
         if (effectiveUri.indexOf("replicaSet=") != -1) hasReplicaSet = true;
-        if (effectiveUri.indexOf("readPreference=") != -1) hasReadPref = true;
         if (effectiveUri.indexOf("authSource=") != -1) hasAuthSource = true;
-        // Only inject when connecting to a replica set aware deployment (detect comma or rs0 in env).
-        // For backward compatibility, always inject replicaSet=rs0 when URI points to a multi-host or when env suggests it.
-        // We inject conservatively: if URI lacks replicaSet and looks like it should be rs0-aware, add it.
-        // The plan's K8s IRCFIBER_MONGO_URL will already contain ?replicaSet=rs0, so injection is a no-op there.
-        // For OVH single-host URI, injection still works — driver will simply use single-node replica set.
-        if (!hasReplicaSet || !hasReadPref || !hasAuthSource) {
+        // The plan's K8s IRCFIBER_MONGO_URL already contains ?replicaSet=rs0, so
+        // injection is a no-op there. For the OVH single-host URI the driver
+        // simply uses a single-node replica set.
+        if (!hasReplicaSet || !hasAuthSource) {
             string sep = effectiveUri.indexOf("?") != -1 ? "&" : "?";
             string inject = "";
             if (!hasReplicaSet) {
                 inject ~= sep ~ "replicaSet=rs0";
                 sep = "&";
             }
-            if (!hasReadPref) {
-                inject ~= sep ~ "readPreference=nearest";
-                sep = "&";
-            }
             if (!hasAuthSource && effectiveUri.indexOf("/ircfiber") != -1) {
                 // authSource defaults to admin, but our app user is in ircfiber DB
-                // Only add if not present and DB is ircfiber
                 inject ~= sep ~ "authSource=ircfiber";
             }
             effectiveUri ~= inject;
@@ -81,7 +68,6 @@ final class AppMongoConnection {
         connected = true;
         initMongoCircuitBreaker();
         logInfo("Connected to MongoDB database %s (uri: %s)", dbName, effectiveUri);
-        startCleanupTask();
     }
     /// Returns the MongoDB database.
     static MongoDatabase getDb() { return db; }
@@ -90,8 +76,20 @@ final class AppMongoConnection {
     /// Returns the database name.
     static string name() { return dbName; }
 
-    /// Closes all currently unused connections in the pool. Useful as a
-    /// safety valve when the process is about to be idle for a while.
+    /// Closes all currently unused connections in the pool.
+    ///
+    /// NOT called periodically any more — with vibe-d 0.10.3 every evicted
+    /// `MongoConnection` leaks its socket: `disconnect()` only drops the
+    /// `m_stream` copy of the `TCPConnection` while `m_outRange` keeps a
+    /// third reference, so the refcounted fd is shut down but never
+    /// `close()`d, and `ConnectionPool.removeUnused` leaves the object in
+    /// `m_lockCount`, so the GC never finalizes it either. The prod engine
+    /// leaked ~100 fds/h this way (strace 2026-09-02: 12 Mongo connects,
+    /// 0 closes, `shutdown()` exactly every 60 s) and hit the 1024 soft
+    /// limit after ~8 h, losing DNS/Redis/IRC until the monitor restarted
+    /// it. A warm, capped pool is safe: a pooled connection that dies is
+    /// reconnected lazily by `MongoConnection.send`, which replaces the old
+    /// stream references and thereby closes the old socket.
     static void cleanupConnections() @trusted {
         if (client) client.cleanupConnections();
     }
@@ -337,19 +335,5 @@ final class AppMongoConnection {
         }
         if (bsonHas(result, "opcounters")) s.opcounters = result["opcounters"];
         return s.toBson();
-    }
-
-    /// Starts a periodic timer that drops idle pool connections. The
-    /// pool grows on demand and never shrinks otherwise, so without this
-    /// a busy gateway can leave dozens of sockets open long after the
-    /// requests that needed them have finished.
-    private static void startCleanupTask() {
-        if (cleanupTimer) return;
-        void callback() {
-            try cleanupConnections();
-            catch (Exception e)
-                logDiagnostic("MongoDB connection cleanup failed: %s", e.msg);
-        }
-        cleanupTimer = setTimer(CLEANUP_INTERVAL, &callback, true);
     }
 }

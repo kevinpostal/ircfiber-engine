@@ -43,6 +43,9 @@ struct RedisKeys {
     
     /// User event stream key
     static string events(string userId) { return "irc:events:" ~ userId; }
+
+    /// Per-user last-seen hash: field `<networkId>:<bufferKey>` → message `t` (ms).
+    static string lastSeen(string userId) { return "irc:lastseen:" ~ userId; }
     
     /// Command queue key (per-server)
     static string cmd(string serverId, string networkId) { 
@@ -69,6 +72,19 @@ struct RedisKeys {
     /// the gateway replays events with eid > sinceEid from this list.
     /// LTRIM keeps the list bounded for memory safety.
     static string userStream(string userId) { return "irc:stream:" ~ userId; }
+
+    /// Per-network hash: field = bouncer clientid, value = last eid delivered to it.
+    static string bncSeen(string networkId) { return "irc:bnc:seen:" ~ networkId; }
+
+    /// Presence record of one attached bouncer client (JSON, short TTL
+    /// refreshed by the client's keepalive loop). Written by the bnc
+    /// process, read by the admin API in the gateway process.
+    static string bncClient(string sessionId) { return "irc:bnc:client:" ~ sessionId; }
+    /// Set of session ids that have a `bncClient` record. An explicit index
+    /// rather than SCAN: vibe.d's RedisReply wedges on SCAN replies whose
+    /// nested key array is empty, and SMEMBERS is O(clients) anyway. Stale
+    /// members (record expired) are pruned by the reader.
+    static string bncClients() { return "irc:bnc:clients"; }
 
     /// Routing config key (per-host max connections, etc.)
     static string routingConfig() { return "irc:routing:config"; }

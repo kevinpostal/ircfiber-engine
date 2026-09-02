@@ -1,26 +1,15 @@
 module ircfiber.engine.processor;
 
-import vibe.core.core : runTask, yield, sleep;
+import vibe.core.core : runTask, yield;
 import vibe.core.log;
-import vibe.data.json : Json;
 
 import std.uuid : parseUUID;
-import std.datetime : Clock;
-import std.datetime.systime : SysTime;
-import core.time : seconds;
 
 import ircfiber.models.irc_event : IRCRawEvent;
 import ircfiber.models.network : Network;
 import ircfiber.engine.bootstrap : EngineContext;
 import ircfiber.engine.state : writeStateSnapshotForNetwork;
 import ircfiber.redis.protocol : RedisKeys;
-
-/// How often the engine publishes heartbeat_echo events. 30s mirrors
-/// IRCCloud's heartbeat cadence (used for connection liveness + buffer
-/// list reconciliation). Tuned so a user with 50 buffers generates ~N
-/// events per 30s regardless of buffer count — see W1-T03 design doc for
-/// the "batched per network" decision.
-private enum HEARTBEAT_INTERVAL_SECONDS = 30;
 
 /// IRC server-log phase events that are purely transient connection-state
 /// (TCP open, TLS handshake, registration steps). They never appear in
@@ -63,13 +52,6 @@ private bool isTransientServerLogPhase(ref IRCRawEvent event) nothrow @safe {
  */
 void startEventProcessor(ref EngineContext ctx) {
     auto serverId = ctx.localServer.serverId;
-
-    // W1-T03: spawn the heartbeat_echo emit task alongside the event
-    // processor. We start it here (not in app_engine.d) because the
-    // engine boot path is part of the user's WIP and we want to keep
-    // the diff for this task to processor.d alone. The task is a
-    // background fiber — it doesn't block the event loop.
-    spawnHeartbeatEchoTask(ctx);
 
     while (true) {
         bool processedAny = false;
@@ -229,94 +211,4 @@ void startEventProcessor(ref EngineContext ctx) {
         // (IRC connection, etc.) get CPU time.
         if (!processedAny) yield();
     }
-}
-
-/**
- * W1-T03: spawn the heartbeat_echo emit task.
- *
- * Runs as an independent vibe.d fiber. Every HEARTBEAT_INTERVAL_SECONDS,
- * iterates over every network managed by this engine and publishes ONE
- * heartbeat_echo event per network to the owning user's Redis channel.
- *
- * Batched per-network (not per-buffer) by design — a user with 50 buffers
- * produces N events per 30s regardless of buffer count. The wire envelope
- * carries bid[] (buffer names) + lastSeen map so the frontend can merge
- * the whole batch in a single $state mutation. See W1-T03 design for
- * the Q1 user decision rationale.
- *
- * lastSeen is emitted as an empty map for now — the engine doesn't track
- * per-buffer read state (that's a frontend concern today). The wire
- * contract reserves the field so a future task can populate it without
- * a frontend change.
- */
-private void spawnHeartbeatEchoTask(ref EngineContext ctx) {
-    runTask(() nothrow {
-        // Initial delay so we don't double-fire alongside the existing
-        // 10s server-registry heartbeat in the first cycle.
-        try sleep(HEARTBEAT_INTERVAL_SECONDS.seconds);
-        catch (Exception e) {
-            logWarn("heartbeat_echo initial sleep failed: %s", e.msg);
-            return;
-        }
-
-        while (true) {
-            try {
-                emitHeartbeatEchoForAllNetworks(ctx);
-            } catch (Exception e) {
-                logError("heartbeat_echo tick failed: %s", e.msg);
-            }
-            try sleep(HEARTBEAT_INTERVAL_SECONDS.seconds);
-            catch (Exception e) {
-                logError("heartbeat_echo sleep failed: %s", e.msg);
-                return;
-            }
-        }
-    });
-}
-
-/// Emit ONE heartbeat_echo event per network managed by this engine.
-/// Public for unit testing; not called outside this module.
-void emitHeartbeatEchoForAllNetworks(ref EngineContext ctx) {
-    auto now = Clock.currTime.toUnixTime!long * 1000L;
-    foreach (net; ctx.connManager.getNetworks()) {
-        try {
-            auto ownerId = ctx.connManager.getOwnerId(net.config.id);
-            if (ownerId.length == 0) continue;
-
-            auto payload = buildHeartbeatEchoPayload(ctx, net, now);
-            ctx.redis.publish(RedisKeys.events(ownerId), payload);
-            logDebug("heartbeat_echo sent for %s (%s buffers) -> %s",
-                net.config.name, net.config.id, ownerId);
-        } catch (Exception e) {
-            logWarn("heartbeat_echo publish failed for %s: %s",
-                net.config.name, e.msg);
-        }
-    }
-}
-
-/// Build the JSON envelope for a single network's heartbeat_echo.
-/// Wire shape (per W1-T03):
-///   { "type": "heartbeat_echo",
-///     "cid":  "<networkId>",
-///     "bid":  ["#chan1", "#chan2", ...],
-///     "ts":   1700000000000,
-///     "lastSeen": { "#chan1": 1700000000000, ... } }
-/// lastSeen is an empty object initially — the engine doesn't yet track
-/// per-buffer read state. The field is reserved on the wire so a future
-/// task can populate it without a frontend change.
-string buildHeartbeatEchoPayload(ref EngineContext ctx, Network net, long now) {
-    auto payload = Json.emptyObject;
-    payload["type"] = Json("heartbeat_echo");
-    payload["cid"] = Json(net.config.id.toString());
-    payload["ts"] = Json(now);
-
-    auto bid = Json.emptyArray;
-    const lastSeen = Json.emptyObject;
-    foreach (buf; ctx.connManager.getBuffersForNetwork(net.config.id)) {
-        bid ~= Json(buf.name);
-        // Future: populate lastSeen[buf.name] with server-tracked timestamp.
-    }
-    payload["bid"] = bid;
-    payload["lastSeen"] = lastSeen;
-    return payload.toString();
 }

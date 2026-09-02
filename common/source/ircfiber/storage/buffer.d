@@ -172,6 +172,10 @@ final class BufferManager {
             "311", "312", "313", "317", "318", "319", "330",
             // misc noise the chat UI never shows
             "301", "671", "401", "PONG", "TAGMSG", "QUIT", "you_nickchange",
+            // Replies to the MODE #chan / ISON probes every bouncer client
+            // fires on attach (324 RPL_CHANNELMODEIS, 329 RPL_CREATIONTIME,
+            // 303 RPL_ISON): rendered as blank rows otherwise.
+            "324", "329", "303",
         ];
         import std.algorithm : canFind;
         return NOISE.canFind(cmd);

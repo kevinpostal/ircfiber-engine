@@ -61,6 +61,18 @@ private void logLoadRepaired(UUID userId) {
         ["event": "prefs_load_fail_repaired", "user_id": userId.toString()]);
 }
 
+/// Default bouncer playback size (lines per buffer on attach).
+enum int BNC_PLAYBACK_DEFAULT = 200;
+/// Upper bound accepted from the UI; keeps a 30-channel attach under ~1 MB.
+enum int BNC_PLAYBACK_MAX = 1000;
+
+/// Clamps a requested playback size into `[0, BNC_PLAYBACK_MAX]`.
+int clampBncPlaybackLines(int v) @safe pure nothrow @nogc {
+    if (v < 0) return 0;
+    if (v > BNC_PLAYBACK_MAX) return BNC_PLAYBACK_MAX;
+    return v;
+}
+
 /// User preference settings.
 struct UserPreferences {
     /// Pinned channels in "networkId:#channel" format.
@@ -128,6 +140,12 @@ struct UserPreferences {
     bool notificationSound = true;
     bool autoDismissNotifs = true;
     bool muteAll = false;
+
+    /// Lines per buffer the bouncer replays when a client without
+    /// `draft/chathistory` attaches (ZNC "playback buffer"). 0 disables.
+    /// Set from the "Connect with another client…" dialog via
+    /// `/api/me/bnc-playback-lines`; read by the bnc process on attach.
+    int bncPlaybackLines = BNC_PLAYBACK_DEFAULT;
     /// Serializes to JSON.
     Json toJson() const {
         auto j = Json.emptyObject;
@@ -174,6 +192,7 @@ struct UserPreferences {
         j["notificationSound"] = Json(notificationSound);
         j["autoDismissNotifs"] = Json(autoDismissNotifs);
         j["muteAll"] = Json(muteAll);
+        j["bncPlaybackLines"] = Json(bncPlaybackLines);
         return j;
     }
     /// Deserializes from JSON. The optional `userId` enables structured
@@ -318,6 +337,14 @@ struct UserPreferences {
                 p.muteAll = v.get!bool;
             else {
                 logFieldInvalid(userId, "muteAll", v.type, "bool");
+                needsRepair = true;
+            }
+        }
+        if (auto v = "bncPlaybackLines" in json) {
+            if (v.type == Json.Type.int_)
+                p.bncPlaybackLines = clampBncPlaybackLines(cast(int) v.get!long);
+            else {
+                logFieldInvalid(userId, "bncPlaybackLines", v.type, "int");
                 needsRepair = true;
             }
         }

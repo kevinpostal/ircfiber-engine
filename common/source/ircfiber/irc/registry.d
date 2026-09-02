@@ -1019,14 +1019,21 @@ final class ServerRegistry {
                     ~ "network→server mapping(s) from per-engine mirrors",
                     raw.length);
                 foreach (netId, serverId; raw) {
+                    if (netId.length == 0 || serverId.length == 0) continue;
                     db.hset(RedisKeys.networkAssignments(), netId, serverId);
                 }
             }
         }
 
-
-
         foreach (netId, serverId; raw) {
+            // A blank field is a ghost row (seen 2026-09-02: "Network  assigned
+            // to server ovh ... reassigning" → "assignNetwork called with empty
+            // networkId"). Drop it from Redis instead of churning on it.
+            if (netId.length == 0 || serverId.length == 0) {
+                try db.hdel(RedisKeys.networkAssignments(), netId);
+                catch (Exception) {}
+                continue;
+            }
             NetworkAssignment na;
             na.networkId = netId;
             na.serverId = serverId;
@@ -1057,6 +1064,7 @@ final class ServerRegistry {
                 foreach (netId, serverId; fields) {
                     // Trust the mirror's stored serverId; it's set by the
                     // engine itself and can't drift.
+                    if (netId.length == 0 || serverId.length == 0) continue;
                     if (netId !in result)
                         result[netId] = serverId;
                 }

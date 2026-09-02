@@ -29,6 +29,14 @@ final class NetworkRepository {
     /// Creates a new network repository.
     this() {
         collection = AppMongoConnection.getDb()["networks"];
+        ensureIndexes();
+    }
+
+    /// Index used by the bouncer listener to resolve a server password
+    /// (`bnc:<token>`) back to its network.
+    private void ensureIndexes() @trusted {
+        try collection.createIndex(Bson(["bncToken": Bson(1)]));
+        catch (Exception e) logWarn("networks bncToken index: %s", e.msg);
     }
 
     /// Network config paired with its owner user ID.
@@ -105,6 +113,52 @@ final class NetworkRepository {
         try uid = parseUUID(doc["userId"].get!string);
         catch (Exception) uid = UUID.init;
         return NetworkWithUser(docToConfig(doc), uid);
+    }
+
+    /// Returns the bouncer token of a network, or `""` when none is set.
+    string getBncToken(UUID id) {
+        auto doc = collection.findOne(["id": id.toString()]);
+        if (doc.isNull) return "";
+        try return doc["bncToken"].get!string;
+        catch (Exception) return "";
+    }
+
+    /// Sets (or, with an empty token, clears) the bouncer token of a network.
+    /// Deliberately separate from `save()` so editing a network never drops it.
+    void setBncToken(UUID id, string token) {
+        auto selector = Bson(["id": Bson(id.toString())]);
+        auto update = token.length
+            ? Bson(["$set": Bson(["bncToken": Bson(token)])])
+            : Bson(["$unset": Bson(["bncToken": Bson("")])]);
+        collection.updateOne(selector, update);
+    }
+
+    /// Resolves a bouncer token to its network and owner. Returns a config
+    /// with `id == UUID.init` when the token is empty or unknown. The token
+    /// is intentionally absent from `NetworkConfig`/`toJson()` so it never
+    /// rides on `/api/networks` or the WS `sync` payload.
+    NetworkWithUser findByBncToken(string token) {
+        if (!token.length) return NetworkWithUser.init;
+        auto doc = collection.findOne(["bncToken": token]);
+        if (doc.isNull) return NetworkWithUser.init;
+        UUID uid;
+        try uid = parseUUID(doc["userId"].get!string);
+        catch (Exception) uid = UUID.init;
+        return NetworkWithUser(docToConfig(doc), uid);
+    }
+
+    /// Every network that currently has a bouncer password, with its owner.
+    /// Admin-only (the bouncer page); the token itself is never returned.
+    NetworkWithUser[] listWithBncToken() {
+        NetworkWithUser[] result;
+        auto filter = Bson(["bncToken": Bson(["$exists": Bson(true), "$ne": Bson("")])]);
+        foreach (doc; collection.find(filter)) {
+            UUID uid;
+            try uid = parseUUID(doc["userId"].get!string);
+            catch (Exception) uid = UUID.init;
+            result ~= NetworkWithUser(docToConfig(doc), uid);
+        }
+        return result;
     }
 
     /// Saves or updates a network configuration.
