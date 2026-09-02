@@ -12,6 +12,59 @@ import core.sync.mutex : Mutex;
 import core.time : seconds, dur;
 import vibe.core.core : runTask, sleep;
 
+/// OTLP resource attributes shared by the traces/metrics/logs exporters so all
+/// three signals correlate on the same identity in SigNoz.
+///
+/// Base set: service.name / service.version / service.namespace /
+/// deployment.environment. `OTEL_RESOURCE_ATTRIBUTES` (k=v,k=v) overrides any
+/// of those and adds k8s.cluster.name / host.name / k8s.node.name — this is
+/// how one binary becomes `ircfiber-engine-ovh` on OVH vs `ircfiber-engine-k8s-1`
+/// in-cluster. `host.name` falls back to gethostname() only when the env did
+/// not set it, so a resource never carries the same key twice.
+///
+/// Returns ordered (key, value) pairs; values are NOT JSON-escaped.
+string[2][] otelResourceAttributes(string serviceName, string serviceVersion) nothrow {
+    string[2][] res;
+    void set(string k, string v) {
+        foreach (ref kv; res) if (kv[0] == k) { kv[1] = v; return; }
+        string[2] pair = [k, v];
+        res ~= pair;
+    }
+    set("service.name", serviceName);
+    set("service.version", serviceVersion);
+    set("service.namespace", "ircfiber");
+    set("deployment.environment", "production");
+    bool hostFromEnv;
+    try {
+        import core.stdc.stdlib : getenv;
+        import core.stdc.string : strlen;
+        import std.string : split, strip, indexOf, toStringz;
+        auto env = getenv("OTEL_RESOURCE_ATTRIBUTES".toStringz);
+        if (env !is null) {
+            foreach (pair; env[0 .. strlen(env)].idup.split(",")) {
+                auto kv = pair.strip;
+                auto eq = kv.indexOf("=");
+                if (eq <= 0) continue;
+                auto k = kv[0 .. eq].strip;
+                auto v = kv[eq + 1 .. $].strip;
+                if (k.length == 0 || v.length == 0) continue;
+                if (k == "host.name") hostFromEnv = true;
+                set(k, v);
+            }
+        }
+        if (!hostFromEnv) {
+            import core.sys.posix.unistd : gethostname;
+            char[256] buf;
+            if (gethostname(buf.ptr, buf.length) == 0) {
+                size_t len = 0;
+                while (len < buf.length && buf[len] != 0) len++;
+                if (len > 0) set("host.name", buf[0 .. len].idup);
+            }
+        }
+    } catch (Throwable) {}
+    return res;
+}
+
 /// Generate a 16-byte (128-bit) trace ID as a lowercase hex string.
 string newTraceId() @trusted {
     try {
@@ -286,15 +339,11 @@ private string buildOtlpJson(ref PendingSpan[] batch) {
     auto sink = appender!string();
     sink ~= `{"resourceSpans":[{"resource":{"attributes":[`;
     bool first = true;
-    void addRes(string k, string v) {
+    foreach (kv; otelResourceAttributes(serviceName, serviceVersion)) {
         if (!first) sink ~= ",";
         first = false;
-        sink ~= format(`{"key":"%s","value":{"stringValue":"%s"}}`, k, jsonEscape(v));
+        sink ~= format(`{"key":"%s","value":{"stringValue":"%s"}}`, jsonEscape(kv[0]), jsonEscape(kv[1]));
     }
-    addRes("service.name", serviceName);
-    addRes("service.version", serviceVersion);
-    addRes("deployment.environment", "production");
-    addRes("service.namespace", "ircfiber");
     sink ~= `]},"scopeSpans":[{"scope":{"name":"ircfiber.engine","version":"`;
     sink ~= serviceVersion;
     sink ~= `"},"spans":[`;

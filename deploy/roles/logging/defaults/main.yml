@@ -37,17 +37,42 @@ signoz_ingester_image: "signoz/signoz-otel-collector:{{ signoz_ingester_version 
 signoz_clickhouse_version: "25.8"
 signoz_clickhouse_image: "clickhouse/clickhouse-server:{{ signoz_clickhouse_version }}"
 
+# ─── Centralized observability (k3s SigNoz) ────────────────────────────────
+# When true, all OVH Docker logs ship to the k3s SigNoz collector over
+# Tailscale and the local SigNoz/ClickHouse stack is disabled to fully
+# centralize. Set to false to keep a local SigNoz copy.
+#
+# Target is the Tailscale-operator VIP Service `svc:otel-collector`
+# (otel-collector.tail544547.ts.net / 100.79.88.61), ports 4319 (http) /
+# 4320 (grpc) = the collector's dedicated `otlp/ovh` receiver feeding the
+# `*/ovh` pipelines (no k8sattributes, resource attrs preserved). See
+# site/deploy/k8s/signoz/values.yaml. Do NOT use 100.94.116.56:4318 — that is
+# the k8s-infra otel-agent hostPort, which rewrites k8s.cluster.name/host.name
+# to ubuntu-docker and drops service.name.
+ovh_logs_centralize_to_k3s: true
+k3s_tailscale_ip: "100.94.116.56"
+k3s_signoz_otlp_host: "otel-collector.tail544547.ts.net"
+k3s_signoz_otlp_http_port: 4319
+k3s_signoz_otlp_grpc_port: 4320
+# k3s SigNoz query API — reachable from OVH Grafana via Tailscale ingress
+# (traefik on ubuntu-docker → signoz:8080). Used as Grafana datasource.
+k3s_signoz_api_url: "https://signoz.ubuntu-docker.tail544547.ts.net"
 # Fluent Bit — Docker log shipper for SigNoz.
-fluent_bit_version: "3.2"
+# `-debug` variant ships curl so the compose healthcheck can hit the
+# built-in /api/v1/health endpoint (curl); the plain tag is distroless and any
+# CMD-SHELL healthcheck fails with "stat /bin/sh: no such file" → permanently
+# "unhealthy" in docker ps while shipping fine.
+fluent_bit_version: "3.2-debug"
 fluent_bit_container_name: ircfiber-fluent-bit
 # Host directory for Fluent Bit config (rendered from fluent-bit.conf.j2).
 fluent_bit_config_dir: /etc/ircfiber/fluent-bit
 fluent_bit_log_level: info
 fluent_bit_memory_limit: 128m
 fluent_bit_cpu_limit: 0.5
-# OTLP output target (internal service name on ircfiber_logging network).
-fluent_bit_otlp_host: signoz-ingester
-fluent_bit_otlp_port: 4318
+# OTLP output target — when centralizing, ship directly to k3s via Tailscale;
+# otherwise use the local ingester on ircfiber_logging.
+fluent_bit_otlp_host: "{{ k3s_signoz_otlp_host if ovh_logs_centralize_to_k3s | default(true) | bool else 'signoz-ingester' }}"
+fluent_bit_otlp_port: "{{ k3s_signoz_otlp_http_port if ovh_logs_centralize_to_k3s | default(true) | bool else 4318 }}"
 fluent_bit_flush: 1
 fluent_bit_mem_buf_limit: 50MB
 fluent_bit_refresh_interval: 5

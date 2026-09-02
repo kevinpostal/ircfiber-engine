@@ -3923,7 +3923,8 @@ private void processEvents() {
                         if (chan !in channelUsers) channelUsers[chan] = [];
                         if (!channelUsers[chan].canFind(event.nick))
                             channelUsers[chan] ~= event.nick;
-                        if (!config.autoJoinChannels.canFind(chan))
+                        bool wasAutoJoin = config.autoJoinChannels.canFind(chan);
+                        if (!wasAutoJoin)
                             config.autoJoinChannels ~= chan;
                         auto pi = config.partedChannels.countUntil(chan);
                         if (pi >= 0) config.partedChannels = config.partedChannels.remove(pi);
@@ -3931,16 +3932,16 @@ private void processEvents() {
                         if (hasCap("chathistory")) {
                             sendRaw("CHATHISTORY LATEST " ~ chan ~ " 100");
                         }
-                        // Skip the JSON log for our own auto-joins to avoid noise;
-                        // we still log JOINs the user initiates from the client.
-                        if (!config.autoJoinChannels.canFind(chan)) {
-                            logJsonMap("info", "protocol",
-                                "JOIN",
-                                ["network": config.name,
-                                 "nick": event.nick,
-                                 "channel": chan,
-                                 "event": "join"]);
-                        }
+                        // Log our own JOINs at info so the web join at
+                        // /irc/Supernets/channel/superbowl is visible in SigNoz.
+                        // Fixed: was checking autoJoinChannels *after* appending, so the
+                        // second canFind was always true and the log never emitted.
+                        logJsonMap("info", "protocol",
+                            "JOIN",
+                            ["network": config.name,
+                             "nick": event.nick,
+                             "channel": chan,
+                             "event": "join"]);
                     } else {
                         // extended-join: params may be [channel, account, realname]
                         channelUsers[chan] ~= event.nick;

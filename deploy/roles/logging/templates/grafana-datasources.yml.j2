@@ -1,17 +1,24 @@
 apiVersion: 1
 
 # Provision Grafana with SigNoz as the primary datasource.
-# Old Loki/Tempo/Prometheus datasources remain in the DB for
-# backward compatibility but will no longer be provisioned.
+# When ovh_logs_centralize_to_k3s is true (default), Grafana queries the
+# k3s SigNoz instance via Tailscale ingress (https://signoz.ubuntu-docker…);
+# otherwise it queries the local sidecar (http://signoz:8080).
 deleteDatasources: []
 
 datasources:
   # ─── SigNoz (unified logs + metrics + traces) ───────────────────────────
-  # Replaces the earlier Loki/Tempo/Prometheus trio. SigNoz combined image
-  # runs on the ircfiber_logging network; port 8080 is the API endpoint.
-  # The API key is provisioned by the signoz_mcp role.
-  # Uses Infinity datasource plugin (yesoreyeram-infinity-datasource)
-  # which must be installed via GF_INSTALL_PLUGINS.
+{% if ovh_logs_centralize_to_k3s | default(true) | bool %}
+  # CENTRALIZED: query k3s SigNoz over Tailscale
+  - name: SigNoz
+    type: yesoreyeram-infinity-datasource
+    access: proxy
+    url: {{ k3s_signoz_api_url | default('https://signoz.ubuntu-docker.tail544547.ts.net') }}
+    jsonData:
+      allowUndeclaredFields: true
+      apiKey: {{ signoz_grafana_api_key }}
+    editable: false
+{% else %}
   - name: SigNoz
     type: yesoreyeram-infinity-datasource
     access: proxy
@@ -20,3 +27,4 @@ datasources:
       allowUndeclaredFields: true
       apiKey: {{ signoz_grafana_api_key }}
     editable: false
+{% endif %}

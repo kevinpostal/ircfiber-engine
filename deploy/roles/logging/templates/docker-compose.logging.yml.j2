@@ -90,11 +90,11 @@ services:
     cpus: 0.5
 
   # ────────────────────────────────────────────────────────────────────────
-  # Fluent Bit — container log shipper via OTLP HTTP to SigNoz ingester.
+  # Fluent Bit — container log shipper via OTLP HTTP.
   # ────────────────────────────────────────────────────────────────────────
-  # Scrapes Docker JSON logs from /var/lib/docker/containers, enriches with
-  # container metadata from the Docker socket, and forwards to the SigNoz
-  # ingester on port 4318 (OTLP HTTP).
+  # Centralized (default): ships directly to k3s SigNoz over Tailscale
+  # (k3s_tailscale_ip:4318). No local SigNoz dependency.
+  # Local (fallback): ships to signoz-ingester on ircfiber_logging.
   fluent-bit:
     <<: *logging-common
     container_name: ${FLUENT_BIT_CONTAINER_NAME:-ircfiber-fluent-bit}
@@ -107,26 +107,34 @@ services:
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
       - {{ fluent_bit_config_dir }}/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
       - {{ fluent_bit_config_dir }}/parsers.conf:/fluent-bit/etc/parsers.conf:ro
+      - {{ fluent_bit_config_dir }}/container_name.lua:/fluent-bit/etc/container_name.lua:ro
     entrypoint:
       - /fluent-bit/bin/fluent-bit
       - -c
       - /fluent-bit/etc/fluent-bit.conf
     healthcheck:
-      test: ["CMD-SHELL", "pgrep fluent-bit || exit 1"]
+      # Real check: Fluent Bit's own health endpoint (HTTP_Server/Health_Check in fluent-bit.conf).
+      # Requires the -debug image (has curl, no wget); the distroless tag has no shell at all.
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:2020/api/v1/health | grep -q ok || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 10s
+      start_period: 15s
+{% if not (ovh_logs_centralize_to_k3s | default(true) | bool) %}
     depends_on:
       - signoz
+{% endif %}
     mem_limit: ${FLUENT_BIT_MEMORY_LIMIT:-128m}
     cpus: ${FLUENT_BIT_CPU_LIMIT:-0.5}
 
   # ────────────────────────────────────────────────────────────────────────
-  # SigNoz combined image — one-container SigNoz with ClickHouse bundled.
-  # Exposes: API+UI on port 3301, REST API on 8080, OTLP on 4317/4318.
-  # See deploy/local/docker-compose.yml for local-dev equivalent.
+  # SigNoz + ClickHouse + ingester — LOCAL ONLY.
+  # When ovh_logs_centralize_to_k3s is true (default) these three services
+  # are NOT deployed — OVH ships directly to k3s SigNoz via Tailscale and
+  # the local 2.5 GB footprint is reclaimed. Set the flag to false to keep
+  # a full local copy (useful for air-gapped debugging).
   # ────────────────────────────────────────────────────────────────────────
+{% if not (ovh_logs_centralize_to_k3s | default(true) | bool) %}
   signoz:
     <<: *logging-common
     container_name: ${SIGNOZ_CONTAINER_NAME:-ircfiber-signoz}
@@ -143,25 +151,9 @@ services:
     environment:
       SIGNOZ_INITIAL_ADMIN_EMAIL: admin@ircfiber.com
       SIGNOZ_INITIAL_ADMIN_PASSWORD: admin123
-      # SigNoz v0.131+ replaced SIGNOZ_CLICKHOUSE_HOST/PORT/DATABASE with
-      # the nested telemetrystore.clickhouse.{dsn,provider} config keys,
-      # populated from env vars with the SIGNOZ_ prefix:
-      #   SIGNOZ_TELEMETRYSTORE_PROVIDER          → telemetrystore.provider
-      #   SIGNOZ_TELEMETRYSTORE_CLICKHOUSE_DSN    → telemetrystore.clickhouse.dsn
-      # The old STORAGE / ClickHouseUrl env vars are still backported by
-      # the binary for compatibility, but the per-key host/port vars are
-      # SILENTLY IGNORED — the binary falls back to its default DSN
-      # tcp://localhost:9000 which can't be reached from inside the
-      # container, breaking every query with "dial tcp [::1]:9000:
-      # connect: connection refused".
       SIGNOZ_TELEMETRYSTORE_PROVIDER: clickhouse
       SIGNOZ_TELEMETRYSTORE_CLICKHOUSE_DSN: tcp://clickhouse:9000
-      # Disable telemetry / usage reporting (stats reporter).
       TELEMETRY_ENABLED: "false"
-      # Without a JWT secret the binary logs a CRITICAL SECURITY ISSUE
-      # warning and refuses to sign session tokens properly. Without
-      # this, every login attempt after a fresh deploy fails with
-      # "no signing key configured".
       SIGNOZ_TOKENIZER_JWT_SECRET: ${SIGNOZ_JWT_SECRET}
     depends_on:
       - clickhouse
@@ -180,9 +172,6 @@ services:
     mem_limit: 2g
     cpus: 2.0
 
-  # ────────────────────────────────────────────────────────────────────────
-  # ClickHouse — columnar storage for SigNoz traces, logs, and metrics
-  # ────────────────────────────────────────────────────────────────────────
   clickhouse:
     <<: *logging-common
     container_name: ${CLICKHOUSE_CONTAINER_NAME:-ircfiber-clickhouse}
@@ -214,11 +203,6 @@ services:
     mem_limit: 1g
     cpus: 1.0
 
-  # ────────────────────────────────────────────────────────────────────────
-  # signoz-ingester — OTel collector receiving OTLP from Fluent Bit & bridge
-  # Accepts OTLP gRPC on 4317 and HTTP on 4318, exports via the OTel
-  # clickhouse exporter to the clickhouse service below (port 9000).
-  # ────────────────────────────────────────────────────────────────────────
   signoz-ingester:
     <<: *logging-common
     container_name: ${SIGNOZ_INGESTER_CONTAINER_NAME:-ircfiber-signoz-ingester}
@@ -235,39 +219,20 @@ services:
       - {{ fluent_bit_config_dir }}/otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
     command:
       - --config=/etc/otel-collector-config.yaml
-    # The otel/opentelemetry-collector-contrib image is **distroless** —
-    # no shell, no wget, no nc. The previous `CMD-SHELL, wget ...`
-    # healthcheck ALWAYS failed (`exec: /bin/sh: no such file`), so
-    # Docker marked the container unhealthy even when the collector was
-    # happily accepting OTLP. Docker compose v2 healthcheck only supports
-    # `CMD`, `CMD-SHELL`, and `NONE` — and the `PORT` test type isn't in
-    # any release. We use the otel-collector binary's `validate` subcommand
-    # as a config-validity probe (exit 0 if /etc/otel-collector-config.yaml
-    # parses cleanly, exit 1 otherwise). It's not a liveness probe — a
-    # real liveness check would require shelling, which the image
-    # doesn't allow. If the config is broken, we WANT the container
-    # marked unhealthy so it shows up in `docker ps`. If the collector
-    # process crashes mid-flight, `restart: unless-stopped` (via the
-    # `x-logging-common` anchor) brings it back; the bridge collector
-    # will show connection-refused if the OTLP listener is down, which
-    # is the real liveness signal at the application layer.
-    # Distroless image — binary is /signoz-otel-collector, no shell/wget.
-    # No validate subcommand exists. restart: unless-stopped handles crashes.
-    # Application-level liveness: OTel collector shows connection-refused
-    # to OTLP if the listener is down, surfaced via the bridge logs.
     healthcheck:
       disable: true
-    # Wait for clickhouse (not signoz) — the clickhouse exporter dials
-    # clickhouse:9000 directly. The exporter's retry_on_failure handles
-    # the ClickHouse init race (ClickHouse takes ~10s to be ready after
-    # the container starts). condition: service_started (not
-    # service_healthy) is enough since the clickhouse healthcheck is its
-    # own subsystem; the exporter's retry loop covers the rest.
     depends_on:
       clickhouse:
         condition: service_started
     mem_limit: 256m
     cpus: 0.5
+{% else %}
+  # Centralized: no local SigNoz/ClickHouse/ingester — Fluent Bit ships
+  # straight to k3s SigNoz at k3s_tailscale_ip:4318 over Tailscale.
+  # This block intentionally empty; the otel-collector config is not needed
+  # when Fluent Bit targets k3s directly (verified: ircfiber_logging →
+  # 100.94.116.56:4318 returns HTTP 200 from both bridge and host nets).
+{% endif %}
 
 networks:
   ircfiber_logging:

@@ -301,16 +301,15 @@ private string buildOtlpMetricsJson(ref MetricPoint[] batch) {
     auto sink = appender!string();
 
     sink ~= `{"resourceMetrics":[{"resource":{"attributes":[`;
-    bool firstResAttr = true;
-    void addRes(string k, string v) {
-        if (!firstResAttr) sink ~= ",";
-        firstResAttr = false;
-        sink ~= format(`{"key":"%s","value":{"stringValue":"%s"}}`, k, jsonEscape(v));
+    {
+        import ircfiber.tracing : otelResourceAttributes;
+        bool firstResAttr = true;
+        foreach (kv; otelResourceAttributes(serviceName, serviceVersion)) {
+            if (!firstResAttr) sink ~= ",";
+            firstResAttr = false;
+            sink ~= format(`{"key":"%s","value":{"stringValue":"%s"}}`, jsonEscape(kv[0]), jsonEscape(kv[1]));
+        }
     }
-    addRes("service.name", serviceName);
-    addRes("service.version", serviceVersion);
-    addRes("service.namespace", "ircfiber");
-    addRes("deployment.environment", "production");
     sink ~= `]},"scopeMetrics":[{"scope":{"name":"ircfiber.observability","version":"`;
     sink ~= serviceVersion;
     sink ~= `"},"metrics":[`;

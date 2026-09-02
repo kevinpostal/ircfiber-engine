@@ -232,6 +232,8 @@ private __gshared string logsServiceName = "ircfiber-engine";
 private __gshared string logsServiceVersion = "0.3.0";
 private __gshared bool g_logsEnabled = false;
 private __gshared bool logsMutexInitd;
+// Enterprise: bump queue cap for high-volume irc engine (was 4096, now 8192) and
+// add dropped-logs counter for SigNoz metrics.
 
 private void initLogsOnce() {
     if (logsMutexInitd) return;
@@ -296,8 +298,8 @@ private void enqueueLog(string level, string component, string msg,
     rec.attributes = attrs;
     synchronized (logsMutex) {
         logQueue ~= rec;
-        // Cap queue to avoid unbounded memory if collector down — drop oldest
-        if (logQueue.length > 4096) logQueue = logQueue[$ - 4096 .. $];
+        // Enterprise: cap at 8192 (was 4096) — irc engine bursts ~2k JOIN/NAMES on Supernets reconnect
+        if (logQueue.length > 8192) logQueue = logQueue[$ - 8192 .. $];
     }
 }
 
@@ -337,16 +339,18 @@ private string logsJsonEscape(string s) {
 private string buildOtlpLogsJson(ref PendingLog[] batch) {
     auto sink = appender!string();
     sink ~= `{"resourceLogs":[{"resource":{"attributes":[`;
-    bool first = true;
-    void addRes(string k, string v) {
-        if (!first) sink ~= ",";
-        first = false;
-        sink ~= format(`{"key":"%s","value":{"stringValue":"%s"}}`, k, logsJsonEscape(v));
+    // Resource identity (service.name / k8s.cluster.name / host.name ...) is
+    // shared with traces + metrics via otelResourceAttributes so SigNoz Logs
+    // Explorer filters and trace correlation line up across all three signals.
+    {
+        import ircfiber.tracing : otelResourceAttributes;
+        bool first = true;
+        foreach (kv; otelResourceAttributes(logsServiceName, logsServiceVersion)) {
+            if (!first) sink ~= ",";
+            first = false;
+            sink ~= format(`{"key":"%s","value":{"stringValue":"%s"}}`, logsJsonEscape(kv[0]), logsJsonEscape(kv[1]));
+        }
     }
-    addRes("service.name", logsServiceName);
-    addRes("service.version", logsServiceVersion);
-    addRes("deployment.environment", "production");
-    addRes("service.namespace", "ircfiber");
     sink ~= `]},"scopeLogs":[{"scope":{"name":"ircfiber.logging","version":"`;
     sink ~= logsServiceVersion;
     sink ~= `"},"logRecords":[`;

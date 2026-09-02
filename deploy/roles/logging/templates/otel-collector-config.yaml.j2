@@ -1,15 +1,21 @@
 # {{ ansible_managed }}
-# Minimal OTel collector config for the SigNoz ingester.
-# Receives OTLP from Fluent Bit (logs) and from the bridge collector
-# (traces + metrics + logs) on 4317/4318, and exports via the OTel
-# clickhouse exporter to the EXTERNAL clickhouse service (not the
-# bundled one in the signoz image — we run a separate clickhouse in
-# the same compose so we can back it up / scale it independently).
+# OTel collector config for the SigNoz ingester.
 #
-# The health_check extension on 0.0.0.0:13133 is what the docker
-# healthcheck in docker-compose.logging.yml.j2 probes — without it
-# port 13133 doesn't listen and the container can never become
-# "healthy" by Docker's view even when the collector itself is fine.
+# TWO MODES (controlled by ovh_logs_centralize_to_k3s):
+#
+#   CENTRALIZED (default, true): OVH fully centralizes to k3s SigNoz.
+#     This collector acts as a FORWARDER — it batches and forwards all
+#     signals via OTLP to the k3s collector at k3s_tailscale_ip:4317/4318
+#     over Tailscale. No local ClickHouse/SigNoz needed; fluent-bit ships
+#     directly to k3s via this collector, and gateway/engine OTel SDKs do
+#     the same (IRCFIBER_OTEL_ENDPOINT=http://k3s_tailscale_ip:4318).
+#
+#   LOCAL (false): Receives OTLP on 4317/4318 and exports to the local
+#     ClickHouse via the signoz-otel-collector's ClickHouse exporters
+#     (clickhousetraces / clickhouselogsexporter / signozclickhousemetrics).
+#     Used only when explicitly keeping a local SigNoz copy.
+#
+# The health_check extension on 0.0.0.0:13133 is the Docker healthcheck probe.
 
 receivers:
   otlp:
@@ -24,51 +30,79 @@ processors:
     timeout: 5s
     send_batch_size: 1024
 
-# SigNoz v0.131+ queries three SEPARATE databases (signoz_traces,
-# signoz_logs, signoz_metrics) and refuses to look anywhere else. The
-# OTel clickhouse exporter only writes to ONE database per exporter
-# instance, so we need three exporter instances — one per signal —
-# each pointing at its own database. Without this, all three signals
-# land in the database named below (signoz_traces), the other two
-# databases are never created, and the query service returns
-# "UNKNOWN_DATABASE" for every logs and metrics request.
+{% if ovh_logs_centralize_to_k3s | default(true) | bool %}
+# ── CENTRALIZED: forward everything to k3s SigNoz via OTLP ────────────────
 exporters:
-  clickhouse/traces:
-    endpoint: tcp://clickhouse:9000
-    database: signoz_traces
-    ttl: 72h
-    username: default
-    password: ""
-    traces_table_name: signoz_traces
-    # The OTel clickhouse exporter tries to CREATE DATABASE on startup
-    # so it can fail the whole collector process if ClickHouse isn't
-    # ready yet (Docker restart loop → unhealthy). retry_on_failure
-    # makes the exporter survive the transient race and start serving
-    # OTLP as soon as ClickHouse responds.
+  otlp/k3s:
+    endpoint: {{ k3s_signoz_otlp_host | default(k3s_tailscale_ip | default('100.94.116.56')) }}:{{ k3s_signoz_otlp_grpc_port | default(4317) }}
+    tls:
+      insecure: true
     retry_on_failure:
       enabled: true
       initial_interval: 2s
       max_interval: 30s
       max_elapsed_time: 300s
-  clickhouse/logs:
-    endpoint: tcp://clickhouse:9000
-    database: signoz_logs
-    ttl: 72h
-    username: default
-    password: ""
-    logs_table_name: signoz_logs
+    sending_queue:
+      enabled: true
+      queue_size: 5000
+      num_consumers: 2
+  otlphttp/k3s:
+    endpoint: http://{{ k3s_signoz_otlp_host | default(k3s_tailscale_ip | default('100.94.116.56')) }}:{{ k3s_signoz_otlp_http_port | default(4318) }}
+    tls:
+      insecure: true
     retry_on_failure:
       enabled: true
       initial_interval: 2s
       max_interval: 30s
       max_elapsed_time: 300s
-  clickhouse/metrics:
-    endpoint: tcp://clickhouse:9000
-    database: signoz_metrics
-    ttl: 72h
-    username: default
-    password: ""
-    metrics_table_name: signoz_metrics
+    sending_queue:
+      enabled: true
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/k3s]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/k3s]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/k3s]
+{% else %}
+# ── LOCAL: export to local ClickHouse (signoz image exporters) ───────────
+# Use the correct exporter types for the signoz-otel-collector image:
+#   clickhousetraces, clickhouselogsexporter, signozclickhousemetrics
+exporters:
+  clickhousetraces:
+    dsn: tcp://clickhouse:9000/signoz_traces
+    low_cardinal_exception_grouping: true
+    use_new_schema: true
+    timeout: 10s
+    retry_on_failure:
+      enabled: true
+      initial_interval: 2s
+      max_interval: 30s
+      max_elapsed_time: 300s
+  clickhouselogsexporter:
+    dsn: tcp://clickhouse:9000/signoz_logs
+    timeout: 10s
+    retry_on_failure:
+      enabled: true
+      initial_interval: 2s
+      max_interval: 30s
+      max_elapsed_time: 300s
+  signozclickhousemetrics:
+    dsn: tcp://clickhouse:9000/signoz_metrics
+    timeout: 10s
     retry_on_failure:
       enabled: true
       initial_interval: 2s
@@ -85,12 +119,13 @@ service:
     traces:
       receivers: [otlp]
       processors: [batch]
-      exporters: [clickhouse/traces]
+      exporters: [clickhousetraces]
     metrics:
       receivers: [otlp]
       processors: [batch]
-      exporters: [clickhouse/metrics]
+      exporters: [signozclickhousemetrics]
     logs:
       receivers: [otlp]
       processors: [batch]
-      exporters: [clickhouse/logs]
+      exporters: [clickhouselogsexporter]
+{% endif %}

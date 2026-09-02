@@ -41,12 +41,20 @@ ircfiber_use_lets_encrypt: true
 cloudflare_target_ip: "47.236.247.169"
 
 # --- Observability: Signoz OTel (production) ---------------------------------
-# Centralized to k3s SigNoz (ubuntu-docker k3s cluster).
+# Fully centralized to k3s SigNoz (ubuntu-docker k3s cluster).
 # This VM (ovh) ships gateway/engine traces/logs/metrics to the k3s
-# otel-collector NodePort via Tailscale (100.94.116.56:30418 → 4318).
+# otel-collector over Tailscale (100.94.116.56:4318 direct). Also ships
+# all Docker container logs via Fluent Bit → same endpoint.
+# Gateway uses deployment.environment=prod, service.name=ircfiber-gateway;
+# Engine uses deployment.environment=prod, service.name=ircfiber-engine.
+# k3s workloads use deployment.environment=dev for disambiguation.
 IRCFIBER_OTEL_ENABLED: "1"
-IRCFIBER_OTEL_ENDPOINT: "http://100.94.116.56:30418"
-OTEL_RESOURCE_ATTRIBUTES: "k8s.cluster.name=ircfiber-prod-1,service.name=ircfiber-engine,deployment.environment=prod"
+IRCFIBER_OTEL_ENDPOINT: "http://100.94.116.56:4318"
+OTEL_RESOURCE_ATTRIBUTES: "k8s.cluster.name=ovh-prod,service.name=ircfiber-engine,deployment.environment=prod"
+# Centralize all Docker logs to k3s — no local SigNoz/ClickHouse.
+ovh_logs_centralize_to_k3s: true
+k3s_tailscale_ip: "100.94.116.56"
+k3s_signoz_api_url: "https://signoz.ubuntu-docker.tail544547.ts.net"
 
 # --- Mullvad egress pool (6 exits for SuperNets session-limit) ----------------
 mullvad_sidecars:

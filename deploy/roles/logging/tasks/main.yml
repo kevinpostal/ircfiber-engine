@@ -56,6 +56,15 @@
     mode: "0644"
   notify: Restart fluent-bit
 
+- name: Install Fluent Bit container_name lua filter
+  ansible.builtin.copy:
+    src: container_name.lua
+    dest: "{{ fluent_bit_config_dir }}/container_name.lua"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart fluent-bit
+
 - name: Render Grafana datasources
   ansible.builtin.template:
     src: grafana-datasources.yml.j2
@@ -132,6 +141,7 @@
   until: signoz_ready.rc == 0
   retries: 30
   delay: 4
+  when: not (ovh_logs_centralize_to_k3s | default(true) | bool)
 
 - name: Wait for Fluent Bit to start
   ansible.builtin.command:
@@ -160,7 +170,7 @@
 - name: Notify Caddy to reload after logging stack deployment
   ansible.builtin.debug:
     msg: "Caddy route for /grafana must be enabled in caddy role"
-  when: signoz_ready is succeeded and grafana_ready is succeeded
+  when: (ovh_logs_centralize_to_k3s | default(true) | bool) or (signoz_ready is succeeded and grafana_ready is succeeded)
 
 # ────────────────────────────────────────────────────────────────────────
 # Deploy SigNoz alert rules (gated — not on every deploy)
