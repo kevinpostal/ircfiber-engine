@@ -80,7 +80,7 @@ final class ConnectionManager {
             return;
         }
 
-        auto client = new PersistentIRCClient(config, mainEventChannel, redis, serverId);
+        auto client = new PersistentIRCClient(config, mainEventChannel, redis, serverId, userId);
         clients[key] = client;
         networkOwners[key] = userId;
         // Defer start() to avoid runTask() inside the bootstrap loop.
@@ -98,7 +98,7 @@ final class ConnectionManager {
             return;
         }
 
-        auto client = new PersistentIRCClient(config, mainEventChannel, redis, serverId);
+        auto client = new PersistentIRCClient(config, mainEventChannel, redis, serverId, userId);
         clients[key] = client;
         networkOwners[key] = userId;
         client.start();

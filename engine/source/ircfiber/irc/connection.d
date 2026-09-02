@@ -8,7 +8,7 @@ import std.datetime : Clock, SysTime;
 import std.uni : toLower;
 import std.algorithm : canFind, countUntil, remove;
 import std.socket : getAddress, AddressFamily;
-import std.uuid : randomUUID;
+import std.uuid : UUID, randomUUID, parseUUID;
 import std.typecons : Nullable;
 import core.sync.mutex : Mutex;
 import core.sys.posix.unistd : getpid;
@@ -38,6 +38,7 @@ import ircfiber.observability : recordCounter, recordGauge, recordHistogram;
 import ircfiber.tracing : withSpan, Span;
 import ircfiber.engine.adopted_socket : AdoptedSocket;
 import ircfiber.async : safeFiberRun;
+import ircfiber.irc.ipv6 : ipv6ForUser, normalizePrefix;
 
 /// IRC connection state.
 ///
@@ -287,6 +288,80 @@ shared static this() {
     // main loop). Unprotected __gshared access caused SyncError@(0) on
     // 2026-08-17 cnTb-fin — this mutex eliminates that class of crash.
     try { gMullvadLock = new Object(); } catch (Throwable) {}
+    try { if (gIpv6Lock is null) gIpv6Lock = new Object(); } catch (Throwable) {}
+}
+
+// ── Per-user IPv6 (IRCCloud-style) ───────────────────────────────────────────
+// Each user gets a deterministic /128 inside a routed /64 (or /48).
+// The host is configured with `ip -6 route add local <prefix>/64 dev lo`
+// and `net.ipv6.ip_nonlocal_bind=1` so any IID in the prefix is bindable
+// without a per-user `ip addr add`. The engine then does
+//   connectTCP(dst, port, ipv6ForUser(prefix, ownerId), 0, timeout)
+// which gives each UID its own source IP — bypassing per-IP session limits.
+private __gshared string gIpv6Prefix;
+private __gshared string gIpv6PoolHost;
+private __gshared bool gIpv6Loaded;
+private __gshared Object gIpv6Lock;
+
+private void loadIpv6Config() {
+    if (gIpv6Lock !is null) synchronized (gIpv6Lock) {
+        if (gIpv6Loaded) return;
+        gIpv6Loaded = true;
+        loadIpv6ConfigUnlocked();
+        return;
+    }
+    if (gIpv6Loaded) return;
+    gIpv6Loaded = true;
+    loadIpv6ConfigUnlocked();
+}
+private void loadIpv6ConfigUnlocked() {
+    import core.stdc.stdlib : getenv;
+    import core.stdc.string : strlen;
+    import std.string : toStringz;
+    auto ep = getenv(toStringz("IRCFIBER_IPV6_PREFIX"));
+    if (ep !is null) {
+        auto raw = ep[0 .. strlen(ep)].idup;
+        gIpv6Prefix = normalizePrefix(raw);
+        if (gIpv6Prefix.length > 0)
+            logInfo("IPv6 per-user: prefix=%s (from IRCFIBER_IPV6_PREFIX)", gIpv6Prefix);
+        else if (raw.strip().length > 0)
+            logWarn("IPv6 per-user: IRCFIBER_IPV6_PREFIX='%s' looks invalid (no colon)", raw);
+    }
+    auto hp = getenv(toStringz("IRCFIBER_IPV6_POOL_HOST"));
+    if (hp !is null) {
+        auto raw = hp[0 .. strlen(hp)].idup.strip();
+        gIpv6PoolHost = raw;
+        if (gIpv6PoolHost.length > 0)
+            logInfo("IPv6 per-user: poolHost=%s (from IRCFIBER_IPV6_POOL_HOST)", gIpv6PoolHost);
+    }
+    if (gIpv6Prefix.length == 0)
+        logInfo("IPv6 per-user: disabled (IRCFIBER_IPV6_PREFIX not set) — using direct/Mullvad egress");
+}
+
+/// Returns the deterministic IPv6 source address for a user, or "" if IPv6 is
+/// not configured or the uid is nil. Handles both UUID and string forms.
+string ipv6BindForUser(UUID uid) {
+    loadIpv6Config();
+    string p;
+    if (gIpv6Lock !is null) synchronized (gIpv6Lock) { p = gIpv6Prefix; }
+    else p = gIpv6Prefix;
+    if (p.length == 0) return "";
+    if (uid == UUID.init) return "";
+    return ipv6ForUser(p, uid);
+}
+string ipv6BindForUser(string userIdStr) {
+    if (userIdStr.length == 0) return "";
+    try {
+        import std.uuid : parseUUID;
+        return ipv6BindForUser(parseUUID(userIdStr));
+    } catch (Exception) {
+        loadIpv6Config();
+        string p;
+        if (gIpv6Lock !is null) synchronized (gIpv6Lock) { p = gIpv6Prefix; }
+        else p = gIpv6Prefix;
+        if (p.length == 0) return "";
+        return ipv6ForUser(p, userIdStr);
+    }
 }
 private string mullvadLabelFromHost(string h) {
     auto base = h.split(":")[0];
@@ -691,9 +766,11 @@ private string shortConnectError(string msg) @safe {
 }
 
 private TCPConnection happyEyeballsConnectWithProxy(string host, ushort port, MullvadProxy* proxy,
+                                                    string ipv6BindAddr = "",
                                                     ConnectProgress progress = null) {
     if (proxy !is null) logInfo("Mullvad egress %s (%s:%d) for %s:%d", proxy.label, proxy.host, proxy.port, host, port);
-    const egressLabel = proxy !is null ? "Mullvad exit " ~ proxy.label : "direct";
+    else if (ipv6BindAddr.length > 0) logInfo("IPv6 per-user egress %s for %s:%d", ipv6BindAddr, host, port);
+    const egressLabel = proxy !is null ? "Mullvad exit " ~ proxy.label : (ipv6BindAddr.length > 0 ? "ipv6:" ~ ipv6BindAddr : "direct");
     auto addrs = resolveAllAddresses(host, port);
     if (addrs.length == 0) {
         report(progress, "attempt_fail", "DNS lookup for " ~ host ~ " returned no addresses.");
@@ -743,7 +820,14 @@ private TCPConnection happyEyeballsConnectWithProxy(string host, ushort port, Mu
         auto addrIp  = addr.ip;
         auto addrFam = addr.family;
         auto proxyForTask = proxy;
+        // For direct connections with per-user IPv6, bind the source to the
+        // user's deterministic /128. SOCKS paths ignore this (they dial the
+        // local sidecar over Tailscale IPv4). We only bind IPv6→IPv6 to avoid
+        // EINVAL when racing an IPv4 A record.
+        auto bindForThisAddr = (proxyForTask is null && ipv6BindAddr.length > 0
+                                && addrFam == AddressFamily.INET6) ? ipv6BindAddr : null;
         report(progress, "attempt", "Trying " ~ addrIp ~ ":" ~ port.to!string ~ " via " ~ egressLabel
+            ~ (bindForThisAddr ? " bind=" ~ bindForThisAddr : "")
             ~ " (up to " ~ CONNECT_TIMEOUT_SECONDS.to!string ~ "s)…");
         safeFiberRun("happy_eyeballs_attempt", host, {
             immutable attemptStartMs = Clock.currTime.toUnixTime!long * 1000;
@@ -758,7 +842,13 @@ private TCPConnection happyEyeballsConnectWithProxy(string host, ushort port, Mu
                         throw se;
                     }
                 } else {
-                    conn = connectTCP(addrIp, port, null, 0, CONNECT_TIMEOUT_SECONDS.seconds);
+                    // bindForThisAddr captured from outer scope — only non-null for direct IPv6
+                    auto localBind = (addrFam == AddressFamily.INET6) ? ipv6BindAddr : null;
+                    // vibe.d connectTCP third param is string localAddr (bind IP)
+                    if (localBind.length > 0 && addrFam == AddressFamily.INET6)
+                        conn = connectTCP(addrIp, port, localBind, 0, CONNECT_TIMEOUT_SECONDS.seconds);
+                    else
+                        conn = connectTCP(addrIp, port, null, 0, CONNECT_TIMEOUT_SECONDS.seconds);
                 }
                 if (done) {
                     try { conn.close(); } catch (Exception) {}
@@ -811,6 +901,7 @@ private TCPConnection happyEyeballsConnectWithProxy(string host, ushort port, Mu
 }
 
 private TCPConnection happyEyeballsConnect(string host, ushort port, string egressNodeId = "",
+                                           string ipv6BindAddr = "",
                                            ConnectProgress progress = null) {
     import std.string : toLower;
     auto hostLower = host.toLower();
@@ -823,7 +914,7 @@ private TCPConnection happyEyeballsConnect(string host, ushort port, string egre
     // also failed, but direct via internal alias succeeded.
     if (hostLower == "irc.ircfiber.com" && egressNodeId.length == 0) {
         try {
-            auto directConn = happyEyeballsConnectWithProxy(host, port, null, progress);
+            auto directConn = happyEyeballsConnectWithProxy(host, port, null, ipv6BindAddr, progress);
             return directConn;
         } catch (Exception e) {
             logWarn("happyEyeballsConnect direct to %s failed (%s), trying Mullvad pool", host, e.msg);
@@ -896,7 +987,7 @@ private TCPConnection happyEyeballsConnect(string host, ushort port, string egre
     Exception lastErr;
     foreach (proxy; toTry) {
         try {
-            auto conn = happyEyeballsConnectWithProxy(host, port, proxy, progress);
+            auto conn = happyEyeballsConnectWithProxy(host, port, proxy, ipv6BindAddr, progress);
             // Enterprise: protect __gshared last-used egress display vars.
             if (gMullvadLock !is null) synchronized (gMullvadLock) {
                 mullvadLastUsedLabel = proxy ? proxy.label : "";
@@ -1462,6 +1553,11 @@ final class PersistentIRCClient {
         // REST gateway can correlate which channels we still owe a fetch to.
         bool[string]        chathistoryInFlight;  // keyed by lowercase channel
 
+        // Per-user IPv6 (IRCCloud-style): deterministic source IP per UID.
+        import std.uuid : UUID;
+        UUID                ownerId;
+        string              ipv6BindCache;
+        bool                ipv6BindResolved;
         // Smart routing: Redis access for failure reporting + reassignment detection.
         RedisStorage        redis;
         /// This engine's server ID (used for failure reporting + assignment check).
@@ -1511,11 +1607,14 @@ final class PersistentIRCClient {
     }
 
     /// Creates a new persistent IRC client.
-    this(NetworkConfig cfg, Channel!IRCRawEvent ch, RedisStorage redisStore = null, string sid = "") {
+    this(NetworkConfig cfg, Channel!IRCRawEvent ch, RedisStorage redisStore = null, string sid = "", UUID owner = UUID.init) {
         this.config       = cfg;
         this.eventChannel = ch;
         this.redis        = redisStore;
         this.serverId     = sid;
+        this.ownerId      = owner;
+        this.ipv6BindResolved = false;
+        this.ipv6BindCache = "";
         this.backoff      = new ExponentialBackoff(3.seconds, RECONNECT_MAX_DELAY_SECS.seconds);
         this.state        = ConnectionState.disconnected;
         this.sessionNick  = cfg.nick.length > 0 ? cfg.nick : "ircfiber";
@@ -2230,7 +2329,23 @@ final class PersistentIRCClient {
     }
 
     /// Updates the network configuration.
-    void updateConfig(NetworkConfig cfg) { config = cfg; }
+    void updateConfig(NetworkConfig cfg) { config = cfg; ipv6BindResolved = false; ipv6BindCache = ""; }
+
+    /// Owner UUID (for per-user IPv6). Exposed for manager/handoff snapshot.
+    @property UUID getOwnerId() const { return ownerId; }
+    void setOwnerId(UUID uid) { ownerId = uid; ipv6BindResolved = false; ipv6BindCache = ""; }
+
+    /// Cached per-user IPv6 bind address (empty when prefix unset).
+    string resolveIpv6Bind() {
+        if (ipv6BindResolved) return ipv6BindCache;
+        ipv6BindResolved = true;
+        ipv6BindCache = ipv6BindForUser(ownerId);
+        if (ipv6BindCache.length > 0)
+            logInfo("IPv6 bind for %s owner %s → %s", config.name, ownerId.toString(), ipv6BindCache);
+        return ipv6BindCache;
+    }
+    /// IPv6 actually used (for admin display)
+    @property string getIpv6Bind() { return resolveIpv6Bind(); }
 
     // ── Connection loop ───────────────────────────────────────────────────────
 
@@ -2818,10 +2933,14 @@ final class PersistentIRCClient {
              "attempt": backoff.currentAttempt().to!string,
              "event": "reconnect_attempt"]);
 
+        // Resolve per-user IPv6 once (cached). Empty when IRCFIBER_IPV6_PREFIX unset.
+        string ipv6Bind = resolveIpv6Bind();
+        logInfo("Connecting to %s:%s (Happy Eyeballs) ipv6Bind=%s egress=%s owner=%s",
+            config.host, config.port, ipv6Bind.length ? ipv6Bind : "-", config.egressNodeId, ownerId.toString());
         withSpan("irc.tcp_connect",
-            ["network": config.name, "host": config.host, "port": config.port.to!string, "egress": config.egressNodeId],
+            ["network": config.name, "host": config.host, "port": config.port.to!string, "egress": config.egressNodeId, "ipv6Bind": ipv6Bind],
             (ref Span ts) {
-            connection = happyEyeballsConnect(config.host, config.port, config.egressNodeId, &emitLog);
+            connection = happyEyeballsConnect(config.host, config.port, config.egressNodeId, ipv6Bind, &emitLog);
             activeEgressLabel = mullvadLastUsedLabel;
             activeEgressHost = mullvadLastUsedHost;
             activeEgressIp = mullvadLastUsedIp;
@@ -2900,7 +3019,9 @@ final class PersistentIRCClient {
                 if (connection && connection.connected) {
                     try { connection.close(); } catch (Exception) {}
                 }
-                connection = happyEyeballsConnect(config.host, config.port, config.egressNodeId, &emitLog);
+                // For TLS→plain fallback, reuse the same ipv6Bind derived above (in scope via closure)
+                string fallbackIpv6Bind = resolveIpv6Bind();
+                connection = happyEyeballsConnect(config.host, config.port, config.egressNodeId, fallbackIpv6Bind, &emitLog);
                 activeEgressLabel = mullvadLastUsedLabel;
                 activeEgressHost = mullvadLastUsedHost;
                 activeEgressIp = mullvadLastUsedIp;
