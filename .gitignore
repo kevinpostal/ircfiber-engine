@@ -1,0 +1,16 @@
+# Build artifacts — regenerated locally, never committed.
+# (Mirrors the build-artifact section of ircfiber-infra's root .gitignore.)
+*.o
+*.a
+*.lib
+*.so
+*.dylib
+*.exe
+*.dll
+*.cg
+irc-fiber-engine
+*-test
+!*-test.d
+!*-test.py
+.dub/
+dub.userprefs
