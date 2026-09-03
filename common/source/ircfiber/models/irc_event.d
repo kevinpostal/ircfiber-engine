@@ -126,6 +126,16 @@ struct IRCRawEvent {
         // from the wire (see parser.d tag loop).
         auto typingTag = getTag("+typing");
         if (typingTag.length) j["typing"] = Json(typingTag);
+        // IRCv3 account-tag: per-message author account name. Shipped so
+        // the frontend can render account identity without a WHOIS round
+        // trip, and so the bouncer can re-emit `account=` to clients that
+        // negotiated account-tag (see bnc/format.d).
+        auto accountTag = getTag("account");
+        if (accountTag.length) j["a"] = Json(accountTag);
+        // Remote in-place edit (draft/edit-message from another client):
+        // names the original message's label so the UI can replace it.
+        auto editOf = getTag("edit_of");
+        if (editOf.length) j["eo"] = Json(editOf);
         // W1-T08: temp_unavailable event carries countdown_ms + serverTs
         if (command == "temp_unavailable") {
             auto cd = getTag("countdown_ms");
@@ -397,6 +407,30 @@ unittest {
     event.addTag("msgid", "abc123");
     auto json = event.toCompactJson();
     assert(json["m"].get!string == "abc123");
+}
+
+@("IRCRawEvent toCompactJson ships account-tag as 'a'")
+unittest {
+    auto event = IRCRawEvent("libera", "PRIVMSG");
+    event.nick = "alice";
+    event.addTag("account", "alice123");
+    auto json = event.toCompactJson();
+    assert(json["a"].get!string == "alice123");
+}
+
+@("IRCRawEvent toCompactJson omits 'a' without account-tag")
+unittest {
+    auto event = IRCRawEvent("libera", "PRIVMSG");
+    auto json = event.toCompactJson();
+    assert(("a" in json) is null);
+}
+
+@("IRCRawEvent toCompactJson ships edit_of as 'eo'")
+unittest {
+    auto event = IRCRawEvent("libera", "PRIVMSG");
+    event.addTag("edit_of", "lbl-1");
+    auto json = event.toCompactJson();
+    assert(json["eo"].get!string == "lbl-1");
 }
 
 @("makeServerLog produces a NOTICE-shaped event with phase tag")

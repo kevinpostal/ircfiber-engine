@@ -82,11 +82,6 @@ struct UserPreferences {
     string[] archivedChannels; // format: "networkId:#channel"
     /// Last active buffer per network (networkId -> bufferName).
     string[string] lastActiveBuffers;
-    /// Collapsed server log connection attempt cards (networkId:eid -> true).
-    /// Keyed by the eid of the attempt's phase event so collapses survive
-    /// reconnection cycles — eid is deterministic per connection attempt.
-    bool[string] serverlogCollapsed;
-
     /// Collapsed member panels per buffer (networkId:#channel -> true).
     bool[string] membersCollapsed;
     /// Collapsed sidebar sections per network (networkId -> true).
@@ -160,11 +155,6 @@ struct UserPreferences {
         foreach (k, v; lastActiveBuffers)
             lab[k] = Json(v);
         j["lastActiveBuffers"] = lab;
-        auto slc = Json.emptyObject;
-        foreach (k, v; serverlogCollapsed)
-            slc[k] = Json(v);
-        j["serverlogCollapsed"] = slc;
-
         auto mc = Json.emptyObject;
         foreach (k, v; membersCollapsed)
             mc[k] = Json(v);
@@ -250,12 +240,6 @@ struct UserPreferences {
             if (lab.type == Json.Type.object) {
                 foreach (string k, v; *lab)
                     p.lastActiveBuffers[k] = v.get!string;
-            }
-        }
-        if (auto slc = "serverlogCollapsed" in json) {
-            if (slc.type == Json.Type.object) {
-                foreach (string k, v; *slc)
-                    p.serverlogCollapsed[k] = v.get!bool;
             }
         }
         if (auto mc = "membersCollapsed" in json) {

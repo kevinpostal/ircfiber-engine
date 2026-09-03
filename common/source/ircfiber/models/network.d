@@ -14,7 +14,13 @@ enum TLSMode {
     /// TLS enabled
     enabled,
     /// TLS required
-    required
+    required,
+    /// Plain-text connect followed by a STARTTLS upgrade
+    /// (`STARTTLS` command, `670 RPL_STARTTLS` reply, then the TLS
+    /// handshake on the same connection). Fails closed: a `691`
+    /// `ERR_STARTTLS` reply or a timeout aborts the attempt instead
+    /// of continuing in plain text.
+    starttls
 }
 
 /// SASL authentication mechanism

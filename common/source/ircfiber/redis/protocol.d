@@ -374,6 +374,32 @@ struct FailInfoSnapshot {
     }
 }
 
+/// Negotiated TLS session details captured by the engine right after
+/// the handshake. Surfaced verbatim in the WS sync payload under
+/// `tlsInfo` so the frontend can render the server-log header line.
+struct TlsInfo {
+    /// Protocol version as reported by OpenSSL (e.g. "TLSv1.3").
+    string version_;
+    /// Negotiated cipher suite name (e.g. "TLS_AES_256_GCM_SHA384").
+    string cipher;
+    /// Peer certificate subject commonName.
+    string certCn;
+    /// Peer certificate issuer commonName.
+    string certIssuer;
+    /// Peer certificate notAfter as unix ms (0 = unknown).
+    long certNotAfterMs;
+
+    Json toJson() const {
+        auto j = Json.emptyObject;
+        j["version"] = Json(version_);
+        j["cipher"] = Json(cipher);
+        j["certCn"] = Json(certCn);
+        j["certIssuer"] = Json(certIssuer);
+        j["certNotAfterMs"] = Json(certNotAfterMs);
+        return j;
+    }
+}
+
 /// Network state snapshot for persistence
 struct NetworkStateSnapshot {
     /// The network configuration
@@ -450,6 +476,16 @@ struct NetworkStateSnapshot {
     /// `backoff.reset()` site clears both). Nullable — absent
     /// when the network is healthy.
     FailInfoSnapshot failInfo;
+    /// Round-trip latency of the engine's last `PING :LAG<ms>` probe
+    /// (unix ms). -1 = unknown (no PONG measured yet this connection).
+    long lagMs = -1;
+    /// Unix ms of RPL_WELCOME for the live connection. 0 = not connected.
+    long connectedAtMs = 0;
+    /// Whether `tlsInfo` is populated; false for plain connections or
+    /// when the engine could not read the session details.
+    bool hasTlsInfo;
+    /// Negotiated TLS session details (only serialised when `hasTlsInfo`).
+    TlsInfo tlsInfo;
 
     /// Converts to JSON
     Json toJson() const {
@@ -492,6 +528,9 @@ struct NetworkStateSnapshot {
         if (activeEgressLabel.length) j["activeEgressLabel"] = Json(activeEgressLabel);
         if (activeEgressHost.length) j["activeEgressHost"] = Json(activeEgressHost);
         if (activeEgressIp.length) j["activeEgressIp"] = Json(activeEgressIp);
+        j["lagMs"] = Json(lagMs);
+        j["connectedAtMs"] = Json(connectedAtMs);
+        if (hasTlsInfo) j["tlsInfo"] = tlsInfo.toJson();
         // W1-T01-rev1: structured retry / fail info payload. The
         // retry status is omitted from the wire entirely when
         // `hasRetryStatus` is false so the frontend sees an absent
@@ -555,6 +594,22 @@ struct NetworkStateSnapshot {
         if (j["activeEgressLabel"].type == Json.Type.string) s.activeEgressLabel = j["activeEgressLabel"].get!string;
         if (j["activeEgressHost"].type == Json.Type.string) s.activeEgressHost = j["activeEgressHost"].get!string;
         if (j["activeEgressIp"].type == Json.Type.string) s.activeEgressIp = j["activeEgressIp"].get!string;
+        if (j["lagMs"].type == Json.Type.int_) s.lagMs = j["lagMs"].get!long;
+        if (j["connectedAtMs"].type == Json.Type.int_) s.connectedAtMs = j["connectedAtMs"].get!long;
+        if (j["tlsInfo"].type == Json.Type.object) {
+            const ti = j["tlsInfo"];
+            if (auto v = "version" in ti)
+                if (v.type == Json.Type.string) s.tlsInfo.version_ = v.get!string;
+            if (auto c = "cipher" in ti)
+                if (c.type == Json.Type.string) s.tlsInfo.cipher = c.get!string;
+            if (auto cn = "certCn" in ti)
+                if (cn.type == Json.Type.string) s.tlsInfo.certCn = cn.get!string;
+            if (auto iss = "certIssuer" in ti)
+                if (iss.type == Json.Type.string) s.tlsInfo.certIssuer = iss.get!string;
+            if (auto na = "certNotAfterMs" in ti)
+                if (na.type == Json.Type.int_) s.tlsInfo.certNotAfterMs = na.get!long;
+            s.hasTlsInfo = true;
+        }
         // W1-T01-rev1: structured retry status. Default to "absent"
         // field still deserialise cleanly — the frontend treats a
         // missing field as "no retry scheduled", exactly like the
@@ -600,4 +655,42 @@ struct NetworkStateSnapshot {
         }
         return s;
     }
+}
+
+@("NetworkStateSnapshot lag/connectedAt/tlsInfo round-trip through JSON")
+unittest {
+    NetworkStateSnapshot s;
+    s.lagMs = 42;
+    s.connectedAtMs = 1_700_000_000_000;
+    s.hasTlsInfo = true;
+    s.tlsInfo = TlsInfo("TLSv1.3", "TLS_AES_256_GCM_SHA384", "irc.example.org", "R11", 1_800_000_000_000);
+    auto j = s.toJson();
+    assert(j["lagMs"].get!long == 42);
+    assert(j["connectedAtMs"].get!long == 1_700_000_000_000);
+    assert(j["tlsInfo"]["version"].get!string == "TLSv1.3");
+    assert(j["tlsInfo"]["cipher"].get!string == "TLS_AES_256_GCM_SHA384");
+    assert(j["tlsInfo"]["certCn"].get!string == "irc.example.org");
+    assert(j["tlsInfo"]["certIssuer"].get!string == "R11");
+    assert(j["tlsInfo"]["certNotAfterMs"].get!long == 1_800_000_000_000);
+    auto back = NetworkStateSnapshot.fromJson(j);
+    assert(back.lagMs == 42);
+    assert(back.connectedAtMs == 1_700_000_000_000);
+    assert(back.hasTlsInfo);
+    assert(back.tlsInfo == s.tlsInfo);
+}
+
+@("NetworkStateSnapshot omits tlsInfo when unset and defaults lag/connectedAt on legacy JSON")
+unittest {
+    NetworkStateSnapshot s;
+    auto j = s.toJson();
+    assert(j["tlsInfo"].type == Json.Type.undefined);
+    assert(j["lagMs"].get!long == -1);
+    assert(j["connectedAtMs"].get!long == 0);
+    auto legacy = Json.emptyObject;
+    legacy["connected"] = Json(true);
+    auto back = NetworkStateSnapshot.fromJson(legacy);
+    assert(back.lagMs == -1);
+    assert(back.connectedAtMs == 0);
+    assert(!back.hasTlsInfo);
+    assert(back.tlsInfo == TlsInfo.init);
 }

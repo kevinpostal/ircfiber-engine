@@ -478,6 +478,7 @@ HandoffState fromJSON(JSONValue j) {
 private TLSMode toTLSMode(string s) {
     if (s == "enabled") return TLSMode.enabled;
     if (s == "required") return TLSMode.required;
+    if (s == "starttls") return TLSMode.starttls;
     return TLSMode.disabled;
 }
 private SASLMechanism toSASLMechanism(string s) {

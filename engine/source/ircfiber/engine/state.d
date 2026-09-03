@@ -11,7 +11,7 @@ import std.uni : toLower;
 import ircfiber.engine.bootstrap : EngineContext;
 import ircfiber.models.network : Network;
 import ircfiber.redis.protocol : RedisKeys, NetworkStateSnapshot,
-    RetryStatus, FailInfoSnapshot, PROTOCOL_VERSION;
+    RetryStatus, FailInfoSnapshot, TlsInfo, PROTOCOL_VERSION;
 import std.conv : to;
 private void runSafeTask(void delegate() dg) {
     runTask(() nothrow {
@@ -191,6 +191,12 @@ void writeStateSnapshotForNetwork(ref EngineContext ctx, Network net, string ser
         snap.activeEgressLabel = clientForEgress.getActiveEgressLabel();
         snap.activeEgressHost = clientForEgress.getActiveEgressHost();
         snap.activeEgressIp = clientForEgress.getActiveEgressIp();
+        // Live-connection telemetry for the server-log header: lag
+        // probe RTT, RPL_WELCOME instant and negotiated TLS details.
+        snap.lagMs = clientForEgress.getLagMs();
+        snap.connectedAtMs = clientForEgress.getConnectedAtMs();
+        snap.hasTlsInfo = clientForEgress.hasTlsInfo();
+        snap.tlsInfo = clientForEgress.hasTlsInfo() ? clientForEgress.getTlsInfo() : TlsInfo.init;
     }
 
     // W1-T01-rev1: structured retry + fail info from the engine's

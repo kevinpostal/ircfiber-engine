@@ -26,7 +26,7 @@ import core.time : Duration, dur, msecs, seconds;
 
 import ircfiber.models.irc_event : IRCRawEvent;
 import ircfiber.models.network : NetworkConfig, SASLMechanism, TLSMode, normalizeChannelName;
-import ircfiber.redis.protocol : RedisKeys;
+import ircfiber.redis.protocol : RedisKeys, TlsInfo;
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.irc.reconnect : ExponentialBackoff;
 import ircfiber.irc.sasl : buildSaslPlainPayload, ScramSha256Client;
@@ -67,6 +67,7 @@ enum ConnectionState {
 private immutable string[] DESIRED_CAPS_BASE = [
     "away-notify",
     "account-notify",
+    "account-tag",
     "extended-join",
     "multi-prefix",
     "userhost-in-names",
@@ -80,7 +81,10 @@ private immutable string[] DESIRED_CAPS_BASE = [
     "chathistory",
     "msgid",
     "labeled-response",
+    "standard-replies",
+    "setname",
     "draft/edit-message",
+    "draft/message-redaction",
 ];
 
 private immutable string[] DESIRED_CAPS_SASL = ["sasl"];
@@ -95,6 +99,7 @@ private enum PROCESS_READ_TIMEOUT_MS      = 50;
 private enum STREAM_BUFFER_SIZE           = 4096;
 private enum DNS_CACHE_TTL_MS             = 30_000;
 private enum QUIT_GRACE_PERIOD_MS         = 2_000;  // wait this long for server to close after QUIT
+private enum STARTTLS_REPLY_TIMEOUT_MS      = 15_000; // wait this long for 670 after STARTTLS
 
 // ── Per-host circuit breaker ─────────────────────────────────────────────────
 // Prevents hammering unresponsive servers with rapid reconnect attempts.
@@ -1182,6 +1187,228 @@ private string nickPrefix(string nick) {
     return "";
 }
 
+// ── CASEMAPPING-aware nick comparison ─────────────────────────────────────────
+// modern.ircdocs.horse (Implementation Notes → Casemapping) asks clients to
+// discover CASEMAPPING from RPL_ISUPPORT and casefold nick/channel keys
+// with it. Servers differ: "ascii" folds A-Z only, "rfc1459" additionally
+// maps []\^ → {}|~, "rfc1459-strict" maps []\ → {|} but leaves ^ and ~
+// distinct. Unknown values fall back to rfc1459 (the common default).
+
+/// Fold one byte per the named CASEMAPPING. Pure — unit-testable.
+char foldCaseChar(char c, string mapping) @safe pure nothrow @nogc {
+    if (c >= 'A' && c <= 'Z') return cast(char)(c + ('a' - 'A'));
+    if (mapping == "ascii") return c;
+    switch (c) {
+        case '[': return '{';
+        case ']': return '}';
+        case '\\': return '|';
+        case '^': return (mapping == "rfc1459-strict") ? '^' : '~';
+        default: return c;
+    }
+}
+
+/// CASEMAPPING-aware equality for already-bare nicks. Pure.
+bool nicksEqualMapped(string a, string b, string mapping) @safe pure nothrow {
+    if (a.length != b.length) return false;
+    foreach (i; 0 .. a.length) {
+        if (foldCaseChar(a[i], mapping) != foldCaseChar(b[i], mapping))
+            return false;
+    }
+    return true;
+}
+
+@("foldCaseChar ascii folds A-Z only")
+unittest {
+    assert(foldCaseChar('A', "ascii") == 'a');
+    assert(foldCaseChar('[', "ascii") == '[');
+    assert(foldCaseChar('^', "ascii") == '^');
+}
+
+@("foldCaseChar rfc1459 maps brackets and caret")
+unittest {
+    assert(foldCaseChar('[', "rfc1459") == '{');
+    assert(foldCaseChar(']', "rfc1459") == '}');
+    assert(foldCaseChar('\\', "rfc1459") == '|');
+    assert(foldCaseChar('^', "rfc1459") == '~');
+}
+
+@("foldCaseChar strict leaves caret distinct")
+unittest {
+    assert(foldCaseChar('[', "rfc1459-strict") == '{');
+    assert(foldCaseChar('^', "rfc1459-strict") == '^');
+}
+
+@("nicksEqualMapped folds case per mapping")
+unittest {
+    assert(nicksEqualMapped("Zod", "zod", "ascii"));
+    assert(nicksEqualMapped("a[b", "a{b", "rfc1459"));
+    assert(!nicksEqualMapped("a[b", "a{b", "ascii"));
+    assert(!nicksEqualMapped("a^b", "a~b", "rfc1459-strict"));
+    assert(nicksEqualMapped("a^b", "a~b", "rfc1459"));
+    assert(!nicksEqualMapped("Zod", "Zod_", "rfc1459"));
+}
+
+// ── MONITOR command builder (IRCv3 monitor) ───────────────────────────────────
+// Verbs: "+" / "-" (targets required, comma-separated nicks),
+// "C" (clear), "L" (list), "S" (status query). Returns null when the
+// verb/target combination is invalid.
+
+/// Build a MONITOR wire line. Pure — unit-testable.
+string buildMonitorLine(string verb, string targets) @safe pure {
+    import std.uni : toUpper;
+    auto v = toUpper(verb);
+    if (v == "+" || v == "-") {
+        if (targets.length == 0) return null;
+        return "MONITOR " ~ v ~ " " ~ targets;
+    }
+    if (v == "C" || v == "L" || v == "S") return "MONITOR " ~ v;
+    return null;
+}
+
+@("buildMonitorLine builds +/- with targets")
+unittest {
+    assert(buildMonitorLine("+", "alice,bob") == "MONITOR + alice,bob");
+    assert(buildMonitorLine("-", "alice") == "MONITOR - alice");
+}
+
+@("buildMonitorLine builds bare C/L/S verbs")
+unittest {
+    assert(buildMonitorLine("C", "") == "MONITOR C");
+    assert(buildMonitorLine("l", "") == "MONITOR L");
+    assert(buildMonitorLine("S", "") == "MONITOR S");
+}
+
+@("buildMonitorLine rejects empty targets and unknown verbs")
+unittest {
+    assert(buildMonitorLine("+", "") is null);
+    assert(buildMonitorLine("-", "") is null);
+    assert(buildMonitorLine("X", "alice") is null);
+}
+
+// ── STARTTLS reply classifier ─────────────────────────────────────────────────
+// Plain-text connect with TLSMode.starttls: the client sends STARTTLS and
+// waits for 670 RPL_STARTTLS (begin the handshake) or 691 ERR_STARTTLS
+// (abort, fail closed). Anything else keeps waiting.
+
+/// Classify one server line during the STARTTLS handshake. Pure.
+enum StarttlsResult { waiting, success, failed }
+
+StarttlsResult classifyStarttlsReply(string command) @safe pure nothrow @nogc {
+    if (command == "670") return StarttlsResult.success;
+    if (command == "691") return StarttlsResult.failed;
+    return StarttlsResult.waiting;
+}
+
+@("classifyStarttlsReply maps 670/691")
+unittest {
+    assert(classifyStarttlsReply("670") == StarttlsResult.success);
+    assert(classifyStarttlsReply("691") == StarttlsResult.failed);
+    assert(classifyStarttlsReply("NOTICE") == StarttlsResult.waiting);
+    assert(classifyStarttlsReply("001") == StarttlsResult.waiting);
+}
+
+// ── Lag probe + TLS detail helpers ───────────────────────────────────────────
+
+/// Current wall-clock time in unix milliseconds.
+private long unixMsNow() @safe {
+    import std.datetime.systime : unixTimeToStdTime;
+    return (Clock.currStdTime - unixTimeToStdTime(0)) / 10_000;
+}
+
+/// Compile-time index of the field named `name` in `T.tupleof`, or -1.
+/// Used to reach vibe-stream's private `OpenSSLStream.m_tls` with the
+/// index verified by name rather than hard-coded.
+private template fieldIndexOf(T, string name) {
+    enum fieldIndexOf = () {
+        ptrdiff_t idx = -1;
+        static foreach (i, _; typeof(T.tupleof))
+            static if (__traits(identifier, T.tupleof[i]) == name) idx = i;
+        return idx;
+    }();
+}
+
+/// Wire token for the keepalive lag probe: `PING :LAG<sentUnixMs>`.
+/// The server echoes the token back in PONG so the round trip can be
+/// measured without any per-connection bookkeeping beyond the
+/// outstanding send timestamp.
+string lagPingToken(long sentMs) @safe pure {
+    return "LAG" ~ sentMs.to!string;
+}
+
+/// Extracts the send timestamp from a PONG parameter produced by
+/// `lagPingToken`. Returns -1 when the parameter is not a lag token
+/// (e.g. a server-initiated PONG or a legacy `keepalive` reply).
+long parseLagPongParam(string param) @safe pure nothrow {
+    if (param.length <= 3 || param[0 .. 3] != "LAG") return -1;
+    foreach (c; param[3 .. $]) if (c < '0' || c > '9') return -1;
+    try return param[3 .. $].to!long;
+    catch (Exception) return -1;
+}
+
+/// Parses an ASN.1 GeneralizedTime (`YYYYMMDDHHMMSS[.fff]Z`, as
+/// produced by `ASN1_TIME_to_generalizedtime`) into unix ms. Returns 0
+/// when the string is malformed.
+long parseAsn1GeneralizedTimeMs(string s) @safe nothrow {
+    import std.datetime.date : DateTime;
+    import std.datetime.systime : SysTime;
+    import std.datetime.timezone : UTC;
+    if (s.length < 15 || s[$ - 1] != 'Z') return 0;
+    foreach (c; s[0 .. 14]) if (c < '0' || c > '9') return 0;
+    try {
+        auto dt = DateTime(s[0 .. 4].to!int, s[4 .. 6].to!int, s[6 .. 8].to!int,
+            s[8 .. 10].to!int, s[10 .. 12].to!int, s[12 .. 14].to!int);
+        return SysTime(dt, UTC()).toUnixTime!long * 1000;
+    } catch (Exception) return 0;
+}
+
+/// Formats a unix-ms timestamp as `YYYY-MM-DD` (UTC).
+string formatUnixMsDate(long ms) @safe {
+    import std.datetime.systime : SysTime;
+    import std.datetime.timezone : UTC;
+    return SysTime.fromUnixTime(ms / 1000, UTC()).toISOExtString()[0 .. 10];
+}
+
+/// Builds the `tls_done` server-log line. With TLS details present the
+/// line reads `TLS handshake complete — <version> · <cipher> · cert <CN>
+/// (issuer <issuer>, expires <YYYY-MM-DD>)`; otherwise the generic
+/// fallback is returned.
+string formatTlsDoneText(bool hasInfo, TlsInfo info, string fallback) @safe {
+    if (!hasInfo) return fallback;
+    return "TLS handshake complete — " ~ info.version_ ~ " · " ~ info.cipher
+        ~ " · cert " ~ info.certCn ~ " (issuer " ~ info.certIssuer
+        ~ ", expires " ~ formatUnixMsDate(info.certNotAfterMs) ~ ")";
+}
+
+@("lagPingToken / parseLagPongParam round-trip")
+unittest {
+    assert(lagPingToken(1_700_000_000_123) == "LAG1700000000123");
+    assert(parseLagPongParam("LAG1700000000123") == 1_700_000_000_123);
+    assert(parseLagPongParam("keepalive") == -1);
+    assert(parseLagPongParam("LAG") == -1);
+    assert(parseLagPongParam("LAGabc") == -1);
+    assert(parseLagPongParam("") == -1);
+}
+
+@("parseAsn1GeneralizedTimeMs parses OpenSSL generalized time")
+unittest {
+    // 2024-01-01T00:00:00Z
+    assert(parseAsn1GeneralizedTimeMs("20240101000000Z") == 1_704_067_200_000);
+    // Fractional seconds are ignored.
+    assert(parseAsn1GeneralizedTimeMs("20240101000000.500Z") == 1_704_067_200_000);
+    assert(parseAsn1GeneralizedTimeMs("240101000000Z") == 0);
+    assert(parseAsn1GeneralizedTimeMs("20240101000000") == 0);
+    assert(parseAsn1GeneralizedTimeMs("2024010100000xZ") == 0);
+    assert(parseAsn1GeneralizedTimeMs("") == 0);
+}
+
+@("formatTlsDoneText renders details or falls back")
+unittest {
+    auto info = TlsInfo("TLSv1.3", "TLS_AES_256_GCM_SHA384", "irc.example.org", "R11", 1_704_067_200_000);
+    assert(formatTlsDoneText(true, info, "fallback")
+        == "TLS handshake complete — TLSv1.3 · TLS_AES_256_GCM_SHA384 · cert irc.example.org (issuer R11, expires 2024-01-01)");
+    assert(formatTlsDoneText(false, info, "fallback") == "fallback");
+}
+
 // ── mIRC color / formatting strip ────────────────────────────────────────────
 
 /// Strip mIRC color codes and formatting characters from a string.
@@ -1604,6 +1831,18 @@ final class PersistentIRCClient {
         // PINGs go out but responses are silently dropped.
         long                lastPongReceivedSecs;
         bool                idleEmitted;
+        // ── Connection telemetry (surfaced via the state snapshot) ──────────
+        /// Round trip of the last answered `PING :LAG<ms>` probe. -1 until
+        /// the first PONG of a connection is measured; reset on disconnect.
+        long                lagMs = -1;
+        /// Send time (unix ms) of the outstanding lag probe; 0 when none.
+        long                lagProbeSentMs;
+        /// Unix ms of RPL_WELCOME for the live connection; 0 otherwise.
+        long                connectedAtMs;
+        /// Whether `tlsInfo` describes the live TLS session.
+        bool                tlsInfoValid;
+        /// Negotiated TLS session details for the live connection.
+        TlsInfo             tlsInfo;
     }
 
     /// Creates a new persistent IRC client.
@@ -1987,6 +2226,9 @@ final class PersistentIRCClient {
         isupportMap = s.isupportMap.dup;
         // Resume the loop without going through the full registration
         // dance: the socket is already authenticated upstream.
+        // Adopted sockets have no RPL_WELCOME on this engine; the
+        // adoption instant is the best-known connect time.
+        connectedAtMs = unixMsNow();
         state = ConnectionState.connected;
         backoff.reset();
         throttledUntil = 0;
@@ -2094,6 +2336,7 @@ final class PersistentIRCClient {
                 tlsStream = createTLSStreamWithTimeout(connection, ctx, stripHostBrackets(config.host),
                     TLS_HANDSHAKE_TIMEOUT_SECONDS.seconds);
                 logInfo("adoptExecSocket: TLS handshake complete for %s on existing TCP", s.config.name);
+                captureTlsInfo();
             } catch (Exception e) {
                 logError("adoptExecSocket: TLS handshake failed for %s on existing TCP: %s"
                     ~ " — falling back to AdoptedSocket only",
@@ -2143,6 +2386,7 @@ final class PersistentIRCClient {
         // session is already active on the IRC side because the TCP
         // connection never closed. The new engine just resumes
         // reading/writing IRC traffic.
+        connectedAtMs = unixMsNow();
         state = ConnectionState.connected;
         backoff.reset();
         throttledUntil = 0;
@@ -2316,8 +2560,98 @@ final class PersistentIRCClient {
     @property string getActiveEgressLabel() const { return activeEgressLabel; }
     @property string getActiveEgressHost() const { return activeEgressHost; }
     @property string getActiveEgressIp() const { return activeEgressIp; }
+    /// Round trip of the last answered lag probe in ms; -1 when unknown.
+    @property long getLagMs() const nothrow { return lagMs; }
+    /// Unix ms of RPL_WELCOME for the live connection; 0 when not connected.
+    @property long getConnectedAtMs() const nothrow { return connectedAtMs; }
+    /// Whether `getTlsInfo()` describes the live TLS session.
+    @property bool hasTlsInfo() const nothrow { return tlsInfoValid; }
+    /// Negotiated TLS session details (valid only when `hasTlsInfo`).
+    @property TlsInfo getTlsInfo() const nothrow { return tlsInfo; }
+
+    /// Clears per-connection telemetry. Called on every disconnect and
+    /// before each reconnect attempt so a stale lag/uptime/TLS tuple
+    /// from the previous socket never leaks into the next snapshot.
+    private void resetConnectionTelemetry() nothrow {
+        lagMs = -1;
+        lagProbeSentMs = 0;
+        connectedAtMs = 0;
+        tlsInfoValid = false;
+        tlsInfo = TlsInfo.init;
+    }
+
+    /// Reads protocol version, cipher and peer-certificate details from
+    /// the freshly handshaken `tlsStream` into `tlsInfo`. Any failure
+    /// (non-OpenSSL backend, missing peer cert, OpenSSL error) leaves
+    /// `tlsInfoValid == false`; the caller falls back to the generic
+    /// `tls_done` text.
+    private void captureTlsInfo() nothrow {
+        tlsInfoValid = false;
+        tlsInfo = TlsInfo.init;
+        try {
+            import vibe.stream.openssl : OpenSSLStream;
+            import deimos.openssl.ssl : SSL_get_version, SSL_get_cipher_name;
+            import deimos.openssl.x509 : X509_NAME, X509_get_subject_name, X509_get_issuer_name,
+                X509_NAME_get_text_by_NID, X509_get0_notAfter;
+            import deimos.openssl.asn1 : ASN1_TIME, ASN1_STRING, ASN1_TIME_to_generalizedtime, ASN1_STRING_free;
+            import deimos.openssl.obj_mac : NID_commonName;
+            import std.string : fromStringz;
+
+            auto ossl = cast(OpenSSLStream) tlsStream;
+            if (ossl is null) return;
+            // `m_tls` (the SSL*) is private in vibe-stream; reach it via
+            // tupleof with the index pinned by name so a field reorder
+            // upstream fails at compile time instead of reading garbage.
+            enum tlsIdx = fieldIndexOf!(OpenSSLStream, "m_tls");
+            static assert(tlsIdx >= 0 && __traits(identifier, OpenSSLStream.tupleof[tlsIdx]) == "m_tls");
+            auto ssl = ossl.tupleof[tlsIdx];
+            if (ssl is null) return;
+            auto x509 = ossl.peerCertificateX509;
+            if (x509 is null) return;
+
+            static string nameCn(X509_NAME* name) {
+                if (name is null) return "";
+                char[256] buf;
+                const n = X509_NAME_get_text_by_NID(name, NID_commonName, buf.ptr, buf.length);
+                return n > 0 ? buf[0 .. n].idup : "";
+            }
+            TlsInfo info;
+            info.version_ = SSL_get_version(ssl).fromStringz.idup;
+            info.cipher = SSL_get_cipher_name(ssl).fromStringz.idup;
+            info.certCn = nameCn(X509_get_subject_name(x509));
+            info.certIssuer = nameCn(X509_get_issuer_name(x509));
+            auto notAfter = X509_get0_notAfter(x509);
+            if (notAfter !is null) {
+                auto gen = ASN1_TIME_to_generalizedtime(cast(ASN1_TIME*) notAfter, null);
+                if (gen !is null) {
+                    scope (exit) ASN1_STRING_free(cast(ASN1_STRING*) gen);
+                    auto str = cast(ASN1_STRING*) gen;
+                    if (str.data !is null && str.length > 0)
+                        info.certNotAfterMs = parseAsn1GeneralizedTimeMs(
+                            (cast(const(char)*) str.data)[0 .. str.length].idup);
+                }
+            }
+            tlsInfo = info;
+            tlsInfoValid = true;
+        } catch (Exception e) {
+            try logWarn("TLS detail capture failed for %s: %s", config.name, e.msg);
+            catch (Exception) {}
+        }
+    }
     /// Whether a given IRCv3 capability was negotiated.
     bool hasCap(string cap) const { return (cap in ackedCaps) !is null && ackedCaps[cap]; }
+
+    /// CASEMAPPING-aware nick equality for membership lookups. Strips
+    /// channel prefixes and userhost-in-names suffixes from both sides,
+    /// then folds per the server's ISUPPORT CASEMAPPING (default
+    /// rfc1459). Replaces bare `==` at every site that matches an event
+    /// nick against the channel roster or the session nick.
+    bool sameNick(string a, string b) {
+        string mapping = "rfc1459";
+        if (auto m = "CASEMAPPING" in isupportMap)
+            if (m.length) mapping = *m;
+        return nicksEqualMapped(stripNickPrefix(a), stripNickPrefix(b), mapping);
+    }
 
     /// Returns all negotiated capabilities.
     string[] getAckedCaps() const {
@@ -2727,6 +3061,7 @@ final class PersistentIRCClient {
             // chance to send or receive any traffic.
             lastPongReceivedSecs = Clock.currTime.toUnixTime!long;
             lastDataReceivedSecs = Clock.currTime.toUnixTime!long;
+            resetConnectionTelemetry();
             // W1-T01-rev1: ordering — emit the user-visible queued log
             // line FIRST so it lands in the chat timestamped before the
             // structured retry event (per plan W1-T01 ordering
@@ -2903,6 +3238,57 @@ final class PersistentIRCClient {
         });
     }
 
+    /// STARTTLS upgrade for TLSMode.starttls: sends STARTTLS on the plain
+    /// connection, waits for 670 RPL_STARTTLS, then performs the TLS
+    /// handshake over the same socket. Fails closed — 691 ERR_STARTTLS or
+    /// a timeout throws so the attempt retries with backoff instead of
+    /// continuing unencrypted.
+    private void performStarttlsUpgrade() {
+        emitLog("tls", "Requesting STARTTLS upgrade with " ~ config.host ~ "...");
+        sendRaw("STARTTLS");
+        ubyte[STREAM_BUFFER_SIZE] buf;
+        string partial;
+        immutable startMs = Clock.currTime.toUnixTime!long * 1000;
+        while (Clock.currTime.toUnixTime!long * 1000 - startMs < STARTTLS_REPLY_TIMEOUT_MS) {
+            auto received = readFromStream(buf[], REGISTRATION_READ_TIMEOUT_MS.msecs);
+            if (received == 0) { yield(); continue; }
+            partial ~= sanitizeUtf8(cast(string) buf[0 .. received]);
+            ptrdiff_t idx;
+            while ((idx = partial.indexOf("\r\n")) >= 0) {
+                auto line = partial[0 .. idx];
+                partial   = partial[idx + 2 .. $];
+                if (line.length == 0) continue;
+                auto evt = parseIRCLine(line);
+                auto res = classifyStarttlsReply(evt.command);
+                if (res == StarttlsResult.failed) {
+                    emitLog("error", "STARTTLS rejected by server (691) — aborting (fail closed).");
+                    throw new Exception("STARTTLS rejected (691 ERR_STARTTLS)");
+                }
+                if (res == StarttlsResult.success) {
+                    emitLog("tls", "Server accepted STARTTLS — starting TLS handshake...");
+                    auto ctx = createTLSContext(TLSContextKind.client);
+                    ctx.peerValidationMode = TLSPeerValidationMode.none;
+                    tlsStream = createTLSStreamWithTimeout(connection, ctx,
+                        stripHostBrackets(config.host),
+                        TLS_HANDSHAKE_TIMEOUT_SECONDS.seconds);
+                    logInfo("Connected to %s:%s with STARTTLS", config.host, config.port);
+                    logJsonMap("info", "connection",
+                        "Connected with STARTTLS",
+                        ["network": config.name, "host": config.host,
+                         "port": config.port.to!string,
+                         "event": "tls_handshake"]);
+                    captureTlsInfo();
+                    emitLog("tls_done", formatTlsDoneText(tlsInfoValid, tlsInfo,
+                        "STARTTLS handshake complete — connection is now encrypted."));
+                    return;
+                }
+                // Still waiting — ignore NOTICE/MOTD chatter, keep reading.
+            }
+        }
+        emitLog("error", "STARTTLS timed out waiting for 670 — aborting (fail closed).");
+        throw new Exception("STARTTLS timeout: no 670 RPL_STARTTLS received");
+    }
+
     private void attemptConnectionImpl(bool) {
         // If the user clicked Disconnect (or the manager removed this client)
         // while we were waiting on the backoff timer, abort the connection
@@ -2959,7 +3345,12 @@ final class PersistentIRCClient {
              "egressIp": activeEgressIp,
              "tls": (config.tls != TLSMode.disabled) ? "true" : "false",
              "event": "tcp_open"]);
-        if (config.tls != TLSMode.disabled) {
+        // STARTTLS upgrades the plain connection in place; the implicit-TLS
+        // block below is skipped for it (tlsStream is already set here).
+        if (config.tls == TLSMode.starttls) {
+            performStarttlsUpgrade();
+        }
+        if (config.tls != TLSMode.disabled && config.tls != TLSMode.starttls) {
             emitLog("tls",
                 "Starting TLS handshake with " ~ config.host ~ "...");
 
@@ -2984,7 +3375,9 @@ final class PersistentIRCClient {
                      "port": config.port.to!string,
                      "sni": config.host,
                      "event": "tls_handshake"]);
-                emitLog("tls_done", "TLS handshake complete — connection is now encrypted.");
+                captureTlsInfo();
+                emitLog("tls_done", formatTlsDoneText(tlsInfoValid, tlsInfo,
+                    "TLS handshake complete — connection is now encrypted."));
                 tls.setStatusOk();
             } catch (Exception e) {
                 logJsonMap("warn", "connection",
@@ -3054,6 +3447,7 @@ final class PersistentIRCClient {
         // state flip happens below; we emit the notice first so the
         // server log timeline ends on a clear success line before any
         // MOTD text begins to stream in.
+        connectedAtMs = unixMsNow();
         emitLog("welcome",
             "Connection registered as " ~ sessionNick
             ~ ". Server handshake complete.");
@@ -3948,8 +4342,9 @@ private void processEvents() {
             }
             processOutboundQueue();
 
-            if (now - lastKeepalive >= 120) {
-                sendRaw("PING :keepalive");
+            if (now - lastKeepalive >= 60) {
+                lagProbeSentMs = unixMsNow();
+                sendRaw("PING :" ~ lagPingToken(lagProbeSentMs));
                 lastKeepalive = now;
                 logJsonMap("debug", "connection",
                     "PING sent",
@@ -4134,6 +4529,14 @@ private void processEvents() {
 
         if (event.command == "PONG") {
             lastPongReceivedSecs = Clock.currTime.toUnixTime!long;
+            {
+                auto pongParams = event.getParams();
+                const sentMs = pongParams.length > 0 ? parseLagPongParam(pongParams[$ - 1]) : -1;
+                if (sentMs > 0 && sentMs == lagProbeSentMs) {
+                    lagMs = unixMsNow() - sentMs;
+                    lagProbeSentMs = 0;
+                }
+            }
             logJsonMap("debug", "connection",
                 "PONG received",
                 ["network": config.name,
@@ -4173,7 +4576,7 @@ private void processEvents() {
                 if (params.length > 0) {
                     auto chan = normalizeChannelName(params[0]);
                     channelState[chan] = "";
-                    if (event.nick == sessionNick) {
+                    if (sameNick(event.nick, sessionNick)) {
                         // Add our nick to channelUsers immediately so the
                         // current user always appears in the member list,
                         // even if the IRC server omits us from RPL_NAMREPLY
@@ -4262,7 +4665,7 @@ private void processEvents() {
                 auto params = event.getParams();
                 if (params.length > 0) {
                     auto chan = normalizeChannelName(params[0]);
-                    if (event.nick == sessionNick) {
+                    if (sameNick(event.nick, sessionNick)) {
                         channelState.remove(chan);
                         channelUsers.remove(chan);
                         channelTopics.remove(chan);
@@ -4313,7 +4716,7 @@ private void processEvents() {
             case "QUIT":
                 foreach (chan, ref users; channelUsers) {
                     foreach (i, u; users) {
-                        if (stripNickPrefix(u) == event.nick) {
+                        if (sameNick(u, event.nick)) {
                             quitChannels ~= chan;
                             users = users.remove(i);
                             break;
@@ -4395,7 +4798,7 @@ private void processEvents() {
                         // host-bearing entry stale and the channel roster
                         // ends up showing both the old and the new nick.
                         foreach (i, ref u; users) {
-                            if (stripNickPrefix(u) == event.nick) {
+                            if (sameNick(u, event.nick)) {
                                 if (!canFind(nickChannels, chan))
                                     nickChannels ~= chan;
                                 u = nickPrefix(u) ~ newNick;
@@ -4409,11 +4812,11 @@ private void processEvents() {
                     //    updated sessionNick. The old nick before the update is
                     //    tracked in optimisticNickOld. We match against that.
                     bool isSelf = false;
-                    if (event.nick == sessionNick) {
+                    if (sameNick(event.nick, sessionNick)) {
                         isSelf = true;
                         sessionNick = newNick;
                         persistNick(sessionNick);
-                    } else if (optimisticNickOld.length > 0 && event.nick == optimisticNickOld) {
+                    } else if (optimisticNickOld.length > 0 && sameNick(event.nick, optimisticNickOld)) {
                         isSelf = true;
                         sessionNick = newNick;
                         optimisticNickOld = "";
@@ -4456,7 +4859,7 @@ private void processEvents() {
                         if (bare.length > 0 && (bare[0] == '~' || bare[0] == '&' ||
                             bare[0] == '@' || bare[0] == '%' || bare[0] == '+'))
                             bare = bare[1 .. $];
-                        if (bare == event.nick) {
+                        if (sameNick(bare, event.nick)) {
                             chghostChannels ~= chan;
                             break;
                         }
@@ -4675,7 +5078,7 @@ private void processEvents() {
                         size_t j = 0;
                         while (j < channelUsers[chan].length) {
                             auto existing = channelUsers[chan][j];
-                            if (stripNickPrefix(existing) == nick) {
+                            if (sameNick(existing, nick)) {
                                 if (existing.length == 0 ||
                                     (existing[0] != '~' && existing[0] != '&' &&
                                      existing[0] != '@' && existing[0] != '%' &&
@@ -4754,7 +5157,7 @@ private void processEvents() {
                 // event.text is the away message (empty = returned from away).
                 foreach (chan, users; channelUsers) {
                     foreach (u; users) {
-                        if (stripNickPrefix(u) == event.nick) {
+                        if (sameNick(u, event.nick)) {
                             auto dup        = event;
                             dup.channel     = chan;
                             dup.id          = randomUUID().toString();
@@ -4770,7 +5173,7 @@ private void processEvents() {
                 // Broadcast to shared channels
                 foreach (chan, users; channelUsers) {
                     foreach (u; users) {
-                        if (stripNickPrefix(u) == event.nick) {
+                        if (sameNick(u, event.nick)) {
                             auto dup    = event;
                             dup.channel = chan;
                             dup.id      = randomUUID().toString();
@@ -4779,6 +5182,62 @@ private void processEvents() {
                     }
                 }
                 return;
+
+            // ── Realname change (setname cap) ──────────────────────────────
+            // `:nick!user@host SETNAME :new real name` — one trailing
+            // param (https://ircv3.net/specs/extensions/setname).
+            // Updates the realname cache and fans out to shared channels
+            // like AWAY/ACCOUNT so the UI can refresh member details.
+            case "SETNAME":
+                if (event.text.length > 0 && event.nick.length > 0)
+                    realnames[event.nick] = event.text;
+                foreach (chan, users; channelUsers) {
+                    foreach (u; users) {
+                        if (sameNick(u, event.nick)) {
+                            auto dup    = event;
+                            dup.channel = chan;
+                            dup.id      = randomUUID().toString();
+                            eventChannel.put(dup);
+                        }
+                    }
+                }
+                return;
+
+            // ── Standard replies (standard-replies cap) ────────────────────
+            // FAIL/WARN/NOTE carry a command name plus code and human text,
+            // e.g. `:server FAIL PRIVMSG CANNOT_SEND_TO_CHANNEL #chan :...`.
+            // They fall through to the normal publish path below so they
+            // land in the target buffer (or _server when no channel is
+            // named). A `label` tag on a FAIL is correlated with our
+            // pending sends in the labeled-response block below.
+            case "FAIL":
+            case "WARN":
+            case "NOTE":
+                break;
+
+            // ── Message redaction (draft/message-redaction cap) ────────────
+            // `REDACT <target> <msgid> [<reason>]` — publishes into the
+            // target buffer so the frontend can tombstone the message by
+            // msgid. Routed explicitly because the trailing channel walk
+            // only matches #-channels while a DM redaction targets a
+            // bare nick.
+            case "REDACT": {
+                auto rp = event.getParams();
+                if (rp.length > 0 && event.channel.length == 0)
+                    event.channel = normalizeChannelName(rp[0]);
+                break;
+            }
+
+            // ── Monitor replies (IRCv3 monitor, ISUPPORT MONITOR) ──────────
+            // 730 RPL_MONONLINE / 731 RPL_MONOFFLINE / 732 RPL_MONLIST /
+            // 733 RPL_ENDOFMONLIST. Published as-is into the server buffer
+            // so watch-status changes are visible. 734 ERR_MONLISTFULL is
+            // deliberately left to the default numeric path (warn-logged).
+            case "730":
+            case "731":
+            case "732":
+            case "733":
+                break;
 
             // ── ISUPPORT ─────────────────────────────────────────────────────
             case "005":
@@ -4905,7 +5364,7 @@ private void processEvents() {
                                 bool found = false;
                                 if (auto members = chan in channelUsers) {
                                     foreach (i, ref u; *members) {
-                                        if (stripNickPrefix(u) == targetNick) {
+                                        if (sameNick(u, targetNick)) {
                                             found = true;
                                             if (adding) {
                                                 char newPrefix;
@@ -5079,16 +5538,31 @@ private void processEvents() {
         // so CHATHISTORY pagination has stable cursors. This runs for both
         // live messages and those arriving inside a chathistory batch.
         if (event.command == "PRIVMSG" || event.command == "NOTICE"
-            || event.command == "TAGMSG") {
+            || event.command == "TAGMSG" || event.command == "FAIL"
+            || event.command == "WARN" || event.command == "NOTE") {
             auto msgLabel = event.getTag("label");
             if (msgLabel.length > 0 && clearPendingLabel(msgLabel)) {
                 event.addTag("labeled_echo", "true");
+            } else if (msgLabel.length > 0 && event.nick.length > 0
+                && !sameNick(event.nick, sessionNick)
+                && (event.command == "PRIVMSG" || event.command == "NOTICE")) {
+                // Remote edit (draft/edit-message from another client):
+                // the label names the original message but we never sent
+                // it, so it is not in pendingLabels. Tag it so the
+                // frontend can replace the original in place instead of
+                // appending a duplicate.
+                event.addTag("edit_of", msgLabel);
             }
+            // IRCv3 account-tag: track the author's account name for
+            // identity display without a WHOIS round trip.
+            auto acctTag = event.getTag("account");
+            if (acctTag.length > 0 && acctTag != "*" && event.nick.length > 0)
+                accounts[event.nick] = acctTag;
             // Self-echo detection: tag PRIVMSG/NOTICE events from the
             // session's own nick. This runs regardless of msgid presence
             // so the suppression below catches all echo paths, including
             // servers that don't assign msgid tags.
-            if (event.nick == sessionNick
+            if (sameNick(event.nick, sessionNick)
                 && (event.command == "PRIVMSG" || event.command == "NOTICE")) {
                 event.addTag("self_echo", "true");
                 // IRCCloud-style duplicate suppression: when the IRC server
@@ -5314,6 +5788,7 @@ private void processEvents() {
     private void handleDisconnection() {
         withSpan("irc.disconnect", ["network": config.name, "reason": lastDisconnectReason], (ref Span s) {
             state = ConnectionState.disconnected;
+            resetConnectionTelemetry();
             try {
                 if (tlsStream) {
                     tlsStream.finalize();
@@ -5436,7 +5911,7 @@ private void processEvents() {
     private void removeFromUsers(string chan, string nick) {
         if (auto users = chan in channelUsers) {
             foreach (i, u; *users) {
-                if (stripNickPrefix(u) == nick) {
+                if (sameNick(u, nick)) {
                     *users = (*users).remove(i);
                     break;
                 }
@@ -5779,6 +6254,40 @@ private void processEvents() {
         if (!hasCap("echo-message")) {
             emitSyntheticSelfMessage(target, text, "PRIVMSG", label);
         }
+    }
+
+    /// Whether the server advertised MONITOR support (ISUPPORT token).
+    bool monitorSupported() {
+        return ("MONITOR" in isupportMap) !is null;
+    }
+
+    /// Sends a MONITOR command (IRCv3 monitor: + add, - remove,
+    /// C clear, L list, S status query). Silent no-op when the server
+    /// did not advertise MONITOR or the verb is invalid.
+    void sendMonitor(string verb, string targets = "") {
+        if (!monitorSupported()) return;
+        auto line = buildMonitorLine(verb, targets);
+        if (line is null) return;
+        sendRaw(line);
+    }
+
+    /// Sends a message redaction using the draft/message-redaction cap:
+    /// `REDACT <target> <msgid> [<reason>]`. Silent no-op when the cap
+    /// was not negotiated.
+    void sendRedactMessage(string target, string msgid, string reason = "") {
+        if (!hasCap("draft/message-redaction")) return;
+        if (target.length == 0 || msgid.length == 0) return;
+        auto line = "REDACT " ~ target ~ " " ~ msgid;
+        if (reason.length > 0) line ~= " :" ~ reason;
+        sendRaw(line);
+    }
+
+    /// Sends a realname change (`SETNAME :<realname>`). The spec requires
+    /// servers to accept this even when the setname cap was not
+    /// negotiated, so this sends unconditionally.
+    void sendSetName(string realname) {
+        if (realname.length == 0) return;
+        sendRaw("SETNAME :" ~ realname);
     }
 
     /// Sends an edited PRIVMSG using the draft/edit-message IRCv3 cap.
