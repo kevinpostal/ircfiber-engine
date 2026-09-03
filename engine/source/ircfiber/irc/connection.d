@@ -3304,6 +3304,17 @@ final class PersistentIRCClient {
         state = ConnectionState.connecting;
         disconnectedEmitted = false;
         ackedCaps.clear();
+        // A dropped connection can strand us inside a `BATCH +chathistory`
+        // (the closing `BATCH -` never arrives — verified live: every row
+        // for #superbowl stored with `batch=chathistory`, so the bouncer's
+        // missed-message replay skipped the whole backlog). Batch state is
+        // per TCP connection, so it dies with the old socket; the same goes
+        // for in-flight CHATHISTORY flags the dead connection can never
+        // answer (they would suppress fresh backfills forever).
+        activeBatchRef = "";
+        activeBatchType = "";
+        activeBatchTarget = "";
+        chathistoryInFlight.clear();
         serverFeatures = ServerFeatures.init;
         // Drop any tokens leftover from the previous connection attempt;
         // the new server's 005 stream will repopulate this map. Without

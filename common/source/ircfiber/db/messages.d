@@ -402,6 +402,20 @@ final class MessageRepository {
         return out_;
     }
 
+    /// Timestamp (unix ms) of the row with `eid` in a network, or 0 when
+    /// unknown. Backs the bouncer's missed-message filter, which needs the
+    /// cursor's timestamp to tell backfill copies of already-seen rows
+    /// (old `t`, safe to skip) from genuinely missed rows.
+    long timestampOfEid(string serverId, string networkId, long eid) @trusted {
+        if (serverId.length == 0 || eid <= 0) return 0;
+        auto doc = collection.findOne(Bson([
+            "serverId": Bson(serverId),
+            "networkId": Bson(networkId),
+            "eid": Bson(eid)
+        ]));
+        return doc.isNull ? 0 : readBsonTimestamp(doc["t"]);
+    }
+
     /// Timestamp (unix ms) of the row with `msgid` in a buffer, or 0 when unknown.
     long timestampOfMsgid(string serverId, string networkId, string channel, string msgid) @trusted {
         channel = normalizeChannel(channel);
