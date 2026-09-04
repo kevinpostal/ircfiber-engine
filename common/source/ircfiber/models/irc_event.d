@@ -85,6 +85,13 @@ struct IRCRawEvent {
     /// `data.fi`). Empty when this is not a CONNECTION_FAIL event.
     /// See `retryStatusPayload` for the string-vs-Json rationale.
     string failInfoPayload;
+    /// Structured payload for the synthetic CHANNEL_LIST event
+    /// (one chunk of `/LIST` rows). Populated by `makeChannelList`
+    /// as a JSON-encoded string and serialised by `toCompactJson`
+    /// as the top-level `cl` object. Empty when this is not a
+    /// CHANNEL_LIST event. See `retryStatusPayload` for the
+    /// string-vs-Json rationale.
+    string channelListPayload;
 
     /// Serialize to compact JSON
     Json toCompactJson() const {
@@ -163,6 +170,9 @@ struct IRCRawEvent {
         if (command == "CONNECTION_FAIL"
             && failInfoPayload.length > 0) {
             j["fi"] = parseJsonString(failInfoPayload);
+        }
+        if (command == "CHANNEL_LIST" && channelListPayload.length > 0) {
+            j["cl"] = parseJsonString(channelListPayload);
         }
         return j;
     }
@@ -281,6 +291,22 @@ struct IRCRawEvent {
         return e;
     }
 
+    /// Build a synthetic CHANNEL_LIST event carrying one chunk of
+    /// `/LIST` rows. `payloadJson` is the encoded
+    /// `{pattern, first, done, rows:[{name,users,topic,modes}], error?}`
+    /// object; it is decoded into the top-level `cl` key by
+    /// `toCompactJson`. Published only — never persisted.
+    static IRCRawEvent makeChannelList(
+        string network,
+        string networkId,
+        string payloadJson,
+    ) {
+        auto e = IRCRawEvent(network, "CHANNEL_LIST");
+        e.networkId = networkId;
+        e.channelListPayload = payloadJson;
+        return e;
+    }
+
     /// Build a synthetic CONNECTION_RETRY_STATUS event. Emitted by the
     /// engine at every reconnect-loop cycle (connection.d around line 1595)
     /// AND at every `backoff.reset()` site with all-zero arguments so the
@@ -387,6 +413,20 @@ unittest {
     assert(json["x"].get!string == "hello");
     assert(json["ch"].get!string == "#d");
     assert(json["p"].length == 2);
+}
+
+@("IRCRawEvent makeChannelList serialises the cl payload")
+unittest {
+    auto event = IRCRawEvent.makeChannelList("libera", "nid",
+        `{"pattern":"","first":true,"done":true,"rows":[{"name":"#d","users":42,"topic":"t","modes":"+nt"}]}`);
+    auto json = event.toCompactJson();
+    assert(json["c"].get!string == "CHANNEL_LIST");
+    assert(json["nid"].get!string == "nid");
+    assert(json["cl"]["rows"].length == 1);
+    assert(json["cl"]["rows"][0]["name"].get!string == "#d");
+    assert(json["cl"]["rows"][0]["users"].get!long == 42);
+    assert(json["cl"]["first"].get!bool);
+    assert(json["cl"]["done"].get!bool);
 }
 
 @("IRCRawEvent addTag stores tag data")

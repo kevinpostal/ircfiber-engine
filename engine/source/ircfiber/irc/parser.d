@@ -253,6 +253,40 @@ public int extractTempUnavailableCountdown(const ref IRCRawEvent event, int defa
     return defaultMs;
 }
 
+/// One RPL_LIST (322) row: `:srv 322 <nick> <channel> <users> :[+modes] <topic>`.
+public struct ChannelListRow {
+    string name;
+    long users;
+    string topic;
+    string modes;
+}
+
+/// Parses a 322 event. Returns false when command != "322", params < 3, or
+/// the user count is not numeric. Strips a leading `[+…]` modes block from
+/// the trailing into `modes` (bracket content, e.g. "+nt"); `topic` is the
+/// remainder trimmed. Missing trailing → topic "".
+public bool parseChannelListRow(const ref IRCRawEvent event, out ChannelListRow row) {
+    import std.conv : to;
+    import std.string : strip;
+    if (event.command != "322") return false;
+    auto params = event.getParams();
+    if (params.length < 3) return false;
+    row.name = params[1];
+    try row.users = params[2].to!long;
+    catch (Exception) return false;
+    string trailing = params.length > 3 ? params[3] : "";
+    if (trailing.startsWith("[+")) {
+        auto close = trailing.indexOf(']');
+        if (close > 0) {
+            row.modes = trailing[1 .. close];
+            row.topic = trailing[close + 1 .. $].strip();
+            return true;
+        }
+    }
+    row.topic = trailing.strip();
+    return true;
+}
+
 /// Convenience: same as `parseIRCLinePublic` but takes the network
 /// name and ID as separate arguments (avoids constructing a full
 /// NetworkConfig when the caller already has these primitives).

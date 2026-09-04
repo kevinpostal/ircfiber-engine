@@ -73,11 +73,17 @@ void startEventProcessor(ref EngineContext ctx) {
                 event.eid = ctx.redis.incr(RedisKeys.globalEid());
                 logDebug("Engine event [server=%s]: %s %s (eid=%d)", serverId, event.network, event.command, event.eid);
 
+                // CHANNEL_LIST chunks are publish-only: they are a live
+                // reply to a /LIST request, not scrollback. Never written
+                // to Redis scrollback, Mongo, or the user stream (a 20k
+                // channel network would otherwise fill all three).
+                const bool transientList = event.command == "CHANNEL_LIST";
+
                 // Store buffer with server namespace (prevents ID collision).
                 // The buffer is the source of truth for the _server
                 // channel scrollback; the MongoDB write below makes it
                 // durable across restarts and Redis flushes.
-                ctx.bufferManager.appendIRCEvent(event, serverId);
+                if (!transientList) ctx.bufferManager.appendIRCEvent(event, serverId);
 
                 // ── MongoDB persistence — async, AFTER publish ──
                 // The 2026-07-13 fix moves the Mongo write BACK to a
@@ -120,7 +126,7 @@ void startEventProcessor(ref EngineContext ctx) {
                         break;
                     }
                 }
-                if (foundNet && userIdStr.length > 0 && !isTransientServerLogPhase(event)) {
+                if (foundNet && userIdStr.length > 0 && !transientList && !isTransientServerLogPhase(event)) {
                     runTask(() nothrow {
                         try {
                             ctx.messageRepo.appendIRCEvent(event, serverId);
@@ -145,9 +151,11 @@ void startEventProcessor(ref EngineContext ctx) {
 
                 if (userIdStr.length > 0) {
                     ctx.redis.publish(RedisKeys.events(userIdStr), msg);
-                    auto streamKey = RedisKeys.userStream(userIdStr);
-                    ctx.redis.getDb().lpush(streamKey, msg);
-                    ctx.redis.getDb().ltrim(streamKey, 0, 999);
+                    if (!transientList) {
+                        auto streamKey = RedisKeys.userStream(userIdStr);
+                        ctx.redis.getDb().lpush(streamKey, msg);
+                        ctx.redis.getDb().ltrim(streamKey, 0, 999);
+                    }
                 }
 
                 if (foundNet && (event.command == "001"

@@ -39,6 +39,7 @@ import ircfiber.tracing : withSpan, Span;
 import ircfiber.engine.adopted_socket : AdoptedSocket;
 import ircfiber.async : safeFiberRun;
 import ircfiber.irc.ipv6 : ipv6ForUser, normalizePrefix;
+import ircfiber.irc.parser : ChannelListRow, parseChannelListRow;
 
 /// IRC connection state.
 ///
@@ -1763,6 +1764,16 @@ final class PersistentIRCClient {
         /// frontend.
         string[string]      isupportMap;
 
+        // /LIST accumulation (transient, per TCP connection; NOT part of
+        // the handoff snapshot). Rows from 322 are buffered here and
+        // flushed as synthetic CHANNEL_LIST chunks of CHANNEL_LIST_CHUNK
+        // rows; 323 / 416 / 263-while-listing finish the request.
+        ChannelListRow[]    channelListPending;
+        bool                channelListInFlight;
+        bool                channelListEmittedFirst;
+        string              channelListPattern;
+        enum CHANNEL_LIST_CHUNK = 200;
+
         // IRCv3 labeled-response tracking.
         // Key: label value, Value: unix-ms timestamp when the PRIVMSG/NOTICE
         // was sent. Used to (a) suppress the duplicate when the labeled
@@ -3204,6 +3215,52 @@ final class PersistentIRCClient {
         }
     }
 
+    /// Starts a new /LIST accumulation. Called from `sendRaw` when we see
+    /// an outgoing LIST, or lazily from the 321/322 handlers when the
+    /// request originated elsewhere (e.g. before a handoff).
+    private void beginChannelList(string pattern) {
+        channelListInFlight = true;
+        channelListEmittedFirst = false;
+        channelListPending.length = 0;
+        channelListPattern = pattern;
+    }
+
+    /// Emits the buffered /LIST rows as one CHANNEL_LIST chunk. `done`
+    /// marks the final chunk (may carry 0 rows); `error` is attached when
+    /// the server aborted the list; `code` is the aborting numeric
+    /// ("416" too many matches, "263" try again) so the frontend can pick
+    /// IRCCloud's `list_response_toomany` vs `try_again` copy.
+    private void flushChannelList(bool done, string error = "", string code = "") nothrow {
+        try {
+            auto j = Json.emptyObject;
+            j["pattern"] = channelListPattern;
+            j["first"] = !channelListEmittedFirst;
+            j["done"] = done;
+            auto rows = Json.emptyArray;
+            foreach (ref r; channelListPending) {
+                auto o = Json.emptyObject;
+                o["name"] = r.name;
+                o["users"] = r.users;
+                o["topic"] = r.topic;
+                o["modes"] = r.modes;
+                rows ~= o;
+            }
+            j["rows"] = rows;
+            if (error.length) {
+                j["error"] = error;
+                if (code.length) j["code"] = code;
+            }
+            eventChannel.put(IRCRawEvent.makeChannelList(
+                config.name, config.id.toString(), j.toString()));
+            channelListEmittedFirst = true;
+            channelListPending.length = 0;
+            if (done) channelListInFlight = false;
+        } catch (Exception e) {
+            try logWarn("flushChannelList[%s]: %s", config.name, e.msg);
+            catch (Exception) {}
+        }
+    }
+
     private void attemptConnection() {
         // Jul 8 2026 UX fix: emit a "Connecting" event to the chat IMMEDIATELY
         // so the user sees feedback the moment the engine starts attempting
@@ -3321,6 +3378,10 @@ final class PersistentIRCClient {
         // the clear, a reconnect to a less-featureful server would leave
         // stale tokens in the synchronised state.
         isupportMap.clear();
+        channelListPending.length = 0;
+        channelListInFlight = false;
+        channelListEmittedFirst = false;
+        channelListPattern = "";
 
         logInfo("Connecting to %s:%s (Happy Eyeballs)", config.host, config.port);
         logJsonMap("info", "connection",
@@ -5445,8 +5506,39 @@ private void processEvents() {
             case "671": // RPL_WHOISSECURE — suppress "is using a Secure Connection" noise
                 return;
 
+            // ── /LIST: 321/322/323 are folded into CHANNEL_LIST chunks ──
+            // and never published raw (raw 322 rows carry channel=#chan
+            // and would otherwise be persisted into per-channel scrollback).
+            case "321": // RPL_LISTSTART — header
+                if (!channelListInFlight) beginChannelList("");
+                return;
+            case "322": { // RPL_LIST — one row
+                ChannelListRow row;
+                if (parseChannelListRow(event, row)) {
+                    if (!channelListInFlight) beginChannelList("");
+                    channelListPending ~= row;
+                    if (channelListPending.length >= CHANNEL_LIST_CHUNK) flushChannelList(false);
+                }
+                return;
+            }
+            case "323": // RPL_LISTEND
+                flushChannelList(true);
+                return;
+            case "416": // ERR_TOOMANYMATCHES — server truncated/refused the list
+                if (channelListInFlight) {
+                    flushChannelList(true, event.text.length ? event.text : "Output too large, truncated", "416");
+                    return;
+                }
+                break;
+
             // ── W1-T08: RPL_TRYAGAIN (263) — Server busy ─────────────────
             case "263": {
+                if (channelListInFlight) {
+                    // A LIST-triggered RPL_TRYAGAIN fails the list rather
+                    // than raising the buffer-level "Server busy" chip.
+                    flushChannelList(true, event.text.length ? event.text : "Server busy, try again later", "263");
+                    return;
+                }
                 import ircfiber.irc.parser : extractTempUnavailableCountdown;
                 auto countdownMs = extractTempUnavailableCountdown(event);
                 auto tue = IRCRawEvent(config.name, "temp_unavailable");
@@ -5470,6 +5562,8 @@ private void processEvents() {
                         || event.command == "354" || event.command == "376"
                         || event.command == "422" || event.command == "432"
                         || event.command == "433" || event.command == "671"
+                        || event.command == "321" || event.command == "322"
+                        || event.command == "323"
                         || event.command == "903" || event.command == "904"
                         || event.command == "905" || event.command == "906"
                         || event.command == "907");
@@ -6233,6 +6327,12 @@ private void processEvents() {
                 optimisticNickOld = sessionNick;
                 sessionNick = newNick;
             }
+        }
+        // /LIST from any client path (web slash command, bouncer client, /raw).
+        import std.uni : icmp;
+        if (line.length >= 4 && icmp(line[0 .. 4], "LIST") == 0
+            && (line.length == 4 || line[4] == ' ')) {
+            beginChannelList(line.length > 5 ? line[5 .. $].strip() : "");
         }
         if (state == ConnectionState.disconnected ||
             (state == ConnectionState.connecting && !transportAlive)) {

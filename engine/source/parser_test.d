@@ -13,7 +13,8 @@ import std.string : indexOf;
 import std.uuid : parseUUID, randomUUID;
 import std.conv : to;
 
-import ircfiber.irc.parser : parseIRCLinePublic, parseIRCLineNamed, parseIsupportPrefix;
+import ircfiber.irc.parser : parseIRCLinePublic, parseIRCLineNamed, parseIsupportPrefix,
+    ChannelListRow, parseChannelListRow;
 import ircfiber.models.network : NetworkConfig;
 import ircfiber.models.irc_event : IRCRawEvent;
 
@@ -336,6 +337,44 @@ void runIsupportTests() {
     }
 }
 
+/// RPL_LIST (322) row parsing for /LIST → CHANNEL_LIST.
+void runChannelListTests() {
+    stderr.writeln("\n[channel list]");
+    {
+        auto e = parseIRCLineNamed(":srv 322 me #d 42 :[+nt] D lang", "TestNet", "nid");
+        ChannelListRow row;
+        check!("322 modes+topic: parses")(parseChannelListRow(e, row));
+        check!("322 modes+topic: name")(row.name == "#d", row.name);
+        check!("322 modes+topic: users")(row.users == 42, row.users.to!string);
+        check!("322 modes+topic: modes")(row.modes == "+nt", row.modes);
+        check!("322 modes+topic: topic")(row.topic == "D lang", row.topic);
+    }
+    {
+        auto e = parseIRCLineNamed(":srv 322 me #x 3 :no modes here", "TestNet", "nid");
+        ChannelListRow row;
+        check!("322 no modes: parses")(parseChannelListRow(e, row));
+        check!("322 no modes: modes empty")(row.modes == "", row.modes);
+        check!("322 no modes: topic")(row.topic == "no modes here", row.topic);
+    }
+    {
+        auto e = parseIRCLineNamed(":srv 322 me #empty 0 :", "TestNet", "nid");
+        ChannelListRow row;
+        check!("322 empty topic: parses")(parseChannelListRow(e, row));
+        check!("322 empty topic: users 0")(row.users == 0);
+        check!("322 empty topic: topic empty")(row.topic == "", row.topic);
+    }
+    {
+        auto e = parseIRCLineNamed(":srv 322 me #bad abc :t", "TestNet", "nid");
+        ChannelListRow row;
+        check!("322 non-numeric users: rejected")(!parseChannelListRow(e, row));
+    }
+    {
+        auto e = parseIRCLineNamed(":srv 321 me Channel :Users  Name", "TestNet", "nid");
+        ChannelListRow row;
+        check!("321 header: rejected")(!parseChannelListRow(e, row));
+    }
+}
+
 int main() {
     stderr.writeln("ircfiber.irc.parser smoke tests");
     runDefensiveTests();
@@ -343,6 +382,7 @@ int main() {
     runIRCv3Tests();
     runSquashedErrorTests();
     runIsupportTests();
+    runChannelListTests();
     stderr.writeln("\n", passed, " passed, ", failed, " failed");
     return failed == 0 ? 0 : 1;
 }
