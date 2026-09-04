@@ -1813,6 +1813,14 @@ final class PersistentIRCClient {
         string              activeEgressHost;
         /// Resolved Tailnet IP of the active proxy (e.g. "100.117.47.8").
         string              activeEgressIp;
+        /// Remote IP the Happy Eyeballs race actually connected to (e.g.
+        /// "2001:6b0:e:2a18::120" for an AAAA winner). The family of this
+        /// address is the only reliable "did we use IPv6" signal — the
+        /// egress fields above only describe the SOCKS hop.
+        string              activePeerIp;
+        /// Local source IP of the live socket: the per-user IPv6 bind, the
+        /// container/host address, or the Tailnet IP of the SOCKS sidecar.
+        string              activeLocalIp;
 
         // ── Handoff support ───────────────────────────────────────────────────
         /// When non-zero, the connection's event loop will not perform any
@@ -2571,6 +2579,19 @@ final class PersistentIRCClient {
     @property string getActiveEgressLabel() const { return activeEgressLabel; }
     @property string getActiveEgressHost() const { return activeEgressHost; }
     @property string getActiveEgressIp() const { return activeEgressIp; }
+    /// Remote/local IPs of the live TCP socket; "" when not connected.
+    @property string getActivePeerIp() const { return activePeerIp; }
+    @property string getActiveLocalIp() const { return activeLocalIp; }
+    /// Snapshot the socket's endpoint addresses right after a successful
+    /// connect. Best effort: an address lookup failing must never abort
+    /// the connection flow.
+    private void recordSocketAddrs() nothrow {
+        activePeerIp = ""; activeLocalIp = "";
+        try {
+            activePeerIp = connection.remoteAddress.toAddressString();
+            activeLocalIp = connection.localAddress.toAddressString();
+        } catch (Exception) {}
+    }
     /// Round trip of the last answered lag probe in ms; -1 when unknown.
     @property long getLagMs() const nothrow { return lagMs; }
     /// Unix ms of RPL_WELCOME for the live connection; 0 when not connected.
@@ -3402,12 +3423,15 @@ final class PersistentIRCClient {
             activeEgressLabel = mullvadLastUsedLabel;
             activeEgressHost = mullvadLastUsedHost;
             activeEgressIp = mullvadLastUsedIp;
+            recordSocketAddrs();
             ts.setStatusOk();
         });
-        logInfo("TCP via egress '%s' (%s/%s) to %s:%d", activeEgressLabel.length ? activeEgressLabel : "direct", activeEgressHost.length ? activeEgressHost : "direct", activeEgressIp.length ? activeEgressIp : "-", config.host, config.port);
+        logInfo("TCP via egress '%s' (%s/%s) to %s:%d peer=%s local=%s", activeEgressLabel.length ? activeEgressLabel : "direct", activeEgressHost.length ? activeEgressHost : "direct", activeEgressIp.length ? activeEgressIp : "-", config.host, config.port, activePeerIp.length ? activePeerIp : "-", activeLocalIp.length ? activeLocalIp : "-");
         emitLog("tcp_open",
             "TCP connection established to " ~ config.host ~ ":" ~ config.port.to!string
-            ~ (activeEgressLabel.length ? " via " ~ activeEgressLabel ~ " (" ~ activeEgressHost ~ (activeEgressIp.length ? "/" ~ activeEgressIp : "") ~ ")" : " (direct)") ~ ".");
+            ~ (activePeerIp.length ? " [" ~ activePeerIp ~ "]" : "")
+            ~ (activeEgressLabel.length ? " via " ~ activeEgressLabel ~ " (" ~ activeEgressHost ~ (activeEgressIp.length ? "/" ~ activeEgressIp : "") ~ ")" : " (direct)")
+            ~ (activeLocalIp.length ? " from " ~ activeLocalIp : "") ~ ".");
         logJsonMap("info", "connection",
             "TCP open",
             ["network": config.name, "host": config.host,
@@ -3415,6 +3439,8 @@ final class PersistentIRCClient {
              "egress": activeEgressLabel.length ? activeEgressLabel : "direct",
              "egressHost": activeEgressHost,
              "egressIp": activeEgressIp,
+             "peerIp": activePeerIp,
+             "localIp": activeLocalIp,
              "tls": (config.tls != TLSMode.disabled) ? "true" : "false",
              "event": "tcp_open"]);
         // STARTTLS upgrades the plain connection in place; the implicit-TLS
@@ -3490,6 +3516,7 @@ final class PersistentIRCClient {
                 activeEgressLabel = mullvadLastUsedLabel;
                 activeEgressHost = mullvadLastUsedHost;
                 activeEgressIp = mullvadLastUsedIp;
+                recordSocketAddrs();
                 logInfo("Plain fallback TCP via egress '%s' (%s/%s) to %s:%d", activeEgressLabel.length ? activeEgressLabel : "direct", activeEgressHost.length ? activeEgressHost : "direct", activeEgressIp.length ? activeEgressIp : "-", config.host, config.port);
                 emitLog("tcp_open", "Re-established plain-text TCP connection to " ~ config.host ~ " via " ~ (activeEgressLabel.length ? activeEgressLabel ~ " (" ~ activeEgressHost ~ (activeEgressIp.length ? "/" ~ activeEgressIp : "") ~ ")" : "direct") ~ ".");
                 logJsonMap("info", "connection", "TLS handshake failed; fell back to plain text", ["network": config.name, "host": config.host, "egress": activeEgressLabel.length ? activeEgressLabel : "direct", "egressHost": activeEgressHost, "egressIp": activeEgressIp, "event": "tls_plain_fallback"]);
@@ -5590,14 +5617,32 @@ private void processEvents() {
                 && p[0][0] != '+' && p[0][0] != '!') {
                 string other;
                 import std.uni : icmp;
-                if (event.nick.length > 0 && sessionNick.length > 0
-                    && icmp(event.nick, sessionNick) == 0) {
+                // Outgoing echo (nick == session nick): the counterparty is
+                // our typed target. Incoming: the sender's nick, which the
+                // server reports in authoritative case.
+                bool outgoing = event.nick.length > 0 && sessionNick.length > 0
+                    && icmp(event.nick, sessionNick) == 0;
+                if (outgoing) {
                     other = p[0];
                 } else {
                     other = event.nick;
                 }
-                if (other.length > 0 && !queryBuffers.canFind(other)) {
-                    queryBuffers ~= other;
+                if (other.length > 0) {
+                    // Casemapping-aware dedup: "nickserv" and "NickServ" are
+                    // the same counterparty (sameNick folds per ISUPPORT
+                    // CASEMAPPING, default rfc1459). Incoming traffic adopts
+                    // the server case so the tracked name — and everything
+                    // derived from it — converges to what is actually on
+                    // IRC; outgoing traffic adopts whatever is tracked.
+                    ptrdiff_t found = -1;
+                    foreach (i, q; queryBuffers) {
+                        if (sameNick(q, other)) { found = i; break; }
+                    }
+                    if (found < 0) {
+                        queryBuffers ~= other;
+                    } else if (!outgoing && queryBuffers[found] != other) {
+                        queryBuffers[found] = other;
+                    }
                 }
             }
         }
@@ -5627,7 +5672,14 @@ private void processEvents() {
                 import std.uni : icmp;
                 if (event.nick.length > 0 && sessionNick.length > 0
                     && icmp(event.nick, sessionNick) == 0) {
+                    // Our echo carries the typed target; resolve to the
+                    // tracked canonical form so a repeat `/msg nickserv`
+                    // reuses the server-case channel instead of forking a
+                    // lowercase twin on the wire.
                     event.channel = p[0];
+                    foreach (q; queryBuffers) {
+                        if (sameNick(q, p[0])) { event.channel = q; break; }
+                    }
                 } else {
                     event.channel = event.nick;
                 }

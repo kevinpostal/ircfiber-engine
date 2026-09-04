@@ -39,11 +39,31 @@
       args:
         executable: /bin/bash
       timeout: 1800
+    # Per-user IPv6: host prep (sysctl + local route) and env-file lines.
+    # deploy-engine.yml deliberately does not re-render env.j2 (that needs the
+    # tailscale/vault facts the engine role gathers), so the two IPv6 keys are
+    # managed line-wise here: present when ircfiber_ipv6_prefix is set, removed
+    # when it is cleared, so a flip in group_vars/host_vars is one deploy.
+    - name: Per-user IPv6 host prep (no-op unless ircfiber_ipv6_prefix is set)
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../roles/engine/tasks/ipv6.yml"
+    - name: Sync IRCFIBER_IPV6_PREFIX in engine env file
+      ansible.builtin.lineinfile:
+        path: /etc/ircfiber/engine/env-{{ ircfiber_engine_id }}
+        regexp: '^IRCFIBER_IPV6_PREFIX='
+        line: "IRCFIBER_IPV6_PREFIX={{ ircfiber_ipv6_prefix | default('') }}"
+        state: "{{ 'present' if (ircfiber_ipv6_prefix | default('') | length > 0) else 'absent' }}"
+    - name: Sync IRCFIBER_IPV6_POOL_HOST in engine env file
+      ansible.builtin.lineinfile:
+        path: /etc/ircfiber/engine/env-{{ ircfiber_engine_id }}
+        regexp: '^IRCFIBER_IPV6_POOL_HOST='
+        line: "IRCFIBER_IPV6_POOL_HOST={{ ircfiber_ipv6_pool_host | default('') }}"
+        state: "{{ 'present' if (ircfiber_ipv6_pool_host | default('') | length > 0) else 'absent' }}"
     # Mirrors roles/engine/tasks/main.yml (ulimits, security_opts, labels).
     # Without `--ulimit nofile` the container inherited dockerd's 1024 soft
     # limit; on 2026-09-02 the engine exhausted it after ~8 h (fd leak) and
     # lost DNS/Redis/Mongo/IRC until ircfiber-monitor restarted it.
-    # IPv6: when ircfiber_ipv6_prefix is set, use host network to preserve per-user source IP.
+    # IPv6: when ircfiber_ipv6_prefix is set, use host network to preserve the
+    # per-user source IP (bridge NAT66 would masquerade it to the host address).
     - name: Recreate engine container with new image (bridge, IPv6 disabled)
       when: ircfiber_ipv6_prefix is not defined or ircfiber_ipv6_prefix | length == 0
       ansible.builtin.shell: |

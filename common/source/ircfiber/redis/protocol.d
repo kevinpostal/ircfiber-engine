@@ -448,6 +448,12 @@ struct NetworkStateSnapshot {
     string activeEgressHost;
     /// Resolved Tailnet IP of active SOCKS proxy (e.g. "100.117.47.8").
     string activeEgressIp;
+    /// Remote IP of the live IRC socket (AAAA or A winner). "" when
+    /// disconnected. Its family is the authoritative IPv6-vs-IPv4 signal.
+    string peerIp;
+    /// Local source IP of the live IRC socket (per-user IPv6 bind, shared
+    /// host address, or SOCKS sidecar hop). "" when disconnected.
+    string localIp;
     /// Channels the user has parted (for inactive sidebar)
     string[] partedChannels;
     /// W1-T01-rev1: structured retry state surfaced from the engine's
@@ -528,6 +534,8 @@ struct NetworkStateSnapshot {
         if (activeEgressLabel.length) j["activeEgressLabel"] = Json(activeEgressLabel);
         if (activeEgressHost.length) j["activeEgressHost"] = Json(activeEgressHost);
         if (activeEgressIp.length) j["activeEgressIp"] = Json(activeEgressIp);
+        if (peerIp.length) j["peerIp"] = Json(peerIp);
+        if (localIp.length) j["localIp"] = Json(localIp);
         j["lagMs"] = Json(lagMs);
         j["connectedAtMs"] = Json(connectedAtMs);
         if (hasTlsInfo) j["tlsInfo"] = tlsInfo.toJson();
@@ -594,6 +602,8 @@ struct NetworkStateSnapshot {
         if (j["activeEgressLabel"].type == Json.Type.string) s.activeEgressLabel = j["activeEgressLabel"].get!string;
         if (j["activeEgressHost"].type == Json.Type.string) s.activeEgressHost = j["activeEgressHost"].get!string;
         if (j["activeEgressIp"].type == Json.Type.string) s.activeEgressIp = j["activeEgressIp"].get!string;
+        if (j["peerIp"].type == Json.Type.string) s.peerIp = j["peerIp"].get!string;
+        if (j["localIp"].type == Json.Type.string) s.localIp = j["localIp"].get!string;
         if (j["lagMs"].type == Json.Type.int_) s.lagMs = j["lagMs"].get!long;
         if (j["connectedAtMs"].type == Json.Type.int_) s.connectedAtMs = j["connectedAtMs"].get!long;
         if (j["tlsInfo"].type == Json.Type.object) {

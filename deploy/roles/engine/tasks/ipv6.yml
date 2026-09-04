@@ -1,0 +1,63 @@
+---
+# Per-user IPv6 host prep (IRCCloud-style: one /128 per user inside a
+# ROUTED prefix). Included by roles/engine/tasks/main.yml and by
+# playbooks/deploy-engine.yml so both deploy paths converge.
+#
+# Prerequisite the playbook cannot create: the prefix must actually be
+# routed to this host by the provider. An on-link /64 where the upstream
+# router only knows the single assigned /128 (OVH VPS, verified 2026-09-04:
+# extra addresses in 2604:2dc0:222::/64 are black-holed, the router never
+# NDPs for them) does NOT qualify — packets leave but replies never return.
+#
+# With a routed prefix, `ip_nonlocal_bind` + a `local` route on lo lets the
+# engine connectTCP(..., bind=<prefix>:<uid-iid>) without a per-user
+# `ip addr add`; replies arrive because the provider routes the whole
+# prefix here and the local route delivers any IID to the socket.
+- name: Configure per-user IPv6 (host-level, idempotent)
+  when: ircfiber_ipv6_prefix is defined and ircfiber_ipv6_prefix | length > 0
+  block:
+    - name: Enable IPv6 non-local bind (allows binding any IID in the routed prefix)
+      ansible.posix.sysctl:
+        name: net.ipv6.ip_nonlocal_bind
+        value: "1"
+        sysctl_set: true
+        state: present
+        reload: true
+
+    - name: Derive IPv6 prefix without CIDR for local route
+      ansible.builtin.set_fact:
+        _ipv6_prefix_nocidr: "{{ ircfiber_ipv6_prefix.split('/')[0] }}"
+        _ipv6_prefix_len: "{{ ircfiber_ipv6_prefix.split('/')[1] | default('64') }}"
+
+    - name: Add local route for the per-user IPv6 prefix (makes every IID bindable)
+      ansible.builtin.command: >
+        ip -6 route add local {{ _ipv6_prefix_nocidr }}/{{ _ipv6_prefix_len }} dev lo
+      register: _ipv6_route_add
+      changed_when: _ipv6_route_add.rc == 0
+      failed_when: _ipv6_route_add.rc != 0 and 'File exists' not in _ipv6_route_add.stderr
+
+    - name: Persist IPv6 local route via systemd (survives reboot)
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/ircfiber-ipv6-route.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=IRC Fiber per-user IPv6 local route ({{ ircfiber_ipv6_prefix }})
+          After=network-online.target
+          Wants=network-online.target
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/sbin/ip -6 route add local {{ _ipv6_prefix_nocidr }}/{{ _ipv6_prefix_len }} dev lo
+          ExecStop=/sbin/ip -6 route del local {{ _ipv6_prefix_nocidr }}/{{ _ipv6_prefix_len }} dev lo
+          [Install]
+          WantedBy=multi-user.target
+      register: _ipv6_route_service
+
+    - name: Enable IPv6 route service
+      # In --check the unit file above is not written, so systemd cannot see it.
+      when: not (ansible_check_mode and _ipv6_route_service.changed)
+      ansible.builtin.systemd:
+        name: ircfiber-ipv6-route.service
+        enabled: true
+        daemon_reload: "{{ _ipv6_route_service.changed }}"

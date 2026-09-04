@@ -48,6 +48,9 @@
     group: root
     mode: "0750"
 
+- name: Per-user IPv6 host prep (no-op unless ircfiber_ipv6_prefix is set)
+  ansible.builtin.include_tasks: ipv6.yml
+
 - name: Render engine env file
   ansible.builtin.template:
     src: env.j2

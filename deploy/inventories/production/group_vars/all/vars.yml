@@ -134,6 +134,18 @@ ircfiber_engine_image_full: "{{ ircfiber_engine_image_name }}:{{ docker_image_ta
 ircfiber_engine_bind_address: "0.0.0.0"
 ircfiber_engine_admin_port: 8091
 ircfiber_engine_log_level: "info"
+# Per-user IPv6 (IRCCloud-style): a prefix ROUTED to the engine host that
+# gives each user their own /128 (low 64 bits of their UUID as the IID).
+# Leave empty to disable — the engine still prefers AAAA (Happy Eyeballs,
+# IPv6 first) but every user shares the host's single IPv6 address.
+# Example: "2001:db8:abcd:12::/64". Setting this switches the engine
+# container to --network host (bridge NAT66 would masquerade the per-user
+# source away) and runs roles/engine/tasks/ipv6.yml on the host.
+# NOT usable with the on-link /64 an OVH VPS shows in netplan: only the
+# assigned /128 is routed (verified 2026-09-04).
+ircfiber_ipv6_prefix: ""
+# rDNS pool host for id-<uid>.pool (e.g. "highgate.ircfiber.com") — optional, for PTR/WHOIS
+ircfiber_ipv6_pool_host: ""
 
 # --- Mullvad egress pool — 3 exits on ubuntu-docker host (root netns) ---
 # The k3s sidecars run in cni0 netns where Tailscale filters 100.64.0.0/10.

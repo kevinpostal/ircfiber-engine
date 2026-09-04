@@ -191,6 +191,14 @@ void writeStateSnapshotForNetwork(ref EngineContext ctx, Network net, string ser
         snap.activeEgressLabel = clientForEgress.getActiveEgressLabel();
         snap.activeEgressHost = clientForEgress.getActiveEgressHost();
         snap.activeEgressIp = clientForEgress.getActiveEgressIp();
+        // Socket endpoints of the live connection: the peer's family is
+        // the admin's "IPv6 or IPv4?" answer; the local IP shows the
+        // per-user bind (or the shared host/NAT66 address). Gated on
+        // connected so a stale pair never outlives its socket.
+        if (snap.connected) {
+            snap.peerIp = clientForEgress.getActivePeerIp();
+            snap.localIp = clientForEgress.getActiveLocalIp();
+        }
         // Live-connection telemetry for the server-log header: lag
         // probe RTT, RPL_WELCOME instant and negotiated TLS details.
         snap.lagMs = clientForEgress.getLagMs();
