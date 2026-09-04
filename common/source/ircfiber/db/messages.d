@@ -168,6 +168,32 @@ final class MessageRepository {
         }
     }
 
+    /// Rename a buffer's channel field after a NICK-follow, so Mongo
+    /// backfill/search follows the conversation. Best-effort: returns
+    /// the number of documents modified. `_id`s embed the old channel
+    /// and are left as-is (still unique; only `channel` is queried).
+    long renameChannel(string serverId, string networkId, string oldChan, string newChan) @trusted {
+        oldChan = normalizeChannel(oldChan);
+        newChan = normalizeChannel(newChan);
+        if (serverId.length == 0 || networkId.length == 0
+            || oldChan.length == 0 || newChan.length == 0 || oldChan == newChan)
+            return 0;
+        try {
+            auto res = collection.updateMany(
+                Bson(["serverId": Bson(serverId),
+                      "networkId": Bson(networkId),
+                      "channel": Bson(oldChan)]),
+                Bson(["$set": Bson(["channel": Bson(newChan)])]));
+            if (res.modifiedCount > 0)
+                logInfo("Renamed Mongo channel %s:%s %s -> %s (%s docs)",
+                    serverId, networkId, oldChan, newChan, res.modifiedCount.to!string);
+            return res.modifiedCount;
+        } catch (Exception e) {
+            logWarn("renameChannel failed: %s", e.msg);
+            return 0;
+        }
+    }
+
     /// Convenience: append directly from an IRCRawEvent.
     void appendIRCEvent(IRCRawEvent event, string serverId) @trusted {
         const networkId = event.networkId.length > 0 ? event.networkId : event.network;

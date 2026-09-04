@@ -35,20 +35,43 @@ enum SASLMechanism {
     scramSha256
 }
 
+/// Fold one nick character per RFC 1459 casemapping (the network
+/// default): A-Z → a-z plus `[`→`{`, `]`→`}`, `\`→`|`, `^`→`~`.
+/// Byte-for-byte twin of the frontend's `foldNickCase` (utils.ts) — the
+/// two must agree or buffer keys diverge across the wire.
+char foldNickChar(char c) @safe pure nothrow {
+    if (c >= 'A' && c <= 'Z') return cast(char)(c + 32);
+    switch (c) {
+        case '[': return '{';
+        case ']': return '}';
+        case '\\': return '|';
+        case '^': return '~';
+        default: return c;
+    }
+}
+
+/// Fold a nick to its case-insensitive identity (RFC 1459).
+string foldNickCase(string nick) @safe pure {
+    char[] out_ = new char[](nick.length);
+    foreach (i, c; nick) out_[i] = foldNickChar(c);
+    return out_.idup;
+}
+
 /// Normalize an IRC channel/buffer name to canonical form.
 /// Channels (`#`/`&`/`+`/`!` prefix) are case-insensitive and lowercased
-/// so `#Zod` and `#zod` collapse. Bare names (DM nick buffers like
-/// `Zodiac`, `alice`) are **not** `#`-prefixed — they must stay bare or
-/// the frontend's `normalizeChannelName` (`name[0] !== '#'? return name`)
-/// and the engine's `scrollback:<srv>:<net>:<chan>` keys diverge and DM
-/// history disappears after reload (see AGENTS.md DM invariant). `_server`
-/// is left untouched.
+/// so `#Zod` and `#zod` collapse. Bare names (DM nick buffers) are
+/// **not** `#`-prefixed — they must stay bare or keys diverge and DM
+/// history disappears after reload (see AGENTS.md DM invariant) — but
+/// they ARE case-folded per RFC 1459 (see foldNickCase) so `NickServ`
+/// and `nickserv` share one scrollback/Mongo key. `_server` is left
+/// untouched. Key contract (not display): buffer OBJECTS keep the
+/// server-reported case; every keyed store folds through here.
 string normalizeChannelName(string name) @safe {
     if (name.length == 0 || name == "_server") return name;
-    // Channel prefixes: lowercased for dedup. Bare nicks: returned as-is.
+    // Channel prefixes: lowercased for dedup.
     if (name[0] == '#' || name[0] == '&' || name[0] == '+' || name[0] == '!')
         return name[0 .. 1] ~ name[1 .. $].toLower();
-    return name;
+    return foldNickCase(name);
 }
 
 /// Normalize a channel name for the auto-join list — ensures a leading `#`.
@@ -220,4 +243,29 @@ unittest {
     assert(json["connected"].get!bool == true);
     assert(json["status"].get!string == "connected");
     assert(json["currentNick"].get!string == "mynick");
+}
+
+@("foldNickCase lowercases ASCII per RFC 1459")
+unittest {
+    assert(foldNickCase("NickServ") == "nickserv");
+    assert(foldNickCase("NICKSERV") == "nickserv");
+    assert(foldNickCase("alice") == "alice");
+}
+
+@("foldNickCase folds brackets and caret per RFC 1459")
+unittest {
+    assert(foldNickCase("[foo]") == "{foo}");
+    assert(foldNickCase("{foo}") == "{foo}");
+    assert(foldNickCase("a\\b") == "a|b");
+    assert(foldNickCase("a^b") == "a~b");
+}
+
+@("normalizeChannelName folds nicks but never #-prefixes")
+unittest {
+    assert(normalizeChannelName("NickServ") == "nickserv");
+    assert(normalizeChannelName("nickserv") == "nickserv");
+    assert(normalizeChannelName("[foo") == "{foo");
+    assert(normalizeChannelName("#Zod") == "#zod");
+    assert(normalizeChannelName("_server") == "_server");
+    assert(normalizeChannelName("") == "");
 }

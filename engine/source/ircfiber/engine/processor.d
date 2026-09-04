@@ -182,6 +182,41 @@ void startEventProcessor(ref EngineContext ctx) {
                     }
                 }
 
+                // NICK-follow storage rename (IRCCloud rename model): when a
+                // DM counterparty changes nick, migrate the Redis
+                // scrollback keys + Mongo channel field so history follows
+                // the conversation across reloads/backfill. Base event only
+                // (channel empty; per-channel dups must not re-run it).
+                // Runs INLINE (not runTask): a follow-up PRIVMSG under the
+                // new nick must append after the rename, otherwise RENAMENX
+                // sees an existing destination and the history splits.
+                // Best-effort try/catch: storage must never break the loop.
+                if (foundNet && event.command == "NICK" && event.channel.length == 0) {
+                    try {
+                        auto nickParams = event.getParams();
+                        if (nickParams.length > 0) {
+                            string newNick = nickParams[$ - 1];
+                            auto nickClient = ctx.connManager.getClient(matchedNet.config.id);
+                            import std.uni : icmp;
+                            bool ownChange = nickClient !is null
+                                && event.nick.length > 0
+                                && icmp(event.nick, nickClient.getCurrentNick) == 0;
+                            // Only DM scrollback keys (bare nicks) can match
+                            // an old nick — channel keys carry a prefix — so
+                            // this is a no-op unless they DM'd. Never touch
+                            // our own change (counterparties are unchanged).
+                            if (!ownChange && event.nick.length > 0 && newNick.length > 0) {
+                                ctx.bufferManager.renameBuffer(
+                                    serverId, event.networkId, event.nick, newNick);
+                                ctx.messageRepo.renameChannel(
+                                    serverId, event.networkId, event.nick, newNick);
+                            }
+                        }
+                    } catch (Exception e) {
+                        logWarn("NICK storage rename failed: %s", e.msg);
+                    }
+                }
+
                 // Persist autoJoinChannels changes to MongoDB when we join/part/kick
                 if (foundNet && (event.command == "JOIN" || event.command == "PART" || event.command == "KICK")) {
                     auto client = ctx.connManager.getClient(matchedNet.config.id);

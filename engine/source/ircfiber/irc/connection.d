@@ -5046,6 +5046,25 @@ private void processEvents() {
                         youChange.text = newNick;
                         youChange.setParams([event.nick, newNick]);
                         eventChannel.put(youChange);
+                    } else {
+                        // Query-partner NICK following (IRCCloud rename
+                        // model): keep the tracked counterparty on the new
+                        // nick so sync + future echoes use it. If the new
+                        // nick is already tracked separately, drop the stale
+                        // entry instead of merging — never destroy history.
+                        // (Redis/Mongo key migration happens in the event
+                        // processor, which owns the stores.)
+                        ptrdiff_t oldIdx = -1, newIdx = -1;
+                        foreach (i, q; queryBuffers) {
+                            if (oldIdx < 0 && sameNick(q, event.nick)) oldIdx = i;
+                            if (newIdx < 0 && sameNick(q, newNick)) newIdx = i;
+                        }
+                        if (oldIdx >= 0 && newIdx < 0) {
+                            queryBuffers[oldIdx] = newNick;
+                        } else if (oldIdx >= 0 && newIdx >= 0 && newIdx != oldIdx) {
+                            queryBuffers[oldIdx] = queryBuffers[$ - 1];
+                            queryBuffers.length--;
+                        }
                     }
                     logJsonMap("info", "protocol",
                         "NICK",

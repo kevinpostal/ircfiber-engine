@@ -574,6 +574,50 @@ final class BufferManager {
     }
 
     /**
+     * Rename a buffer's Redis keys (scrollback list + dedup set) after a
+     * NICK-follow, so history survives the rename across reloads.
+     * Collision-safe: RENAMENX refuses when the destination exists, in
+     * which case both histories are kept and nothing is clobbered.
+     * Best-effort: missing source keys are a no-op. Migrates both the
+     * namespaced (`scrollback:<srv>:<net>:<buf>`) and legacy
+     * (`scrollback:<net>:<buf>`) variants. RENAME preserves TTL.
+     * Returns true when at least one key moved.
+     */
+    bool renameBuffer(string serverId, string networkId, string oldBuf, string newBuf) @trusted {
+        oldBuf = normalizeChannel(oldBuf);
+        newBuf = normalizeChannel(newBuf);
+        if (networkId.length == 0 || oldBuf.length == 0 || newBuf.length == 0
+            || oldBuf == newBuf)
+            return false;
+        auto db = redis.getDb();
+        bool moved = false;
+        static immutable string[2] prefixes = [KEY_PREFIX, DEDUP_PREFIX];
+        foreach (prefix; prefixes) {
+            // Namespaced variant.
+            if (serverId.length > 0) {
+                try {
+                    if (db.renameNX(prefix ~ serverId ~ ":" ~ networkId ~ ":" ~ oldBuf,
+                                    prefix ~ serverId ~ ":" ~ networkId ~ ":" ~ newBuf))
+                        moved = true;
+                } catch (Exception e) {
+                    logDebug("renameBuffer: %s", e.msg);
+                }
+            }
+            // Legacy variant (no server segment).
+            try {
+                if (db.renameNX(prefix ~ networkId ~ ":" ~ oldBuf,
+                                prefix ~ networkId ~ ":" ~ newBuf))
+                    moved = true;
+            } catch (Exception e) {
+                logDebug("renameBuffer: %s", e.msg);
+            }
+        }
+        if (moved)
+            logInfo("Renamed buffer %s:%s %s -> %s", serverId, networkId, oldBuf, newBuf);
+        return moved;
+    }
+
+    /**
      * Clear all buffers for a network (all channels + server log).
      *
      * Called when a network is deleted so a new network with the same

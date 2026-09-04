@@ -14,3 +14,5 @@ irc-fiber-engine
 !*-test.py
 .dub/
 dub.userprefs
+# Ansible vault password — local secret, never committed.
+deploy/.vault_pass.txt
