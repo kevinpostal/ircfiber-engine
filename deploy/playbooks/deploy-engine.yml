@@ -58,6 +58,14 @@
         regexp: '^IRCFIBER_IPV6_POOL_HOST='
         line: "IRCFIBER_IPV6_POOL_HOST={{ ircfiber_ipv6_pool_host | default('') }}"
         state: "{{ 'present' if (ircfiber_ipv6_pool_host | default('') | length > 0) else 'absent' }}"
+    # Same line-wise sync for the Mullvad SOCKS pool: `<name>@host:port` so the
+    # sidecar name becomes the egress label (pins, host-bans, "Connect via").
+    - name: Sync IRCFIBER_MULLVAD_POOL in engine env file
+      ansible.builtin.lineinfile:
+        path: /etc/ircfiber/engine/env-{{ ircfiber_engine_id }}
+        regexp: '^IRCFIBER_MULLVAD_POOL='
+        line: "IRCFIBER_MULLVAD_POOL={% for sc in mullvad_sidecars | default([]) %}socks5://{{ sc.name }}@{{ sc.host }}:{{ sc.port | default(1080) }}{% if not loop.last %},{% endif %}{% endfor %}"
+        state: "{{ 'present' if (mullvad_sidecars | default([]) | length > 0) else 'absent' }}"
     # Mirrors roles/engine/tasks/main.yml (ulimits, security_opts, labels).
     # Without `--ulimit nofile` the container inherited dockerd's 1024 soft
     # limit; on 2026-09-02 the engine exhausted it after ~8 h (fd leak) and

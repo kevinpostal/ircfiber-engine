@@ -581,5 +581,14 @@ private NetworkConfig parseNetworkConfig(Json j) {
     if (j["nspass"].type != Json.Type.undefined) cfg.nspass = j["nspass"].get!string;
     if (j["commands"].type != Json.Type.undefined) cfg.commands = j["commands"].get!string;
     if (j["serverPass"].type != Json.Type.undefined) cfg.serverPass = j["serverPass"].get!string;
+    // Fields the gateway ships in NetworkConfig.toJson() that were silently
+    // dropped here, so a pin/delay set via the API only took effect after a
+    // restart re-read Mongo (db/network.d honours both).
+    if (j["autoJoinDelaySeconds"].type == Json.Type.int_) {
+        const v = j["autoJoinDelaySeconds"].get!int;
+        if (v > 0) cfg.autoJoinDelaySeconds = cast(uint) v;
+    }
+    if (j["egressNodeId"].type == Json.Type.string) cfg.egressNodeId = j["egressNodeId"].get!string;
+    if (j["systemManaged"].type == Json.Type.bool_) cfg.systemManaged = j["systemManaged"].get!bool;
     return cfg;
 }
