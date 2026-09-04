@@ -595,11 +595,21 @@ private bool isDirectBannedForHost(string hostLower) {
 }
 // SOCKS5 → TLS handoff: connectTCP to sidecar, handshake on same TCPConnection,
 // then return it for createTLSStreamWithTimeout (avoids private TCPConnection(fd) ctor).
-private TCPConnection socks5ConnectViaProxy(MullvadProxy* proxy, string targetIp, ushort targetPort, AddressFamily fam) {
+//
+// `target` is the IRC hostname (SOCKS5 ATYP=domain) or an IP literal (ATYP
+// 1/4). Names are resolved BY THE EXIT: the engine's own resolver can be
+// split-horizon (on prod `irc.ircfiber.com` is a Docker alias → fd00:f1b3:1::7,
+// unreachable from a remote sidecar) and the exit's answer is the one that
+// matches the address the IRC network will see anyway.
+private TCPConnection socks5ConnectViaProxy(MullvadProxy* proxy, string target, ushort targetPort) {
     import core.sys.posix.arpa.inet : inet_pton;
     import core.sys.posix.sys.socket : AF_INET, AF_INET6;
     auto proxyConn = connectTCP(proxy.host, proxy.port, null, 0, CONNECT_TIMEOUT_SECONDS.seconds);
     scope(failure) try { proxyConn.close(); } catch (Exception) {}
+    // The exit dials the IRC server before answering CONNECT; bound that wait
+    // like every other connect step (an unbounded read here wedged fibers on
+    // a hung sidecar). Reset afterwards — the socket carries TLS + IRC next.
+    proxyConn.readTimeout = HAPPY_EYEBALLS_RACE_TIMEOUT_SECONDS.seconds;
     ubyte[3] greet = [0x05, 0x01, 0x00];
     proxyConn.write(greet[]);
     ubyte[2] greetResp;
@@ -607,17 +617,16 @@ private TCPConnection socks5ConnectViaProxy(MullvadProxy* proxy, string targetIp
     if (greetResp[0] != 0x05 || greetResp[1] != 0x00) throw new Exception("SOCKS5 proxy auth failed");
     ubyte[] req;
     req ~= cast(ubyte)0x05; req ~= cast(ubyte)0x01; req ~= cast(ubyte)0x00;
-    if (fam == AddressFamily.INET) {
-        req ~= cast(ubyte)0x01;
-        ubyte[4] ip4;
-        if (inet_pton(AF_INET, targetIp.toStringz, ip4.ptr) != 1) throw new Exception("SOCKS5 bad IPv4 " ~ targetIp);
-        req ~= ip4[];
-    } else if (fam == AddressFamily.INET6) {
-        req ~= cast(ubyte)0x04;
-        ubyte[16] ip6;
-        if (inet_pton(AF_INET6, targetIp.toStringz, ip6.ptr) != 1) throw new Exception("SOCKS5 bad IPv6 " ~ targetIp);
-        req ~= ip6[];
-    } else throw new Exception("SOCKS5 unknown family");
+    ubyte[4] ip4;
+    ubyte[16] ip6;
+    if (inet_pton(AF_INET, target.toStringz, ip4.ptr) == 1) {
+        req ~= cast(ubyte)0x01; req ~= ip4[];
+    } else if (inet_pton(AF_INET6, target.toStringz, ip6.ptr) == 1) {
+        req ~= cast(ubyte)0x04; req ~= ip6[];
+    } else {
+        if (target.length == 0 || target.length > 255) throw new Exception("SOCKS5 bad target name " ~ target);
+        req ~= cast(ubyte)0x03; req ~= cast(ubyte) target.length; req ~= cast(const(ubyte)[]) target;
+    }
     req ~= cast(ubyte)(targetPort >> 8); req ~= cast(ubyte)(targetPort & 0xFF);
     proxyConn.write(req);
     ubyte[4] hdr;
@@ -630,6 +639,7 @@ private TCPConnection socks5ConnectViaProxy(MullvadProxy* proxy, string targetIp
     else if (atyp == 0x03) { ubyte l; proxyConn.read((&l)[0 .. 1]); remain = l + 2; }
     else throw new Exception("SOCKS5 bad ATYP");
     if (remain > 0) { ubyte[] tmp = new ubyte[remain]; proxyConn.read(tmp); }
+    proxyConn.readTimeout = Duration.max;
     return proxyConn;
 }
 
@@ -809,6 +819,27 @@ private TCPConnection happyEyeballsConnectWithProxy(string host, ushort port, Mu
     if (proxy !is null) logInfo("Mullvad egress %s (%s:%d) for %s:%d", proxy.label, proxy.host, proxy.port, host, port);
     else if (ipv6BindAddr.length > 0) logInfo("IPv6 per-user egress %s for %s:%d", ipv6BindAddr, host, port);
     const egressLabel = proxy !is null ? "Mullvad exit " ~ proxy.label : (ipv6BindAddr.length > 0 ? "ipv6:" ~ ipv6BindAddr : "direct");
+    if (proxy !is null) {
+        // One CONNECT with the hostname: the exit resolves it (see
+        // socks5ConnectViaProxy). Racing locally-resolved addresses through
+        // a single proxy only multiplied its fail count — and on prod fed it
+        // the Docker-internal address of irc.ircfiber.com.
+        auto target = stripHostBrackets(host);
+        immutable startMs = Clock.currTime.toUnixTime!long * 1000;
+        report(progress, "attempt", "Trying " ~ target ~ ":" ~ port.to!string ~ " via " ~ egressLabel
+            ~ " (exit resolves the name, up to " ~ HAPPY_EYEBALLS_RACE_TIMEOUT_SECONDS.to!string ~ "s)…");
+        try {
+            auto conn = socks5ConnectViaProxy(proxy, target, port);
+            recordMullvadSuccess(proxy.label);
+            return conn;
+        } catch (Exception e) {
+            recordMullvadFailure(proxy.label);
+            const tookMs = Clock.currTime.toUnixTime!long * 1000 - startMs;
+            report(progress, "attempt_fail", target ~ " via " ~ egressLabel ~ ": "
+                ~ shortConnectError(e.msg) ~ " (" ~ (tookMs / 1000).to!string ~ "s).");
+            throw e;
+        }
+    }
     auto addrs = resolveAllAddresses(host, port);
     if (addrs.length == 0) {
         report(progress, "attempt_fail", "DNS lookup for " ~ host ~ " returned no addresses.");
@@ -857,37 +888,20 @@ private TCPConnection happyEyeballsConnectWithProxy(string host, ushort port, Mu
         auto connIdx = idx;
         auto addrIp  = addr.ip;
         auto addrFam = addr.family;
-        auto proxyForTask = proxy;
-        // For direct connections with per-user IPv6, bind the source to the
-        // user's deterministic /128. SOCKS paths ignore this (they dial the
-        // local sidecar over Tailscale IPv4). We only bind IPv6→IPv6 to avoid
-        // EINVAL when racing an IPv4 A record.
-        auto bindForThisAddr = (proxyForTask is null && ipv6BindAddr.length > 0
-                                && addrFam == AddressFamily.INET6) ? ipv6BindAddr : null;
+        // Direct only from here (proxied connects returned above). With
+        // per-user IPv6, bind the source to the user's deterministic /128 —
+        // IPv6→IPv6 only, to avoid EINVAL when racing an IPv4 A record.
+        auto bindForThisAddr = (ipv6BindAddr.length > 0 && addrFam == AddressFamily.INET6) ? ipv6BindAddr : null;
         report(progress, "attempt", "Trying " ~ addrIp ~ ":" ~ port.to!string ~ " via " ~ egressLabel
             ~ (bindForThisAddr ? " bind=" ~ bindForThisAddr : "")
             ~ " (up to " ~ CONNECT_TIMEOUT_SECONDS.to!string ~ "s)…");
         safeFiberRun("happy_eyeballs_attempt", host, {
             immutable attemptStartMs = Clock.currTime.toUnixTime!long * 1000;
             try {
-                TCPConnection conn;
-                if (proxyForTask !is null) {
-                    try {
-                        conn = socks5ConnectViaProxy(proxyForTask, addrIp, port, addrFam);
-                        recordMullvadSuccess(proxyForTask.label);
-                    } catch (Exception se) {
-                        recordMullvadFailure(proxyForTask.label);
-                        throw se;
-                    }
-                } else {
-                    // bindForThisAddr captured from outer scope — only non-null for direct IPv6
-                    auto localBind = (addrFam == AddressFamily.INET6) ? ipv6BindAddr : null;
-                    // vibe.d connectTCP third param is string localAddr (bind IP)
-                    if (localBind.length > 0 && addrFam == AddressFamily.INET6)
-                        conn = connectTCP(addrIp, port, localBind, 0, CONNECT_TIMEOUT_SECONDS.seconds);
-                    else
-                        conn = connectTCP(addrIp, port, null, 0, CONNECT_TIMEOUT_SECONDS.seconds);
-                }
+                // vibe.d connectTCP third param is string localAddr (bind IP)
+                TCPConnection conn = bindForThisAddr.length > 0
+                    ? connectTCP(addrIp, port, bindForThisAddr, 0, CONNECT_TIMEOUT_SECONDS.seconds)
+                    : connectTCP(addrIp, port, null, 0, CONNECT_TIMEOUT_SECONDS.seconds);
                 if (done) {
                     try { conn.close(); } catch (Exception) {}
                     return;
