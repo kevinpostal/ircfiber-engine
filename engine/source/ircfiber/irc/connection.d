@@ -936,6 +936,50 @@ ExitLocation[] egressLocations() nothrow {
     }
 }
 
+/// Moves one named slot to `pin` on an operator's instruction (admin
+/// "swap exit"), rather than because a connect needs it. Returns "" on
+/// success, else a short reason the gateway can surface:
+///   "unknown-slot" | "not-controllable" | "busy" | "retargeting"
+///   | "no-catalog" | "retarget-failed"
+///
+/// The in-use lock is the same one a user pin obeys: a slot carrying live
+/// connections is refused, never yanked. Shells out, so this runs on the
+/// control-consumer task, never on a connection fiber.
+string retargetSlotByLabel(string label, string pin) nothrow {
+    if (label.length == 0 || pin.length == 0) return "unknown-slot";
+    loadMullvadPoolSafe();
+    size_t idx = size_t.max;
+    string reason;
+    withPoolLock({
+        const now = nowMsSafe();
+        foreach (i, ref p; mullvadPool) {
+            if (p.label != label) continue;
+            if (p.controlSocket.length == 0) { reason = "not-controllable"; return; }
+            if (p.activeConns > 0) { reason = "busy"; return; }
+            if (p.state == "retargeting") { reason = "retargeting"; return; }
+            if (pickRelayForPin(gExitRelays, pin).ip.length == 0) { reason = "no-catalog"; return; }
+            // Reserve exactly as acquireSlotForPin does, so a connect landing
+            // between here and the retarget cannot claim the same slot.
+            p.state = "retargeting";
+            p.heldUntilMs = now + RETARGET_RESERVE_MS;
+            idx = i;
+            return;
+        }
+        reason = "unknown-slot";
+    });
+    if (idx == size_t.max) return reason.length ? reason : "unknown-slot";
+    if (!retargetSlot(idx, pin)) return "retarget-failed";
+    // The operator asked for this location, so hold the slot briefly: a
+    // connect that arrives now should use it, not move it again.
+    withPoolLock({
+        if (idx < mullvadPool.length) mullvadPool[idx].heldUntilMs = nowMsSafe() + SLOT_HOLD_MS;
+    });
+    try {
+        logInfo("Mullvad slot %s: operator retarget to %s complete", label, pin);
+    } catch (Exception) {}
+    return "";
+}
+
 /// Finds or prepares a slot for `pin` (a country or city pin, lower-case).
 /// Returns null when nothing is available, with `reason` set to one of
 /// "no-pin" | "no-catalog" | "all-busy" | "retarget-failed" | "not-controllable".

@@ -506,6 +506,31 @@ private void handleControlMessage(ref EngineContext ctx, ControlMessage msg) {
                 logInfo("Network %s migrated away from server %s", msg.networkId, ctx.localServer.serverId);
             }
             break;
+        case "retargetEgress":
+            // Admin "swap exit" from the Mullvad page. The gateway cannot
+            // touch a slot's tailscaled (the socket is on the engine host),
+            // so it asks us. Payload:
+            //   msg.config["label"]      = slot label ("de")
+            //   msg.config["locationId"] = target location ("se-sto")
+            // Result is observed through the slot registry the snapshotter
+            // publishes (locationId / state / error), so there is nothing to
+            // reply to; a refusal is logged and recorded as the slot's error.
+            {
+                import ircfiber.irc.connection : retargetSlotByLabel;
+                string label, locationId;
+                if (msg.config.type == Json.Type.object) {
+                    if (auto l = "label" in msg.config)
+                        if (l.type == Json.Type.string) label = l.get!string;
+                    if (auto v = "locationId" in msg.config)
+                        if (v.type == Json.Type.string) locationId = v.get!string;
+                }
+                const reason = retargetSlotByLabel(label, locationId);
+                logJsonMap(reason.length ? "warn" : "info", "consumer",
+                    reason.length ? "Egress retarget refused" : "Egress retarget done",
+                    ["label": label, "locationId": locationId,
+                     "reason": reason, "event": "egress_retarget"]);
+            }
+            break;
         default:
             logWarn("Unknown control action: %s", msg.action);
     }
