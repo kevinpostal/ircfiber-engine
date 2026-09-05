@@ -2261,6 +2261,35 @@ unittest {
     assert(remainingJoinDelayMs(6, 906_000, 900_000) == 0);
 }
 
+/// Packs channel names into `JOIN` argument strings that stay inside the
+/// 512-byte IRC line limit (`maxArgLen` counts only the argument, so the
+/// caller's `"JOIN "` prefix and the CRLF have room).
+///
+/// One comma-joined JOIN per batch instead of one JOIN per channel: a
+/// server that rate-limits *per command* (SuperNETs/DangerousIRCd answers
+/// `421 … connected for at least 5 seconds` to every early JOIN) then
+/// produces a single refusal to wait out, and the user's server log gets
+/// one line instead of one per channel.
+string[] joinBatches(const(string)[] chans, size_t maxArgLen = 400) pure @safe {
+    string[] out_;
+    string cur;
+    foreach (chan; chans) {
+        if (chan.length == 0) continue;
+        if (cur.length == 0) {
+            cur = chan;
+            continue;
+        }
+        if (cur.length + 1 + chan.length > maxArgLen) {
+            out_ ~= cur;
+            cur = chan;
+            continue;
+        }
+        cur ~= "," ~ chan;
+    }
+    if (cur.length) out_ ~= cur;
+    return out_;
+}
+
 /// Parses the grace period out of an ERR_UNKNOWNCOMMAND (421) JOIN throttle,
 /// e.g. SuperNETs' `421 <nick> JOIN :You must be connected for at least 5
 /// seconds before you can use this command` (verified on
@@ -3418,20 +3447,13 @@ final class PersistentIRCClient {
                     scope(exit) joinThrottleRetryInFlight = false;
                     if (state != ConnectionState.connected) return;
                     // Anything confirmed or refused while we waited is gone
-                    // from the pending set — never re-ask for it.
-                    string[] batch;
-                    size_t len = 5; // "JOIN "
-                    foreach (chan; joinsAwaitingConfirm) {
-                        // Keep the line comfortably inside the 512-byte IRC
-                        // limit; a further round picks up any remainder.
-                        if (len + chan.length + 1 > 400) break;
-                        batch ~= chan;
-                        len += chan.length + 1;
-                    }
-                    if (batch.length == 0) return;
-                    logInfo("Re-sending %d throttled JOIN(s) for %s as one command: %s",
-                        cast(int) batch.length, config.name, batch.join(","));
-                    sendRaw("JOIN " ~ batch.join(","));
+                    // from the pending set — never re-ask for it. A further
+                    // round picks up whatever does not fit in one line.
+                    auto batches = joinBatches(joinsAwaitingConfirm);
+                    if (batches.length == 0) return;
+                    logInfo("Re-sending throttled JOIN(s) for %s as one command: %s",
+                        config.name, batches[0]);
+                    sendRaw("JOIN " ~ batches[0]);
                 } catch (Exception e) {
                     joinThrottleRetryInFlight = false;
                     logWarn("JOIN throttle retry failed for %s: %s", config.name, e.msg);
@@ -5104,14 +5126,22 @@ final class PersistentIRCClient {
             }
         }
 
+        // One comma-joined JOIN (per 400-byte batch) instead of one command
+        // per channel. Servers that rate-limit per command answered every
+        // single JOIN of the burst with its own refusal — nine identical
+        // "You must be connected for at least 5 seconds" rows in the user's
+        // server log for a nine-channel network. Same batching the throttle
+        // retry already uses.
+        string[] autoJoin;
         foreach (chan; config.autoJoinChannels) {
             string ch = chan.strip();
             if (ch.length == 0) continue;
             if (ch[0] != '#' && ch[0] != '&' && ch[0] != '+' && ch[0] != '!')
                 ch = "#" ~ ch;
-            ch = ch[0 .. 1] ~ ch[1 .. $].toLower();
-            sendRaw("JOIN " ~ ch);
+            autoJoin ~= ch[0 .. 1] ~ ch[1 .. $].toLower();
         }
+        foreach (batch; joinBatches(autoJoin))
+            sendRaw("JOIN " ~ batch);
 
         // ── Post-registration commands ─────────────────────────────────────
         // NickServ IDENTIFY (if configured) — sent BEFORE user-supplied

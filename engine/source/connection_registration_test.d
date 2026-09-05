@@ -22,10 +22,11 @@ module connection_registration_test;
 import std.stdio : stderr, writeln;
 import std.algorithm : canFind;
 import std.conv : to;
+import std.array : split;
 import vibe.data.json : Json;
 
 import ircfiber.irc.server : ConnectionServer;
-import ircfiber.irc.connection : parseJoinThrottleSeconds, remainingJoinDelayMs;
+import ircfiber.irc.connection : parseJoinThrottleSeconds, remainingJoinDelayMs, joinBatches;
 
 /// Tracks the number of passing checks.
 int passed;
@@ -71,6 +72,33 @@ void main() {
         remainingJoinDelayMs(6, 900_100, 900_000) == 5_900);
     ok("retry delay is zero once the window elapsed",
         remainingJoinDelayMs(6, 907_000, 900_000) == 0);
+
+    // Auto-joins go out as one comma-joined JOIN per line, so a server that
+    // rate-limits per command answers once instead of once per channel.
+    ok("nine channels ride one JOIN",
+        joinBatches(["#a", "#b", "#c", "#d", "#e", "#f", "#g", "#h", "#i"]).length == 1);
+    ok("the batch is comma-joined in order",
+        joinBatches(["#zod", "#bowlcut", "#dev"])[0] == "#zod,#bowlcut,#dev");
+    ok("empty names never produce a stray comma",
+        joinBatches(["#a", "", "#b"])[0] == "#a,#b");
+    ok("no channels means no command",
+        joinBatches([]).length == 0);
+    // 512-byte IRC lines: split rather than truncate, and never lose a name.
+    {
+        string[] many;
+        foreach (i; 0 .. 60) many ~= "#channel" ~ to!string(i);
+        auto b = joinBatches(many);
+        ok("a long channel list splits into several lines", b.length > 1);
+        bool allShort = true;
+        size_t names = 0;
+        foreach (line; b) {
+            if (line.length > 400) allShort = false;
+            names += line.split(",").length;
+        }
+        ok("every batch stays inside the line limit", allShort);
+        ok("splitting keeps every channel", names == many.length,
+            "got " ~ to!string(names));
+    }
 
     // 1. registrationUnavailableFor defaults to empty
     ConnectionServer s1;
