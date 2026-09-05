@@ -138,10 +138,15 @@ struct NetworkConfig {
     ///   "direct"      the host's own address, no SOCKS hop
     ///   "de"          country pin — any city in that country (2 letters, lower-case)
     ///   "de-ber"      city pin — `<countryCode>-<cityCode>`, lower-case
+    ///   "de"          also the label of a *static* slot (see below)
     /// The engine resolves a country/city pin against its Mullvad location
     /// catalog and retargets a free exit slot to that location; a slot that is
-    /// already serving live connections is never retargeted. Slot labels from
-    /// IRCFIBER_MULLVAD_POOL are internal names and are not valid pins.
+    /// already serving live connections is never retargeted.
+    ///
+    /// A slot whose tailscaled the engine cannot reach (sidecars on another
+    /// host — no control socket) has no readable location, so it is addressed
+    /// by its IRCFIBER_MULLVAD_POOL label instead. Only such slots answer to
+    /// a label, so a retargetable pool never has two names for one exit.
     string egressNodeId = "";
     /// Serialize to JSON
     Json toJson() const {

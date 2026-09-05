@@ -957,6 +957,18 @@ private MullvadProxy* acquireSlotForPin(string hostLower, string pin, out string
     int controllable = 0;
     withPoolLock({
         const now = nowMsSafe();
+        // A slot the engine cannot drive (no control socket) has no readable
+        // location, so it is addressed by its label — the pre-slot behaviour,
+        // kept for deployments whose sidecars live on another host. Only
+        // non-controllable slots answer to a label, so a retargetable pool
+        // never has two ways to name the same exit.
+        foreach (i, ref p; mullvadPool) {
+            if (p.controlSocket.length > 0 || p.label != pin) continue;
+            if (p.deadUntilMs != 0 && now < p.deadUntilMs) continue;
+            if (isEgressBannedForHost(hostLower, slotBanKey(&mullvadPool[i]))) continue;
+            match = &mullvadPool[i];
+            return;
+        }
         foreach (i, ref p; mullvadPool) {
             if (!locationMatches(p.locationId, pin)) continue;
             if (p.deadUntilMs != 0 && now < p.deadUntilMs) continue;
@@ -999,6 +1011,17 @@ private MullvadProxy* acquireSlotForPin(string hostLower, string pin, out string
         return null;
     }
     return &mullvadPool[candidate];
+}
+
+/// True when a user's pin addresses the exact route identified by `banKey`
+/// (see `slotBanKey`): the literal `direct` pseudo-label, a location the pin
+/// matches, or the label of a static slot. Drives "the user pinned the route
+/// that just got banned, so do not fail over behind their back".
+private bool pinCoversBanKey(string pin, string banKey) nothrow {
+    if (pin.length == 0 || banKey.length == 0) return false;
+    if (pin == banKey) return true;
+    if (banKey.length > 5 && banKey[0 .. 5] == "slot:" && banKey[5 .. $] == pin) return true;
+    return locationMatches(banKey, pin);
 }
 
 /// Location id of the best online relay that is not host-banned for
@@ -3470,9 +3493,7 @@ final class PersistentIRCClient {
                     import std.string : toLower;
                     const banKey = activeEgressLocationId.length > 0
                         ? activeEgressLocationId : DIRECT_EGRESS_LABEL;
-                    const pinnedHere = config.egressNodeId.length > 0
-                        && (config.egressNodeId.toLower() == banKey
-                            || locationMatches(banKey, config.egressNodeId.toLower()));
+                    const pinnedHere = pinCoversBanKey(config.egressNodeId.toLower(), banKey);
                     if (!pinnedHere && hasAlternativeEgressForHost(config.host.toLower(), banKey)) {
                         banEgressForHost(config.host, banKey, TLS_CLOSED_ROTATE_BAN_MS);
                         consecutiveTlsClosed = 0;
@@ -5186,11 +5207,10 @@ private void processEvents() {
         banEgressForHost(config.host, banKey);
         logJsonMap("warn", "connection", "Egress host-banned after G/K/Z-line",
             ["network": config.name, "host": config.host, "egress": banKey, "event": "egress_host_ban"]);
-        // A pin covers the banned route when it names it exactly ("direct")
-        // or when it is the country/city pin that resolved to this location.
-        const pinnedBanned = config.egressNodeId.length > 0
-            && (config.egressNodeId.toLower() == banKey
-                || locationMatches(banKey, config.egressNodeId.toLower()));
+        // A pin covers the banned route when it names it exactly ("direct"),
+        // when it is the country/city pin that resolved to this location, or
+        // when it is the label of a static slot.
+        const pinnedBanned = pinCoversBanKey(config.egressNodeId.toLower(), banKey);
         if (!pinnedBanned && hasAlternativeEgressForHost(config.host.toLower(), banKey)) {
             throttledUntil = 0;
             emitLog("info", "Banned via " ~ via ~ " — retrying through a different exit.");
