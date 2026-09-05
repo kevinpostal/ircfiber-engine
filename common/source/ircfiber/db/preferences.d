@@ -103,6 +103,11 @@ struct UserPreferences {
     /// in real time.
     string[] networkOrder;
 
+    /// IRCCloud-style ignore masks (nick!user@host globs), synced across
+    /// devices. One global list (deliberate deviation from IRCCloud's
+    /// per-connection scoping) — matches the frontend's single storage key.
+    string[] ignores;
+
     /// Per-buffer preferences (showJoinPart, mute, formatColor, etc.).
     /// Key is "networkId:#channel", value is a JSON object of buffer-level
     /// toggles (e.g. {"showJoinPart":false, "mute":true}).
@@ -172,6 +177,7 @@ struct UserPreferences {
             cc[k] = Json(v);
         j["conversationsCollapsed"] = cc;
         j["networkOrder"] = networkOrder is null ? Json.emptyArray : serializeToJson(networkOrder);
+        j["ignores"] = ignores is null ? Json.emptyArray : serializeToJson(ignores);
         auto bp = Json.emptyObject;
         foreach (k, v; bufferPrefs)
             bp[k] = v;
@@ -271,6 +277,14 @@ struct UserPreferences {
                 p.networkOrder = deserializeJson!(string[])(*no);
             else {
                 logFieldInvalid(userId, "networkOrder", no.type, "array");
+                needsRepair = true;
+            }
+        }
+        if (auto ig = "ignores" in json) {
+            if (ig.type == Json.Type.array)
+                p.ignores = deserializeJson!(string[])(*ig);
+            else {
+                logFieldInvalid(userId, "ignores", ig.type, "array");
                 needsRepair = true;
             }
         }
@@ -403,6 +417,11 @@ if type(newDoc.networkOrder) == 'table' and next(newDoc.networkOrder) == nil the
     newDoc.networkOrder = cjson.empty_array
 elseif newDoc.networkOrder == nil or newDoc.networkOrder == cjson.null then
     newDoc.networkOrder = cjson.empty_array
+end
+if type(newDoc.ignores) == 'table' and next(newDoc.ignores) == nil then
+    newDoc.ignores = cjson.empty_array
+elseif newDoc.ignores == nil or newDoc.ignores == cjson.null then
+    newDoc.ignores = cjson.empty_array
 end
 redis.call('SET', KEYS[1], cjson.encode(newDoc))
 return newPrefVersion`;
@@ -607,6 +626,7 @@ unittest {
     j["pinnedChannels"]    = Json.emptyObject;  // wrong type: should be array
     j["archivedChannels"]  = Json.emptyObject;  // wrong type
     j["networkOrder"]      = Json.emptyObject;  // wrong type
+    j["ignores"]           = Json.emptyObject;  // wrong type
     j["lastActiveBuffers"] = Json.emptyObject;  // correct type
     const r1 = UserPreferences.fromJson(j, UUID.init);
     assert(r1.needsRepair, "needsRepair must be true when array fields are wrong type");
@@ -621,6 +641,7 @@ unittest {
     auto j3 = Json.emptyObject;
     j3["pinnedChannels"] = serializeToJson(["net1:#a"]);
     j3["networkOrder"]   = serializeToJson(["net1"]);
+    j3["ignores"]        = serializeToJson(["spammer!*@*"]);
     const r3 = UserPreferences.fromJson(j3, UUID.init);
     assert(!r3.needsRepair, "needsRepair must be false when all fields are correct type");
 }
@@ -688,6 +709,7 @@ unittest {
     j["pinnedChannels"]   = Json.emptyObject;    // wrong type — would previously throw
     j["archivedChannels"] = Json.emptyObject;    // wrong type
     j["networkOrder"]     = Json.emptyObject;    // wrong type
+    j["ignores"]          = Json.emptyObject;    // wrong type
     j["prefVersion"]      = Json(7L);
 
     const back = UserPreferences.fromJson(j).prefs;
@@ -699,6 +721,8 @@ unittest {
         "object-shaped archivedChannels must default to an empty list");
     assert(back.networkOrder.length == 0,
         "object-shaped networkOrder must default to an empty list");
+    assert(back.ignores.length == 0,
+        "object-shaped ignores must default to an empty list");
 }
 
 @("UserPreferences fromJson tolerates null and string-shaped array fields")
@@ -710,12 +734,14 @@ unittest {
     j["pinnedChannels"] = Json("not-an-array");
     j["archivedChannels"] = Json(null);
     j["networkOrder"] = Json(42L);
+    j["ignores"] = Json("nope");
     j["prefVersion"] = Json(3L);
 
     const back = UserPreferences.fromJson(j).prefs;
     assert(back.pinnedChannels.length == 0);
     assert(back.archivedChannels.length == 0);
     assert(back.networkOrder.length == 0);
+    assert(back.ignores.length == 0);
     assert(back.prefVersion == 3);
 }
 
@@ -726,12 +752,14 @@ unittest {
     j["pinnedChannels"]   = serializeToJson(["net1:#a", "net2:#b"]);
     j["archivedChannels"] = serializeToJson(["net3:#old"]);
     j["networkOrder"]     = serializeToJson(["net1", "net2"]);
+    j["ignores"]          = serializeToJson(["spammer!*@*", "*!*@bad.host"]);
     j["prefVersion"]      = Json(11L);
 
     const back = UserPreferences.fromJson(j).prefs;
     assert(back.pinnedChannels   == ["net1:#a", "net2:#b"]);
     assert(back.archivedChannels == ["net3:#old"]);
     assert(back.networkOrder     == ["net1", "net2"]);
+    assert(back.ignores          == ["spammer!*@*", "*!*@bad.host"]);
     assert(back.prefVersion == 11);
 }
 
