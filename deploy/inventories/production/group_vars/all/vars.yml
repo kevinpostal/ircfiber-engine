@@ -147,25 +147,28 @@ ircfiber_ipv6_prefix: ""
 # rDNS pool host for id-<uid>.pool (e.g. "highgate.ircfiber.com") — optional, for PTR/WHOIS
 ircfiber_ipv6_pool_host: ""
 
-# --- Mullvad egress pool — 3 exits on ubuntu-docker host (root netns) ---
-# The k3s sidecars run in cni0 netns where Tailscale filters 100.64.0.0/10.
-# ubuntu-docker (100.94.116.56) runs in root netns and sees all Mullvad exits.
+# --- Mullvad egress slots (local sidecars on the engine host, retargetable) --
+# Long-lived SOCKS slots the engine drives through each sidecar's own
+# tailscaled LocalAPI socket (mounted at /egress/<name>/tailscaled.sock), so a
+# user's location pin retargets an *idle* slot in place. `exit_node` is only
+# the boot location.
+#
 # Keep identical to
 # site/deploy/inventories/production/host_vars/vps-efb4b52d.yml — this copy
 # re-renders IRCFIBER_MULLVAD_POOL via deploy-engine.yml's lineinfile, so
 # drift makes the gateway and engine disagree about slot labels.
 #
-# Remote slots are NOT retargetable (the engine needs the slot's tailscaled
-# socket on its own filesystem), so they report `controllable: false` and are
-# pinned by label. Local retargetable sidecars were tried on OVH 2026-09-04
-# and reverted: no Mullvad exit peers in that host's netmap, and
-# `--exit-node=<hostname>` cannot resolve at tailscaled boot. Enabling them
-# needs a Tailscale ACL nodeAttrs `mullvad` grant for the sidecar devices
-# plus IP-form exit nodes.
+# `exit_node` MUST be a relay tailnet IP: tailscaled cannot resolve a peer
+# hostname during `tailscale up` and the container crash-loops. Relay IPs
+# rotate; the engine's catalog retarget makes a stale boot value harmless.
+# Slot count is capped by the Mullvad licence (3 seats, held by these
+# devices; the ubuntu-docker host-mullvad-* sidecars were retired to free
+# them). The tailnet ACL grants the `mullvad` nodeAttr to tag:ircfiber only —
+# over-granting makes the control plane withhold the relay set.
 mullvad_sidecars:
-  - { name: "de", host: "100.94.116.56", port: 1080 } # de-ber-wg-003
-  - { name: "ch", host: "100.94.116.56", port: 1081 } # ch-zrh-wg-503
-  - { name: "us", host: "100.94.116.56", port: 1082 } # us-atl-wg-001
+  - { name: "de", exit_node: "100.117.47.8", port: 1055 }  # de-ber-wg-003, Berlin
+  - { name: "ch", exit_node: "100.86.38.66", port: 1055 }  # ch-zrh-wg-403, Zurich
+  - { name: "us", exit_node: "100.97.85.120", port: 1055 } # us-atl-wg-002, Atlanta
 
 # --- Gateway defaults ---------------------------------------------------------
 ircfiber_gateway_log_level: "info"
