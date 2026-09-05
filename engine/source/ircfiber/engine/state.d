@@ -12,6 +12,9 @@ import ircfiber.engine.bootstrap : EngineContext;
 import ircfiber.models.network : Network;
 import ircfiber.redis.protocol : RedisKeys, NetworkStateSnapshot,
     RetryStatus, FailInfoSnapshot, TlsInfo, PROTOCOL_VERSION;
+import ircfiber.irc.connection : EgressSlotView, egressLocations, egressSlotViews,
+    refreshEgressState;
+import ircfiber.irc.egress_catalog : ExitLocation;
 import std.conv : to;
 private void runSafeTask(void delegate() dg) {
     runTask(() nothrow {
@@ -40,6 +43,10 @@ void startStateSnapshotter(ref EngineContext ctx) {
 /// Writes state snapshots for all networks to Redis.
 void writeStateSnapshots(ref EngineContext ctx) {
     auto serverId = ctx.localServer.serverId;
+    // Egress slots + location catalog for `GET /api/egress`. Done here
+    // because this task is off every connection fiber: refreshEgressState()
+    // shells out to each slot's tailscaled.
+    publishEgressState(ctx, serverId);
     foreach (net; ctx.connManager.getNetworks()) {
         try {
             writeStateSnapshotForNetwork(ctx, net, serverId);
@@ -53,6 +60,67 @@ void writeStateSnapshots(ref EngineContext ctx) {
         ctx.redis.getDb().set(RedisKeys.protocolVersion(), PROTOCOL_VERSION.to!string);
     } catch (Exception e) {
         logWarn("Failed to write protocol version: %s", e.msg);
+    }
+}
+
+/// One slot's published state. Keys must match the gateway's reader
+/// (site/backend/source/ircfiber/egress.d).
+private Json slotViewToJson(EgressSlotView v) {
+    auto j = Json.emptyObject;
+    j["label"] = Json(v.label);
+    j["host"] = Json(v.host);
+    j["port"] = Json(cast(long) v.port);
+    j["locationId"] = Json(v.locationId);
+    j["hostname"] = Json(v.exitHostname);
+    j["country"] = Json(v.exitCountry);
+    j["countryCode"] = Json(v.exitCountryCode);
+    j["city"] = Json(v.exitCity);
+    j["controllable"] = Json(v.controllable);
+    j["state"] = Json(v.state);
+    j["activeConns"] = Json(cast(long) v.activeConns);
+    j["heldUntilMs"] = Json(v.heldUntilMs);
+    j["error"] = Json(v.lastError);
+    return j;
+}
+
+/// The pickable location catalog as a JSON array.
+private Json locationsToJson(ExitLocation[] locs) {
+    auto arr = Json.emptyArray;
+    foreach (l; locs) {
+        auto j = Json.emptyObject;
+        j["id"] = Json(l.id);
+        j["country"] = Json(l.country);
+        j["countryCode"] = Json(l.countryCode);
+        j["city"] = Json(l.city);
+        j["cityCode"] = Json(l.cityCode);
+        j["relays"] = Json(cast(long) l.relays);
+        arr ~= j;
+    }
+    return arr;
+}
+
+/// Refreshes and publishes this engine's egress slots and location catalog.
+/// Slots expire after 60 s so a dead engine's exits vanish from the picker
+/// instead of lingering; the catalog lives 30 min so it survives a few
+/// missed refreshes. A Redis hiccup must never kill the snapshotter.
+private void publishEgressState(ref EngineContext ctx, string serverId) {
+    // Legacy single-engine mode has no server namespace to publish under.
+    if (serverId.length == 0) return;
+    try {
+        refreshEgressState();
+        auto slots = egressSlotViews();
+        auto slotsKey = RedisKeys.egressSlots(serverId);
+        foreach (v; slots)
+            ctx.redis.getDb().hset(slotsKey, v.label, slotViewToJson(v).toString());
+        if (slots.length > 0) ctx.redis.getDb().expire(slotsKey, 60);
+        auto catalogKey = RedisKeys.egressCatalog(serverId);
+        auto locs = egressLocations();
+        if (locs.length > 0) {
+            ctx.redis.getDb().set(catalogKey, locationsToJson(locs).toString());
+            ctx.redis.getDb().expire(catalogKey, 1800);
+        }
+    } catch (Exception e) {
+        logWarn("Failed to publish egress state: %s", e.msg);
     }
 }
 /// Writes a state snapshot for a network (legacy non-decentralized).
@@ -191,6 +259,7 @@ void writeStateSnapshotForNetwork(ref EngineContext ctx, Network net, string ser
         snap.activeEgressLabel = clientForEgress.getActiveEgressLabel();
         snap.activeEgressHost = clientForEgress.getActiveEgressHost();
         snap.activeEgressIp = clientForEgress.getActiveEgressIp();
+        snap.activeEgressLocation = clientForEgress.getActiveEgressLocation();
         // Socket endpoints of the live connection: the peer's family is
         // the admin's "IPv6 or IPv4?" answer; the local IP shows the
         // per-user bind (or the shared host/NAT66 address). Gated on

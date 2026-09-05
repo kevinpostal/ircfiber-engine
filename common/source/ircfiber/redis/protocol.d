@@ -54,6 +54,21 @@ struct RedisKeys {
     
     /// Control queue key (per-server)
     static string control(string serverId) { return "irc:control:" ~ serverId; }
+
+    /// Per-server Mullvad egress slot registry: hash `label` → slot JSON
+    /// `{label,host,port,locationId,hostname,country,countryCode,city,
+    ///   controllable,state,activeConns,heldUntilMs,error}`.
+    /// Written by the engine's state snapshotter, read by the gateway's
+    /// `GET /api/egress`. Refreshed every snapshot tick with EXPIRE 60 so a
+    /// dead engine's slots vanish instead of lingering as phantom exits.
+    static string egressSlots(string serverId) { return "irc:egress:slots:" ~ serverId; }
+
+    /// Per-server Mullvad location catalog: JSON array of
+    /// `{id,country,countryCode,city,cityCode,relays}`, one entry per
+    /// pickable exit city as the slot's own tailscaled reports it.
+    /// EXPIRE 1800 — the catalog changes rarely and must survive a few
+    /// missed refreshes so the picker never goes blank.
+    static string egressCatalog(string serverId) { return "irc:egress:catalog:" ~ serverId; }
     
     /// Legacy state key (non-namespaced)
     static string state_legacy(string networkId) { return "irc:state:" ~ networkId; }
@@ -448,6 +463,10 @@ struct NetworkStateSnapshot {
     string activeEgressHost;
     /// Resolved Tailnet IP of active SOCKS proxy (e.g. "100.117.47.8").
     string activeEgressIp;
+    /// Human-readable location of the active egress, e.g. "Berlin, Germany".
+    /// Empty when the connection is direct or the slot's location is unknown.
+    /// Slot labels are internal names now, so this is what the UI shows.
+    string activeEgressLocation;
     /// Remote IP of the live IRC socket (AAAA or A winner). "" when
     /// disconnected. Its family is the authoritative IPv6-vs-IPv4 signal.
     string peerIp;
@@ -534,6 +553,7 @@ struct NetworkStateSnapshot {
         if (activeEgressLabel.length) j["activeEgressLabel"] = Json(activeEgressLabel);
         if (activeEgressHost.length) j["activeEgressHost"] = Json(activeEgressHost);
         if (activeEgressIp.length) j["activeEgressIp"] = Json(activeEgressIp);
+        if (activeEgressLocation.length) j["activeEgressLocation"] = Json(activeEgressLocation);
         if (peerIp.length) j["peerIp"] = Json(peerIp);
         if (localIp.length) j["localIp"] = Json(localIp);
         j["lagMs"] = Json(lagMs);
@@ -602,6 +622,7 @@ struct NetworkStateSnapshot {
         if (j["activeEgressLabel"].type == Json.Type.string) s.activeEgressLabel = j["activeEgressLabel"].get!string;
         if (j["activeEgressHost"].type == Json.Type.string) s.activeEgressHost = j["activeEgressHost"].get!string;
         if (j["activeEgressIp"].type == Json.Type.string) s.activeEgressIp = j["activeEgressIp"].get!string;
+        if (j["activeEgressLocation"].type == Json.Type.string) s.activeEgressLocation = j["activeEgressLocation"].get!string;
         if (j["peerIp"].type == Json.Type.string) s.peerIp = j["peerIp"].get!string;
         if (j["localIp"].type == Json.Type.string) s.localIp = j["localIp"].get!string;
         if (j["lagMs"].type == Json.Type.int_) s.lagMs = j["lagMs"].get!long;

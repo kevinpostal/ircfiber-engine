@@ -100,6 +100,13 @@ configuration "parser-test" {
     versions "VibeUseFibers"
 }
 
+configuration "egress-catalog-test" {
+    targetType "executable"
+    targetName "egress-catalog-test"
+    mainSourceFile "source/egress_catalog_test.d"
+    versions "VibeUseFibers"
+}
+
 configuration "consumer-test" {
     targetType "executable"
     targetName "consumer-test"

@@ -40,6 +40,9 @@ import ircfiber.engine.adopted_socket : AdoptedSocket;
 import ircfiber.async : safeFiberRun;
 import ircfiber.irc.ipv6 : ipv6ForUser, normalizePrefix;
 import ircfiber.irc.parser : ChannelListRow, parseChannelListRow;
+import ircfiber.irc.egress_catalog : ExitLocation, ExitRelay, locationMatches,
+    locationsFromRelays, parseExitOnline, parseExitRelays, parseSelectedExit,
+    pickRelayForPin;
 
 /// IRC connection state.
 ///
@@ -259,34 +262,80 @@ private enum REGISTRATION_WARN_AT_FRACTION_2     = 75;
 
 private enum HAPPY_EYEBALLS_DELAY_MS = 250;
 
-// ── Mullvad egress (SOCKS5) pool ─────────────────────────────────────────────
-// Sidecars on 1 VPS, scalable to N via IRCFIBER_MULLVAD_POOL env (e.g. 6:
-// de/ch/nl/gb/se/us). Each entry is socks5://host:port (resolve locally →
-// CONNECT <ip>:<port>). Egress selection per NetworkConfig.egressNodeId:
-// "" = random healthy for this host, else label pin (e.g. "se"/"us").
+// ── Mullvad egress (SOCKS5) slots ────────────────────────────────────────────
+// A fixed pool of long-lived *slots* (one SOCKS sidecar each) configured at
+// deploy time via IRCFIBER_MULLVAD_POOL. Slot count is fixed at runtime:
+// happyEyeballsConnect holds raw MullvadProxy* into `mullvadPool` outside the
+// lock, so the array is only ever mutated in place.
+//
+// Each slot is *retargeted* to a Mullvad exit location on demand
+// (`tailscale --socket=<slot> set --exit-node=…`) rather than a sidecar being
+// launched per location — Mullvad-over-Tailscale is device-license limited.
+// A slot carrying live connections (`activeConns > 0`) or inside its sticky
+// hold (`heldUntilMs`) is never retargeted, so picking a location can never
+// yank another network's egress.
+//
+// Egress selection per NetworkConfig.egressNodeId ("pin"): "" = automatic,
+// "direct" = host address, "de" = any city in country, "de-ber" = that city.
 // Smart picker is host-aware: when a server G/K/Z-lines an egress, that
-// egress is auto-banned for that host for 12 h (no hostname hardcode).
-// Global circuit-breaker still marks proxy dead 30 s after 3 generic fails.
+// *location* is auto-banned for that host for 12 h (no hostname hardcode).
+// Global circuit-breaker still marks a slot dead 30 s after 3 generic fails.
 private struct MullvadProxy {
     string host;
     ushort port;
     string label;
     int failCount;
     long deadUntilMs;
+    // ── Slot identity/state. Mutated in place under gMullvadLock only. ──
+    /// tailscaled LocalAPI socket for this slot; "" = not controllable
+    /// (static sidecar, no shared control volume) — never retargeted.
+    string controlSocket;
+    /// Current exit location id ("de-ber"); "" until the first status read.
+    string locationId;
+    /// Current exit relay host name ("de-ber-wg-003").
+    string exitHostname;
+    string exitCountry;
+    string exitCountryCode;
+    string exitCity;
+    /// "ready" | "retargeting" | "error".
+    string state = "ready";
+    string lastError;
+    /// Live connections currently egressing through this slot.
+    int activeConns;
+    /// Slot is reserved (retarget in flight) or in its post-release sticky
+    /// hold until this unix-ms timestamp.
+    long heldUntilMs;
 }
 private __gshared MullvadProxy[] mullvadPool;
 private __gshared size_t mullvadRR;
 private __gshared bool mullvadPoolLoaded;
 private __gshared Object gMullvadLock;
-// Per-host egress ban: hostLower -> label -> expiryMs. When a server
-// G/K/Z-lines an egress IP, we remember that egress is banned for that
-// host for HOST_EGRESS_BAN_MS so future connects to the same host
-// skip that egress without hardcoding any hostname in the binary.
+/// Mullvad relay catalog as the slots' own tailscaled reports it, plus the
+/// unix-ms it was last rebuilt. Guarded by gMullvadLock.
+private __gshared ExitRelay[] gExitRelays;
+private __gshared long gExitRelaysAtMs;
+/// Per-host egress ban: hostLower -> locationId -> expiryMs. When a server
+/// G/K/Z-lines an egress IP, we remember that *location* is banned for that
+/// host for HOST_EGRESS_BAN_MS so future connects to the same host skip it
+/// without hardcoding any hostname in the binary. Keyed by location, not by
+/// slot label, because a slot's address changes when it is retargeted.
 private enum HOST_EGRESS_BAN_MS = 12 * 60 * 60 * 1000L; // 12 h
 // Shorter host-ban used when a ban is inferred from repeated TLS closes
 // rather than read from an ERROR line (see the reconnect loop).
 private enum TLS_CLOSED_ROTATE_BAN_MS = 15 * 60 * 1000L; // 15 min
 private enum TLS_CLOSED_ROTATE_AFTER  = 2;
+/// Sticky hold after the last connection releases a slot, so a reconnect
+/// loop keeps its location instead of losing the slot to another network.
+private enum SLOT_HOLD_MS               = 120_000L;
+/// Reservation held while a retarget is in flight (two concurrent connects
+/// must not fight over the same free slot).
+private enum RETARGET_RESERVE_MS        = 60_000L;
+/// How long to wait for ExitNodeStatus.Online after `tailscale set`.
+private enum RETARGET_READY_TIMEOUT_MS  = 20_000L;
+private enum RETARGET_POLL_MS           = 500L;
+private enum TS_CMD_TIMEOUT_SECS        = 10;
+/// Catalog refresh interval — the relay list changes rarely.
+private enum EGRESS_CATALOG_TTL_MS      = 15 * 60 * 1000L;
 private __gshared long[string][string] hostEgressBanUntil;
 shared static this() {
     // Enterprise: single global mutex protects all __gshared Mullvad state.
@@ -392,10 +441,45 @@ private void loadMullvadPool() {
     loadMullvadPoolUnlocked();
 }
 
-// Reads IRCFIBER_MULLVAD_POOL directly via getenv. std.process.environment
-// returned an empty string in the deployed binary despite the variable being
-// present in /proc/self/environ, leaving the pool empty at runtime. Caller
-// holds gMullvadLock and has set mullvadPoolLoaded = true.
+/// Reads an env var via getenv. `std.process.environment` returned an empty
+/// string in the deployed binary despite the variable being present in
+/// /proc/self/environ, so every egress env read goes through getenv.
+private string envRaw(string name) nothrow {
+    import core.stdc.stdlib : getenv;
+    import core.stdc.string : strlen;
+    try {
+        auto p = getenv(toStringz(name));
+        if (p is null) return "";
+        return p[0 .. strlen(p)].idup.strip();
+    } catch (Exception) {
+        return "";
+    }
+}
+
+/// `<IRCFIBER_EGRESS_CONTROL_DIR>/<label>/tailscaled.sock` when that socket
+/// exists, else "" — a slot whose sidecar does not share its control socket
+/// with the engine is static and never retargeted.
+private string slotControlSocketPath(string label) nothrow {
+    import std.file : exists;
+    try {
+        auto dir = envRaw("IRCFIBER_EGRESS_CONTROL_DIR");
+        if (dir.length == 0) dir = "/egress";
+        auto path = dir ~ "/" ~ label ~ "/tailscaled.sock";
+        return exists(path) ? path : "";
+    } catch (Exception) {
+        return "";
+    }
+}
+
+/// tailscale CLI used to drive a slot's tailscaled (overridden by the local
+/// verification shim via IRCFIBER_EGRESS_TAILSCALE_BIN).
+private string tailscaleBin() nothrow {
+    auto b = envRaw("IRCFIBER_EGRESS_TAILSCALE_BIN");
+    return b.length ? b : "/usr/local/bin/tailscale";
+}
+
+// Reads IRCFIBER_MULLVAD_POOL directly via getenv, for the reason envRaw
+// documents. Caller holds gMullvadLock and has set mullvadPoolLoaded = true.
 private void loadMullvadPoolUnlocked() {
     import core.stdc.stdlib : getenv;
     import core.stdc.string : strlen;
@@ -430,39 +514,13 @@ private void loadMullvadPoolUnlocked() {
         } else host = e;
         if (host.length == 0) continue;
         auto label = explicitLabel.length > 0 ? explicitLabel : mullvadLabelFromHost(host);
-        mullvadPool ~= MullvadProxy(host, port, label, 0, 0);
+        auto sock = slotControlSocketPath(label);
+        mullvadPool ~= MullvadProxy(host, port, label, 0, 0, sock);
         logInfo("Mullvad pool: %s → %s:%d (label=%s)", entry, host, port, label);
+        logInfo("Mullvad slot %s: controllable=%s (socket=%s)", label,
+            sock.length ? "true" : "false", sock.length ? sock : "-");
     }
-    logInfo("Mullvad pool loaded: %d proxies", cast(int) mullvadPool.length);
-}
-
-private MullvadProxy* pickMullvadProxy(string egressNodeId) {
-    loadMullvadPool();
-    if (gMullvadLock !is null) synchronized (gMullvadLock) {
-        return pickMullvadProxyLocked(egressNodeId);
-    }
-    return pickMullvadProxyLocked(egressNodeId);
-}
-private MullvadProxy* pickMullvadProxyLocked(string egressNodeId) {
-    if (mullvadPool.length == 0) return null;
-    const now = Clock.currTime.toUnixTime!long * 1000;
-    foreach (ref pr; mullvadPool) if (pr.deadUntilMs != 0 && now >= pr.deadUntilMs) { pr.failCount = 0; pr.deadUntilMs = 0; }
-    if (egressNodeId.length > 0) {
-        foreach (ref pr; mullvadPool) if (pr.label == egressNodeId.toLower()) {
-            if (pr.deadUntilMs != 0 && now < pr.deadUntilMs) {
-                logWarn("Mullvad pinned %s is dead until %d, falling back to random healthy", egressNodeId, pr.deadUntilMs);
-                break;
-            }
-            return &pr;
-        }
-        logWarn("Mullvad pinned egress '%s' not found in pool, using random healthy", egressNodeId);
-    }
-    import std.random : uniform;
-    MullvadProxy*[] healthy;
-    foreach (ref pr; mullvadPool) if (pr.deadUntilMs == 0 || now >= pr.deadUntilMs) healthy ~= &pr;
-    if (healthy.length == 0) return null;
-    if (healthy.length == 1) return healthy[0];
-    return healthy[uniform(0, healthy.length)];
+    logInfo("Mullvad pool loaded: %d slots", cast(int) mullvadPool.length);
 }
 
 private MullvadProxy*[] getHealthyProxies() {
@@ -510,31 +568,43 @@ private void recordMullvadFailure(string label) {
     }
 }
 
-private bool isEgressBannedForHost(string hostLower, string label) {
-    if (hostLower.length == 0 || label.length == 0) return false;
+/// Is `locationId` (or the `slot:<label>` key of a slot whose location is
+/// unknown, or `DIRECT_EGRESS_LABEL`) banned for this host right now?
+private bool isEgressBannedForHost(string hostLower, string locationId) {
+    if (hostLower.length == 0 || locationId.length == 0) return false;
     // Called only from synchronized contexts (getHealthyProxiesForHost) or with mutex held.
     if (auto outer = hostLower in hostEgressBanUntil) {
-        if (auto expiry = label in *outer) {
+        if (auto expiry = locationId in *outer) {
             const now = Clock.currTime.toUnixTime!long * 1000;
             if (now < *expiry) return true;
-            (*outer).remove(label);
+            (*outer).remove(locationId);
             if ((*outer).length == 0) hostEgressBanUntil.remove(hostLower);
         }
     }
     return false;
 }
 
-private void banEgressForHost(string host, string label, long durationMs = HOST_EGRESS_BAN_MS) {
-    if (host.length == 0 || label.length == 0) return;
+/// Per-host ban key for a slot. A ban must follow the *address*, not the
+/// slot: a slot is retargeted over time, so keying by label would move the
+/// ban with the slot instead of leaving it on the banned exit. Slots whose
+/// location the engine cannot read (static sidecars, no control socket) keep
+/// a stable per-slot key so host-bans still work for them.
+private string slotBanKey(const(MullvadProxy)* p) nothrow {
+    if (p is null) return "";
+    return p.locationId.length ? p.locationId : "slot:" ~ p.label;
+}
+
+private void banEgressForHost(string host, string locationId, long durationMs = HOST_EGRESS_BAN_MS) {
+    if (host.length == 0 || locationId.length == 0) return;
     import std.string : toLower;
     auto hl = host.toLower();
     const exp = Clock.currTime.toUnixTime!long * 1000 + durationMs;
     if (gMullvadLock !is null) synchronized (gMullvadLock) {
-        hostEgressBanUntil[hl][label.toLower()] = exp;
+        hostEgressBanUntil[hl][locationId.toLower()] = exp;
     } else {
-        hostEgressBanUntil[hl][label.toLower()] = exp;
+        hostEgressBanUntil[hl][locationId.toLower()] = exp;
     }
-    logWarn("Mullvad host-ban: egress %s banned for %s for %d ms (until %d)", label, hl, durationMs, exp);
+    logWarn("Mullvad host-ban: egress %s banned for %s for %d ms (until %d)", locationId, hl, durationMs, exp);
 }
 
 private MullvadProxy*[] getHealthyProxiesForHost(string hostLower) {
@@ -563,7 +633,7 @@ private MullvadProxy*[] getHealthyProxiesForHostLocked(string hostLower) {
         if ((*outer).length == 0) hostEgressBanUntil.remove(hostLower);
     }
     MullvadProxy*[] out_;
-    foreach (p; healthy) if (!isEgressBannedForHost(hostLower, p.label)) out_ ~= p;
+    foreach (p; healthy) if (!isEgressBannedForHost(hostLower, slotBanKey(p))) out_ ~= p;
     return out_;
 }
 
@@ -573,16 +643,26 @@ private MullvadProxy*[] getHealthyProxiesForHostLocked(string hostLower) {
 /// can pin it ("direct") the same way it pins a Mullvad label.
 enum DIRECT_EGRESS_LABEL = "direct";
 
-/// True when, after `bannedLabel` was just banned for `hostLower`, at least
-/// one other route to the host remains: a healthy Mullvad exit that is not
-/// host-banned, or the direct path if that is not host-banned. Drives the
-/// ban policy: failover now vs. wait out the ban window.
-private bool hasAlternativeEgressForHost(string hostLower, string bannedLabel) {
+/// True when, after `bannedKey` was just banned for `hostLower`, at least
+/// one other route to the host remains: a healthy exit whose location is not
+/// host-banned, a free controllable slot that could be retargeted to an
+/// unbanned location, or the direct path if that is not host-banned. Drives
+/// the ban policy: failover now vs. wait out the ban window.
+private bool hasAlternativeEgressForHost(string hostLower, string bannedKey) {
     loadMullvadPool();
     bool check() {
         foreach (p; getHealthyProxiesForHostLocked(hostLower))
-            if (p.label != bannedLabel) return true;
-        return bannedLabel != DIRECT_EGRESS_LABEL && !isEgressBannedForHost(hostLower, DIRECT_EGRESS_LABEL);
+            if (slotBanKey(p) != bannedKey) return true;
+        // A free controllable slot is an alternative in itself: it can be
+        // retargeted to any city in the catalog that is not host-banned.
+        const now = Clock.currTime.toUnixTime!long * 1000;
+        if (gExitRelays.length > 0) {
+            foreach (ref pr; mullvadPool)
+                if (pr.controlSocket.length > 0 && pr.activeConns == 0
+                    && now >= pr.heldUntilMs && pr.state != "retargeting")
+                    return true;
+        }
+        return bannedKey != DIRECT_EGRESS_LABEL && !isEgressBannedForHost(hostLower, DIRECT_EGRESS_LABEL);
     }
     if (gMullvadLock !is null) synchronized (gMullvadLock) return check();
     return check();
@@ -592,6 +672,380 @@ private bool hasAlternativeEgressForHost(string hostLower, string bannedLabel) {
 private bool isDirectBannedForHost(string hostLower) {
     if (gMullvadLock !is null) synchronized (gMullvadLock) return isEgressBannedForHost(hostLower, DIRECT_EGRESS_LABEL);
     return isEgressBannedForHost(hostLower, DIRECT_EGRESS_LABEL);
+}
+
+// ── Egress slot control: read location, retarget, refcount ───────────────────
+// A slot is retargeted only while it is idle: `activeConns == 0`, past its
+// sticky hold, and not already reserved. That is the whole guarantee that
+// choosing a location for one network never drops another network's socket.
+
+/// Unix ms. Wrapped so the `nothrow` slot bookkeeping below can use it.
+private long nowMsSafe() nothrow {
+    try {
+        return Clock.currTime.toUnixTime!long * 1000;
+    } catch (Exception) {
+        return 0;
+    }
+}
+
+/// Loads the pool from `nothrow` context (the loader logs, which can throw).
+private void loadMullvadPoolSafe() nothrow {
+    try {
+        loadMullvadPool();
+    } catch (Exception) {}
+}
+
+/// Runs `action` under `gMullvadLock`, swallowing any throw so the slot
+/// bookkeeping can live in `nothrow` code paths. Never yields inside the
+/// lock — every `action` below is pure in-memory bookkeeping.
+private void withPoolLock(scope void delegate() action) nothrow {
+    try {
+        if (gMullvadLock !is null) synchronized (gMullvadLock) action();
+        else action();
+    } catch (Exception e) {
+        try { logWarn("Mullvad slot bookkeeping failed: %s", e.msg); } catch (Exception) {}
+    }
+}
+
+private struct TsResult {
+    /// Process exited 0.
+    bool ok;
+    /// stdout, whether or not the process succeeded.
+    string output;
+}
+
+/// Runs `<bin> --socket=<socket> <args…>` against one slot's tailscaled with
+/// a hard `timeout(1)` ceiling. Uses `vibe.core.process.execute`, which
+/// yields the calling fiber instead of blocking the event-loop thread — the
+/// std.process version would stall every other IRC connection for the
+/// duration. Returns `ok == false` and whatever stdout was produced on
+/// failure; callers that only need the payload (status reads) use `output`.
+private TsResult tailscaleCmd(string socket, string[] args) nothrow {
+    TsResult r;
+    if (socket.length == 0) return r;
+    try {
+        import vibe.core.process : vibeExecute = execute;
+        auto cmd = ["timeout", TS_CMD_TIMEOUT_SECS.to!string, tailscaleBin(),
+                    "--socket=" ~ socket] ~ args;
+        auto res = vibeExecute(cmd);
+        r.ok = res.status == 0;
+        r.output = res.output;
+        if (!r.ok)
+            logWarn("tailscale %s (%s) exited %d: %s", args.join(" "), socket, res.status,
+                res.output.length > 200 ? res.output[0 .. 200] : res.output);
+    } catch (Exception e) {
+        try { logWarn("tailscale %s (%s) failed: %s", args.join(" "), socket, e.msg); } catch (Exception) {}
+        r.ok = false;
+    }
+    return r;
+}
+
+/// Re-reads one slot's exit location and health from its own tailscaled, and
+/// refreshes the shared relay catalog from the same payload. No-op for a
+/// static slot. Must run off the connection fibers (it shells out).
+private void refreshSlotFromStatus(size_t idx) nothrow {
+    string socket;
+    withPoolLock({
+        if (idx < mullvadPool.length) socket = mullvadPool[idx].controlSocket;
+    });
+    if (socket.length == 0) return;
+    auto st = tailscaleCmd(socket, ["status", "--json"]);
+    if (st.output.length == 0) {
+        withPoolLock({
+            if (idx >= mullvadPool.length) return;
+            auto p = &mullvadPool[idx];
+            if (p.state == "retargeting") return;
+            p.state = "error";
+            p.lastError = "tailscale status unavailable";
+        });
+        return;
+    }
+    auto sel = parseSelectedExit(st.output);
+    const online = parseExitOnline(st.output);
+    auto relays = parseExitRelays(st.output);
+    withPoolLock({
+        if (idx >= mullvadPool.length) return;
+        auto p = &mullvadPool[idx];
+        if (sel.locationId.length) {
+            p.locationId = sel.locationId;
+            p.exitHostname = sel.hostname;
+            p.exitCountry = sel.country;
+            p.exitCountryCode = sel.countryCode;
+            p.exitCity = sel.city;
+        }
+        // A retarget in flight owns the slot's state field.
+        if (p.state != "retargeting") {
+            if (sel.hostname.length == 0) {
+                p.state = "error";
+                p.lastError = "no exit node selected";
+            } else if (!online) {
+                p.state = "error";
+                p.lastError = "exit node offline";
+            } else {
+                p.state = "ready";
+                p.lastError = "";
+            }
+        }
+        if (relays.length > 0) {
+            gExitRelays = relays;
+            gExitRelaysAtMs = nowMsSafe();
+        }
+    });
+}
+
+/// Points slot `idx` at the best relay for `pin` and waits for tailscaled to
+/// report the new exit online. Returns false (leaving the slot in `error`
+/// with its hold cleared, so it can be retried) on any failure.
+/// The caller must already have reserved the slot via `acquireSlotForPin`.
+private bool retargetSlot(size_t idx, string pin) nothrow {
+    string socket, label;
+    ExitRelay relay;
+    withPoolLock({
+        if (idx >= mullvadPool.length) return;
+        socket = mullvadPool[idx].controlSocket;
+        label = mullvadPool[idx].label;
+        relay = pickRelayForPin(gExitRelays, pin);
+    });
+    if (socket.length == 0 || relay.ip.length == 0) return false;
+    try {
+        logInfo("Mullvad slot %s: retargeting to %s (%s / %s)", label, relay.locationId,
+            relay.hostname, relay.ip);
+    } catch (Exception) {}
+    if (!tailscaleCmd(socket, ["set", "--exit-node=" ~ relay.ip]).ok) {
+        withPoolLock({
+            if (idx >= mullvadPool.length) return;
+            auto p = &mullvadPool[idx];
+            p.state = "error";
+            p.lastError = "tailscale set failed";
+            p.heldUntilMs = 0;
+        });
+        return false;
+    }
+    const deadline = nowMsSafe() + RETARGET_READY_TIMEOUT_MS;
+    bool ready = false;
+    while (nowMsSafe() < deadline) {
+        auto st = tailscaleCmd(socket, ["status", "--json"]);
+        if (st.output.length && parseExitOnline(st.output)
+            && parseSelectedExit(st.output).hostname == relay.hostname) {
+            ready = true;
+            break;
+        }
+        try {
+            sleep(RETARGET_POLL_MS.msecs);
+        } catch (Exception) {
+            break;
+        }
+    }
+    withPoolLock({
+        if (idx >= mullvadPool.length) return;
+        auto p = &mullvadPool[idx];
+        if (ready) {
+            p.locationId = relay.locationId;
+            p.exitHostname = relay.hostname;
+            p.exitCountry = relay.country;
+            p.exitCountryCode = relay.countryCode;
+            p.exitCity = relay.city;
+            p.state = "ready";
+            p.lastError = "";
+        } else {
+            p.state = "error";
+            p.lastError = "exit node did not come online";
+            p.heldUntilMs = 0;
+        }
+    });
+    if (!ready) {
+        try {
+            logWarn("Mullvad slot %s: retarget to %s timed out after %d ms", label,
+                relay.locationId, RETARGET_READY_TIMEOUT_MS);
+        } catch (Exception) {}
+    }
+    return ready;
+}
+
+/// Refreshes every controllable slot's location and the relay catalog.
+/// Cheap no-op inside `EGRESS_CATALOG_TTL_MS` — retargets update slot state
+/// synchronously, so a periodic read only picks up out-of-band changes.
+/// Shells out: call only from the state snapshotter task, never from a
+/// connection fiber's hot path.
+void refreshEgressState() nothrow {
+    loadMullvadPoolSafe();
+    size_t[] idxs;
+    long lastAt;
+    withPoolLock({
+        lastAt = gExitRelaysAtMs;
+        foreach (i, ref p; mullvadPool) if (p.controlSocket.length > 0) idxs ~= i;
+    });
+    if (idxs.length == 0) return;
+    if (lastAt != 0 && nowMsSafe() - lastAt < EGRESS_CATALOG_TTL_MS) return;
+    foreach (i; idxs) refreshSlotFromStatus(i);
+}
+
+/// Copy-by-value snapshot of one slot, taken under the lock, for publishing.
+struct EgressSlotView {
+    string label;
+    string host;
+    string locationId;
+    string exitHostname;
+    string exitCountry;
+    string exitCountryCode;
+    string exitCity;
+    string state;
+    string lastError;
+    ushort port;
+    bool controllable;
+    int activeConns;
+    long heldUntilMs;
+}
+
+/// Every slot's current state, for `irc:egress:slots:<serverId>`.
+EgressSlotView[] egressSlotViews() nothrow {
+    loadMullvadPoolSafe();
+    EgressSlotView[] views;
+    withPoolLock({
+        foreach (ref p; mullvadPool) {
+            EgressSlotView v;
+            v.label = p.label;
+            v.host = p.host;
+            v.port = p.port;
+            // A retargetable slot reports its real location; a static one has
+            // none to report (its `slot:` ban key never leaves the engine).
+            v.locationId = p.locationId;
+            v.exitHostname = p.exitHostname;
+            v.exitCountry = p.exitCountry;
+            v.exitCountryCode = p.exitCountryCode;
+            v.exitCity = p.exitCity;
+            v.state = p.state;
+            v.lastError = p.lastError;
+            v.controllable = p.controlSocket.length > 0;
+            v.activeConns = p.activeConns;
+            v.heldUntilMs = p.heldUntilMs;
+            views ~= v;
+        }
+    });
+    return views;
+}
+
+/// The pickable location catalog, for `irc:egress:catalog:<serverId>`.
+ExitLocation[] egressLocations() nothrow {
+    ExitRelay[] relays;
+    withPoolLock({ relays = gExitRelays.dup; });
+    try {
+        return locationsFromRelays(relays);
+    } catch (Exception) {
+        return null;
+    }
+}
+
+/// Finds or prepares a slot for `pin` (a country or city pin, lower-case).
+/// Returns null when nothing is available, with `reason` set to one of
+/// "no-pin" | "no-catalog" | "all-busy" | "retarget-failed" | "not-controllable".
+///
+/// A slot already sitting on a matching location is shared as-is — that is
+/// the common case and it never disturbs the connections already on it. Only
+/// a genuinely idle slot is ever retargeted, and it is reserved (state
+/// "retargeting" + a `RETARGET_RESERVE_MS` hold) before the lock is released
+/// so two concurrent connects cannot fight over the same slot.
+private MullvadProxy* acquireSlotForPin(string hostLower, string pin, out string reason) nothrow {
+    reason = "";
+    if (pin.length == 0) {
+        reason = "no-pin";
+        return null;
+    }
+    loadMullvadPoolSafe();
+    MullvadProxy* match = null;
+    size_t candidate = size_t.max;
+    int controllable = 0;
+    withPoolLock({
+        const now = nowMsSafe();
+        foreach (i, ref p; mullvadPool) {
+            if (!locationMatches(p.locationId, pin)) continue;
+            if (p.deadUntilMs != 0 && now < p.deadUntilMs) continue;
+            if (isEgressBannedForHost(hostLower, slotBanKey(&mullvadPool[i]))) continue;
+            match = &mullvadPool[i];
+            return;
+        }
+        long lru = long.max;
+        foreach (i, ref p; mullvadPool) {
+            if (p.controlSocket.length == 0) continue;
+            controllable++;
+            if (p.activeConns != 0 || now < p.heldUntilMs || p.state == "retargeting") continue;
+            if (p.heldUntilMs <= lru) {
+                lru = p.heldUntilMs;
+                candidate = i;
+            }
+        }
+        if (candidate == size_t.max) return;
+        mullvadPool[candidate].state = "retargeting";
+        mullvadPool[candidate].heldUntilMs = now + RETARGET_RESERVE_MS;
+    });
+    if (match !is null) return match;
+    if (candidate == size_t.max) {
+        reason = controllable > 0 ? "all-busy" : "not-controllable";
+        return null;
+    }
+    bool haveRelay = false;
+    withPoolLock({ haveRelay = pickRelayForPin(gExitRelays, pin).ip.length > 0; });
+    if (!haveRelay) {
+        withPoolLock({
+            if (candidate >= mullvadPool.length) return;
+            mullvadPool[candidate].state = "ready";
+            mullvadPool[candidate].heldUntilMs = 0;
+        });
+        reason = "no-catalog";
+        return null;
+    }
+    if (!retargetSlot(candidate, pin)) {
+        reason = "retarget-failed";
+        return null;
+    }
+    return &mullvadPool[candidate];
+}
+
+/// Location id of the best online relay that is not host-banned for
+/// `hostLower` — the target for an automatic retarget when every existing
+/// slot is banned for this host. "" when the catalog offers nothing better.
+/// A city id (not a country) so the retarget cannot land on a banned city.
+private string bestUnbannedLocationFor(string hostLower) nothrow {
+    string best;
+    long bestPriority = long.min;
+    withPoolLock({
+        foreach (r; gExitRelays) {
+            if (!r.online || r.locationId.length == 0) continue;
+            if (isEgressBannedForHost(hostLower, r.locationId)) continue;
+            if (r.priority > bestPriority) {
+                bestPriority = r.priority;
+                best = r.locationId;
+            }
+        }
+    });
+    return best;
+}
+
+/// Takes a reference on `label`'s slot: it can no longer be retargeted, and
+/// keeps a sticky hold for SLOT_HOLD_MS past the last release so a reconnect
+/// loop does not lose its location to another network.
+private void holdSlot(string label) nothrow {
+    if (label.length == 0) return;
+    withPoolLock({
+        foreach (ref p; mullvadPool) if (p.label == label) {
+            p.activeConns++;
+            p.heldUntilMs = nowMsSafe() + SLOT_HOLD_MS;
+            break;
+        }
+    });
+}
+
+/// Drops a reference taken by `holdSlot` (floored at zero) and starts the
+/// sticky hold window.
+private void releaseSlot(string label) nothrow {
+    if (label.length == 0) return;
+    withPoolLock({
+        foreach (ref p; mullvadPool) if (p.label == label) {
+            if (p.activeConns > 0) p.activeConns--;
+            p.heldUntilMs = nowMsSafe() + SLOT_HOLD_MS;
+            break;
+        }
+    });
 }
 // SOCKS5 → TLS handoff: connectTCP to sidecar, handshake on same TCPConnection,
 // then return it for createTLSStreamWithTimeout (avoids private TCPConnection(fd) ctor).
@@ -954,15 +1408,38 @@ private TCPConnection happyEyeballsConnectWithProxy(string host, ushort port, Mu
 
 /// Which egress a `happyEyeballsConnect` call actually used. Returned per
 /// call (not via a global) because many networks connect concurrently on
-/// different fibers and the ban policy keys off `label` — a crossed label
-/// would ban the wrong exit.
+/// different fibers and the ban policy keys off the location — a crossed
+/// value would ban the wrong exit.
 struct EgressUsed {
-    /// "" = direct, else the pool label ("de").
+    /// "" = direct, else the slot label ("de"). Identifies the slot whose
+    /// refcount the caller now holds.
     string label;
     /// "host:port" of the SOCKS sidecar; "" for direct.
     string host;
     /// Resolved IP of the sidecar for admin display; "" for direct.
     string ip;
+    /// Per-host ban key of the exit: its location id ("de-ber") when known,
+    /// else `slot:<label>` for a slot whose location cannot be read.
+    string locationId;
+    /// Human text for the UI, e.g. "Berlin, Germany"; "" when unknown.
+    string locationText;
+}
+
+/// User-facing copy for a pin that could not be honoured. A pin problem
+/// never hard-fails a connect — being offline is worse than being in the
+/// wrong city — so every branch ends "connecting via another exit".
+private string egressPinFallbackCopy(string reason) nothrow {
+    switch (reason) {
+        case "all-busy":
+            return "All exits are in use right now — connecting via another exit; "
+                ~ "your location will be used when one frees up.";
+        case "retarget-failed":
+            return "Could not switch an exit to that location — connecting via another exit.";
+        case "no-catalog":
+            return "No exit locations are available on this server — connecting via another exit.";
+        default:
+            return "That location is not available on this server — connecting via another exit.";
+    }
 }
 
 private TCPConnection happyEyeballsConnect(string host, ushort port, string egressNodeId,
@@ -1022,35 +1499,43 @@ private TCPConnection happyEyeballsConnect(string host, ushort port, string egre
     // told them to pick another route; honour the pin and let the ban
     // window run.
     const pinDirect = egressNodeId.length > 0 && egressNodeId.toLower() == DIRECT_EGRESS_LABEL;
+    string egressBusyNote;
     if (egressNodeId.length > 0 && !pinDirect) {
-        auto pinnedLabel = egressNodeId.toLower();
-        MullvadProxy* pinned = null;
-        if (gMullvadLock !is null) synchronized (gMullvadLock) {
-            foreach (ref pr; mullvadPool) if (pr.label == pinnedLabel) { pinned = &pr; break; }
+        // Country/city pin: reuse a slot already on that location, else
+        // retarget an idle one. A slot carrying live connections is never
+        // touched, so honouring this pin cannot drop another network.
+        string reason;
+        auto slot = acquireSlotForPin(hostLower, egressNodeId.toLower(), reason);
+        if (slot !is null) {
+            toTry ~= slot;
         } else {
-            foreach (ref pr; mullvadPool) if (pr.label == pinnedLabel) { pinned = &pr; break; }
+            logWarn("Mullvad pin '%s' unavailable for %s (%s) — using automatic",
+                egressNodeId, hostLower, reason);
+            logJsonMap("warn", "connection", "Egress pin unavailable",
+                ["host": hostLower, "pin": egressNodeId, "reason": reason,
+                 "event": "egress_busy"]);
+            egressBusyNote = egressPinFallbackCopy(reason);
         }
-        if (pinned !is null) {
-            bool banned;
-            bool dead;
-            if (gMullvadLock !is null) synchronized (gMullvadLock) {
-                banned = isEgressBannedForHost(hostLower, pinned.label);
-                dead = (pinned.deadUntilMs != 0);
+    } else if (egressNodeId.length == 0 && healthyForHost.length == 0) {
+        // Automatic, and every existing exit is host-banned or dead: retarget
+        // one idle slot to the best location this host has not banned rather
+        // than falling straight through to the (possibly banned) direct route.
+        // At most one retarget per connect attempt — this is the only call.
+        auto target = bestUnbannedLocationFor(hostLower);
+        if (target.length > 0) {
+            string reason;
+            auto slot = acquireSlotForPin(hostLower, target, reason);
+            if (slot !is null) {
+                logInfo("Automatic egress: slot %s retargeted to %s for %s (no healthy exit left)",
+                    slot.label, target, hostLower);
+                toTry ~= slot;
             } else {
-                banned = isEgressBannedForHost(hostLower, pinned.label);
-                dead = (pinned.deadUntilMs != 0);
+                logWarn("Automatic egress: no slot could take %s for %s (%s)",
+                    target, hostLower, reason);
             }
-            if (banned) {
-                logWarn("Mullvad pinned %s is host-banned for %s, falling back to other healthy egresses", pinned.label, hostLower);
-            } else if (dead) {
-                logWarn("Mullvad pinned %s is globally dead, falling back to other healthy egresses", pinned.label);
-            } else {
-                toTry ~= pinned;
-            }
-        } else {
-            logWarn("Mullvad pinned egress '%s' not found in pool, using random healthy", egressNodeId);
         }
     }
+    if (egressBusyNote.length > 0) report(progress, "info", egressBusyNote);
     if (!pinDirect) {
         foreach (p; healthyForHost) {
             bool already = false;
@@ -1083,7 +1568,15 @@ private TCPConnection happyEyeballsConnect(string host, ushort port, string egre
                         if (a.length > 0) used.ip = a[0].toAddrString();
                     } catch (Exception) {}
                 }
+                used.locationId = slotBanKey(proxy);
+                used.locationText = proxy.exitCity.length
+                    ? proxy.exitCity ~ ", " ~ proxy.exitCountry
+                    : proxy.exitCountry;
                 recordMullvadSuccess(proxy.label);
+                // Take the slot's refcount: it can no longer be retargeted
+                // while this connection lives. Released by the client's
+                // releaseEgressSlot() on every disconnect / reconnect.
+                holdSlot(proxy.label);
             }
             return conn;
         } catch (Exception e) {
@@ -1092,7 +1585,7 @@ private TCPConnection happyEyeballsConnect(string host, ushort port, string egre
             // On TLS timeout specifically, ban this egress for this host so the next proxy is tried immediately
             // rather than re-cycling the same wedged exit.
             if (proxy !is null && e.msg.canFind("TLS handshake timed out")) {
-                banEgressForHost(host, proxy.label);
+                banEgressForHost(host, slotBanKey(proxy));
             }
             continue;
         }
@@ -1865,6 +2358,20 @@ final class PersistentIRCClient {
         string              activeEgressHost;
         /// Resolved Tailnet IP of the active proxy (e.g. "100.117.47.8").
         string              activeEgressIp;
+        /// Per-host ban key of the active egress: its location id
+        /// ("de-ber") or `slot:<label>`. Survives a disconnect so the ban
+        /// policy in the reconnect loop can still attribute the failure.
+        string              activeEgressLocationId;
+        /// Human-readable location of the active egress ("Berlin, Germany").
+        /// "" for direct or an unknown location. This is what the UI shows.
+        string              activeEgressLocation;
+        /// Slot whose refcount this client currently holds ("" = none).
+        /// Distinct from activeEgressLabel, which deliberately survives a
+        /// disconnect for the ban policy; this one is cleared the moment the
+        /// hold ends, so a slot is never pinned by a dead connection.
+        string              egressSlotLabel;
+        /// Whether `egressSlotLabel`'s refcount is currently taken.
+        bool                egressSlotHeld;
         /// Remote IP the Happy Eyeballs race actually connected to (e.g.
         /// "2001:6b0:e:2a18::120" for an AAAA winner). The family of this
         /// address is the only reliable "did we use IPv6" signal — the
@@ -2635,6 +3142,14 @@ final class PersistentIRCClient {
     @property string getActiveEgressLabel() const { return activeEgressLabel; }
     @property string getActiveEgressHost() const { return activeEgressHost; }
     @property string getActiveEgressIp() const { return activeEgressIp; }
+    /// Location text of the live egress ("Berlin, Germany"); "" when direct
+    /// or unknown. Published in the state snapshot for the UI.
+    @property string getActiveEgressLocation() const { return activeEgressLocation; }
+    /// Text for user-facing copy about the live egress: the location when
+    /// known ("Berlin, Germany"), else the internal slot label.
+    private string egressDisplay() const nothrow {
+        return activeEgressLocation.length ? activeEgressLocation : activeEgressLabel;
+    }
     /// Remote/local IPs of the live TCP socket; "" when not connected.
     @property string getActivePeerIp() const { return activePeerIp; }
     @property string getActiveLocalIp() const { return activeLocalIp; }
@@ -2661,11 +3176,24 @@ final class PersistentIRCClient {
     /// before each reconnect attempt so a stale lag/uptime/TLS tuple
     /// from the previous socket never leaks into the next snapshot.
     private void resetConnectionTelemetry() nothrow {
+        // Every connect attempt and every disconnect passes through here, so
+        // this is the one place that guarantees a slot hold cannot outlive
+        // the socket that took it.
+        releaseEgressSlot();
         lagMs = -1;
         lagProbeSentMs = 0;
         connectedAtMs = 0;
         tlsInfoValid = false;
         tlsInfo = TlsInfo.init;
+    }
+
+    /// Drops this client's slot refcount if it holds one. Idempotent by
+    /// construction — `egressSlotHeld` is cleared before the release.
+    private void releaseEgressSlot() nothrow {
+        if (!egressSlotHeld) return;
+        egressSlotHeld = false;
+        releaseSlot(egressSlotLabel);
+        egressSlotLabel = "";
     }
 
     /// Reads protocol version, cipher and peer-certificate details from
@@ -2926,7 +3454,7 @@ final class PersistentIRCClient {
                 if (reason.canFind("TLS handshake timed out") || errMsg.canFind("TLS handshake timed out")) {
                     recordCounter("ircfiber.tls_handshake.timeout_disconnect", 1, ["host": config.host]);
                     // Ban the egress this network used for this host so the next attempt tries a different exit.
-                    if (activeEgressLabel.length > 0) banEgressForHost(config.host, activeEgressLabel);
+                    if (activeEgressLocationId.length > 0) banEgressForHost(config.host, activeEgressLocationId);
                     recordHostFailure(config.host, config.port);
                 }
                 // An IP ban on a TLS port never reaches us as text: InspIRCd
@@ -2940,16 +3468,19 @@ final class PersistentIRCClient {
                 consecutiveTlsClosed = tlsClosed ? consecutiveTlsClosed + 1 : 0;
                 if (tlsClosed && consecutiveTlsClosed >= TLS_CLOSED_ROTATE_AFTER) {
                     import std.string : toLower;
-                    const label = activeEgressLabel.length > 0 ? activeEgressLabel : DIRECT_EGRESS_LABEL;
-                    const pinnedHere = config.egressNodeId.length > 0 && config.egressNodeId.toLower() == label;
-                    if (!pinnedHere && hasAlternativeEgressForHost(config.host.toLower(), label)) {
-                        banEgressForHost(config.host, label, TLS_CLOSED_ROTATE_BAN_MS);
+                    const banKey = activeEgressLocationId.length > 0
+                        ? activeEgressLocationId : DIRECT_EGRESS_LABEL;
+                    const pinnedHere = config.egressNodeId.length > 0
+                        && (config.egressNodeId.toLower() == banKey
+                            || locationMatches(banKey, config.egressNodeId.toLower()));
+                    if (!pinnedHere && hasAlternativeEgressForHost(config.host.toLower(), banKey)) {
+                        banEgressForHost(config.host, banKey, TLS_CLOSED_ROTATE_BAN_MS);
                         consecutiveTlsClosed = 0;
                         emitLog("info", "TLS handshake keeps being closed via "
-                            ~ (activeEgressLabel.length ? "Mullvad exit " ~ activeEgressLabel : "the direct host IP")
+                            ~ (activeEgressLabel.length ? "Mullvad exit " ~ egressDisplay() : "the direct host IP")
                             ~ " — likely an IP ban on that address; switching to a different exit.");
                         logJsonMap("warn", "connection", "Repeated TLS close — rotating egress",
-                            ["network": config.name, "host": config.host, "egress": label, "event": "egress_tls_close_rotate"]);
+                            ["network": config.name, "host": config.host, "egress": banKey, "event": "egress_tls_close_rotate"]);
                     }
                 }
             }
@@ -3493,10 +4024,18 @@ final class PersistentIRCClient {
             ["network": config.name, "host": config.host, "port": config.port.to!string, "egress": config.egressNodeId, "ipv6Bind": ipv6Bind],
             (ref Span ts) {
             EgressUsed used;
+            // Release before the new connect: happyEyeballsConnect takes the
+            // hold on the slot it wins, and releasing afterwards would cancel
+            // it out when the same slot is reused.
+            releaseEgressSlot();
             connection = happyEyeballsConnect(config.host, config.port, config.egressNodeId, ipv6Bind, &emitLog, used);
             activeEgressLabel = used.label;
             activeEgressHost = used.host;
             activeEgressIp = used.ip;
+            activeEgressLocationId = used.locationId;
+            activeEgressLocation = used.locationText;
+            egressSlotLabel = used.label;
+            egressSlotHeld = used.label.length > 0;
             recordSocketAddrs();
             ts.setStatusOk();
         });
@@ -3504,7 +4043,7 @@ final class PersistentIRCClient {
         emitLog("tcp_open",
             "TCP connection established to " ~ config.host ~ ":" ~ config.port.to!string
             ~ (activePeerIp.length ? " [" ~ activePeerIp ~ "]" : "")
-            ~ (activeEgressLabel.length ? " via " ~ activeEgressLabel ~ " (" ~ activeEgressHost ~ (activeEgressIp.length ? "/" ~ activeEgressIp : "") ~ ")" : " (direct)")
+            ~ (activeEgressLabel.length ? " via " ~ egressDisplay() ~ " (" ~ activeEgressHost ~ (activeEgressIp.length ? "/" ~ activeEgressIp : "") ~ ")" : " (direct)")
             ~ (activeLocalIp.length ? " from " ~ activeLocalIp : "") ~ ".");
         logJsonMap("info", "connection",
             "TCP open",
@@ -3587,13 +4126,18 @@ final class PersistentIRCClient {
                 // For TLS→plain fallback, reuse the same ipv6Bind derived above (in scope via closure)
                 string fallbackIpv6Bind = resolveIpv6Bind();
                 EgressUsed used;
+                releaseEgressSlot();
                 connection = happyEyeballsConnect(config.host, config.port, config.egressNodeId, fallbackIpv6Bind, &emitLog, used);
                 activeEgressLabel = used.label;
                 activeEgressHost = used.host;
                 activeEgressIp = used.ip;
+                activeEgressLocationId = used.locationId;
+                activeEgressLocation = used.locationText;
+                egressSlotLabel = used.label;
+                egressSlotHeld = used.label.length > 0;
                 recordSocketAddrs();
                 logInfo("Plain fallback TCP via egress '%s' (%s/%s) to %s:%d", activeEgressLabel.length ? activeEgressLabel : "direct", activeEgressHost.length ? activeEgressHost : "direct", activeEgressIp.length ? activeEgressIp : "-", config.host, config.port);
-                emitLog("tcp_open", "Re-established plain-text TCP connection to " ~ config.host ~ " via " ~ (activeEgressLabel.length ? activeEgressLabel ~ " (" ~ activeEgressHost ~ (activeEgressIp.length ? "/" ~ activeEgressIp : "") ~ ")" : "direct") ~ ".");
+                emitLog("tcp_open", "Re-established plain-text TCP connection to " ~ config.host ~ " via " ~ (activeEgressLabel.length ? egressDisplay() ~ " (" ~ activeEgressHost ~ (activeEgressIp.length ? "/" ~ activeEgressIp : "") ~ ")" : "direct") ~ ".");
                 logJsonMap("info", "connection", "TLS handshake failed; fell back to plain text", ["network": config.name, "host": config.host, "egress": activeEgressLabel.length ? activeEgressLabel : "direct", "egressHost": activeEgressHost, "egressIp": activeEgressIp, "event": "tls_plain_fallback"]);
                 logInfo("Connected to %s:%s without TLS via %s", config.host, config.port, activeEgressLabel.length ? activeEgressLabel : "direct");
             }
@@ -4634,26 +5178,31 @@ private void processEvents() {
     /// Both branches tell the user what happened in the _server buffer.
     private void applyBanPolicy(string text) {
         import std.string : toLower;
-        const label = activeEgressLabel.length > 0 ? activeEgressLabel : DIRECT_EGRESS_LABEL;
+        const banKey = activeEgressLocationId.length > 0
+            ? activeEgressLocationId : DIRECT_EGRESS_LABEL;
         const via = activeEgressLabel.length > 0
-            ? "Mullvad exit " ~ activeEgressLabel ~ (activeEgressIp.length ? " (" ~ activeEgressIp ~ ")" : "")
+            ? "Mullvad exit " ~ egressDisplay() ~ (activeEgressIp.length ? " (" ~ activeEgressIp ~ ")" : "")
             : "the direct host IP" ~ (activeLocalIp.length ? " (" ~ activeLocalIp ~ ")" : "");
-        banEgressForHost(config.host, label);
+        banEgressForHost(config.host, banKey);
         logJsonMap("warn", "connection", "Egress host-banned after G/K/Z-line",
-            ["network": config.name, "host": config.host, "egress": label, "event": "egress_host_ban"]);
-        const pinnedBanned = config.egressNodeId.length > 0 && config.egressNodeId.toLower() == label;
-        if (!pinnedBanned && hasAlternativeEgressForHost(config.host.toLower(), label)) {
+            ["network": config.name, "host": config.host, "egress": banKey, "event": "egress_host_ban"]);
+        // A pin covers the banned route when it names it exactly ("direct")
+        // or when it is the country/city pin that resolved to this location.
+        const pinnedBanned = config.egressNodeId.length > 0
+            && (config.egressNodeId.toLower() == banKey
+                || locationMatches(banKey, config.egressNodeId.toLower()));
+        if (!pinnedBanned && hasAlternativeEgressForHost(config.host.toLower(), banKey)) {
             throttledUntil = 0;
             emitLog("info", "Banned via " ~ via ~ " — retrying through a different exit.");
             logJsonMap("warn", "connection", "Server BAN detected — failing over to another egress",
-                ["network": config.name, "message": text, "egress": label, "event": "server_ban_failover"]);
+                ["network": config.name, "message": text, "egress": banKey, "event": "server_ban_failover"]);
         } else {
             throttledUntil = Clock.currTime.toUnixTime!long * 1000 + 30 * 60 * 1000;
             emitLog("info", "Banned via " ~ via ~ " and no other exit is available"
                 ~ (pinnedBanned ? " (this network is pinned to it — change \"Connect via\" to use another route)" : "")
                 ~ " — retrying in 30 minutes.");
             logJsonMap("error", "connection", "Server BAN detected (ZLINE/GLINE) — 30m backoff",
-                ["network": config.name, "message": text, "egress": label, "event": "server_ban_detected"]);
+                ["network": config.name, "message": text, "egress": banKey, "event": "server_ban_detected"]);
         }
     }
 

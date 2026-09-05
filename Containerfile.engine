@@ -180,6 +180,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 WORKDIR /app
 
+# tailscale CLI: the engine drives each Mullvad slot's tailscaled through the
+# slot's own LocalAPI socket (`tailscale --socket=<slot> set --exit-node=…`)
+# to retarget an idle exit to the location a user picked.
+COPY --from=tailscale/tailscale:stable /usr/local/bin/tailscale /usr/local/bin/tailscale
+
 COPY --from=builder-engine /build/irc-fiber-engine      /app/irc-fiber-engine
 COPY --from=builder-engine /build/janitor-migrate       /app/janitor-migrate
 COPY config/ ./config/

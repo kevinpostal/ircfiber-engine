@@ -147,13 +147,23 @@ ircfiber_ipv6_prefix: ""
 # rDNS pool host for id-<uid>.pool (e.g. "highgate.ircfiber.com") — optional, for PTR/WHOIS
 ircfiber_ipv6_pool_host: ""
 
-# --- Mullvad egress pool — 3 exits on ubuntu-docker host (root netns) ---
-# The k3s sidecars run in cni0 netns where Tailscale filters 100.64.0.0/10.
-# ubuntu-docker (100.94.116.56) runs in root netns and sees all Mullvad exits.
+# --- Mullvad egress slots (local sidecars, retargetable) ---------------------
+# Long-lived SOCKS slots on the engine host. The engine retargets an *idle*
+# slot's exit node when a user picks a location; `exit_node` is only the boot
+# location. Keep identical to
+# site/deploy/inventories/production/host_vars/vps-efb4b52d.yml — this copy
+# re-renders IRCFIBER_MULLVAD_POOL via deploy-engine.yml's lineinfile, so
+# drift makes the gateway and engine disagree about slot labels.
+#
+# ROLLBACK (host cannot reach Mullvad exits in userspace mode): restore the
+# remote root-netns ports on ubuntu-docker; slots become non-controllable.
+#   - { name: "de", host: "100.94.116.56", port: 1080 } # de-ber-wg-003
+#   - { name: "ch", host: "100.94.116.56", port: 1081 } # ch-zrh-wg-503
+#   - { name: "us", host: "100.94.116.56", port: 1082 } # us-atl-wg-001
 mullvad_sidecars:
-  - { name: "de", host: "100.94.116.56", port: 1080 } # de-ber-wg-003
-  - { name: "ch", host: "100.94.116.56", port: 1081 } # ch-zrh-wg-503
-  - { name: "us", host: "100.94.116.56", port: 1082 } # us-atl-wg-001
+  - { name: "de", exit_node: "de-ber-wg-003.mullvad.ts.net", port: 1055 }
+  - { name: "ch", exit_node: "ch-zrh-wg-503.mullvad.ts.net", port: 1055 }
+  - { name: "us", exit_node: "us-atl-wg-001.mullvad.ts.net", port: 1055 }
 
 # --- Gateway defaults ---------------------------------------------------------
 ircfiber_gateway_log_level: "info"

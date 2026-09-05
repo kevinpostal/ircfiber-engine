@@ -64,8 +64,24 @@
       ansible.builtin.lineinfile:
         path: /etc/ircfiber/engine/env-{{ ircfiber_engine_id }}
         regexp: '^IRCFIBER_MULLVAD_POOL='
-        line: "IRCFIBER_MULLVAD_POOL={% for sc in mullvad_sidecars | default([]) %}socks5://{{ sc.name }}@{{ sc.host }}:{{ sc.port | default(1080) }}{% if not loop.last %},{% endif %}{% endfor %}"
+        line: "IRCFIBER_MULLVAD_POOL={% for sc in mullvad_sidecars | default([]) %}socks5://{{ sc.name }}@{{ sc.host | default('tailscale-mullvad-' ~ sc.name) }}:{{ sc.port | default(1080) }}{% if not loop.last %},{% endif %}{% endfor %}"
         state: "{{ 'present' if (mullvad_sidecars | default([]) | length > 0) else 'absent' }}"
+    # Per-slot tailscaled LocalAPI sockets: present only when this host runs
+    # its own sidecars (entries with `exit_node`), which is what makes a slot
+    # retargetable to another Mullvad city.
+    - name: Sync IRCFIBER_EGRESS_CONTROL_DIR in engine env file
+      ansible.builtin.lineinfile:
+        path: /etc/ircfiber/engine/env-{{ ircfiber_engine_id }}
+        regexp: '^IRCFIBER_EGRESS_CONTROL_DIR='
+        line: "IRCFIBER_EGRESS_CONTROL_DIR=/egress"
+        state: "{{ 'present' if (mullvad_sidecars | default([]) | selectattr('exit_node', 'defined') | list | length > 0) else 'absent' }}"
+    - name: Build the engine's egress control volume mounts
+      ansible.builtin.set_fact:
+        _egress_mounts: >-
+          {{ mullvad_sidecars | default([]) | selectattr('exit_node', 'defined')
+             | map(attribute='name')
+             | map('regex_replace', '^(.+)$', '-v mullvad-\1-ctl:/egress/\1')
+             | join(' ') }}
     # Mirrors roles/engine/tasks/main.yml (ulimits, security_opts, labels).
     # Without `--ulimit nofile` the container inherited dockerd's 1024 soft
     # limit; on 2026-09-02 the engine exhausted it after ~8 h (fd leak) and
@@ -80,6 +96,7 @@
         docker run -d --name {{ engine_container }} --restart unless-stopped \
           --network ircfiber_net --network ircfiber_logging \
           --env-file /etc/ircfiber/engine/env-{{ ircfiber_engine_id }} \
+          {{ _egress_mounts }} \
           --ulimit nofile=65536:65536 \
           --security-opt no-new-privileges:true \
           --label com.ircfiber.component=engine \
@@ -95,6 +112,7 @@
         docker run -d --name {{ engine_container }} --restart unless-stopped \
           --network host \
           --env-file /etc/ircfiber/engine/env-{{ ircfiber_engine_id }} \
+          {{ _egress_mounts }} \
           --ulimit nofile=65536:65536 \
           --security-opt no-new-privileges:true \
           --label com.ircfiber.component=engine \
