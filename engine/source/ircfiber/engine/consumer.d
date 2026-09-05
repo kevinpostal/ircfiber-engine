@@ -518,16 +518,28 @@ private void handleControlMessage(ref EngineContext ctx, ControlMessage msg) {
             {
                 import ircfiber.irc.connection : retargetSlotByLabel;
                 string label, locationId;
+                bool force = false;
                 if (msg.config.type == Json.Type.object) {
                     if (auto l = "label" in msg.config)
                         if (l.type == Json.Type.string) label = l.get!string;
                     if (auto v = "locationId" in msg.config)
                         if (v.type == Json.Type.string) locationId = v.get!string;
+                    // Operator override of the in-use lock (admin confirmed).
+                    if (auto f = "force" in msg.config)
+                        if (f.type == Json.Type.bool_) force = f.get!bool;
                 }
-                const reason = retargetSlotByLabel(label, locationId);
+                const reason = retargetSlotByLabel(label, locationId, force);
+                int bounced = 0;
+                // The slot now exits somewhere else, so the sockets riding it
+                // are pointing through a path the sidecar no longer uses.
+                // Close them and let each network's reconnect loop re-dial.
+                if (reason.length == 0 && force)
+                    bounced = ctx.connManager.bounceNetworksOnEgress(label);
                 logJsonMap(reason.length ? "warn" : "info", "consumer",
                     reason.length ? "Egress retarget refused" : "Egress retarget done",
                     ["label": label, "locationId": locationId,
+                     "forced": force ? "true" : "false",
+                     "bounced": bounced.to!string,
                      "reason": reason, "event": "egress_retarget"]);
             }
             break;

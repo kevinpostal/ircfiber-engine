@@ -942,22 +942,31 @@ ExitLocation[] egressLocations() nothrow {
 ///   "unknown-slot" | "not-controllable" | "busy" | "retargeting"
 ///   | "no-catalog" | "retarget-failed"
 ///
-/// The in-use lock is the same one a user pin obeys: a slot carrying live
-/// connections is refused, never yanked. Shells out, so this runs on the
-/// control-consumer task, never on a connection fiber.
-string retargetSlotByLabel(string label, string pin) nothrow {
+/// `force` is the operator overriding the in-use lock. Without it a slot
+/// carrying live connections is refused, never yanked — which is the right
+/// default for an automatic pin, but on a busy deployment every slot is in
+/// use, so an operator who wants to move an exit has no other way. With
+/// `force`, the connections riding the slot are reconnected onto the new
+/// exit right after the retarget instead of being left to notice the change
+/// when their socket eventually breaks.
+///
+/// Shells out, so this runs on the control-consumer task, never on a
+/// connection fiber.
+string retargetSlotByLabel(string label, string pin, bool force = false) nothrow {
     if (label.length == 0 || pin.length == 0) return "unknown-slot";
     loadMullvadPoolSafe();
     size_t idx = size_t.max;
     string reason;
+    int wasCarrying = 0;
     withPoolLock({
         const now = nowMsSafe();
         foreach (i, ref p; mullvadPool) {
             if (p.label != label) continue;
             if (p.controlSocket.length == 0) { reason = "not-controllable"; return; }
-            if (p.activeConns > 0) { reason = "busy"; return; }
+            if (p.activeConns > 0 && !force) { reason = "busy"; return; }
             if (p.state == "retargeting") { reason = "retargeting"; return; }
             if (pickRelayForPin(gExitRelays, pin).ip.length == 0) { reason = "no-catalog"; return; }
+            wasCarrying = p.activeConns;
             // Reserve exactly as acquireSlotForPin does, so a connect landing
             // between here and the retarget cannot claim the same slot.
             p.state = "retargeting";
@@ -975,7 +984,13 @@ string retargetSlotByLabel(string label, string pin) nothrow {
         if (idx < mullvadPool.length) mullvadPool[idx].heldUntilMs = nowMsSafe() + SLOT_HOLD_MS;
     });
     try {
-        logInfo("Mullvad slot %s: operator retarget to %s complete", label, pin);
+        logJsonMap("info", "connection",
+            "Operator retargeted a Mullvad slot",
+            ["slot": label,
+             "location": pin,
+             "forced": force ? "true" : "false",
+             "carrying": wasCarrying.to!string,
+             "event": "egress_retargeted"]);
     } catch (Exception) {}
     return "";
 }

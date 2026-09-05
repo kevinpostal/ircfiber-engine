@@ -137,6 +137,30 @@ final class ConnectionManager {
         }
     }
 
+    /// Drops the transport of every network currently egressing through the
+    /// named Mullvad slot, so each one's own reconnect loop re-dials and
+    /// re-runs egress selection — landing on the slot's new exit.
+    ///
+    /// Used after an operator force-swaps a slot that was carrying
+    /// connections. Without it those sockets keep pointing at a relay the
+    /// sidecar no longer routes through: nothing errors, the connection just
+    /// goes quiet until the server's ping timeout minutes later. A deliberate
+    /// close turns that into a ~5 s reconnect.
+    int bounceNetworksOnEgress(string egressLabel) {
+        if (egressLabel.length == 0) return 0;
+        int bounced = 0;
+        foreach (id, client; clients) {
+            if (client is null) continue;
+            if (client.getActiveEgressLabel != egressLabel) continue;
+            if (!client.getConnected) continue;
+            logInfo("Egress swap: bouncing %s so it re-dials through the new exit",
+                client.getConfig.name);
+            client.transportClose();
+            bounced++;
+        }
+        return bounced;
+    }
+
     PersistentIRCClient getClient(UUID networkId) {
         const key = networkId.toString();
         if (auto p = key in clients) {
