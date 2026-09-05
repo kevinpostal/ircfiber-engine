@@ -2320,9 +2320,11 @@ final class PersistentIRCClient {
         /// JOIN echo) or refused (471/473/474/…). Bounded; cleared per
         /// connection. Drives the JOIN-throttle retry.
         string[]            joinsAwaitingConfirm;
-        /// One throttle retry per connection — a server that keeps saying
-        /// "wait" must never turn into a JOIN loop.
-        bool                joinThrottleRetried;
+        /// Throttle retry rounds already used on this connection, and whether
+        /// one is waiting out the window right now. Bounded so a server that
+        /// keeps answering "wait" cannot become a JOIN loop.
+        int                 joinThrottleRounds;
+        bool                joinThrottleRetryInFlight;
 
         // Set when REGISTRATION_OVERALL_TIMEOUT_SECS elapses without 001
         // (or a fatal registration error). unix-ms of the most recent
@@ -3321,7 +3323,8 @@ final class PersistentIRCClient {
         // A new socket gets a fresh throttle budget; pending JOINs from the
         // old one are meaningless (the reconnect re-sends the auto-joins).
         joinsAwaitingConfirm = [];
-        joinThrottleRetried = false;
+        joinThrottleRounds = 0;
+        joinThrottleRetryInFlight = false;
     }
 
     /// Max channels tracked for the throttle retry. The auto-join burst is
@@ -3355,45 +3358,73 @@ final class PersistentIRCClient {
         } catch (Exception) {}
     }
 
+    /// Max throttle retry rounds per connection. A server that keeps saying
+    /// "wait" must never turn into a JOIN loop, but one round is not always
+    /// enough: observed on prod, SuperNETs rate-limits *per command*, so the
+    /// first round can itself be partially throttled.
+    private enum MAX_JOIN_THROTTLE_ROUNDS = 3;
+
     /// SuperNETs/DangerousIRCd (and UnrealIRCd anti-flood) answer a JOIN sent
     /// inside the first N seconds after connect with `421 <nick> JOIN :You
-    /// must be connected for at least N seconds…` — the channel is simply
-    /// dropped, so an auto-join burst that raced the window leaves the user
-    /// in no channels at all. Wait out the server's own window and re-send
-    /// the JOINs we never saw confirmed, once per connection.
+    /// must be connected for at least N seconds…` and drop the channel, so an
+    /// auto-join burst that raced the window leaves the user in no channels.
+    ///
+    /// The retry re-sends the unconfirmed channels as ONE comma-separated
+    /// JOIN rather than a burst of them. Prod evidence (2026-09-05, five
+    /// auto-joins on Supernets): a burst of five separate JOINs sent right
+    /// after the window landed only the first — the rest were dropped
+    /// silently by the per-command rate limit. One command is one rate-limit
+    /// hit, and `TARGMAX=…JOIN:` there is unlimited (`CHANLIMIT=#:10`).
     private void scheduleJoinThrottleRetry(uint windowSecs) nothrow {
-        if (joinThrottleRetried) return;
+        if (joinThrottleRetryInFlight) return;
+        if (joinThrottleRounds >= MAX_JOIN_THROTTLE_ROUNDS) return;
         if (joinsAwaitingConfirm.length == 0) return;
-        joinThrottleRetried = true;
+        joinThrottleRounds++;
+        joinThrottleRetryInFlight = true;
         // +1s cushion: the window is measured server-side from its own view
-        // of the connect, which is never earlier than ours.
-        auto waitMs = remainingJoinDelayMs(windowSecs + 1, nowMsSafe(), registrationStartedAtMs);
+        // of the connect, which is never earlier than ours. Later rounds are
+        // answering a fresh 421, so wait the whole window again.
+        auto waitMs = joinThrottleRounds == 1
+            ? remainingJoinDelayMs(windowSecs + 1, nowMsSafe(), registrationStartedAtMs)
+            : (windowSecs + 1) * 1000L;
         if (waitMs <= 0) waitMs = 500;
         try {
-            auto chans = joinsAwaitingConfirm.dup;
             logJsonMap("warn", "connection",
                 "JOIN throttled — retrying after the server's grace period",
                 ["network": config.name,
-                 "channels": chans.join(","),
+                 "channels": joinsAwaitingConfirm.join(","),
+                 "round": joinThrottleRounds.to!string,
                  "windowSecs": windowSecs.to!string,
                  "waitMs": waitMs.to!string,
                  "event": "join_throttled"]);
             runTask({
                 try {
                     sleep(waitMs.msecs);
+                    scope(exit) joinThrottleRetryInFlight = false;
                     if (state != ConnectionState.connected) return;
-                    foreach (chan; chans) {
-                        // Anything confirmed or refused in the meantime is
-                        // gone from the pending set — don't re-ask.
-                        if (!joinsAwaitingConfirm.canFind(chan)) continue;
-                        logInfo("Re-sending throttled JOIN %s for %s", chan, config.name);
-                        sendRaw("JOIN " ~ chan);
+                    // Anything confirmed or refused while we waited is gone
+                    // from the pending set — never re-ask for it.
+                    string[] batch;
+                    size_t len = 5; // "JOIN "
+                    foreach (chan; joinsAwaitingConfirm) {
+                        // Keep the line comfortably inside the 512-byte IRC
+                        // limit; a further round picks up any remainder.
+                        if (len + chan.length + 1 > 400) break;
+                        batch ~= chan;
+                        len += chan.length + 1;
                     }
+                    if (batch.length == 0) return;
+                    logInfo("Re-sending %d throttled JOIN(s) for %s as one command: %s",
+                        cast(int) batch.length, config.name, batch.join(","));
+                    sendRaw("JOIN " ~ batch.join(","));
                 } catch (Exception e) {
+                    joinThrottleRetryInFlight = false;
                     logWarn("JOIN throttle retry failed for %s: %s", config.name, e.msg);
                 }
             });
-        } catch (Exception) {}
+        } catch (Exception) {
+            joinThrottleRetryInFlight = false;
+        }
     }
 
     /// Drops this client's slot refcount if it holds one. Idempotent by
