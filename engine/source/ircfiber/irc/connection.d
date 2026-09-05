@@ -2246,6 +2246,60 @@ unittest {
     assert(remainingJoinDelayMs(6, 906_000, 900_000) == 0);
 }
 
+/// Parses the grace period out of an ERR_UNKNOWNCOMMAND (421) JOIN throttle,
+/// e.g. SuperNETs' `421 <nick> JOIN :You must be connected for at least 5
+/// seconds before you can use this command` (verified on
+/// irc.supernets.org, openwater.supernets.org, 2026-09-05). Returns 0 when
+/// the text is not a throttle notice, so callers can tell "the server is
+/// making us wait" apart from a genuinely unknown command.
+///
+/// The server is the authority on its own window: reading the number here
+/// means a network that says 10 seconds is honoured without configuration.
+uint parseJoinThrottleSeconds(string text) @safe pure nothrow {
+    import std.string : indexOf, toLower;
+    if (text.length == 0) return 0;
+    string lower;
+    try { lower = toLower(text); } catch (Exception) { return 0; }
+    immutable marker = "connected for at least";
+    auto at = lower.indexOf(marker);
+    if (at < 0) return 0;
+    uint secs = 0;
+    bool sawDigit = false;
+    foreach (c; lower[at + marker.length .. $]) {
+        if (c >= '0' && c <= '9') {
+            sawDigit = true;
+            secs = secs * 10 + cast(uint)(c - '0');
+            if (secs > 600) return 600; // absurd window: clamp, never spin
+        } else if (sawDigit) {
+            break;
+        } else if (c != ' ') {
+            return 0; // digits must follow the marker, not prose
+        }
+    }
+    return sawDigit ? secs : 0;
+}
+
+@("parseJoinThrottleSeconds reads the SuperNETs 421 text")
+unittest {
+    assert(parseJoinThrottleSeconds(
+        "You must be connected for at least 5 seconds before you can use this command") == 5);
+    assert(parseJoinThrottleSeconds(
+        "You must be connected for at least 10 seconds before you can use this command") == 10);
+}
+
+@("parseJoinThrottleSeconds ignores unrelated 421 text")
+unittest {
+    assert(parseJoinThrottleSeconds("Unknown command") == 0);
+    assert(parseJoinThrottleSeconds("") == 0);
+    // Same shape, no number — must not be read as "wait 0".
+    assert(parseJoinThrottleSeconds("You must be connected for at least a while") == 0);
+}
+
+@("parseJoinThrottleSeconds clamps an absurd window")
+unittest {
+    assert(parseJoinThrottleSeconds("connected for at least 99999 seconds") == 600);
+}
+
 /// Persistent IRC client with auto-reconnect and IRCv3 support.
 final class PersistentIRCClient {
     private {
@@ -2257,6 +2311,18 @@ final class PersistentIRCClient {
         /// transferred socket fd. When non-null, `processEvents`
         /// uses this instead of `connection`.
         AdoptedSocket      adoptedSocket;
+
+        /// unix-ms when the current registration handshake began (≈ TCP
+        /// connect). The JOIN-throttle window is measured from there, and
+        /// the retry below needs it after registration has returned.
+        long                registrationStartedAtMs;
+        /// Channels whose JOIN we sent but have not seen confirmed (our own
+        /// JOIN echo) or refused (471/473/474/…). Bounded; cleared per
+        /// connection. Drives the JOIN-throttle retry.
+        string[]            joinsAwaitingConfirm;
+        /// One throttle retry per connection — a server that keeps saying
+        /// "wait" must never turn into a JOIN loop.
+        bool                joinThrottleRetried;
 
         // Set when REGISTRATION_OVERALL_TIMEOUT_SECS elapses without 001
         // (or a fatal registration error). unix-ms of the most recent
@@ -3252,6 +3318,82 @@ final class PersistentIRCClient {
         connectedAtMs = 0;
         tlsInfoValid = false;
         tlsInfo = TlsInfo.init;
+        // A new socket gets a fresh throttle budget; pending JOINs from the
+        // old one are meaningless (the reconnect re-sends the auto-joins).
+        joinsAwaitingConfirm = [];
+        joinThrottleRetried = false;
+    }
+
+    /// Max channels tracked for the throttle retry. The auto-join burst is
+    /// the realistic upper bound; the cap only stops an unbounded list when
+    /// a server never answers a JOIN at all.
+    private enum MAX_PENDING_JOINS = 64;
+
+    /// Records the targets of an outgoing `JOIN <chans>[ <keys>]`.
+    private void recordPendingJoins(string argstr) nothrow {
+        try {
+            auto targets = argstr.strip();
+            auto sp = targets.indexOf(' ');
+            if (sp >= 0) targets = targets[0 .. sp]; // drop channel keys
+            foreach (raw; targets.split(",")) {
+                auto chan = normalizeChannelName(raw.strip());
+                if (chan.length == 0) continue;
+                if (joinsAwaitingConfirm.canFind(chan)) continue;
+                if (joinsAwaitingConfirm.length >= MAX_PENDING_JOINS) return;
+                joinsAwaitingConfirm ~= chan;
+            }
+        } catch (Exception) {}
+    }
+
+    /// Drops a channel from the pending set — it either joined or the server
+    /// refused it for a reason waiting will not fix.
+    private void clearPendingJoin(string chan) nothrow {
+        try {
+            auto norm = normalizeChannelName(chan);
+            auto i = joinsAwaitingConfirm.countUntil(norm);
+            if (i >= 0) joinsAwaitingConfirm = joinsAwaitingConfirm.remove(i);
+        } catch (Exception) {}
+    }
+
+    /// SuperNETs/DangerousIRCd (and UnrealIRCd anti-flood) answer a JOIN sent
+    /// inside the first N seconds after connect with `421 <nick> JOIN :You
+    /// must be connected for at least N seconds…` — the channel is simply
+    /// dropped, so an auto-join burst that raced the window leaves the user
+    /// in no channels at all. Wait out the server's own window and re-send
+    /// the JOINs we never saw confirmed, once per connection.
+    private void scheduleJoinThrottleRetry(uint windowSecs) nothrow {
+        if (joinThrottleRetried) return;
+        if (joinsAwaitingConfirm.length == 0) return;
+        joinThrottleRetried = true;
+        // +1s cushion: the window is measured server-side from its own view
+        // of the connect, which is never earlier than ours.
+        auto waitMs = remainingJoinDelayMs(windowSecs + 1, nowMsSafe(), registrationStartedAtMs);
+        if (waitMs <= 0) waitMs = 500;
+        try {
+            auto chans = joinsAwaitingConfirm.dup;
+            logJsonMap("warn", "connection",
+                "JOIN throttled — retrying after the server's grace period",
+                ["network": config.name,
+                 "channels": chans.join(","),
+                 "windowSecs": windowSecs.to!string,
+                 "waitMs": waitMs.to!string,
+                 "event": "join_throttled"]);
+            runTask({
+                try {
+                    sleep(waitMs.msecs);
+                    if (state != ConnectionState.connected) return;
+                    foreach (chan; chans) {
+                        // Anything confirmed or refused in the meantime is
+                        // gone from the pending set — don't re-ask.
+                        if (!joinsAwaitingConfirm.canFind(chan)) continue;
+                        logInfo("Re-sending throttled JOIN %s for %s", chan, config.name);
+                        sendRaw("JOIN " ~ chan);
+                    }
+                } catch (Exception e) {
+                    logWarn("JOIN throttle retry failed for %s: %s", config.name, e.msg);
+                }
+            });
+        } catch (Exception) {}
     }
 
     /// Drops this client's slot refcount if it holds one. Idempotent by
@@ -4309,6 +4451,9 @@ final class PersistentIRCClient {
         // only protects against a tight loop on partial data; it does not
         // protect against a peer that accepts bytes but never replies.
         immutable registrationStartMs = Clock.currTime.toUnixTime!long * 1000;
+        // Mirrored onto the client so the JOIN-throttle retry can measure
+        // the server's grace window after this function has returned.
+        registrationStartedAtMs = registrationStartMs;
         immutable registrationOverallTimeoutMs
             = REGISTRATION_OVERALL_TIMEOUT_SECS * 1000;
         long registrationLastWarnMs = 0;
@@ -5394,6 +5539,8 @@ private void processEvents() {
                     auto chan = normalizeChannelName(params[0]);
                     channelState[chan] = "";
                     if (sameNick(event.nick, sessionNick)) {
+                        // Confirmed: the throttle retry must not re-ask.
+                        clearPendingJoin(chan);
                         // Add our nick to channelUsers immediately so the
                         // current user always appears in the member list,
                         // even if the IRC server omits us from RPL_NAMREPLY
@@ -5570,6 +5717,32 @@ private void processEvents() {
                 awayMessage = event.text;
                 break;
 
+            case "421": { // ERR_UNKNOWNCOMMAND — or a JOIN throttle wearing its clothes
+                auto ps = event.getParams();
+                // `421 <nick> JOIN :You must be connected for at least 5 seconds…`
+                const rejected = ps.length > 1 ? ps[1] : "";
+                import std.uni : icmp;
+                if (rejected.length == 4 && icmp(rejected, "JOIN") == 0) {
+                    const window = parseJoinThrottleSeconds(event.text);
+                    if (window > 0) scheduleJoinThrottleRetry(window);
+                }
+                break;
+            }
+
+            case "403": // ERR_NOSUCHCHANNEL
+            case "405": // ERR_TOOMANYCHANNELS
+            case "471": // ERR_CHANNELISFULL
+            case "473": // ERR_INVITEONLYCHAN
+            case "474": // ERR_BANNEDFROMCHAN
+            case "475": // ERR_BADCHANNELKEY
+            case "477": // ERR_NOCHANMODES / registration required
+            case "489": { // ERR_SECUREONLYCHAN
+                // A refusal waiting will not fix: stop tracking the channel so
+                // a later throttle retry does not re-ask for it.
+                auto ps = event.getParams();
+                if (ps.length > 1) clearPendingJoin(ps[1]);
+                break;
+            }
             case "433": // ERR_NICKNAMEINUSE
             case "432": // ERR_ERRONEUSNICKNAME
                 // Post-registration nick change rejected. The user sent /nick
@@ -7123,6 +7296,13 @@ private void processEvents() {
         if (line.length >= 4 && icmp(line[0 .. 4], "LIST") == 0
             && (line.length == 4 || line[4] == ' ')) {
             beginChannelList(line.length > 5 ? line[5 .. $].strip() : "");
+        }
+        // Remember what we asked to join. Every JOIN — auto-join burst, a
+        // sidebar click, /raw, a bouncer client — funnels through here, so
+        // this is the one place that knows the target set the JOIN-throttle
+        // retry has to re-send (421 names the command, never the channel).
+        if (line.length >= 5 && icmp(line[0 .. 5], "JOIN ") == 0) {
+            recordPendingJoins(line[5 .. $]);
         }
         if (state == ConnectionState.disconnected ||
             (state == ConnectionState.connecting && !transportAlive)) {

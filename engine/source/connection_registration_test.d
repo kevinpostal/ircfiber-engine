@@ -25,6 +25,7 @@ import std.conv : to;
 import vibe.data.json : Json;
 
 import ircfiber.irc.server : ConnectionServer;
+import ircfiber.irc.connection : parseJoinThrottleSeconds, remainingJoinDelayMs;
 
 /// Tracks the number of passing checks.
 int passed;
@@ -47,6 +48,29 @@ string toJsonString(scope ref Json j) { return j.toString(); }
 
 void main() {
     stderr.writeln("\n[connection.registration] admin surface contract");
+
+    // ── JOIN-throttle parsing (SuperNETs 421) ────────────────────────────
+    // Wire text captured from openwater.supernets.org 2026-09-05:
+    //   421 <nick> JOIN :You must be connected for at least 5 seconds
+    //   before you can use this command
+    ok("throttle parser reads the SuperNETs window",
+        parseJoinThrottleSeconds(
+            "You must be connected for at least 5 seconds before you can use this command") == 5);
+    ok("throttle parser honours a longer server window",
+        parseJoinThrottleSeconds(
+            "You must be connected for at least 30 seconds before you can use this command") == 30);
+    ok("throttle parser ignores a real unknown-command 421",
+        parseJoinThrottleSeconds("Unknown command") == 0);
+    ok("throttle parser ignores the phrase without a number",
+        parseJoinThrottleSeconds("You must be connected for at least a while") == 0);
+    ok("throttle parser clamps an absurd window",
+        parseJoinThrottleSeconds("connected for at least 99999 seconds") == 600);
+    // The retry waits out the server's window measured from the connect,
+    // not from the moment the 421 arrived.
+    ok("retry delay covers the remaining window",
+        remainingJoinDelayMs(6, 900_100, 900_000) == 5_900);
+    ok("retry delay is zero once the window elapsed",
+        remainingJoinDelayMs(6, 907_000, 900_000) == 0);
 
     // 1. registrationUnavailableFor defaults to empty
     ConnectionServer s1;
