@@ -47,6 +47,17 @@ final class ConnectionManager {
         // TLS socket before we attempt NICK (otherwise we collide and
         // get a `_` suffix on every hot reload — bug Jul 4 2026).
         HandoffRecord[] pendingHandoffRecords;
+        /// Networks removed on this engine, `networkId` → unix ms.
+        ///
+        /// Stopping a client emits its farewell events (the QUIT echo and
+        /// the server's `ERROR :Quit:`) into the shared event channel, and
+        /// the processor persists whatever it drains — AFTER the delete path
+        /// has cleared that network's scrollback. The result was a deleted
+        /// network keeping a `_server` and `#channel` buffer, which is how
+        /// its rooms stayed renderable at /irc/<name>/channel/%23chan long
+        /// after the sidebar dropped it. The processor consults this map and
+        /// drops those events instead.
+        long[string] removedAtMs;
     }
 
     /// Creates a new connection manager with the given event channel.
@@ -83,6 +94,7 @@ final class ConnectionManager {
         auto client = new PersistentIRCClient(config, mainEventChannel, redis, serverId, userId);
         clients[key] = client;
         networkOwners[key] = userId;
+        removedAtMs.remove(key);
         // Defer start() to avoid runTask() inside the bootstrap loop.
         // The caller must call startDeferredClients() after all networks
         // are loaded.
@@ -102,6 +114,10 @@ final class ConnectionManager {
         clients[key] = client;
         networkOwners[key] = userId;
         client.start();
+        // Re-adding clears the removal marker (reconnectNetwork removes and
+        // immediately re-adds), or every event of the new client would be
+        // dropped as belonging to a deleted network.
+        removedAtMs.remove(key);
     }
 
     /// Starts IRC clients for all networks that were added via addNetwork.
@@ -115,6 +131,10 @@ final class ConnectionManager {
     /// Removes a network and stops its IRC client.
     void removeNetwork(UUID networkId) {
         auto key = networkId.toString();
+        // Marked before `stop()`: stopping is what emits the QUIT/ERROR
+        // farewell into the shared event channel, and those must already be
+        // droppable by the time the processor drains them.
+        removedAtMs[key] = Clock.currTime.toUnixTime!long * 1000;
         if (auto p = key in clients) {
             (*p).stop();
             // Mirror MongoDB's disabled flag into the in-memory config
@@ -125,6 +145,27 @@ final class ConnectionManager {
             clients.remove(key);
             networkOwners.remove(key);
         }
+    }
+
+    /// How long a removal is remembered. Long enough to outlive the event
+    /// pipeline draining a stopped client's farewell, short enough that an
+    /// id re-added later (a network recreated with the same UUID by a
+    /// restore) is not silenced. `addNetwork`/`addAndStartNetwork` clear the
+    /// marker explicitly, so this is only a backstop.
+    private enum long REMOVED_MEMORY_MS = 60_000;
+
+    /// True when this network was removed here and its trailing events must
+    /// not be persisted or published. Prunes stale entries as it goes.
+    bool isRemoved(string networkId) {
+        if (networkId.length == 0) return false;
+        const now = Clock.currTime.toUnixTime!long * 1000;
+        auto at = networkId in removedAtMs;
+        if (at is null) return false;
+        if (now - *at > REMOVED_MEMORY_MS) {
+            removedAtMs.remove(networkId);
+            return false;
+        }
+        return true;
     }
 
     /// Disconnects a network without removing it. If `quitReason` is set

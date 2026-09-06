@@ -67,6 +67,19 @@ void startEventProcessor(ref EngineContext ctx) {
                 if (!ctx.eventChannel.tryConsumeOne(event)) break;
                 processedAny = true;
 
+                // A network removed on this engine keeps emitting for a
+                // moment: stopping the client produces the QUIT echo and
+                // the server's `ERROR :Quit:`. Persisting those re-creates
+                // the scrollback the delete path just cleared, which left a
+                // deleted network's rooms readable at
+                // /irc/<name>/channel/%23chan. Nothing downstream wants
+                // them, so drop them here — before the eid is spent.
+                if (ctx.connManager !is null && ctx.connManager.isRemoved(event.networkId)) {
+                    logDebug("Dropping %s for removed network %s",
+                        event.command, event.networkId);
+                    continue;
+                }
+
                 // IRCCloud-style: assign a global sequential eid to every
                 // event. This is the primary key for pagination, dedup,
                 // and stream resume — always present, never missing.

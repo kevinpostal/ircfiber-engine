@@ -618,31 +618,66 @@ final class BufferManager {
     }
 
     /**
-     * Clear all buffers for a network (all channels + server log).
+     * Clear ALL buffers for a network — every channel and query, plus the
+     * server log and the paired dedup sets.
      *
-     * Called when a network is deleted so a new network with the same
-     * name doesn't inherit old scrollback.
+     * Called when a network is deleted (by the gateway's delete route and
+     * again by the engine after teardown, since the QUIT/ERROR farewell
+     * events are persisted *after* the gateway's clear). This used to drop
+     * only the `_server` key and leave the channel scrollback on its TTL,
+     * which is how a deleted network stayed readable at
+     * `/irc/<name>/channel/%23chan` after the sidebar had dropped it.
+     *
+     * Keys are enumerated by pattern because the channel names are not
+     * known here. `KEYS` (not `SCAN`) deliberately: one-shot delete path,
+     * pattern anchored on a UUID, and a SCAN cursor reply is a nested
+     * multi-bulk that desynchronises the pooled connection when read flat.
      */
     void clearNetworkBuffers(string serverId, string networkId) @trusted {
-        auto db = redis.getDb();
-        // Delete the _server buffer
-        auto serverKey = KEY_PREFIX ~ serverId ~ ":" ~ networkId ~ ":_server";
-        db.del(serverKey);
-        // We don't know all channel names here, but the server log is
-        // the most important one to clear.  Channel buffers will age
-        // out via TTL (7 days) or can be explicitly cleared later if
-        // a channels-list is added to this API.
-        logInfo("Cleared buffers for network %s on server %s", networkId, serverId);
+        if (serverId.length == 0 || networkId.length == 0) {
+            logWarn("clearNetworkBuffers: refusing empty arg (server=%s net=%s)",
+                serverId, networkId);
+            return;
+        }
+        const deleted = deleteByPrefix(serverId ~ ":" ~ networkId ~ ":");
+        logInfo("Cleared %s buffer key(s) for network %s on server %s",
+            deleted.to!string, networkId, serverId);
     }
 
     /**
      * Legacy overload for clearing buffers without server namespace.
      */
     void clearNetworkBuffers(string networkId) @trusted {
+        if (networkId.length == 0) {
+            logWarn("clearNetworkBuffers: refusing empty networkId");
+            return;
+        }
+        const deleted = deleteByPrefix(networkId ~ ":");
+        logInfo("Cleared %s legacy buffer key(s) for network %s",
+            deleted.to!string, networkId);
+    }
+
+    /// Deletes every scrollback + dedup key whose name starts with
+    /// `<prefix>` (already including the trailing colon). Returns the
+    /// number of keys removed.
+    private long deleteByPrefix(string prefix) @trusted {
         auto db = redis.getDb();
-        auto serverKey = KEY_PREFIX ~ networkId ~ ":_server";
-        db.del(serverKey);
-        logInfo("Cleared legacy buffers for network %s", networkId);
+        long deleted = 0;
+        foreach (ns; [KEY_PREFIX, DEDUP_PREFIX]) {
+            string[] keys;
+            try {
+                foreach (k; db.keys(ns ~ prefix ~ "*"))
+                    keys ~= () @trusted { return cast(string) k.idup; }();
+            } catch (Exception e) {
+                logWarn("clearNetworkBuffers: listing %s%s* failed: %s", ns, prefix, e.msg);
+                continue;
+            }
+            foreach (key; keys) {
+                try deleted += db.del(key);
+                catch (Exception e) logWarn("clearNetworkBuffers: DEL %s failed: %s", key, e.msg);
+            }
+        }
+        return deleted;
     }
 
     /**

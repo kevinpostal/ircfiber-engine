@@ -12,6 +12,7 @@ import ircfiber.redis.protocol : RedisKeys, ControlMessage, IRCCommand;
 import ircfiber.models.network : NetworkConfig, TLSMode, SASLMechanism;
 import ircfiber.models.irc_event : IRCRawEvent;
 import ircfiber.logging : logJsonMap;
+import ircfiber.storage.buffer : BufferManager;
 import std.datetime.systime : Clock;
 import core.time : seconds, Duration, msecs;
 
@@ -388,7 +389,30 @@ private void handleControlMessage(ref EngineContext ctx, ControlMessage msg) {
             break;
         case "removeNetwork":
             if (msg.networkId.length) {
+                const key = msg.networkId;
                 ctx.connManager.removeNetwork(parseUUID(msg.networkId));
+                // Tearing the client down emits its own farewell events —
+                // the QUIT echo and the `ERROR :Quit:` line — and those get
+                // persisted like any other event, into scrollback keys the
+                // gateway has usually just deleted. Result: a deleted
+                // network kept a `_server` and `#channel` buffer with a
+                // 30-day TTL, which is what let its rooms still render at
+                // /irc/<name>/channel/%23chan after the sidebar had
+                // (correctly) dropped it. Clearing here, after teardown, is
+                // the only point that runs *last*.
+                try {
+                    auto bm = new BufferManager(ctx.redis);
+                    bm.clearNetworkBuffers(ctx.localServer.serverId, key);
+                } catch (Exception e) {
+                    logWarn("removeNetwork: clearing buffers for %s failed: %s", key, e.msg);
+                }
+                try {
+                    auto db = ctx.redis.getDb();
+                    db.del(RedisKeys.state(ctx.localServer.serverId, key));
+                    db.del(RedisKeys.state_legacy(key));
+                } catch (Exception e) {
+                    logWarn("removeNetwork: failed to clean Redis state for %s: %s", key, e.msg);
+                }
             }
             break;
         case "disconnectNetwork":
