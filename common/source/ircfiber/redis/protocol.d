@@ -180,6 +180,20 @@ struct RedisKeys {
     /// admin endpoint at GET /api/admin/janitor/events.
     static string janitorEvents() { return "irc:janitor:events"; }
 
+    /// FIFO outbox of support-issue announcements (RPUSH by the gateway,
+    /// BLPOP by the #support bot, LTRIM -1000 -1 keeps it bounded).
+    static string supportOutbox() { return "irc:support:outbox"; }
+
+    /// Presence/heartbeat of the #support services bot (JSON, 60 s TTL
+    /// refreshed every ~5 s by the bot process). Read by the admin IRCD page
+    /// through GET /api/admin/support/bot; absent = bot process down.
+    static string supportBot() { return "irc:support:bot"; }
+
+    /// Control commands for the #support bot (RPUSH by the admin API, BLPOP
+    /// by the bot): `{"cmd":"reconnect"|"rejoin","by":"<admin>","ts":<ms>}`.
+    /// Commands older than 60 s are dropped by the consumer.
+    static string supportBotControl() { return "irc:support:bot:control"; }
+
     /// Protocol version key. Written by engine heartbeat (see
     /// `ircfiber.engine.state.writeStateSnapshots`). Gateways and
     /// future Python implementations read this at startup to assert

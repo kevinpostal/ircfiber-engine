@@ -3,6 +3,7 @@ module ircfiber.db.preferences;
 import std.uuid;
 import vibe.data.json;
 import vibe.core.log;
+import vibe.core.sync : TaskMutex;
 import ircfiber.logging : logJsonMap;
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.db.prefs_cache : PrefsCache;
@@ -579,6 +580,53 @@ return newPrefVersion`;
         }
 
         return newVersion;
+    }
+
+    /// Per-user lock table for `mutate()`. Keyed by user id string.
+    ///
+    /// `save()` is atomic for the *counter*, but a caller doing
+    /// `load()` → change a field → `save()` is not: two concurrent
+    /// requests for the same user both read the old blob, and whichever
+    /// reaches the Lua second wins on EVERY field while also getting the
+    /// higher `prefVersion`. That is a lost update, and because the
+    /// frontend resolves conflicts by highest `prefVersion`, the stale
+    /// value also wins on the client.
+    ///
+    /// Observed live: toggling "Desktop notifications" when notification
+    /// permission has not been granted writes `true` then immediately
+    /// `false`; the requests were sent in that order but were assigned
+    /// prefVersion 19 and 18 respectively, so the server kept `true`.
+    private TaskMutex[string] userLocks;
+
+    private TaskMutex lockFor(UUID userId) {
+        const key = userId.toString();
+        if (auto m = key in userLocks) return *m;
+        auto m = new TaskMutex;
+        userLocks[key] = m;
+        return m;
+    }
+
+    /// Serialized read-modify-write of one user's preferences.
+    ///
+    /// `apply` receives the freshly loaded struct by reference and should
+    /// mutate the fields it owns. Returns the `prefVersion` written, or 0
+    /// when `apply` reports nothing changed (no save is issued then).
+    ///
+    /// Every mutating pref endpoint MUST go through this instead of
+    /// hand-rolling `load()`/`save()`, otherwise it reintroduces the lost
+    /// update above.
+    long mutate(UUID userId, scope bool delegate(ref UserPreferences) apply) {
+        auto lock = lockFor(userId);
+        synchronized (lock) {
+            auto prefs = load(userId);
+            if (!apply(prefs)) return 0;
+            return save(userId, prefs);
+        }
+    }
+
+    /// Convenience overload for callers that always save.
+    long mutate(UUID userId, scope void delegate(ref UserPreferences) apply) {
+        return mutate(userId, (ref UserPreferences p) { apply(p); return true; });
     }
 }
 
