@@ -26,6 +26,30 @@ final class UserRepository {
         return docFromBson(doc);
     }
 
+    /**
+     * Finds a user whose username matches case-insensitively.
+     *
+     * Every website username is also the owner's IRC nick and their NickServ
+     * account name, and IRC nicks are case-insensitive — so `Alice` and
+     * `alice` are the same identity on the network and must not be able to
+     * coexist as two website accounts. Signup uses this instead of
+     * `findByUsername` for its uniqueness check.
+     *
+     * ASCII case folding only: the rfc1459 casemapping also equates
+     * `[]\` with `{}|`, which the Anope-side availability check catches.
+     */
+    User findByUsernameCI(string username) {
+        if (username.length == 0) return User.init;
+        auto doc = collection.findOne(Bson([
+            "username": Bson([
+                "$regex": Bson("^" ~ escapeRegexLiteral(username) ~ "$"),
+                "$options": Bson("i")
+            ])
+        ]));
+        if (doc.isNull) return User.init;
+        return docFromBson(doc);
+    }
+
     /// Finds a user by ID.
     User findById(UUID id) {
         auto doc = collection.findOne(["id": id.toString()]);
@@ -159,4 +183,36 @@ final class UserRepository {
             u.loginIps = deserializeBson!(string[])(doc["loginIps"]);
         return u;
     }
+}
+
+/**
+ * Escape every PCRE metacharacter so a stored value is matched literally.
+ * Legacy usernames predate the IRC-nick charset gate and can contain `.`,
+ * `[`, `\`, `^`, `{`, `|`, `}` — all of which would otherwise turn a
+ * uniqueness lookup into a pattern match (`bob.smith` matching `bobXsmith`).
+ */
+private string escapeRegexLiteral(string s) @safe pure {
+    string res;
+    foreach (char c; s) {
+        switch (c) {
+            case '\\': case '^': case '$': case '.': case '[': case ']':
+            case '|':  case '(': case ')': case '?': case '*': case '+':
+            case '{':  case '}': case '/': case '-':
+                res ~= '\\';
+                res ~= c;
+                break;
+            default:
+                res ~= c;
+        }
+    }
+    return res;
+}
+
+@("escapeRegexLiteral neutralises metacharacters in legacy usernames")
+unittest {
+    assert(escapeRegexLiteral("alice") == "alice");
+    assert(escapeRegexLiteral("bob.smith") == "bob\\.smith");
+    assert(escapeRegexLiteral("a[b]c") == "a\\[b\\]c");
+    assert(escapeRegexLiteral("x|y") == "x\\|y");
+    assert(escapeRegexLiteral(".*") == "\\.\\*", "a wildcard username must not match everything");
 }
