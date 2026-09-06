@@ -45,7 +45,9 @@ import ircfiber.irc.pacer : FakeLagPacer, FloodLimits, ChannelLineLimit, LineRat
     parseChannelFloodLines, payloadBudget, sanitizeLine, splitMessage,
     multilineByteCount, multilineBatchCostMs, userModesGrantOper, statusModesOf,
     statusExemptsFromFlood, parseEffectiveFloodNotice, floodExceptionExempts,
-    serverAnswersFloodQuery, targetFloodLimit;
+    serverAnswersFloodQuery, targetFloodLimit, CommandRateBucket, CommandRateLimit,
+    floodTrustedHost, ircdSoftwareFromVersion, parseCommandRateLimit,
+    parseFloodTrustedHosts, serverHasTargetFlood;
 import ircfiber.irc.egress_catalog : ExitLocation, ExitRelay, locationMatches,
     locationsFromRelays, parseExitOnline, parseExitRelays, parseSelectedExit,
     pickRelayForPin;
@@ -111,6 +113,32 @@ private enum STREAM_BUFFER_SIZE           = 4096;
 private enum DNS_CACHE_TTL_MS             = 30_000;
 private enum QUIT_GRACE_PERIOD_MS         = 2_000;  // wait this long for server to close after QUIT
 private enum STARTTLS_REPLY_TIMEOUT_MS      = 15_000; // wait this long for 670 after STARTTLS
+
+// ── Flood trust (the one ircd whose limits we know) ──────────────────────────
+// The engine paces nothing until a server complains, because IRC never
+// advertises its flood configuration and modelling a guess throttled real
+// pastes. The exception is the platform ircd: the deploy renders the same
+// `commandrate`/`threshold` into its InspIRCd `<connect name="ircfiber-engine">`
+// block and into this env, so the model there is a fact, not an assumption.
+private struct FloodTrustSettings {
+    string[] hosts;
+    CommandRateLimit rate;
+}
+
+/// Parsed once per thread — the environment cannot change under a process.
+private FloodTrustSettings floodTrustSettings() {
+    import std.process : environment;
+
+    static bool loaded;
+    static FloodTrustSettings cached;
+    if (loaded) return cached;
+    loaded = true;
+    cached.hosts = parseFloodTrustedHosts(environment.get("IRCFIBER_FLOOD_TRUSTED_HOSTS", ""));
+    cached.rate = parseCommandRateLimit(
+        environment.get("IRCFIBER_FLOOD_TRUSTED_THRESHOLD", ""),
+        environment.get("IRCFIBER_FLOOD_TRUSTED_COMMANDRATE", ""));
+    return cached;
+}
 
 // ── Per-host circuit breaker ─────────────────────────────────────────────────
 // Prevents hammering unresponsive servers with rapid reconnect attempts.
@@ -2497,6 +2525,25 @@ final class PersistentIRCClient {
         /// keyed by lowercase channel.
         ChannelLineLimit[string] chanFloodLimit;
         LineRateWindow[string]   chanFloodWindow;
+        /// True when this network's ircd flood configuration is one we
+        /// author ourselves (`IRCFIBER_FLOOD_TRUSTED_HOSTS` — in production
+        /// `irc.ircfiber.com`, whose `<connect name="ircfiber-engine">`
+        /// class every platform user is multiplexed through).
+        ///
+        /// There the guessing stops: `trustedRate` is that class's real
+        /// `commandrate`/`threshold`, and it MUST be respected because the
+        /// class runs `fakelag="no"` — InspIRCd kills an over-rate client
+        /// with `Excess Flood` instead of delaying it (verified against
+        /// `scripts/flood-ircd`: 300 lines at once → kill on line 101).
+        bool                floodTrusted;
+        /// ditto — the `<connect>` numbers, from the env the deploy renders.
+        CommandRateLimit    trustedRate;
+        /// Local model of InspIRCd's per-user command-penalty counter.
+        /// Only used while `floodTrusted`.
+        CommandRateBucket   cmdBucket;
+        /// Unix ms of the last "still sending" server-log line, so a long
+        /// paste reports progress instead of looking hung.
+        long                lastPacedNoticeMs;
         /// Our own `nick!user@host` as other clients see it (396
         /// RPL_VISIBLEHOST, or the echo of our own JOIN). Drives the
         /// per-line payload budget; empty until known.
@@ -4352,6 +4399,12 @@ final class PersistentIRCClient {
         lastFloodNoticeChannel = "";
         chanFloodWindow.clear();
         lastPacedWriteMs = 0;
+        // The command-penalty counter is per TCP session too. The trust
+        // itself is per host, so re-derive it here: a network can be edited
+        // between attempts.
+        cmdBucket.clear();
+        lastPacedNoticeMs = 0;
+        applyFloodTrust();
         // A dropped connection can strand us inside a `BATCH +chathistory`
         // (the closing `BATCH -` never arrives — verified live: every row
         // for #superbowl stored with `batch=chathistory`, so the bouncer's
@@ -7117,6 +7170,36 @@ private void processEvents() {
         return identified ? KNOWN_USER_LIMITS : UNKNOWN_USER_LIMITS;
     }
 
+    /// Resolves `IRCFIBER_FLOOD_TRUSTED_HOSTS` for this network.
+    ///
+    /// Everything else the pacer knows is a guess about a configuration IRC
+    /// never advertises, which is why it now stays out of the way until the
+    /// server complains (see `FakeLagPacer`). Our own ircd is the exception:
+    /// the deploy renders the same `commandrate`/`threshold` into the
+    /// InspIRCd `<connect>` block and into this env, so here the numbers are
+    /// facts — and `fakelag="no"` on that class makes exceeding them a kill,
+    /// not a delay, so they are respected rather than assumed away.
+    private void applyFloodTrust() {
+        auto cfgTrust = floodTrustSettings();
+        const trusted = floodTrustedHost(cfgTrust.hosts, config.host);
+        if (trusted == floodTrusted) {
+            floodTrusted = trusted;
+            trustedRate = cfgTrust.rate;
+            return;
+        }
+        floodTrusted = trusted;
+        trustedRate = cfgTrust.rate;
+        if (!trusted) return;
+        logJsonMap("info", "connection",
+            "Platform ircd — pacing against its own connect class",
+            ["network":     config.name,
+             "networkId":   config.id.toString(),
+             "host":        config.host,
+             "commandRate": trustedRate.commandRateMilli.to!string,
+             "threshold":   trustedRate.threshold.to!string,
+             "event":       "flood_trusted_host"]);
+    }
+
     /// Queues a user-originated message line behind the pacer.
     ///
     /// Protocol-critical traffic (PING/PONG, CAP, NICK, registration) must
@@ -7256,8 +7339,18 @@ private void processEvents() {
     /// Writes as many paced lines as the server will currently accept.
     ///
     /// Called from `processOutboundQueue` on every event-loop tick (50 ms).
-    /// In the normal case nothing is delayed at all: the gate only bites
-    /// once the modelled recvq or a per-target flood window fills.
+    ///
+    /// Three gates, in order of how much we actually know:
+    ///   1. the platform ircd's real `<connect>` command rate, when this is
+    ///      a trusted host — a fact, and one that kills us if ignored;
+    ///   2. the fake-lag/recvq model, which only paces after the server has
+    ///      complained (`FakeLagPacer` is unarmed until then — IRCCloud
+    ///      sends at wire speed and so do we);
+    ///   3. per-target ceilings: a channel's advertised `+f`, always, and
+    ///      UnrealIRCd's unadvertised `target-flood`, only on software that
+    ///      has it AND only once the server has already complained. That
+    ///      assumed ceiling is what throttled a 500-line paste to ~7
+    ///      lines/second on an InspIRCd network that has no such limit.
     private void drainPacedQueue() {
         if (pacedQueue.length == 0) return;
         if (state != ConnectionState.connected) return;
@@ -7271,12 +7364,20 @@ private void processEvents() {
             pacer.relax();
             lastFloodComplaintMs = now;   // one step per minute of quiet
         }
+        const startedWith = pacedQueue.length;
 
         while (pacedQueue.length > 0) {
             auto line = pacedQueue[0];
             // The server charges fake lag on the whole command it receives.
             const cmdBytes = line.length + 2;      // + CRLF
-            if (pacer.waitMs(cmdBytes, now) > 0) return;
+            if (floodTrusted && cmdBucket.waitMs(now, trustedRate) > 0) {
+                reportPacing(now, startedWith);
+                return;
+            }
+            if (pacer.waitMs(cmdBytes, now) > 0) {
+                reportPacing(now, startedWith);
+                return;
+            }
 
             auto target = messageTargetOf(line);
             if (target.length > 0) {
@@ -7286,20 +7387,26 @@ private void processEvents() {
                     chanFloodWindow[key] = LineRateWindow.init;
                     w = key in chanFloodWindow;
                 }
-                // Two independent per-target ceilings:
-                //  * `+f` — kicks or sets +m, and ops are exempt.
-                //  * target-flood — applies to EVERYONE and silently DROPS
-                //    the message, so the user just sees lines vanish. Only
-                //    `immune:target-flood` escapes it, which is a different
-                //    privilege from `immune:lag`, so oper immunity here is
-                //    NOT assumed.
-                const isChan = target.length > 0
-                    && (target[0] == '#' || target[0] == '&' || target[0] == '!' || target[0] == '+');
-                auto lim = targetFloodLimit(isChan, isNoticeLine(line));
-                auto chanLim = floodLimitFor(target);
-                if (chanLim.valid() && stricterLimit(chanLim, lim)) lim = chanLim;
+                // `+f` is advertised by the channel itself, so it is always
+                // honoured — exceeding it gets us kicked or the channel
+                // moderated, which loses the rest of the paste. UnrealIRCd's
+                // `target-flood` is neither advertised nor universal: it
+                // silently DROPS messages, so it is respected once the
+                // server has shown it rate-limits us, but never assumed on
+                // an ircd that does not implement it at all.
+                auto lim = floodLimitFor(target);
+                if (pacer.isArmed() && !floodTrusted
+                    && serverHasTargetFlood(ircdSoftwareFromVersion(serverSoftware))) {
+                    const isChan = target[0] == '#' || target[0] == '&'
+                        || target[0] == '!' || target[0] == '+';
+                    auto tf = targetFloodLimit(isChan, isNoticeLine(line));
+                    if (!lim.valid() || stricterLimit(tf, lim)) lim = tf;
+                }
                 if (lim.valid()) {
-                    if (w.waitMs(now, lim) > 0) return;
+                    if (w.waitMs(now, lim) > 0) {
+                        reportPacing(now, startedWith);
+                        return;
+                    }
                     w.record(now);
                 }
             }
@@ -7312,6 +7419,38 @@ private void processEvents() {
                 return;
             }
         }
+    }
+
+    /// Tells the user their paste is still going out, at most every 5 s.
+    ///
+    /// A queue that drains slowly is indistinguishable from a hung client:
+    /// the reported symptom was "it posted a chunk and then waited way too
+    /// long", with nothing anywhere saying why. Only fires for a backlog big
+    /// enough to be worth a line in the server log.
+    private void reportPacing(long nowMs, size_t startedWith) {
+        enum size_t PACED_NOTICE_MIN_QUEUE = 25;
+        enum long PACED_NOTICE_INTERVAL_MS = 5_000;
+        if (pacedQueue.length < PACED_NOTICE_MIN_QUEUE) return;
+        if (lastPacedNoticeMs > 0 && nowMs - lastPacedNoticeMs < PACED_NOTICE_INTERVAL_MS) return;
+        lastPacedNoticeMs = nowMs;
+        const sent = startedWith > pacedQueue.length ? startedWith - pacedQueue.length : 0;
+        const reason = floodTrusted
+            ? "the server accepts " ~ (trustedRate.commandRateMilli / 1000).to!string
+              ~ " lines/second"
+            : pacer.isArmed()
+                ? "the server asked us to slow down"
+                : "a channel rate limit (+f)";
+        emitLog("flood_pacing",
+            "Sending queued lines: " ~ pacedQueue.length.to!string ~ " left ("
+            ~ sent.to!string ~ " sent this pass) — " ~ reason);
+        logJsonMap("info", "connection",
+            "Pacing outbound queue",
+            ["network":   config.name,
+             "networkId": config.id.toString(),
+             "queued":    pacedQueue.length.to!string,
+             "trusted":   floodTrusted.to!string,
+             "armed":     pacer.isArmed().to!string,
+             "event":     "flood_pacing"]);
     }
 
     /// Server NOTICE texts that mean "you are sending too fast". Deliberately
@@ -7478,6 +7617,10 @@ private void processEvents() {
         // reach a socket — keeps the model honest. Multiline batches are
         // charged as one clamped lump instead, so they suppress this.
         if (!chargeSuppressed) pacer.charge(line.length + 2, unixMsNow());
+        // InspIRCd charges one penalty point per COMMAND, whatever its
+        // length, and it charges them for our PING/WHO/JOIN/MODE traffic
+        // too — so the bucket has to see every line, not just paced ones.
+        if (floodTrusted) cmdBucket.record(unixMsNow(), trustedRate);
         if (tlsStream !is null) {
             try {
                 tlsStream.write((line ~ "\r\n").dup);

@@ -125,15 +125,25 @@ size_t multilineByteCount(const string[] lines, const bool[] concat)
 /// default) disconnects us. So the correct gate is "will this line fit in
 /// the server's receive queue", not "has our fake lag run out".
 ///
-/// IRCCloud reaches the same conclusion by doing nothing: its web client has
-/// no send-side throttle whatsoever (the only `_.throttle` in its bundle
-/// caps *typing notifications* at 3 s), and it merely reacts to the
-/// server's `*** Message to #x throttled due to flooding` notice.
+/// **IRCCloud parity is the default.** IRCCloud's web client has no
+/// send-side throttle whatsoever (the only `_.throttle` in its bundle caps
+/// *typing notifications* at 3 s); it sends at wire speed and merely reacts
+/// to the server's `*** Message to #x throttled due to flooding` notice.
+/// Modelling a flood configuration no server advertises means guessing, and
+/// the guess was wrong in the expensive direction: a 500-line ANSI-art paste
+/// crawled out at a few lines a second on a network that applies no fake lag
+/// to us at all.
 ///
-/// Consequence: with 8000 bytes of recvq and ~60-byte chat lines, ~80 lines
-/// can be in flight at once. Interactive typing is never delayed, a normal
-/// paste goes out at wire speed, and only a genuinely huge dump gets paced —
-/// and then only as fast as the server drains it.
+/// So this pacer stays OUT of the way until the server itself says
+/// otherwise: `waitMs` admits everything until `tighten()` records a real
+/// complaint (439/707, a flood NOTICE, a FAIL, an Excess Flood kill). From
+/// that moment the model below is exactly what is wanted — it is the only
+/// thing that knows how fast the queue can drain — and it stays armed for
+/// the rest of the session, surviving the reconnect a kill causes.
+///
+/// The one server whose limits are known without being told is our own:
+/// `CommandRateLimit` models the `<connect>` class we ship, and the engine
+/// applies it to the hosts in `IRCFIBER_FLOOD_TRUSTED_HOSTS`.
 struct FakeLagPacer {
     private {
         FloodLimits lim = UNKNOWN_USER_LIMITS;
@@ -159,6 +169,13 @@ struct FakeLagPacer {
         /// can withhold it — hence `tighten()` revokes this on the first
         /// complaint rather than trusting oper status forever.
         bool immune;
+        /// True once the server has actually rate-limited us on this
+        /// session. Until then nothing is paced and nothing is modelled:
+        /// the flood configuration is unknowable from the client side, and
+        /// guessing it throttled real pastes for no reason. Survives
+        /// reconnects on purpose — an Excess Flood kill must not be
+        /// forgotten by the reconnect it caused.
+        bool armed;
     }
 
     /// Current parameters (for logging and tests).
@@ -172,6 +189,10 @@ struct FakeLagPacer {
 
     /// Whether the server currently exempts us from fake lag.
     bool isImmune() const pure nothrow @safe { return immune; }
+
+    /// Whether the server has complained, i.e. whether this pacer paces at
+    /// all. False is the normal, IRCCloud-equivalent state.
+    bool isArmed() const pure nothrow @safe { return armed; }
 
     /// Grants or withdraws the fake-lag exemption (oper gained/lost).
     /// Granting also zeroes the accrual: the server stops counting for us.
@@ -231,8 +252,12 @@ struct FakeLagPacer {
 
     /// 0 when a `cmdBytes`-byte command may be written now, otherwise the
     /// number of milliseconds to wait before asking again.
+    ///
+    /// Admits everything until the server has complained at least once
+    /// (`armed`): the flood configuration is not advertised, and pacing
+    /// against a guess is what made large pastes crawl. See the struct doc.
     long waitMs(size_t cmdBytes, long nowMs) pure nothrow @safe {
-        if (immune) return 0;
+        if (immune || !armed) return 0;
         advance(nowMs);
 
         // A server complaint imposes a real minimum interval. The recvq gate
@@ -256,8 +281,12 @@ struct FakeLagPacer {
     }
 
     /// Records that a `cmdBytes`-byte command was written.
+    ///
+    /// Nothing is modelled before the first complaint — the backlog estimate
+    /// would be an unbounded list of guesses nobody reads, and `tighten()`
+    /// assumes a full queue anyway when it arms the pacer.
     void charge(size_t cmdBytes, long nowMs) pure nothrow @safe {
-        if (immune) return;
+        if (immune || !armed) return;
         advance(nowMs);
         pending ~= cmdBytes;
         lastSendMs = nowMs;
@@ -280,7 +309,7 @@ struct FakeLagPacer {
 
     /// Charges a completed batch its single clamped penalty.
     void chargeBatch(const string[] lines, long nowMs) pure nothrow @safe {
-        if (immune) return;
+        if (immune || !armed) return;
         drain(nowMs);
         accruedMs += multilineBatchCostMs(lines, lim);
     }
@@ -289,6 +318,10 @@ struct FakeLagPacer {
     /// an Excess Flood kill): double the modelled per-command penalty and
     /// assume we are already at the ceiling, so the next line waits.
     void tighten(long nowMs) pure nothrow @safe {
+        // From here on we pace. Before the first complaint the pacer admits
+        // everything (IRCCloud parity) because nothing on the wire says what
+        // the server's flood limits are; a complaint is that statement.
+        armed = true;
         // An exemption we assumed from oper status is disproved the moment
         // the server rate-limits us: `immune:lag` can be withheld from an
         // oper block, and other ircds grant opers nothing at all.
@@ -314,13 +347,22 @@ struct FakeLagPacer {
         accruedMs = max(accruedMs, cast(long)lim.ceilingMs);
     }
 
-    /// Undoes one tightening step (called after a long quiet period).
+    /// Undoes one tightening step (called after a long quiet period). Once
+    /// every step is undone the pacer stands down completely: the server has
+    /// been quiet for minutes, so the complaint that armed it is stale and
+    /// keeping a modelled ceiling would throttle pastes again for nothing.
     void relax() pure nothrow @safe {
         if (tightenSteps == 0) return;
         tightenSteps--;
         lim.penaltyMs = max(lim.penaltyMs / 2, 1);
         lim.recvqUsePct = min(lim.recvqUsePct * 2, 60);
         minIntervalMs = minIntervalMs > 1 ? minIntervalMs / 2 : 0;
+        if (tightenSteps == 0) {
+            armed = false;
+            minIntervalMs = 0;
+            pending = null;
+            accruedMs = 0;
+        }
     }
 
     /// New TCP connection: the server's recvq and fake lag both start empty.
@@ -462,6 +504,196 @@ struct LineRateWindow {
 
     /// Forgets all history (new connection, or channel re-joined).
     void clear() pure nothrow @safe { stamps = null; }
+}
+
+// ---------------------------------------------------------------------------
+// Which ircd are we actually talking to
+// ---------------------------------------------------------------------------
+
+/// Server software, as far as it can be identified from the wire.
+///
+/// This matters because the assumptions above are UnrealIRCd's. In
+/// particular `set::anti-flood::everyone::target-flood` — the silent
+/// per-target message drop the `TARGET_FLOOD_*` ceilings guard against —
+/// exists ONLY on UnrealIRCd. InspIRCd has no per-target message rate at
+/// all (it rate-limits *commands* per user, see `CommandRateLimit`), and
+/// neither does Ergo or Solanum. Applying an Unreal-only ceiling to an
+/// InspIRCd network throttles a paste to ~7 lines/second for nothing.
+enum IrcdSoftware {
+    unknown,
+    unreal,
+    inspircd,
+    ergo,
+    solanum
+}
+
+/// Identify the server from its RPL_MYINFO (004) version token, e.g.
+/// `InspIRCd-4`, `UnrealIRCd-6.1.7`, `ergo-2.18.0`, `solanum-1.0.0`.
+IrcdSoftware ircdSoftwareFromVersion(string version_) pure nothrow @safe {
+    string v;
+    try v = version_.toLower();
+    catch (Exception) return IrcdSoftware.unknown;
+    if (v.canFind("inspircd")) return IrcdSoftware.inspircd;
+    if (v.canFind("unreal")) return IrcdSoftware.unreal;
+    if (v.canFind("ergo") || v.canFind("oragono")) return IrcdSoftware.ergo;
+    if (v.canFind("solanum") || v.canFind("charybdis")) return IrcdSoftware.solanum;
+    return IrcdSoftware.unknown;
+}
+
+/// Whether this software implements UnrealIRCd's `target-flood` silent
+/// per-target message drop. Unknown software is assumed to, because the
+/// failure mode there is invisible message loss.
+bool serverHasTargetFlood(IrcdSoftware s) pure nothrow @safe @nogc {
+    final switch (s) {
+        case IrcdSoftware.unreal:
+        case IrcdSoftware.unknown:
+            return true;
+        case IrcdSoftware.inspircd:
+        case IrcdSoftware.ergo:
+        case IrcdSoftware.solanum:
+            return false;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// InspIRCd command-penalty model
+// ---------------------------------------------------------------------------
+
+/// InspIRCd's `<connect>` flood parameters.
+///
+/// InspIRCd does not scale its penalty by command length the way
+/// UnrealIRCd's fake lag does: every command costs one penalty point (a few,
+/// like `OPER`, cost up to ten), the points drain at `commandrate`
+/// millicommands per second (1000 = one command per second), and reaching
+/// `threshold` ends the connection — `fakelag="no"` KILLS with
+/// `Excess Flood` rather than delaying, which is precisely why a client that
+/// knows these numbers must pace itself to stay under them.
+///
+/// These are never advertised on the wire. They are only known for the one
+/// network whose `<connect>` block we author ourselves (see
+/// `IRCFIBER_FLOOD_TRUSTED_HOSTS`), which is where this model is used.
+struct CommandRateLimit {
+    /// `<connect threshold>` — penalty points before the kill.
+    int threshold;
+    /// `<connect commandrate>` — millicommands/second.
+    int commandRateMilli;
+    /// Percentage of `threshold` we allow ourselves to occupy. The rest
+    /// absorbs commands we do not send from this queue: PING/PONG, WHO,
+    /// JOIN, a NICK, and any bouncer client sharing the session.
+    int usePct = 70;
+
+    bool valid() const pure nothrow @safe @nogc {
+        return threshold > 0 && commandRateMilli > 0;
+    }
+}
+
+/// The `<connect name="ircfiber-engine">` class every platform user is
+/// multiplexed through (`roles/ircd/templates/inspircd.conf.j2`):
+/// `commandrate="100000" threshold="100" fakelag="no"` — 100 commands per
+/// second sustained, a burst of 100, and an Excess Flood kill above it.
+/// Kept in sync with ansible through `IRCFIBER_FLOOD_TRUSTED_*`.
+enum CommandRateLimit PLATFORM_COMMAND_RATE = CommandRateLimit(100, 100_000, 70);
+
+/// Local model of InspIRCd's per-user command penalty counter.
+struct CommandRateBucket {
+    private {
+        /// Accrued penalty in thousandths of a point, so the drain rate can
+        /// be applied in integer millicommands without rounding to zero.
+        long penaltyMilli;
+        long lastTickMs;
+    }
+
+    /// Accrued penalty points (for logging).
+    long penaltyPoints() const pure nothrow @safe @nogc { return penaltyMilli / 1000; }
+
+    private void drain(long nowMs, const CommandRateLimit lim) pure nothrow @safe @nogc {
+        if (lastTickMs == 0) {
+            lastTickMs = nowMs;
+            return;
+        }
+        if (nowMs <= lastTickMs) return;
+        penaltyMilli -= (nowMs - lastTickMs) * lim.commandRateMilli / 1000;
+        if (penaltyMilli < 0) penaltyMilli = 0;
+        lastTickMs = nowMs;
+    }
+
+    /// Budget in thousandths of a point.
+    private static long budgetMilli(const CommandRateLimit lim) pure nothrow @safe @nogc {
+        const pct = lim.usePct <= 0 || lim.usePct > 100 ? 70 : lim.usePct;
+        auto b = cast(long)lim.threshold * 1000 * pct / 100;
+        // One command must always fit, or the queue would never move.
+        return b < 1000 ? 1000 : b;
+    }
+
+    /// 0 when one more command fits under the budget, else the wait in ms.
+    long waitMs(long nowMs, const CommandRateLimit lim) pure nothrow @safe @nogc {
+        if (!lim.valid()) return 0;
+        drain(nowMs, lim);
+        const budget = budgetMilli(lim);
+        const over = penaltyMilli + 1000 - budget;
+        if (over <= 0) return 0;
+        // ms needed to drain `over` thousandths at commandRateMilli per second.
+        const wait = (over * 1000 + lim.commandRateMilli - 1) / lim.commandRateMilli;
+        return wait < 1 ? 1 : wait;
+    }
+
+    /// Records one command of `points` penalty (1 for ordinary commands).
+    void record(long nowMs, const CommandRateLimit lim, int points = 1) pure nothrow @safe @nogc {
+        if (!lim.valid()) return;
+        drain(nowMs, lim);
+        penaltyMilli += cast(long)(points < 1 ? 1 : points) * 1000;
+    }
+
+    /// New TCP session: the server's counter starts at zero.
+    void clear() pure nothrow @safe @nogc {
+        penaltyMilli = 0;
+        lastTickMs = 0;
+    }
+}
+
+/// Parses `IRCFIBER_FLOOD_TRUSTED_HOSTS`: a comma-separated host list.
+/// Empty entries are dropped; an empty result disables the trust entirely.
+string[] parseFloodTrustedHosts(string csv) pure @safe {
+    string[] hosts;
+    foreach (part; csv.split(",")) {
+        auto h = part.strip().toLower();
+        if (h.length == 0) continue;
+        if (!hosts.canFind(h)) hosts ~= h;
+    }
+    return hosts;
+}
+
+/// Whether `host` is one whose flood configuration we author (exact match,
+/// case-insensitive — hostnames are). Deliberately NOT a suffix match: a
+/// wildcard would hand the same trust to any subdomain somebody registers.
+bool floodTrustedHost(const string[] hosts, string host) pure @safe {
+    if (hosts.length == 0 || host.length == 0) return false;
+    const h = host.strip().toLower();
+    foreach (t; hosts)
+        if (t == h) return true;
+    return false;
+}
+
+/// Parses the `IRCFIBER_FLOOD_TRUSTED_THRESHOLD` /
+/// `IRCFIBER_FLOOD_TRUSTED_COMMANDRATE` pair, falling back to the shipped
+/// `ircfiber-engine` numbers when either is missing or unparseable — a typo
+/// in the env must not silently remove the ceiling.
+CommandRateLimit parseCommandRateLimit(string threshold, string commandRate) pure @safe {
+    CommandRateLimit lim = PLATFORM_COMMAND_RATE;
+    static int num(string s, int fallback) pure @safe {
+        auto t = s.strip();
+        if (t.length == 0) return fallback;
+        int v = 0;
+        foreach (c; t) {
+            if (!isDigit(c)) return fallback;
+            v = v * 10 + (c - '0');
+            if (v > 10_000_000) return fallback;
+        }
+        return v > 0 ? v : fallback;
+    }
+    lim.threshold = num(threshold, PLATFORM_COMMAND_RATE.threshold);
+    lim.commandRateMilli = num(commandRate, PLATFORM_COMMAND_RATE.commandRateMilli);
+    return lim;
 }
 
 /// `draft/multiline` CAP value.
@@ -818,47 +1050,52 @@ string[] splitMessage(string text, size_t maxBytes, out bool[] concatFlags)
 }
 
 @safe unittest {
-    // The gate is the server's recvq, not its patience. Budget is
-    // 8000 * 60% = 4800 bytes, so ~60-byte chat lines go out in a burst of
-    // 80 queued — plus the ~10 the server processes outright before fake
-    // lag reaches its 10 s ceiling, which free their recvq bytes again.
-    // 90 lines with zero delay is what "as fast as I can type" needs.
+    // The default contract: nothing is paced until the server complains.
+    // This is the IRCCloud behaviour — its client has no send-side throttle
+    // — and it is what makes a 500-line ANSI-art paste leave at wire speed
+    // instead of trickling out against a flood model nobody advertised.
     FakeLagPacer p;
     long t = 1_000_000;
-    int sent = 0;
-    while (p.waitMs(60, t) == 0 && sent < 500) {
-        p.charge(60, t);
-        sent++;
+    assert(!p.isArmed(), "a fresh pacer must not pace");
+    foreach (i; 0 .. 500) {
+        assert(p.waitMs(400, t) == 0, "line " ~ i.to!string ~ " must not wait");
+        p.charge(400, t);
     }
-    assert(sent == 90, "burst size " ~ sent.to!string);
-    assert(p.waitMs(60, t) > 0, "the 91st line has to wait for drain");
-
-    // Sustained throughput is whatever the server drains, and that IS the
-    // fake-lag rate: ~10 commands per 10 s ceiling-cycle for small lines.
-    // Bursts are free; only a sustained dump is rate-limited, by the server.
-    const before = p.backlogBytes();
-    t += 11_000;
-    assert(p.waitMs(60, t) == 0, "drain must free room");
-    assert(p.backlogBytes() < before, "backlog must shrink");
-    int more = 0;
-    while (p.waitMs(60, t) == 0 && more < 100) { p.charge(60, t); more++; }
-    assert(more == 10, "freed slots " ~ more.to!string);
+    assert(p.backlogBytes() == 0, "nothing is modelled while unarmed");
+    assert(p.canStartBatch(t));
 }
 
 @safe unittest {
-    // A 40-line paste of ordinary lines never waits — the whole point.
+    // Once the server HAS complained the model takes over, and it is the
+    // recvq — not the server's patience — that gates the next line.
     FakeLagPacer p;
-    long t = 500_000;
-    foreach (i; 0 .. 40) {
-        assert(p.waitMs(70, t) == 0, "line " ~ i.to!string ~ " must not wait");
-        p.charge(70, t);
-    }
+    long t = 1_000_000;
+    p.tighten(t);
+    assert(p.isArmed());
+    // The complaint imposes a real minimum interval, so the next line waits.
+    assert(p.waitMs(60, t) > 0);
+
+    // After a complaint the dominant gate is the minimum interval it
+    // imposes: one line, then wait out the penalty. That is the whole point
+    // of arming — the server just told us it is dropping or deferring us.
+    t += 20_000;
+    assert(p.waitMs(60, t) == 0, "the interval has elapsed");
+    p.charge(60, t);
+    const w = p.waitMs(60, t);
+    assert(w > 1_000 && w <= 2_000, "armed min-interval " ~ w.to!string);
+    t += w;
+    assert(p.waitMs(60, t) == 0, "waiting it out admits the next line");
+    // And the recvq model is live underneath: the backlog is being tracked
+    // now, which it is not while unarmed.
+    p.charge(60, t);
+    assert(p.backlogBytes() > 0, "an armed pacer models the server's queue");
 }
 
 @safe unittest {
     // A command bigger than the whole budget is let through rather than
     // deadlocking (unreachable in practice: lines are <= 512 bytes).
     FakeLagPacer p;
+    p.tighten(1_000);
     assert(p.waitMs(100_000, 5_000) == 0);
 }
 
@@ -878,6 +1115,15 @@ string[] splitMessage(string text, size_t maxBytes, out bool[] concatFlags)
     assert(p.limits().recvqUsePct == 10, "floor at 10%");
     p.relax();
     assert(p.limits().penaltyMs == 4000 && p.limits().recvqUsePct == 20);
+    assert(p.isArmed(), "one relaxed step is not forgiveness");
+    // Every step relaxed → the complaint is stale and the pacer stands down
+    // completely, or a single 707 would throttle pastes until reconnect.
+    p.relax();
+    p.relax();
+    p.relax();
+    assert(p.penaltySteps() == 0);
+    assert(!p.isArmed(), "a fully relaxed pacer paces nothing again");
+    assert(p.waitMs(400, 99_000) == 0);
     // Promotion keeps the tightening multiplier.
     FakeLagPacer q;
     q.tighten(0);
@@ -967,18 +1213,22 @@ string[] splitMessage(string text, size_t maxBytes, out bool[] concatFlags)
     // Uncapped this would be 750 + 15*(1+1)*750 = 23 250.
     assert(multilineBatchCostMs(big, KNOWN_USER_LIMITS) == MULTILINE_MAX_FAKELAG_MS);
 
-    // The batch is admitted whenever recvq has room. Its lump penalty stops
-    // the server *processing* for ~15 s, so anything sent after it simply
-    // queues — which is fine until recvq fills, and then we wait.
+    // Nothing is charged before the server complains — that is the IRCCloud
+    // default, and a batch is no exception.
+    FakeLagPacer idle;
+    idle.chargeBatch(big, 1000);
+    assert(idle.accrued() == 0, "an unarmed pacer models nothing");
+    assert(idle.canStartBatch(1000));
+
+    // Once armed the lump lands exactly once, clamped, and delays what
+    // follows until the server has drained it.
     FakeLagPacer p;
-    assert(p.canStartBatch(1000));
+    p.tighten(1000);
+    const before = p.accrued();
     p.chargeBatch(big, 1000);
-    assert(p.waitMs(50, 1000) == 0, "recvq is empty, one more line is fine");
-    int queued = 0;
-    while (p.waitMs(60, 1000) == 0 && queued < 500) { p.charge(60, 1000); queued++; }
-    assert(queued == 80, "queued " ~ queued.to!string);
-    // 15 s of drain lets the server work through it again.
-    assert(p.waitMs(60, 1000 + 16_000) == 0);
+    assert(p.accrued() == before + MULTILINE_MAX_FAKELAG_MS,
+           "accrued " ~ p.accrued().to!string);
+    assert(p.waitMs(60, 1000 + 20_000) == 0, "20 s of drain clears it");
 }
 
 @safe unittest {
@@ -1022,18 +1272,10 @@ string[] splitMessage(string text, size_t maxBytes, out bool[] concatFlags)
 }
 
 @safe unittest {
-    // An oper is exempt from fake lag entirely, and a complaint revokes it.
-    FakeLagPacer p;
-    long t = 2_000_000;
-    // 400-byte lines against a 4800-byte budget: a plain user gets a
-    // sizeable burst (12 queued + the handful the server processes at once)
-    // and is then paced by the server's own drain rate.
-    int admitted = 0;
-    while (p.waitMs(400, t) == 0 && admitted < 500) { p.charge(400, t); admitted++; }
-    assert(admitted > 8 && admitted < 40, "burst " ~ admitted.to!string);
-    assert(p.waitMs(400, t) > 0, "non-oper is eventually paced");
-
+    // Oper immunity is independent of arming: it survives a complaint only
+    // as far as `tighten` allows, which is not at all.
     FakeLagPacer o;
+    long t = 2_000_000;
     o.setImmune(true);
     assert(o.isImmune());
     foreach (i; 0 .. 500) { assert(o.waitMs(400, t) == 0); o.charge(400, t); }
@@ -1041,6 +1283,7 @@ string[] splitMessage(string text, size_t maxBytes, out bool[] concatFlags)
     // The server disagreed with us — immunity is only ever an assumption.
     o.tighten(t);
     assert(!o.isImmune());
+    assert(o.isArmed());
     assert(o.waitMs(400, t) > 0, "must fall back to pacing after a complaint");
 }
 
@@ -1191,4 +1434,101 @@ string[] splitMessage(string text, size_t maxBytes, out bool[] concatFlags)
     auto inj = splitMessage("safe\rQUIT :bye", 400, flags);
     assert(inj == ["safeQUIT :bye"]);
     assert(flags == [false]);
+}
+
+@safe unittest {
+    // Server identification decides whether UnrealIRCd's target-flood
+    // ceiling applies at all. Getting this wrong in the permissive
+    // direction loses messages silently, so unknown software keeps it.
+    assert(ircdSoftwareFromVersion("InspIRCd-4") == IrcdSoftware.inspircd);
+    assert(ircdSoftwareFromVersion("UnrealIRCd-6.1.7") == IrcdSoftware.unreal);
+    assert(ircdSoftwareFromVersion("ergo-2.18.0") == IrcdSoftware.ergo);
+    assert(ircdSoftwareFromVersion("solanum-1.0-dev") == IrcdSoftware.solanum);
+    assert(ircdSoftwareFromVersion("") == IrcdSoftware.unknown);
+    assert(ircdSoftwareFromVersion("SomeNewIrcd-1") == IrcdSoftware.unknown);
+
+    // 004 always precedes user traffic, so the version token is the only
+    // signal needed — no CAP sniffing.
+
+    assert(serverHasTargetFlood(IrcdSoftware.unreal));
+    assert(serverHasTargetFlood(IrcdSoftware.unknown), "fail closed on unknown software");
+    assert(!serverHasTargetFlood(IrcdSoftware.inspircd),
+           "InspIRCd has no per-target message rate — it limits commands");
+    assert(!serverHasTargetFlood(IrcdSoftware.ergo));
+}
+
+@safe unittest {
+    // The platform class: 100 commands/s sustained, burst of 100, and
+    // `fakelag="no"` means the 101st is an Excess Flood KILL — so the burst
+    // must stop under the budget, not at the threshold.
+    CommandRateBucket b;
+    long t = 1_000_000;
+    int sent = 0;
+    while (b.waitMs(t, PLATFORM_COMMAND_RATE) == 0 && sent < 500) {
+        b.record(t, PLATFORM_COMMAND_RATE);
+        sent++;
+    }
+    assert(sent == 70, "burst is 70% of the 100-point threshold, got " ~ sent.to!string);
+    assert(b.waitMs(t, PLATFORM_COMMAND_RATE) > 0, "the 71st command has to wait");
+    // One point drains in 10 ms at 100 commands/s.
+    assert(b.waitMs(t, PLATFORM_COMMAND_RATE) <= 10,
+           "waiting for a single point must be ~10 ms, not a second");
+
+    // Sustained rate is the drain rate: 500 lines take ~5 s, not the ~70 s
+    // the UnrealIRCd target-flood assumption imposed on this network.
+    long elapsed = 0;
+    while (sent < 500) {
+        const w = b.waitMs(t, PLATFORM_COMMAND_RATE);
+        if (w > 0) {
+            t += w;
+            elapsed += w;
+            continue;
+        }
+        b.record(t, PLATFORM_COMMAND_RATE);
+        sent++;
+    }
+    assert(elapsed > 3_500 && elapsed < 6_000,
+           "500 lines should take about 5 s, took " ~ elapsed.to!string ~ " ms");
+}
+
+@safe unittest {
+    // A stricter class is modelled faithfully: InspIRCd's own shipped
+    // defaults are 1 command/s with a burst of 10.
+    auto strict = CommandRateLimit(10, 1000, 70);
+    CommandRateBucket b;
+    long t = 5_000;
+    int sent = 0;
+    while (b.waitMs(t, strict) == 0 && sent < 100) {
+        b.record(t, strict);
+        sent++;
+    }
+    assert(sent == 7, "70% of a 10-point threshold, got " ~ sent.to!string);
+    // Draining one point at 1 command/s takes a full second.
+    const w = b.waitMs(t, strict);
+    assert(w > 900 && w <= 1000, "wait " ~ w.to!string);
+
+    // An invalid limit never paces anything (feature disabled).
+    CommandRateBucket idle;
+    assert(idle.waitMs(t, CommandRateLimit(0, 0)) == 0);
+}
+
+@safe unittest {
+    // Trusted-host parsing. An exact, case-insensitive match only: a suffix
+    // match would hand the platform's flood trust to any lookalike host.
+    auto hosts = parseFloodTrustedHosts("irc.ircfiber.com, IRC.Example.NET ,,");
+    assert(hosts == ["irc.ircfiber.com", "irc.example.net"]);
+    assert(floodTrustedHost(hosts, "IRC.IRCFiber.com"));
+    assert(!floodTrustedHost(hosts, "irc.ircfiber.com.evil.net"));
+    assert(!floodTrustedHost(hosts, "evil.irc.ircfiber.com"));
+    assert(!floodTrustedHost(parseFloodTrustedHosts(""), "irc.ircfiber.com"),
+           "an empty list disables the trust");
+
+    // Env parsing falls back to the shipped numbers rather than removing
+    // the ceiling when a value is missing or malformed.
+    auto ok = parseCommandRateLimit("40", "20000");
+    assert(ok.threshold == 40 && ok.commandRateMilli == 20_000);
+    auto bad = parseCommandRateLimit("abc", "");
+    assert(bad == PLATFORM_COMMAND_RATE);
+    auto zero = parseCommandRateLimit("0", "0");
+    assert(zero == PLATFORM_COMMAND_RATE, "zero would mean 'never send'");
 }

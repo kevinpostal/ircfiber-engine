@@ -181,6 +181,23 @@ ircd_image: "ghcr.io/ergochat/ergo:v2.18.0"
 ircd_container_name: "ircfiber-ircd"
 ircd_data_volume: "ircfiber_ircd_data"
 
+# Our own ircd's server name. Also here, not only in roles/ircd defaults,
+# because roles/engine's env.j2 needs it: the engine role runs in its own
+# play (hosts: ircfiber_engines) where the ircd role's defaults are not in
+# scope at all.
+ircd_server_name: "irc.ircfiber.com"
+
+# Flood parameters of the InspIRCd `ircfiber-engine` connect class. Single
+# source of truth: consumed BOTH by roles/ircd (inspircd.conf.j2, the actual
+# server-side limit) and by roles/engine (env.j2, the engine's client-side
+# model of it). They must never drift — the engine paces itself against
+# these numbers, and `fakelag="no"` on that class means exceeding the
+# threshold is an Excess Flood KILL, not a delay.
+# commandrate is millicommands/second: 100000 = 100 commands/second.
+ircd_engine_commandrate: 100000
+# threshold is command penalty points (a normal command costs 1).
+ircd_engine_threshold: 100
+
 # --- Cloudflare DNS ------------------------------------------------------------
 # Used by the `cloudflare` role to point DNS records at this host's public IP.
 # `cloudflare_zone` is the registered domain (the zone that owns the records).
