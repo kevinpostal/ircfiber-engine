@@ -40,6 +40,12 @@ import ircfiber.engine.adopted_socket : AdoptedSocket;
 import ircfiber.async : safeFiberRun;
 import ircfiber.irc.ipv6 : ipv6ForUser, normalizePrefix;
 import ircfiber.irc.parser : ChannelListRow, parseChannelListRow;
+import ircfiber.irc.pacer : FakeLagPacer, FloodLimits, ChannelLineLimit, LineRateWindow,
+    MultilineLimits, UNKNOWN_USER_LIMITS, KNOWN_USER_LIMITS, parseMultilineCap,
+    parseChannelFloodLines, payloadBudget, sanitizeLine, splitMessage,
+    multilineByteCount, multilineBatchCostMs, userModesGrantOper, statusModesOf,
+    statusExemptsFromFlood, parseEffectiveFloodNotice, floodExceptionExempts,
+    targetFloodLimit;
 import ircfiber.irc.egress_catalog : ExitLocation, ExitRelay, locationMatches,
     locationsFromRelays, parseExitOnline, parseExitRelays, parseSelectedExit,
     pickRelayForPin;
@@ -89,6 +95,7 @@ private immutable string[] DESIRED_CAPS_BASE = [
     "setname",
     "draft/edit-message",
     "draft/message-redaction",
+    "draft/multiline",
 ];
 
 private immutable string[] DESIRED_CAPS_SASL = ["sasl"];
@@ -2469,6 +2476,55 @@ final class PersistentIRCClient {
 
         // IRCv3 capabilities that were ACK'd by the server
         bool[string]        ackedCaps;
+        /// CAP values as advertised in `CAP LS`/`CAP NEW`, keyed by cap name
+        /// (`draft/multiline` → `max-bytes=5250,max-lines=15`). The names
+        /// alone live in `ackedCaps`; the values carry the only flood limits
+        /// any ircd actually tells clients about, and UnrealIRCd re-sends
+        /// them via CAP DEL + CAP NEW when we move between its
+        /// known-users / unknown-users groups.
+        string[string]      capValues;
+
+        // ── Outbound flood pacing ────────────────────────────────────────
+        /// Local model of the server's fake-lag accumulator. See
+        /// ircfiber.irc.pacer.
+        FakeLagPacer        pacer;
+        /// Message lines waiting for the pacer to admit them. Only user
+        /// traffic (PRIVMSG/NOTICE) is parked here; protocol-critical lines
+        /// (PING/PONG/CAP/NICK/registration) always go out immediately.
+        string[]            pacedQueue;
+        enum MAX_PACED_QUEUE = 2_000;
+        /// Per-channel `+f` line-rate ceiling and its sliding window,
+        /// keyed by lowercase channel.
+        ChannelLineLimit[string] chanFloodLimit;
+        LineRateWindow[string]   chanFloodWindow;
+        /// Our own `nick!user@host` as other clients see it (396
+        /// RPL_VISIBLEHOST, or the echo of our own JOIN). Drives the
+        /// per-line payload budget; empty until known.
+        string              ownHostmask;
+        /// Unix ms of the last paced write, for the relax-after-quiet rule.
+        long                lastPacedWriteMs;
+        /// True once 903 RPL_SASLSUCCESS arrived on this connection: we are
+        /// identified to services, so the server's looser `known-users`
+        /// flood limits apply.
+        bool                saslSucceeded;
+        /// Set while a multiline batch is being written, so `writeRaw` does
+        /// not charge each line individually.
+        bool                chargeSuppressed;
+        /// Monotonic counter for `draft/multiline` BATCH reference tags.
+        uint                batchSeq;
+        /// True when we currently hold IRCOp status on this connection
+        /// (381 / user mode `+o` / 221). Grants the pacer's fake-lag
+        /// exemption optimistically — `immune:lag` is a privilege an oper
+        /// block can withhold, so the first flood complaint revokes it.
+        bool                isOper;
+        /// Channels where our own status modes exempt us from `+f`
+        /// (floodprot's `check_channel_access(client, channel, "hoaq")`),
+        /// or where a `~F:`/`~flood:` `+e` entry matches us. Keyed
+        /// lowercase.
+        bool[string]        chanFloodExempt;
+        /// Channels we have already probed with `MODE <chan> f`, so the
+        /// query is issued at most once per channel per connection.
+        bool[string]        chanFloodProbed;
 
         // IRCv3 BATCH tracking
         string              activeBatchRef;
@@ -4261,6 +4317,28 @@ final class PersistentIRCClient {
         state = ConnectionState.connecting;
         disconnectedEmitted = false;
         ackedCaps.clear();
+        capValues.clear();
+        // Fake lag is per TCP session, and so is our own hostmask, the
+        // channel `+f` inventory and the sliding windows. The pacer's
+        // *tightening* deliberately survives: it is what we learned about
+        // this server, and an Excess Flood kill must not be forgotten by
+        // the reconnect it caused. Queued user lines survive too — they
+        // were never delivered.
+        saslSucceeded = false;
+        pacer.resetAccrual();
+        pacer.adopt(assumedFloodLimits());
+        chargeSuppressed = false;
+        ownHostmask = "";
+        chanFloodLimit.clear();
+        // Oper status and every channel exemption are per TCP session; a
+        // reconnect starts as a plain user until the server says otherwise.
+        isOper = false;
+        pacer.setImmune(false);
+        chanFloodExempt.clear();
+        chanFloodProbed.clear();
+        lastFloodNoticeChannel = "";
+        chanFloodWindow.clear();
+        lastPacedWriteMs = 0;
         // A dropped connection can strand us inside a `BATCH +chathistory`
         // (the closing `BATCH -` never arrives — verified live: every row
         // for #superbowl stored with `batch=chathistory`, so the bouncer's
@@ -4454,6 +4532,13 @@ final class PersistentIRCClient {
         consecutiveTlsClosed = 0;
         throttledUntil = 0;
         droppedNoConnWarned = false;
+        // The handshake (CAP LS / NICK / USER / CAP REQ / CAP END / SASL) is
+        // accounted separately by the server — UnrealIRCd meters it with
+        // handshake-data-flood, not fake lag — so charging it to the bucket
+        // would make the first message after every connect wait for nothing.
+        // Start the fake-lag model at zero from the moment we are a
+        // registered user.
+        pacer.resetAccrual();
         recordHostSuccess(config.host, config.port);
         // Welcome received — clear any prior registration-timeout marker so
         // the admin SPA doesn't keep showing this network as stuck.
@@ -4470,8 +4555,7 @@ final class PersistentIRCClient {
 
     private void performRegistration() {
         // Build cap list
-        string[] desiredCaps = DESIRED_CAPS_BASE.dup;
-        if (config.sasl != SASLMechanism.none) desiredCaps ~= DESIRED_CAPS_SASL;
+        string[] desiredCaps = desiredCapList();
 
         // CAP LS 302 first — lets us inspect what the server offers
         sendRaw("CAP LS 302");
@@ -4779,6 +4863,7 @@ final class PersistentIRCClient {
                             if (sub == "LS") {
                                 // Accumulate caps (multi-line uses trailing '*')
                                 const bool isMultiline = (params.length >= 3 && params[2] == "*");
+                                recordCapValues(capLine);
                                 foreach (cap; capLine.split(" ")) {
                                     auto eqPos = cap.indexOf("=");
                                     auto capName = eqPos >= 0 ? cap[0 .. eqPos] : cap;
@@ -4930,16 +5015,24 @@ final class PersistentIRCClient {
                                          "event": "cap_negotiated"]);
                                 }
                             } else if (sub == "NEW") {
-                                // Server added new caps (cap-notify); request any we want
+                                // Server added new caps (cap-notify); request any we want.
+                                // UnrealIRCd also uses CAP DEL + CAP NEW to *update* a
+                                // value — the multiline max-lines/max-bytes change when
+                                // we move between its known-users and unknown-users
+                                // groups — so the values have to be re-read here.
+                                recordCapValues(capLine);
                                 foreach (cap; capLine.split(" ")) {
-                                    if (desiredCaps.canFind(cap)) {
-                                        sendRaw("CAP REQ :" ~ cap);
+                                    auto capName = capNameOf(cap);
+                                    if (desiredCaps.canFind(capName)) {
+                                        sendRaw("CAP REQ :" ~ capName);
                                     }
                                 }
                             } else if (sub == "DEL") {
                                 // Server removed caps
                                 foreach (cap; capLine.split(" ")) {
-                                    ackedCaps.remove(cap.strip());
+                                    auto capName = capNameOf(cap);
+                                    ackedCaps.remove(capName);
+                                    capValues.remove(capName);
                                 }
                             }
                             break;
@@ -5008,6 +5101,12 @@ final class PersistentIRCClient {
                         // ── SASL success / failure ────────────────────────────
                         case "903": // RPL_SASLSUCCESS
                             saslDone = true;
+                            // UnrealIRCd's `known-users` security group is
+                            // "identified to services OR connected > 2h", and
+                            // it carries looser flood limits. Being identified
+                            // is the half we can actually observe.
+                            saslSucceeded = true;
+                            pacer.adopt(KNOWN_USER_LIMITS);
                             emitLog("sasl_done",
                                 "SASL " ~ saslMechanismName(config.sasl) ~ " authentication succeeded");
                             if (!capEndSent) {
@@ -5507,6 +5606,11 @@ private void processEvents() {
             throttledUntil = Clock.currTime.toUnixTime!long * 1000 + 300_000; // 5 min
             lastDisconnectReason = text;
             emitConnectionFail(text, text);
+            // "Excess Flood" means our send rate model was too optimistic.
+            // The client object outlives the reconnect, so tightening here
+            // carries over to the new TCP session.
+            if (text.toLower().canFind("flood"))
+                onFloodComplaint("excess_flood", text);
         } else {
             lastDisconnectReason = text;
             emitConnectionFail(text, text);
@@ -5617,6 +5721,15 @@ private void processEvents() {
                     if (sameNick(event.nick, sessionNick)) {
                         // Confirmed: the throttle retry must not re-ask.
                         clearPendingJoin(chan);
+                        // Our own JOIN echo is the one line that reliably
+                        // carries the `nick!user@host` other clients see —
+                        // 396 RPL_VISIBLEHOST only gives the host. The
+                        // payload budget subtracts this prefix, so without
+                        // it we have to assume the IRCv3 worst case.
+                        if (event.prefix.length > 0
+                            && event.prefix.indexOf("!") > 0
+                            && event.prefix.indexOf("@") > 0)
+                            ownHostmask = event.prefix;
                         // Add our nick to channelUsers immediately so the
                         // current user always appears in the member list,
                         // even if the IRC server omits us from RPL_NAMREPLY
@@ -6084,6 +6197,11 @@ private void processEvents() {
                     ["network": config.name, "channel": params.length>=2?params[1]:"?", "event": "rpl_endofnames"]);
                 if (params.length >= 2) {
                     auto chan = params[1];
+                    // Our own prefix is now known for this channel, so we
+                    // can tell whether `+f` even applies to us, and ask the
+                    // server what its effective limit actually is.
+                    refreshFloodExemption(chan);
+                    probeChannelFlood(chan);
                     import std.datetime : Clock;
                     const whoNow = Clock.currTime.toUnixTime!long;
                     if (chan in channelUsers) {
@@ -6298,6 +6416,12 @@ private void processEvents() {
             case "FAIL":
             case "WARN":
             case "NOTE":
+                // `FAIL BATCH MULTILINE_MAX_LINES 15 :Too many lines` and
+                // MULTILINE_MAX_BYTES carry the server's real limit, which
+                // beats whatever the CAP said (a channel's +f can lower it).
+                // Record it so the next paste chunks correctly instead of
+                // failing again.
+                applyMultilineFail(event);
                 break;
 
             // ── Message redaction (draft/message-redaction cap) ────────────
@@ -6368,6 +6492,16 @@ private void processEvents() {
                          "from": event.nick,
                          "to": to,
                          "event": "notice"]);
+                    // Server-sourced flood warnings ("Message to #chan
+                    // throttled due to flooding", "You must wait…") are the
+                    // only notice we act on; a user saying "flood" is not a
+                    // signal, so this requires a server prefix (no nick).
+                    if (event.nick.length == 0 && isFloodNotice(event.text))
+                        onFloodComplaint("notice", event.text);
+                    // Reply to our `MODE <chan> f` probe. This is the only
+                    // way to read the numbers behind `+F <profile>`, whose
+                    // limits are otherwise server-side config.
+                    if (event.nick.length == 0) applyEffectiveFloodNotice(event.text);
                 }
                 break;
 
@@ -6429,6 +6563,10 @@ private void processEvents() {
                              "by": event.nick,
                              "event": "mode_change"]);
                     }
+                    // Channel flood mode: `MODE #chan +f [5t]:15` is the one
+                    // per-channel flood limit clients can actually read, and
+                    // it caps both our line rate and a multiline batch.
+                    if (mp.length >= 3) applyChannelFloodMode(mp[0], mp[1], mp[2 .. $]);
                     if (mp.length >= 3) {
                         const chan = mp[0];
                         auto modeStr = mp[1];
@@ -6513,6 +6651,16 @@ private void processEvents() {
                             }
                         }
                     }
+                    // Our own status may have just changed, which decides
+                    // whether floodprot's "hoaq" exemption covers us.
+                    refreshFloodExemption(mp[0]);
+                } else if (mp.length >= 2 && sameNick(mp[0], sessionNick)) {
+                    // User-mode change on ourselves: `MODE <us> +o` is the
+                    // live signal that we just gained (or lost) the
+                    // `immune:lag` privilege every IRCOp holds by default.
+                    if (userModesGrantOper(mp[1])) setOperState(true, "mode_self");
+                    else if (mp[1].canFind("-o") || mp[1].canFind("-O"))
+                        setOperState(false, "mode_self");
                 }
                 break;
 
@@ -6544,6 +6692,40 @@ private void processEvents() {
                 }
                 break;
 
+            // 324 RPL_CHANNELMODEIS: `<nick> <channel> <modes> [params…]`.
+            // Sent on join/`MODE #chan`, so this is how we learn an
+            // already-set +f rather than waiting for someone to change it.
+            case "324": {
+                auto cp = event.getParams();
+                if (cp.length >= 3)
+                    applyChannelFloodMode(cp[1], cp[2], cp[3 .. $]);
+                break;
+            }
+
+            // 381 RPL_YOUREOPER / 221 RPL_UMODEIS: the two authoritative
+            // statements of our own oper status. An IRCOp holds
+            // `immune:lag` by default, which switches fake lag off
+            // entirely (UnrealIRCd src/parse.c).
+            case "381":
+                setOperState(true, "381");
+                break;
+            case "221": {
+                auto up = event.getParams();
+                const modes = up.length >= 2 ? up[1] : event.text;
+                setOperState(userModesGrantOper(modes), "221");
+                break;
+            }
+
+            // ── Rate-limit signals the server sends instead of killing us ──
+            // 439 ERR_TARGETTOOFAST ("target change too fast"), 707
+            // ERR_TARGETTOOFAST / ERR_TARGCHANGE on some ircds. Both mean
+            // the server is already dropping or deferring our traffic,
+            // which is the last warning before an Excess Flood kill.
+            case "439":
+            case "707":
+                onFloodComplaint(event.command, event.text);
+                break;
+
             // ── W1-T08: RPL_TRYAGAIN (263) — Server busy ─────────────────
             case "263": {
                 if (channelListInFlight) {
@@ -6552,6 +6734,9 @@ private void processEvents() {
                     flushChannelList(true, event.text.length ? event.text : "Server busy, try again later", "263");
                     return;
                 }
+                // 263 outside a /LIST means the server is refusing commands
+                // for rate reasons — slow down, not just show a countdown.
+                onFloodComplaint("263", event.text);
                 import ircfiber.irc.parser : extractTempUnavailableCountdown;
                 auto countdownMs = extractTempUnavailableCountdown(event);
                 auto tue = IRCRawEvent(config.name, "temp_unavailable");
@@ -6838,19 +7023,413 @@ private void processEvents() {
         return (Clock.currTime - SysTime.fromUnixTime(0)).total!"msecs";
     }
 
+    // ── CAP values + flood pacing ─────────────────────────────────────────────
+
+    /// Cap list we ask for on this connection.
+    private string[] desiredCapList() {
+        string[] caps = DESIRED_CAPS_BASE.dup;
+        if (config.sasl != SASLMechanism.none) caps ~= DESIRED_CAPS_SASL;
+        return caps;
+    }
+
+    /// `draft/multiline=max-bytes=5250` → `draft/multiline`.
+    private static string capNameOf(string token) {
+        auto t = token.strip();
+        const eq = t.indexOf("=");
+        return eq >= 0 ? t[0 .. eq] : t;
+    }
+
+    /// Stores the `=value` part of every cap token in a CAP LS / CAP NEW
+    /// line. Bare caps get an empty string so presence is still recorded.
+    private void recordCapValues(string capLine) {
+        foreach (token; capLine.split(" ")) {
+            auto t = token.strip();
+            if (t.length == 0) continue;
+            const eq = t.indexOf("=");
+            if (eq >= 0) capValues[t[0 .. eq]] = t[eq + 1 .. $];
+            else if ((t in capValues) is null) capValues[t] = "";
+        }
+    }
+
+    /// The server's advertised multiline limits, or an unusable value when
+    /// the cap was not negotiated. `batch` is a hard dependency of the spec.
+    private MultilineLimits multilineLimits() {
+        if (!hasCap("draft/multiline") || !hasCap("batch"))
+            return MultilineLimits.init;
+        if (auto v = "draft/multiline" in capValues)
+            return parseMultilineCap(*v);
+        return MultilineLimits.init;
+    }
+
+    /// Payload bytes available for one PRIVMSG/NOTICE line to `target`.
+    private size_t linePayloadBudget(string target, string command) {
+        int linelen = 512;
+        if (auto v = "LINELEN" in isupportMap) {
+            try { linelen = (*v).to!int; } catch (Exception) { linelen = 512; }
+        }
+        return payloadBudget(linelen, ownHostmask, command, target);
+    }
+
+    /// Flood group we assume for the fake-lag model. UnrealIRCd promotes a
+    /// user to `known-users` when they are identified to services OR have
+    /// been connected over two hours; we only claim the first, because the
+    /// second is not observable from here without guessing the server's
+    /// `security-group` config.
+    private FloodLimits assumedFloodLimits() {
+        const identified = config.sasl != SASLMechanism.none && saslSucceeded;
+        return identified ? KNOWN_USER_LIMITS : UNKNOWN_USER_LIMITS;
+    }
+
+    /// Queues a user-originated message line behind the pacer.
+    ///
+    /// Protocol-critical traffic (PING/PONG, CAP, NICK, registration) must
+    /// never be delayed and is written by `sendRaw` directly; it is still
+    /// *charged* to the bucket so the model tracks the server's real view.
+    private void enqueuePaced(string line) {
+        if (pacedQueue.length >= MAX_PACED_QUEUE) {
+            logJsonMap("warn", "connection",
+                "Paced outbound queue full — dropping line",
+                ["network": config.name,
+                 "networkId": config.id.toString(),
+                 "queued": pacedQueue.length.to!string,
+                 "event": "flood_queue_full"]);
+            return;
+        }
+        pacedQueue ~= line;
+        // Give the first line a chance to leave immediately rather than
+        // waiting for the next 50 ms event-loop tick.
+        drainPacedQueue();
+    }
+
+    /// Channel `+f` ceiling for a target, if one is known AND it applies to
+    /// us. UnrealIRCd's floodprot skips the whole check for members with
+    /// `hoaq` status (or a matching `~F:` exception), so holding ops means
+    /// there is no per-channel ceiling to respect.
+    private ChannelLineLimit floodLimitFor(string target) {
+        auto key = target.toLower();
+        if (auto ex = key in chanFloodExempt) if (*ex) return ChannelLineLimit.init;
+        if (auto l = key in chanFloodLimit) return *l;
+        return ChannelLineLimit.init;
+    }
+
+    /// Recomputes whether our own status on `channel` exempts us from `+f`
+    /// and records it. Called whenever NAMES or a MODE change could have
+    /// altered our prefix.
+    private void refreshFloodExemption(string channel) {
+        auto key = normalizeChannelName(channel).toLower();
+        auto prefixToken = isupportMap.get("PREFIX", "(qaohv)~&@%+");
+        bool exempt = false;
+        if (auto members = key in channelUsers) {
+            // `channelUsers` can hold us twice: the bare nick appended by
+            // our own JOIN echo AND the prefixed form from 353. Checking
+            // only the first match therefore misses the status entirely, so
+            // every matching entry contributes.
+            foreach (entry; *members) {
+                auto bare = stripNickPrefix(entry);
+                auto bang = bare.indexOf("!");
+                if (bang > 0) bare = bare[0 .. bang];
+                if (!sameNick(bare, sessionNick)) continue;
+                if (statusExemptsFromFlood(statusModesOf(entry, prefixToken))) {
+                    exempt = true;
+                    break;
+                }
+            }
+        }
+        const was = (key in chanFloodExempt) !is null && chanFloodExempt[key];
+        if (exempt) chanFloodExempt[key] = true;
+        else if (key in chanFloodExempt) chanFloodExempt.remove(key);
+        if (exempt != was) {
+            logJsonMap("info", "connection",
+                exempt ? "Channel flood exemption gained"
+                       : "Channel flood exemption lost",
+                ["network": config.name,
+                 "channel": channel,
+                 "event":   "channel_flood_exempt"]);
+        }
+    }
+
+    /// Grants or withdraws the fake-lag exemption from observed oper state.
+    private void setOperState(bool oper, string signal) {
+        if (isOper == oper) return;
+        isOper = oper;
+        pacer.setImmune(oper);
+        logJsonMap("info", "connection",
+            oper ? "IRCOp status detected — fake-lag pacing disabled"
+                 : "IRCOp status lost — fake-lag pacing re-enabled",
+            ["network": config.name,
+             "networkId": config.id.toString(),
+             "signal":  signal,
+             "event":   "flood_immunity"]);
+    }
+
+    /// Asks the server for a channel's *effective* flood setting. Only
+    /// UnrealIRCd answers this (`floodprot_override_mode`), and it is the
+    /// only way to read the numbers behind `+F <profile>`; elsewhere the
+    /// reply is a harmless 324 or an error we already ignore.
+    private void probeChannelFlood(string channel) {
+        auto key = normalizeChannelName(channel).toLower();
+        if (key in chanFloodProbed) return;
+        chanFloodProbed[key] = true;
+        enqueuePaced("MODE " ~ channel ~ " f");
+    }
+
+    /// Target of a PRIVMSG/NOTICE line, for the `+f` window. Empty when the
+    /// line is not a message.
+    private static string messageTargetOf(string line) {
+        auto l = line;
+        if (l.startsWith("@")) {
+            const sp = l.indexOf(" ");
+            if (sp < 0) return "";
+            l = l[sp + 1 .. $];
+        }
+        const sp1 = l.indexOf(" ");
+        if (sp1 < 0) return "";
+        const verb = l[0 .. sp1].toUpper();
+        if (verb != "PRIVMSG" && verb != "NOTICE") return "";
+        auto rest = l[sp1 + 1 .. $].stripLeft();
+        const sp2 = rest.indexOf(" ");
+        return sp2 < 0 ? rest : rest[0 .. sp2];
+    }
+
+    /// True when a wire line is a NOTICE (target-flood limits notices much
+    /// more tightly than PRIVMSGs).
+    private static bool isNoticeLine(string line) {
+        auto l = line;
+        if (l.startsWith("@")) {
+            const sp = l.indexOf(" ");
+            if (sp < 0) return false;
+            l = l[sp + 1 .. $];
+        }
+        return l.length >= 6 && l[0 .. 6].toUpper() == "NOTICE";
+    }
+
+    /// `a` permits fewer lines per second than `b`.
+    private static bool stricterLimit(ChannelLineLimit a, ChannelLineLimit b) {
+        if (!b.valid()) return true;
+        if (!a.valid()) return false;
+        return cast(long)a.lines * b.seconds < cast(long)b.lines * a.seconds;
+    }
+
+    /// Writes as many paced lines as the server will currently accept.
+    ///
+    /// Called from `processOutboundQueue` on every event-loop tick (50 ms).
+    /// In the normal case nothing is delayed at all: the gate only bites
+    /// once the modelled recvq or a per-target flood window fills.
+    private void drainPacedQueue() {
+        if (pacedQueue.length == 0) return;
+        if (state != ConnectionState.connected) return;
+
+        const now = unixMsNow();
+        // A long quiet period means the server is no longer complaining;
+        // walk one tightening step back so a single 707 does not slow the
+        // connection down forever.
+        if (lastPacedWriteMs > 0 && now - lastPacedWriteMs > 60_000)
+            pacer.relax();
+
+        while (pacedQueue.length > 0) {
+            auto line = pacedQueue[0];
+            // The server charges fake lag on the whole command it receives.
+            const cmdBytes = line.length + 2;      // + CRLF
+            if (pacer.waitMs(cmdBytes, now) > 0) return;
+
+            auto target = messageTargetOf(line);
+            if (target.length > 0) {
+                auto key = target.toLower();
+                auto w = key in chanFloodWindow;
+                if (w is null) {
+                    chanFloodWindow[key] = LineRateWindow.init;
+                    w = key in chanFloodWindow;
+                }
+                // Two independent per-target ceilings:
+                //  * `+f` — kicks or sets +m, and ops are exempt.
+                //  * target-flood — applies to EVERYONE and silently DROPS
+                //    the message, so the user just sees lines vanish. Only
+                //    `immune:target-flood` escapes it, which is a different
+                //    privilege from `immune:lag`, so oper immunity here is
+                //    NOT assumed.
+                const isChan = target.length > 0
+                    && (target[0] == '#' || target[0] == '&' || target[0] == '!' || target[0] == '+');
+                auto lim = targetFloodLimit(isChan, isNoticeLine(line));
+                auto chanLim = floodLimitFor(target);
+                if (chanLim.valid() && stricterLimit(chanLim, lim)) lim = chanLim;
+                if (lim.valid()) {
+                    if (w.waitMs(now, lim) > 0) return;
+                    w.record(now);
+                }
+            }
+
+            pacedQueue = pacedQueue[1 .. $];
+            lastPacedWriteMs = now;      // writeRaw charges the bucket
+            try writeRaw(line);
+            catch (Exception e) {
+                logInfo("Paced write failed for %s: %s", config.name, e.msg);
+                return;
+            }
+        }
+    }
+
+    /// Server NOTICE texts that mean "you are sending too fast". Deliberately
+    /// narrow: only phrases ircds emit for rate limiting, never a user's
+    /// chatter (the caller also requires a server prefix).
+    private static bool isFloodNotice(string text) {
+        auto t = text.toLower();
+        return t.canFind("flood")
+            || t.canFind("throttl")
+            || t.canFind("too fast")
+            || t.canFind("slow down")
+            || t.canFind("rate limit");
+    }
+
+    /// `FAIL BATCH MULTILINE_MAX_LINES <limit>` / `MULTILINE_MAX_BYTES
+    /// <limit>`: the server's authoritative limit for the batch we just
+    /// tried. Overwrite the CAP-derived value so the retry fits, and treat
+    /// TIMEOUT as a flood signal (the batch went out too slowly).
+    private void applyMultilineFail(ref IRCRawEvent event) {
+        if (event.command != "FAIL") return;
+        auto p = event.getParams();
+        if (p.length < 3 || p[0].toUpper() != "BATCH") return;
+        const code = p[1].toUpper();
+        auto ml = multilineLimits();
+        int newLines = ml.maxLines;
+        int newBytes = ml.maxBytes;
+        if (code == "MULTILINE_MAX_LINES") {
+            try newLines = p[2].to!int; catch (Exception) return;
+        } else if (code == "MULTILINE_MAX_BYTES") {
+            try newBytes = p[2].to!int; catch (Exception) return;
+        } else {
+            return;
+        }
+        if (newBytes <= 0) return;
+        capValues["draft/multiline"] =
+            "max-bytes=" ~ newBytes.to!string ~ ",max-lines=" ~ newLines.to!string;
+        logJsonMap("info", "connection",
+            "Multiline limits corrected by server FAIL",
+            ["network":  config.name,
+             "code":     code,
+             "maxLines": newLines.to!string,
+             "maxBytes": newBytes.to!string,
+             "event":    "multiline_limits_updated"]);
+    }
+
+    /// Applies the effective `+f` limit reported by a `MODE <chan> f`
+    /// probe reply. The notice names the channel in single quotes, and the
+    /// follow-up lines ("Plus flood setting via +f: '…'") carry no channel
+    /// name — those are attributed to the channel the last one named.
+    private string lastFloodNoticeChannel;
+    private void applyEffectiveFloodNotice(string text) {
+        if (text.length == 0) return;
+        // "Channel '#x' has effective flood setting …" / "… on #x"
+        foreach (chan; channelState.byKey()) {
+            if (text.canFind(chan)) { lastFloodNoticeChannel = chan; break; }
+        }
+        if (lastFloodNoticeChannel.length == 0) return;
+        if (text.canFind("No channel mode +f")) {
+            auto key = lastFloodNoticeChannel.toLower();
+            if (key in chanFloodLimit) chanFloodLimit.remove(key);
+            return;
+        }
+        auto lim = parseEffectiveFloodNotice(text);
+        if (!lim.valid()) return;
+        auto key = lastFloodNoticeChannel.toLower();
+        auto existing = key in chanFloodLimit;
+        // Keep the strictest limit seen for this channel: `+f` and `+F` are
+        // reported on separate notices and both apply.
+        if (existing !is null
+            && cast(long)existing.lines * lim.seconds <= cast(long)lim.lines * existing.seconds)
+            return;
+        chanFloodLimit[key] = lim;
+        logJsonMap("info", "connection",
+            "Effective channel flood limit learned",
+            ["network": config.name,
+             "channel": lastFloodNoticeChannel,
+             "lines":   lim.lines.to!string,
+             "seconds": lim.seconds.to!string,
+             "event":   "channel_flood_effective"]);
+    }
+
+    /// Applies a channel mode change, tracking only `+f`/`-f` (the channel
+    /// flood limit). `params` are the mode arguments after the mode string.
+    private void applyChannelFloodMode(string channel, string modeStr, string[] params) {
+        auto key = normalizeChannelName(channel).toLower();
+        bool adding = true;
+        size_t argIdx = 0;
+        foreach (c; modeStr) {
+            if (c == '+') { adding = true; continue; }
+            if (c == '-') { adding = false; continue; }
+            if (c == 'f') {
+                if (!adding) {
+                    chanFloodLimit.remove(key);
+                    if (auto w = key in chanFloodWindow) w.clear();
+                } else if (argIdx < params.length) {
+                    auto lim = parseChannelFloodLines(params[argIdx]);
+                    if (lim.valid()) {
+                        chanFloodLimit[key] = lim;
+                        logJsonMap("info", "connection",
+                            "Channel flood limit observed",
+                            ["network": config.name,
+                             "channel": channel,
+                             "lines":   lim.lines.to!string,
+                             "seconds": lim.seconds.to!string,
+                             "event":   "channel_flood_limit"]);
+                    } else {
+                        chanFloodLimit.remove(key);
+                    }
+                }
+                // `f` takes an argument in both directions on UnrealIRCd.
+                argIdx++;
+                continue;
+            }
+            // Any other mode may or may not consume an argument; we cannot
+            // know without CHANMODES parsing, and guessing would misalign
+            // `f`'s argument. Only trust `+f` when it is the first
+            // argument-taking mode in the string, which is the common case
+            // (`MODE #chan +f [5t]:15`, `MODE #chan -f`).
+            if (params.length > 0) break;
+        }
+    }
+
+    /// A flood complaint arrived (263 / 439 / 707 / flood NOTICE / FAIL /
+    /// Excess Flood). Backs the pacer off and records why.
+    private void onFloodComplaint(string signal, string detail) {
+        pacer.tighten(unixMsNow());
+        logJsonMap("warn", "connection",
+            "Server flood complaint — tightening outbound pacing",
+            ["network":     config.name,
+             "networkId":   config.id.toString(),
+             "signal":      signal,
+             "detail":      detail,
+             "penaltyMs":   pacer.limits().penaltyMs.to!string,
+             "steps":       pacer.penaltySteps().to!string,
+             "queued":      pacedQueue.length.to!string,
+             "event":       "flood_tightened"]);
+        recordCounter("ircfiber.flood.tightened", 1,
+            ["network": config.name, "signal": signal]);
+    }
+
     // ── Outbound queue ────────────────────────────────────────────────────────
 
     private void processOutboundQueue() {
-        if (outboundQueue.length == 0) return;
         if (state != ConnectionState.connected) return;
 
-        auto queue = outboundQueue;
-        outboundQueue = [];
+        // Reconnect buffer first: these lines were written while the
+        // transport was down and must not be reordered behind a paste.
+        if (outboundQueue.length > 0) {
+            auto queue = outboundQueue;
+            outboundQueue = [];
+            foreach (l; queue) writeRaw(l);
+        }
 
-        foreach (l; queue) writeRaw(l);
+        // Then whatever the flood pacer is holding back.
+        drainPacedQueue();
     }
 
     private void writeRaw(string line) {
+        // Every byte the server reads costs us fake lag, not just paced
+        // message lines: our own WHO/WHOIS probes, JOIN bursts, NICK and
+        // MODE all count too. Charging here — the single point where bytes
+        // reach a socket — keeps the model honest. Multiline batches are
+        // charged as one clamped lump instead, so they suppress this.
+        if (!chargeSuppressed) pacer.charge(line.length + 2, unixMsNow());
         if (tlsStream !is null) {
             try {
                 tlsStream.write((line ~ "\r\n").dup);
@@ -7390,27 +7969,130 @@ private void processEvents() {
 
     /// Sends a PRIVMSG to a target.
     void sendMessage(string target, string text) {
-        sendRaw("PRIVMSG " ~ target ~ " :" ~ text);
-        if (!hasCap("echo-message")) {
-            emitSyntheticSelfMessage(target, text, "PRIVMSG");
-        }
+        sendUserMessage("PRIVMSG", target, text, "");
     }
 
     /// Sends a labeled PRIVMSG when labeled-response cap is active.
     /// The label is registered in `pendingLabels` so the echo-message
     /// correlation in `processLine()` can suppress the duplicate.
     void sendLabeledMessage(string target, string text, string label) {
-        // Register label BEFORE sending so the echo handler can find it
-        // even on a fast round-trip.
-        pendingLabels[label] = Clock.currTime.toUnixTime!long * 1000;
-        if (hasCap("labeled-response")) {
-            sendRaw("@label=" ~ label ~ " PRIVMSG " ~ target ~ " :" ~ text);
+        sendUserMessage("PRIVMSG", target, text, label);
+    }
+
+    /// One logical user message → protocol lines on the wire.
+    ///
+    /// `text` may contain newlines and may exceed one line: this is the
+    /// single place that decides how a message becomes IRC traffic.
+    ///
+    ///  1. CR/LF/NUL are stripped from every logical line, so a message body
+    ///     can never inject a second command.
+    ///  2. Lines are split to the server's real byte budget (ISUPPORT
+    ///     `LINELEN` minus our own `nick!user@host` and the command
+    ///     framing), never mid-code-point.
+    ///  3. When the server negotiated `draft/multiline` and the whole
+    ///     message fits its advertised `max-lines`/`max-bytes` (and the
+    ///     channel's `+f` line ceiling), it goes out as ONE batch: the
+    ///     server then treats it as a single message for flood purposes, so
+    ///     it cannot trip `+f` or target-flood. A batch must be written
+    ///     contiguously — `set::multiline::batch-timeout` aborts a slow one
+    ///     — so it is admitted as a unit or not at all.
+    ///  4. Otherwise the lines are queued behind the fake-lag pacer.
+    private void sendUserMessage(string command, string target, string text,
+                                 string label) {
+        const budget = linePayloadBudget(target, command);
+        bool[] concat;
+        auto lines = splitMessage(text, budget, concat);
+        if (lines.length == 0) return;
+        // A single empty line is only meaningful inside a multiline batch;
+        // as a bare PRIVMSG it is an error on most servers.
+        if (lines.length == 1 && lines[0].length == 0) return;
+
+        const bool labeled = label.length > 0 && hasCap("labeled-response");
+        if (label.length > 0)
+            pendingLabels[label] = Clock.currTime.toUnixTime!long * 1000;
+
+        if (lines.length > 1 && tryMultilineBatch(command, target, lines, concat, labeled ? label : "")) {
+            // Batch accepted.
         } else {
-            sendRaw("PRIVMSG " ~ target ~ " :" ~ text);
+            foreach (i, line; lines) {
+                if (line.length == 0) continue;   // no blank bare messages
+                string wire = (labeled && i == 0)
+                    ? "@label=" ~ label ~ " " ~ command ~ " " ~ target ~ " :" ~ line
+                    : command ~ " " ~ target ~ " :" ~ line;
+                enqueuePaced(wire);
+            }
         }
+
         if (!hasCap("echo-message")) {
-            emitSyntheticSelfMessage(target, text, "PRIVMSG", label);
+            foreach (i, line; lines) {
+                if (line.length == 0) continue;
+                emitSyntheticSelfMessage(target, line, command,
+                                         (label.length > 0 && i == 0) ? label : "");
+            }
         }
+    }
+
+    /// Writes `lines` as one `draft/multiline` BATCH, or returns false when
+    /// the server's limits (or its current fake lag) do not allow it.
+    private bool tryMultilineBatch(string command, string target,
+                                   string[] lines, bool[] concat, string label) {
+        const ml = multilineLimits();
+        if (!ml.usable()) return false;
+        if (state != ConnectionState.connected) return false;
+
+        // UnrealIRCd also clamps a batch to the channel's +f 'm'/'t' limit.
+        int maxLines = ml.maxLines;
+        auto floodLim = floodLimitFor(target);
+        if (floodLim.valid() && (maxLines == 0 || floodLim.lines < maxLines))
+            maxLines = floodLim.lines;
+        if (maxLines > 0 && lines.length > maxLines) return false;
+        if (multilineByteCount(lines, concat) > cast(size_t)ml.maxBytes) return false;
+
+        // Anything already queued must go first, or the paste would arrive
+        // out of order.
+        if (pacedQueue.length > 0) return false;
+
+        const now = unixMsNow();
+        if (!pacer.canStartBatch(now)) return false;
+
+        const ref_ = nextBatchRef();
+        // The whole batch is one fake-lag lump, so the per-write charge in
+        // writeRaw must stand down for its duration.
+        chargeSuppressed = true;
+        scope (exit) chargeSuppressed = false;
+        try {
+            auto open = "BATCH +" ~ ref_ ~ " draft/multiline " ~ target;
+            writeRaw(label.length > 0 ? "@label=" ~ label ~ " " ~ open : open);
+            foreach (i, line; lines) {
+                const bool isConcat = i < concat.length && concat[i];
+                auto tags = isConcat
+                    ? "@batch=" ~ ref_ ~ ";draft/multiline-concat "
+                    : "@batch=" ~ ref_ ~ " ";
+                writeRaw(tags ~ command ~ " " ~ target ~ " :" ~ line);
+            }
+            writeRaw("BATCH -" ~ ref_);
+        } catch (Exception e) {
+            logInfo("Multiline batch write failed for %s: %s", config.name, e.msg);
+            return false;
+        }
+        // The server charges the whole batch one clamped lump when it closes.
+        pacer.chargeBatch(lines, now);
+        lastPacedWriteMs = now;
+        logJsonMap("debug", "connection",
+            "Sent multiline batch",
+            ["network":   config.name,
+             "networkId": config.id.toString(),
+             "target":    target,
+             "lines":     lines.length.to!string,
+             "bytes":     multilineByteCount(lines, concat).to!string,
+             "event":     "multiline_batch_sent"]);
+        recordCounter("ircfiber.multiline.batch", 1, ["network": config.name]);
+        return true;
+    }
+
+    /// Batch reference tags must be unique per connection.
+    private string nextBatchRef() {
+        return "f" ~ (++batchSeq).to!string;
     }
 
     /// Whether the server advertised MONITOR support (ISUPPORT token).
@@ -7452,24 +8134,33 @@ private void processEvents() {
     /// existing message in-place on the frontend.
     void sendEditMessage(string target, string originalLabel, string newBody) {
         if (!hasCap("draft/edit-message")) return; // silent no-op
+        // An edit replaces one existing row, so the label must stay on the
+        // first line regardless of labeled-response — but the body still
+        // needs the same sanitising, byte-splitting and pacing as any other
+        // user message.
+        const budget = linePayloadBudget(target, "PRIVMSG");
+        bool[] concat;
+        auto lines = splitMessage(newBody, budget, concat);
+        if (lines.length == 0 || (lines.length == 1 && lines[0].length == 0)) return;
         pendingLabels[originalLabel] = Clock.currTime.toUnixTime!long * 1000;
-        sendRaw("@label=" ~ originalLabel ~ " PRIVMSG " ~ target ~ " :" ~ newBody);
+        foreach (i, line; lines) {
+            if (line.length == 0) continue;
+            enqueuePaced(i == 0
+                ? "@label=" ~ originalLabel ~ " PRIVMSG " ~ target ~ " :" ~ line
+                : "PRIVMSG " ~ target ~ " :" ~ line);
+        }
         if (!hasCap("echo-message")) {
-            emitSyntheticSelfMessage(target, newBody, "PRIVMSG", originalLabel);
+            foreach (i, line; lines) {
+                if (line.length == 0) continue;
+                emitSyntheticSelfMessage(target, line, "PRIVMSG",
+                                         i == 0 ? originalLabel : "");
+            }
         }
     }
 
     /// Sends a labeled NOTICE when labeled-response cap is active.
     void sendLabeledNotice(string target, string text, string label) {
-        pendingLabels[label] = Clock.currTime.toUnixTime!long * 1000;
-        if (hasCap("labeled-response")) {
-            sendRaw("@label=" ~ label ~ " NOTICE " ~ target ~ " :" ~ text);
-        } else {
-            sendRaw("NOTICE " ~ target ~ " :" ~ text);
-        }
-        if (!hasCap("echo-message")) {
-            emitSyntheticSelfMessage(target, text, "NOTICE", label);
-        }
+        sendUserMessage("NOTICE", target, text, label);
     }
 
     /// Emit a synthetic self-message event when the IRC server does not
