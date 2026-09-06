@@ -1025,10 +1025,28 @@ parser-fuzz-test: ## Test > parser property-based fuzz (10k random lines)
 	@$(DUB) build --config=parser-fuzz-test 2>&1 | tail -3
 	@./engine/parser-fuzz-test
 
-test-fast: ## Test > All fast standalone test suites (prefs/parser/consumer/observability/registration)
-	@for t in prefs-test parser-test consumer-test observability-test connection-registration-test session-queue-test oob-test; do \
+# pacer.d imports nothing but Phobos on purpose, so its in-module unittests
+# compile and run standalone in ~1s — no dub, no vibe, no Redis. Keep it that
+# way: the flood-pacing arithmetic is the one thing that must never regress
+# silently (a wrong bucket = Excess Flood kills in production).
+pacer-test: ## Test > Outbound flood pacer (fake-lag bucket, +f, multiline CAP, UTF-8 split)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Flood pacer tests  $(R)"
+	@cd $(dir $(lastword $(MAKEFILE_LIST)))engine/source \
+	  && ldc2 -unittest -main -of=/tmp/ircfiber-pacer-test -run ircfiber/irc/pacer.d
+
+# `session-queue-test` and `dedup-test` are NOT here: their dub configs
+# depend on `irc-fiber-backend path="../backend"`, and in the split
+# workspace `engine/backend/` is a stub (dub.sdl only, no source/) — the
+# real backend lives in the site repo. They fail with
+# `Error: unable to read module 'session'`. Run them from the site repo,
+# not from here.
+#
+# `|| exit 1` on the build only caught build failures; a test binary that
+# reports failures still let the loop pass. Both are fatal now.
+test-fast: pacer-test ## Test > All fast standalone test suites (pacer/prefs/parser/consumer/observability/registration)
+	@set -e; for t in prefs-test parser-test consumer-test observability-test connection-registration-test oob-test; do \
 		printf '\n%b\n' "$(_BCn)$(K)$(B)  $$t  $(R)"; \
-		$(DUB) build --config=$$t 2>&1 | tail -1 || exit 1; \
+		$(DUB) build --config=$$t 2>&1 | tail -1; \
 		./engine/$$t 2>&1 | tail -3; \
 	done
 

@@ -161,8 +161,11 @@ void runRFC2812Tests() {
         check!("PRIVMSG: command")(e.command == "PRIVMSG");
         check!("PRIVMSG: target")(e.getParams()[0] == "Wiz");
         check!("PRIVMSG: text")(e.text == "Hello are you receiving this message ?");
-        // Channel not set: target is a nick, not a channel
-        check!("PRIVMSG: channel is sender's nick")(e.channel == "Angel");
+        // DM invariant (AGENTS.md): the parser must NOT set channel = nick
+        // for a PRIVMSG to a bare nick. Doing so broke the outgoing echo
+        // under echo-message, so the counterparty is resolved
+        // session-aware in connection.d:processLine instead.
+        check!("PRIVMSG: channel left unresolved for a DM")(e.channel.length == 0);
     }
 
     // Section 3.4.1 — Ping/pong
