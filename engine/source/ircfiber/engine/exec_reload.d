@@ -145,6 +145,8 @@ JSONValue snapshotToJson(ref ExecReloadSnapshot snap) {
             foreach (k, v; rec.state.isupportMap) iso.object[k] = JSONValue(v);
             r.object["isupport"] = iso;
         }
+        if (rec.state.serverSoftware.length > 0)
+            r.object["serverSoftware"] = JSONValue(rec.state.serverSoftware);
         recs.array ~= r;
     }
     root.object["records"] = recs;
@@ -208,6 +210,7 @@ ExecReloadSnapshot snapshotFromJson(JSONValue root) {
             auto obj = p.object;
             foreach (k, v; obj) rec.state.isupportMap[toUpper(k)] = v.str;
         }
+        if (auto p = "serverSoftware" in r.object) rec.state.serverSoftware = p.str;
             snap.records ~= rec;
         }
     }

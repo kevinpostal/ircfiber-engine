@@ -97,6 +97,11 @@ struct HandoffState {
     /// 005 reply stream — the IRC server only sends 005 once per
     /// registration, so the new engine wouldn't otherwise see it.
     string[string] isupportMap;
+    /// Server software/version token from RPL_MYINFO (004). Like the
+    /// ISUPPORT map it only arrives once per registration, so the new
+    /// engine cannot re-learn it after an exec handoff — and without it
+    /// ircd-specific probes stay off (see `probeChannelFlood`).
+    string serverSoftware;
     /// Negotiated IRCv3 capabilities.
     string[] ackedCaps;          // negotiated IRCv3 caps
     /// Active query PM targets.
@@ -319,6 +324,7 @@ JSONValue toJSON(ref HandoffState s) {
 
     j.object["serverFeatures"] = serverFeaturesToJSON(s.serverFeatures);
     j.object["isupport"] = stringMapToJSON(s.isupportMap);
+    j.object["serverSoftware"] = JSONValue(s.serverSoftware);
     j.object["ackedCaps"] = jsonArrayOf(s.ackedCaps);
     j.object["queryBuffers"] = jsonArrayOf(s.queryBuffers);
     j.object["failureReasons"] = jsonArrayOf(s.failureReasons);
@@ -436,6 +442,9 @@ HandoffState fromJSON(JSONValue j) {
     // because the field is optional and absent == empty).
     if (auto p = "isupport" in root)
         foreach (k, v; p.object) s.isupportMap[k] = v.str;
+    // Server software token (optional; absent == unknown, which only
+    // disables the ircd-specific probes until the next reconnect).
+    if (auto p = "serverSoftware" in root) s.serverSoftware = p.str;
 
     if (auto p = "ackedCaps" in root)
         foreach (v; p.array) s.ackedCaps ~= v.str;

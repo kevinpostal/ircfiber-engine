@@ -630,6 +630,35 @@ ChannelLineLimit parseEffectiveFloodNotice(string text) pure nothrow @safe {
     return best;
 }
 
+/// True when `MODE <channel> f` is answered as a *query* instead of being
+/// executed as a mode change with a missing parameter.
+///
+/// Only UnrealIRCd implements that override-mode query (floodprot.c
+/// `floodprot_override_mode`). Everywhere else the same line is a real
+/// mode change and the server replies with an error the user sees in
+/// their channel:
+///
+///   * InspIRCd (m_messageflood): `696 <chan> f * :You must specify a
+///     parameter for the flood mode. Syntax: [*]<messages>:<period>.`
+///   * Solanum/Charybdis (no `+f` at all): `472 f :is an unknown mode char`
+///
+/// `software` is the version token from RPL_MYINFO (004), e.g.
+/// `UnrealIRCd-6.1.7`, `InspIRCd-4`, `ergo-2.13.0`.
+bool serverAnswersFloodQuery(string software) pure nothrow @safe @nogc {
+    static immutable string NEEDLE = "unreal";
+    if (software.length < NEEDLE.length) return false;
+    foreach (start; 0 .. software.length - NEEDLE.length + 1) {
+        bool hit = true;
+        foreach (i, n; NEEDLE) {
+            char c = software[start + i];
+            if (c >= 'A' && c <= 'Z') c = cast(char)(c + 32);
+            if (c != n) { hit = false; break; }
+        }
+        if (hit) return true;
+    }
+    return false;
+}
+
 /// `a` allows fewer lines per second than `b`.
 private bool stricter(ChannelLineLimit a, ChannelLineLimit b) pure nothrow @safe {
     // a.lines/a.seconds < b.lines/b.seconds, integer-safe.
@@ -1056,6 +1085,21 @@ string[] splitMessage(string text, size_t maxBytes, out bool[] concatFlags)
     // No flood protection at all → no limit.
     assert(!parseEffectiveFloodNotice("No channel mode +f/+F is active on #x").valid());
     assert(!parseEffectiveFloodNotice("nothing quoted here").valid());
+}
+
+@safe unittest {
+    // Only UnrealIRCd may be sent `MODE <chan> f`: on InspIRCd the same
+    // line is a mode change with a missing parameter and the user gets
+    // `696 … You must specify a parameter for the flood mode` on every join.
+    assert(serverAnswersFloodQuery("UnrealIRCd-6.1.7"));
+    assert(serverAnswersFloodQuery("unrealircd-6"), "version token case varies");
+    assert(serverAnswersFloodQuery("UnrealIRCd-5.0.9-dev"));
+    assert(!serverAnswersFloodQuery("InspIRCd-4"));
+    assert(!serverAnswersFloodQuery("InspIRCd-3.17.1"));
+    assert(!serverAnswersFloodQuery("ergo-2.13.0"));
+    assert(!serverAnswersFloodQuery("solanum-1.0.3"));
+    assert(!serverAnswersFloodQuery(""), "no 004 seen yet → do not probe");
+    assert(!serverAnswersFloodQuery("unrea"), "shorter than the needle");
 }
 
 @safe unittest {

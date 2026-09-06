@@ -45,7 +45,7 @@ import ircfiber.irc.pacer : FakeLagPacer, FloodLimits, ChannelLineLimit, LineRat
     parseChannelFloodLines, payloadBudget, sanitizeLine, splitMessage,
     multilineByteCount, multilineBatchCostMs, userModesGrantOper, statusModesOf,
     statusExemptsFromFlood, parseEffectiveFloodNotice, floodExceptionExempts,
-    targetFloodLimit;
+    serverAnswersFloodQuery, targetFloodLimit;
 import ircfiber.irc.egress_catalog : ExitLocation, ExitRelay, locationMatches,
     locationsFromRelays, parseExitOnline, parseExitRelays, parseSelectedExit,
     pickRelayForPin;
@@ -2545,6 +2545,12 @@ final class PersistentIRCClient {
         /// server-specific tokens like DYNAMITE) survives to the
         /// frontend.
         string[string]      isupportMap;
+        /// Server software/version token from RPL_MYINFO (004), e.g.
+        /// `UnrealIRCd-6.1.7`, `InspIRCd-4`, `ergo-2.13.0`. The only
+        /// machine-readable statement a server makes about *which ircd it
+        /// is*; used to decide whether server-specific probes are safe to
+        /// send (see `probeChannelFlood`). Empty until 004 arrives.
+        string              serverSoftware;
 
         // /LIST accumulation (transient, per TCP connection; NOT part of
         // the handoff snapshot). Rows from 322 are buffered here and
@@ -2973,6 +2979,9 @@ final class PersistentIRCClient {
         // render empty for an arbitrary interval until another 005
         // arrives (it usually never does on subsequent reconnects).
         s.isupportMap = isupportMap.dup;
+        // Same reasoning for the 004 software token: it never comes again
+        // on an adopted session, and it gates the ircd-specific probes.
+        s.serverSoftware = serverSoftware;
         return s;
     }
 
@@ -3043,6 +3052,7 @@ final class PersistentIRCClient {
         // waiting for a fresh 005 reply stream (which won't come —
         // the IRC server's registration already completed upstream).
         isupportMap = s.isupportMap.dup;
+        serverSoftware = s.serverSoftware;
         // Resume the loop without going through the full registration
         // dance: the socket is already authenticated upstream.
         // Adopted sockets have no RPL_WELCOME on this engine; the
@@ -3199,6 +3209,7 @@ final class PersistentIRCClient {
         // Carry the full ISUPPORT map forward so the categorised panel
         // renders without waiting for a redundant 005 reply stream.
         isupportMap = s.isupportMap.dup;
+        serverSoftware = s.serverSoftware;
 
         // 4. Mark connected and reset backoff. We DO NOT re-register
         // with the IRC server (NICK, USER, CAP, SASL, JOIN) — the
@@ -4815,6 +4826,16 @@ final class PersistentIRCClient {
                                 sendRaw("NICK " ~ sessionNick);
                             }
                             break;
+
+                        // ── RPL_MYINFO ────────────────────────────────────────
+                        // `004 <nick> <server> <version> <umodes> <cmodes>…` —
+                        // the only place a server names its own software, and
+                        // what gates the ircd-specific probes (probeChannelFlood).
+                        case "004": {
+                            auto myinfo = evt.getParams();
+                            if (myinfo.length >= 3) serverSoftware = myinfo[2];
+                            break;
+                        }
 
                         // ── ISUPPORT ──────────────────────────────────────────
                         case "005":
@@ -6450,6 +6471,13 @@ private void processEvents() {
             case "733":
                 break;
 
+            // ── RPL_MYINFO (see the handshake handler) ───────────────────────
+            case "004": {
+                auto myinfo = event.getParams();
+                if (myinfo.length >= 3) serverSoftware = myinfo[2];
+                break;
+            }
+
             // ── ISUPPORT ─────────────────────────────────────────────────────
             case "005":
                 auto params = event.getParams();
@@ -7171,11 +7199,17 @@ private void processEvents() {
              "event":   "flood_immunity"]);
     }
 
-    /// Asks the server for a channel's *effective* flood setting. Only
-    /// UnrealIRCd answers this (`floodprot_override_mode`), and it is the
-    /// only way to read the numbers behind `+F <profile>`; elsewhere the
-    /// reply is a harmless 324 or an error we already ignore.
+    /// Asks the server for a channel's *effective* flood setting — the only
+    /// way to read the numbers behind `+F <profile>`.
+    ///
+    /// Sent ONLY to servers that answer `MODE <chan> f` as a query
+    /// (UnrealIRCd's `floodprot_override_mode`). Anywhere else the same
+    /// line is a mode CHANGE with a missing parameter and the server
+    /// answers with an error the user then reads in their channel —
+    /// InspIRCd replies `696 <chan> f * :You must specify a parameter for
+    /// the flood mode. Syntax: [*]<messages>:<period>.` on every join.
     private void probeChannelFlood(string channel) {
+        if (!serverAnswersFloodQuery(serverSoftware)) return;
         auto key = normalizeChannelName(channel).toLower();
         if (key in chanFloodProbed) return;
         chanFloodProbed[key] = true;

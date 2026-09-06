@@ -107,6 +107,13 @@ configuration "egress-catalog-test" {
     versions "VibeUseFibers"
 }
 
+configuration "pacer-test" {
+    targetType "executable"
+    targetName "pacer-test"
+    mainSourceFile "source/pacer_test.d"
+    versions "VibeUseFibers"
+}
+
 configuration "consumer-test" {
     targetType "executable"
     targetName "consumer-test"
