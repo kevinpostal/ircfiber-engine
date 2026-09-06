@@ -2503,6 +2503,8 @@ final class PersistentIRCClient {
         string              ownHostmask;
         /// Unix ms of the last paced write, for the relax-after-quiet rule.
         long                lastPacedWriteMs;
+        /// Unix ms of the last genuine flood complaint, for the decay rule.
+        long                lastFloodComplaintMs;
         /// True once 903 RPL_SASLSUCCESS arrived on this connection: we are
         /// identified to services, so the server's looser `known-users`
         /// flood limits apply.
@@ -6734,9 +6736,16 @@ private void processEvents() {
                     flushChannelList(true, event.text.length ? event.text : "Server busy, try again later", "263");
                     return;
                 }
-                // 263 outside a /LIST means the server is refusing commands
-                // for rate reasons — slow down, not just show a countdown.
-                onFloodComplaint("263", event.text);
+                // Deliberately NOT a flood complaint. 263 RPL_TRYAGAIN is a
+                // COMMAND rate limit, not a message one — Libera's text is
+                // literally "This command could not be completed because it
+                // has been used recently, and is rate-limited", and it is
+                // answering our own periodic WHO/WHOIS probes. Treating it
+                // as a chat-flood signal ratcheted a live Libera connection
+                // to the 8 s penalty cap within 15 minutes of deploy,
+                // throttling the user's messages for traffic they never
+                // sent. Only message-related signals (439/707, a flood
+                // NOTICE, FAIL, Excess Flood) tighten the pacer.
                 import ircfiber.irc.parser : extractTempUnavailableCountdown;
                 auto countdownMs = extractTempUnavailableCountdown(event);
                 auto tue = IRCRawEvent(config.name, "temp_unavailable");
@@ -7220,11 +7229,14 @@ private void processEvents() {
         if (state != ConnectionState.connected) return;
 
         const now = unixMsNow();
-        // A long quiet period means the server is no longer complaining;
-        // walk one tightening step back so a single 707 does not slow the
-        // connection down forever.
-        if (lastPacedWriteMs > 0 && now - lastPacedWriteMs > 60_000)
+        // Walk the tightening back once a minute has passed since the last
+        // COMPLAINT, not since the last write. Keying it on write activity
+        // meant a busy connection could never relax: one 707 pinned it at
+        // the penalty cap until reconnect.
+        if (lastFloodComplaintMs > 0 && now - lastFloodComplaintMs > 60_000) {
             pacer.relax();
+            lastFloodComplaintMs = now;   // one step per minute of quiet
+        }
 
         while (pacedQueue.length > 0) {
             auto line = pacedQueue[0];
@@ -7391,7 +7403,9 @@ private void processEvents() {
     /// A flood complaint arrived (263 / 439 / 707 / flood NOTICE / FAIL /
     /// Excess Flood). Backs the pacer off and records why.
     private void onFloodComplaint(string signal, string detail) {
-        pacer.tighten(unixMsNow());
+        const nowMs = unixMsNow();
+        lastFloodComplaintMs = nowMs;
+        pacer.tighten(nowMs);
         logJsonMap("warn", "connection",
             "Server flood complaint — tightening outbound pacing",
             ["network":     config.name,
