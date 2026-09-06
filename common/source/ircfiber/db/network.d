@@ -161,6 +161,24 @@ final class NetworkRepository {
         return result;
     }
 
+    /// Every network on `host` that carries a NickServ credential, with its
+    /// owner. Backs the admin NickServ section: it annotates the Anope
+    /// account inventory with the IRC Fiber user that owns each account.
+    NetworkWithUser[] listWithSaslAccount(string host) {
+        NetworkWithUser[] result;
+        auto filter = Bson([
+            "host": Bson(host),
+            "saslUsername": Bson(["$exists": Bson(true), "$ne": Bson("")])
+        ]);
+        foreach (doc; collection.find(filter)) {
+            UUID uid;
+            try uid = parseUUID(doc["userId"].get!string);
+            catch (Exception) uid = UUID.init;
+            result ~= NetworkWithUser(docToConfig(doc), uid);
+        }
+        return result;
+    }
+
     /// Saves or updates a network configuration.
     void save(NetworkConfig config, UUID userId) {
         auto selector = Bson(["id": Bson(config.id.toString())]);
