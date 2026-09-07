@@ -287,6 +287,42 @@ public bool parseChannelListRow(const ref IRCRawEvent event, out ChannelListRow 
     return true;
 }
 
+/// IRCv3 `BATCH` reference forms (https://ircv3.net/specs/extensions/batch).
+///
+///   open : `BATCH +<ref> <type> [<args>…]`   — two or more parameters
+///   close: `BATCH -<ref>`                    — exactly ONE parameter
+///
+/// The close is a single parameter and servers are free to send it as a
+/// trailing: InspIRCd 4 ends its `chanhistory` (+H) replay with
+/// `:irc.example.org BATCH :-1`, which parses to `params == ["-1"]`. Any
+/// `params.length >= 2` guard therefore never sees the close, so the batch
+/// stays open forever and every later live event keeps the
+/// `batch=chathistory` tag — the client then treats live traffic as
+/// history replay (prepend path, no notifications, no unread counts).
+public bool parseBatchOpen(const string[] params, out string batchRef,
+                           out string batchType, out string batchTarget) {
+    batchRef = "";
+    batchType = "";
+    batchTarget = "";
+    if (params.length < 2) return false;
+    auto tok = params[0];
+    if (tok.length < 2 || tok[0] != '+') return false;
+    batchRef = tok[1 .. $];
+    batchType = params[1];
+    batchTarget = params.length >= 3 ? params[2] : "";
+    return true;
+}
+
+/// Parses the `BATCH -<ref>` close form. See `parseBatchOpen`.
+public bool parseBatchClose(const string[] params, out string batchRef) {
+    batchRef = "";
+    if (params.length == 0) return false;
+    auto tok = params[0];
+    if (tok.length < 2 || tok[0] != '-') return false;
+    batchRef = tok[1 .. $];
+    return true;
+}
+
 /// Convenience: same as `parseIRCLinePublic` but takes the network
 /// name and ID as separate arguments (avoids constructing a full
 /// NetworkConfig when the caller already has these primitives).

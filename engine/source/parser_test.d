@@ -14,7 +14,7 @@ import std.uuid : parseUUID, randomUUID;
 import std.conv : to;
 
 import ircfiber.irc.parser : parseIRCLinePublic, parseIRCLineNamed, parseIsupportPrefix,
-    ChannelListRow, parseChannelListRow;
+    ChannelListRow, parseChannelListRow, parseBatchOpen, parseBatchClose;
 import ircfiber.models.network : NetworkConfig;
 import ircfiber.models.irc_event : IRCRawEvent;
 
@@ -378,6 +378,50 @@ void runChannelListTests() {
     }
 }
 
+/// IRCv3 BATCH open/close reference parsing.
+///
+/// Regression: InspIRCd 4 ends its `+H` (chanhistory) replay with
+/// `:irc.example.org BATCH :-1` — a SINGLE trailing parameter. The old
+/// `params.length >= 2` guard in connection.d never matched it, so the
+/// batch never closed and every subsequent live event carried
+/// `batch=chathistory`, which the client treats as history replay.
+void runBatchTests() {
+    stderr.writeln("\n[batch]");
+    string bref, btype, btarget;
+    {
+        auto e = parseIRCLineNamed(":irc.example.org BATCH +1 chathistory :#chan",
+                                   "TestNet", "nid");
+        auto p = e.getParams();
+        check!("batch open: parses")(parseBatchOpen(p, bref, btype, btarget));
+        check!("batch open: ref")(bref == "1", bref);
+        check!("batch open: type")(btype == "chathistory", btype);
+        check!("batch open: target")(btarget == "#chan", btarget);
+        check!("batch open: not a close")(!parseBatchClose(p, bref));
+    }
+    {
+        // The real close line from irc.ircfiber.com (InspIRCd 4).
+        auto e = parseIRCLineNamed(":irc.example.org BATCH :-1", "TestNet", "nid");
+        auto p = e.getParams();
+        check!("batch close: single trailing param")(p.length == 1,
+            p.length.to!string);
+        check!("batch close: parses")(parseBatchClose(p, bref));
+        check!("batch close: ref")(bref == "1", bref);
+        check!("batch close: not an open")(!parseBatchOpen(p, bref, btype, btarget));
+    }
+    {
+        // Space-separated close (other ircds) must work identically.
+        auto e = parseIRCLineNamed(":irc.example.org BATCH -abc", "TestNet", "nid");
+        check!("batch close: non-trailing form")(
+            parseBatchClose(e.getParams(), bref) && bref == "abc", bref);
+    }
+    {
+        string[] none;
+        check!("batch: empty params rejected")(!parseBatchClose(none, bref));
+        check!("batch: bare ref rejected")(!parseBatchClose(["1"], bref));
+        check!("batch: open needs a type")(!parseBatchOpen(["+1"], bref, btype, btarget));
+    }
+}
+
 int main() {
     stderr.writeln("ircfiber.irc.parser smoke tests");
     runDefensiveTests();
@@ -385,6 +429,7 @@ int main() {
     runIRCv3Tests();
     runSquashedErrorTests();
     runIsupportTests();
+    runBatchTests();
     runChannelListTests();
     stderr.writeln("\n", passed, " passed, ", failed, " failed");
     return failed == 0 ? 0 : 1;
