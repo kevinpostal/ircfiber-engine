@@ -59,6 +59,8 @@ RUN case "$TARGETARCH" in \
 
 ENV PATH="/opt/ldc2/bin:${PATH}"
 WORKDIR /build
+# Every RUN below fails on the first failing command; /bin/sh (dash) has no pipefail.
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
 
 # ============================================================================
@@ -76,7 +78,6 @@ COPY common/source/ ./common/source/
 
 RUN --mount=type=cache,target=/build/.dub,sharing=locked \
     --mount=type=cache,target=/root/.dub,sharing=locked \
-    set -e -o pipefail && \
     dub build --root=common --compiler=ldc2 --build=release --parallel
 
 # ============================================================================
@@ -94,7 +95,6 @@ COPY engine/source/ ./engine/source/
 
 RUN --mount=type=cache,target=/build/.dub,sharing=locked \
     --mount=type=cache,target=/root/.dub,sharing=locked \
-    set -e -o pipefail && \
     dub build --root=engine --compiler=ldc2 --build=release --parallel && \
     dub build --root=engine --config=janitor-migrate --compiler=ldc2 --build=release --parallel && \
     dub build --root=engine --config=ircfiber-default-migrate --compiler=ldc2 --build=release --parallel && \
