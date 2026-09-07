@@ -28,15 +28,22 @@ private string makeActor() {
 }
 
 /**
- * Purge every Redis key in the engine's namespace.
+ * Purge the engine's own state keys.
  *
  * Called at engine boot BEFORE registering as a server. Idempotent —
  * safe on a clean namespace. Skips the handoff boot path
  * (`IRCFIBER_RELOAD_FROM_PID` set) so adopted sockets keep their state.
  *
- * Wipes `*:<serverId>:*` keys + `irc:server:<id>` + `irc:control:<id>` +
- * `irc:server-assignments:<id>` atomically via Lua so a parallel janitor
- * can never re-create them mid-purge.
+ * Wipes `irc:*:<serverId>:*` keys + `irc:server:<id>` +
+ * `irc:control:<id>` + `irc:server-assignments:<id>` atomically via Lua
+ * so a parallel janitor can never re-create them mid-purge.
+ *
+ * NOT `*:<serverId>:*`: that also matched `scrollback:<serverId>:<net>:
+ * <buffer>`, so every engine start deleted every user's chat history —
+ * scroll-back went back only as far as the last deploy. Scroll-back is
+ * user data with its own 30-day TTL (storage/buffer.d), not engine
+ * state, and `dedup:` is the paired set that keeps it from doubling up.
+ * Neither belongs in a boot-time wipe.
  *
  * Returns the number of keys removed. Zero means clean namespace.
  */
@@ -47,7 +54,7 @@ long purgeLocalServerNamespace(RedisDatabase db, string serverId) @trusted {
         "local deleted = 0\n" ~
         "local cursor = '0'\n" ~
         "repeat\n" ~
-        "  local res = redis.call('SCAN', cursor, 'MATCH', '*:' .. sid .. ':*', 'COUNT', 500)\n" ~
+        "  local res = redis.call('SCAN', cursor, 'MATCH', 'irc:*:' .. sid .. ':*', 'COUNT', 500)\n" ~
         "  cursor = res[1]\n" ~
         "  local keys = res[2]\n" ~
         "  if #keys > 0 then\n" ~
@@ -93,6 +100,12 @@ long purgeLocalServerNamespace(RedisDatabase db, string serverId) @trusted {
  * state alive (TTL > heartbeat interval) but a dead engine's state
  * expires within STATE_TTL seconds regardless of janitor availability.
  *
+ * Scroll-back and its dedup set are deliberately absent: STATE_TTL is
+ * 600 s, so bumping them here *capped* 30 days of chat history at ten
+ * minutes past the last heartbeat — stop the engine and the history was
+ * gone before it came back. They carry their own TTL, re-set on every
+ * append.
+ *
  * Batched via SCAN to avoid blocking Redis on huge keyspaces. Idempotent.
  * No-op when the engine has no namespace yet (cold start).
  */
@@ -100,8 +113,7 @@ long bumpServerStateTTLs(RedisDatabase db, string serverId, long ttlSeconds) @tr
     if (serverId.length == 0 || ttlSeconds <= 0) return 0;
     immutable string[] patterns = [
         "irc:state:" ~ serverId ~ ":*",
-        "scrollback:" ~ serverId ~ ":*",
-        "dedup:" ~ serverId ~ ":*",
+        "irc:cmd:" ~ serverId ~ ":*",
     ];
         long touched = 0;
         foreach (pattern; patterns) {

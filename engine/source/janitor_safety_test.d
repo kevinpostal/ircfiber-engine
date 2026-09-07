@@ -249,6 +249,10 @@ void runPurgeLocalServerNamespace() {
     db.set(RedisKeys.control(sid), "ctrl");
     db.hset(RedisKeys.serverAssignments(sid), "n1", sid);
     db.set(RedisKeys.server(sid), "alive");
+    // Chat history lives under the same serverId segment but is NOT engine
+    // state: a `*:<sid>:*` purge used to wipe every user's scroll-back on
+    // every engine boot.
+    db.set("scrollback:" ~ sid ~ ":n1:#chan", "history");
     check!("precondition: state key present")
         (keyExists(redis, "irc:state:" ~ sid ~ ":n1"));
     check!("precondition: server key present")
@@ -266,6 +270,8 @@ void runPurgeLocalServerNamespace() {
         (!keyExists(redis, RedisKeys.serverAssignments(sid)));
     check!("postcondition: sid removed from irc:servers")
         (!isInServers(redis, sid));
+    check!("postcondition: scroll-back SURVIVES the purge")
+        (keyExists(redis, "scrollback:" ~ sid ~ ":n1:#chan"));
 
     // Audit event?
     bool found = false;
@@ -288,7 +294,8 @@ void runPurgeLocalServerNamespace() {
     } catch (Exception) {}
     check!("audit event of kind 'namespace_purge' recorded")(found);
 
-    // Idempotency: second purge returns 0 (nothing left).
+    // Idempotency: a second purge finds nothing of the engine's own left.
+    // (Scroll-back is still there and must not be counted.)
     const long second = purgeLocalServerNamespace(db, sid);
     check!("idempotent: second purge returns 0")(second == 0);
 }
@@ -307,32 +314,39 @@ void runBumpStateTtls() {
     string sid = "jt-ttl-" ~ randomUUID().toString()[0..8];
     scope (exit) cleanupNamespace(redis, sid);
 
-    // Seed each of the patterns the helper touches.
+    // Seed each of the patterns the helper touches, plus the two it must
+    // NOT touch: capping scroll-back at STATE_TTL (600 s) threw away 30
+    // days of chat history ten minutes after the last heartbeat.
     db.set("irc:state:" ~ sid ~ ":n1", "x");
+    db.set("irc:cmd:" ~ sid ~ ":n1", "c");
     db.set("scrollback:" ~ sid ~ ":n1:ch1", "y");
+    db.expire("scrollback:" ~ sid ~ ":n1:ch1", 86_400);
     db.set("dedup:" ~ sid ~ ":n1:msg1", "z");
+    db.expire("dedup:" ~ sid ~ ":n1:msg1", 86_400);
     db.set(RedisKeys.control(sid), "ctrl");
 
     const long touched = bumpServerStateTTLs(db, sid, 600);
-    check!("bumpServerStateTTLs reports ≥3 touched")
-        (touched >= 3);
+    check!("bumpServerStateTTLs reports ≥2 touched")
+        (touched >= 2);
 
     // Verify TTLs were applied.
-    long sTtl, bTtl, dTtl, cTtl;
+    long sTtl, cmdTtl, bTtl, dTtl, cTtl;
     try sTtl = db.ttl("irc:state:" ~ sid ~ ":n1");   catch (Exception) sTtl = -2;
+    try cmdTtl = db.ttl("irc:cmd:" ~ sid ~ ":n1");   catch (Exception) cmdTtl = -2;
     try bTtl = db.ttl("scrollback:" ~ sid ~ ":n1:ch1"); catch (Exception) bTtl = -2;
     try dTtl = db.ttl("dedup:" ~ sid ~ ":n1:msg1");   catch (Exception) dTtl = -2;
     try cTtl = db.ttl(RedisKeys.control(sid));         catch (Exception) cTtl = -2;
 
     check!("state key has positive TTL")(sTtl > 0);
-    check!("scrollback key has positive TTL")(bTtl > 0);
-    check!("dedup key has positive TTL")(dTtl > 0);
+    check!("cmd queue has positive TTL")(cmdTtl > 0);
+    check!("scroll-back keeps its own long TTL, not STATE_TTL")(bTtl > 600);
+    check!("dedup keeps its own long TTL, not STATE_TTL")(dTtl > 600);
     check!("control queue has positive TTL (StateTTL.CONTROL_QUEUE_TTL = 300)")
         (cTtl > 0);
 
     // Idempotency: a second call touches the same set again.
     const long second = bumpServerStateTTLs(db, sid, 600);
-    check!("second bump touches ≥3 again")(second >= 3);
+    check!("second bump touches ≥2 again")(second >= 2);
 
     // Zero / negative TTL is a safe no-op.
     const long noop = bumpServerStateTTLs(db, sid, 0);
