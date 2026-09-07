@@ -1,7 +1,7 @@
 ---
 # Per-user IPv6 host prep (IRCCloud-style: one /128 per user inside a
 # ROUTED prefix). Included by roles/engine/tasks/main.yml and by
-# playbooks/deploy-engine.yml so both deploy paths converge.
+# site/deploy/playbooks/engine-deploy.yml (via the role) so both deploy paths converge.
 #
 # Prerequisite the playbook cannot create: the prefix must actually be
 # routed to this host by the provider. An on-link /64 where the upstream

@@ -155,7 +155,7 @@ ircfiber_ipv6_pool_host: ""
 #
 # Keep identical to
 # site/deploy/inventories/production/host_vars/vps-efb4b52d.yml — this copy
-# re-renders IRCFIBER_MULLVAD_POOL via deploy-engine.yml's lineinfile, so
+# re-renders IRCFIBER_MULLVAD_POOL through the engine role, so
 # drift makes the gateway and engine disagree about slot labels.
 #
 # `exit_node` MUST be a relay tailnet IP: tailscaled cannot resolve a peer

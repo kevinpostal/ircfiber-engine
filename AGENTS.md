@@ -482,27 +482,30 @@ make update                        # full deploy (frontend + binaries, hard rest
 scp irc-fiber deploy@server:/tmp/  # ← do not do this
 ```
 
-## Deploy flow (hard restart)
+## Deploy flow (`make ship` from ircfiber-infra)
 
-`deploy-update.yml` builds the binary INSIDE a Docker container on the remote server using BuildKit:
-1. Rsync local source → `/opt/ircfiber-src/` on remote
-2. `docker build --target builder` — compiles D code via dub + LDC
-3. Extracts binary from builder image
-4. `docker cp` into running gateway container + restart
-5. Engine hard restart — brief IRC disconnect, auto-reconnect via backoff (no handoff)
+Images are built on the builder host (`ubuntu-docker`), pushed to GHCR, and
+pulled by prod **by digest**; the laptop never carries image bytes:
+1. `git push` HEAD → builder (`~/ircfiber-build/site`, ref `ship`); builder checks it out and asserts the SHA.
+2. `docker buildx build --target runtime-gateway --push` → `ghcr.io/kevinpostal/irc-fiber-gateway:sha-<short>`; digest captured from `--metadata-file`.
+3. `playbooks/gateway-deploy.yml -e gateway_image_ref=<repo>@<digest>`: pull, tag `irc-fiber-gateway:deploy`, start green, wait `/health`, swap, assert the running container's image id == requested.
+4. Laptop gates on `GET /api/version .commit == HEAD`, then promotes `:prod` (`imagetools create`, manifest-only).
+`make ship-engine` is the same shape for the engine (hard restart; gate polls `.engines[].gitShort`).
+`make swap` redeploys `:prod`; `make rollback` swaps to the local `:blue-prev` anchor and does not move `:prod`.
 
-Key issue: `rsync delete: false` (now fixed to `delete: true`) allowed stale source files like `source/ircfiber/web/admin.d` to persist on the remote after the admin code was refactored into the `admin/` package directory. This caused `dub build` to fail with "package name conflicts with module name" — the error was hidden by `|| true` in the Containerfile's RUN command.
+## Build identity and caching
 
-## Build cache invalidation
-
-The Containerfile has two caching layers, both of which silently swallow code changes if not invalidated:
-
-1. **Docker layer cache.** A bare `--build-arg CACHE_BUST=$(date +%s)` is **not enough** to invalidate a `COPY source/ ./source/` layer — BuildKit keys COPY layers by source-directory contents, not by build args. The Containerfile works around this with a heredoc sentinel (`COPY <<EOF ./source/.cache_bust_$CACHE_BUST\nbust=$CACHE_BUST\nEOF`) so the source tree's bytes change with `CACHE_BUST`. The next `COPY source/` is therefore invalidated.
-2. **dub's incremental compile cache** (`/build/.dub`, mounted via `--mount=type=cache,sharing=locked`). Even if the COPY layer is fresh, LDC silently skips changed `.d` files when its module cache is warm. The Containerfile wipes `/build/.dub` when `CACHE_BUST` is non-default.
-
-**Always pass `--build-arg CACHE_BUST=$(date +%s)`** when rebuilding locally after a code change. Without it, you can edit `source/ircfiber/irc/connection.d`, push the change, watch the engine restart cleanly, and STILL see the old behaviour — the build cache hides it.
-
-This bite the author of the 432/433 nick-revert fix: the in-place mutation and dedup changes landed and worked, but the synthetic revert-event code was missing from the binary for ~20 minutes of debugging because the layer cache skipped recompilation. Symptom was `grep -ac 'Mirror the 433' /app/irc-fiber-engine` returning `0` on a freshly built image.
+Nothing about the commit is compiled in. `ircfiber.build_info` reads
+`IRCFIBER_BUILD_*` from the environment, which the Containerfile sets in an
+ENV-only layer at the very end of `runtime-gateway`; the SPA shell
+(`views/index.dt`) takes its bundle URLs from `public/dist/.vite/manifest.json`
+at runtime (`ircfiber.web.assets`). So a commit that changes no sources
+yields byte-identical D and JS layers, `builder-backend` and `frontend-builder`
+are independent stages that BuildKit runs concurrently, and a frontend-only
+change never recompiles D (and vice versa). There is no `CACHE_BUST`, no
+`dub --force`: the build context is a git checkout, so BuildKit's content
+hashing of every `COPY` is the whole invalidation story, and the dub/npm cache
+mounts on the builder make a one-file change an incremental compile.
 
 ## Admin SPA deployment
 
@@ -1390,60 +1393,7 @@ Files:
 ---
 
 # IRC Fiber — Deploy (gateway-only, engine untouched)
-The live host is `vps-efb4b52d` (`203.0.113.10`). Inventory `deploy/inventories/production/hosts.ini` lists `vps-efb4b52d`; the gateway/engine both run there.
 
 The engine (`ircfiber-engine-ovh`, PID 7) holds all IRC TCP/TLS sockets. Restarting it drops every network for ~1s (TLS soft-reconnect) and risks nick collisions. A frontend/CSS change must not touch it.
 
-## When this applies
-
-* Only `frontend/` or `backend/views/index.dt` changed (Vite content-hash). `make frontend` rewrites `public/dist/assets/main-*.js` + `backend/views/index.dt` (the Diet template that injects the hashed `<script>`). No D code changed.
-* Do **not** run `make update` / `playbooks/deploy-update.yml` — that builds `builder` → extracts both `irc-fiber` + `irc-fiber-engine` → `docker restart ircfiber-gateway` **and** engine hard-restart (handoff removed 2026-08-08). Use the gateway-only path below.
-
-## Procedure (Aug 2026, verified on `vps-efb4b52d`)
-
-```bash
-# 1. Build frontend locally (deterministic hash, e.g. main-k8PJwXAF.js)
-make frontend-build   # vite build + inject-manifest → public/dist + backend/views/index.dt
-#    (use `make frontend` when a LOCAL dev gateway container is running —
-#     it additionally rebuilds that container so 127.0.0.1:8090 serves the bundle)
-ls -lh public/dist/assets/ | grep main
-cat backend/views/index.dt | grep main
-
-# 2. Sync to host's build context (host builds gateway image FROM this context)
-tar cz --no-xattrs --format=ustar -C public dist | ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber deploy@203.0.113.10 'sudo sh -c "rm -rf /opt/ircfiber-src/public/dist && mkdir -p /opt/ircfiber-src/public && tar xzf - -C /opt/ircfiber-src/public"'
-cat backend/views/index.dt | ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber deploy@203.0.113.10 'sudo tee /opt/ircfiber-src/backend/views/index.dt >/dev/null'
-
-# 3. Rebuild gateway image on host (runtime-gateway never compiles engine)
-ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber deploy@203.0.113.10 'cd /opt/ircfiber-src && DOCKER_BUILDKIT=1 docker build --target runtime-gateway -t kevindpostal/irc-fiber-gateway:0.3.0 -f Containerfile .'
-
-# 4. Recreate gateway container only (engine stays PID 7)
-ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber deploy@203.0.113.10 '
-  sudo docker stop ircfiber-gateway && sudo docker rm ircfiber-gateway
-  sudo docker run -d --name ircfiber-gateway --restart unless-stopped \
-    --network ircfiber_net --network ircfiber_logging \
-    -v ircfiber_uploads:/app/uploads -v ircfiber_logs:/var/log/irc-fiber \
-    --env-file /etc/ircfiber/gateway/env -p 8090:8090 \
-    kevindpostal/irc-fiber-gateway:0.3.0 /app/irc-fiber
-  sudo docker network connect ircfiber_logging ircfiber-gateway 2>/dev/null || true
-'
-# Alternative if host still uses docker-compose for gateway:
-#   ssh deploy@203.0.113.10 'cd /opt/ircfiber-src && docker compose build ircfiber-gateway && docker compose up -d --force-recreate ircfiber-gateway'
-
-# 5. Keep old hash for 1h Cloudflare edge cache (Cache-Control: public, max-age=3600 on HTML)
-#    The new HTML references main-k8PJ..., but CF may still serve cached HTML referencing main-Dlu...
-#    for up to 1h. Without the alias the old JS 404s (edge caches 404s too — purge token lacks Zone:Cache Purge).
-ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber deploy@203.0.113.10 '
-  sudo docker exec ircfiber-gateway sh -c "cp /app/public/dist/assets/main-k8PJwXAF.js /app/public/dist/assets/main-Dlu0gYHA.js 2>/dev/null; ls -lh /app/public/dist/assets/ | grep main"
-  sudo sh -c "cp /opt/ircfiber-src/public/dist/assets/main-k8PJwXAF.js /opt/ircfiber-src/public/dist/assets/main-Dlu0gYHA.js 2>/dev/null; ls -lh /opt/ircfiber-src/public/dist/assets/ | grep main"
-'
-```
-
-Verification (`engine untouched`):
-```bash
-ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber deploy@203.0.113.10 'docker exec ircfiber-engine-ovh pidof irc-fiber-engine; docker ps --format "{{.Names}} {{.Status}}" | grep -E "gateway|engine"; docker exec ircfiber-gateway sh -c "curl -fsS http://localhost:8090/health | head -5"; curl -s -o /dev/null -w "%{http_code} " https://ircfiber.com/public/dist/assets/main-k8PJwXAF.js; echo'
-# → engine PID 7, gateway Up <1m, health healthy, 200
-curl -s https://ircfiber.com/public/dist/assets/main-k8PJwXAF.js -o /dev/null -w "%{http_code}\n"  # 200 via CF
-```
-
-* If you also need to stop the 404 for the *previous* hash immediately and the vault CF token lacks purge, add the alias as above — it costs one extra 469K file and avoids a 1h 404 window. Remove the alias on the next deploy after the edge TTL expires.*
-* Host SSH must use `-F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber` — the default `IdentityAgent` (1Password) offers too many keys and hits `Too many authentication failures`. `deploy/.vault_pass.txt` supplies the vault password for `ansible-vault view` but is not needed for this gateway-only tar+docker path.*
+`make ship` (ircfiber-infra root) is the gateway-only path: blue/green swap of the gateway container, engine never restarted. See "Deploy flow" above. A frontend-only commit reuses the cached D layers and only reruns `npm run build` (~60–90 s end to end). Verify with `make engine-status` before and after (PID + uptime unchanged) and `curl -fsS https://ircfiber.com/api/version | jq -r .commit`.

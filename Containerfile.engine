@@ -1,5 +1,4 @@
 # syntax=docker/dockerfile:1.7
-ARG CACHE_BUST=fixed
 #
 # ===================================
 #
@@ -10,7 +9,14 @@ ARG CACHE_BUST=fixed
 #   runtime-engine   : slim Ubuntu + engine binaries only
 #
 # Engine-only image: never compiles backend or frontend sources.
-# Build: DOCKER_BUILDKIT=1 docker build --target runtime-engine -f Containerfile.engine . -t test-engine:split
+#
+# Caching: the build context is a git checkout, so BuildKit's content hashing
+# of every COPY is the whole invalidation story — no CACHE_BUST sentinels, no
+# `dub --force`. The dub cache mounts persist across builds on the builder
+# host, so a one-file change is an incremental compile. Build identity lives
+# in an ENV-only layer at the very end of runtime-engine.
+#
+# Build: docker buildx build --target runtime-engine -f Containerfile.engine . -t test-engine
 #
 # ============================================================================
 # Stage: base — Ubuntu + toolchain
@@ -58,78 +64,25 @@ WORKDIR /build
 # ============================================================================
 # Stage: builder-common — fetch deps + build the shared common library.
 #
-# `dub build --parallel` parallelizes LDC compile jobs within a config
-# (dub-1.x dispatches independent modules to parallel LDC invocations).
+# `dub build --parallel` parallelizes LDC compile jobs within a config.
 # Without `--force`, dub reuses the incremental module cache in the
 # /build/.dub + /root/.dub cache mounts, so editing one file recompiles
 # only that module.
-#
-# CACHE_BUST default "fixed"; pass `--build-arg CACHE_BUST=$(date +%s)`
-# to force a clean rebuild of the dub steps.
 # ============================================================================
 FROM base AS builder-common
-ARG GIT_HASH=unknown
-ARG GIT_SHORT=unknown
-ARG GIT_DESCRIBE=unknown
-ARG GIT_BRANCH=unknown
-
-# ── Build cache invalidation ─────────────────────────────────────────────
-# Same sentinel trick as before, but now one sentinel per package so editing
-# `backend/source/api/rest.d` does not force-rebuild the engine and vice versa.
-# Each heredoc writes inside its package's source tree, invalidating the
-# matching COPY below.
-COPY <<EOF ./common/source/.cache_bust_$CACHE_BUST
-bust=$CACHE_BUST
-EOF
 
 COPY common/dub.sdl common/dub.selections.json ./common/
 COPY common/source/ ./common/source/
 
-# If GIT_HASH was passed via --build-arg (from deploy-update.yml's local git),
-# override the rsynced build_version.d so the binary embeds the correct version
-# even when .git was excluded from rsync or rsync's checksum was stale. This
-# is the safety net for the 6daa040 → caf2887 drift seen when times:false + no checksum
-# left build_version.d unchanged despite a new commit. The file size is identical
-# for different hashes, so size-only rsync would skip it.
-RUN if [ "$GIT_HASH" != "unknown" ] && [ "$GIT_HASH" != "" ]; then \
-      echo "builder-common: using GIT_HASH=$GIT_HASH GIT_SHORT=$GIT_SHORT"; \
-      mkdir -p common/source/ircfiber; \
-      printf 'module ircfiber.build_version;\n\n// Generated via Docker build-arg at %s\n// docker build --build-arg GIT_HASH=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$GIT_HASH" > common/source/ircfiber/build_version.d; \
-      printf 'enum GIT_HASH = "%s";\n' "$GIT_HASH" >> common/source/ircfiber/build_version.d; \
-      printf 'enum GIT_SHORT = "%s";\n' "${GIT_SHORT:-$GIT_HASH}" >> common/source/ircfiber/build_version.d; \
-      printf 'enum GIT_DESCRIBE = "%s";\n' "${GIT_DESCRIBE:-$GIT_SHORT}" >> common/source/ircfiber/build_version.d; \
-      printf 'enum GIT_BRANCH = "%s";\n' "${GIT_BRANCH:-unknown}" >> common/source/ircfiber/build_version.d; \
-      printf 'enum BUILD_TIME = "%s";\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> common/source/ircfiber/build_version.d; \
-      printf 'enum BUILD_HOST = "docker-builder";\n' >> common/source/ircfiber/build_version.d; \
-      printf 'enum VERSION = "0.3.0";\n' >> common/source/ircfiber/build_version.d; \
-      printf 'enum GIT_MESSAGE = "via build-arg";\n' >> common/source/ircfiber/build_version.d; \
-      printf 'enum GIT_COMMIT_URL = "https://github.com/kevinpostal/ircfiber-engine/commit/%s";\n' "$GIT_HASH" >> common/source/ircfiber/build_version.d; \
-      cat common/source/ircfiber/build_version.d; \
-    fi
-
-# When CACHE_BUST is non-default, nuke ALL caches dub/LDC might use:
-# - /build/.dub (dub's global cache)
-# - /root/.dub (dub's user-level cache — packages AND object files in 1.41)
-# Then pass `--force` to dub to skip its own mtime/size checks.
 RUN --mount=type=cache,target=/build/.dub,sharing=locked \
     --mount=type=cache,target=/root/.dub,sharing=locked \
-    if [ "$CACHE_BUST" != "fixed" ]; then \
-        DUB_FLAGS="--force" && \
-        echo "dub cache busted (CACHE_BUST=$CACHE_BUST) --force" ; \
-    else \
-        DUB_FLAGS="" ; \
-    fi && \
-    echo "build: $CACHE_BUST" && \
-    dub build --root=common --compiler=ldc2 --build=release --parallel $DUB_FLAGS
+    set -e -o pipefail && \
+    dub build --root=common --compiler=ldc2 --build=release --parallel
 
 # ============================================================================
 # Stage: builder-engine — engine binaries only (irc-fiber-engine + migrates)
 # ============================================================================
 FROM builder-common AS builder-engine
-
-COPY <<EOF ./engine/source/.cache_bust_$CACHE_BUST
-bust=$CACHE_BUST
-EOF
 
 # dub validates EVERY declared path dependency at package load — including the
 # config-scoped `irc-fiber-backend` used only by test configs — so it needs
@@ -141,21 +94,16 @@ COPY engine/source/ ./engine/source/
 
 RUN --mount=type=cache,target=/build/.dub,sharing=locked \
     --mount=type=cache,target=/root/.dub,sharing=locked \
-    if [ "$CACHE_BUST" != "fixed" ]; then \
-        DUB_FLAGS="--force" && \
-        echo "dub cache busted (CACHE_BUST=$CACHE_BUST)" ; \
-    else \
-        DUB_FLAGS="" ; \
-    fi && \
-    dub build --root=engine --compiler=ldc2 --build=release --parallel $DUB_FLAGS && \
-    dub build --root=engine --config=janitor-migrate --compiler=ldc2 --build=release --parallel $DUB_FLAGS && \
-    dub build --root=engine --config=ircfiber-default-migrate --compiler=ldc2 --build=release --parallel $DUB_FLAGS && \
+    set -e -o pipefail && \
+    dub build --root=engine --compiler=ldc2 --build=release --parallel && \
+    dub build --root=engine --config=janitor-migrate --compiler=ldc2 --build=release --parallel && \
+    dub build --root=engine --config=ircfiber-default-migrate --compiler=ldc2 --build=release --parallel && \
     cp engine/irc-fiber-engine ./irc-fiber-engine && \
     cp engine/janitor-migrate ./janitor-migrate && \
-    cp engine/ircfiber-default-migrate ./ircfiber-default-migrate 2>/dev/null || true && \
+    cp engine/ircfiber-default-migrate ./ircfiber-default-migrate && \
     test -f ./irc-fiber-engine && \
     test -f ./janitor-migrate
-RUN find . -maxdepth 1 -type f -executable -exec strip {} +; find engine -maxdepth 2 -type f -executable -exec strip {} + 2>/dev/null; true
+RUN strip ./irc-fiber-engine ./janitor-migrate ./ircfiber-default-migrate
 
 
 # ============================================================================
@@ -200,3 +148,24 @@ RUN chmod 0755 /usr/local/bin/ircfiber-engine-entrypoint.sh \
 
 # tini as init — same rationale as runtime
 ENTRYPOINT ["/usr/bin/tini", "--"]
+
+# ── Build identity ─────────────────────────────────────────────────────────
+# Last, after every COPY: an ENV-only layer is metadata — no pushed bytes and
+# nothing above it is invalidated when the commit changes. The engine reads
+# these at runtime (ircfiber.build_info) when it registers in Redis.
+ARG GIT_HASH=dev
+ARG GIT_SHORT=dev
+ARG GIT_DESCRIBE=dev
+ARG GIT_BRANCH=dev
+ARG BUILD_TIME=dev
+ARG GIT_MESSAGE=""
+ENV IRCFIBER_VERSION=0.3.0 \
+    IRCFIBER_BUILD_COMMIT=$GIT_HASH \
+    IRCFIBER_BUILD_SHORT=$GIT_SHORT \
+    IRCFIBER_BUILD_DESCRIBE=$GIT_DESCRIBE \
+    IRCFIBER_BUILD_BRANCH=$GIT_BRANCH \
+    IRCFIBER_BUILD_TIME=$BUILD_TIME \
+    IRCFIBER_BUILD_HOST=builder \
+    IRCFIBER_BUILD_MESSAGE=$GIT_MESSAGE \
+    IRCFIBER_BUILD_COMMIT_URL=https://github.com/kevinpostal/ircfiber-engine/commit/$GIT_HASH
+LABEL org.opencontainers.image.revision=$GIT_HASH

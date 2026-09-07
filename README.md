@@ -22,7 +22,7 @@ At **Rabl** I ran `Celery` + `RabbitMQ` (10K+ jobs/day) and at **National Servic
 
 * **Holds connections:** `engine/source/ircfiber/irc/{connection,manager,parser}.d` — per-network `ConnectionServer`, `SASL`/`CAP`/`CHATHISTORY`, exponential backoff, `TLS` soft-reconnect.
 * **Sharded + resilient:** `ServerRegistry` shards networks across `engine` hosts, `EngineJanitor` TTL (Redis `EXPIRE 600s`), `NetworkStateSnapshot` survives `docker restart` / host reboot — same patterns as `Celery` + `Redis` + `Mongo` I shipped.
-* **Ops:** `Containerfile.engine` (`base` → `builder-common` → `builder-engine` → `runtime-engine`) **never compiles `frontend/`/`backend/`** — `ansible-playbook deploy-engine.yml` hard-restarts `ircfiber-engine-*` only, gateway stays up.
+* **Ops:** `Containerfile.engine` (`base` → `builder-common` → `builder-engine` → `runtime-engine`) **never compiles `frontend/`/`backend/`** — `make ship-engine` (ircfiber-infra) builds on the builder, pushes to GHCR and hard-restarts `ircfiber-engine-*` only, gateway stays up.
 
 Part of [kevinpostal/irc-fiber](https://github.com/kevinpostal/irc-fiber) superproject.
 
@@ -52,7 +52,7 @@ ircfiber-engine/
  common/source/ircfiber/{redis,models,db,storage} # duplicated from ircfiber-common
  backend/dub.sdl + dub.selections.json           # stub for dub validation
  Containerfile.engine + Makefile.engine + docker-compose.yml
- deploy/playbooks/deploy-engine.yml               # src_root=/opt/ircfiber-engine
+ (deploys: `make ship-engine` from ircfiber-infra — site/deploy/playbooks/engine-deploy.yml)
 ```
 
 ## Configuration
@@ -68,8 +68,8 @@ No hardcoded `ircfiber_admin_password` — via `vault_ircfiber_admin_password`.
 ## Deployment
 
 ```bash
-ansible-playbook deploy/playbooks/deploy-engine.yml -l vps-efb4b52d
-# BuildKit --target runtime-engine, hard-restarts engine only
+make -C .. ship-engine        # from ircfiber-infra: build on ubuntu-docker, push GHCR, deploy by digest
+# hard-restarts the engine container only (gateway untouched)
 ```
 
 ## Testing

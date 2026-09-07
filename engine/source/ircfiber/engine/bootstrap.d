@@ -17,7 +17,7 @@ import ircfiber.observability : flushAndSendMetrics, recordGauge, isMetricsEnabl
 import ircfiber.db.circuit_breaker : exportMongoCircuitMetrics;
 import vibe.core.log;
 import core.time : seconds;
-import ircfiber.build_version;
+import ircfiber.build_info : buildInfo;
 import ircfiber.models.irc_event : IRCRawEvent;
 import ircfiber.irc.manager : ConnectionManager;
 import ircfiber.irc.server : ConnectionServer;
@@ -192,14 +192,15 @@ EngineContext bootstrapEngine() {
     localServer.isHealthy = true;
     localServer.lastHeartbeat = Clock.currTime.toUnixTime!long * 1000;
     localServer.bufferOffset = 0; // Registry will set proper offset
-    localServer.gitHash = GIT_HASH;
-    localServer.gitShort = GIT_SHORT;
-    localServer.gitDescribe = GIT_DESCRIBE;
-    localServer.gitBranch = GIT_BRANCH;
-    localServer.buildTime = BUILD_TIME;
-    localServer.version_ = VERSION;
-    localServer.gitMessage = GIT_MESSAGE;
-    localServer.gitCommitUrl = GIT_COMMIT_URL;
+    auto bi = buildInfo();
+    localServer.gitHash = bi.commit;
+    localServer.gitShort = bi.shortHash;
+    localServer.gitDescribe = bi.describe;
+    localServer.gitBranch = bi.branch;
+    localServer.buildTime = bi.builtAt;
+    localServer.version_ = bi.version_;
+    localServer.gitMessage = bi.message;
+    localServer.gitCommitUrl = bi.commitUrl;
     localServer.assignedNetworks = [];
 
     // Apply admin-saved engine config overrides from Redis.

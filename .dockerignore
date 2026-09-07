@@ -1,0 +1,14 @@
+.git
+.github
+.deploy-cache
+node_modules
+frontend/node_modules
+.dub
+public/dist
+e2e
+test-results
+__screenshots__
+docs
+*.log
+backend/irc-fiber*
+engine/irc-fiber*

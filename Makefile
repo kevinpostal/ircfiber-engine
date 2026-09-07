@@ -83,8 +83,8 @@ help: ## Root > Show this help + use-case matrix (site + engine)
 	@printf '    Terminal 2: \033[92mmake debug\033[0m           gateway only\n'
 	@printf '    Terminal 3: \033[92mmake dev\033[0m             Vite HMR\n'
 	@printf '  \033[36mDeploy (OVH vps-efb4b52d, ansible — no manual docker build)\033[0m\n'
-	@printf '    \033[92mmake deploy-site\033[0m         site only (gateway+frontend, engine stays up)\n'
-	@printf '    \033[92mmake deploy-engine\033[0m       engine only (IRC daemon)\n'
+	@printf '    \033[92mmake -C .. ship\033[0m          site only (gateway+frontend, blue/green, engine stays up)\n'
+	@printf '    \033[92mmake -C .. ship-engine\033[0m   engine only (IRC daemon, hard restart)\n'
 	@printf '  \033[36mObserve\033[0m\n'
 	@printf '    \033[92mmake status\033[0m              processes + ports + log tails\n'
 	@printf '    \033[92mmake logs\033[0m                gateway + engine (docker)\n'
@@ -95,7 +95,7 @@ help: ## Root > Show this help + use-case matrix (site + engine)
 	@awk 'BEGIN{FS=":.*##[ \t]*"} /^[a-zA-Z0-9_.\/-]+:.*##[ \t]*Root[ \t]*>/{sub(/.*Root[ \t]*>[ \t]*/,"",$$2); printf "  \033[92mmake %-*s\033[0m \033[2m—\033[0m %s\n", 28, $$1, $$2}' $(MAKEFILE_LIST)
 	@printf '\n$(_BCn)$(K)$(B)  SITE — Gateway + Frontend  $(R)  \033[2m(site/Makefile.site)\033[0m\n'
 	@printf '  \033[36m\033[1m▸ Frontend — Vite / Svelte / Assets\033[0m \033[2m(dev, build)\033[0m\n'
-	@awk 'BEGIN{FS=":.*##[ \t]*"} /^[a-zA-Z0-9_.\/-]+:.*##/{t=$$1; c=$$2; if (t ~ /^(dev|dev-live|dev-docker|frontend|version)$$/ || t ~ /^frontend-/) {sub(/.*>[ \t]*/,"",c); printf "    \033[36mmake %-*s\033[0m %s\n", 26, t, c}}' $(SITE_DIR)/Makefile.site | sort -u
+	@awk 'BEGIN{FS=":.*##[ \t]*"} /^[a-zA-Z0-9_.\/-]+:.*##/{t=$$1; c=$$2; if (t ~ /^(dev|dev-live|dev-docker|frontend)$$/ || t ~ /^frontend-/) {sub(/.*>[ \t]*/,"",c); printf "    \033[36mmake %-*s\033[0m %s\n", 26, t, c}}' $(SITE_DIR)/Makefile.site | sort -u
 	@printf '\n  \033[32m\033[1m▸ Gateway — D/vibe.d REST+WS\033[0m \033[2m(debug, gateway)\033[0m\n'
 	@awk 'BEGIN{FS=":.*##[ \t]*"} /^[a-zA-Z0-9_.\/-]+:.*##/{t=$$1; c=$$2; if (t ~ /^(debug|debug-all|debug-host|debug-live|gateway|gateway-rebuild|gateway-restart)$$/ || t ~ /^gateway-/ || t == "build-gateway") {sub(/.*>[ \t]*/,"",c); printf "    \033[32mmake %-*s\033[0m %s\n", 26, t, c}}' $(SITE_DIR)/Makefile.site | sort -u
 	@printf '\n  \033[33m\033[1m▸ Observability — Logs / Status / Watch\033[0m\n'
@@ -133,13 +133,9 @@ engine-help: ## Root > Show engine/Makefile.engine help
 # ----------------------------------------------------------------------------
 # Aggregates
 # ----------------------------------------------------------------------------
-.PHONY: all version up down install-env verify ci
+.PHONY: all up down install-env verify ci
 
 all: help ## Root > Alias for help
-
-version: ## Root > Generate version file in site + engine (common/source/ircfiber/version.d)
-	@$(SITE_MAKE) version
-	@$(ENGINE_MAKE) version
 
 up: ## Root > Start local stack (site gateway + engine, docker)
 	@printf '\n$(BG)$(OK) Starting local stack (gateway + engine)$(R)\n'
@@ -290,15 +286,10 @@ stop: ## Root > Stop debug/debug-live + local docker stacks (site)
 # ----------------------------------------------------------------------------
 # Deploy — ansible, decoupled (site never restarts engine)
 # ----------------------------------------------------------------------------
-.PHONY: deploy-site deploy-engine deploy-restart deploy-restart-gateway deploy-restart-engine
+.PHONY: deploy-restart deploy-restart-gateway deploy-restart-engine
 
-deploy-site: ## Root > Deploy site (gateway+frontend) to OVH — engine untouched
-	@$(SITE_MAKE) deploy 2>/dev/null || $(SITE_MAKE) update 2>/dev/null || \
-		(cd $(SITE_DIR) && ansible-playbook deploy/playbooks/deploy-site.yml -l vps-efb4b52d)
-
-deploy-engine: ## Root > Deploy engine (IRC daemon) to OVH
-	@$(ENGINE_MAKE) deploy 2>/dev/null || $(ENGINE_MAKE) update 2>/dev/null || \
-		(cd $(ENGINE_DIR) && ansible-playbook deploy/playbooks/deploy-engine.yml -l vps-efb4b52d)
+# Image builds + deploys: `make ship` / `make ship-engine` in the
+# ircfiber-infra root Makefile (build on the builder, GHCR, pull by digest).
 
 deploy-restart: ## Root > Restart remote containers (all; site playbook)
 	@$(SITE_MAKE) deploy-restart
