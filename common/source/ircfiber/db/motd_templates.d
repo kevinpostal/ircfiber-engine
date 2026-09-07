@@ -25,12 +25,14 @@ import vibe.data.json;
 import vibe.core.log;
 import ircfiber.db.mongo : AppMongoConnection;
 
-/// Longest line accepted in a template body, in characters. Box-drawing
-/// art is 3 bytes per cell, so the byte cap below is what keeps a 372 line
-/// (`:server 372 nick :- ` + text) inside IRC's 512-byte limit.
-immutable size_t MOTD_MAX_LINE_LENGTH = 200;
+/// Longest line accepted in a template body, in characters. Coloured
+/// TheDraw art spends up to 6 characters per colour run on top of its 72
+/// cells, and box-drawing cells are 3 bytes each, so the byte cap below is
+/// what keeps a 372 line (`:server 372 <32-char nick> :- ` + text) inside
+/// IRC's 512-byte limit.
+immutable size_t MOTD_MAX_LINE_LENGTH = 400;
 /// Byte cap per line (see `MOTD_MAX_LINE_LENGTH`).
-immutable size_t MOTD_MAX_LINE_BYTES = 440;
+immutable size_t MOTD_MAX_LINE_BYTES = 450;
 /// Most lines one template may have.
 immutable size_t MOTD_MAX_LINES = 120;
 
@@ -61,6 +63,12 @@ struct MotdTemplateRecord {
     bool enabled;
     /// Admin ordering in the list (ascending).
     long sortOrder;
+    /// Builder recipe (JSON) the body was generated from; "" for hand-
+    /// written templates. Opaque to the server; the admin SPA owns the schema.
+    string recipe;
+    /// Variant group: templates generated together from one recipe share a
+    /// group and are replaced together on regeneration; "" = standalone.
+    string group;
     /// Creation timestamp (unix ms).
     long createdAt;
     /// Last change timestamp (unix ms).
@@ -78,6 +86,7 @@ struct MotdTemplateRecord {
         return Bson([
             "_id": Bson(id), "name": Bson(name), "body": Bson(body_),
             "enabled": Bson(enabled), "sortOrder": Bson(sortOrder),
+            "recipe": Bson(recipe), "group": Bson(group),
             "createdAt": Bson(createdAt), "updatedAt": Bson(updatedAt),
         ]);
     }
@@ -90,6 +99,8 @@ struct MotdTemplateRecord {
         r.body_ = bsonStr(b, "body");
         r.enabled = bsonBool(b, "enabled");
         r.sortOrder = bsonLong(b, "sortOrder");
+        r.recipe = bsonStr(b, "recipe");
+        r.group = bsonStr(b, "group");
         r.createdAt = bsonLong(b, "createdAt");
         r.updatedAt = bsonLong(b, "updatedAt");
         return r;
@@ -103,6 +114,8 @@ struct MotdTemplateRecord {
         j["body"] = body_;
         j["enabled"] = enabled;
         j["sortOrder"] = sortOrder;
+        j["recipe"] = recipe;
+        j["group"] = group;
         j["createdAt"] = createdAt;
         j["updatedAt"] = updatedAt;
         return j;
@@ -117,6 +130,8 @@ struct MotdTemplateRecord {
         r.body_ = j["body"].type == Json.Type.string ? j["body"].get!string : "";
         r.enabled = j["enabled"].type == Json.Type.bool_ ? j["enabled"].get!bool : false;
         r.sortOrder = j["sortOrder"].type == Json.Type.int_ ? j["sortOrder"].get!long : 0;
+        r.recipe = j["recipe"].type == Json.Type.string ? j["recipe"].get!string : "";
+        r.group = j["group"].type == Json.Type.string ? j["group"].get!string : "";
         r.createdAt = j["createdAt"].type == Json.Type.int_ ? j["createdAt"].get!long : 0;
         r.updatedAt = j["updatedAt"].type == Json.Type.int_ ? j["updatedAt"].get!long : 0;
         return r;
@@ -191,15 +206,24 @@ final class MotdTemplateRepository {
     }
 
     /// Replaces the editable fields. Returns false when the id is unknown.
-    bool update(string id, string name, string body_, bool enabled, long sortOrder) @trusted {
+    bool update(string id, string name, string body_, bool enabled, long sortOrder,
+                string recipe, string group) @trusted {
         auto now = Clock.currTime.toUnixTime!long * 1000;
         auto res = collection.updateOne(
             Bson(["_id": Bson(id)]),
             Bson(["$set": Bson([
                 "name": Bson(name), "body": Bson(body_), "enabled": Bson(enabled),
-                "sortOrder": Bson(sortOrder), "updatedAt": Bson(now),
+                "sortOrder": Bson(sortOrder), "recipe": Bson(recipe), "group": Bson(group),
+                "updatedAt": Bson(now),
             ])]));
         return res.matchedCount > 0;
+    }
+
+    /// Deletes every template in `group`. Returns the number removed.
+    long removeGroup(string group) @trusted {
+        if (group.length == 0) return 0;
+        auto res = collection.deleteMany(Bson(["group": Bson(group)]));
+        return res.deletedCount;
     }
 
     /// Deletes a template. Returns false when it did not exist.
@@ -351,6 +375,7 @@ Rules
 unittest {
     MotdTemplateRecord r;
     r.id = "t1"; r.name = "n"; r.body_ = "a\nb \n"; r.enabled = true; r.sortOrder = 5;
+    r.recipe = `{"blocks":[]}`; r.group = "g1";
     r.createdAt = 1; r.updatedAt = 2;
     auto b = MotdTemplateRecord.fromBson(r.toBson());
     assert(b == r);
@@ -379,7 +404,10 @@ unittest {
     assert(validateMotdBody("") != "");
     assert(validateMotdBody("\n\n") != "");
     assert(validateMotdBody("hello\n") == "");
-    assert(validateMotdBody("x".repeat(201).join) != "");
+    assert(validateMotdBody("x".repeat(401).join) != "");
+    // 72 box-drawing cells (3 bytes each) plus 30 colour runs fit; the
+    // builder warns past this so a 372 line stays inside 512 bytes.
+    assert(validateMotdBody("\x0301,01█".repeat(30).join ~ "█".repeat(42).join) == "");
     assert(validateMotdBody("l\n".repeat(121).join) != "");
 }
 

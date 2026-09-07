@@ -4927,7 +4927,11 @@ final class PersistentIRCClient {
                             if (!fiberMotdSwapped) {
                                 fiberMotdSwapped = true;
                                 foreach (l; fiberMotdLines) {
-                                    auto synth = parseIRCLine(":" ~ evt.prefix ~ " 372 " ~ sessionNick ~ " :- " ~ l);
+                                    // InspIRCd 4 sends 372 without the classic "- "
+                                    // prefix, so neither do we. A blank line ships as
+                                    // one space: an empty trailing is dropped as noise
+                                    // downstream and the template's spacing would go.
+                                    auto synth = parseIRCLine(":" ~ evt.prefix ~ " 372 " ~ sessionNick ~ " :" ~ (l.length ? l : " "));
                                     synth.network     = config.name;
                                     synth.timestampMs = resolveTimestamp(evt);
                                     eventChannel.put(synth);
