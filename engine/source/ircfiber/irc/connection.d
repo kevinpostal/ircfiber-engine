@@ -1845,11 +1845,33 @@ private TLSStream createTLSStreamWithTimeout(TCPConnection connection, TLSContex
 }
 
 // ── Nick prefix helpers ───────────────────────────────────────────────────────
+//
+// Every char a server can put in front of a nick in NAMES, highest rank
+// first. `*` is InspIRCd's <operprefix> and `!` its <ojoin>; the rest are
+// the usual status modes. With `multi-prefix` (which this engine always
+// requests) a nick arrives carrying the WHOLE run it holds — an opered
+// channel founder is `*~@+Zodiac` — so every one of these helpers works on
+// the run, not on nick[0]. Treating only `~&@%+` as prefixes made
+// `*~@+Zodiac` look like a bare nick: `sameNick` stopped matching it, and
+// the 352 handler "promoted" it by replacing the run with the single char
+// from the WHO flags, which is how the channel owner ended up rendered as
+// an op.
+private enum nickPrefixChars = "*!~&@%+";
+
+private bool isNickPrefixChar(char c) @safe pure nothrow @nogc {
+    foreach (p; nickPrefixChars) if (p == c) return true;
+    return false;
+}
+
+/// Length of the leading run of prefix chars (0 when the nick is bare).
+private size_t nickPrefixRun(string nick) @safe pure nothrow @nogc {
+    size_t i = 0;
+    while (i < nick.length && isNickPrefixChar(nick[i])) i++;
+    return i;
+}
 
 private string stripNickPrefix(string nick) {
-    if (nick.length > 0 && (nick[0] == '~' || nick[0] == '&' || nick[0] == '@' || nick[0] == '%' || nick[0] == '+')) {
-        nick = nick[1 .. $];
-    }
+    nick = nick[nickPrefixRun(nick) .. $];
     // Strip hostmask suffix when userhost-in-names is active (nick!user@host)
     auto bang = nick.indexOf("!");
     if (bang > 0) nick = nick[0 .. bang];
@@ -1857,10 +1879,66 @@ private string stripNickPrefix(string nick) {
 }
 
 private string nickPrefix(string nick) {
-    if (nick.length > 0 && (nick[0] == '~' || nick[0] == '&' || nick[0] == '@' || nick[0] == '%' || nick[0] == '+')) {
-        return nick[0 .. 1];
+    return nick[0 .. nickPrefixRun(nick)];
+}
+
+/// Channel status mode letter → the prefix char it renders as, `'\0'` for a
+/// mode that takes no member target. `y`/`Y` are InspIRCd's operprefix and
+/// ojoin modes: without them a `MODE #chan +yo nick1 nick2` consumed no
+/// target for `y` and applied `o` to the wrong nick.
+private char prefixForModeChar(char m) @safe pure nothrow @nogc {
+    switch (m) {
+        case 'q': return '~';
+        case 'a': return '&';
+        case 'o': case 'O': return '@';
+        case 'h': return '%';
+        case 'v': return '+';
+        case 'y': return '*';
+        case 'Y': return '!';
+        default: return '\0';
     }
-    return "";
+}
+
+/// Add `p` to a member entry's prefix run, keeping the run in rank order.
+/// Idempotent, and it never drops the other prefixes the member holds —
+/// replacing the first char (what this used to do) turned `~alice` into
+/// `+alice` on a `+v`, demoting an owner to voiced.
+private string addNickPrefix(string entry, char p) @safe pure {
+    const run = nickPrefixRun(entry);
+    const bare = entry[run .. $];
+    string kept;
+    foreach (c; nickPrefixChars) {
+        if (c == p) { kept ~= c; continue; }
+        foreach (h; entry[0 .. run]) if (h == c) { kept ~= c; break; }
+    }
+    return kept ~ bare;
+}
+
+/// Remove exactly `p` from a member entry's prefix run, leaving any other
+/// status the member still holds in place.
+private string removeNickPrefix(string entry, char p) @safe pure {
+    const run = nickPrefixRun(entry);
+    string kept;
+    foreach (c; entry[0 .. run]) if (c != p) kept ~= c;
+    return kept ~ entry[run .. $];
+}
+
+@("nick prefix helpers handle a multi-prefix run")
+unittest {
+    assert(stripNickPrefix("*~@+Zodiac") == "Zodiac");
+    assert(stripNickPrefix("Zodiac") == "Zodiac");
+    assert(stripNickPrefix("@bob!user@host") == "bob");
+    assert(nickPrefix("*~@+Zodiac") == "*~@+");
+    assert(nickPrefix("bare") == "");
+    // Rank order is preserved and an already-held prefix is a no-op.
+    assert(addNickPrefix("@bob", '~') == "~@bob");
+    assert(addNickPrefix("~@bob", '+') == "~@+bob");
+    assert(addNickPrefix("~@bob", '@') == "~@bob");
+    assert(addNickPrefix("bob", '+') == "+bob");
+    // Removing one status keeps the others.
+    assert(removeNickPrefix("*~@+Zodiac", '+') == "*~@Zodiac");
+    assert(removeNickPrefix("*~@Zodiac", '~') == "*@Zodiac");
+    assert(removeNickPrefix("bob", '@') == "bob");
 }
 
 // ── CASEMAPPING-aware nick comparison ─────────────────────────────────────────
@@ -6159,11 +6237,7 @@ private void processEvents() {
             case "CHGHOST":
                 foreach (chan, ref users; channelUsers) {
                     foreach (u; users) {
-                        string bare = u;
-                        if (bare.length > 0 && (bare[0] == '~' || bare[0] == '&' ||
-                            bare[0] == '@' || bare[0] == '%' || bare[0] == '+'))
-                            bare = bare[1 .. $];
-                        if (sameNick(bare, event.nick)) {
+                        if (sameNick(stripNickPrefix(u), event.nick)) {
                             chghostChannels ~= chan;
                             break;
                         }
@@ -6388,10 +6462,13 @@ private void processEvents() {
                         while (j < channelUsers[chan].length) {
                             auto existing = channelUsers[chan][j];
                             if (sameNick(existing, nick)) {
-                                if (existing.length == 0 ||
-                                    (existing[0] != '~' && existing[0] != '&' &&
-                                     existing[0] != '@' && existing[0] != '%' &&
-                                     existing[0] != '+')) {
+                                // A run of prefix chars — including the
+                                // operprefix `*` a multi-prefix NAMES puts
+                                // first — means the entry already carries
+                                // the server's own, richer answer. Only a
+                                // genuinely bare entry gets the single char
+                                // WHO's flags field can express.
+                                if (nickPrefixRun(existing) == 0) {
                                     // Bare entry — promote it to the
                                     // prefixed form from the WHO response.
                                     if (!foundBare) {
@@ -6718,7 +6795,8 @@ private void processEvents() {
                         foreach (ch; modeStr) {
                             if (ch == '+') { adding = true; continue; }
                             if (ch == '-') { adding = false; continue; }
-                            if (ch == 'q' || ch == 'a' || ch == 'o' || ch == 'O' || ch == 'h' || ch == 'v') {
+                            const modePrefix = prefixForModeChar(ch);
+                            if (modePrefix != '\0') {
                                 if (targetIdx >= mp.length) break;
                                 const targetNick = mp[targetIdx++];
                                 bool found = false;
@@ -6726,64 +6804,21 @@ private void processEvents() {
                                     foreach (i, ref u; *members) {
                                         if (sameNick(u, targetNick)) {
                                             found = true;
-                                            if (adding) {
-                                                char newPrefix;
-                                                switch (ch) {
-                                                    case 'q': newPrefix = '~'; break;
-                                                    case 'a': newPrefix = '&'; break;
-                                                    case 'o': newPrefix = '@'; break;
-                                                    case 'O': newPrefix = '@'; break;
-                                                    case 'h': newPrefix = '%'; break;
-                                                    case 'v': newPrefix = '+'; break;
-                                                    default: break;
-                                                }
-                                                if (newPrefix) {
-                                                    if (u.length > 0 && (u[0] == '~' || u[0] == '&'
-                                                        || u[0] == '@' || u[0] == '%'
-                                                        || u[0] == '+'))
-                                                        u = newPrefix ~ u[1 .. $];
-                                                    else
-                                                        u = newPrefix ~ u;
-                                                }
-                                            } else {
-                                                if (u.length > 0 && (u[0] == '~' || u[0] == '&'
-                                                    || u[0] == '@' || u[0] == '%'
-                                                    || u[0] == '+'))
-                                                        u = u[1 .. $];
-                                            }
+                                            // Merge into / remove from the run
+                                            // rather than rewriting its first
+                                            // char: a `+v` on `~alice` used to
+                                            // overwrite the owner prefix and
+                                            // demote her to voiced.
+                                            u = adding
+                                                ? addNickPrefix(u, modePrefix)
+                                                : removeNickPrefix(u, modePrefix);
                                             break;
                                         }
                                     }
-                                    if (!found && adding) {
-                                        char newPrefix;
-                                        switch (ch) {
-                                            case 'q': newPrefix = '~'; break;
-                                            case 'a': newPrefix = '&'; break;
-                                            case 'o': newPrefix = '@'; break;
-                                            case 'O': newPrefix = '@'; break;
-                                            case 'h': newPrefix = '%'; break;
-                                            case 'v': newPrefix = '+'; break;
-                                            default: break;
-                                        }
-                                        if (newPrefix) {
-                                            *members ~= newPrefix ~ targetNick;
-                                        } else {
-                                            *members ~= targetNick;
-                                        }
-                                    }
+                                    if (!found && adding)
+                                        *members ~= modePrefix ~ targetNick;
                                 } else if (adding) {
-                                    char newPrefix;
-                                    switch (ch) {
-                                        case 'q': newPrefix = '~'; break;
-                                        case 'a': newPrefix = '&'; break;
-                                        case 'o': newPrefix = '@'; break;
-                                        case 'O': newPrefix = '@'; break;
-                                        case 'h': newPrefix = '%'; break;
-                                        case 'v': newPrefix = '+'; break;
-                                        default: break;
-                                    }
-                                    string newUser = newPrefix ? newPrefix ~ targetNick : targetNick;
-                                    channelUsers[chan] = [newUser];
+                                    channelUsers[chan] = [modePrefix ~ targetNick];
                                 }
                             }
                         }
