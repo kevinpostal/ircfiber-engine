@@ -210,9 +210,13 @@ public IRCRawEvent parseIRCLinePublic(string line, NetworkConfig config) {
     // Do NOT set event.channel = nick here; that legacy assignment
     // broke outgoing echo with echo-message (see AGENTS.md DM invariant).
     // JOIN error numerics (471, 473, etc.) carry the target channel as
-    // a non-leading parameter.
+    // a non-leading parameter. The trailing parameter is free text and is
+    // never a channel once there is anything before it: a MOTD or NOTICE
+    // line that happens to start with '#' (ASCII art, "#help: ...") was
+    // being routed to a phantom channel buffer and vanished from _server.
     if (event.channel.length == 0) {
-        foreach (p; params) {
+        auto candidates = params.length > 1 ? params[0 .. $ - 1] : params;
+        foreach (p; candidates) {
             if (p.length > 0 && p[0] == '#') { event.channel = p; break; }
         }
     }

@@ -3081,8 +3081,16 @@ final class PersistentIRCClient {
         import ircfiber.db.motd_templates : motdTemplatesFromJson;
         if (redis is null || config.host.toLower != DEFAULT_FIBER_HOST) return null;
         try {
-            auto templates = motdTemplatesFromJson(redis.getDb().get(RedisKeys.motdTemplates()));
+            auto rdb = redis.getDb();
+            auto templates = motdTemplatesFromJson(rdb.get(RedisKeys.motdTemplates()));
             if (templates.length == 0) return null;
+            // An admin-pinned template wins over the random pick (the same
+            // one is rotated into the ircd file, so every client agrees).
+            auto pinned = rdb.get(RedisKeys.motdPinned());
+            foreach (t; templates) if (pinned.length && t.id == pinned) {
+                logInfo("MOTD for %s: serving pinned template '%s'", config.name, t.name);
+                return t.lines();
+            }
             auto t = templates[uniform(0, templates.length)];
             logInfo("MOTD for %s: serving template '%s' (1 of %d enabled)", config.name, t.name, templates.length);
             return t.lines();
@@ -4926,14 +4934,19 @@ final class PersistentIRCClient {
                             }
                             if (!fiberMotdSwapped) {
                                 fiberMotdSwapped = true;
-                                foreach (l; fiberMotdLines) {
+                                // One ms apart: the buffer store dedups msgid-less
+                                // lines by (command, text, timestampMs), so two
+                                // identical banner rows or blank lines sharing the
+                                // 375's stamp would collapse into one.
+                                const motdBaseT = resolveTimestamp(evt);
+                                foreach (i, l; fiberMotdLines) {
                                     // InspIRCd 4 sends 372 without the classic "- "
                                     // prefix, so neither do we. A blank line ships as
                                     // one space: an empty trailing is dropped as noise
                                     // downstream and the template's spacing would go.
                                     auto synth = parseIRCLine(":" ~ evt.prefix ~ " 372 " ~ sessionNick ~ " :" ~ (l.length ? l : " "));
                                     synth.network     = config.name;
-                                    synth.timestampMs = resolveTimestamp(evt);
+                                    synth.timestampMs = motdBaseT + i;
                                     eventChannel.put(synth);
                                 }
                             }

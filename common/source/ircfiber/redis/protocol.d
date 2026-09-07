@@ -207,6 +207,10 @@ struct RedisKeys {
     /// random in place of the ircd's static file. Empty/absent = pass the
     /// ircd MOTD through unchanged.
     static string motdTemplates() { return "irc:config:motdTemplates"; }
+    /// Id of the admin-pinned MOTD template, or absent. While set the
+    /// engine serves it on every connect and the gateway keeps it in the
+    /// ircd file instead of rotating.
+    static string motdPinned() { return "irc:config:motdPinned"; }
 
     /// Protocol version key. Written by engine heartbeat (see
     /// `ircfiber.engine.state.writeStateSnapshots`). Gateways and

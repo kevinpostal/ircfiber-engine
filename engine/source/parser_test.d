@@ -340,6 +340,31 @@ void runIsupportTests() {
     }
 }
 
+/// Channel derivation must never read the trailing free text: a MOTD or
+/// NOTICE line starting with '#' was routed to a phantom channel buffer.
+void runChannelDerivationTests() {
+    stderr.writeln("\n[channel derivation]");
+    {
+        auto e = parseIRCLineNamed(":srv 372 me :#### ########   ######", "TestNet", "nid");
+        check!("372 '#' art: no channel")(e.channel.length == 0, e.channel);
+        check!("372 '#' art: text kept")(e.text == "#### ########   ######", e.text);
+    }
+    {
+        auto e = parseIRCLineNamed(":srv NOTICE me :#help is the support channel", "TestNet", "nid");
+        check!("NOTICE '#' text: no channel")(e.channel.length == 0, e.channel);
+    }
+    {
+        // Middle parameters still resolve (JOIN error numerics).
+        auto e = parseIRCLineNamed(":srv 471 me #full :Cannot join channel (+l)", "TestNet", "nid");
+        check!("471: channel from middle param")(e.channel == "#full", e.channel);
+    }
+    {
+        // A lone trailing channel (JOIN :#chan) is still a channel.
+        auto e = parseIRCLineNamed(":nick!u@h JOIN :#chan", "TestNet", "nid");
+        check!("JOIN trailing-only: channel")(e.channel == "#chan", e.channel);
+    }
+}
+
 /// RPL_LIST (322) row parsing for /LIST → CHANNEL_LIST.
 void runChannelListTests() {
     stderr.writeln("\n[channel list]");
@@ -431,6 +456,7 @@ int main() {
     runIsupportTests();
     runBatchTests();
     runChannelListTests();
+    runChannelDerivationTests();
     stderr.writeln("\n", passed, " passed, ", failed, " failed");
     return failed == 0 ? 0 : 1;
 }
