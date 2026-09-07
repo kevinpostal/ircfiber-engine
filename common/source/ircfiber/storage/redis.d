@@ -265,17 +265,38 @@ struct ScanResult {
 }
 
 /// SCAN-based key listing, returning up to `count` matching keys.
+///
+/// The reply is flattened server-side by a Lua script, because SCAN's own
+/// reply is a NESTED multi-bulk (`[cursor, [key, …]]`) and vibe's
+/// RedisReply only decodes flat replies: it reads the inner array header
+/// (`*N`) as if it were a bulk length, which yields garbage keys/cursors
+/// AND leaves the pooled connection mid-reply, so the next request to
+/// borrow that connection reads the leftovers (it either sees another
+/// request's data or blocks on a trailing read). Same trap as the `KEYS`
+/// note in storage/buffer.d clearNetworkBuffers.
+///
+/// `SCAN` inside `EVAL` is allowed from Redis 5 on (effect replication is
+/// the default there); every deployment here runs redis:7.
 ScanResult scanKeys(string cursor, string match, long count = 100) @trusted {
     import std.conv : to;
+    // ARGV: cursor, match, count. Returns [cursor, key, …] — one flat array.
+    static immutable scanFlatScript =
+        "local r = redis.call('SCAN', ARGV[1], 'MATCH', ARGV[2], 'COUNT', ARGV[3])\n"
+        ~ "local out = {r[1]}\n"
+        ~ "for i = 1, #r[2] do out[#out + 1] = r[2][i] end\n"
+        ~ "return out";
     ScanResult r;
     try {
-        auto reply = db.request!(RedisReply!string)("SCAN", cursor, "MATCH", match, "COUNT", count.to!string);
-        // Reply format: [nextCursor, [key, key, ...]]
+        auto reply = db.request!(RedisReply!string)("EVAL", scanFlatScript, "0",
+            cursor, match, count.to!string);
         bool first = true;
         foreach (item; reply) {
             if (first) { r.cursor = item; first = false; }
             else r.keys ~= item;
         }
+        // An empty reply would otherwise leave `cursor` empty and spin a
+        // caller's `while (cursor != "0")` loop forever.
+        if (first) r.cursor = "0";
     } catch (Exception e) {
         logDebug("Redis SCAN failed: %s", e.msg);
         r.cursor = "0";
@@ -283,16 +304,70 @@ ScanResult scanKeys(string cursor, string match, long count = 100) @trusted {
     return r;
 }
 
-/// Returns up to `count` entries from the SLOWLOG.
-/// Each entry is a flat array: [id, unixMs, durationMicros, [cmd, arg, ...], ip, ...]
-RedisReply!string slowlog(long count = 50) @trusted {
+/// One SLOWLOG entry.
+struct SlowlogEntry {
+    long id;
+    /// Unix ms (SLOWLOG itself reports seconds; converted here).
+    long timestampMs;
+    long durationMicros;
+    /// The command and its arguments, as Redis recorded them.
+    string[] command;
+}
+
+/// Returns up to `count` SLOWLOG entries, newest first.
+///
+/// Flattened server-side for the same reason as scanKeys: a SLOWLOG GET
+/// entry nests its command tokens in a sub-array, and vibe's RedisReply
+/// only decodes flat replies — read flat it mis-reads the sub-array header
+/// and leaves the pooled connection mid-reply, so the next request on that
+/// connection blocks. The script emits
+/// `id, timestampSeconds, durationMicros, tokenCount, token…` per entry, so
+/// the arity is explicit instead of guessed.
+SlowlogEntry[] slowlog(long count = 50) @trusted {
     import std.conv : to;
-    try return db.request!(RedisReply!string)("SLOWLOG", "GET", count.to!string);
-    catch (Exception e) {
+    static immutable slowlogFlatScript =
+        "local r = redis.call('SLOWLOG', 'GET', ARGV[1])\n"
+        ~ "local out = {}\n"
+        ~ "for i = 1, #r do\n"
+        ~ "  local e = r[i]\n"
+        ~ "  local cmd = e[4]\n"
+        ~ "  out[#out + 1] = tostring(e[1])\n"
+        ~ "  out[#out + 1] = tostring(e[2])\n"
+        ~ "  out[#out + 1] = tostring(e[3])\n"
+        ~ "  out[#out + 1] = tostring(#cmd)\n"
+        ~ "  for j = 1, #cmd do out[#out + 1] = tostring(cmd[j]) end\n"
+        ~ "end\n"
+        ~ "return out";
+    string[] flat;
+    try {
+        auto reply = db.request!(RedisReply!string)("EVAL", slowlogFlatScript, "0",
+            count.to!string);
+        foreach (item; reply) flat ~= item;
+    } catch (Exception e) {
         logDebug("Redis SLOWLOG GET failed: %s", e.msg);
-        // Return an empty reply by triggering a no-op
-        return db.request!(RedisReply!string)("SLOWLOG", "LEN");
+        return null;
     }
+
+    SlowlogEntry[] entries;
+    size_t i = 0;
+    while (i + 4 <= flat.length) {
+        SlowlogEntry e;
+        size_t tokens;
+        try {
+            e.id = flat[i].to!long;
+            e.timestampMs = flat[i + 1].to!long * 1000L;
+            e.durationMicros = flat[i + 2].to!long;
+            tokens = flat[i + 3].to!size_t;
+        } catch (Exception) {
+            break;   // malformed stream: stop rather than mis-attribute fields
+        }
+        i += 4;
+        if (i + tokens > flat.length) break;
+        e.command = flat[i .. i + tokens].dup;
+        i += tokens;
+        entries ~= e;
+    }
+    return entries;
 }
 
 /// Returns PUBSUB CHANNELS matching the pattern.
