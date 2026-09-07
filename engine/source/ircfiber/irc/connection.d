@@ -74,8 +74,21 @@ enum ConnectionState {
 }
 
 // ── IRCv3 capabilities we request ────────────────────────────────────────────
-// Sent as CAP REQ :cap1 cap2 ...
-// The server will ACK or NAK each; we track which we got.
+// Sent as CAP REQ :cap1 cap2 ... — but only for names the server actually
+// advertised in CAP LS (see the `serverCaps.canFind(desired)` intersection in
+// the handshake), so a name no server offers is simply dead weight, not a
+// failed REQ.
+//
+// Two such dead entries were removed:
+//   `msgid`       — never a capability. The `msgid` tag rides on
+//                   `message-tags`; asking for it could never be ACKed.
+//   `chathistory` — the spec name is `draft/chathistory`. With only the
+//                   bare name in this list, `hasCap` was false on every
+//                   server, so the `CHATHISTORY LATEST` request on self-JOIN
+//                   and `requestChathistory()` were unreachable. The bare
+//                   name stays below purely for tolerance: a server that
+//                   ships it un-prefixed still negotiates, and
+//                   `hasChathistoryCap()` accepts either spelling.
 private immutable string[] DESIRED_CAPS_BASE = [
     "away-notify",
     "account-notify",
@@ -90,8 +103,8 @@ private immutable string[] DESIRED_CAPS_BASE = [
     "echo-message",
     "chghost",
     "invite-notify",
+    "draft/chathistory",
     "chathistory",
-    "msgid",
     "labeled-response",
     "standard-replies",
     "setname",
@@ -3650,6 +3663,13 @@ final class PersistentIRCClient {
     /// Whether a given IRCv3 capability was negotiated.
     bool hasCap(string cap) const { return (cap in ackedCaps) !is null && ackedCaps[cap]; }
 
+    /// Whether server-side history is available. IRCv3 names it
+    /// `draft/chathistory`; accept a bare `chathistory` too for servers
+    /// that ship the un-prefixed spelling.
+    bool hasChathistoryCap() const {
+        return hasCap("draft/chathistory") || hasCap("chathistory");
+    }
+
     /// CASEMAPPING-aware nick equality for membership lookups. Strips
     /// channel prefixes and userhost-in-names suffixes from both sides,
     /// then folds per the server's ISUPPORT CASEMAPPING (default
@@ -5827,10 +5847,12 @@ private void processEvents() {
                             config.autoJoinChannels ~= chan;
                         auto pi = config.partedChannels.countUntil(chan);
                         if (pi >= 0) config.partedChannels = config.partedChannels.remove(pi);
-                        // Request server-side history if available
-                        if (hasCap("chathistory")) {
-                            sendRaw("CHATHISTORY LATEST " ~ chan ~ " 100");
-                        }
+                        // Request server-side history if available. Goes
+                        // through requestChathistory so it uses the spec
+                        // wire format and takes the per-channel in-flight
+                        // slot the BATCH close releases — the hand-rolled
+                        // `sendRaw` here did neither.
+                        requestChathistory(chan, "LATEST", "", 100);
                         // Log our own JOINs at info so the web join at
                         // /irc/Supernets/channel/superbowl is visible in SigNoz.
                         // Fixed: was checking autoJoinChannels *after* appending, so the
@@ -6439,8 +6461,15 @@ private void processEvents() {
                 return;
 
             // ── Away notify (away-notify cap) ─────────────────────────────────
+            // ONE event per shared channel, not one per matching roster
+            // entry: the same nick legitimately appears twice in
+            // channelUsers — bare from the JOIN handler, host-bearing from
+            // 353 with userhost-in-names or from WHO (see the NICK handler
+            // below, which mutates every copy for exactly that reason).
+            // sameNick strips both the mode prefix and the !user@host
+            // suffix, so a per-entry loop matched twice and published two
+            // events with distinct ids — two identical rows in the client.
             case "AWAY":
-                // Broadcast to all channels this user is in so the UI can update.
                 // event.text is the away message (empty = returned from away).
                 foreach (chan, users; channelUsers) {
                     foreach (u; users) {
@@ -6449,6 +6478,7 @@ private void processEvents() {
                             dup.channel     = chan;
                             dup.id          = randomUUID().toString();
                             eventChannel.put(dup);
+                            break; // one per channel
                         }
                     }
                 }
@@ -6456,25 +6486,30 @@ private void processEvents() {
 
             // ── Account notify (account-notify cap) ──────────────────────────
             case "ACCOUNT":
-                // params[0] = account name or "*" (logged out)
-                // Broadcast to shared channels
-                foreach (chan, users; channelUsers) {
-                    foreach (u; users) {
-                        if (sameNick(u, event.nick)) {
-                            auto dup    = event;
-                            dup.channel = chan;
-                            dup.id      = randomUUID().toString();
-                            eventChannel.put(dup);
-                        }
+                // params[0] = account name or "*" (logged out).
+                // Server-log only: per-channel fan-out spammed every shared
+                // channel with "nick logged in as account" rows. A single
+                // _server event (empty channel falls through to the publish
+                // below) keeps the login visible without the channel noise —
+                // QUIT/NICK/CHGHOST dual-publish, ACCOUNT does not.
+                {
+                    auto ap = event.getParams();
+                    if (ap.length >= 1 && ap[0].length > 0 && event.nick.length > 0) {
+                        accounts[event.nick] = ap[0];
+                        // Colon-less `ACCOUNT acct` parses with empty text;
+                        // the timeline renders msg.text, so normalize it.
+                        if (event.text.length == 0)
+                            event.text = ap[0];
                     }
                 }
-                return;
+                event.channel = "";
+                break;
 
             // ── Realname change (setname cap) ──────────────────────────────
             // `:nick!user@host SETNAME :new real name` — one trailing
             // param (https://ircv3.net/specs/extensions/setname).
             // Updates the realname cache and fans out to shared channels
-            // like AWAY/ACCOUNT so the UI can refresh member details.
+            // like AWAY so the UI can refresh member details.
             case "SETNAME":
                 if (event.text.length > 0 && event.nick.length > 0)
                     realnames[event.nick] = event.text;
@@ -6485,6 +6520,7 @@ private void processEvents() {
                             dup.channel = chan;
                             dup.id      = randomUUID().toString();
                             eventChannel.put(dup);
+                            break; // one per channel
                         }
                     }
                 }
@@ -6612,28 +6648,38 @@ private void processEvents() {
                 }
                 break;
 
-            // ── BATCH (chathistory) ──────────────────────────────────────────
-            case "BATCH":
+            // ── BATCH (chathistory / chanhistory replay) ──────────────────────
+            // The close form carries a SINGLE parameter and arrives as a
+            // trailing on InspIRCd 4 (`:irc.example.org BATCH :-1`). The old
+            // `params.length >= 2` guard skipped it, so the batch never
+            // closed: `activeBatchType` stayed "chathistory" for the life of
+            // the connection and every later event was tagged
+            // `batch=chathistory` (see the tag block below). The frontend
+            // routes tagged events down the backfill/prepend path, which
+            // suppresses notifications and unread counts for all live
+            // traffic. parseBatchOpen/parseBatchClose own both shapes.
+            case "BATCH": {
+                import ircfiber.irc.parser : parseBatchOpen, parseBatchClose;
                 auto params = event.getParams();
-                if (params.length >= 2) {
-                    auto ref_ = params[0];
-                    const batchType = params[1];
-                    if (ref_.startsWith("+")) {
-                        activeBatchRef = ref_[1 .. $];
-                        activeBatchType = batchType;
-                        activeBatchTarget = params.length >= 3 ? params[2] : "";
-                    } else if (ref_.startsWith("-")) {
-                        // Batch ended — clear in-flight flag for the channel
-                        // so the next CHATHISTORY request can go through.
-                        if (activeBatchType == "chathistory" && activeBatchTarget.length > 0) {
-                            clearChathistoryInFlight(activeBatchTarget);
-                        }
-                        activeBatchRef = "";
-                        activeBatchType = "";
-                        activeBatchTarget = "";
+                string batchRef, batchType, batchTarget;
+                if (parseBatchOpen(params, batchRef, batchType, batchTarget)) {
+                    activeBatchRef = batchRef;
+                    activeBatchType = batchType;
+                    activeBatchTarget = batchTarget;
+                } else if (parseBatchClose(params, batchRef)) {
+                    // Clear in-flight flag for the channel so the next
+                    // CHATHISTORY request can go through. A ref mismatch
+                    // means our tracking drifted — clear anyway, because
+                    // staying open is the failure mode above.
+                    if (activeBatchType == "chathistory" && activeBatchTarget.length > 0) {
+                        clearChathistoryInFlight(activeBatchTarget);
                     }
+                    activeBatchRef = "";
+                    activeBatchType = "";
+                    activeBatchTarget = "";
                 }
                 return; // Don't publish BATCH events to the UI
+            }
 
             // ── Channel mode (ban/quiet/op/voice/etc.) ───────────────────────
             case "MODE":
@@ -8445,7 +8491,7 @@ private void processEvents() {
     /// `command` is one of: "LATEST", "BEFORE", "AFTER", "AROUND", "BETWEEN".
     /// For BEFORE/AFTER/AROUND `refMsgid` must be non-empty.
     void requestChathistory(string channel, string command, string refMsgid, int limit) {
-        if (!hasCap("chathistory")) return;
+        if (!hasChathistoryCap()) return;
         import ircfiber.irc.chathistory : buildChathistoryLine;
         auto line = buildChathistoryLine(command, channel, refMsgid, limit);
         if (line is null) {

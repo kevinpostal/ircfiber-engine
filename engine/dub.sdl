@@ -196,6 +196,13 @@ configuration "janitor-lock-test" {
     versions "VibeUseFibers"
 }
 
+configuration "buffer-dedup-test" {
+    targetType "executable"
+    targetName "buffer-dedup-test"
+    mainSourceFile "source/buffer_dedup_test.d"
+    versions "VibeUseFibers"
+}
+
 configuration "janitor-safety-test" {
     targetType "executable"
     targetName "janitor-safety-test"

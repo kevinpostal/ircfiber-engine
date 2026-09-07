@@ -96,7 +96,22 @@ void startEventProcessor(ref EngineContext ctx) {
                 // The buffer is the source of truth for the _server
                 // channel scrollback; the MongoDB write below makes it
                 // durable across restarts and Redis flushes.
-                if (!transientList) ctx.bufferManager.appendIRCEvent(event, serverId);
+                //
+                // The dedup verdict is authoritative for ALL THREE sinks.
+                // It used to gate only the Redis scrollback while Mongo and
+                // the live WebSocket publish below ran unconditionally, so a
+                // re-emitted event (an IRCv3 batch replayed on rejoin, a
+                // roster fan-out that matched a nick twice) reached the
+                // browser as a second row with its own id and eid — nothing
+                // downstream can collapse those — while the scrollback kept
+                // exactly one. That is the "it showed my JOIN twice" class
+                // of bug: duplicated live rows over a clean scrollback.
+                if (!transientList && !ctx.bufferManager.appendIRCEvent(event, serverId)) {
+                    logDebug("Dropping duplicate %s eid=%d for %s/%s (already in scrollback)",
+                        event.command, event.eid, event.network,
+                        event.channel.length ? event.channel : "_server");
+                    continue;
+                }
 
                 // ── MongoDB persistence — async, AFTER publish ──
                 // The 2026-07-13 fix moves the Mongo write BACK to a

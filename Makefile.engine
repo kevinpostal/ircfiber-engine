@@ -991,6 +991,11 @@ observability-test: ## Test > OTel metrics pipeline (counter/gauge/histogram JSO
 	@$(DUB) build --config=observability-test 2>&1 | tail -3
 	@./engine/observability-test
 
+buffer-dedup-test: ## Test > BufferManager event dedup (duplicate verdict, reassignment, adoption, clear)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  BufferManager dedup tests  $(R)"
+	@$(DUB) build --config=buffer-dedup-test 2>&1 | tail -3
+	@./engine/buffer-dedup-test
+
 janitor-test: ## Test > EngineJanitor basic reap (orphan → reaped, live → skipped)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  EngineJanitor basic-reap tests  $(R)"
 	@$(DUB) build --config=janitor-test 2>&1 | tail -3

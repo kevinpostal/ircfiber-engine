@@ -96,17 +96,31 @@ final class BufferManager {
         enum MAX_SCROLLBACK = 5000;
         enum KEY_PREFIX = "scrollback:";
         enum TTL_DAYS = 30;
-        // Dedup-set key namespace. Each scrollback buffer has a paired
-        // Redis SET that holds the dedup keys (msgid or content hash) of
-        // every message it has ever stored. SADD returns 1 if the key
-        // was new, 0 if it already existed — that's the dedup check.
-        // Persisted in Redis (not in-memory) so engine restarts, failovers,
-        // and reassignments between connection servers don't replay
-        // duplicates.
+        // Dedup-set key namespace: `dedup:<networkId>:<channel>`.
+        //
+        // Each buffer has a paired Redis SET holding the dedup key (msgid
+        // or content hash) of every message stored for it. SADD returns 1
+        // for a new key and 0 for an existing one — that is the check.
+        //
+        // Deliberately NOT namespaced by serverId, unlike the scrollback
+        // list. networkId is a UUID, so there is no collision to defend
+        // against, and a server segment made the set per-engine: after a
+        // reassignment or failover the new engine started with an empty
+        // set and re-published every event it had already seen — to the
+        // live WebSocket stream and to Mongo, both of which are
+        // network-scoped, so the client saw duplicate rows. The old
+        // `dedup:<serverId>:<networkId>:<channel>` sets are adopted once
+        // per buffer via RENAMENX (see adoptServerDedupSet) and otherwise
+        // expire on their own TTL.
         enum DEDUP_PREFIX = "dedup:";
         enum DEDUP_MAX = 10_000;
         enum DEDUP_TTL_SECS = 30 * 86_400;  // 30 days, same as scrollback
     }
+
+    /// Buffers whose legacy server-scoped dedup set has already been
+    /// considered for adoption in this process. Keyed by the new
+    /// network-scoped key.
+    private bool[string] dedupAdopted;
 
     /// Creates a new buffer manager.
     this(RedisStorage redisStorage) {
@@ -398,8 +412,15 @@ final class BufferManager {
      * scrollback. When the bound is hit, a sampled trim keeps the most
      * recent half — the cost of briefly re-allowing duplicates on
      * ancient history is much lower than the cost of unbounded growth.
+     *
+     * Returns `true` when the event was stored and `false` when the dedup
+     * set already held it. Callers MUST honour `false`: the event processor
+     * used to ignore it and still publish the duplicate to the live
+     * WebSocket stream, so a re-emitted event (an IRCv3 batch replayed on
+     * rejoin, a roster-driven fan-out that matched twice) rendered as two
+     * identical rows that vanished on refresh — the scrollback had one.
      */
-    void appendIRCEvent(IRCRawEvent event, string serverId) @trusted {
+    bool appendIRCEvent(IRCRawEvent event, string serverId) @trusted {
         auto msg = Json([
             "network": Json(sanitizeUtf8(event.network)),
             "i": Json(sanitizeUtf8(event.id)),
@@ -448,19 +469,48 @@ final class BufferManager {
         const channel = event.channel.length > 0 ? normalizeChannel(event.channel) : "_server";
 
         if (hasDedupKey(serverId, networkId, channel, msgid, event, params)) {
-            return;
+            return false;
         }
         appendMessage(serverId, networkId, channel, msg);
+        return true;
+    }
+
+    /// Network-scoped dedup set key for a buffer. Channel is normalized
+    /// so every caller agrees on the name.
+    private string dedupSetKey(string networkId, string channel) @trusted {
+        return DEDUP_PREFIX ~ networkId ~ ":" ~ normalizeChannel(channel);
+    }
+
+    /// One-time, per-buffer adoption of the pre-existing server-scoped
+    /// dedup set. Without it the first append after a deploy (or after a
+    /// reassignment) faces an empty set and re-stores everything the old
+    /// key already knew — a single burst of duplicates, exactly what the
+    /// set exists to prevent. RENAMENX moves the set into place only when
+    /// the network-scoped key does not exist yet, so it never clobbers
+    /// live state; leftovers from other servers keep their own TTL.
+    private void adoptServerDedupSet(string serverId, string networkId,
+                                     string channel, string dedupKey) @trusted {
+        if (serverId.length == 0 || dedupKey in dedupAdopted) return;
+        dedupAdopted[dedupKey] = true;
+        const legacyKey = DEDUP_PREFIX ~ serverId ~ ":" ~ networkId ~ ":" ~ channel;
+        try {
+            if (redis.getDb().renameNX(legacyKey, dedupKey))
+                logInfo("Adopted server-scoped dedup set %s -> %s", legacyKey, dedupKey);
+        } catch (Exception e) {
+            // Source missing (the common case) or destination exists.
+            logDebug("adoptServerDedupSet: %s", e.msg);
+        }
     }
 
     /// Compute a stable dedup key for an event and check it against
     /// the buffer's Redis dedup set. Returns true if this event is a
-    /// duplicate and should be dropped.
+    /// duplicate and should be dropped. `serverId` is only used to adopt
+    /// the legacy server-scoped set; it is not part of the key.
     private bool hasDedupKey(string serverId, string networkId, string channel,
                              string msgid, IRCRawEvent event, string[] params) @trusted {
-        if (serverId.length == 0) return false;
         channel = normalizeChannel(channel);
-        auto dedupKey = DEDUP_PREFIX ~ serverId ~ ":" ~ networkId ~ ":" ~ channel;
+        auto dedupKey = dedupSetKey(networkId, channel);
+        adoptServerDedupSet(serverId, networkId, channel, dedupKey);
 
         string key;
         if (msgid.length > 0) {
@@ -548,9 +598,16 @@ final class BufferManager {
         buffer = normalizeChannel(buffer);
         auto db = redis.getDb();
         auto scrollbackKey = KEY_PREFIX ~ serverId ~ ":" ~ networkId ~ ":" ~ buffer;
-        auto dedupKey = DEDUP_PREFIX ~ serverId ~ ":" ~ networkId ~ ":" ~ buffer;
+        // Both dedup spellings: the network-scoped key in use now, plus a
+        // leftover server-scoped one this engine may not have adopted yet.
+        // Keeping either would make "Clear backlog" permanent for every
+        // message it dropped — the buffer refills only with events whose
+        // dedup key is not already in the set.
+        auto dedupKey = dedupSetKey(networkId, buffer);
+        auto legacyDedupKey = DEDUP_PREFIX ~ serverId ~ ":" ~ networkId ~ ":" ~ buffer;
         // DEL is idempotent — missing keys just return 0.
-        auto deleted = db.del(scrollbackKey, dedupKey);
+        auto deleted = db.del(scrollbackKey, dedupKey, legacyDedupKey);
+        dedupAdopted.remove(dedupKey);
         logInfo("Cleared buffer %s:%s:%s from Redis (keys deleted: %s)",
             serverId, networkId, buffer, deleted.to!string);
     }
@@ -567,8 +624,9 @@ final class BufferManager {
         buffer = normalizeChannel(buffer);
         auto db = redis.getDb();
         auto scrollbackKey = KEY_PREFIX ~ networkId ~ ":" ~ buffer;
-        auto dedupKey = DEDUP_PREFIX ~ networkId ~ ":" ~ buffer;
+        auto dedupKey = dedupSetKey(networkId, buffer);
         auto deleted = db.del(scrollbackKey, dedupKey);
+        dedupAdopted.remove(dedupKey);
         logInfo("Cleared legacy buffer %s:%s from Redis (keys deleted: %s)",
             networkId, buffer, deleted.to!string);
     }
@@ -612,8 +670,13 @@ final class BufferManager {
                 logDebug("renameBuffer: %s", e.msg);
             }
         }
-        if (moved)
+        if (moved) {
+            // The adoption guard is keyed by destination; both names just
+            // changed identity, so let a fresh adoption run if needed.
+            dedupAdopted.remove(dedupSetKey(networkId, oldBuf));
+            dedupAdopted.remove(dedupSetKey(networkId, newBuf));
             logInfo("Renamed buffer %s:%s %s -> %s", serverId, networkId, oldBuf, newBuf);
+        }
         return moved;
     }
 
@@ -639,7 +702,15 @@ final class BufferManager {
                 serverId, networkId);
             return;
         }
-        const deleted = deleteByPrefix(serverId ~ ":" ~ networkId ~ ":");
+        // The scrollback list is server-namespaced but the dedup sets are
+        // network-scoped, so a network delete needs both patterns. Leaving
+        // the dedup set behind would make a re-added network inherit it:
+        // an empty scrollback whose every replayed event is dropped as a
+        // duplicate.
+        const deleted = deleteByPrefix(serverId ~ ":" ~ networkId ~ ":")
+            + deleteMatching(DEDUP_PREFIX ~ networkId ~ ":*");
+        foreach (k; dedupAdopted.keys)
+            if (k.startsWith(DEDUP_PREFIX ~ networkId ~ ":")) dedupAdopted.remove(k);
         logInfo("Cleared %s buffer key(s) for network %s on server %s",
             deleted.to!string, networkId, serverId);
     }
@@ -661,21 +732,27 @@ final class BufferManager {
     /// `<prefix>` (already including the trailing colon). Returns the
     /// number of keys removed.
     private long deleteByPrefix(string prefix) @trusted {
+        long deleted = 0;
+        foreach (ns; [KEY_PREFIX, DEDUP_PREFIX])
+            deleted += deleteMatching(ns ~ prefix ~ "*");
+        return deleted;
+    }
+
+    /// Deletes every key matching a Redis glob. Returns the number removed.
+    private long deleteMatching(string pattern) @trusted {
         auto db = redis.getDb();
         long deleted = 0;
-        foreach (ns; [KEY_PREFIX, DEDUP_PREFIX]) {
-            string[] keys;
-            try {
-                foreach (k; db.keys(ns ~ prefix ~ "*"))
-                    keys ~= () @trusted { return cast(string) k.idup; }();
-            } catch (Exception e) {
-                logWarn("clearNetworkBuffers: listing %s%s* failed: %s", ns, prefix, e.msg);
-                continue;
-            }
-            foreach (key; keys) {
-                try deleted += db.del(key);
-                catch (Exception e) logWarn("clearNetworkBuffers: DEL %s failed: %s", key, e.msg);
-            }
+        string[] keys;
+        try {
+            foreach (k; db.keys(pattern))
+                keys ~= () @trusted { return cast(string) k.idup; }();
+        } catch (Exception e) {
+            logWarn("deleteMatching: listing %s failed: %s", pattern, e.msg);
+            return 0;
+        }
+        foreach (key; keys) {
+            try deleted += db.del(key);
+            catch (Exception e) logWarn("deleteMatching: DEL %s failed: %s", key, e.msg);
         }
         return deleted;
     }
@@ -686,7 +763,7 @@ final class BufferManager {
      * Warning: This uses the non-namespaced key format and should only
      * be used in single-server (legacy) mode.
      */
-    void appendIRCEvent(IRCRawEvent event) @trusted {
+    bool appendIRCEvent(IRCRawEvent event) @trusted {
         auto msg = Json([
             "network": Json(sanitizeUtf8(event.network)),
             "i": Json(sanitizeUtf8(event.id)),
@@ -710,9 +787,11 @@ final class BufferManager {
         const networkId = event.networkId.length > 0 ? event.networkId : event.network;
         const channel = event.channel.length > 0 ? normalizeChannel(event.channel) : "_server";
 
-        // Legacy path (no serverId) — use the same Redis-based dedup with
-        // an empty serverId so restarts don't replay duplicates.
-        if (hasDedupKey("", networkId, channel, msgid, event, params)) return;
+        // Legacy path (no serverId) — shares the network-scoped dedup set
+        // with the namespaced path, so restarts and mode switches don't
+        // replay duplicates. This used to be a no-op: hasDedupKey bailed
+        // out whenever serverId was empty, which is every call here.
+        if (hasDedupKey("", networkId, channel, msgid, event, params)) return false;
 
         auto key = KEY_PREFIX ~ networkId ~ ":" ~ channel;
         auto db = redis.getDb();
@@ -721,5 +800,6 @@ final class BufferManager {
         db.lpush(key, msgStr);
         db.ltrim(key, 0, MAX_SCROLLBACK - 1);
         db.expire(key, 86_400 * TTL_DAYS);
+        return true;
     }
 }
