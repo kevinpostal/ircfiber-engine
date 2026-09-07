@@ -42,6 +42,7 @@ module ircfiber_default_migrate;
 import std.stdio : writeln, writefln, stdout, stderr;
 import std.getopt : getopt, defaultGetoptPrinter;
 import std.string : toStringz;
+import std.algorithm : startsWith;
 import std.uuid : UUID, randomUUID;
 import std.conv : to;
 import std.array : array;
@@ -107,7 +108,7 @@ private int runSelfTest() {
             stderr.writeln("FAIL: alice systemManaged");
             failed++;
         }
-        if (cfg.autoJoinChannels != ["#ircfiber", "#welcome"]) {
+        if (cfg.autoJoinChannels != ["#support", "#ircfiber"]) {
             stderr.writeln("FAIL: alice channels");
             failed++;
         }
@@ -117,38 +118,37 @@ private int runSelfTest() {
         }
     }
 
-    // 2. buildDefaultNick returns plain username, stable across calls
+    // 2. buildDefaultNick appends the deterministic UUID suffix, stable across calls
     {
         User u;
         u.id = randomUUID();
         u.username = "bob";
         const n1 = buildDefaultNick(u);
         const n2 = buildDefaultNick(u);
-        if (n1 != "bob") { stderr.writeln("FAIL: nick must be plain username"); failed++; }
+        if (!n1.startsWith("bob_") || n1.length != "bob_".length + 4) {
+            stderr.writeln("FAIL: nick must be username_<4 hex>");
+            failed++;
+        }
         if (n1 != n2) { stderr.writeln("FAIL: deterministic nick"); failed++; }
     }
 
-    // 3. Same username different UUIDs -> same nick (plain username)
+    // 3. Same username, different UUIDs -> different suffixed nicks
     {
         User u1; u1.id = randomUUID(); u1.username = "carol";
         User u2; u2.id = randomUUID(); u2.username = "carol";
-        if (buildDefaultNick(u1) != buildDefaultNick(u2)) {
-            stderr.writeln("FAIL: same username must yield same nick");
-            failed++;
-        }
-        if (buildDefaultNick(u1) != "carol") {
-            stderr.writeln("FAIL: carol nick");
+        if (buildDefaultNick(u1) == buildDefaultNick(u2)) {
+            stderr.writeln("FAIL: distinct UUIDs must yield distinct nicks");
             failed++;
         }
     }
 
-    // 4. Nick is plain username regardless of UUID value
+    // 4. Suffix is the first 4 hex chars of the hyphen-stripped UUID
     {
         User u;
         u.id = UUID("12345678-90ab-cdef-1234-567890abcdef");
         u.username = "dan";
-        if (buildDefaultNick(u) != "dan") {
-            stderr.writeln("FAIL: dan nick must be plain");
+        if (buildDefaultNick(u) != "dan_1234") {
+            stderr.writeln("FAIL: dan nick suffix");
             failed++;
         }
     }

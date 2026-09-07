@@ -83,6 +83,34 @@ final class NetworkRepository {
         }
     }
 
+    /// Finds all networks for a user, straight from Mongo: no Redis cache,
+    /// and no silent empty on an open circuit breaker (which also returns
+    /// [] and is indistinguishable from "has no networks").
+    ///
+    /// Destructive callers (account purge) MUST use this: purging on an
+    /// empty answer deletes the user while leaving every network, engine
+    /// connection and NickServ account behind — the orphan pattern seen on
+    /// prod (networks outliving their users). Throwing here fails the
+    /// deletion loudly while the account still exists, so it can be
+    /// retried; returning [] would fail it silently and permanently.
+    NetworkConfig[] findByUserIdDirect(UUID userId) {
+        import ircfiber.db.circuit_breaker : mongoAllowRequest, mongoRecordFailure;
+        if (!mongoAllowRequest())
+            throw new Exception(
+                "Mongo circuit breaker open while enumerating networks for purge");
+        try {
+            NetworkConfig[] result;
+            foreach (doc; collection.find(["userId": userId.toString()])) {
+                try { result ~= docToConfig(doc); }
+                catch (Exception e) { logWarn("NetworkRepository.findByUserIdDirect: skipping broken doc %s: %s", doc["id"].toString(), e.msg); }
+            }
+            return result;
+        } catch (Exception e) {
+            mongoRecordFailure();
+            throw e;
+        }
+    }
+
     /// Finds all networks with their owners.
     NetworkWithUser[] findAll() {
         NetworkWithUser[] result;
@@ -193,6 +221,8 @@ final class NetworkRepository {
                 "sasl": Bson(config.sasl.to!string),
                 "saslUsername": Bson(config.saslUsername),
                 "saslPassword": Bson(config.saslPassword),
+                "operUsername": Bson(config.operUsername),
+                "operPassword": Bson(config.operPassword),
                 "autoJoinChannels": Bson(config.autoJoinChannels.map!(c => Bson(c)).array),
                 "partedChannels": Bson(config.partedChannels.map!(c => Bson(c)).array),
                 "nick": Bson(config.nick),
@@ -269,6 +299,8 @@ final class NetworkRepository {
             try { cfg.nspass = elem["nspass"].get!string; } catch (Exception) {}
             try { cfg.commands = elem["commands"].get!string; } catch (Exception) {}
             try { cfg.serverPass = elem["serverPass"].get!string; } catch (Exception) {}
+            try { cfg.operUsername = elem["operUsername"].get!string; } catch (Exception) {}
+            try { cfg.operPassword = elem["operPassword"].get!string; } catch (Exception) {}
             // systemManaged is optional in cached records (added July 2026).
             try { cfg.systemManaged = elem["systemManaged"].get!bool; } catch (Exception) {}
             // autoJoinDelaySeconds optional — 0 (join immediately) when absent.
@@ -307,6 +339,8 @@ final class NetworkRepository {
         try { cfg.nspass = doc["nspass"].get!string; } catch (Exception) {}
         try { cfg.commands = doc["commands"].get!string; } catch (Exception) {}
         try { cfg.serverPass = doc["serverPass"].get!string; } catch (Exception) {}
+        try { cfg.operUsername = doc["operUsername"].get!string; } catch (Exception) {}
+        try { cfg.operPassword = doc["operPassword"].get!string; } catch (Exception) {}
         return cfg;
     }
 }

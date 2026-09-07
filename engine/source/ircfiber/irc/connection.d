@@ -5282,6 +5282,14 @@ final class PersistentIRCClient {
         }
 
         if (!welcomed) logWarn("Registration timed out for %s, proceeding anyway", config.host);
+        // Auto-OPER (if configured) — sent before the auto-join block below so
+        // oper-only (+O) channels in the auto-join list are joinable. The IRCd
+        // processes OPER then JOIN in receive order on this one connection, so +o
+        // is set before each JOIN is evaluated; no need to await the 381 reply.
+        // performRegistration() runs on every (re)connect, so this re-opers too.
+        if (config.operUsername.length > 0 && config.operPassword.length > 0) {
+            sendRaw("OPER " ~ config.operUsername ~ " " ~ config.operPassword);
+        }
 
         // SuperNETs/DangerousIRCd throttles JOIN until the client has been
         // connected for ≥5s (421 "You must be connected for at least 5

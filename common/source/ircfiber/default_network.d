@@ -68,11 +68,11 @@ immutable ushort DEFAULT_FIBER_PORT = 6697;
 /// Human-readable name for the default network as it appears in the sidebar.
 immutable string DEFAULT_FIBER_NAME = "IRC Fiber";
 
-/// Default channels the connection auto-joins. Only attempted on first
-/// connect — if either channel does not exist on the server, the engine
-/// surfaces an ERR_NOSUCHCHANNEL in the buffer and the user can edit the
-/// list away from the network settings UI.
-immutable string[] DEFAULT_FIBER_CHANNELS = ["#ircfiber", "#welcome"];
+/// Default channels the connection auto-joins: #support and #ircfiber.
+/// Only attempted on first connect — if one of them does not exist on the
+/// server, the engine surfaces an ERR_NOSUCHCHANNEL in the buffer and the
+/// user can edit the list away from the network settings UI.
+immutable string[] DEFAULT_FIBER_CHANNELS = ["#support", "#ircfiber"];
 
 /// Length (hex chars, no hyphens) of the deterministic nick suffix.
 immutable size_t DEFAULT_FIBER_NICK_SUFFIX_LEN = 4;
@@ -158,8 +158,31 @@ NetworkConfig ensureDefaultFiberNetwork(
     // default that is already wired up.
     auto existing = networkRepo.findByUserId(user.id);
     foreach (ref cfg; existing) {
-        if (cfg.host == DEFAULT_FIBER_HOST)
-            return cfg;
+        if (cfg.host != DEFAULT_FIBER_HOST) continue;
+        // Top up default channels added after this account was provisioned
+        // (e.g. #support). A channel the user deliberately parted stays
+        // parted — partedChannels is the engine's PART record.
+        bool[string] have;   foreach (c; cfg.autoJoinChannels) have[c] = true;
+        bool[string] parted; foreach (c; cfg.partedChannels)   parted[c] = true;
+        string[] added;
+        foreach (ch; DEFAULT_FIBER_CHANNELS)
+            if (ch !in have && ch !in parted) { cfg.autoJoinChannels ~= ch; added ~= ch; }
+        if (added.length) {
+            networkRepo.save(cfg, user.id);   // also drops the userNetworks Redis cache
+            try {
+                const sid = serverRegistry.getServerForNetwork(cfg.id.toString());
+                if (sid.length > 0) {
+                    auto up = ControlMessage("updateConfig", cfg.id.toString(), "", cfg.toJson());
+                    up.timestampMs = Clock.currTime.toUnixTime!long * 1000;
+                    redis.lpush(RedisKeys.control(sid), up.toJson().toString());
+                }
+            } catch (Exception e) {
+                logWarn("ensureDefaultFiberNetwork: failed to push updateConfig for %s: %s",
+                        cfg.id.toString(), e.msg);
+            }
+            logInfo("ensureDefaultFiberNetwork: topped up %s for user=%s", added, user.username);
+        }
+        return cfg;
     }
 
     auto cfg = buildDefaultFiberNetwork(user);
@@ -230,7 +253,7 @@ unittest {
     assert(cfg.sasl == SASLMechanism.none);
     assert(cfg.systemManaged == true);
     assert(cfg.disabled == false);
-    assert(cfg.autoJoinChannels == ["#ircfiber", "#welcome"]);
+    assert(cfg.autoJoinChannels == ["#support", "#ircfiber"]);
     assert(cfg.realName == "alice");
     assert(cfg.nick == "alice");
 }

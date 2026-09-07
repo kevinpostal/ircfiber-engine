@@ -642,6 +642,8 @@ private NetworkConfig parseNetworkConfig(Json j) {
     if (j["nspass"].type != Json.Type.undefined) cfg.nspass = j["nspass"].get!string;
     if (j["commands"].type != Json.Type.undefined) cfg.commands = j["commands"].get!string;
     if (j["serverPass"].type != Json.Type.undefined) cfg.serverPass = j["serverPass"].get!string;
+    if (j["operUsername"].type != Json.Type.undefined) cfg.operUsername = j["operUsername"].get!string;
+    if (j["operPassword"].type != Json.Type.undefined) cfg.operPassword = j["operPassword"].get!string;
     // Fields the gateway ships in NetworkConfig.toJson() that were silently
     // dropped here, so a pin/delay set via the API only took effect after a
     // restart re-read Mongo (db/network.d honours both).

@@ -100,6 +100,14 @@ struct NetworkConfig {
     string saslUsername;
     /// The SASL password
     string saslPassword;
+    /// Oper credentials — sent as `OPER <operUsername> <operPassword>` after
+    /// registration completes and BEFORE auto-join, so oper-only (+O) channels
+    /// in the auto-join list are joinable. Empty (either field) disables it.
+    /// Re-sent on every (re)connect. operPassword must be a single token: IRC
+    /// OPER has no trailing parameter, so an embedded space truncates it.
+    string operUsername;
+    /// Oper password (see operUsername).
+    string operPassword;
     /// Channels to auto-join
     string[] autoJoinChannels;
     /// Channels the user has parted (kept for inactive sidebar)
@@ -159,6 +167,8 @@ struct NetworkConfig {
             "sasl": Json(sasl.to!string),
             "saslUsername": Json(saslUsername),
             "saslPassword": Json(saslPassword),
+            "operUsername": Json(operUsername),
+            "operPassword": Json(operPassword),
             "autoJoinChannels": serializeToJson(autoJoinChannels),
             "partedChannels": serializeToJson(partedChannels),
             "nick": Json(nick),

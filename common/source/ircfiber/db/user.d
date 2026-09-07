@@ -17,6 +17,32 @@ final class UserRepository {
     /// Creates a new user repository.
     this() {
         collection = AppMongoConnection.getDb()["users"];
+        ensureIndexes();
+    }
+
+    /**
+     * Case-insensitive uniqueness on usernames, enforced by the database so
+     * two simultaneous signups for case-variants of one name cannot both
+     * land (both pass the application-level `findByUsernameCI` checks, then
+     * the loser hits E11000). Collation strength 2 folds case but not
+     * accents; signup restricts usernames to the ASCII IRC-nick charset, so
+     * the two rules agree exactly. Idempotent: re-creating an identical
+     * index is a server-side no-op.
+     */
+    private void ensureIndexes() @trusted {
+        try {
+            AppMongoConnection.getDb().runCommandChecked(Bson([
+                "createIndexes": Bson("users"),
+                "indexes": Bson([Bson([
+                    "key": Bson(["username": Bson(1)]),
+                    "name": Bson("username_ci_unique"),
+                    "unique": Bson(true),
+                    "collation": Bson(["locale": Bson("en"), "strength": Bson(2)])
+                ])])
+            ]));
+        } catch (Exception e) {
+            logWarn("users username_ci_unique index: %s", e.msg);
+        }
     }
 
     /// Finds a user by username.
@@ -29,14 +55,16 @@ final class UserRepository {
     /**
      * Finds a user whose username matches case-insensitively.
      *
-     * Every website username is also the owner's IRC nick and their NickServ
-     * account name, and IRC nicks are case-insensitive — so `Alice` and
-     * `alice` are the same identity on the network and must not be able to
-     * coexist as two website accounts. Signup uses this instead of
-     * `findByUsername` for its uniqueness check.
-     *
-     * ASCII case folding only: the rfc1459 casemapping also equates
-     * `[]\` with `{}|`, which the Anope-side availability check catches.
+    * Every website username is also the owner's IRC nick and their NickServ
+    * account name, and IRC nicks are case-insensitive — so `Alice` and
+    * `alice` are one identity and must never become two website accounts.
+    *
+    * This is the uniqueness gate for every user-creation path (public
+    * signup, admin API, admin web form); the `username_ci_unique` index is
+    * the backstop for races between two simultaneous checks.
+    *
+    * ASCII case folding only: the rfc1459 casemapping also equates
+    * `[]\` with `{}|`, which the Anope-side availability check catches.
      */
     User findByUsernameCI(string username) {
         if (username.length == 0) return User.init;
