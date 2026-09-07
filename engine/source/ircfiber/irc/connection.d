@@ -3069,6 +3069,29 @@ final class PersistentIRCClient {
         return "";
     }
 
+    /// Lines of a randomly chosen admin MOTD template for the IRC Fiber
+    /// network, or null when this is not the platform host, Redis is
+    /// unavailable, or no template is enabled (the ircd MOTD then passes
+    /// through verbatim). Read once per registration; the mirror is written
+    /// by the gateway (`ircfiber.web.admin.motd.publishMotdTemplates`).
+    private string[] pickFiberMotdLines() {
+        import std.random : uniform;
+        import std.uni : toLower;
+        import ircfiber.default_network : DEFAULT_FIBER_HOST;
+        import ircfiber.db.motd_templates : motdTemplatesFromJson;
+        if (redis is null || config.host.toLower != DEFAULT_FIBER_HOST) return null;
+        try {
+            auto templates = motdTemplatesFromJson(redis.getDb().get(RedisKeys.motdTemplates()));
+            if (templates.length == 0) return null;
+            auto t = templates[uniform(0, templates.length)];
+            logInfo("MOTD for %s: serving template '%s' (1 of %d enabled)", config.name, t.name, templates.length);
+            return t.lines();
+        } catch (Exception e) {
+            logWarn("Failed to load MOTD templates for %s: %s", config.name, e.msg);
+            return null;
+        }
+    }
+
     /// Build a snapshot of every piece of per-connection in-memory
     /// state the new engine needs to seamlessly continue this
     /// connection. The returned struct is plain-old-data; no
@@ -4754,6 +4777,11 @@ final class PersistentIRCClient {
         bool capReqSent  = false;
         bool capLsDone   = false;
         string[] serverCaps;
+        // IRC Fiber MOTD swap (see `pickFiberMotdLines`): filled on the
+        // first 375/372 of this registration; while non-empty the ircd's own
+        // 372 lines are dropped and these are published in their place.
+        string[] fiberMotdLines;
+        bool fiberMotdSwapped = false;
 
         // SCRAM state (may be null)
         ScramSha256Client* scram = null;
@@ -4873,8 +4901,41 @@ final class PersistentIRCClient {
                     if (line.length == 0) continue;
 
                     auto evt = parseIRCLine(line);
+                    // Set by a case below to keep this line out of the
+                    // generic publish at the bottom of the loop.
+                    bool suppressPublish = false;
 
                     switch (evt.command) {
+                        // ── MOTD: IRC Fiber per-connect template swap ─────────
+                        // The ircd serves one static file per rehash; for the
+                        // platform network the admin-managed templates are
+                        // mirrored to Redis and one is picked per connect. The
+                        // ircd's 375 header passes through unchanged (server
+                        // name + "message of the day"), its 372 body is
+                        // replaced. Any other network, or an empty mirror,
+                        // falls through to the verbatim path.
+                        case "375":
+                        case "372":
+                            if (!fiberMotdSwapped && fiberMotdLines.length == 0)
+                                fiberMotdLines = pickFiberMotdLines();
+                            if (fiberMotdLines.length == 0) break;
+                            if (evt.command == "375" && !fiberMotdSwapped) {
+                                evt.network     = config.name;
+                                evt.timestampMs = resolveTimestamp(evt);
+                                eventChannel.put(evt);
+                            }
+                            if (!fiberMotdSwapped) {
+                                fiberMotdSwapped = true;
+                                foreach (l; fiberMotdLines) {
+                                    auto synth = parseIRCLine(":" ~ evt.prefix ~ " 372 " ~ sessionNick ~ " :- " ~ l);
+                                    synth.network     = config.name;
+                                    synth.timestampMs = resolveTimestamp(evt);
+                                    eventChannel.put(synth);
+                                }
+                            }
+                            suppressPublish = true;
+                            break;
+
                         case "PING":
                             auto params = evt.getParams();
                             sendRaw("PONG :" ~ (params.length > 0 ? params[$ - 1] : ""));
@@ -5367,7 +5428,7 @@ final class PersistentIRCClient {
                         "330", "332", "333", "354", "366", "376", "401",
                         "422",
                     ];
-                    if (evt.command != "PING" && evt.command != "ERROR"
+                    if (!suppressPublish && evt.command != "PING" && evt.command != "ERROR"
                         && !noPublishDuringRegistration.canFind(evt.command)) {
                         evt.network     = config.name;
                         evt.timestampMs = resolveTimestamp(evt);

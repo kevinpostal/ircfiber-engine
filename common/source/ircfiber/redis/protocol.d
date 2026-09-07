@@ -194,6 +194,20 @@ struct RedisKeys {
     /// Commands older than 60 s are dropped by the consumer.
     static string supportBotControl() { return "irc:support:bot:control"; }
 
+    /// Run records published by the k3s `ircfiber-redis-backup` CronJob
+    /// (LPUSH + LTRIM 0 59). Read by GET /api/admin/backups; the Mongo job
+    /// writes its own records to the `backup_runs` collection instead,
+    /// because `mongo:7` carries no redis-cli.
+    static string backupRuns() { return "irc:backup:runs"; }
+
+    /// Enabled MOTD templates for the IRC Fiber network: JSON array of
+    /// `{id,name,body}` written by the gateway on every admin edit
+    /// (`ircfiber.db.motd_templates.publishMotdTemplates`) and read by the
+    /// engine on each connect to irc.ircfiber.com, which serves one at
+    /// random in place of the ircd's static file. Empty/absent = pass the
+    /// ircd MOTD through unchanged.
+    static string motdTemplates() { return "irc:config:motdTemplates"; }
+
     /// Protocol version key. Written by engine heartbeat (see
     /// `ircfiber.engine.state.writeStateSnapshots`). Gateways and
     /// future Python implementations read this at startup to assert
