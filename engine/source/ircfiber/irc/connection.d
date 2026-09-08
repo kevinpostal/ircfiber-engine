@@ -2650,10 +2650,11 @@ final class PersistentIRCClient {
         // ghost member entries (one per fallback nick per connect cycle).
         // Reset to 0 on every successful 001.
         int                 registrationFallbackAttempts;
-        // True once the 001 handler has persisted the random-suffix nick
-        // for this connection lifetime. Guards against re-persisting on
-        // a future re-registration that lands on the same suffix (rare,
-        // but the suffix was already chosen for uniqueness).
+        // True when this registration attempt landed on the random-suffix
+        // escape-hatch nick (persisted in the 433 handler). Tells the 001
+        // handler to keep that persisted nick; a plain `_` fallback with
+        // this false clears the persisted key so the next reconnect
+        // retries the configured nick. Reset at every attempt start.
         bool                randomNickPersisted;
         bool                isAway = false;
         string              awayMessage;
@@ -4896,6 +4897,10 @@ final class PersistentIRCClient {
         // landed on the requested nick or a fallback. (Fallbacks must NOT
         // be persisted — see clearPersistedNick.)
         requestedNick = config.nick.length > 0 ? config.nick : sessionNick;
+        // Fresh attempt: a previous attempt's random-suffix escape hatch
+        // must not shield this attempt's plain `_` fallback from the
+        // 001 handler's clearPersistedNick below.
+        randomNickPersisted = false;
         // PASS must be sent before NICK/USER per RFC 1459 §4.1
         if (config.serverPass.length > 0) sendRaw("PASS " ~ config.serverPass);
         sendRaw("NICK " ~ sessionNick);
@@ -5055,27 +5060,16 @@ final class PersistentIRCClient {
                             registrationFallbackAttempts = 0;
                             // Only persist the nick if it matches the one
                             // we asked for — otherwise we're on a 433
-                            // fallback (e.g. `Zodiac__`) and persisting
-                            // it would lock the user out of their
-                            // intended nick (`Zodiac`) the next time it
-                            // frees up. The random-suffix nick
-                            // (`Zodiac_a1b2c`) IS persisted above (in
-                            // the 433 handler) so subsequent reconnects
-                            // re-use the same nick until cfg.nick frees
-                            // up.
+                            // fallback (e.g. `Zodiac_`) and we clear any
+                            // persisted nick so the next reconnect retries
+                            // the configured nick instead of locking the
+                            // fallback in. (The random-suffix escape hatch
+                            // below keeps its persisted nick, gated by
+                            // randomNickPersisted.)
                             if (sessionNick == requestedNick)
                                 persistNick(sessionNick);
-                            else if (!randomNickPersisted) {
-                                // First non-fallback 001 with a fallback
-                                // nick: persist the fallback as the
-                                // session stickiness. Done here rather
-                                // than in the 433 handler so the value
-                                // we persist is the post-server-confirmed
-                                // nick (e.g. 'Zod_a1b2c' if the server
-                                // normalized case).
-                                persistNick(sessionNick);
-                                randomNickPersisted = true;
-                            }
+                            else if (!randomNickPersisted)
+                                clearPersistedNick();
                             logJsonMap("info", "connection",
                                 "RPL_WELCOME received",
                                 ["network": config.name,
@@ -5133,6 +5127,9 @@ final class PersistentIRCClient {
                                 auto suffix = cast(string) hex;
                                 sessionNick = requestedNick ~ "_" ~ suffix;
                                 persistNick(sessionNick);
+                                // Escape-hatch nick: keep it persisted so
+                                // the 001 handler below doesn't clear it.
+                                randomNickPersisted = true;
                                 logWarn("Nick '%s' persistently unavailable for %s after %d fallbacks; "
                                     ~ "switching to random nick '%s' and persisting",
                                     requestedNick, config.name, REGISTRATION_MAX_FALLBACK_ATTEMPTS, sessionNick);
