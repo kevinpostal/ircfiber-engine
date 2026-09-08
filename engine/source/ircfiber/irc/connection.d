@@ -153,6 +153,71 @@ private FloodTrustSettings floodTrustSettings() {
     return cached;
 }
 
+/// WEBIRC password for irc.ircfiber.com (`<gateway type="webirc">` in the
+/// ircd config), from IRCFIBER_IRCD_WEBIRC_PASSWORD. Empty = never send
+/// WEBIRC. Read once per thread, same as the flood-trust settings.
+private string webircPassword() {
+    import std.process : environment;
+    import std.string : strip;
+
+    static bool loaded;
+    static string cached;
+    if (loaded) return cached;
+    loaded = true;
+    cached = environment.get("IRCFIBER_IRCD_WEBIRC_PASSWORD", "").strip;
+    return cached;
+}
+
+/// True when `ip` parses and is a public unicast address: not loopback,
+/// RFC 1918, link-local, CGNAT, 0.0.0.0/8, IPv6 loopback/ULA/link-local or
+/// v4-mapped. Load-bearing, not hygiene: the gateway's client-IP resolver
+/// trusts CF-Connecting-IP / X-Forwarded-For / X-Real-IP from any peer, and
+/// the address forwarded via WEBIRC is what the ircd classifies on — a
+/// forged 172.30.0.9 would land in the engine's own connect class,
+/// 127.0.0.1 in `localhost`. A private address is never a legitimate
+/// browser origin here, so the session keeps the engine's IP instead.
+package bool isPublicUnicast(string ip) {
+    import core.sys.posix.arpa.inet : inet_pton;
+    import core.sys.posix.sys.socket : AF_INET, AF_INET6;
+    import std.string : strip, toStringz;
+
+    ip = ip.strip;
+    if (ip.length == 0 || ip.length > 45) return false;
+    ubyte[16] b;
+    if (inet_pton(AF_INET, ip.toStringz, b.ptr) == 1) {
+        const o1 = b[0], o2 = b[1];
+        if (o1 == 0 || o1 == 10 || o1 == 127) return false;        // 0/8, 10/8, loopback
+        if (o1 == 100 && o2 >= 64 && o2 <= 127) return false;       // CGNAT 100.64/10
+        if (o1 == 169 && o2 == 254) return false;                   // link-local
+        if (o1 == 172 && o2 >= 16 && o2 <= 31) return false;        // 172.16/12
+        if (o1 == 192 && o2 == 168) return false;                   // 192.168/16
+        if (o1 >= 224) return false;                                // multicast / reserved
+        return true;
+    }
+    if (inet_pton(AF_INET6, ip.toStringz, b.ptr) == 1) {
+        bool allZero = true;
+        foreach (i; 0 .. 15) if (b[i] != 0) { allZero = false; break; }
+        if (allZero && b[15] <= 1) return false;                    // :: and ::1
+        if ((b[0] & 0xFE) == 0xFC) return false;                    // ULA fc00::/7
+        if (b[0] == 0xFE && (b[1] & 0xC0) == 0x80) return false;    // link-local fe80::/10
+        if (b[0] == 0xFF) return false;                             // multicast
+        bool mapped = true;                                         // ::ffff:a.b.c.d
+        foreach (i; 0 .. 10) if (b[i] != 0) { mapped = false; break; }
+        if (mapped && b[10] == 0xFF && b[11] == 0xFF) return false;
+        return true;
+    }
+    return false;
+}
+
+unittest {
+    assert(isPublicUnicast("203.0.113.7"));
+    assert(isPublicUnicast("2001:db8::1"));
+    foreach (bad; ["", "nope", "127.0.0.1", "10.1.2.3", "172.30.0.9", "192.168.1.1",
+                   "100.64.0.1", "169.254.1.1", "0.0.0.0", "224.0.0.1",
+                   "::1", "::", "fd00:f1b3:1::e", "fe80::1", "::ffff:203.0.113.7", "ff02::1"])
+        assert(!isPublicUnicast(bad), bad);
+}
+
 // ── Per-host circuit breaker ─────────────────────────────────────────────────
 // Prevents hammering unresponsive servers with rapid reconnect attempts.
 // Shared across all PersistentIRCClient instances in the same process.
@@ -2758,6 +2823,8 @@ final class PersistentIRCClient {
         // Per-user IPv6 (IRCCloud-style): deterministic source IP per UID.
         import std.uuid : UUID;
         UUID                ownerId;
+        /// Browser IP forwarded via WEBIRC on the fiber network ("" = none).
+        string              clientIp;
         string              ipv6BindCache;
         bool                ipv6BindResolved;
         // Smart routing: Redis access for failure reporting + reassignment detection.
@@ -3109,6 +3176,22 @@ final class PersistentIRCClient {
             logWarn("Failed to load persisted nick for %s: %s", config.name, e.msg);
         }
         return "";
+    }
+
+    /// The browser IP the gateway recorded for this connection's owner at
+    /// its last websocket handshake (`RedisKeys.webircIp`), or "" when
+    /// none / Redis unavailable. Read from Redis at connect time rather
+    /// than taken from the control message, so engine-initiated reconnects
+    /// and engine restarts keep forwarding it without the gateway.
+    private string loadClientIp() {
+        import std.string : strip;
+        if (redis is null || ownerId == UUID.init) return "";
+        try {
+            return redis.getDb().get(RedisKeys.webircIp(ownerId.toString())).strip;
+        } catch (Exception e) {
+            logWarn("Failed to load client ip for %s: %s", config.name, e.msg);
+            return "";
+        }
     }
 
     /// Lines of a randomly chosen admin MOTD template for the IRC Fiber
@@ -4800,6 +4883,30 @@ final class PersistentIRCClient {
     private void performRegistration() {
         // Build cap list
         string[] desiredCaps = desiredCapList();
+
+        // WEBIRC before anything else, and only to irc.ircfiber.com: the ircd
+        // swaps this session's address for the user's own (and re-matches
+        // the connect class on the `webirc="ircfiber"` constraint) before
+        // registration continues. Never to another host, never a
+        // non-public address (see isPublicUnicast). Every branch logs so
+        // prod can account for each fiber connection.
+        {
+            import std.uni : toLower;
+            import ircfiber.default_network : DEFAULT_FIBER_HOST;
+            const bool fiber = config.host.toLower == DEFAULT_FIBER_HOST;
+            const webSecret = fiber ? webircPassword() : "";
+            if (fiber) clientIp = loadClientIp();
+            if (fiber && webSecret.length && isPublicUnicast(clientIp)) {
+                sendRaw("WEBIRC " ~ webSecret ~ " ircfiber " ~ clientIp ~ " " ~ clientIp);
+                logJsonMap("info", "connection", "WEBIRC sent",
+                    ["network": config.name, "ip": clientIp, "event": "webirc_sent"]);
+            } else if (fiber) {
+                logJsonMap("info", "connection", "WEBIRC skipped",
+                    ["network": config.name, "event": "webirc_skipped",
+                     "reason": webSecret.length == 0 ? "no-password"
+                             : clientIp.length == 0 ? "no-client-ip" : "non-public-ip"]);
+            }
+        }
 
         // CAP LS 302 first — lets us inspect what the server offers
         sendRaw("CAP LS 302");

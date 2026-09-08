@@ -211,6 +211,10 @@ struct RedisKeys {
     /// engine serves it on every connect and the gateway keeps it in the
     /// ircd file instead of rotating.
     static string motdPinned() { return "irc:config:motdPinned"; }
+    /// Last browser IP seen for this user's web session, written by the
+    /// gateway on every websocket handshake (30 day TTL). Read by the engine
+    /// to forward the user's real address to irc.ircfiber.com via WEBIRC.
+    static string webircIp(string userId) { return "irc:webirc:ip:" ~ userId; }
 
     /// Protocol version key. Written by engine heartbeat (see
     /// `ircfiber.engine.state.writeStateSnapshots`). Gateways and
