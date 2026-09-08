@@ -1882,6 +1882,33 @@ private string nickPrefix(string nick) {
     return nick[0 .. nickPrefixRun(nick)];
 }
 
+/// Sweeps per channel per connection before the engine gives up asking.
+enum int MAX_WHO_ENRICH_ATTEMPTS = 3;
+
+/// Whether `member` (`@nick`, `nick!user@host`, or bare) still needs a
+/// realname probe. `probed` records nicks the server has already answered
+/// for — `realnames` cannot double as that record because an answer equal
+/// to the nick is deliberately not stored.
+bool memberNeedsRealname(string member, const string[string] realnames,
+                         const bool[string] probed) {
+    const bare = stripNickPrefix(member);
+    if (bare.length == 0) return false;
+    return (bare !in realnames) && (bare !in probed);
+}
+
+/// Whether the realname sweep should still issue `WHO <chan>`.
+/// `attempts` = sweeps already sent for this channel on this connection.
+bool channelNeedsRealnameWho(const string[] members,
+                             const string[string] realnames,
+                             const bool[string] probed,
+                             int attempts,
+                             int maxAttempts = MAX_WHO_ENRICH_ATTEMPTS) {
+    if (attempts >= maxAttempts) return false;
+    foreach (m; members)
+        if (memberNeedsRealname(m, realnames, probed)) return true;
+    return false;
+}
+
 /// Channel status mode letter → the prefix char it renders as, `'\0'` for a
 /// mode that takes no member target. `y`/`Y` are InspIRCd's operprefix and
 /// ojoin modes: without them a `MODE #chan +yo nick1 nick2` consumed no
@@ -2569,11 +2596,22 @@ final class PersistentIRCClient {
         string[string]      channelTopics;
         string[][string]    channelUsers;
         long[string]        lastWhoTime;  // throttle: chan→last WHO timestamp
+        // Sweeps already sent per channel on this connection; capped by
+        // MAX_WHO_ENRICH_ATTEMPTS so a server that answers WHO without
+        // naming every member cannot keep the sweep alive forever.
+        int[string]         whoEnrichAttempts;
         long                lastWhoisTime; // throttle: 1/s for WHOIS queries
         // IRCCloud-style realname cache. Populated from extended-join
         // (realname param) and RPL_WHOISUSER (311). Used to render the
         // <span class="author-realname"> next to the nick.
         string[string]      realnames;
+        // Nicks the server has already answered a realname question for.
+        // Distinct from `realnames`, which deliberately does not store an
+        // answer equal to the nick (the UI would double-print it) — without
+        // this set those nicks stayed "unknown" and re-triggered WHO/WHOIS
+        // on every sweep, forever. Survives reconnects: the answer does not
+        // change with the socket.
+        bool[string]        realnameProbed;
         // IRCv3 extended-join / account-notify: nick → account name (or "*" for none)
         string[string]      accounts;
         // Ident (username) extracted from nick!user@host in JOIN/353
@@ -2802,6 +2840,10 @@ final class PersistentIRCClient {
         long                lagProbeSentMs;
         /// Unix ms of RPL_WELCOME for the live connection; 0 otherwise.
         long                connectedAtMs;
+        /// Line counters for the live connection, logged on disconnect so a
+        /// silent server-side kill can be attributed without re-deriving it.
+        /// `whoOut` counts our own WHO/WHOIS probes.
+        long                linesIn, linesOut, whoOut;
         /// Whether `tlsInfo` describes the live TLS session.
         bool                tlsInfoValid;
         /// Negotiated TLS session details for the live connection.
@@ -3602,6 +3644,13 @@ final class PersistentIRCClient {
         connectedAtMs = 0;
         tlsInfoValid = false;
         tlsInfo = TlsInfo.init;
+        // Per-connection: a fresh socket may legitimately re-ask once.
+        // `realnameProbed` is deliberately NOT cleared — the knowledge that
+        // a nick has no distinct realname outlives the socket.
+        whoEnrichAttempts = null;
+        linesIn = 0;
+        linesOut = 0;
+        whoOut = 0;
         // A new socket gets a fresh throttle budget; pending JOINs from the
         // old one are meaningless (the reconnect re-sends the auto-joins).
         joinsAwaitingConfirm = [];
@@ -5097,8 +5146,14 @@ final class PersistentIRCClient {
                             if (params.length >= 6) {
                               auto nick = params[1];
                               const rn   = params[5];
-                              if (nick.length > 0 && rn.length > 0 && rn != nick)
-                                realnames[nick] = rn;
+                              if (nick.length > 0) {
+                                // The server answered — record that even when
+                                // the answer is the nick itself and therefore
+                                // not stored below.
+                                realnameProbed[nick] = true;
+                                if (rn.length > 0 && rn != nick)
+                                  realnames[nick] = rn;
+                              }
                             }
                             break;
                         }
@@ -5758,25 +5813,27 @@ private void processEvents() {
                 lastWhoEnrichCheck = now;
                 foreach (chan, users; channelUsers) {
                     if (users.length == 0) continue;
-                    bool needsWho = false;
-                    foreach (u; users) {
-                        const bare = stripNickPrefix(u);
-                        if (bare !in realnames) { needsWho = true; break; }
-                    }
-                    if (needsWho && (chan !in lastWhoTime || now - lastWhoTime[chan] >= 2)) {
-                        sendRaw("WHO " ~ chan);
-                        lastWhoTime[chan] = now;
-                        // Downgraded from info to debug — 60s per channel was spamming SigNoz
-                        // with WHO periodic enrichment logs (263-user channel = 1 log/min).
-                        // Useful for debugging WHO, but not for production info level.
-                        logJsonMap("debug", "protocol",
-                            "WHO periodic enrichment",
-                            ["network": config.name, "channel": chan,
-                                "users": users.length.to!string,
-                                "event": "who_periodic"]);
-                    }
+                    auto ap = chan in whoEnrichAttempts;
+                    const attempts = ap ? *ap : 0;
+                    if (!channelNeedsRealnameWho(users, realnames, realnameProbed, attempts))
+                        continue;
+                    if (chan in lastWhoTime && now - lastWhoTime[chan] < 2) continue;
+                    sendRaw("WHO " ~ chan);
+                    lastWhoTime[chan] = now;
+                    whoEnrichAttempts[chan] = attempts + 1;
+                    // info, not debug: bounded now (at most
+                    // MAX_WHO_ENRICH_ATTEMPTS per channel per connection), and
+                    // this counter is the production proof the sweep
+                    // terminates instead of running once a minute forever.
+                    logJsonMap("info", "protocol",
+                        "WHO periodic enrichment",
+                        ["network": config.name, "channel": chan,
+                            "users": users.length.to!string,
+                            "attempt": whoEnrichAttempts[chan].to!string,
+                            "event": "who_periodic"]);
                 }
             }
+
             // W1-T08: Connection idle detection — after 120s without any
             // incoming data, emit a synthetic "idle" event so the frontend
             // can show a stale-connection indicator.
@@ -5898,6 +5955,7 @@ private void processEvents() {
     }
 
     private void processLine(string line) {
+        linesIn++;
         auto event      = parseIRCLine(line);
         event.network   = config.name;
         event.timestampMs = resolveTimestamp(event);
@@ -6029,6 +6087,10 @@ private void processEvents() {
                           if (acct.length > 0)
                             accounts[event.nick] = acct;
                           const rn = params[2];
+                          // The realname param was supplied, so the question
+                          // is answered even when it equals the nick.
+                          if (event.nick.length > 0)
+                            realnameProbed[event.nick] = true;
                           if (rn.length > 0 && rn != event.nick)
                             realnames[event.nick] = rn;
                         }
@@ -6049,22 +6111,13 @@ private void processEvents() {
                         // Rate-limit to 1/s so a 2000-user channel burst on
                         // SuperNets doesn't flood the server log with 354
                         // WHOX responses.
-                        if (event.nick !in realnames) {
+                        if (memberNeedsRealname(event.nick, realnames, realnameProbed)) {
                             import std.datetime : Clock;
                             const whoisNow = Clock.currTime.toUnixTime!long;
                             if (whoisNow - lastWhoisTime >= 1) {
                                 sendRaw("WHOIS " ~ event.nick);
                                 lastWhoisTime = whoisNow;
                             }
-                        }
-                        // Issue WHO to discover the new user's mode prefix.
-                        // The 352 handler promotes bare entries to their
-                        // prefixed form without overwriting MODE changes.
-                        import std.datetime : Clock;
-                        const whoNow = Clock.currTime.toUnixTime!long;
-                        if (chan !in lastWhoTime || whoNow - lastWhoTime[chan] >= 2) {
-                            sendRaw("WHO " ~ chan ~ " %tn");
-                            lastWhoTime[chan] = whoNow;
                         }
                         logJsonMap("debug", "protocol",
                             "JOIN",
@@ -6426,14 +6479,15 @@ private void processEvents() {
                         import std.datetime : Clock;
                         const whoNow = Clock.currTime.toUnixTime!long;
                         bool needsWho = false;
-                        foreach (u; channelUsers[chan]) {
-                            const bare = stripNickPrefix(u);
-                            if (bare !in realnames) { needsWho = true; break; }
-                        }
+                        auto ap = chan in whoEnrichAttempts;
+                        const attempts = ap ? *ap : 0;
+                        needsWho = channelNeedsRealnameWho(
+                            channelUsers[chan], realnames, realnameProbed, attempts);
                         if (needsWho && channelUsers[chan].length > 5
                             && (chan !in lastWhoTime || whoNow - lastWhoTime[chan] >= 2)) {
                             sendRaw("WHO " ~ chan);
                             lastWhoTime[chan] = whoNow;
+                            whoEnrichAttempts[chan] = attempts + 1;
                             logJsonMap("info", "protocol",
                                 "WHO after NAMES(353) to populate realnames",
                                 ["network": config.name, "channel": chan, "event": "who_after_names_353"]);
@@ -6463,11 +6517,10 @@ private void processEvents() {
                     import std.datetime : Clock;
                     const whoNow = Clock.currTime.toUnixTime!long;
                     if (chan in channelUsers) {
-                        bool needsWho = false;
-                        foreach (u; channelUsers[chan]) {
-                            const bare = stripNickPrefix(u);
-                            if (bare !in realnames) { needsWho = true; break; }
-                        }
+                        auto ap = chan in whoEnrichAttempts;
+                        const attempts = ap ? *ap : 0;
+                        const needsWho = channelNeedsRealnameWho(
+                            channelUsers[chan], realnames, realnameProbed, attempts);
                         logJsonMap("info", "protocol",
                             "366 needsWho check",
                             ["network": config.name, "channel": chan,
@@ -6478,6 +6531,7 @@ private void processEvents() {
                         if (needsWho && (chan !in lastWhoTime || whoNow - lastWhoTime[chan] >= 2)) {
                             sendRaw("WHO " ~ chan);
                             lastWhoTime[chan] = whoNow;
+                            whoEnrichAttempts[chan] = attempts + 1;
                             logJsonMap("info", "protocol",
                                 "WHO after NAMES to populate realnames",
                                 ["network": config.name, "channel": chan, "event": "who_after_names"]);
@@ -6505,6 +6559,7 @@ private void processEvents() {
                 if (mp.length >= 7) {
                     auto chan = mp[1];
                     auto nick = mp[5];
+                    if (nick.length > 0) realnameProbed[nick] = true;
                     auto flags = mp[6];
                     char[5] order = ['~', '&', '@', '%', '+'];
                     char chosen = '\0';
@@ -6584,6 +6639,25 @@ private void processEvents() {
                 return;
             }
 
+            // ── RPL_WHOISUSER (311) in the main loop ──────────────────────
+            // The handshake switch has its own 311 case, so a WHOIS answer
+            // arriving after registration used to update nothing: the
+            // JOIN-time `WHOIS <nick>` could never satisfy the check that
+            // triggered it and fired again on every JOIN. `break` (not
+            // `return`) keeps WHOIS output flowing to the server buffer.
+            case "311": {
+                auto p = event.getParams();
+                if (p.length >= 6) {
+                    auto nick = p[1];
+                    const rn = p[5];
+                    if (nick.length > 0) {
+                        realnameProbed[nick] = true;
+                        if (rn.length > 0 && rn != nick) realnames[nick] = rn;
+                    }
+                }
+                break;
+            }
+
             // ── End of WHO (RPL_ENDOFWHO, 315) — no-op for state ───────────
             // WHO reply (352) rows themselves are consumed above (realname
             // cache + channelUsers prefix promotion) and are never
@@ -6596,8 +6670,21 @@ private void processEvents() {
             // displayed window on every page load and making recent
             // messages appear to "disappear" behind a wall of
             // "End of WHO list" noise.
-            case "315":
+            // After End-of-WHO the roster is resolved: a member the server
+            // did not name in any 352 will never be named, so marking the
+            // whole channel probed is what stops the 60 s sweep from asking
+            // again forever.
+            case "315": {
+                auto p = event.getParams();
+                if (p.length >= 2) {
+                    if (auto members = p[1] in channelUsers)
+                        foreach (u; *members) {
+                            const bare = stripNickPrefix(u);
+                            if (bare.length) realnameProbed[bare] = true;
+                        }
+                }
                 return;
+            }
 
             // ── WHOX reply (RPL_WHOX, 354) — engine consumes nothing ──────
             // The engine issues `WHO %tn` from the JOIN handler to populate
@@ -6666,8 +6753,10 @@ private void processEvents() {
             // Updates the realname cache and fans out to shared channels
             // like AWAY so the UI can refresh member details.
             case "SETNAME":
-                if (event.text.length > 0 && event.nick.length > 0)
+                if (event.text.length > 0 && event.nick.length > 0) {
+                    realnameProbed[event.nick] = true;
                     realnames[event.nick] = event.text;
+                }
                 foreach (chan, users; channelUsers) {
                     foreach (u; users) {
                         if (sameNick(u, event.nick)) {
@@ -7778,6 +7867,8 @@ private void processEvents() {
     }
 
     private void writeRaw(string line) {
+        linesOut++;
+        if (line.length >= 3 && line[0 .. 3] == "WHO") whoOut++;
         // Every byte the server reads costs us fake lag, not just paced
         // message lines: our own WHO/WHOIS probes, JOIN bursts, NICK and
         // MODE all count too. Charging here — the single point where bytes
@@ -7867,6 +7958,16 @@ private void processEvents() {
 
     private void handleDisconnection() {
         withSpan("irc.disconnect", ["network": config.name, "reason": lastDisconnectReason], (ref Span s) {
+            // Captured before resetConnectionTelemetry() zeroes them: the
+            // "disconnected" log below is the only forensic record of how
+            // long the session lasted and how much we asked of the server.
+            const uptimeSecs   = connectedAtMs > 0 ? (unixMsNow() - connectedAtMs) / 1000 : 0;
+            const nowSecs      = Clock.currTime.toUnixTime!long;
+            const idleSecs     = lastDataReceivedSecs > 0 ? nowSecs - lastDataReceivedSecs : -1;
+            const egressAtDrop = activeEgressLabel.length ? activeEgressLabel : "direct";
+            const linesInAtDrop  = linesIn;
+            const linesOutAtDrop = linesOut;
+            const whoOutAtDrop   = whoOut;
             state = ConnectionState.disconnected;
             resetConnectionTelemetry();
             try {
@@ -7923,6 +8024,12 @@ private void processEvents() {
                 ["network": config.name,
                  "reason": lastDisconnectReason.length > 0 ? lastDisconnectReason : "connection_lost",
                  "attempt": backoff.currentAttempt().to!string,
+                 "uptimeSecs": uptimeSecs.to!string,
+                 "idleSecs": idleSecs.to!string,
+                 "egress": egressAtDrop,
+                 "linesIn": linesInAtDrop.to!string,
+                 "linesOut": linesOutAtDrop.to!string,
+                 "whoOut": whoOutAtDrop.to!string,
                  "event": "disconnected"]);
             // Record host failure for the circuit breaker — unless this is
             // a shutdown (user-initiated disconnect), which shouldn't count.

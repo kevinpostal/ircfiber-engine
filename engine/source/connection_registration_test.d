@@ -26,7 +26,8 @@ import std.array : split;
 import vibe.data.json : Json;
 
 import ircfiber.irc.server : ConnectionServer;
-import ircfiber.irc.connection : parseJoinThrottleSeconds, remainingJoinDelayMs, joinBatches;
+import ircfiber.irc.connection : parseJoinThrottleSeconds, remainingJoinDelayMs, joinBatches,
+    memberNeedsRealname, channelNeedsRealnameWho, MAX_WHO_ENRICH_ATTEMPTS;
 
 /// Tracks the number of passing checks.
 int passed;
@@ -160,6 +161,36 @@ void main() {
     ok("registration list shows supernets as third entry in toJson",
         j5["registrationUnavailableFor"][2].get!string == "supernets",
         "got: " ~ toJsonString(j5));
+
+    // ── Realname-probe termination (SuperNets WHO/WHOIS flood) ───────────
+    // The engine used to ask SuperNets for realnames forever: a user whose
+    // realname equals their nick is deliberately not stored in `realnames`
+    // (the UI would double-print it), so `bare !in realnames` stayed true
+    // and the 60 s sweep re-sent `WHO #chan` every minute for the life of
+    // the connection. `realnameProbed` records that the server answered.
+    stderr.writeln("\n[connection.realnames] probe termination");
+
+    ok("a stored realname needs no probe",
+        !memberNeedsRealname("nick", ["nick": "Real Name"], null));
+    ok("an unprobed nick needs a probe",
+        memberNeedsRealname("nick", null, null));
+    // The regression: pre-fix there was no probed set, so this member kept
+    // its channel "needing WHO" on every sweep, forever.
+    ok("a realname identical to the nick stops asking once answered",
+        !memberNeedsRealname("nick", null, ["nick": true]));
+    ok("prefix + userhost-in-names forms fold to the same nick",
+        !memberNeedsRealname("@nick!user@host", null, ["nick": true]));
+
+    ok("a fully resolved roster needs no WHO",
+        !channelNeedsRealnameWho(["@a!u@h", "b"], ["b": "Bee"], ["a": true], 0));
+    ok("an unresolved member triggers a WHO",
+        channelNeedsRealnameWho(["a"], null, null, 0));
+    // A server that answers WHO but omits members (or never sends 315)
+    // cannot keep the sweep alive past the cap.
+    ok("the attempt cap stops the sweep",
+        !channelNeedsRealnameWho(["a"], null, null, MAX_WHO_ENRICH_ATTEMPTS));
+    ok("an empty channel needs no WHO",
+        !channelNeedsRealnameWho([], null, null, 0));
 
     stderr.writeln("\n[", passed, " passed, ", failed, " failed]");
     if (failed > 0) core.stdc.stdlib.exit(1);
