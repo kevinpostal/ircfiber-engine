@@ -1,14 +1,12 @@
 /**
  * MOTD templates for the IRC Fiber network.
  *
- * InspIRCd serves one static MOTD file per rehash, so "a different MOTD on
- * every connect" is done in the engine: the gateway keeps the admin-edited
- * templates in Mongo (`motd_templates`), mirrors the enabled ones into
- * Redis (`RedisKeys.motdTemplates`, see `publishMotdTemplates`) and the
- * engine picks one at random per registration to irc.ircfiber.com in place
- * of the ircd's 372 lines. The gateway additionally renders a random one
- * into the ircd's MOTD file and rehashes (rotation for native clients);
- * that lives in the gateway (`web/admin/motd.d`), not here.
+ * The ircd's motdpool module is the only MOTD renderer: the gateway keeps
+ * the admin-edited templates in Mongo (`motd_templates`), writes every
+ * enabled one into the ircd's `motd.d/pool` on each edit
+ * (`web/admin/motd.d:writePool`) and the ircd draws one block per connect,
+ * substituting per-user `{placeholders}` from `motd.d/profiles` — no Redis
+ * mirror, no engine substitution, no REHASH.
  */
 module ircfiber.db.motd_templates;
 
@@ -233,32 +231,6 @@ final class MotdTemplateRepository {
     }
 }
 
-/// Serializes the enabled templates for the Redis mirror.
-string motdTemplatesToJson(const MotdTemplateRecord[] templates) @trusted {
-    Json arr = Json.emptyArray;
-    foreach (t; templates) if (t.enabled) arr ~= t.toJson();
-    return arr.toString();
-}
-
-/// Parses the Redis mirror. Malformed or empty input yields an empty list
-/// (callers then pass the ircd MOTD through).
-MotdTemplateRecord[] motdTemplatesFromJson(string json) @trusted {
-    if (json.length == 0) return null;
-    try {
-        auto arr = parseJsonString(json);
-        if (arr.type != Json.Type.array) return null;
-        MotdTemplateRecord[] result;
-        foreach (item; arr) {
-            auto t = MotdTemplateRecord.fromJson(item);
-            if (t.body_.strip.length) result ~= t;
-        }
-        return result;
-    } catch (Exception e) {
-        logWarn("motd templates mirror is not valid JSON: %s", e.msg);
-        return null;
-    }
-}
-
 /// The templates seeded into an empty collection: the four comps chosen
 /// for launch plus one that exercises the ircd's per-user `{placeholders}`
 /// (motdpool module: built-ins such as {nick}/{ip}/{users} and the
@@ -392,19 +364,6 @@ unittest {
     auto j = MotdTemplateRecord.fromJson(r.toJson());
     assert(j == r);
     assert(r.lines() == ["a", "b"]);
-}
-
-@("motd templates mirror keeps only enabled, non-empty templates")
-unittest {
-    MotdTemplateRecord a, b, c;
-    a.id = "a"; a.body_ = "x"; a.enabled = true;
-    b.id = "b"; b.body_ = "y"; b.enabled = false;
-    c.id = "c"; c.body_ = "  \n"; c.enabled = true;
-    auto back = motdTemplatesFromJson(motdTemplatesToJson([a, b, c]));
-    assert(back.length == 1 && back[0].id == "a");
-    assert(motdTemplatesFromJson("").length == 0);
-    assert(motdTemplatesFromJson("not json").length == 0);
-    assert(motdTemplatesFromJson(`{"id":"x"}`).length == 0);
 }
 
 @("validateMotdBody rejects empty and overlong bodies")

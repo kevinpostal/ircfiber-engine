@@ -3194,37 +3194,6 @@ final class PersistentIRCClient {
         }
     }
 
-    /// Lines of a randomly chosen admin MOTD template for the IRC Fiber
-    /// network, or null when this is not the platform host, Redis is
-    /// unavailable, or no template is enabled (the ircd MOTD then passes
-    /// through verbatim). Read once per registration; the mirror is written
-    /// by the gateway (`ircfiber.web.admin.motd.publishMotdTemplates`).
-    private string[] pickFiberMotdLines() {
-        import std.random : uniform;
-        import std.uni : toLower;
-        import ircfiber.default_network : DEFAULT_FIBER_HOST;
-        import ircfiber.db.motd_templates : motdTemplatesFromJson;
-        if (redis is null || config.host.toLower != DEFAULT_FIBER_HOST) return null;
-        try {
-            auto rdb = redis.getDb();
-            auto templates = motdTemplatesFromJson(rdb.get(RedisKeys.motdTemplates()));
-            if (templates.length == 0) return null;
-            // An admin-pinned template wins over the random pick (the same
-            // one is rotated into the ircd file, so every client agrees).
-            auto pinned = rdb.get(RedisKeys.motdPinned());
-            foreach (t; templates) if (pinned.length && t.id == pinned) {
-                logInfo("MOTD for %s: serving pinned template '%s'", config.name, t.name);
-                return t.lines();
-            }
-            auto t = templates[uniform(0, templates.length)];
-            logInfo("MOTD for %s: serving template '%s' (1 of %d enabled)", config.name, t.name, templates.length);
-            return t.lines();
-        } catch (Exception e) {
-            logWarn("Failed to load MOTD templates for %s: %s", config.name, e.msg);
-            return null;
-        }
-    }
-
     /// Build a snapshot of every piece of per-connection in-memory
     /// state the new engine needs to seamlessly continue this
     /// connection. The returned struct is plain-old-data; no
@@ -4941,11 +4910,6 @@ final class PersistentIRCClient {
         bool capReqSent  = false;
         bool capLsDone   = false;
         string[] serverCaps;
-        // IRC Fiber MOTD swap (see `pickFiberMotdLines`): filled on the
-        // first 375/372 of this registration; while non-empty the ircd's own
-        // 372 lines are dropped and these are published in their place.
-        string[] fiberMotdLines;
-        bool fiberMotdSwapped = false;
 
         // SCRAM state (may be null)
         ScramSha256Client* scram = null;
@@ -5067,47 +5031,11 @@ final class PersistentIRCClient {
                     auto evt = parseIRCLine(line);
                     // Set by a case below to keep this line out of the
                     // generic publish at the bottom of the loop.
-                    bool suppressPublish = false;
 
                     switch (evt.command) {
-                        // ── MOTD: IRC Fiber per-connect template swap ─────────
-                        // The ircd serves one static file per rehash; for the
-                        // platform network the admin-managed templates are
-                        // mirrored to Redis and one is picked per connect. The
-                        // ircd's 375 header passes through unchanged (server
-                        // name + "message of the day"), its 372 body is
-                        // replaced. Any other network, or an empty mirror,
-                        // falls through to the verbatim path.
-                        case "375":
-                        case "372":
-                            if (!fiberMotdSwapped && fiberMotdLines.length == 0)
-                                fiberMotdLines = pickFiberMotdLines();
-                            if (fiberMotdLines.length == 0) break;
-                            if (evt.command == "375" && !fiberMotdSwapped) {
-                                evt.network     = config.name;
-                                evt.timestampMs = resolveTimestamp(evt);
-                                eventChannel.put(evt);
-                            }
-                            if (!fiberMotdSwapped) {
-                                fiberMotdSwapped = true;
-                                // One ms apart: the buffer store dedups msgid-less
-                                // lines by (command, text, timestampMs), so two
-                                // identical banner rows or blank lines sharing the
-                                // 375's stamp would collapse into one.
-                                const motdBaseT = resolveTimestamp(evt);
-                                foreach (i, l; fiberMotdLines) {
-                                    // InspIRCd 4 sends 372 without the classic "- "
-                                    // prefix, so neither do we. A blank line ships as
-                                    // one space: an empty trailing is dropped as noise
-                                    // downstream and the template's spacing would go.
-                                    auto synth = parseIRCLine(":" ~ evt.prefix ~ " 372 " ~ sessionNick ~ " :" ~ (l.length ? l : " "));
-                                    synth.network     = config.name;
-                                    synth.timestampMs = motdBaseT + i;
-                                    eventChannel.put(synth);
-                                }
-                            }
-                            suppressPublish = true;
-                            break;
+                        // 375/372 pass through verbatim like every other
+                        // registration numeric: the ircd's motdpool module
+                        // renders the per-connect, per-user MOTD.
 
                         case "PING":
                             auto params = evt.getParams();
@@ -5607,7 +5535,7 @@ final class PersistentIRCClient {
                         "330", "332", "333", "354", "366", "376", "401",
                         "422",
                     ];
-                    if (!suppressPublish && evt.command != "PING" && evt.command != "ERROR"
+                    if (evt.command != "PING" && evt.command != "ERROR"
                         && !noPublishDuringRegistration.canFind(evt.command)) {
                         evt.network     = config.name;
                         evt.timestampMs = resolveTimestamp(evt);
