@@ -260,7 +260,10 @@ MotdTemplateRecord[] motdTemplatesFromJson(string json) @trusted {
 }
 
 /// The templates seeded into an empty collection: the four comps chosen
-/// for launch. Returned in admin order.
+/// for launch plus one that exercises the ircd's per-user `{placeholders}`
+/// (motdpool module: built-ins such as {nick}/{ip}/{users} and the
+/// motd.d/profiles fields such as {geo_city}/{connects}). Returned in
+/// admin order.
 MotdTemplateRecord[] defaultMotdTemplates() @safe {
     MotdTemplateRecord mk(string name, string body_, long order) {
         MotdTemplateRecord r;
@@ -275,6 +278,7 @@ MotdTemplateRecord[] defaultMotdTemplates() @safe {
         mk("Slant · classic", MOTD_SEED_SLANT, 20),
         mk("Calvin S · compact", MOTD_SEED_CALVIN, 30),
         mk("Banner3 · solid caps", MOTD_SEED_BANNER3, 40),
+        mk("Personal · placeholders", MOTD_SEED_PERSONAL, 50),
     ];
 }
 
@@ -371,6 +375,12 @@ Rules
   3. Follow the network operator instructions.
 `;
 
+private immutable string MOTD_SEED_PERSONAL = `You are {nick}!{user}@{host} — connecting from {ip}
+Location: {geo_city}, {geo_country} · {geo_org}
+Visits: {connects} since {first_seen} · last nick {last_nick}
+Strikes: {strikes} · banned: {banned} · {users} users online
+`;
+
 @("MotdTemplateRecord round-trips through Bson and Json")
 unittest {
     MotdTemplateRecord r;
@@ -414,7 +424,7 @@ unittest {
 @("default templates are enabled, non-empty and fit in 80 columns")
 unittest {
     auto defs = defaultMotdTemplates();
-    assert(defs.length == 4);
+    assert(defs.length == 5);
     foreach (t; defs) {
         assert(t.enabled);
         assert(validateMotdBody(t.body_) == "");
