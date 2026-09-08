@@ -28,6 +28,8 @@ final class UserRepository {
      * accents; signup restricts usernames to the ASCII IRC-nick charset, so
      * the two rules agree exactly. Idempotent: re-creating an identical
      * index is a server-side no-op.
+     *
+     * `bncToken_1` backs the admin bouncer page (`listWithBncToken`).
      */
     private void ensureIndexes() @trusted {
         try {
@@ -43,6 +45,8 @@ final class UserRepository {
         } catch (Exception e) {
             logWarn("users username_ci_unique index: %s", e.msg);
         }
+        try collection.createIndex(Bson(["bncToken": Bson(1)]));
+        catch (Exception e) logWarn("users bncToken index: %s", e.msg);
     }
 
     /// Finds a user by username.
@@ -90,10 +94,40 @@ final class UserRepository {
         collection.insertOne(userToBson(user));
     }
 
-    /// Updates an existing user account.
+    /// Updates an existing user account. `$set` rather than a replace so
+    /// fields outside `User` (the bouncer token) survive profile edits.
     void update(User user) {
-        auto bson = userToBson(user);
-        collection.replaceOne(["id": user.id.toString()], bson);
+        collection.updateOne(["id": user.id.toString()], Bson(["$set": userToBson(user)]));
+    }
+
+    /// Returns the user's bouncer password, or `""` when none is set. Kept
+    /// off `User`/`toJson` so it never rides on `/api/me` or session caches.
+    string getBncToken(UUID id) {
+        auto doc = collection.findOne(["id": id.toString()]);
+        if (doc.isNull) return "";
+        try return doc["bncToken"].get!string;
+        catch (Exception) return "";
+    }
+
+    /// Sets (or, with an empty token, clears) the user's bouncer password.
+    void setBncToken(UUID id, string token) {
+        auto selector = Bson(["id": Bson(id.toString())]);
+        auto update = token.length
+            ? Bson(["$set": Bson(["bncToken": Bson(token)])])
+            : Bson(["$unset": Bson(["bncToken": Bson("")])]);
+        collection.updateOne(selector, update);
+    }
+
+    /// Every user that currently has a bouncer password. Admin-only (the
+    /// bouncer page); the token itself is never returned.
+    User[] listWithBncToken() {
+        User[] result;
+        auto filter = Bson(["bncToken": Bson(["$exists": Bson(true), "$ne": Bson("")])]);
+        foreach (doc; collection.find(filter)) {
+            if (doc.isNull) continue;
+            result ~= docFromBson(doc);
+        }
+        return result;
     }
 
     /// Deletes a user by ID.
