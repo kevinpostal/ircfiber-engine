@@ -376,6 +376,14 @@ private void handleControlMessage(ref EngineContext ctx, ControlMessage msg) {
             if (msg.config.type != Json.Type.undefined) {
                 auto cfg = parseNetworkConfig(msg.config);
                 auto uid = parseUUID(msg.userId);
+                // A queued addNetwork for a network that has since been
+                // parked (SASL rejection) or admin-disabled must not
+                // resurrect it: fresh rows are never disabled, so this only
+                // fires on stale control traffic.
+                if (cfg.disabled) {
+                    logWarn("addNetwork[%s]: network is parked/disabled — ignoring stale control message", cfg.id.toString());
+                    break;
+                }
 
                 // Claim ownership in registry
                 const sid = ctx.serverRegistry.assignNetwork(cfg.id.toString());

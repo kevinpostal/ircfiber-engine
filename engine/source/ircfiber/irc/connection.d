@@ -2572,6 +2572,17 @@ unittest {
     assert(parseJoinThrottleSeconds("connected for at least 99999 seconds") == 600);
 }
 
+/// Thrown when services definitively reject our SASL credential (904/905).
+/// The stored password does not match the live NickServ account, so every
+/// reconnect would re-enter the same nick war. The run loop catches this
+/// separately from generic failures and parks the network (persisted
+/// `disabled`, same as the admin-disconnect path) instead of backing off
+/// and retrying forever. A proven credential — NickServ-password site login
+/// or admin link/reset — re-enables via `reconnectNetwork`.
+class SaslParkedException : Exception {
+    this(string msg) { super(msg); }
+}
+
 /// Persistent IRC client with auto-reconnect and IRCv3 support.
 final class PersistentIRCClient {
     private {
@@ -4027,7 +4038,23 @@ final class PersistentIRCClient {
                 // loop stuck forever. SyncError must be treated as a recoverable
                 // disconnect, not a fiber terminator.
                 string errMsg;
-                try { errMsg = e.msg; } catch (Throwable) { errMsg = "unknown throwable"; }
+                // SASL park (parkOnSaslRejection already persisted `disabled`,
+                // mirrored it in-memory, tore the socket down and emitted the
+                // user-visible error): skip the disconnect/backoff machinery
+                // and idle exactly like the admin-disabled path. A proven
+                // credential re-enables via control and this loop resumes.
+                if (auto se = cast(SaslParkedException) e) {
+                    string seMsg;
+                    try { seMsg = se.msg; } catch (Throwable) { seMsg = "SASL rejected"; }
+                    lastEmittedReason = seMsg;
+                    lastDisconnectReason = seMsg;
+                    while (!isShutdownRequested && config.disabled) {
+                        sleep(5.seconds);
+                    }
+                    if (isShutdownRequested) return;
+                    logInfo("runConnectionLoop[%s]: network re-enabled after SASL park — resuming", config.name);
+                    continue;
+                }
                 // Downgraded from logException(error) with hex stack spam.
                 // `transport not alive` and `Registration timed out` are expected
                 // during normal reconnect — not `error`.
@@ -4868,6 +4895,40 @@ final class PersistentIRCClient {
         emitZeroRetryStatus();
     }
 
+    /// Definitive SASL rejection (904/905): services are reachable and refuse
+    /// the stored credential, so the password no longer matches the live
+    /// NickServ account (rotated on IRC, dropped and re-registered, or lost
+    /// in an Anope restart). Persist `disabled` — survives restarts, skips
+    /// bootstrap, renders as admin-disabled — mirror it in-memory so the run
+    /// loop idles, and tear the half-registered socket down. Recovery is a
+    /// proven credential: NickServ-password site login or admin link/reset,
+    /// both of which re-enable and push `reconnectNetwork`. The account name
+    /// is logged; the credential never is.
+    private void parkOnSaslRejection(string detail) {
+        import ircfiber.db.network : NetworkRepository;
+        const msg = "SASL " ~ saslMechanismName(config.sasl) ~ " rejected for account \"" ~
+            config.saslUsername ~ "\" (" ~ detail ~ ") — stored credential does not match " ~
+            "the live NickServ account. Parked (disabled); log into the site with " ~
+            "the NickServ password to reconnect.";
+        try {
+            (new NetworkRepository()).setDisabled(config.id, true);
+        } catch (Exception e) {
+            logWarn("sasl_park[%s]: persisting disabled failed: %s", config.name, e.msg);
+        }
+        config.disabled = true;
+        try transportClose(); catch (Exception e) logWarn("sasl_park[%s]: transport close failed: %s", config.name, e.msg);
+        state = ConnectionState.disconnected;
+        emitLog("error", msg);
+        logWarn("sasl_park[%s]: %s", config.name, msg);
+        logJsonMap("warn", "auth", "SASL rejected — parking network",
+            ["network": config.name, "host": config.host,
+             "account": config.saslUsername, "event": "sasl_parked"]);
+        recordCounter("ircfiber.sasl.parked", 1, ["network": config.name, "host": config.host]);
+        try eventChannel.put(IRCRawEvent.makeDisconnected(config.name, config.id.toString(), msg));
+        catch (Exception) {}
+        emitZeroRetryStatus();
+    }
+
     // ── Registration (CAP + NICK + USER + SASL) ───────────────────────────────
 
     private void performRegistration() {
@@ -5490,20 +5551,13 @@ final class PersistentIRCClient {
                             break;
                         case "904": // ERR_SASLFAIL
                         case "905": // ERR_SASLTOOLONG
-                            emitLog("sasl_fail",
-                                "SASL " ~ saslMechanismName(config.sasl) ~ " authentication failed: " ~ evt.text);
-                            logJsonMap("warn", "auth",
-                                "SASL fail",
-                                ["network": config.name,
-                                 "host": config.host, "port": config.port.to!string,
-                                 "mechanism": saslMechanismName(config.sasl),
-                                 "err": evt.text,
-                                 "event": "sasl_fail"]);
-                            recordCounter("ircfiber.sasl.failure", 1,
-                                ["network": config.name, "host": config.host,
-                                 "port": config.port.to!string,
-                                 "mechanism": saslMechanismName(config.sasl)]);
-                            throw new Exception("SASL authentication failed: " ~ evt.text);
+                            // Definitive: services are reachable and refuse the
+                            // stored credential. Retrying would re-enter the
+                            // same nick war forever — park instead. 906
+                            // (aborted, usually our own timeout) stays on the
+                            // retry path below.
+                            parkOnSaslRejection(evt.text);
+                            throw new SaslParkedException("SASL authentication failed: " ~ evt.text);
                         case "906": // ERR_SASLABORTED
                             emitLog("sasl_fail", "SASL authentication aborted");
                             logJsonMap("warn", "auth",
