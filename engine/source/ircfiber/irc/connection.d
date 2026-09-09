@@ -8127,20 +8127,27 @@ private void processEvents() {
 
     private size_t readFromStream(ubyte[] buffer, Duration timeout = 0.seconds) {
         if (tlsStream !is null) {
-            // TLS path: safeTLSRead has no timeout of its own (it is a
-            // thin wrapper over SSL_read), so gate on the underlying
-            // socket's waitForData with the caller's timeout first. This
-            // keeps the registration read loop paced at
-            // REGISTRATION_READ_TIMEOUT_MS even when the peer is silent —
-            // without it a read could block indefinitely and the
-            // registration timeout / 400-read cap never fire (regression
-            // from the BLCKND outage: the loop stalled in a blocked read
-            // while safeTLSRead's WANT_READ handling was broken).
-            if (timeout > 0.seconds) {
-                if (tlsStream.leastSize == 0) {
-                    if (!connection.waitForData(timeout))
-                        return 0;
-                }
+            // TLS path. NEVER touch the TLS stream unless bytes are already
+            // pending: `tlsStream.leastSize` (SSL_peek) and `read` (SSL_read)
+            // pull from vibe's BIO, whose `onBioRead` calls
+            // `TCPConnection.leastSize`, which blocks for `readTimeout`
+            // (`Duration.max` after the SOCKS handshake) until the peer sends
+            // a byte. With a silent peer that parked processEvents() inside
+            // OpenSSL indefinitely: no 30 s keepalive PING, no PONG timeout,
+            // no idle reaper — the drop was only noticed hours later when a
+            // FIN finally arrived or a user write failed (SuperNets
+            // 2026-09-09: dataAgeSecs 6098 / 7902 at disconnect). The same
+            // stall hit the registration loop during the BLCKND outage.
+            //
+            // `dataAvailableForRead` is SSL_pending || waitForData(0): never
+            // blocks. When nothing is pending, wait on the raw socket for the
+            // caller's timeout (0 in processEvents → immediate wouldBlock).
+            // `noMoreData` (peer FIN) deliberately falls through so SSL_read
+            // surfaces the close as the usual "closed by peer" exception.
+            if (!tlsStream.dataAvailableForRead) {
+                import vibe.core.net : WaitForDataStatus;
+                if (connection.waitForDataEx(timeout) == WaitForDataStatus.timeout)
+                    return 0;
             }
             return safeTLSRead(tlsStream, buffer);
         }
