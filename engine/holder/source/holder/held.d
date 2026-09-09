@@ -111,6 +111,10 @@ final class Held {
     /// Set once a QUIT is in flight or the entry is closing; the reader
     /// keeps draining upstream (to see the server's EOF) but relays nothing.
     private bool closing;
+    /// A fiber is inside `writeUpstream` (pump or QUIT); teardown waits.
+    private bool writing;
+    /// `teardownUpstream` ran (once, on the reader fiber).
+    private bool tornDown;
 
     this(string id, ref DialRequest req, ref DialOutcome o, size_t detachBufferBytes, long detachMaxSecs) {
         this.id = id;
@@ -167,8 +171,34 @@ final class Held {
     // ── Upstream I/O ────────────────────────────────────────────────────
 
     private void writeUpstream(const(ubyte)[] bytes) {
+        if (tornDown) throw new Exception("closed");
+        writing = true;
+        scope (exit) writing = false;
         if (tls !is null) { tls.write(bytes); tls.flush(); }
         else { conn.write(bytes); conn.flush(); }
+    }
+
+    /// Frees the TLS object and closes the upstream socket. Runs ONLY on
+    /// the reader fiber, after it has left `SSL_read` for good: `finalize()`
+    /// nulls the SSL object, and a reader still inside OpenSSL (blocked in
+    /// the BIO read of a partial record) then dereferences null — that is
+    /// the segfault the holder took on prod 2026-09-09 when a `CLOSE`
+    /// finalized from the control fiber. Other fibers only `conn.close()`
+    /// (see `markClosed`), which wakes the reader; the reader comes here
+    /// on its way out. An upstream write in flight (pump / QUIT) gets up
+    /// to 2 s to finish first.
+    private void teardownUpstream() {
+        if (tornDown) return;
+        tornDown = true;
+        foreach (_; 0 .. 200) {
+            if (!writing) break;
+            try sleep(10.msecs); catch (Exception) {}
+        }
+        if (tls !is null) {
+            try tls.finalize(); catch (Exception) {}
+            tls = null;
+        }
+        try conn.close(); catch (Exception) {}
     }
 
     private void sendPong(string reply) {
@@ -217,8 +247,10 @@ final class Held {
         return n;
     }
 
-    /// Upstream-reader fiber: lives as long as the upstream socket.
+    /// Upstream-reader fiber: lives as long as the upstream socket, and is
+    /// the only fiber that may free the TLS object (on its way out).
     private void readerLoop() {
+        scope (exit) teardownUpstream();
         ubyte[STREAM_BUFFER_SIZE] buf;
         while (isOpen) {
             size_t n;
@@ -343,7 +375,10 @@ final class Held {
 
     // ── Close ───────────────────────────────────────────────────────────
 
-    /// Marks the entry closed, tears down the sockets and the attachment.
+    /// Marks the entry closed and drops the attachment. The upstream socket
+    /// is closed here (that wakes a reader blocked in a wait or inside the
+    /// BIO read); the TLS object is freed by the reader fiber alone when it
+    /// unwinds (`teardownUpstream`).
     private void markClosed(string reason) {
         if (!isOpen) return;
         state = "closed";
@@ -358,7 +393,6 @@ final class Held {
             try { ipc.close(); } catch (Exception) {}
             ipc = TCPConnection.init;
         }
-        try { if (tls !is null) tls.finalize(); } catch (Exception) {}
         try { conn.close(); } catch (Exception) {}
     }
 
