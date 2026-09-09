@@ -272,6 +272,8 @@ void writeStateSnapshotForNetwork(ref EngineContext ctx, Network net, string ser
         // probe RTT, RPL_WELCOME instant and negotiated TLS details.
         snap.lagMs = clientForEgress.getLagMs();
         snap.connectedAtMs = clientForEgress.getConnectedAtMs();
+        snap.dataAgeSecs = clientForEgress.getDataAgeSecs();
+        snap.pongAgeSecs = clientForEgress.getPongAgeSecs();
         snap.hasTlsInfo = clientForEgress.hasTlsInfo();
         snap.tlsInfo = clientForEgress.hasTlsInfo() ? clientForEgress.getTlsInfo() : TlsInfo.init;
     }

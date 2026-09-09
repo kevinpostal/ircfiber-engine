@@ -535,6 +535,12 @@ struct NetworkStateSnapshot {
     long lagMs = -1;
     /// Unix ms of RPL_WELCOME for the live connection. 0 = not connected.
     long connectedAtMs = 0;
+    /// Seconds since the last inbound byte on the live connection. 0 =
+    /// unknown / not connected. Shipped on every snapshot so the UI can
+    /// show a stale hint before the PONG-timeout reaper fires.
+    long dataAgeSecs = 0;
+    /// Seconds since the last PONG on the live connection. 0 = unknown.
+    long pongAgeSecs = 0;
     /// Whether `tlsInfo` is populated; false for plain connections or
     /// when the engine could not read the session details.
     bool hasTlsInfo;
@@ -587,6 +593,8 @@ struct NetworkStateSnapshot {
         if (localIp.length) j["localIp"] = Json(localIp);
         j["lagMs"] = Json(lagMs);
         j["connectedAtMs"] = Json(connectedAtMs);
+        j["dataAgeSecs"] = Json(dataAgeSecs);
+        j["pongAgeSecs"] = Json(pongAgeSecs);
         if (hasTlsInfo) j["tlsInfo"] = tlsInfo.toJson();
         // W1-T01-rev1: structured retry / fail info payload. The
         // retry status is omitted from the wire entirely when
@@ -656,6 +664,8 @@ struct NetworkStateSnapshot {
         if (j["localIp"].type == Json.Type.string) s.localIp = j["localIp"].get!string;
         if (j["lagMs"].type == Json.Type.int_) s.lagMs = j["lagMs"].get!long;
         if (j["connectedAtMs"].type == Json.Type.int_) s.connectedAtMs = j["connectedAtMs"].get!long;
+        if (j["dataAgeSecs"].type == Json.Type.int_) s.dataAgeSecs = j["dataAgeSecs"].get!long;
+        if (j["pongAgeSecs"].type == Json.Type.int_) s.pongAgeSecs = j["pongAgeSecs"].get!long;
         if (j["tlsInfo"].type == Json.Type.object) {
             const ti = j["tlsInfo"];
             if (auto v = "version" in ti)
@@ -753,4 +763,23 @@ unittest {
     assert(back.connectedAtMs == 0);
     assert(!back.hasTlsInfo);
     assert(back.tlsInfo == TlsInfo.init);
+}
+
+@("NetworkStateSnapshot dataAgeSecs/pongAgeSecs round-trip; legacy JSON defaults to 0")
+unittest {
+    NetworkStateSnapshot s;
+    s.dataAgeSecs = 95;
+    s.pongAgeSecs = 61;
+    auto j = s.toJson();
+    assert(j["dataAgeSecs"].get!long == 95);
+    assert(j["pongAgeSecs"].get!long == 61);
+    auto back = NetworkStateSnapshot.fromJson(j);
+    assert(back.dataAgeSecs == 95);
+    assert(back.pongAgeSecs == 61);
+    // Pre-change snapshot without the fields: no throw, ages read 0.
+    auto legacy = Json.emptyObject;
+    legacy["connected"] = Json(true);
+    auto legacyBack = NetworkStateSnapshot.fromJson(legacy);
+    assert(legacyBack.dataAgeSecs == 0);
+    assert(legacyBack.pongAgeSecs == 0);
 }

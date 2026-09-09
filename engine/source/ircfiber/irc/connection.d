@@ -2899,6 +2899,9 @@ final class PersistentIRCClient {
         // Used to detect half-open TCP connections where keepalive
         // PINGs go out but responses are silently dropped.
         long                lastPongReceivedSecs;
+        // Last time a `keepalive_missed` info line was emitted (unix secs).
+        // Throttles that line to at most once per minute per network.
+        long                lastKeepaliveMissedLogSecs;
         bool                idleEmitted;
         // ── Connection telemetry (surfaced via the state snapshot) ──────────
         /// Round trip of the last answered `PING :LAG<ms>` probe. -1 until
@@ -2927,7 +2930,8 @@ final class PersistentIRCClient {
         this.ownerId      = owner;
         this.ipv6BindResolved = false;
         this.ipv6BindCache = "";
-        this.backoff      = new ExponentialBackoff(3.seconds, RECONNECT_MAX_DELAY_SECS.seconds);
+        // Never park: Duration.zero = retry forever at the 6 h tier (tiers/caps/jitter unchanged). The reconnect_gave_up path below is retained but unreachable unless a future cap returns.
+        this.backoff      = new ExponentialBackoff(3.seconds, RECONNECT_MAX_DELAY_SECS.seconds, 0, Duration.zero);
         this.state        = ConnectionState.disconnected;
         this.sessionNick  = cfg.nick.length > 0 ? cfg.nick : "ircfiber";
         this.lastDataReceivedSecs = Clock.currTime.toUnixTime!long;
@@ -3679,6 +3683,11 @@ final class PersistentIRCClient {
     @property long getLagMs() const nothrow { return lagMs; }
     /// Unix ms of RPL_WELCOME for the live connection; 0 when not connected.
     @property long getConnectedAtMs() const nothrow { return connectedAtMs; }
+    /// Seconds since the last inbound byte; 0 when never. Surfaced via the
+    /// state snapshot so the UI can hint staleness before the reaper fires.
+    @property long getDataAgeSecs() const { return lastDataReceivedSecs > 0 ? Clock.currTime.toUnixTime!long - lastDataReceivedSecs : 0; }
+    /// Seconds since the last PONG; 0 when never.
+    @property long getPongAgeSecs() const { return lastPongReceivedSecs > 0 ? Clock.currTime.toUnixTime!long - lastPongReceivedSecs : 0; }
     /// Whether `getTlsInfo()` describes the live TLS session.
     @property bool hasTlsInfo() const nothrow { return tlsInfoValid; }
     /// Negotiated TLS session details (valid only when `hasTlsInfo`).
@@ -4689,6 +4698,7 @@ final class PersistentIRCClient {
             recordSocketAddrs();
             ts.setStatusOk();
         });
+        // No OS TCP keepalive here: vibe.d TCPConnection exposes no socket fd cleanly — the 30 s app-level LAG probes in processEvents() hold NAT mappings and meet the ~2 min detection goal.
         logInfo("TCP via egress '%s' (%s/%s) to %s:%d peer=%s local=%s", activeEgressLabel.length ? activeEgressLabel : "direct", activeEgressHost.length ? activeEgressHost : "direct", activeEgressIp.length ? activeEgressIp : "-", config.host, config.port, activePeerIp.length ? activePeerIp : "-", activeLocalIp.length ? activeLocalIp : "-");
         emitLog("tcp_open",
             "TCP connection established to " ~ config.host ~ ":" ~ config.port.to!string
@@ -5789,7 +5799,7 @@ private void processEvents() {
             }
             processOutboundQueue();
 
-            if (now - lastKeepalive >= 60) {
+            if (now - lastKeepalive >= 30) {
                 lagProbeSentMs = unixMsNow();
                 sendRaw("PING :" ~ lagPingToken(lagProbeSentMs));
                 lastKeepalive = now;
@@ -5798,13 +5808,32 @@ private void processEvents() {
                     ["network": config.name,
                      "event": "ping_sent"]);
             }
-            // PONG timeout: if no PONG has been received in 300s (5 min),
+            // Silent-drop early warning: a LAG probe is outstanding and no
+            // PONG (or any data, which also resets the PONG clock) has
+            // arrived for 60 s. Info level so prod sees it without a debug
+            // restart; throttled to one line per minute per network.
+            // Per-probe ping_sent/pong_received traffic stays at debug.
+            if (lagProbeSentMs != 0
+                && now - lastPongReceivedSecs >= 60
+                && now - lastKeepaliveMissedLogSecs >= 60) {
+                lastKeepaliveMissedLogSecs = now;
+                logJsonMap("info", "connection",
+                    "LAG probe unanswered for 60s — peer may be silently dead",
+                    ["network": config.name,
+                     "host": config.host,
+                     "lagMs": lagMs.to!string,
+                     "dataAgeSecs": (lastDataReceivedSecs > 0 ? now - lastDataReceivedSecs : -1).to!string,
+                     "pongAgeSecs": (now - lastPongReceivedSecs).to!string,
+                     "egress": activeEgressLabel.length ? activeEgressLabel : "direct",
+                     "event": "keepalive_missed"]);
+            }
+            // PONG timeout: if no PONG has been received in 120s (2 min),
             // the connection is half-open (server silently died but local
             // socket stays ESTABLISHED). Throw to trigger the auto-reconnect
             // with exponential backoff — same as TCP read failure.
-            if (now - lastPongReceivedSecs >= 300) {
+            if (now - lastPongReceivedSecs >= 120) {
                 throw new Exception(
-                    "PONG timeout — no response for 300s (network: " ~
+                    "PONG timeout — no response for 120s (network: " ~
                     config.name ~ ")");
             }
             // Defense-in-depth A (idle-reaper): some IRC servers stop
@@ -5816,15 +5845,15 @@ private void processEvents() {
             // reaper only triggers on a client send. This guard closes
             // the gap: if we've had at least one byte of activity,
             // sent ≥2 keepalives since then, and still seen ZERO bytes
-            // for 600 s (10 min), the half-open is unambiguous. Throw
+            // for 300 s (5 min), the half-open is unambiguous. Throw
             // so the runConnectionLoop() catch block runs
             // handleDisconnection() and schedules a fresh reconnect.
             // The threshold is well above the 120 s W1-T08 idle event
             // (which the UI uses as a status hint, not a reaper), so a
             // merely-quiet channel will not falsely trip.
             if (lastDataReceivedSecs > 0
-                && now - lastDataReceivedSecs >= 600
-                && now - lastKeepalive >= 240) {
+                && now - lastDataReceivedSecs >= 300
+                && now - lastKeepalive >= 120) {
                 throw new Exception(
                     "Idle half-open detected — no data for "
                     ~ (now - lastDataReceivedSecs).to!string
@@ -8062,6 +8091,9 @@ private void processEvents() {
                  "linesIn": linesInAtDrop.to!string,
                  "linesOut": linesOutAtDrop.to!string,
                  "whoOut": whoOutAtDrop.to!string,
+                 "pongAgeSecs": (lastPongReceivedSecs > 0 ? nowSecs - lastPongReceivedSecs : -1).to!string,
+                 "dataAgeSecs": (lastDataReceivedSecs > 0 ? nowSecs - lastDataReceivedSecs : -1).to!string,
+                 "lastError": lastErrorText,
                  "event": "disconnected"]);
             // Record host failure for the circuit breaker — unless this is
             // a shutdown (user-initiated disconnect), which shouldn't count.
