@@ -92,18 +92,22 @@ FROM builder-common AS builder-engine
 COPY backend/dub.sdl backend/dub.selections.json ./backend/
 COPY engine/dub.sdl engine/dub.selections.json ./engine/
 COPY engine/source/ ./engine/source/
+COPY engine/holder/ ./engine/holder/
 
 RUN --mount=type=cache,target=/build/.dub,sharing=locked \
     --mount=type=cache,target=/root/.dub,sharing=locked \
     dub build --root=engine --compiler=ldc2 --build=release --parallel && \
+    dub build --root=engine :holder --compiler=ldc2 --build=release --parallel && \
     dub build --root=engine --config=janitor-migrate --compiler=ldc2 --build=release --parallel && \
     dub build --root=engine --config=ircfiber-default-migrate --compiler=ldc2 --build=release --parallel && \
     cp engine/irc-fiber-engine ./irc-fiber-engine && \
+    cp engine/irc-fiber-holder ./irc-fiber-holder && \
     cp engine/janitor-migrate ./janitor-migrate && \
     cp engine/ircfiber-default-migrate ./ircfiber-default-migrate && \
     test -f ./irc-fiber-engine && \
+    test -f ./irc-fiber-holder && \
     test -f ./janitor-migrate
-RUN strip ./irc-fiber-engine ./janitor-migrate ./ircfiber-default-migrate
+RUN strip ./irc-fiber-engine ./irc-fiber-holder ./janitor-migrate ./ircfiber-default-migrate
 
 
 # ============================================================================
@@ -153,6 +157,54 @@ ENTRYPOINT ["/usr/bin/tini", "--"]
 # Last, after every COPY: an ENV-only layer is metadata — no pushed bytes and
 # nothing above it is invalidated when the commit changes. The engine reads
 # these at runtime (ircfiber.build_info) when it registers in Redis.
+ARG GIT_HASH=dev
+ARG GIT_SHORT=dev
+ARG GIT_DESCRIBE=dev
+ARG GIT_BRANCH=dev
+ARG BUILD_TIME=dev
+ARG GIT_MESSAGE=""
+ENV IRCFIBER_VERSION=0.3.0 \
+    IRCFIBER_BUILD_COMMIT=$GIT_HASH \
+    IRCFIBER_BUILD_SHORT=$GIT_SHORT \
+    IRCFIBER_BUILD_DESCRIBE=$GIT_DESCRIBE \
+    IRCFIBER_BUILD_BRANCH=$GIT_BRANCH \
+    IRCFIBER_BUILD_TIME=$BUILD_TIME \
+    IRCFIBER_BUILD_HOST=builder \
+    IRCFIBER_BUILD_MESSAGE=$GIT_MESSAGE \
+    IRCFIBER_BUILD_COMMIT_URL=https://github.com/kevinpostal/ircfiber-engine/commit/$GIT_HASH
+LABEL org.opencontainers.image.revision=$GIT_HASH
+
+# ============================================================================
+# Stage: runtime-holder — slim Ubuntu + the connection holder only.
+# Owns every IRC TCP/SOCKS5/TLS socket for one engine; never redeployed by
+# an engine ship (recreating it reconnects every IRC network). Needs no
+# tailscale (egress policy stays in the engine) and no config/ tree.
+# ============================================================================
+FROM ubuntu:22.04 AS runtime-holder
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libssl3 \
+        ca-certificates \
+        tini && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder-engine /build/irc-fiber-holder /app/irc-fiber-holder
+
+# Unix-socket directory shared with the engine (compose/ansible mount a
+# named volume here); HEALTHCHECK (`--check`) is set by compose/ansible/k8s.
+RUN mkdir -p /run/ircfiber
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["/app/irc-fiber-holder"]
+
+# ── Build identity ─────────────────────────────────────────────────────────
+# Same block as runtime-engine: the holder reports IRCFIBER_BUILD_SHORT in
+# HELLO/STATUS so `make ship-holder` can gate on the deployed build.
 ARG GIT_HASH=dev
 ARG GIT_SHORT=dev
 ARG GIT_DESCRIBE=dev

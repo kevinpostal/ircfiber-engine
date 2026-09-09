@@ -19,8 +19,6 @@ import vibe.core.log;
 import vibe.core.net : connectTCP, TCPConnection;
 import vibe.core.task : Task;
 import vibe.data.json : Json;
-import vibe.stream.tls : TLSContext, TLSContextKind, TLSPeerValidationMode,
-    TLSStream, createTLSContext, createTLSStream;
 import vibe.stream.operations : IOMode;
 import core.time : Duration, dur, msecs, seconds;
 
@@ -30,13 +28,13 @@ import ircfiber.redis.protocol : RedisKeys, TlsInfo;
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.irc.reconnect : ExponentialBackoff;
 import ircfiber.irc.sasl : buildSaslPlainPayload, ScramSha256Client;
-import ircfiber.irc.tls_safe : safeTLSRead;
 import ircfiber.storage.buffer : sanitizeUtf8;
-import ircfiber.engine.handoff : HandoffState, ServerFeaturesSnapshot;
+import ircfiber.engine.session_snapshot : SessionSnapshot, ServerFeaturesSnapshot, SESSION_SNAPSHOT_SCHEMA, toJSON;
+import ircfiber.engine.holder_client : HolderClient, DialTag, DialProxy, DialRequest, DialResult, DialEvent,
+    DialProgress, AttachResult, HolderEntry, DialFailedException, HolderUnavailableException, HolderErrorException;
 import ircfiber.logging : logJsonMap, logException;
 import ircfiber.observability : recordCounter, recordGauge, recordHistogram;
 import ircfiber.tracing : withSpan, Span;
-import ircfiber.engine.adopted_socket : AdoptedSocket;
 import ircfiber.async : safeFiberRun;
 import ircfiber.irc.ipv6 : ipv6ForUser, normalizePrefix;
 import ircfiber.irc.parser : ChannelListRow, parseChannelListRow;
@@ -125,7 +123,6 @@ private enum SASL_MAX_READS               = 100;
 private enum SASL_READ_TIMEOUT_MS         = 100;
 private enum PROCESS_READ_TIMEOUT_MS      = 50;
 private enum STREAM_BUFFER_SIZE           = 4096;
-private enum DNS_CACHE_TTL_MS             = 30_000;
 private enum QUIT_GRACE_PERIOD_MS         = 2_000;  // wait this long for server to close after QUIT
 private enum STARTTLS_REPLY_TIMEOUT_MS      = 15_000; // wait this long for 670 after STARTTLS
 
@@ -239,7 +236,6 @@ private __gshared Object gHostBreakerLock;
 private shared static this() {
     try {
         if (gMullvadLock is null) gMullvadLock = new Object();
-        if (gDnsLock is null) gDnsLock = new Object();
         gHostBreakerLock = new Object();
     } catch (Throwable) {}
 }
@@ -376,14 +372,9 @@ private enum REGISTRATION_WARN_AT_FRACTION_2     = 75;
 
 // ── Happy Eyeballs (RFC 8305) ─────────────────────────────────────────────────
 //
-// Races IPv6 and IPv4 connections with a 250ms stagger so a broken
-// address family never causes a visible delay. The algorithm:
-//   1. Resolve DNS → collect all A + AAAA records
-//   2. Interleave address families (IPv6 first, then IPv4, alternating)
-//   3. Start first attempt immediately; after 250ms launch the next, etc.
-//   4. Use whichever TCP connection succeeds first; close the losers.
-
-private enum HAPPY_EYEBALLS_DELAY_MS = 250;
+// Direct dials race IPv6 and IPv4 inside the connection holder (holder.dial):
+// DNS → interleave families → 250 ms stagger → first winner. The engine only
+// picks the egress and forwards the holder's timeline events.
 
 // ── Mullvad egress (SOCKS5) slots ────────────────────────────────────────────
 // A fixed pool of long-lived *slots* (one SOCKS sidecar each) configured at
@@ -1252,61 +1243,6 @@ private void releaseSlot(string label) nothrow {
         }
     });
 }
-// SOCKS5 → TLS handoff: connectTCP to sidecar, handshake on same TCPConnection,
-// then return it for createTLSStreamWithTimeout (avoids private TCPConnection(fd) ctor).
-//
-// `target` is the IRC hostname (SOCKS5 ATYP=domain) or an IP literal (ATYP
-// 1/4). Names are resolved BY THE EXIT: the engine's own resolver can be
-// split-horizon (on prod `irc.ircfiber.com` is a Docker alias → fd00:f1b3:1::7,
-// unreachable from a remote sidecar) and the exit's answer is the one that
-// matches the address the IRC network will see anyway.
-private TCPConnection socks5ConnectViaProxy(MullvadProxy* proxy, string target, ushort targetPort) {
-    import core.sys.posix.arpa.inet : inet_pton;
-    import core.sys.posix.sys.socket : AF_INET, AF_INET6;
-    auto proxyConn = connectTCP(proxy.host, proxy.port, null, 0, CONNECT_TIMEOUT_SECONDS.seconds);
-    scope(failure) try { proxyConn.close(); } catch (Exception) {}
-    // The exit dials the IRC server before answering CONNECT; bound that wait
-    // like every other connect step (an unbounded read here wedged fibers on
-    // a hung sidecar). Reset afterwards — the socket carries TLS + IRC next.
-    proxyConn.readTimeout = HAPPY_EYEBALLS_RACE_TIMEOUT_SECONDS.seconds;
-    ubyte[3] greet = [0x05, 0x01, 0x00];
-    proxyConn.write(greet[]);
-    ubyte[2] greetResp;
-    proxyConn.read(greetResp[]);
-    if (greetResp[0] != 0x05 || greetResp[1] != 0x00) throw new Exception("SOCKS5 proxy auth failed");
-    ubyte[] req;
-    req ~= cast(ubyte)0x05; req ~= cast(ubyte)0x01; req ~= cast(ubyte)0x00;
-    ubyte[4] ip4;
-    ubyte[16] ip6;
-    if (inet_pton(AF_INET, target.toStringz, ip4.ptr) == 1) {
-        req ~= cast(ubyte)0x01; req ~= ip4[];
-    } else if (inet_pton(AF_INET6, target.toStringz, ip6.ptr) == 1) {
-        req ~= cast(ubyte)0x04; req ~= ip6[];
-    } else {
-        if (target.length == 0 || target.length > 255) throw new Exception("SOCKS5 bad target name " ~ target);
-        req ~= cast(ubyte)0x03; req ~= cast(ubyte) target.length; req ~= cast(const(ubyte)[]) target;
-    }
-    req ~= cast(ubyte)(targetPort >> 8); req ~= cast(ubyte)(targetPort & 0xFF);
-    proxyConn.write(req);
-    ubyte[4] hdr;
-    proxyConn.read(hdr[]);
-    if (hdr[0] != 0x05 || hdr[1] != 0x00) throw new Exception("SOCKS5 CONNECT failed rep=" ~ hdr[1].to!string);
-    ubyte atyp = hdr[3];
-    size_t remain = 0;
-    if (atyp == 0x01) remain = 4 + 2;
-    else if (atyp == 0x04) remain = 16 + 2;
-    else if (atyp == 0x03) { ubyte l; proxyConn.read((&l)[0 .. 1]); remain = l + 2; }
-    else throw new Exception("SOCKS5 bad ATYP");
-    if (remain > 0) { ubyte[] tmp = new ubyte[remain]; proxyConn.read(tmp); }
-    proxyConn.readTimeout = Duration.max;
-    return proxyConn;
-}
-
-private struct ResolvedAddr {
-    string ip;
-    AddressFamily family;
-}
-
 private string stripHostBrackets(string host) @safe pure {
     host = host.strip();
     // Handle full ircs:// / irc:// URLs pasted into host field
@@ -1341,123 +1277,19 @@ private string stripHostBrackets(string host) @safe pure {
     return host;
 }
 
-private __gshared ResolvedAddr[][string] dnsCache;
-private __gshared long[string]           dnsCacheTime;
-private __gshared Object gDnsLock;
-shared static this() {
-    // gMullvadLock already initialized in previous shared static this;
-    // D allows multiple shared static this blocks — they run in order.
-    // Initialize DNS mutex here; if gMullvadLock init already ran, keep it.
-    try {
-        if (gMullvadLock is null) gMullvadLock = new Object();
-        gDnsLock = new Object();
-    } catch (Throwable) {}
-}
-
-private ResolvedAddr[] resolveAllAddresses(string host, ushort port) {
-    import std.datetime : Clock;
-    const now = Clock.currTime.toUnixTime!long * 1000;
-    auto normalizedHost = stripHostBrackets(host);
-    auto cacheKey = normalizedHost;
-    // Check cache under lock (enterprise: avoid SyncError on __gshared AA).
-    if (gDnsLock !is null) synchronized (gDnsLock) {
-        if (auto t = cacheKey in dnsCacheTime) {
-            if (now - *t < DNS_CACHE_TTL_MS) {
-                if (auto cached = cacheKey in dnsCache) return (*cached).dup;
-            }
-        }
-    } else {
-        if (auto t = cacheKey in dnsCacheTime) {
-            if (now - *t < DNS_CACHE_TTL_MS) {
-                if (auto cached = cacheKey in dnsCache) return *cached;
-            }
-        }
-    }
-    import vibe.core.core : runWorkerTask;
-    import vibe.core.channel : createChannel;
-    import core.time : seconds;
-    auto ch = createChannel!string();
-    runWorkerTask((string h, ushort p, Channel!string c) nothrow {
-        try {
-            auto addrs = getAddress(h, p);
-            string encoded;
-            // getaddrinfo without a socktype hint returns one entry per
-            // (address, socktype) — the same IP three times (STREAM, DGRAM,
-            // RAW). Dedupe so Happy Eyeballs does not race three identical
-            // connects and then wait three race timeouts for the same host.
-            bool[string] seen;
-            foreach (addr; addrs) {
-                auto key = addr.toAddrString();
-                if (key in seen) continue;
-                seen[key] = true;
-                if (encoded.length > 0) encoded ~= "|";
-                encoded ~= key
-                    ~ (addr.addressFamily == AddressFamily.INET6 ? "/6" : "/4");
-            }
-            try { c.put(encoded); } catch (Exception) {}
-        } catch (Exception) {
-            try { c.put(""); } catch (Exception) {}
-        }
-    }, normalizedHost, port, ch);
-    string encoded;
-    if (ch.tryConsumeOne(encoded, 5.seconds) && encoded.length > 0) {
-        ResolvedAddr[] result;
-        foreach (entry; encoded.split("|")) {
-            auto sep = entry.lastIndexOf("/");
-            if (sep > 0) {
-                auto ip  = entry[0 .. sep];
-                auto fam = entry[sep + 1 .. $] == "6"
-                    ? AddressFamily.INET6 : AddressFamily.INET;
-                result ~= ResolvedAddr(ip, fam);
-            }
-        }
-        if (result.length > 0) {
-            if (gDnsLock !is null) synchronized (gDnsLock) {
-                dnsCache[cacheKey]     = result;
-                dnsCacheTime[cacheKey] = now;
-            } else {
-                dnsCache[cacheKey]     = result;
-                dnsCacheTime[cacheKey] = now;
-            }
-            return result;
-        }
-    }
-    auto fam = AddressFamily.INET;
-    if (normalizedHost.canFind(":")) {
-        auto colonCount = 0;
-        foreach (c; normalizedHost) if (c == ':') colonCount++;
-        if (colonCount >= 2 || normalizedHost.canFind("::")) fam = AddressFamily.INET6;
-        else {
-            bool isIPv6 = true;
-            foreach (c; normalizedHost) if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') || c == ':')) { isIPv6 = false; break; }
-            if (isIPv6 && colonCount >= 1) fam = AddressFamily.INET6;
-        }
-    }
-    return [ResolvedAddr(normalizedHost, fam)];
-}
-
-private ResolvedAddr[] interleaveAddressFamilies(ResolvedAddr[] addrs) {
-    ResolvedAddr[] v6, v4;
-    foreach (a; addrs) {
-        if (a.family == AddressFamily.INET6) v6 ~= a;
-        else v4 ~= a;
-    }
-    ResolvedAddr[] out_;
-    size_t i6, i4;
-    while (i6 < v6.length || i4 < v4.length) {
-        if (i6 < v6.length) out_ ~= v6[i6++];
-        if (i4 < v4.length) out_ ~= v4[i4++];
-    }
-    return out_;
-}
-
-/// User-visible connect progress sink: `(phase, text)` lands in the
-/// network's `_server` buffer via `PersistentIRCClient.emitLog`. Optional
-/// (null → silent) so the module-level helpers stay usable without a client.
-alias ConnectProgress = void delegate(string phase, string text) nothrow;
+/// User-visible connect progress sink: each holder dial `EVENT` (plus the
+/// engine-composed `attempt`/`attempt_fail`/`info` lines) lands in the
+/// network's `_server` buffer via `PersistentIRCClient.onDialEvent`.
+/// Optional (null → silent) so the module-level helpers stay usable
+/// without a client.
+alias ConnectProgress = DialProgress;
 
 private void report(ConnectProgress progress, string phase, string text) nothrow {
-    if (progress !is null) progress(phase, text);
+    if (progress is null) return;
+    DialEvent ev;
+    ev.phase = phase;
+    ev.text = text;
+    progress(ev);
 }
 
 /// Shortens a vibe/eventcore connect error to something a user can act on.
@@ -1472,143 +1304,98 @@ private string shortConnectError(string msg) @safe {
     return msg.length > 90 ? msg[0 .. 90] ~ "…" : msg;
 }
 
-private TCPConnection happyEyeballsConnectWithProxy(string host, ushort port, MullvadProxy* proxy,
-                                                    string ipv6BindAddr = "",
-                                                    ConnectProgress progress = null) {
+/// Best-effort Tailnet IP of a SOCKS sidecar for admin display ("" when
+/// it cannot be resolved right now).
+private string resolveProxyIp(MullvadProxy* proxy) nothrow {
+    try {
+        auto a = getAddress(proxy.host, proxy.port);
+        if (a.length > 0) return a[0].toAddrString();
+    } catch (Exception) {}
+    return "";
+}
+
+/// "Berlin, Germany" / "Germany" / "" for the UI.
+private string proxyLocationText(const MullvadProxy* proxy) nothrow {
+    return proxy.exitCity.length ? proxy.exitCity ~ ", " ~ proxy.exitCountry : proxy.exitCountry;
+}
+
+/// One dial through exactly one egress, performed by the holder. Direct
+/// dials (`proxy is null`) are DNS + Happy Eyeballs (+ optional per-user
+/// IPv6 bind) inside the holder, which composes their `dns`/`attempt`/
+/// `attempt_fail` timeline lines; proxied dials are a single SOCKS5
+/// CONNECT through the sidecar (the exit resolves the name), and this
+/// wrapper composes their `attempt`/`attempt_fail` lines and keeps the
+/// Mullvad success/failure accounting. Every forwarded event carries the
+/// candidate egress identity so the timeline can name it.
+private TCPConnection happyEyeballsConnectWithProxy(HolderClient holder, DialTag tag, string host, ushort port,
+                                                    string tlsMode, MullvadProxy* proxy,
+                                                    string ipv6BindAddr, ConnectProgress progress,
+                                                    out DialResult dr) {
     if (proxy !is null) logInfo("Mullvad egress %s (%s:%d) for %s:%d", proxy.label, proxy.host, proxy.port, host, port);
     else if (ipv6BindAddr.length > 0) logInfo("IPv6 per-user egress %s for %s:%d", ipv6BindAddr, host, port);
     const egressLabel = proxy !is null ? "Mullvad exit " ~ proxy.label : (ipv6BindAddr.length > 0 ? "ipv6:" ~ ipv6BindAddr : "direct");
+    if (holder is null) throw new HolderUnavailableException("no connection holder configured");
+
+    DialRequest req;
+    req.tag = tag;
+    req.tag.egressLabel = proxy !is null ? proxy.label : "";
+    req.host = host;
+    req.port = port;
+    req.tls = tlsMode;
+    req.sni = stripHostBrackets(host);
     if (proxy !is null) {
-        // One CONNECT with the hostname: the exit resolves it (see
-        // socks5ConnectViaProxy). Racing locally-resolved addresses through
-        // a single proxy only multiplied its fail count — and on prod fed it
-        // the Docker-internal address of irc.ircfiber.com.
-        auto target = stripHostBrackets(host);
-        immutable startMs = Clock.currTime.toUnixTime!long * 1000;
-        report(progress, "attempt", "Trying " ~ target ~ ":" ~ port.to!string ~ " via " ~ egressLabel
-            ~ " (exit resolves the name, up to " ~ HAPPY_EYEBALLS_RACE_TIMEOUT_SECONDS.to!string ~ "s)…");
-        try {
-            auto conn = socks5ConnectViaProxy(proxy, target, port);
-            recordMullvadSuccess(proxy.label);
-            return conn;
-        } catch (Exception e) {
-            recordMullvadFailure(proxy.label);
-            const tookMs = Clock.currTime.toUnixTime!long * 1000 - startMs;
-            report(progress, "attempt_fail", target ~ " via " ~ egressLabel ~ ": "
-                ~ shortConnectError(e.msg) ~ " (" ~ (tookMs / 1000).to!string ~ "s).");
-            throw e;
-        }
+        req.hasProxy = true;
+        req.proxy = DialProxy(proxy.host, proxy.port);
     }
-    auto addrs = resolveAllAddresses(host, port);
-    if (addrs.length == 0) {
-        report(progress, "attempt_fail", "DNS lookup for " ~ host ~ " returned no addresses.");
-        throw new Exception("DNS resolution failed for " ~ host);
+    req.bindIp6 = proxy is null ? ipv6BindAddr : "";
+    req.connectTimeoutMs = CONNECT_TIMEOUT_SECONDS * 1000;
+    req.tlsTimeoutMs = TLS_HANDSHAKE_TIMEOUT_SECONDS * 1000;
+    req.starttlsTimeoutMs = STARTTLS_REPLY_TIMEOUT_MS;
+
+    // Candidate egress identity for the timeline (the holder does not know
+    // which slot it is dialing through).
+    string evLabel, evHost, evIp, evLocation;
+    if (proxy !is null) {
+        evLabel = proxy.label;
+        evHost = proxy.host ~ ":" ~ proxy.port.to!string;
+        evIp = resolveProxyIp(proxy);
+        evLocation = proxyLocationText(proxy);
     }
+    DialProgress wrapped = (ref DialEvent ev) nothrow {
+        ev.egressLabel = evLabel;
+        ev.egressHost = evHost;
+        ev.egressIp = evIp;
+        ev.egressLocationText = evLocation;
+        if (progress !is null) progress(ev);
+    };
 
-    auto interleaved = interleaveAddressFamilies(addrs);
-    {
-        string list;
-        foreach (i, a; interleaved) {
-            if (i >= 4) { list ~= ", …"; break; }
-            if (i) list ~= ", ";
-            list ~= a.ip;
-        }
-        report(progress, "dns", "Resolved " ~ host ~ " → " ~ interleaved.length.to!string
-            ~ (interleaved.length == 1 ? " address" : " addresses") ~ " (" ~ list ~ "), connecting via " ~ egressLabel ~ ".");
+    if (proxy is null) {
+        // Direct: the holder resolves, races and reports; nothing to account.
+        dr = holder.dial(req, wrapped);
+        return dr.stream;
     }
-    logDebug("Happy Eyeballs: racing %d addresses for %s (connect timeout %ds, race timeout %ds)",
-        interleaved.length, host, CONNECT_TIMEOUT_SECONDS, HAPPY_EYEBALLS_RACE_TIMEOUT_SECONDS);
-    immutable raceStartMs = Clock.currTime.toUnixTime!long * 1000;
-
-    import vibe.core.channel : createChannel;
-
-    auto winnerCh = createChannel!int();
-    auto conns = new TCPConnection[interleaved.length];
-    auto tasks = new Task[interleaved.length];
-    bool done = false;
-    size_t failed = 0;
-
-    foreach (idx, addr; interleaved) {
-        // Before launching the next attempt, see if an earlier one already won.
-        if (idx > 0) {
-            int winIdx;
-            if (winnerCh.tryConsumeOne(winIdx, HAPPY_EYEBALLS_DELAY_MS.msecs)) {
-                if (winIdx < 0) {
-                    failed++;
-                } else if (conns[winIdx] && conns[winIdx].connected) {
-                    done = true;
-                    finishHappyEyeballs(conns, tasks, winIdx);
-                    logDebug("Happy Eyeballs: winner %s for %s", interleaved[winIdx].ip, host);
-                    return conns[winIdx];
-                }
-            }
-        }
-
-        auto connIdx = idx;
-        auto addrIp  = addr.ip;
-        auto addrFam = addr.family;
-        // Direct only from here (proxied connects returned above). With
-        // per-user IPv6, bind the source to the user's deterministic /128 —
-        // IPv6→IPv6 only, to avoid EINVAL when racing an IPv4 A record.
-        auto bindForThisAddr = (ipv6BindAddr.length > 0 && addrFam == AddressFamily.INET6) ? ipv6BindAddr : null;
-        report(progress, "attempt", "Trying " ~ addrIp ~ ":" ~ port.to!string ~ " via " ~ egressLabel
-            ~ (bindForThisAddr ? " bind=" ~ bindForThisAddr : "")
-            ~ " (up to " ~ CONNECT_TIMEOUT_SECONDS.to!string ~ "s)…");
-        safeFiberRun("happy_eyeballs_attempt", host, {
-            immutable attemptStartMs = Clock.currTime.toUnixTime!long * 1000;
-            try {
-                // vibe.d connectTCP third param is string localAddr (bind IP)
-                TCPConnection conn = bindForThisAddr.length > 0
-                    ? connectTCP(addrIp, port, bindForThisAddr, 0, CONNECT_TIMEOUT_SECONDS.seconds)
-                    : connectTCP(addrIp, port, null, 0, CONNECT_TIMEOUT_SECONDS.seconds);
-                if (done) {
-                    try { conn.close(); } catch (Exception) {}
-                    return;
-                }
-                conns[connIdx] = conn;
-                try { winnerCh.put(cast(int) connIdx); } catch (Exception) {
-                    try { conn.close(); } catch (Exception) {}
-                }
-            } catch (Exception e) {
-                logDebug("Happy Eyeballs: %s failed: %s", addrIp, e.msg);
-                if (!done) {
-                    const tookMs = Clock.currTime.toUnixTime!long * 1000 - attemptStartMs;
-                    report(progress, "attempt_fail", addrIp ~ " via " ~ egressLabel ~ ": "
-                        ~ shortConnectError(e.msg) ~ " (" ~ (tookMs / 1000).to!string ~ "s).");
-                    // -1 = "one attempt failed": lets the race loop below give
-                    // up as soon as every address has failed instead of
-                    // sleeping out HAPPY_EYEBALLS_RACE_TIMEOUT per address
-                    // (45 s of silence for a 3-address host that refuses
-                    // within 10 s).
-                    try { winnerCh.put(-1); } catch (Exception) {}
-                }
-            }
-        });
-
-
+    // One CONNECT with the hostname: the exit resolves it (see the holder's
+    // SOCKS5 dial). Racing locally-resolved addresses through a single
+    // proxy only multiplied its fail count — and on prod fed it the
+    // Docker-internal address of irc.ircfiber.com.
+    auto target = stripHostBrackets(host);
+    immutable startMs = Clock.currTime.toUnixTime!long * 1000;
+    report(wrapped, "attempt", "Trying " ~ target ~ ":" ~ port.to!string ~ " via " ~ egressLabel
+        ~ " (exit resolves the name, up to " ~ HAPPY_EYEBALLS_RACE_TIMEOUT_SECONDS.to!string ~ "s)…");
+    try {
+        dr = holder.dial(req, wrapped);
+        recordMullvadSuccess(proxy.label);
+        return dr.stream;
+    } catch (HolderUnavailableException e) {
+        // The exit was never tried — leave its counters alone.
+        throw e;
+    } catch (Exception e) {
+        recordMullvadFailure(proxy.label);
+        const tookMs = Clock.currTime.toUnixTime!long * 1000 - startMs;
+        report(wrapped, "attempt_fail", target ~ " via " ~ egressLabel ~ ": "
+            ~ shortConnectError(e.msg) ~ " (" ~ (tookMs / 1000).to!string ~ "s).");
+        throw e;
     }
-
-    // Wait for a winner. Each attempt reports either its index (success) or
-    // -1 (failure); the race ends on the first success, once every attempt
-    // has failed, or when the per-address race timeout expires.
-    while (failed < interleaved.length) {
-        int winIdx;
-        if (!winnerCh.tryConsumeOne(winIdx, HAPPY_EYEBALLS_RACE_TIMEOUT_SECONDS.seconds)) break;
-        if (winIdx < 0) { failed++; continue; }
-        if (conns[winIdx] && conns[winIdx].connected) {
-            done = true;
-            finishHappyEyeballs(conns, tasks, winIdx);
-            logDebug("Happy Eyeballs: winner %s for %s", interleaved[winIdx].ip, host);
-            return conns[winIdx];
-        }
-    }
-
-    done = true;
-    finishHappyEyeballs(conns, tasks, -1);
-    const tookMs = Clock.currTime.toUnixTime!long * 1000 - raceStartMs;
-    report(progress, "attempt_fail", "No address for " ~ host ~ " answered via " ~ egressLabel
-        ~ " (" ~ (tookMs / 1000).to!string ~ "s).");
-    throw new Exception("All connection attempts failed for " ~ host ~ ":" ~ port.to!string);
 }
 
 /// Which egress a `happyEyeballsConnect` call actually used. Returned per
@@ -1647,9 +1434,17 @@ private string egressPinFallbackCopy(string reason) nothrow {
     }
 }
 
-private TCPConnection happyEyeballsConnect(string host, ushort port, string egressNodeId,
+/// Egress policy loop: picks the egresses to try (direct-first for the
+/// first-party ircd, pins, rotation, host bans, direct fallback) and issues
+/// one holder `DIAL` per candidate through `happyEyeballsConnectWithProxy`.
+/// `tlsMode` (`none`/`implicit`/`starttls`) is performed by the holder as
+/// part of the dial, so a TLS failure on one exit moves on to the next; a
+/// `TLS handshake timed out` bans the exit for this host. `dr` carries the
+/// holder's `CONNECTED` facts for the winning dial.
+private TCPConnection happyEyeballsConnect(HolderClient holder, DialTag tag, string host, ushort port,
+                                           string tlsMode, string egressNodeId,
                                            string ipv6BindAddr, ConnectProgress progress,
-                                           out EgressUsed used) {
+                                           out EgressUsed used, out DialResult dr) {
     import std.string : toLower;
     auto hostLower = host.toLower();
     // Fast-path for the first-party InspIRCd instance (irc.ircfiber.com):
@@ -1663,9 +1458,11 @@ private TCPConnection happyEyeballsConnect(string host, ushort port, string egre
     // Z-line): the ban policy already failed the network over to an exit.
     if (hostLower == "irc.ircfiber.com" && egressNodeId.length == 0 && !isDirectBannedForHost(hostLower)) {
         try {
-            auto directConn = happyEyeballsConnectWithProxy(host, port, null, ipv6BindAddr, progress);
+            auto directConn = happyEyeballsConnectWithProxy(holder, tag, host, port, tlsMode, null, ipv6BindAddr, progress, dr);
             used = EgressUsed.init;
             return directConn;
+        } catch (HolderUnavailableException e) {
+            throw e;
         } catch (Exception e) {
             logWarn("happyEyeballsConnect direct to %s failed (%s), trying Mullvad pool", host, e.msg);
         }
@@ -1757,33 +1554,25 @@ private TCPConnection happyEyeballsConnect(string host, ushort port, string egre
     Exception lastErr;
     foreach (proxy; toTry) {
         try {
-            auto conn = happyEyeballsConnectWithProxy(host, port, proxy, ipv6BindAddr, progress);
+            auto conn = happyEyeballsConnectWithProxy(holder, tag, host, port, tlsMode, proxy, ipv6BindAddr, progress, dr);
             used = EgressUsed.init;
             if (proxy !is null) {
                 used.label = proxy.label;
                 used.host = proxy.host ~ ":" ~ proxy.port.to!string;
                 // Best-effort resolve Tailnet IP for admin display.
-                try {
-                    auto addrs = resolveAllAddresses(proxy.host, proxy.port);
-                    if (addrs.length > 0) used.ip = addrs[0].ip;
-                } catch (Exception) {}
-                if (used.ip.length == 0) {
-                    try {
-                        auto a = getAddress(proxy.host, proxy.port);
-                        if (a.length > 0) used.ip = a[0].toAddrString();
-                    } catch (Exception) {}
-                }
+                used.ip = resolveProxyIp(proxy);
                 used.locationId = slotBanKey(proxy);
-                used.locationText = proxy.exitCity.length
-                    ? proxy.exitCity ~ ", " ~ proxy.exitCountry
-                    : proxy.exitCountry;
-                recordMullvadSuccess(proxy.label);
+                used.locationText = proxyLocationText(proxy);
                 // Take the slot's refcount: it can no longer be retargeted
                 // while this connection lives. Released by the client's
                 // releaseEgressSlot() on every disconnect / reconnect.
                 holdSlot(proxy.label);
             }
             return conn;
+        } catch (HolderUnavailableException e) {
+            // The exit was never tried: no ban, no counters — just retry
+            // later from the connection loop.
+            throw e;
         } catch (Exception e) {
             lastErr = e;
             logWarn("happyEyeballsConnect via %s failed for %s:%d: %s, trying next egress", proxy ? proxy.label : "direct", host, port, e.msg);
@@ -1798,127 +1587,6 @@ private TCPConnection happyEyeballsConnect(string host, ushort port, string egre
     used = EgressUsed.init;
     throw lastErr ? lastErr : new Exception("All connection attempts failed for " ~ host ~ ":" ~ port.to!string);
 }
-/**
- * Clean up Happy Eyeballs loser tasks and connections.
- *
- * Interrupts any still-running connection tasks and closes any sockets that
- * lost the race. This prevents resource leaks and ensures a silent/black-holed
- * peer does not leave fibers stuck indefinitely.
- */
-private void finishHappyEyeballs(TCPConnection[] conns, Task[] tasks, int winnerIdx) {
-    foreach (i, c; conns) {
-        if (cast(int)i != winnerIdx && c && c.connected) {
-            try { c.close(); } catch (Exception) {}
-        }
-    }
-    foreach (i, t; tasks) {
-        if (cast(int)i != winnerIdx && t != Task.init) {
-            try { t.interrupt(); } catch (Exception) {}
-        }
-    }
-}
-/**
- * Create a TLS stream with a bounded handshake timeout — enterprise grade.
- *
- * vibe.d's createTLSStream performs the SSL handshake inside the constructor
- * and has no timeout parameter. If the server accepts TCP but never completes
- * the TLS handshake, the fiber blocks forever. The previous implementation
- * used task.interrupt() + holder.conn.close() but OpenSSL's SSL_connect
- * blocks on a raw read() that does NOT yield to vibe's scheduler, so the
- * interrupt never fires and the fiber wedges (observed 2026-08-18 20:55:17:
- * tcp_open succeeded via socks-mullvad-se/172.22.0.3 but no tls_handshake
- * log for 5h). Heartbeat kept ticking while the connection loop was stuck
- * forever in createTLSStreamWithTimeout.
- *
- * Enterprise fix (2026-08-18):
- *  - Capture the underlying fd and call POSIX shutdown(SHUT_RDWR) on timeout
- *    to force SSL_connect's blocked read() to return. close() alone is not
- *    sufficient when the BIO holds a dup of the fd.
- *  - Use shared atomic flag + eventDriver timer to guarantee the timeout
- *    fires even if the channel's internal mutex is wedged (SyncError).
- *  - Catch Throwable (not just Exception) so SyncError propagates as a
- *    clean timeout exception instead of killing the TaskFiber.
- *  - Structured logging + observability counters for timeout vs fail.
- *  - Auto-ban the egress for this host on TLS timeout so the retry loop
- *    falls through to the next healthy egress (se → us → direct).
- */
-private TLSStream createTLSStreamWithTimeout(TCPConnection connection, TLSContext ctx, string host, Duration timeout) {
-    import vibe.core.channel : createChannel;
-    import core.atomic : atomicLoad, atomicStore;
-    import core.sys.posix.sys.socket : shutdown, SHUT_RDWR;
-    shared bool handshakeDone = false;
-    auto doneCh = createChannel!bool();
-    TLSStream resultStream;
-    Throwable resultThrowable;
-
-    // TCPConnection has scoped destruction and cannot be captured directly in
-    // a closure. Store it on the heap so the handshake task can safely use it
-    // while this function waits on the completion channel.
-    static final class ConnHolder {
-        TCPConnection conn;
-        this(TCPConnection c) { this.conn = c; }
-    }
-    auto holder = new ConnHolder(connection);
-    // Capture fd early — after close() the fd becomes -1.
-    int rawFd = -1;
-    try { rawFd = cast(int) connection.fd; } catch (Exception) {}
-
-    auto task = safeFiberRun("tls_handshake", host, {
-        try {
-            resultStream = createTLSStream(holder.conn, ctx, host);
-            atomicStore(handshakeDone, true);
-            try { doneCh.put(true); } catch (Throwable) {}
-        } catch (Throwable e) {
-            resultThrowable = e;
-            atomicStore(handshakeDone, true);
-            try { doneCh.put(false); } catch (Throwable) {}
-        }
-    });
-
-    bool ok;
-    bool consumed = false;
-    try {
-        consumed = doneCh.tryConsumeOne(ok, timeout);
-    } catch (Throwable e) {
-        // Channel SyncError (observed 2026-08-17 cnTb-fin) — treat as timeout.
-        logWarn("TLS handshake channel SyncError for %s: %s — forcing timeout path", host, e.msg);
-        consumed = false;
-    }
-    if (!consumed) {
-        // Timeout: force-unblock the handshake task.
-        logWarn("TLS handshake timed out for %s after %s (fd=%d) — shutting down socket to unblock OpenSSL", host, timeout.to!string, rawFd);
-        recordCounter("ircfiber.tls_handshake.timeout", 1, ["host": host]);
-        // 1) shutdown() forces SSL_connect's blocked read to return (close alone may not).
-        if (rawFd >= 0) {
-            try { shutdown(rawFd, SHUT_RDWR); } catch (Throwable) {}
-        }
-        // 2) vibe-level close to release the TCPConnection object.
-        try { holder.conn.close(); } catch (Throwable) {}
-        // 3) interrupt the fiber (best-effort — may already be blocked in C).
-        try { task.interrupt(); } catch (Throwable) {}
-        // Give the handshake task a brief grace to observe the shutdown and exit.
-        try { sleep(200.msecs); } catch (Throwable) {}
-        // If it still hasn't completed, the task will be reaped on next GC; we throw now
-        // so the connection loop retries via the next egress instead of wedging forever.
-        if (!atomicLoad(handshakeDone)) {
-            logWarn("TLS handshake task for %s still not done after shutdown — abandoning (fiber will be GC'd)", host);
-        }
-        throw new Exception("TLS handshake timed out after " ~ timeout.to!string ~ " for " ~ host);
-    }
-
-    if (!ok) {
-        if (resultThrowable !is null) {
-            // Preserve original error chain for operator triage.
-            if (auto e = cast(Exception) resultThrowable) throw e;
-            throw new Exception("TLS handshake failed for " ~ host ~ ": " ~ resultThrowable.msg);
-        }
-        throw new Exception("TLS handshake failed for " ~ host);
-    }
-
-    recordCounter("ircfiber.tls_handshake.success", 1, ["host": host]);
-    return resultStream;
-}
-
 // ── Nick prefix helpers ───────────────────────────────────────────────────────
 //
 // Every char a server can put in front of a nick in NAMES, highest rank
@@ -2141,46 +1809,12 @@ unittest {
     assert(buildMonitorLine("X", "alice") is null);
 }
 
-// ── STARTTLS reply classifier ─────────────────────────────────────────────────
-// Plain-text connect with TLSMode.starttls: the client sends STARTTLS and
-// waits for 670 RPL_STARTTLS (begin the handshake) or 691 ERR_STARTTLS
-// (abort, fail closed). Anything else keeps waiting.
-
-/// Classify one server line during the STARTTLS handshake. Pure.
-enum StarttlsResult { waiting, success, failed }
-
-StarttlsResult classifyStarttlsReply(string command) @safe pure nothrow @nogc {
-    if (command == "670") return StarttlsResult.success;
-    if (command == "691") return StarttlsResult.failed;
-    return StarttlsResult.waiting;
-}
-
-@("classifyStarttlsReply maps 670/691")
-unittest {
-    assert(classifyStarttlsReply("670") == StarttlsResult.success);
-    assert(classifyStarttlsReply("691") == StarttlsResult.failed);
-    assert(classifyStarttlsReply("NOTICE") == StarttlsResult.waiting);
-    assert(classifyStarttlsReply("001") == StarttlsResult.waiting);
-}
-
 // ── Lag probe + TLS detail helpers ───────────────────────────────────────────
 
 /// Current wall-clock time in unix milliseconds.
 private long unixMsNow() @safe {
     import std.datetime.systime : unixTimeToStdTime;
     return (Clock.currStdTime - unixTimeToStdTime(0)) / 10_000;
-}
-
-/// Compile-time index of the field named `name` in `T.tupleof`, or -1.
-/// Used to reach vibe-stream's private `OpenSSLStream.m_tls` with the
-/// index verified by name rather than hard-coded.
-private template fieldIndexOf(T, string name) {
-    enum fieldIndexOf = () {
-        ptrdiff_t idx = -1;
-        static foreach (i, _; typeof(T.tupleof))
-            static if (__traits(identifier, T.tupleof[i]) == name) idx = i;
-        return idx;
-    }();
 }
 
 /// Wire token for the keepalive lag probe: `PING :LAG<sentUnixMs>`.
@@ -2199,22 +1833,6 @@ long parseLagPongParam(string param) @safe pure nothrow {
     foreach (c; param[3 .. $]) if (c < '0' || c > '9') return -1;
     try return param[3 .. $].to!long;
     catch (Exception) return -1;
-}
-
-/// Parses an ASN.1 GeneralizedTime (`YYYYMMDDHHMMSS[.fff]Z`, as
-/// produced by `ASN1_TIME_to_generalizedtime`) into unix ms. Returns 0
-/// when the string is malformed.
-long parseAsn1GeneralizedTimeMs(string s) @safe nothrow {
-    import std.datetime.date : DateTime;
-    import std.datetime.systime : SysTime;
-    import std.datetime.timezone : UTC;
-    if (s.length < 15 || s[$ - 1] != 'Z') return 0;
-    foreach (c; s[0 .. 14]) if (c < '0' || c > '9') return 0;
-    try {
-        auto dt = DateTime(s[0 .. 4].to!int, s[4 .. 6].to!int, s[6 .. 8].to!int,
-            s[8 .. 10].to!int, s[10 .. 12].to!int, s[12 .. 14].to!int);
-        return SysTime(dt, UTC()).toUnixTime!long * 1000;
-    } catch (Exception) return 0;
 }
 
 /// Formats a unix-ms timestamp as `YYYY-MM-DD` (UTC).
@@ -2243,18 +1861,6 @@ unittest {
     assert(parseLagPongParam("LAG") == -1);
     assert(parseLagPongParam("LAGabc") == -1);
     assert(parseLagPongParam("") == -1);
-}
-
-@("parseAsn1GeneralizedTimeMs parses OpenSSL generalized time")
-unittest {
-    // 2024-01-01T00:00:00Z
-    assert(parseAsn1GeneralizedTimeMs("20240101000000Z") == 1_704_067_200_000);
-    // Fractional seconds are ignored.
-    assert(parseAsn1GeneralizedTimeMs("20240101000000.500Z") == 1_704_067_200_000);
-    assert(parseAsn1GeneralizedTimeMs("240101000000Z") == 0);
-    assert(parseAsn1GeneralizedTimeMs("20240101000000") == 0);
-    assert(parseAsn1GeneralizedTimeMs("2024010100000xZ") == 0);
-    assert(parseAsn1GeneralizedTimeMs("") == 0);
 }
 
 @("formatTlsDoneText renders details or falls back")
@@ -2587,13 +2193,14 @@ class SaslParkedException : Exception {
 final class PersistentIRCClient {
     private {
         NetworkConfig      config;
+        /// Relay stream to the holder (AF_UNIX or TCP). Plain IRC bytes;
+        /// the holder owns the upstream TCP/SOCKS5/TLS socket.
         TCPConnection      connection;
-        TLSStream          tlsStream;
-        /// For handoff-adopted connections, we bypass vibe.d's
-        /// TCPConnection entirely and use raw POSIX I/O on the
-        /// transferred socket fd. When non-null, `processEvents`
-        /// uses this instead of `connection`.
-        AdoptedSocket      adoptedSocket;
+        /// Client of this engine's holder; null only in unit tests.
+        HolderClient       holder;
+        /// Holder id (`c-<n>`) of the live upstream connection; "" when
+        /// there is none.
+        string             holderConnId;
 
         /// unix-ms when the current registration handshake began (≈ TCP
         /// connect). The JOIN-throttle window is measured from there, and
@@ -2816,7 +2423,7 @@ final class PersistentIRCClient {
         string              serverSoftware;
 
         // /LIST accumulation (transient, per TCP connection; NOT part of
-        // the handoff snapshot). Rows from 322 are buffered here and
+        // the session snapshot). Rows from 322 are buffered here and
         // flushed as synthetic CHANNEL_LIST chunks of CHANNEL_LIST_CHUNK
         // rows; 323 / 416 / 263-while-listing finish the request.
         ChannelListRow[]    channelListPending;
@@ -2893,20 +2500,27 @@ final class PersistentIRCClient {
         /// in the reconnect loop. Reset on any other failure and on 001.
         int                 consecutiveTlsClosed;
 
-        // ── Handoff support ───────────────────────────────────────────────────
+        // ── Hot-swap support ──────────────────────────────────────────────────
         /// When non-zero, the connection's event loop will not perform any
         /// network I/O and will yield until this drops back to zero. Set by
-        /// `pauseForHandoff()`; cleared by `resumeAfterHandoff()`. The pause
+        /// `pauseForDetach()`; cleared by `resumeAfterDetach()`. The pause
         /// is observed at the `yield()` checkpoints inside
         /// `processEvents()` so a single in-flight line is always allowed to
         /// finish before the loop stops.
-        shared(int)         handoffPauseCount;
-        /// When set to a non-zero timestamp (unix ms), the next time the
-        /// event loop wakes up it will QUIT gracefully and close the
-        /// connection. Used after a successful handoff to the new engine
-        /// so the *old* engine doesn't keep the FD alive on the IRC server.
-        /// The new engine has already adopted the same socket.
-        shared(long)        postHandoffQuitAtMs;
+        shared(int)         detachPauseCount;
+        /// Set by `detachForHotSwap()`: the relay stream was closed on
+        /// purpose, the session lives on in the holder and this process is
+        /// exiting. Every disconnect/reconnect path returns silently.
+        bool                detachedForHotSwap;
+        /// TLS mode of the dial in flight (`none`/`implicit`/`starttls`),
+        /// for the timeline adapter's wording.
+        string              dialTlsMode;
+        /// The dial in flight is the TLS→plain fallback re-dial.
+        bool                dialPlainFallback;
+        /// A META write already failed on this connection (log once).
+        bool                metaWarned;
+        /// Own NICK/JOIN/PART/KICK/AWAY/005 applied since the last META write.
+        bool                metaDirty;
         // Tracks sessionNick before an optimistic NICK update in sendRaw.
         // The NICK handler checks this to correlate the server's echo back
         // to us post-optimistic-update, since event.nick (old nick) won't
@@ -2943,7 +2557,8 @@ final class PersistentIRCClient {
     }
 
     /// Creates a new persistent IRC client.
-    this(NetworkConfig cfg, Channel!IRCRawEvent ch, RedisStorage redisStore = null, string sid = "", UUID owner = UUID.init) {
+    this(NetworkConfig cfg, Channel!IRCRawEvent ch, RedisStorage redisStore = null, string sid = "", UUID owner = UUID.init, HolderClient holderClient = null) {
+        this.holder       = holderClient;
         this.config       = cfg;
         this.eventChannel = ch;
         this.redis        = redisStore;
@@ -2965,8 +2580,10 @@ final class PersistentIRCClient {
         this.randomNickPersisted = false;
     }
 
-    /// Starts the connection loop in a background task.
+    /// Starts the connection loop in a background task. No-op for a
+    /// session that is already running (attached from the holder).
     void start() {
+        if (state == ConnectionState.connected) return;
         // Set state immediately so any snapshot taken before the fiber runs
         // reflects the actual intent. Without this, a freshly created client
         // stays in 'disconnected' until the event loop schedules the fiber,
@@ -2974,8 +2591,12 @@ final class PersistentIRCClient {
         // (e.g. after an engine restart where state snapshots are written before
         // the connection-loop fiber gets to run).
         state = ConnectionState.connecting;
+        spawnConnectionLoop("connection_loop");
+    }
 
-        safeFiberRun("connection_loop", config.name, {
+    /// Runs `runConnectionLoop()` on a fiber with one crash restart.
+    private void spawnConnectionLoop(string label) {
+        safeFiberRun(label, config.name, {
             try {
                 runConnectionLoop();
             } catch (Throwable e) {
@@ -3007,12 +2628,12 @@ final class PersistentIRCClient {
     /// Stops the connection and requests shutdown. If `quitReason` is
     /// supplied (or default empty), a QUIT is sent first so the server
     /// emits a final ERROR and closes the link cleanly; otherwise the
-    /// socket is closed immediately.
+    /// socket is closed immediately. Either way the holder's upstream
+    /// socket is closed too (see `transportClose`).
     void stop(string quitReason = "") {
         isShutdownRequested = true;
 
-        if (state == ConnectionState.connected
-            && (tlsStream !is null || (connection && connection.connected))) {
+        if (state == ConnectionState.connected && connection.connected) {
             try {
                  writeRaw("QUIT :" ~ quitReason);
             } catch (Exception e) {
@@ -3037,119 +2658,47 @@ final class PersistentIRCClient {
         transportClose();
     }
 
-    // ── Handoff API (called by ConnectionManager before/after engine reload) ──
+    // ── Detach API (called by ConnectionManager before a hot-swap detach) ──
 
-    /// Pause the event loop so the connection can be safely serialised
-    /// and its FD handed off to a new engine process. Idempotent.
+    /// Pause the event loop so the session state can be snapshotted
+    /// exactly before the relay stream is closed. Idempotent (counted).
     /// The pause is observed at the next `yield()` inside
     /// `processEvents()`; the loop finishes its current line first, then
-    /// yields until `resumeAfterHandoff()` is called.
-    void pauseForHandoff() {
-        import core.atomic : atomicOp, atomicLoad;
-        atomicOp!"+="(handoffPauseCount, 1);
-        logJsonMap("info", "handoff",
-            "Handoff pause requested",
+    /// spins until `resumeAfterDetach()` brings the count back to zero.
+    void pauseForDetach() {
+        import core.atomic : atomicOp;
+        atomicOp!"+="(detachPauseCount, 1);
+        logJsonMap("info", "connection",
+            "Detach pause requested",
             ["network": config.name,
-             "event": "handoff_prepare"]);
+             "event": "detach_prepare"]);
     }
 
-    /// Mark this connection as handed off. The next time the event
-    /// loop observes the pause release, it will send a graceful QUIT
-    /// (if the transport is still writable) and close without
-    /// reconnecting. This prevents the OLD engine from racing the
-    /// NEW engine for the same nick on the IRC server, especially
-    /// for TLS connections where the FD can't be transferred via
-    /// SCM_RIGHTS and the new engine must soft-reconnect.
-    void schedulePostHandoffQuit(long timestampMs) {
-        import core.atomic : atomicStore;
-        atomicStore(postHandoffQuitAtMs, timestampMs);
-    }
-
-    /// Synchronously send QUIT on the live transport NOW, instead of
-    /// waiting for the event loop's pause release. Used by the OLD
-    /// engine's `notifyHandoffComplete` for TLS records — without
-    /// this, the OLD engine's QUIT is delayed until the connection
-    /// loop wakes from `pauseForHandoff()`, by which time the NEW
-    /// engine has already started its TLS soft-reconnect and hit
-    /// 433 on the still-registered nick (falling back to `Zodiac_`,
-    /// `Zodiac__`, etc.). Writing QUIT synchronously here puts it on
-    /// the wire before the NEW engine even sees the handoff's DONE
-    /// marker, so the IRC server frees the nick first.
-    ///
-    /// The flag-based path (`schedulePostHandoffQuit`) is kept as a
-    /// belt-and-suspenders backup in case the synchronous write fails
-    /// or the loop never resumes (e.g. fiber scheduler deadlock).
-    void forcePostHandoffQuit(long timestampMs) {
-        import core.atomic : atomicStore;
-        atomicStore(postHandoffQuitAtMs, timestampMs);
-        try {
-            if (transportAlive && state == ConnectionState.connected) {
-                try {
-                    writeRaw("QUIT :engine-handoff");
-                    logJsonMap("info", "handoff",
-                        "Forced synchronous QUIT for " ~ config.name,
-                        ["network": config.name,
-                         "sessionNick": sessionNick,
-                         "event": "post_handoff_quit_forced"]);
-                } catch (Exception e) {
-                    logInfo("Forced post-handoff QUIT for %s: %s", config.name, e.msg);
-                }
-            }
-        } catch (Exception e) {
-            logWarn("Forced post-handoff cleanup failed for %s: %s", config.name, e.msg);
-        }
-    }
-
-    /// Inverse of `pauseForHandoff()`. When the count returns to zero
-    /// the event loop resumes I/O. Idempotent.
-    void resumeAfterHandoff() {
-        import core.atomic : atomicOp, atomicLoad;
-        const prev = atomicOp!"-="(handoffPauseCount, 1);
+    /// Inverse of `pauseForDetach()`. When the count returns to zero the
+    /// event loop resumes I/O. Idempotent.
+    void resumeAfterDetach() {
+        import core.atomic : atomicOp;
+        const prev = atomicOp!"-="(detachPauseCount, 1);
         if (prev < 1) {
             // Defensive: restore so we don't underflow.
-            atomicOp!"+="(handoffPauseCount, 1);
+            atomicOp!"+="(detachPauseCount, 1);
             return;
         }
         if (prev - 1 == 0) {
-            logJsonMap("info", "handoff",
-                "Handoff pause released",
+            logJsonMap("info", "connection",
+                "Detach pause released",
                 ["network": config.name,
-                 "event": "handoff_complete"]);
+                 "event": "detach_released"]);
         }
     }
 
-    /// Wait until the event loop has acknowledged the pause by
-    /// observing the counter at a yield checkpoint. Bounded by a
-    /// 2-second deadline so a stalled loop doesn't deadlock the
-    /// handoff protocol.
-    void waitForHandoffPause() {
-        import core.atomic : atomicLoad;
-        import core.time : msecs;
-        const deadline = Clock.currTime.toUnixTime!long * 1000 + 2_000;
-        while (Clock.currTime.toUnixTime!long * 1000 < deadline) {
-            // The loop drops into `yield()` only between reads. We
-            // poll the count after a short sleep. If the loop is busy
-            // parsing a long line the wait will hit the deadline and
-            // we'll fall back to a forced pause (the loop checks
-            // `handoffPauseCount` on every yield anyway).
-            sleep(20.msecs);
-            // Heuristic: if the loop is reading, it'll see the count
-            // and yield. We can't observe "in-yield" from here, so
-            // just sleep until the deadline — by then, any in-flight
-            // line will have completed (lines are bounded by 4096
-            // bytes and parsed in microseconds).
-            break;
-        }
-    }
-
-    /// Returns the underlying TCP socket fd if the connection is
-    /// plain (non-TLS). Returns -1 for TLS connections — those
-    /// cannot be transferred via SCM_RIGHTS and must be soft-
-    /// reconnected by the new engine.
-    int rawSocketFd() {
-        if (state != ConnectionState.connected) return -1;
-        if (tlsStream !is null) return -1;
-        return transportFd();
+    /// Wait until the event loop has acknowledged the pause by observing
+    /// the counter at a yield checkpoint. The loop only drops into
+    /// `yield()` between reads, and a line is parsed in microseconds, so a
+    /// short sleep is enough for any in-flight line to complete; a stalled
+    /// loop cannot deadlock the detach (bounded).
+    void waitForDetachPause() {
+        sleep(20.msecs);
     }
 
     /// Persist the last-negotiated nick to Redis so subsequent
@@ -3220,21 +2769,16 @@ final class PersistentIRCClient {
         }
     }
 
-    /// Build a snapshot of every piece of per-connection in-memory
-    /// state the new engine needs to seamlessly continue this
-    /// connection. The returned struct is plain-old-data; no
-    /// references back into this engine.
-    HandoffState snapshotForHandoff() {
-        import ircfiber.engine.handoff : ServerFeaturesSnapshot;
-        HandoffState s;
-        s.schemaTag = "IRCFv1";
+    /// Build the per-connection in-memory state the next engine needs to
+    /// seamlessly continue this session on the held socket. Plain-old-data;
+    /// no references back into this engine. With `graceful` (planned hot
+    /// swap) the lines the flood pacer is still holding ride along in
+    /// `outboundQueue`, so nothing typed during the swap window is lost.
+    SessionSnapshot snapshotSession(bool graceful = false) {
+        SessionSnapshot s;
+        s.schemaTag = SESSION_SNAPSHOT_SCHEMA;
         s.config = config;
-        s.userId = config.id.toString(); // userId is a UUID stored alongside in mongo; client only knows networkId
-        // userId is actually owned by ConnectionManager; we re-resolve
-        // it from there in the new engine via Redis. Leaving "" is
-        // safe: the snapshot is for *this* network only, and the new
-        // engine gets userId from `connManager` when re-instantiating.
-        s.userId = "";
+        s.userId = ownerId == UUID.init ? "" : ownerId.toString();
         s.serverId = serverId;
         s.sessionNick = sessionNick;
         s.isAway = isAway;
@@ -3243,6 +2787,7 @@ final class PersistentIRCClient {
         s.queryBuffers = queryBuffers.dup;
         s.failureReasons = failureReasons.dup;
         s.outboundQueue = outboundQueue.dup;
+        if (graceful && pacedQueue.length > 0) s.outboundQueue ~= pacedQueue.dup;
         s.channelState = channelState.dup;
         s.channelTopics = channelTopics.dup;
         // Duplicate the associative array of user lists.
@@ -3254,68 +2799,77 @@ final class PersistentIRCClient {
         s.channelLatestMsgid = channelLatestMsgid.dup;
         s.channelEarliestMsgid = channelEarliestMsgid.dup;
         s.chathistoryInFlight = chathistoryInFlight.dup;
-        s.transportWasPlain = (tlsStream is null);
+        s.transportWasPlain = !tlsInfoValid;
         s.wasConnected = (state == ConnectionState.connected);
-        s.capturedAtMs = Clock.currTime.toUnixTime!long * 1000;
+        s.capturedAtMs = unixMsNow();
+        s.graceful = graceful;
+        s.metaAtMs = s.capturedAtMs;
         s.serverFeatures = ServerFeaturesSnapshot(
             serverFeatures.network, serverFeatures.prefix,
             serverFeatures.chanModes, serverFeatures.maxChannels,
             serverFeatures.maxNickLen, serverFeatures.topicLen);
-        // Hand off the FULL ISUPPORT map so the new engine can render
-        // the categorised "Server features" panel without waiting for
-        // the IRC server to re-send 005 — which it won't, since the
-        // session is already registered. Without this, the panel would
-        // render empty for an arbitrary interval until another 005
-        // arrives (it usually never does on subsequent reconnects).
+        // The FULL ISUPPORT map and the 004 software token: the server sends
+        // them once per registration, so an attaching engine cannot re-learn
+        // them — without them the "Server features" panel renders empty and
+        // the ircd-specific probes stay off.
         s.isupportMap = isupportMap.dup;
-        // Same reasoning for the 004 software token: it never comes again
-        // on an adopted session, and it gates the ircd-specific probes.
         s.serverSoftware = serverSoftware;
+        // Egress bookkeeping the next engine must re-take (slot hold, ban
+        // attribution, admin display).
+        s.egressLabel = activeEgressLabel;
+        s.egressHost = activeEgressHost;
+        s.egressIp = activeEgressIp;
+        s.egressLocationId = activeEgressLocationId;
+        s.egressLocationText = activeEgressLocation;
+        s.peerIp = activePeerIp;
+        s.localIp = activeLocalIp;
         return s;
     }
 
-    /// Adopt a connection from a handoff. Wraps the raw socket fd in
-    /// an `AdoptedSocket` for raw POSIX I/O and also registers it
-    /// with vibe.d's event driver via `adoptStream` so the event
-    /// loop's `waitForData` works.
-    void adoptAndStart(int fd, ref HandoffState s) {
-        import vibe.core.core : runTask;
-        import eventcore.core : eventDriver;
-        import eventcore.driver : StreamSocketFD;
-        import vibe.core.net : createStreamConnection;
-        // Register the fd with vibe.d's event driver. This makes
-        // `waitForData` (via the event loop's yield) wake up when
-        // data arrives. We still use AdoptedSocket for actual
-        // reads/writes because TCPConnection.connected can be
-        // unreliable for externally-adopted fds.
-        auto streamFd = eventDriver.sockets.adoptStream(fd);
-        if (streamFd == StreamSocketFD.invalid) {
-            logWarn("adoptAndStart: eventcore refused to adopt fd=%d, falling back to raw fd", fd);
-        } else {
+    /// Writes the session snapshot as the holder's META for the live
+    /// connection, so a hot swap or a crash can re-attach it with the
+    /// registered state. No-op without a live holder connection or before
+    /// registration completes. Holder trouble is logged once per connection
+    /// and never disturbs the session.
+    void publishMeta(bool graceful) nothrow {
+        if (holder is null || holderConnId.length == 0 || state != ConnectionState.connected) return;
+        try {
+            auto s = snapshotSession(graceful);
             try {
-                connection = createStreamConnection(streamFd);
-                logInfo("adoptAndStart: fd=%d registered with event driver", fd);
-            } catch (Exception e) {
-                logWarn("adoptAndStart: createStreamConnection failed for fd=%d: %s", fd, e.msg);
+                holder.setMeta(holderConnId, toJSON(s));
+            } catch (HolderErrorException e) {
+                if (e.code != "too_large") throw e;
+                // Member lists are the only unbounded part; drop them and
+                // let the attaching engine re-sync with NAMES.
+                s.channelUsers = null;
+                s.usersDropped = true;
+                holder.setMeta(holderConnId, toJSON(s));
             }
+            metaWarned = false;
+        } catch (Exception e) {
+            if (metaWarned) return;
+            metaWarned = true;
+            string m; try { m = e.msg; } catch (Exception) { m = "unknown"; }
+            try logJsonMap("warn", "connection", "Holder META write failed — session state may be stale for a swap",
+                ["network": config.name, "holderId": holderConnId, "err": m, "event": "meta_write_fail"]);
+            catch (Exception) {}
         }
-        adoptedSocket = new AdoptedSocket(fd);
-        if (!adoptedSocket.connected) {
-            logError("adoptAndStart: adopted socket fd=%d is not connected", fd);
-            state = ConnectionState.disconnected;
-            logJsonMap("error", "handoff",
-                "Adopted socket not connected",
-                ["network": s.config.name,
-                 "fd": fd.to!string,
-                 "reason": "socket_not_connected",
-                 "event": "handoff_fail"]);
-            return;
-        }
-        // Replay the snapshot. Order matters: config first (so the
-        // rehydration of channels into per-channel maps uses the
-        // right config), then state maps.
-        config = s.config;
-        sessionNick = s.sessionNick;
+    }
+
+    /// Attach to a live connection the holder kept across an engine restart
+    /// (planned hot swap or crash). Restores the snapshot the previous
+    /// engine published, re-takes the egress slot hold, and resumes the
+    /// event loop without any registration — the socket is already
+    /// registered upstream. `graceful == false` (or `usersDropped`) means
+    /// the member lists may have drifted: re-sync every channel with NAMES.
+    void attachHeld(AttachResult r, SessionSnapshot s, bool graceful) {
+        connection = r.stream;
+        holderConnId = r.entry.id;
+        detachedForHotSwap = false;
+        isShutdownRequested = false;
+        // Replay the snapshot. `config` stays the one loaded from Mongo (the
+        // snapshot only carries identity); everything else is session state.
+        if (s.sessionNick.length) sessionNick = s.sessionNick;
         isAway = s.isAway;
         awayMessage = s.awayMessage;
         foreach (cap; s.ackedCaps) ackedCaps[cap] = true;
@@ -3326,6 +2880,8 @@ final class PersistentIRCClient {
         channelTopics = s.channelTopics.dup;
         foreach (k, v; s.channelUsers) channelUsers[k] = v.dup;
         realnames = s.realnames.dup;
+        accounts = s.accounts.dup;
+        idents = s.idents.dup;
         pendingLabels = s.pendingLabels.dup;
         channelLatestMsgid = s.channelLatestMsgid.dup;
         channelEarliestMsgid = s.channelEarliestMsgid.dup;
@@ -3336,220 +2892,112 @@ final class PersistentIRCClient {
         serverFeatures.maxChannels = s.serverFeatures.maxChannels;
         serverFeatures.maxNickLen = s.serverFeatures.maxNickLen;
         serverFeatures.topicLen = s.serverFeatures.topicLen;
-        // Inherit the full ISUPPORT map so the categorised "Server
-        // features" panel renders correctly on the new engine without
-        // waiting for a fresh 005 reply stream (which won't come —
-        // the IRC server's registration already completed upstream).
         isupportMap = s.isupportMap.dup;
         serverSoftware = s.serverSoftware;
-        // Resume the loop without going through the full registration
-        // dance: the socket is already authenticated upstream.
-        // Adopted sockets have no RPL_WELCOME on this engine; the
-        // adoption instant is the best-known connect time.
-        connectedAtMs = unixMsNow();
+        // Socket / TLS facts come from the holder (it owns the socket).
+        activePeerIp = r.entry.peerIp;
+        activeLocalIp = r.entry.localIp;
+        tlsInfoValid = r.entry.tlsOk;
+        tlsInfo = r.entry.tls;
+        // Real signon time: the session never dropped.
+        connectedAtMs = r.entry.connectedAtMs > 0 ? r.entry.connectedAtMs : unixMsNow();
+        // Egress bookkeeping: the session still rides its Mullvad slot, so
+        // re-take the hold — `retargetSlotByLabel` must refuse to move it
+        // and `bounceNetworksOnEgress(label)` must find it, exactly as
+        // before the swap.
+        activeEgressLabel = s.egressLabel.length ? s.egressLabel : r.entry.tag.egressLabel;
+        activeEgressHost = s.egressHost;
+        activeEgressIp = s.egressIp;
+        activeEgressLocationId = s.egressLocationId;
+        activeEgressLocation = s.egressLocationText;
+        egressSlotLabel = activeEgressLabel;
+        egressSlotHeld = activeEgressLabel.length > 0;
+        if (egressSlotHeld) holdSlot(activeEgressLabel);
+        // Per-session pacing model: the fake-lag accumulator is unknown
+        // after a swap; start it at zero as a registered user and keep the
+        // learned limits. Trust is per host and re-derived from config.
+        pacer.resetAccrual();
+        pacer.adopt(assumedFloodLimits());
+        applyFloodTrust();
+        const nowSecs = Clock.currTime.toUnixTime!long;
+        lastDataReceivedSecs = nowSecs;
+        lastPongReceivedSecs = nowSecs;
+        idleEmitted = false;
         state = ConnectionState.connected;
         backoff.reset();
         throttledUntil = 0;
-        // W1-T01 (plan B3): zero-valued CONNECTION_RETRY_STATUS emit at
-        // every backoff.reset() site so the frontend's
-        // applyRetryStatus(networkId, null) clears both net.retryStatus
-        // AND net.failInfo. Without this the banner would keep showing
-        // a stale "Disconnected: ..." text after a successful reconnect.
+        consecutiveTlsClosed = 0;
+        droppedNoConnWarned = false;
+        disconnectedEmitted = false;
+        registrationTimeoutSince = 0;
+        // Zero-valued CONNECTION_RETRY_STATUS at every backoff.reset() site
+        // so the frontend clears any stale retry/fail banner.
         emitZeroRetryStatus();
-        logInfo("Adopted live connection for %s (fd=%d, %d joined channels, %d acked caps)",
-            config.host, fd, channelState.length, ackedCaps.length);
-        logJsonMap("info", "handoff",
-            "Adopted live socket",
-            ["network": config.name,
-             "fd": fd.to!string,
+        const upSecs = (unixMsNow() - connectedAtMs) / 1000;
+        // No CONNECTED lifecycle event: the session never changed. One
+        // server-log line tells the user what happened.
+        emitLog("info", "Engine reattached to live connection (hot swap); connected for "
+            ~ formatUptime(upSecs) ~ (activeEgressLabel.length ? " via " ~ egressDisplay() : "") ~ ".");
+        logInfo("Attached to held connection %s for %s (%d joined channels, %d acked caps, graceful=%s)",
+            holderConnId, config.host, channelState.length, ackedCaps.length, graceful);
+        logJsonMap("info", "connection",
+            "Attached to held connection",
+            ["network": config.name, "host": config.host,
+             "holderId": holderConnId,
+             "graceful": graceful ? "true" : "false",
              "channels": channelState.length.to!string,
              "caps": ackedCaps.length.to!string,
-             "event": "adopted_socket"]);
-        try eventChannel.put(IRCRawEvent.makeConnected(config.name, config.id.toString()));
-        catch (Exception e) logWarn("handoff: failed to publish CONNECTED: %s", e.msg);
-        // Spawn the resumed event loop. We use a separate code path
-        // (`runAdoptedLoop`) so we can skip registration cleanly.
-        // Wrapped in `taskNothrow` so the loop can throw freely while
-        // still satisfying vibe-core 2.14's nothrow callback contract.
-        safeFiberRun("adopted_loop", config.name, {
-            try {
-                runAdoptedLoop();
-            } catch (Exception e) {
-                logException("connection", e,
-                    "Adopted connection crashed",
-                    ["network": config.name, "host": config.host,
-                     "event": "adopted_crash"]);
-                state = ConnectionState.disconnected;
-                try eventChannel.put(IRCRawEvent.makeDisconnected(config.name, config.id.toString(), e.msg));
-                catch (Exception) {}
-            }
-        });
-
+             "uptimeSecs": upSecs.to!string,
+             "egress": activeEgressLabel.length ? activeEgressLabel : "direct",
+             "event": "attached"]);
+        if (!graceful || s.usersDropped) {
+            // Crash path: member lists may have drifted while no engine was
+            // reading. NAMES is paced by writeRaw like any other line.
+            foreach (chan; channelState.byKey) sendRaw("NAMES " ~ chan);
+        }
+        // Fresh META from the attached engine: the previous one was the
+        // detach snapshot (`graceful == true`), and a crash before the next
+        // upkeep write must not be mistaken for a planned swap.
+        publishMeta(false);
+        // Resume the ordinary loop: `state == connected` skips the dial and
+        // enters processEvents() (whose first iteration drains the restored
+        // outboundQueue); a later drop reconnects with backoff as usual.
+        spawnConnectionLoop("attached_loop");
     }
 
-    /// Resumed event loop for an adopted connection. Same as
-    /// `processEvents()` but skips `processOutboundQueue()` for the
-    /// first iteration (the queue was already drained before
-    /// handoff; if anything was queued during the handoff window the
-    /// new engine's queue is already populated).
-    private void runAdoptedLoop() {
-        processEvents();
+    /// Hot-swap detach: publish the exact session state as META, close the
+    /// relay stream and leave the upstream socket (and its egress slot)
+    /// with the holder for the next engine. No QUIT, no CLOSE, no
+    /// DISCONNECTED event; `state` stays `connected` — the truth during the
+    /// gap. A client still dialing/registering just stops; the holder
+    /// keeps a META-less entry that the next engine closes and re-dials.
+    void detachForHotSwap() {
+        const live = state == ConnectionState.connected && holderConnId.length > 0;
+        if (live) publishMeta(true);
+        isShutdownRequested = true;
+        detachedForHotSwap = true;
+        try { if (connection.connected) connection.close(); }
+        catch (Exception e) { logWarn("detachForHotSwap: closing relay for %s: %s", config.name, e.msg); }
+        if (live) {
+            logJsonMap("info", "connection",
+                "Detached for hot swap — session left with the holder",
+                ["network": config.name, "host": config.host,
+                 "holderId": holderConnId,
+                 "channels": channelState.length.to!string,
+                 "queued": (outboundQueue.length + pacedQueue.length).to!string,
+                 "event": "detached"]);
+        }
+        holderConnId = "";
     }
 
-    /// Adopt a connection that survived an exec(2) reload. The TCP
-    /// file descriptor is reused; for TLS, a fresh TLS handshake is
-    /// performed on the SAME TCP socket so the IRC server's IRC
-    /// layer (above TLS) sees no change — the IRC session continues
-    /// uninterrupted.
-    ///
-    /// This is the post-exec-restart entry point. The new engine
-    /// calls this once per IRC network after reading the checkpoint
-    /// file written by the old engine.
-    void adoptExecSocket(int fd, ref HandoffState s) {
-        import vibe.core.core : runTask;
-        import eventcore.core : eventDriver;
-        import eventcore.driver : StreamSocketFD;
-        import vibe.core.net : createStreamConnection;
-        import core.time : seconds;
-
-        logInfo("adoptExecSocket: %s fd=%d wasTls=%s",
-            s.config.name, fd, !s.transportWasPlain);
-
-        // 1. Adopt the FD into vibe.d's event driver. Same as
-        // `adoptAndStart` — we get a `connection` field that the rest
-        // of the engine uses for non-blocking I/O.
-        auto streamFd = eventDriver.sockets.adoptStream(fd);
-        if (streamFd == StreamSocketFD.invalid) {
-            logError("adoptExecSocket: eventcore refused to adopt fd=%d — falling back to AdoptedSocket", fd);
-        } else {
-            try {
-                connection = createStreamConnection(streamFd);
-                logInfo("adoptExecSocket: fd=%d registered with event driver", fd);
-            } catch (Exception e) {
-                logException("connection", e,
-                    "adoptExecSocket: createStreamConnection failed",
-                    ["fd": fd.to!string, "network": config.name,
-                     "event": "adopt_stream_fail"]);
-            }
-        }
-        // Always also keep a raw POSIX wrapper as fallback. This lets
-        // us read/write even if vibe.d's TCPConnection gets into a bad
-        // state (which can happen with externally-adopted FDs).
-        adoptedSocket = new AdoptedSocket(fd);
-        if (!adoptedSocket.connected) {
-            logError("adoptExecSocket: adopted socket fd=%d is not connected — aborting", fd);
-            state = ConnectionState.disconnected;
-            return;
-        }
-
-        // 2. If the connection was TLS, do a fresh handshake on the
-        // SAME TCP socket. The IRC server's TLS layer re-authenticates,
-        // but its IRC layer (above TLS) doesn't notice — IRC sessions
-        // are keyed to the TCP 4-tuple, not the TLS identity.
-        if (!s.transportWasPlain) {
-            logInfo("adoptExecSocket: %s was TLS — doing fresh TLS handshake on existing TCP", s.config.name);
-            try {
-                auto ctx = createTLSContext(TLSContextKind.client);
-                ctx.peerValidationMode = TLSPeerValidationMode.none;
-                tlsStream = createTLSStreamWithTimeout(connection, ctx, stripHostBrackets(config.host),
-                    TLS_HANDSHAKE_TIMEOUT_SECONDS.seconds);
-                logInfo("adoptExecSocket: TLS handshake complete for %s on existing TCP", s.config.name);
-                captureTlsInfo();
-            } catch (Exception e) {
-                logError("adoptExecSocket: TLS handshake failed for %s on existing TCP: %s"
-                    ~ " — falling back to AdoptedSocket only",
-                    s.config.name, e.msg);
-                // Don't bail — we still have the raw TCP socket via
-                // adoptedSocket. The new engine can continue using it
-                // for plain-text IRC, but the IRC server will likely
-                // disconnect because it expects TLS. Mark for reconnect.
-                tlsStream = null;
-                state = ConnectionState.disconnected;
-                try eventChannel.put(IRCRawEvent.makeDisconnected(
-                    config.name, config.id.toString(),
-                    "TLS re-handshake failed after exec reload"));
-                catch (Exception) {}
-                return;
-            }
-        }
-
-        // 3. Restore the in-memory state from the snapshot. Same as
-        // `adoptAndStart` — config first, then state maps.
-        config = s.config;
-        sessionNick = s.sessionNick;
-        isAway = s.isAway;
-        awayMessage = s.awayMessage;
-        foreach (cap; s.ackedCaps) ackedCaps[cap] = true;
-        queryBuffers = s.queryBuffers.dup;
-        channelState = s.channelState.dup;
-        channelTopics = s.channelTopics.dup;
-        foreach (k, v; s.channelUsers) channelUsers[k] = v.dup;
-        realnames = s.realnames.dup;
-        pendingLabels = s.pendingLabels.dup;
-        channelLatestMsgid = s.channelLatestMsgid.dup;
-        channelEarliestMsgid = s.channelEarliestMsgid.dup;
-        chathistoryInFlight = s.chathistoryInFlight.dup;
-        serverFeatures.network = s.serverFeatures.network;
-        serverFeatures.prefix = s.serverFeatures.prefix;
-        serverFeatures.chanModes = s.serverFeatures.chanModes;
-        serverFeatures.maxChannels = s.serverFeatures.maxChannels;
-        serverFeatures.maxNickLen = s.serverFeatures.maxNickLen;
-        serverFeatures.topicLen = s.serverFeatures.topicLen;
-        // Carry the full ISUPPORT map forward so the categorised panel
-        // renders without waiting for a redundant 005 reply stream.
-        isupportMap = s.isupportMap.dup;
-        serverSoftware = s.serverSoftware;
-
-        // 4. Mark connected and reset backoff. We DO NOT re-register
-        // with the IRC server (NICK, USER, CAP, SASL, JOIN) — the
-        // session is already active on the IRC side because the TCP
-        // connection never closed. The new engine just resumes
-        // reading/writing IRC traffic.
-        connectedAtMs = unixMsNow();
-        state = ConnectionState.connected;
-        backoff.reset();
-        throttledUntil = 0;
-        // W1-T01 (plan B3): see adoptAndStart above — same zero-valued
-        // CONNECTION_RETRY_STATUS emit so the frontend clears its
-        // stale failInfo / retryStatus on this successful reconnect.
-        emitZeroRetryStatus();
-        logInfo("adoptExecSocket: %s ready (fd=%d, %d joined channels, %d acked caps)",
-            config.host, fd, channelState.length, ackedCaps.length);
-        try eventChannel.put(IRCRawEvent.makeConnected(config.name, config.id.toString()));
-        catch (Exception e) logWarn("adoptExecSocket: failed to publish CONNECTED: %s", e.msg);
-
-        // 5. After a moment, send a CAP LS to refresh the cap list
-        // and verify the IRC session is alive. This is purely a
-        // sanity check — the server may reply with our already-acked
-        // caps, which we just acknowledge and discard.
-        safeFiberRun("post_adopt_cap_ls", config.name, {
-            try {
-                sleep(500.msecs);
-                if (state == ConnectionState.connected) {
-                    sendRaw("CAP LS 302");
-                    logInfo("adoptExecSocket: sent CAP LS to refresh state for %s", config.name);
-                }
-            } catch (Exception e) {
-                logWarn("adoptExecSocket: post-adopt CAP LS failed: %s", e.msg);
-            }
-        });
-
-        // 6. Spawn the resumed event loop.
-        safeFiberRun("adopted_exec_loop", config.name, {
-            try {
-                runAdoptedLoop();
-            } catch (Exception e) {
-                logException("connection", e,
-                    "Adopted-exec connection crashed",
-                    ["network": config.name, "host": config.host,
-                     "event": "adopted_exec_crash"]);
-                state = ConnectionState.disconnected;
-                try eventChannel.put(IRCRawEvent.makeDisconnected(
-                    config.name, config.id.toString(), e.msg));
-                catch (Exception) {}
-            }
-        });
-
+    /// `"3d 4h"`, `"4h 12m"`, `"12m 5s"`, `"5s"` for the reattach line.
+    private static string formatUptime(long secs) @safe pure {
+        if (secs < 0) secs = 0;
+        const d = secs / 86_400, h = (secs % 86_400) / 3600, m = (secs % 3600) / 60, s = secs % 60;
+        if (d > 0) return d.to!string ~ "d " ~ h.to!string ~ "h";
+        if (h > 0) return h.to!string ~ "h " ~ m.to!string ~ "m";
+        if (m > 0) return m.to!string ~ "m " ~ s.to!string ~ "s";
+        return s.to!string ~ "s";
     }
 
     @property bool            getConnected()     const { return state == ConnectionState.connected; }
@@ -3571,44 +3019,44 @@ final class PersistentIRCClient {
     /// duplicating the fields elsewhere.
     @property inout(NetworkConfig) getConfig() inout { return config; }
 
-    /// Whether the underlying transport is alive, regardless of
-    /// whether it wraps a vibe.d TCPConnection or an adopted socket.
+    /// Whether the relay stream to the holder is alive.
     @property bool transportAlive() const {
-        if (adoptedSocket !is null) return adoptedSocket.connected;
         return connection.connected;
     }
 
-    /// Read from the transport. For adopted sockets, uses direct
-    /// POSIX read(); for normal connections, delegates to vibe.d.
+    /// Read from the transport (non-blocking).
     size_t transportRead(ubyte[] buf) {
-        if (adoptedSocket !is null) return adoptedSocket.read(buf);
         if (!connection.waitForData(0.seconds)) return 0;
         return connection.read(buf, IOMode.once);
     }
 
     /// Write a line to the transport, appending CRLF.
     void transportWrite(const(char)[] line) {
-        if (adoptedSocket !is null) {
-            adoptedSocket.write(cast(const(ubyte)[]) (line ~ "\r\n"));
-        } else if (connection.connected) {
+        if (connection.connected) {
             connection.write((line ~ "\r\n").dup);
             connection.flush();
         }
     }
 
-    /// Close the transport. Idempotent.
-    void transportClose() {
-        if (adoptedSocket !is null) {
-            adoptedSocket.close();
-            adoptedSocket = null;
-        }
+    /// Close the transport: the relay stream to the holder **and** the
+    /// upstream IRC socket the holder owns for it. Non-empty `quit` makes
+    /// the holder send `QUIT :<quit>` first (≤ 2 s grace); empty means the
+    /// QUIT already went out in-band (or none is wanted). Idempotent. Every
+    /// engine-initiated disconnect goes through here — only
+    /// `detachForHotSwap()` closes the relay without closing upstream.
+    void transportClose(string quit = "") {
         if (connection.connected) connection.close();
-    }
-
-    /// Underlying fd, for snapshot.
-    int transportFd() const {
-        if (adoptedSocket !is null) return adoptedSocket.fd;
-        return cast(int) connection.fd;
+        if (holderConnId.length && holder !is null) {
+            const id = holderConnId;
+            holderConnId = "";
+            try holder.close(id, quit);
+            catch (HolderUnavailableException e) {
+                logWarn("transportClose: holder unavailable, upstream %s for %s left to the holder's detach timeout (%s)",
+                    id, config.name, e.msg);
+            } catch (Exception e) {
+                logWarn("transportClose: holder CLOSE %s failed for %s: %s", id, config.name, e.msg);
+            }
+        }
     }
 
 
@@ -3690,16 +3138,6 @@ final class PersistentIRCClient {
     /// Remote/local IPs of the live TCP socket; "" when not connected.
     @property string getActivePeerIp() const { return activePeerIp; }
     @property string getActiveLocalIp() const { return activeLocalIp; }
-    /// Snapshot the socket's endpoint addresses right after a successful
-    /// connect. Best effort: an address lookup failing must never abort
-    /// the connection flow.
-    private void recordSocketAddrs() nothrow {
-        activePeerIp = ""; activeLocalIp = "";
-        try {
-            activePeerIp = connection.remoteAddress.toAddressString();
-            activeLocalIp = connection.localAddress.toAddressString();
-        } catch (Exception) {}
-    }
     /// Round trip of the last answered lag probe in ms; -1 when unknown.
     @property long getLagMs() const nothrow { return lagMs; }
     /// Unix ms of RPL_WELCOME for the live connection; 0 when not connected.
@@ -3843,64 +3281,6 @@ final class PersistentIRCClient {
         egressSlotLabel = "";
     }
 
-    /// Reads protocol version, cipher and peer-certificate details from
-    /// the freshly handshaken `tlsStream` into `tlsInfo`. Any failure
-    /// (non-OpenSSL backend, missing peer cert, OpenSSL error) leaves
-    /// `tlsInfoValid == false`; the caller falls back to the generic
-    /// `tls_done` text.
-    private void captureTlsInfo() nothrow {
-        tlsInfoValid = false;
-        tlsInfo = TlsInfo.init;
-        try {
-            import vibe.stream.openssl : OpenSSLStream;
-            import deimos.openssl.ssl : SSL_get_version, SSL_get_cipher_name;
-            import deimos.openssl.x509 : X509_NAME, X509_get_subject_name, X509_get_issuer_name,
-                X509_NAME_get_text_by_NID, X509_get0_notAfter;
-            import deimos.openssl.asn1 : ASN1_TIME, ASN1_STRING, ASN1_TIME_to_generalizedtime, ASN1_STRING_free;
-            import deimos.openssl.obj_mac : NID_commonName;
-            import std.string : fromStringz;
-
-            auto ossl = cast(OpenSSLStream) tlsStream;
-            if (ossl is null) return;
-            // `m_tls` (the SSL*) is private in vibe-stream; reach it via
-            // tupleof with the index pinned by name so a field reorder
-            // upstream fails at compile time instead of reading garbage.
-            enum tlsIdx = fieldIndexOf!(OpenSSLStream, "m_tls");
-            static assert(tlsIdx >= 0 && __traits(identifier, OpenSSLStream.tupleof[tlsIdx]) == "m_tls");
-            auto ssl = ossl.tupleof[tlsIdx];
-            if (ssl is null) return;
-            auto x509 = ossl.peerCertificateX509;
-            if (x509 is null) return;
-
-            static string nameCn(X509_NAME* name) {
-                if (name is null) return "";
-                char[256] buf;
-                const n = X509_NAME_get_text_by_NID(name, NID_commonName, buf.ptr, buf.length);
-                return n > 0 ? buf[0 .. n].idup : "";
-            }
-            TlsInfo info;
-            info.version_ = SSL_get_version(ssl).fromStringz.idup;
-            info.cipher = SSL_get_cipher_name(ssl).fromStringz.idup;
-            info.certCn = nameCn(X509_get_subject_name(x509));
-            info.certIssuer = nameCn(X509_get_issuer_name(x509));
-            auto notAfter = X509_get0_notAfter(x509);
-            if (notAfter !is null) {
-                auto gen = ASN1_TIME_to_generalizedtime(cast(ASN1_TIME*) notAfter, null);
-                if (gen !is null) {
-                    scope (exit) ASN1_STRING_free(cast(ASN1_STRING*) gen);
-                    auto str = cast(ASN1_STRING*) gen;
-                    if (str.data !is null && str.length > 0)
-                        info.certNotAfterMs = parseAsn1GeneralizedTimeMs(
-                            (cast(const(char)*) str.data)[0 .. str.length].idup);
-                }
-            }
-            tlsInfo = info;
-            tlsInfoValid = true;
-        } catch (Exception e) {
-            try logWarn("TLS detail capture failed for %s: %s", config.name, e.msg);
-            catch (Exception) {}
-        }
-    }
     /// Whether a given IRCv3 capability was negotiated.
     bool hasCap(string cap) const { return (cap in ackedCaps) !is null && ackedCaps[cap]; }
 
@@ -3935,7 +3315,7 @@ final class PersistentIRCClient {
     /// Updates the network configuration.
     void updateConfig(NetworkConfig cfg) { config = cfg; ipv6BindResolved = false; ipv6BindCache = ""; }
 
-    /// Owner UUID (for per-user IPv6). Exposed for manager/handoff snapshot.
+    /// Owner UUID (for per-user IPv6). Exposed for the manager / session snapshot.
     @property UUID getOwnerId() const { return ownerId; }
     void setOwnerId(UUID uid) { ownerId = uid; ipv6BindResolved = false; ipv6BindCache = ""; }
 
@@ -3958,7 +3338,9 @@ final class PersistentIRCClient {
     /// `start()` worker task and any test harness can invoke it;
     /// callers must still set initial state via `start()`.
     package void runConnectionLoop() {
-        bool wasEverConnected    = false;
+        // An attached session (hot swap) enters the loop already connected;
+        // its first drop must not read "Failed to connect".
+        bool wasEverConnected    = state == ConnectionState.connected;
         // Last reason we surfaced to the UI. We re-emit a DISCONNECT event
         // whenever the reason changes so persistently-failing connections
         // (e.g. TLS handshake reset) don't loop silently — but identical,
@@ -4019,25 +3401,36 @@ final class PersistentIRCClient {
                     }
                 }
                 processEvents();
-                // Enterprise belt-and-suspenders: after processEvents returns,
-                // check postHandoffQuitAtMs again.  If the early check inside
-                // processEvents was somehow missed (e.g. the connection state
-                // loop exited before reaching it), we catch it here and prevent
-                // a reconnection cycle that would collide with the new engine.
-                import core.atomic : atomicLoad;
-                if (atomicLoad(postHandoffQuitAtMs) > 0) {
-                    logInfo("Post-handoff: %s - hard fallback triggered", config.name);
-                    isShutdownRequested = true;
-                    try transportClose(); catch (Exception) {}
-                    break;
-                }
+                // A hot-swap detach ends this loop: the holder keeps the
+                // session and the process is exiting.
+                if (detachedForHotSwap) return;
             } catch (Throwable e) {
                 // Enterprise: catch Throwable (not just Exception) — SyncError@(0) from
                 // unsynchronized __gshared access previously killed the TaskFiber
                 // (observed 2026-08-17 cnTb-fin FATAL) and the TLS wedge left the
                 // loop stuck forever. SyncError must be treated as a recoverable
                 // disconnect, not a fiber terminator.
+                if (detachedForHotSwap) return;
                 string errMsg;
+                try { errMsg = e.msg; } catch (Throwable) { errMsg = "unknown throwable"; }
+                // Holder outage: not a network failure and not this network's
+                // fault — no backoff growth, no ban policy, no failure report.
+                // Retry on a short fixed cadence until the holder is back.
+                if (cast(HolderUnavailableException) e) {
+                    logJsonMap("warn", "connection", "Connection holder unavailable — retrying in 5s",
+                        ["network": config.name, "host": config.host, "err": errMsg,
+                         "event": "holder_unavailable_retry"]);
+                    emitLog("error", "Connection holder unavailable — retrying in 5s");
+                    try transportClose(); catch (Throwable) {}
+                    state = ConnectionState.waiting_to_retry;
+                    backoff.reset();
+                    emitZeroRetryStatus();
+                    foreach (_; 0 .. 50) {
+                        if (isShutdownRequested) break;
+                        sleep(100.msecs);
+                    }
+                    continue;
+                }
                 // SASL park (parkOnSaslRejection already persisted `disabled`,
                 // mirrored it in-memory, tore the socket down and emitted the
                 // user-visible error): skip the disconnect/backoff machinery
@@ -4397,20 +3790,9 @@ final class PersistentIRCClient {
         // handleDisconnection() (called via cleanup() below), which
         // covers ALL disconnect paths.  The per-path emitLog("error") +
         // DISCONNECT that was previously duplicated in the catch block
-        // and the exit block have been centralized there.
-        // Handoff suppression is gated inside handleDisconnection() by
-        // postHandoffQuitAtMs == 0.
+        // and the exit block have been centralized there. A hot-swap
+        // detach returns early inside handleDisconnection().
         cleanup();
-        // If this engine was handed off (postHandoffQuitAtMs was set),
-        // and we're not PID 1 (the container init process), exit cleanly
-        // to free resources.  PID 1 must stay alive to keep the container
-        // running; it will just spin the event loop with no connections.
-        import core.atomic : atomicLoad;
-        if (getpid() != 1 && atomicLoad(postHandoffQuitAtMs) > 0) {
-            logInfo("Post-handoff: exiting old engine process (pid=%d)", getpid());
-            import core.stdc.stdlib : exit;
-            exit(0);
-        }
     }
 
     // ── Connection attempt ────────────────────────────────────────────────────
@@ -4420,7 +3802,7 @@ final class PersistentIRCClient {
     /// Failures are swallowed (eventChannel.put can throw if the channel
     /// is closed during shutdown) so the connection attempt itself is
     /// never blocked by a logging error.
-    private void emitLog(string phase, string text) nothrow {
+    package(ircfiber) void emitLog(string phase, string text) nothrow {
         try {
             auto evt = IRCRawEvent.makeServerLog(config.name, config.id.toString(), phase, text);
             eventChannel.put(evt);
@@ -4432,8 +3814,8 @@ final class PersistentIRCClient {
 
     /// W1-T01 (plan B3): emit a zero-valued CONNECTION_RETRY_STATUS
     /// event AND clear the in-memory retry state. Called at every
-    /// `backoff.reset()` site (registration success, handoff adoption,
-    /// exec-reload adoption, fail-cycle success). The frontend's
+    /// `backoff.reset()` site (registration success, holder attach,
+    /// fail-cycle success). The frontend's
     /// `applyRetryStatus(networkId, null)` on receipt of this event
     /// clears BOTH `net.retryStatus` AND `net.failInfo` so the banner
     /// doesn't keep showing "Reconnecting..." / "Disconnected: ...".
@@ -4464,7 +3846,7 @@ final class PersistentIRCClient {
     /// W1-T01: build a structured FailInfo from a disconnect reason
     /// string + the engine's `lastErrorText` and publish a
     /// `CONNECTION_FAIL` event. Called from `handleDisconnection()`
-    /// (centralised site — covers the catch block, post-handoff exits,
+    /// (centralised site — covers the catch block,
     /// data-loss detection, and server-error paths). Failures during
     /// the put are swallowed so they don't mask the existing
     /// DISCONNECTED lifecycle event. Also stashes the FailInfo on
@@ -4510,7 +3892,7 @@ final class PersistentIRCClient {
 
     /// Starts a new /LIST accumulation. Called from `sendRaw` when we see
     /// an outgoing LIST, or lazily from the 321/322 handlers when the
-    /// request originated elsewhere (e.g. before a handoff).
+    /// request originated elsewhere (e.g. before a hot swap).
     private void beginChannelList(string pattern) {
         channelListInFlight = true;
         channelListEmittedFirst = false;
@@ -4588,55 +3970,123 @@ final class PersistentIRCClient {
         });
     }
 
-    /// STARTTLS upgrade for TLSMode.starttls: sends STARTTLS on the plain
-    /// connection, waits for 670 RPL_STARTTLS, then performs the TLS
-    /// handshake over the same socket. Fails closed — 691 ERR_STARTTLS or
-    /// a timeout throws so the attempt retries with backoff instead of
-    /// continuing unencrypted.
-    private void performStarttlsUpgrade() {
-        emitLog("tls", "Requesting STARTTLS upgrade with " ~ config.host ~ "...");
-        sendRaw("STARTTLS");
-        ubyte[STREAM_BUFFER_SIZE] buf;
-        string partial;
-        immutable startMs = Clock.currTime.toUnixTime!long * 1000;
-        while (Clock.currTime.toUnixTime!long * 1000 - startMs < STARTTLS_REPLY_TIMEOUT_MS) {
-            auto received = readFromStream(buf[], REGISTRATION_READ_TIMEOUT_MS.msecs);
-            if (received == 0) { yield(); continue; }
-            partial ~= sanitizeUtf8(cast(string) buf[0 .. received]);
-            ptrdiff_t idx;
-            while ((idx = partial.indexOf("\r\n")) >= 0) {
-                auto line = partial[0 .. idx];
-                partial   = partial[idx + 2 .. $];
-                if (line.length == 0) continue;
-                auto evt = parseIRCLine(line);
-                auto res = classifyStarttlsReply(evt.command);
-                if (res == StarttlsResult.failed) {
-                    emitLog("error", "STARTTLS rejected by server (691) — aborting (fail closed).");
-                    throw new Exception("STARTTLS rejected (691 ERR_STARTTLS)");
-                }
-                if (res == StarttlsResult.success) {
-                    emitLog("tls", "Server accepted STARTTLS — starting TLS handshake...");
-                    auto ctx = createTLSContext(TLSContextKind.client);
-                    ctx.peerValidationMode = TLSPeerValidationMode.none;
-                    tlsStream = createTLSStreamWithTimeout(connection, ctx,
-                        stripHostBrackets(config.host),
-                        TLS_HANDSHAKE_TIMEOUT_SECONDS.seconds);
-                    logInfo("Connected to %s:%s with STARTTLS", config.host, config.port);
-                    logJsonMap("info", "connection",
-                        "Connected with STARTTLS",
-                        ["network": config.name, "host": config.host,
-                         "port": config.port.to!string,
-                         "event": "tls_handshake"]);
-                    captureTlsInfo();
-                    emitLog("tls_done", formatTlsDoneText(tlsInfoValid, tlsInfo,
-                        "STARTTLS handshake complete — connection is now encrypted."));
+    /// TLS mode string for the holder `DIAL` request.
+    private static string holderTlsMode(TLSMode tls) @safe pure nothrow {
+        if (tls == TLSMode.disabled) return "none";
+        if (tls == TLSMode.starttls) return "starttls";
+        return "implicit";
+    }
+
+    /// Timeline adapter for holder dial events: the holder reports *when*
+    /// each phase happens (real timestamps), the engine owns the wording.
+    /// `attempt`/`attempt_fail`/`dns`/`info` texts arrive holder-composed
+    /// (or wrapper-composed for proxied dials) and are emitted verbatim.
+    private void onDialEvent(ref DialEvent ev) nothrow {
+        switch (ev.phase) {
+            case "tcp_open":
+                activeEgressLabel = ev.egressLabel;
+                activeEgressHost = ev.egressHost;
+                activeEgressIp = ev.egressIp;
+                activeEgressLocation = ev.egressLocationText;
+                activePeerIp = ev.peerIp;
+                activeLocalIp = ev.localIp;
+                if (dialPlainFallback) {
+                    emitLog("tcp_open", "Re-established plain-text TCP connection to " ~ config.host ~ " via "
+                        ~ (activeEgressLabel.length ? egressDisplay() ~ " (" ~ activeEgressHost
+                            ~ (activeEgressIp.length ? "/" ~ activeEgressIp : "") ~ ")" : "direct") ~ ".");
                     return;
                 }
-                // Still waiting — ignore NOTICE/MOTD chatter, keep reading.
-            }
+                emitLog("tcp_open",
+                    "TCP connection established to " ~ config.host ~ ":" ~ config.port.to!string
+                    ~ (activePeerIp.length ? " [" ~ activePeerIp ~ "]" : "")
+                    ~ (activeEgressLabel.length ? " via " ~ egressDisplay() ~ " (" ~ activeEgressHost ~ (activeEgressIp.length ? "/" ~ activeEgressIp : "") ~ ")" : " (direct)")
+                    ~ (activeLocalIp.length ? " from " ~ activeLocalIp : "") ~ ".");
+                try logJsonMap("info", "connection",
+                    "TCP open",
+                    ["network": config.name, "host": config.host,
+                     "port": config.port.to!string,
+                     "egress": activeEgressLabel.length ? activeEgressLabel : "direct",
+                     "egressHost": activeEgressHost,
+                     "egressIp": activeEgressIp,
+                     "peerIp": activePeerIp,
+                     "localIp": activeLocalIp,
+                     "tls": dialTlsMode != "none" ? "true" : "false",
+                     "event": "tcp_open"]);
+                catch (Exception) {}
+                return;
+            case "starttls":
+                emitLog("tls", "Requesting STARTTLS upgrade with " ~ config.host ~ "...");
+                return;
+            case "tls":
+                emitLog("tls", dialTlsMode == "starttls"
+                    ? "Server accepted STARTTLS — starting TLS handshake..."
+                    : "Starting TLS handshake with " ~ config.host ~ "...");
+                return;
+            default:
+                emitLog(ev.phase, ev.text);
+                return;
         }
-        emitLog("error", "STARTTLS timed out waiting for 670 — aborting (fail closed).");
-        throw new Exception("STARTTLS timeout: no 670 RPL_STARTTLS received");
+    }
+
+    /// One holder-backed connect through the egress policy loop. Sets the
+    /// transport, the holder connection id, the active egress/socket
+    /// bookkeeping and the TLS details; emits the post-connect timeline.
+    private void dialViaHolder(string tlsMode, string ipv6Bind) {
+        if (holder is null) throw new HolderUnavailableException("no connection holder configured");
+        dialTlsMode = tlsMode;
+        DialResult dr;
+        withSpan("irc.tcp_connect",
+            ["network": config.name, "host": config.host, "port": config.port.to!string,
+             "egress": config.egressNodeId, "ipv6Bind": ipv6Bind, "tls": tlsMode],
+            (ref Span ts) {
+            EgressUsed used;
+            // Release before the new connect: happyEyeballsConnect takes the
+            // hold on the slot it wins, and releasing afterwards would cancel
+            // it out when the same slot is reused.
+            releaseEgressSlot();
+            auto tag = DialTag(config.id.toString(), ownerId.toString(), config.name, "");
+            connection = happyEyeballsConnect(holder, tag, config.host, config.port, tlsMode,
+                config.egressNodeId, ipv6Bind, &onDialEvent, used, dr);
+            holderConnId = dr.id;
+            activeEgressLabel = used.label;
+            activeEgressHost = used.host;
+            activeEgressIp = used.ip;
+            activeEgressLocationId = used.locationId;
+            activeEgressLocation = used.locationText;
+            egressSlotLabel = used.label;
+            egressSlotHeld = used.label.length > 0;
+            activePeerIp = dr.peerIp;
+            activeLocalIp = dr.localIp;
+            tlsInfoValid = dr.tlsOk;
+            tlsInfo = dr.tls;
+            ts.setStatusOk();
+        });
+        // No OS TCP keepalive here: the upstream socket lives in the holder — the 30 s app-level LAG probes in processEvents() hold NAT mappings and meet the ~2 min detection goal.
+        logInfo("TCP via egress '%s' (%s/%s) to %s:%d peer=%s local=%s holder=%s", activeEgressLabel.length ? activeEgressLabel : "direct", activeEgressHost.length ? activeEgressHost : "direct", activeEgressIp.length ? activeEgressIp : "-", config.host, config.port, activePeerIp.length ? activePeerIp : "-", activeLocalIp.length ? activeLocalIp : "-", holderConnId);
+        if (tlsMode == "starttls") {
+            logInfo("Connected to %s:%s with STARTTLS", config.host, config.port);
+            logJsonMap("info", "connection",
+                "Connected with STARTTLS",
+                ["network": config.name, "host": config.host,
+                 "port": config.port.to!string,
+                 "event": "tls_handshake"]);
+            emitLog("tls_done", formatTlsDoneText(tlsInfoValid, tlsInfo,
+                "STARTTLS handshake complete — connection is now encrypted."));
+        } else if (tlsMode != "none") {
+            logInfo("Connected to %s:%s with TLS", config.host, config.port);
+            logJsonMap("info", "connection",
+                "Connected with TLS",
+                ["network": config.name, "host": config.host,
+                 "port": config.port.to!string,
+                 "sni": config.host,
+                 "event": "tls_handshake"]);
+            emitLog("tls_done", formatTlsDoneText(tlsInfoValid, tlsInfo,
+                "TLS handshake complete — connection is now encrypted."));
+        } else {
+            emitLog("info",
+                "Plain-text mode — no TLS handshake will be performed.");
+            logInfo("Connected to %s:%s (plain)", config.host, config.port);
+        }
     }
 
     private void attemptConnectionImpl(bool) {
@@ -4716,132 +4166,36 @@ final class PersistentIRCClient {
         string ipv6Bind = resolveIpv6Bind();
         logInfo("Connecting to %s:%s (Happy Eyeballs) ipv6Bind=%s egress=%s owner=%s",
             config.host, config.port, ipv6Bind.length ? ipv6Bind : "-", config.egressNodeId, ownerId.toString());
-        withSpan("irc.tcp_connect",
-            ["network": config.name, "host": config.host, "port": config.port.to!string, "egress": config.egressNodeId, "ipv6Bind": ipv6Bind],
-            (ref Span ts) {
-            EgressUsed used;
-            // Release before the new connect: happyEyeballsConnect takes the
-            // hold on the slot it wins, and releasing afterwards would cancel
-            // it out when the same slot is reused.
-            releaseEgressSlot();
-            connection = happyEyeballsConnect(config.host, config.port, config.egressNodeId, ipv6Bind, &emitLog, used);
-            activeEgressLabel = used.label;
-            activeEgressHost = used.host;
-            activeEgressIp = used.ip;
-            activeEgressLocationId = used.locationId;
-            activeEgressLocation = used.locationText;
-            egressSlotLabel = used.label;
-            egressSlotHeld = used.label.length > 0;
-            recordSocketAddrs();
-            ts.setStatusOk();
-        });
-        // No OS TCP keepalive here: vibe.d TCPConnection exposes no socket fd cleanly — the 30 s app-level LAG probes in processEvents() hold NAT mappings and meet the ~2 min detection goal.
-        logInfo("TCP via egress '%s' (%s/%s) to %s:%d peer=%s local=%s", activeEgressLabel.length ? activeEgressLabel : "direct", activeEgressHost.length ? activeEgressHost : "direct", activeEgressIp.length ? activeEgressIp : "-", config.host, config.port, activePeerIp.length ? activePeerIp : "-", activeLocalIp.length ? activeLocalIp : "-");
-        emitLog("tcp_open",
-            "TCP connection established to " ~ config.host ~ ":" ~ config.port.to!string
-            ~ (activePeerIp.length ? " [" ~ activePeerIp ~ "]" : "")
-            ~ (activeEgressLabel.length ? " via " ~ egressDisplay() ~ " (" ~ activeEgressHost ~ (activeEgressIp.length ? "/" ~ activeEgressIp : "") ~ ")" : " (direct)")
-            ~ (activeLocalIp.length ? " from " ~ activeLocalIp : "") ~ ".");
-        logJsonMap("info", "connection",
-            "TCP open",
-            ["network": config.name, "host": config.host,
-             "port": config.port.to!string,
-             "egress": activeEgressLabel.length ? activeEgressLabel : "direct",
-             "egressHost": activeEgressHost,
-             "egressIp": activeEgressIp,
-             "peerIp": activePeerIp,
-             "localIp": activeLocalIp,
-             "tls": (config.tls != TLSMode.disabled) ? "true" : "false",
-             "event": "tcp_open"]);
-        // STARTTLS upgrades the plain connection in place; the implicit-TLS
-        // block below is skipped for it (tlsStream is already set here).
-        if (config.tls == TLSMode.starttls) {
-            performStarttlsUpgrade();
-        }
-        if (config.tls != TLSMode.disabled && config.tls != TLSMode.starttls) {
-            emitLog("tls",
-                "Starting TLS handshake with " ~ config.host ~ "...");
-
-            auto ctx = createTLSContext(TLSContextKind.client);
-            // TODO(security): TLSPeerValidationMode.none was inherited from main; re-enable peer
-            // validation in a follow-up security hardening PR. Wave 1 cannot surface
-            // nested SSL detail until then.
-            ctx.peerValidationMode = TLSPeerValidationMode.none;
-            bool tlsOk = false;
-            withSpan("irc.tls_handshake",
+        dialPlainFallback = false;
+        try {
+            dialViaHolder(holderTlsMode(config.tls), ipv6Bind);
+        } catch (DialFailedException e) {
+            if (e.phase != "tls" && e.phase != "starttls") throw e;
+            logJsonMap("warn", "connection",
+                "TLS handshake failed",
                 ["network": config.name, "host": config.host,
-                 "port": config.port.to!string, "sni": config.host],
-                (ref Span tls) {
-            try {
-                tlsStream = createTLSStreamWithTimeout(connection, ctx, stripHostBrackets(config.host),
-                    TLS_HANDSHAKE_TIMEOUT_SECONDS.seconds);
-                tlsOk = true;
-                logInfo("Connected to %s:%s with TLS", config.host, config.port);
-                logJsonMap("info", "connection",
-                    "Connected with TLS",
-                    ["network": config.name, "host": config.host,
-                     "port": config.port.to!string,
-                     "sni": config.host,
-                     "event": "tls_handshake"]);
-                captureTlsInfo();
-                emitLog("tls_done", formatTlsDoneText(tlsInfoValid, tlsInfo,
-                    "TLS handshake complete — connection is now encrypted."));
-                tls.setStatusOk();
-            } catch (Exception e) {
-                logJsonMap("warn", "connection",
-                    "TLS handshake failed",
-                    ["network": config.name, "host": config.host,
-                     "err": e.msg,
-                     "event": "tls_fail"]);
-                tls.setStatusError(e.msg);
+                 "err": e.msg,
+                 "event": "tls_fail"]);
+            // TLS-only ports must not fall back to plain even when config says "enabled".
+            // 6697/6698/7000 are de-facto TLS ports — plain on them gets 0 bytes
+            // and leads to "Registration timed out → transport not alive" loop.
+            // Treat enabled+TLS-port as required by default. STARTTLS fails
+            // closed as well.
+            bool isTlsOnlyPort = config.port == 6697 || config.port == 6698
+                || config.port == 7000 || config.port == 6699;
+            bool mustRequireTls = config.tls == TLSMode.required || config.tls == TLSMode.starttls
+                || (config.tls == TLSMode.enabled && isTlsOnlyPort);
+            if (mustRequireTls) {
+                emitLog("error", "TLS handshake failed");
                 throw e;
             }
-            });
-            if (!tlsOk) {
-                string tlsError = "TLS handshake failed";
-                // TLS-only ports must not fall back to plain even when config says "enabled".
-                // 6697/6698/7000 are de-facto TLS ports — plain on them gets 0 bytes
-                // and leads to "Registration timed out → transport not alive" loop.
-                // Treat enabled+TLS-port as required by default.
-                bool isTlsOnlyPort = config.port == 6697 || config.port == 6698
-                    || config.port == 7000 || config.port == 6699;
-                bool mustRequireTls = config.tls == TLSMode.required
-                    || (config.tls == TLSMode.enabled && isTlsOnlyPort);
-                if (mustRequireTls) {
-                    if (connection && connection.connected) {
-                        try { connection.close(); } catch (Exception) {}
-                    }
-                    emitLog("error", tlsError);
-                    throw new Exception(tlsError);
-                }
-
-                logWarn("TLS handshake failed for %s, falling back to plain text", config.host);
-                emitLog("warn", "TLS handshake failed — falling back to plain text as configured.");
-                if (connection && connection.connected) {
-                    try { connection.close(); } catch (Exception) {}
-                }
-                // For TLS→plain fallback, reuse the same ipv6Bind derived above (in scope via closure)
-                string fallbackIpv6Bind = resolveIpv6Bind();
-                EgressUsed used;
-                releaseEgressSlot();
-                connection = happyEyeballsConnect(config.host, config.port, config.egressNodeId, fallbackIpv6Bind, &emitLog, used);
-                activeEgressLabel = used.label;
-                activeEgressHost = used.host;
-                activeEgressIp = used.ip;
-                activeEgressLocationId = used.locationId;
-                activeEgressLocation = used.locationText;
-                egressSlotLabel = used.label;
-                egressSlotHeld = used.label.length > 0;
-                recordSocketAddrs();
-                logInfo("Plain fallback TCP via egress '%s' (%s/%s) to %s:%d", activeEgressLabel.length ? activeEgressLabel : "direct", activeEgressHost.length ? activeEgressHost : "direct", activeEgressIp.length ? activeEgressIp : "-", config.host, config.port);
-                emitLog("tcp_open", "Re-established plain-text TCP connection to " ~ config.host ~ " via " ~ (activeEgressLabel.length ? egressDisplay() ~ " (" ~ activeEgressHost ~ (activeEgressIp.length ? "/" ~ activeEgressIp : "") ~ ")" : "direct") ~ ".");
-                logJsonMap("info", "connection", "TLS handshake failed; fell back to plain text", ["network": config.name, "host": config.host, "egress": activeEgressLabel.length ? activeEgressLabel : "direct", "egressHost": activeEgressHost, "egressIp": activeEgressIp, "event": "tls_plain_fallback"]);
-                logInfo("Connected to %s:%s without TLS via %s", config.host, config.port, activeEgressLabel.length ? activeEgressLabel : "direct");
-            }
-        } else {
-            emitLog("info",
-                "Plain-text mode — no TLS handshake will be performed.");
-            logInfo("Connected to %s:%s (plain)", config.host, config.port);
+            logWarn("TLS handshake failed for %s, falling back to plain text", config.host);
+            emitLog("warn", "TLS handshake failed — falling back to plain text as configured.");
+            dialPlainFallback = true;
+            dialViaHolder("none", resolveIpv6Bind());
+            logInfo("Plain fallback TCP via egress '%s' (%s/%s) to %s:%d", activeEgressLabel.length ? activeEgressLabel : "direct", activeEgressHost.length ? activeEgressHost : "direct", activeEgressIp.length ? activeEgressIp : "-", config.host, config.port);
+            logJsonMap("info", "connection", "TLS handshake failed; fell back to plain text", ["network": config.name, "host": config.host, "egress": activeEgressLabel.length ? activeEgressLabel : "direct", "egressHost": activeEgressHost, "egressIp": activeEgressIp, "event": "tls_plain_fallback"]);
+            logInfo("Connected to %s:%s without TLS via %s", config.host, config.port, activeEgressLabel.length ? activeEgressLabel : "direct");
         }
 
         emitLog("registering",
@@ -4893,6 +4247,9 @@ final class PersistentIRCClient {
         // reconnect cycle — see the smoke scenario 3 in plan W1-T01
         // section G.
         emitZeroRetryStatus();
+        // First META for this session: from here a hot swap (or a crash)
+        // can re-attach the held socket with the registered state.
+        publishMeta(false);
     }
 
     /// Definitive SASL rejection (904/905): services are reachable and refuse
@@ -5739,27 +5096,10 @@ final class PersistentIRCClient {
     // ── Event processing loop ─────────────────────────────────────────────────
 
 private void processEvents() {
-        // Check post-handoff QUIT *before* the connection-state loop.
-        // The connection may have dropped during the handoff pause (IRC
-        // server ping timeout, etc.), which would exit the inner while
-        // loop without ever reaching the postHandoffQuitAtMs check at
-        // the bottom — causing the old engine to reconnect and collide
-        // with the new engine's nick registration.
+        // Detached for a hot swap: the holder owns the session now and the
+        // process is exiting. Never read, write or reconnect from here.
+        if (detachedForHotSwap) return;
         import core.atomic : atomicLoad;
-        if (atomicLoad(postHandoffQuitAtMs) > 0) {
-            if (transportAlive) {
-                try writeRaw("QUIT :engine-handoff");
-                catch (Exception) {}
-            }
-            isShutdownRequested = true;
-            try transportClose(); catch (Exception) {}
-            logInfo("Post-handoff: %s closed by OLD engine (early check)", config.name);
-            logJsonMap("info", "handoff",
-                "Post-handoff: " ~ config.name ~ " closed by OLD engine (early check)",
-                ["network": config.name,
-                 "event": "post_handoff_quit"]);
-            return;
-        }
 
         ubyte[] buffer = new ubyte[4096];
         string partial;
@@ -5776,8 +5116,7 @@ private void processEvents() {
 
         while (state == ConnectionState.connected) {
             auto now = Clock.currTime.toUnixTime!long;
-            if (!transportAlive) throw new Exception("Connection lost: transport not alive (adopted="
-                ~ (adoptedSocket !is null).to!string ~ ")");
+            if (!transportAlive) throw new Exception("Connection lost: transport not alive");
 
             // Proactive disconnect probe: every N consecutive zero-reads
             // (after a successful read earlier), touch the transport to
@@ -5793,16 +5132,12 @@ private void processEvents() {
                         "idleMs": (now * 1000 - lastDataReceivedSecs * 1000).to!string,
                         "event": "disconnect_probe"
                     ]);
-                if (!transportAlive) throw new Exception(
-                    "Proactive probe: transport not alive (adopted=" ~
-                    (adoptedSocket !is null).to!string ~ ")");
+                if (!transportAlive) throw new Exception("Proactive probe: transport not alive");
                 consecutiveZeroReads = 0; // reset so we don't spam every iter
             }
 
-            // Same fix as performRegistration: don't gate on waitForData()
-            // (raw socket), because tlsStream may have buffered decrypted data
-            // that the underlying TCP socket doesn't know about. Just try to
-            // read — IOMode.once is non-blocking.
+            // Non-blocking read (0 s waitForData gate); the outer sleep paces
+            // the loop.
             auto received = readFromStream(buffer[]);
             if (received == 0) {
                 consecutiveZeroReads++;
@@ -5824,48 +5159,27 @@ private void processEvents() {
                     partial   = partial[idx + 2 .. $];
                     if (line.length > 0) processLine(line);
                 }
+                // Own NICK/JOIN/PART/KICK/AWAY/005 changed the session state:
+                // refresh the holder META once per read batch (an auto-join
+                // burst is one write, not ten).
+                if (metaDirty && state == ConnectionState.connected) {
+                    metaDirty = false;
+                    publishMeta(false);
+                }
             }
 
             yield();
-            // Handoff pause: if a handoff has been requested, spin here
-            // until it's released. We check *after* yield() so any
-            // pending wake-ups get processed; the count is shared/atomic
-            // so reads from the engine thread are well-defined.
-            import core.atomic : atomicLoad;
-            while (atomicLoad(handoffPauseCount) > 0) {
-                import core.time : msecs;
+            // Detach pause: while a hot-swap detach is being prepared, spin
+            // here so the snapshot the engine publishes is exact. We check
+            // *after* yield() so any pending wake-ups get processed; the
+            // count is shared/atomic so reads from the engine thread are
+            // well-defined.
+            while (atomicLoad(detachPauseCount) > 0) {
                 sleep(10.msecs);
             }
-            // Post-handoff quit: if the connection was handed off to a
-            // new engine, this OLD engine must release the IRC server's
-            // nick registration BEFORE the new engine soft-reconnects.
-            // We send QUIT on the still-live socket (best effort — if
-            // the FD was transferred to the new engine, the write fails
-            // silently) and exit the loop without reconnecting. Without
-            // this, TLS handoffs cause nick collisions ("Zod" → "Zod_").
-            if (atomicLoad(postHandoffQuitAtMs) > 0) {
-                try {
-                    if (transportAlive && state == ConnectionState.connected) {
-                        try writeRaw("QUIT :engine-handoff");
-                        catch (Exception e) {
-                            logInfo("Post-handoff QUIT for %s: %s", config.name, e.msg);
-                        }
-                    }
-                } catch (Exception e) {
-                    logWarn("Post-handoff cleanup failed for %s: %s", config.name, e.msg);
-                }
-                // Don't reconnect — the new engine owns this network now.
-                // Force the outer loop to exit by setting shutdown + breaking.
-                isShutdownRequested = true;
-                // Best-effort close. transportClose() handles adoptedSocket.
-                try transportClose(); catch (Exception) {}
-                logInfo("Post-handoff: %s closed by OLD engine", config.name);
-                logJsonMap("info", "handoff",
-                    "Post-handoff: " ~ config.name ~ " closed by OLD engine",
-                    ["network": config.name,
-                     "event": "post_handoff_quit"]);
-                break;
-            }
+            // The detach closed our relay stream and the process is exiting:
+            // leave without reconnecting or emitting a disconnect.
+            if (detachedForHotSwap) return;
             processOutboundQueue();
 
             if (now - lastKeepalive >= 30) {
@@ -5876,6 +5190,9 @@ private void processEvents() {
                     "PING sent",
                     ["network": config.name,
                      "event": "ping_sent"]);
+                // Catch-up META write (member-list drift from other users'
+                // JOIN/PART/NICK, which do not trigger a write of their own).
+                publishMeta(false);
             }
             // Silent-drop early warning: a LAG probe is outstanding and no
             // PONG (or any data, which also resets the PONG clock) has
@@ -6067,8 +5384,7 @@ private void processEvents() {
         // data loop) exits without throwing (squashed ERROR path).
         // Without this, the old attempt card stays "Connected" while
         // a new reconnect cycle silently opens a second card.
-        import core.atomic : atomicLoad;
-        if (atomicLoad(postHandoffQuitAtMs) == 0 && !disconnectedEmitted) {
+        if (!detachedForHotSwap && !disconnectedEmitted) {
             disconnectedEmitted = true;
             try eventChannel.put(IRCRawEvent.makeDisconnected(
                 config.name, config.id.toString(), text));
@@ -6169,6 +5485,7 @@ private void processEvents() {
                     if (sameNick(event.nick, sessionNick)) {
                         // Confirmed: the throttle retry must not re-ask.
                         clearPendingJoin(chan);
+                        metaDirty = true;
                         // Our own JOIN echo is the one line that reliably
                         // carries the `nick!user@host` other clients see —
                         // 396 RPL_VISIBLEHOST only gives the host. The
@@ -6265,6 +5582,7 @@ private void processEvents() {
                     auto chan = normalizeChannelName(params[0]);
                     if (sameNick(event.nick, sessionNick)) {
                         channelState.remove(chan);
+                        metaDirty = true;
                         channelUsers.remove(chan);
                         channelTopics.remove(chan);
                         auto i = config.autoJoinChannels.countUntil(chan);
@@ -6291,6 +5609,7 @@ private void processEvents() {
                     auto targetNick = params[1];
                     if (targetNick == sessionNick) {
                         channelState.remove(chan);
+                        metaDirty = true;
                         channelUsers.remove(chan);
                         channelTopics.remove(chan);
                         auto i = config.autoJoinChannels.countUntil(chan);
@@ -6344,11 +5663,13 @@ private void processEvents() {
             case "305": // RPL_UNAWAY — no longer away
                 isAway = false;
                 awayMessage = "";
+                metaDirty = true;
                 break;
 
             case "306": // RPL_NOWAWAY — marked as away
                 isAway = true;
                 awayMessage = event.text;
+                metaDirty = true;
                 break;
 
             case "421": { // ERR_UNKNOWNCOMMAND — or a JOIN throttle wearing its clothes
@@ -6439,10 +5760,12 @@ private void processEvents() {
                     if (sameNick(event.nick, sessionNick)) {
                         isSelf = true;
                         sessionNick = newNick;
+                        metaDirty = true;
                         persistNick(sessionNick);
                     } else if (optimisticNickOld.length > 0 && sameNick(event.nick, optimisticNickOld)) {
                         isSelf = true;
                         sessionNick = newNick;
+                        metaDirty = true;
                         optimisticNickOld = "";
                         persistNick(sessionNick);
                     }
@@ -6959,7 +6282,7 @@ private void processEvents() {
                     applyIsupport(serverFeatures, isupportMap, token);
                     if (isupportMap.length != before) mapChanged = true;
                 }
-                if (mapChanged) publishIsupportEvent();
+                if (mapChanged) { publishIsupportEvent(); metaDirty = true; }
                 break;
 
             // ── CTCP ──────────────────────────────────────────────────────────
@@ -8009,33 +7332,7 @@ private void processEvents() {
         // length, and it charges them for our PING/WHO/JOIN/MODE traffic
         // too — so the bucket has to see every line, not just paced ones.
         if (floodTrusted) cmdBucket.record(unixMsNow(), trustedRate);
-        if (tlsStream !is null) {
-            try {
-                tlsStream.write((line ~ "\r\n").dup);
-                tlsStream.flush();
-            } catch (Exception e) {
-                // The TLS stream is now in an unrecoverable state. Release
-                // it so the next writeRaw() falls into the transportAlive
-                // branch and the connection state machine can react via
-                // handleDisconnection(), instead of silently looping on the
-                // same dead stream and flooding the consumer with identical
-                // "Failed to parse command" warnings for every queued msg.
-                logJsonMap("error", "connection",
-                    "TLS write failed — marking stream dead",
-                    [
-                        "network":   config.name,
-                        "networkId": config.id.toString(),
-                        "error":     e.msg,
-                        "event":     "tls_write_fail"
-                    ]);
-                logWarn("writeRaw: TLS write failed for %s (%s) — stream torn down",
-                    config.name, e.msg);
-                try { tlsStream.finalize(); } catch (Exception) {}
-                try { tlsStream.destroy(); } catch (Exception) {}
-                tlsStream = null;
-                throw e;
-            }
-        } else if (transportAlive) {
+        if (transportAlive) {
             try transportWrite(line);
             catch (Exception e) {
                 logJsonMap("error", "connection",
@@ -8087,6 +7384,9 @@ private void processEvents() {
     // ── Disconnect / cleanup ──────────────────────────────────────────────────
 
     private void handleDisconnection() {
+        // A hot-swap detach is not a disconnect: the session lives on in the
+        // holder and the next engine re-attaches. Nothing to emit or reset.
+        if (detachedForHotSwap) return;
         withSpan("irc.disconnect", ["network": config.name, "reason": lastDisconnectReason], (ref Span s) {
             // Captured before resetConnectionTelemetry() zeroes them: the
             // "disconnected" log below is the only forensic record of how
@@ -8100,15 +7400,21 @@ private void processEvents() {
             const whoOutAtDrop   = whoOut;
             state = ConnectionState.disconnected;
             resetConnectionTelemetry();
-            try {
-                if (tlsStream) {
-                    tlsStream.finalize();
-                    tlsStream.destroy();
-                    tlsStream = null;
-                }
-            } catch (Exception e) {
-                logWarn("Error cleaning up TLS stream for %s: %s", config.host, e.msg);
-                tlsStream = null;
+            // When the relay ended from the holder's side (upstream EOF, TLS
+            // read error, detach timeout…) the holder knows why; surface that
+            // instead of the generic "Connection lost".
+            if (holderConnId.length && holder !is null) {
+                try {
+                    auto e = holder.info(holderConnId);
+                    if (e.state == "closed" && e.closeReason.length) {
+                        if (lastDisconnectReason.length == 0
+                            || lastDisconnectReason == "Connection closed unexpectedly"
+                            || lastDisconnectReason == "Connection lost")
+                            lastDisconnectReason = e.closeReason;
+                        try holder.forget(holderConnId); catch (Exception) {}
+                        holderConnId = "";
+                    }
+                } catch (Exception) {}
             }
             try {
                 transportClose();
@@ -8119,8 +7425,7 @@ private void processEvents() {
             // learns about the state transition, even when the disconnect
             // happens outside the catch block (e.g. processEvents data-loss
             // detection or handleServerError squashed ERROR).
-            import core.atomic : atomicLoad;
-            if (atomicLoad(postHandoffQuitAtMs) == 0 && !disconnectedEmitted) {
+            if (!disconnectedEmitted) {
                 disconnectedEmitted = true;
                 try eventChannel.put(IRCRawEvent.makeDisconnected(
                     config.name, config.id.toString(),
@@ -8130,12 +7435,9 @@ private void processEvents() {
             // W1-T01: structured fail-info emit. Sits next to the legacy
             // DISCONNECTED event so the frontend's `applyFail` and the
             // legacy `disconnectReason` write can co-exist (per plan R2
-            // dual-emit). Skipped on post-handoff exits because the
-            // disconnect is intentional and the new engine already has
-            // the socket — emitting a fail would surface a phantom
-            // "Disconnected" banner to the user mid-handoff.
+            // dual-emit).
             //
-            // W1-T01-rev1: also skip when the user (or admin) called
+            // W1-T01-rev1: skip when the user (or admin) called
             // stop() — `isShutdownRequested == true` means the
             // disconnect was intentional and the frontend should see
             // the no-fail "disconnected" branch instead of a
@@ -8144,7 +7446,7 @@ private void processEvents() {
             // CONNECTION_FAIL event + a populated snap.failInfo,
             // leaving the banner stuck on the user until the next
             // successful reconnect.
-            if (atomicLoad(postHandoffQuitAtMs) == 0 && !isShutdownRequested) {
+            if (!isShutdownRequested) {
                 emitConnectionFail(
                     lastDisconnectReason.length > 0 ? lastDisconnectReason : "connection_lost",
                     lastErrorText);
@@ -8195,37 +7497,13 @@ private void processEvents() {
     }
 
     private size_t readFromStream(ubyte[] buffer, Duration timeout = 0.seconds) {
-        if (tlsStream !is null) {
-            // TLS path. NEVER touch the TLS stream unless bytes are already
-            // pending: `tlsStream.leastSize` (SSL_peek) and `read` (SSL_read)
-            // pull from vibe's BIO, whose `onBioRead` calls
-            // `TCPConnection.leastSize`, which blocks for `readTimeout`
-            // (`Duration.max` after the SOCKS handshake) until the peer sends
-            // a byte. With a silent peer that parked processEvents() inside
-            // OpenSSL indefinitely: no 30 s keepalive PING, no PONG timeout,
-            // no idle reaper — the drop was only noticed hours later when a
-            // FIN finally arrived or a user write failed (SuperNets
-            // 2026-09-09: dataAgeSecs 6098 / 7902 at disconnect). The same
-            // stall hit the registration loop during the BLCKND outage.
-            //
-            // `dataAvailableForRead` is SSL_pending || waitForData(0): never
-            // blocks. When nothing is pending, wait on the raw socket for the
-            // caller's timeout (0 in processEvents → immediate wouldBlock).
-            // `noMoreData` (peer FIN) deliberately falls through so SSL_read
-            // surfaces the close as the usual "closed by peer" exception.
-            if (!tlsStream.dataAvailableForRead) {
-                import vibe.core.net : WaitForDataStatus;
-                if (connection.waitForDataEx(timeout) == WaitForDataStatus.timeout)
-                    return 0;
-            }
-            return safeTLSRead(tlsStream, buffer);
-        }
-        if (adoptedSocket !is null) return adoptedSocket.read(buffer);
-        // Plain TCP: gate on waitForData() with a (potentially zero) timeout.
-        // Calling connection.read(IOMode.once) with no data available causes
-        // the vibe.d read loop to busy-poll until readTimeout expires on this
-        // platform (cfrunloop/kqueue), burning a full CPU core per idle
-        // connection.  Only enter read() when data is buffered.
+        // The transport is always the holder relay (plain bytes over a vibe
+        // TCPConnection; TLS lives in the holder). Gate on waitForData() with
+        // a (potentially zero) timeout: calling connection.read(IOMode.once)
+        // with no data available makes the vibe.d read loop busy-poll until
+        // readTimeout expires on this platform (cfrunloop/kqueue), burning a
+        // full CPU core per idle connection. Only enter read() when data is
+        // buffered.
         //
         // During registration (performRegistration) we pass a non-zero timeout
         // so the fiber actually blocks until data arrives.  During the main

@@ -96,152 +96,6 @@ void startControlConsumer(ref EngineContext ctx) {
     });
 }
 
-// ── Graceful reload plumbing ───────────────────────────────────────────────
-//
-// The control consumer runs on its own vibe.d fiber. The actual handoff
-// (pausing every connection, transferring FDs, etc.) needs to happen
-// in a coordinated way that the rest of the engine can observe. We use
-// a shared atomic flag and a one-shot callback registered by
-// `app_engine.d`.
-//
-// Flow:
-//   1. Watch-engine sends `gracefulReload` to irc:control:<serverId>
-//   2. This consumer flips `g_handoffRequested = true` and stores the
-//      handoff parameters
-//   3. The main loop in `app_engine.d` checks the flag and invokes
-//      `g_handoffCallback`, which is responsible for the actual
-//      pause/snapshot/serve/done cycle.
-//   4. After handoff completes, the engine exits with rc=0 (clean
-//      shutdown), the supervisor respawns the new binary.
-
-private class HandoffRequest {
-    bool pending;
-    int newEnginePid;
-    string socketPath;
-    long deadlineMs;
-}
-
-private __gshared HandoffRequest g_handoffRequest;
-
-/// Callback signature: invoked from the main loop on receipt of a
-/// gracefulReload control message. Returns true on success (engine
-/// will exit cleanly), false on failure (engine continues running).
-private alias HandoffCallback = bool delegate();
-
-private __gshared HandoffCallback g_handoffCallback;
-
-/// Check whether a handoff has been requested. If so, consume the
-/// request (returns true once) and populate `newEnginePid`/
-/// `socketPath`/`deadlineMs` for the caller. Thread-safe.
-bool consumeHandoffRequest(out int newEnginePid, out string socketPath, out long deadlineMs) {
-    import core.atomic : atomicLoad;
-    if (g_handoffRequest is null || !atomicLoad(g_handoffRequest.pending)) return false;
-    synchronized (g_handoffRequest) {
-        if (!g_handoffRequest.pending) return false;
-        newEnginePid = g_handoffRequest.newEnginePid;
-        socketPath   = g_handoffRequest.socketPath;
-        deadlineMs   = g_handoffRequest.deadlineMs;
-        g_handoffRequest.pending = false;
-    }
-    return true;
-}
-
-/// Register the callback that performs the actual handoff. Called
-/// once at startup by `app_engine.d`.
-void setHandoffCallback(HandoffCallback cb) {
-    g_handoffCallback = cb;
-    if (g_handoffRequest is null) g_handoffRequest = new HandoffRequest();
-}
-
-private void handleGracefulReload(ref EngineContext ctx, ControlMessage msg) {
-    int newPid = 0;
-    string socketPath = "";
-    long deadlineMs = 0;
-    if (msg.config.type == Json.Type.undefined) return;
-    // Numeric values in our wire format are always JSON ints.
-    // The `Json.Type` enum has trailing underscores on some members
-    // (`int_`, `null_`) which trip the D parser in some contexts; we
-    // compare against the underlying integer value directly.
-    // The enum order is: undefined=0, null_=1, bool_=2, int_=3,
-    // bigInt=4, float_=5, string=6, array=7, object=8.
-    enum TYPE_INT = 3;
-    enum TYPE_STRING = 6;
-    // Access individual fields via Json.opIndex(string). Missing keys
-    // yield a Json with .type == .undefined; we guard on that.
-    if (msg.config.type == Json.Type.undefined) return;
-    Json pidV, pathV, dlV;
-    try { pidV = msg.config["newEnginePid"]; } catch (Exception) {}
-    try { pathV = msg.config["socketPath"]; } catch (Exception) {}
-    try { dlV = msg.config["deadlineMs"]; } catch (Exception) {}
-    if (pidV.type == cast(Json.Type) TYPE_INT) newPid = cast(int) pidV.get!long;
-    if (pathV.type == cast(Json.Type) TYPE_STRING) socketPath = pathV.get!string;
-    if (dlV.type == cast(Json.Type) TYPE_INT) deadlineMs = dlV.get!long;
-    if (socketPath.length == 0) {
-        logError("gracefulReload: missing socketPath");
-        return;
-    }
-    // `newEnginePid` is informational only (we don't use it for FD
-    // transfer) — the *old* engine never references it. We accept
-    // 0 as "unknown" so the Makefile doesn't have to look up its
-    // own pid and stuff it into the control message.
-    if (newPid < 0) newPid = 0;
-    logInfo("gracefulReload requested: newPid=%d socketPath=%s deadlineMs=%d",
-        newPid, socketPath, deadlineMs);
-    logInfo("gracefulReload: invoking handoff callback (pending=%s, cb=%s)",
-        g_handoffRequest.pending, g_handoffCallback !is null);
-    if (g_handoffRequest is null) g_handoffRequest = new HandoffRequest();
-    synchronized (g_handoffRequest) {
-        if (g_handoffRequest.pending) {
-            logInfo("gracefulReload: handoff already in progress, ignoring");
-            return;
-        }
-        g_handoffRequest.pending       = true;
-        g_handoffRequest.newEnginePid  = newPid;
-        g_handoffRequest.socketPath    = socketPath;
-        g_handoffRequest.deadlineMs    = deadlineMs;
-    }
-    // Invoke the handoff callback synchronously. This blocks the
-    // control-consumer fiber but that's fine — the consumer is the
-    // only one watching this control queue, and a brief block
-    // doesn't drop any messages (BLPOP will time out and retry).
-    if (g_handoffCallback) {
-        try {
-            g_handoffCallback();
-        } catch (Exception e) {
-            logError("Handoff callback threw: %s", e.msg);
-        }
-    } else {
-        logError("gracefulReload: no handoff callback registered; engine will exit normally");
-    }
-}
-
-/// Handle a `beginExecReload` control message. This is the
-/// zero-disconnect hot-reload path: pause all clients, snapshot state,
-/// clear O_CLOEXEC on IRC socket FDs, write a checkpoint file, then
-/// replace the process image via execve(2).
-///
-/// This function NEVER returns on success — the process is replaced
-/// in-place by the new binary. The new binary detects the exec-reload
-/// marker and reads the checkpoint file to restore its state.
-private void handleExecReload(ref EngineContext ctx, ControlMessage msg) {
-    import ircfiber.engine.reload_orchestrator : serveExecReload;
-
-    if (auto binP = "binary" in msg.config) {
-        const binVal = *binP;
-        if (binVal.type == Json.Type.string) {
-            auto binary = binVal.get!string;
-            logInfo("beginExecReload: target binary=%s", binary);
-            try {
-                serveExecReload(ctx, binary);
-            } catch (Exception e) {
-                logError("beginExecReload failed: %s", e.msg);
-            }
-            return;
-        }
-    }
-    logError("beginExecReload: missing or invalid 'binary' field in msg.config");
-}
-
 /**
  * Start command consumers for networks assigned to this server.
  * 
@@ -266,7 +120,7 @@ void spawnNetworkCommandConsumer(ref EngineContext ctx, string networkId) {
             try {
                 // If `addNetwork`/`reconnectNetwork` control handlers
                 // haven't finalized the network yet (race vs. `loadNetworks`
-                // at boot, vs. transient state during handoff), wait it out
+                // at boot, vs. transient state during a hot swap), wait it out
                 // instead of exiting the loop. `break` here used to leak
                 // the consumer forever for any network added after a fresh
                 // engine start, leaving WS-queued cmds stuck in
@@ -347,31 +201,6 @@ private void handleControlMessage(ref EngineContext ctx, ControlMessage msg) {
     logInfo("Control message [server=%s]: %s network=%s", ctx.localServer.serverId, msg.action, msg.networkId);
 
     switch (msg.action) {
-        case "gracefulReload":
-            // The `make watch-engine` Makefile target (and external
-            // tools) sends this control message to ask the engine to
-            // hand off its live IRC connections to a freshly-built
-            // binary instead of exiting. The new engine is started as
-            // a *child* of the old one with the same `serverId`, so
-            // the gateway sees no disruption.
-            //
-            // Expected msg fields:
-            //   msg.config["newEnginePid"]   = JSON integer (pid_t)
-            //   msg.config["socketPath"]     = JSON string
-            //   msg.config["deadlineMs"]     = JSON integer (ms)
-            handleGracefulReload(ctx, msg);
-            break;
-        case "beginExecReload":
-            // Zero-disconnect hot-reload via exec(2). Replaces the
-            // current process image with `msg.config["binary"]`. The
-            // new binary inherits the IRC socket FDs (after we clear
-            // O_CLOEXEC on them) so the TCP connection survives and
-            // the IRC server sees no disconnect.
-            //
-            // Expected msg fields:
-            //   msg.config["binary"] = JSON string (path to new binary)
-            handleExecReload(ctx, msg);
-            break;
         case "addNetwork":
             if (msg.config.type != Json.Type.undefined) {
                 auto cfg = parseNetworkConfig(msg.config);

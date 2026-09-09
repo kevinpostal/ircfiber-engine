@@ -30,6 +30,8 @@ import ircfiber.db.network : NetworkRepository;
 import ircfiber.db.user : UserRepository;
 import ircfiber.db.messages : MessageRepository;
 import ircfiber.redis.protocol : RedisKeys, StateTTL;
+import ircfiber.engine.holder_client : HolderClient, HolderEntry, HolderUnavailableException;
+import ircfiber.engine.session_snapshot : SessionSnapshot, fromJSON;
 
 /// Context holding all engine dependencies.
 struct EngineContext {
@@ -49,6 +51,8 @@ struct EngineContext {
     ServerRegistry serverRegistry;  // NEW
     /// This engine's server identity.
     ConnectionServer localServer;   // NEW: this engine's identity
+    /// Client of this engine's connection holder (owns every IRC socket).
+    HolderClient holder;
 }
 
 /**
@@ -100,28 +104,16 @@ EngineContext bootstrapEngine() {
         if (qIdx >= 0) mongoDbName = mongoDbName[0 .. qIdx];
         if (mongoDbName.length == 0) mongoDbName = "ircfiber";
     }
-    // adopts live connections from the old engine. The 30-second
-    // retry delay would cause the handoff protocol to time out.
-    // We try once and warn on failure instead.
-    if (environment.get("IRCFIBER_RELOAD_FROM_PID", "").length > 0) {
+    foreach (attempt; 0 .. 30) {
         try {
             AppMongoConnection.connect(mongoUrl, mongoDbName);
-            logInfo("MongoDB connected during handoff boot");
+            break;
         } catch (Exception e) {
-            logWarn("MongoDB not available during handoff: %s — proceeding without persistence", e.msg);
-        }
-    } else {
-        foreach (attempt; 0 .. 30) {
-            try {
-                AppMongoConnection.connect(mongoUrl, mongoDbName);
-                break;
-            } catch (Exception e) {
-                if (attempt == 29) {
-                    throw new Exception("MongoDB connection failed after 30 attempts: " ~ e.msg);
-                } else {
-                    logInfo("MongoDB connection attempt %d failed (%s), retrying in 1s...", attempt + 1, e.msg);
-                    sleep(1.seconds);
-                }
+            if (attempt == 29) {
+                throw new Exception("MongoDB connection failed after 30 attempts: " ~ e.msg);
+            } else {
+                logInfo("MongoDB connection attempt %d failed (%s), retrying in 1s...", attempt + 1, e.msg);
+                sleep(1.seconds);
             }
         }
     }
@@ -145,18 +137,43 @@ EngineContext bootstrapEngine() {
 
     NetworkRepository.initRedis(redis);
 
+    // ── Connection holder ─────────────────────────────────────────
+    // The holder owns every IRC socket; the engine attaches to it. Boot
+    // blocks until the control session is up (≤ IRCFIBER_HOLDER_CONNECT_
+    // TIMEOUT_SECS, then exit 75 so the restart policy retries); a
+    // protocol/serverId mismatch exits 78.
+    HolderClient holder;
+    try {
+        holder = new HolderClient(serverId);
+    } catch (Exception e) {
+        logError("Invalid IRCFIBER_HOLDER_ADDR: %s", e.msg);
+        import core.stdc.stdlib : exit;
+        exit(78);
+    }
+    holder.connectControl();
+    size_t heldLive;
+    try {
+        foreach (e; holder.list()) if (e.state == "open") heldLive++;
+    } catch (Exception e) {
+        logWarn("Holder LIST failed at boot (%s) — assuming no live sessions", e.msg);
+    }
+
     // ── Bootstrap-time namespace purge (Layer 3) ─────────────────
     // Wipes `*:<serverId>:*` keys + companion keys before this engine
     // registers itself. Prevents "same serverId, new epoch" from inheriting
     // 40+ fossilized keys from a prior boot (the exact failure mode that
     // built up testengine1's garbage pile on Jun 22).
     //
-    // Skipped on handoff boots (`IRCFIBER_RELOAD_FROM_PID` set) so
-    // adopted sockets keep their state.
+    // Skipped when the holder still carries live sessions for this engine
+    // (hot swap / crash restart): their state is about to be re-attached.
     // Override with IRCFIBER_BOOTSTRAP_PURGE=0 to disable (debugging).
-    if (environment.get("IRCFIBER_RELOAD_FROM_PID", "").length == 0) {
+    {
         const purgeEnv = environment.get("IRCFIBER_BOOTSTRAP_PURGE", "1");
-        if (purgeEnv != "0" && purgeEnv != "false") {
+        if (purgeEnv == "0" || purgeEnv == "false") {
+            logInfo("Bootstrap purge: disabled by IRCFIBER_BOOTSTRAP_PURGE");
+        } else if (heldLive > 0) {
+            logInfo("Bootstrap purge: skipped, holder holds %d live sessions", heldLive);
+        } else {
             try {
                 const purged = purgeLocalServerNamespace(redis.getDb(), serverId);
                 if (purged > 0)
@@ -173,7 +190,7 @@ EngineContext bootstrapEngine() {
     logInfo("Bootstrap: BufferManager created");
     auto eventChannel = createChannel!IRCRawEvent();
     logInfo("Bootstrap: eventChannel created");
-    auto connManager = new ConnectionManager(eventChannel, redis, serverId);
+    auto connManager = new ConnectionManager(eventChannel, redis, serverId, holder);
     logInfo("Bootstrap: ConnectionManager created");
     auto networkRepo = new NetworkRepository();
     auto messageRepo = new MessageRepository();
@@ -250,7 +267,7 @@ EngineContext bootstrapEngine() {
     logInfo("Bootstrap: network loading deferred to event loop");
 
     return EngineContext(connManager, redis, bufferManager, messageRepo, networkRepo,
-        eventChannel, serverRegistry, localServer);
+        eventChannel, serverRegistry, localServer, holder);
 }
 
 /// Load networks from MongoDB and start IRC clients.
@@ -275,7 +292,27 @@ void loadNetworks(ref EngineContext ctx) {
     auto allNetworks = ctx.networkRepo.findAll();
     logInfo("Network loading: %d networks from MongoDB", allNetworks.length);
 
+    // Sessions the holder kept across the restart (hot swap / crash),
+    // indexed by networkId. An `open` entry wins over retained `closed`
+    // ones; every entry not consumed below is cleaned up afterwards.
+    HolderEntry[string] held;
+    HolderEntry[] heldAll;
+    if (ctx.holder !is null) {
+        try heldAll = ctx.holder.list();
+        catch (Exception e) logWarn("Network loading: holder LIST failed (%s) — dialing every network fresh", e.msg);
+    }
+    foreach (e; heldAll) {
+        auto nid = e.tag.networkId;
+        if (nid.length == 0) continue;
+        if (auto p = nid in held) { if (p.state == "open" || e.state != "open") continue; }
+        held[nid] = e;
+    }
+    bool[string] consumed;
+    if (heldAll.length)
+        logInfo("Network loading: holder has %d session(s) for %d network(s)", heldAll.length, held.length);
+
     int loadedCount = 0;
+    int attachedCount = 0;
     int skippedCount = 0;
     int orphanCount = 0;
     auto serverId = ctx.localServer.serverId;
@@ -345,7 +382,45 @@ void loadNetworks(ref EngineContext ctx) {
                 skippedCount++;
                 continue;
             }
-            ctx.connManager.addNetwork(nw.config, nw.userId);
+            const nid = nw.config.id.toString();
+            bool attached = false;
+            if (auto e = nid in held) {
+                consumed[e.id] = true;
+                if (e.state == "open") {
+                    SessionSnapshot snap;
+                    bool usable = false;
+                    if (e.hasMeta) {
+                        try { snap = fromJSON(e.meta); usable = snap.wasConnected; }
+                        catch (Exception ex) logWarn("Held session %s for %s has unreadable META (%s) — re-dialing", e.id, nw.config.name, ex.msg);
+                    }
+                    if (usable) {
+                        logJsonMap("info", "connection", "Attaching to held session",
+                            ["network": nw.config.name, "holderId": e.id,
+                             "graceful": snap.graceful ? "true" : "false",
+                             "connectedAtMs": e.connectedAtMs.to!string, "event": "attach_start"]);
+                        ctx.connManager.attachNetwork(nw.config, nw.userId, *e, snap);
+                        attached = true;
+                        attachedCount++;
+                    } else {
+                        // The previous engine died before registration finished
+                        // (or never wrote META): the socket is not a usable
+                        // session. Close it and dial fresh.
+                        logInfo("Held session %s for %s was never registered — closing and re-dialing", e.id, nw.config.name);
+                        try ctx.holder.close(e.id, "engine restarted"); catch (Exception ex) logWarn("holder CLOSE %s failed: %s", e.id, ex.msg);
+                    }
+                }
+            }
+            if (!attached) {
+                ctx.connManager.addNetwork(nw.config, nw.userId);
+                if (auto e = nid in held) if (e.state == "closed") {
+                    // Dropped while no engine was reading: tell the user why
+                    // before the fresh dial's timeline starts.
+                    if (auto client = ctx.connManager.getClient(nw.config.id))
+                        client.emitLog("warn", "Connection dropped while the engine was down: "
+                            ~ (e.closeReason.length ? e.closeReason : "unknown reason"));
+                    try ctx.holder.forget(e.id); catch (Exception ex) logWarn("holder FORGET %s failed: %s", e.id, ex.msg);
+                }
+            }
             loadedCount++;
             // Spawn the command consumer for this network so WS-queued
             // cmds (join, msg, part) don't sit in irc:cmd:<server>:<nid>
@@ -360,11 +435,28 @@ void loadNetworks(ref EngineContext ctx) {
         }
     }
 
+    // Whatever the holder still has that no loaded network consumed: the
+    // network was disabled, deleted or reassigned while the engine was down.
+    foreach (e; heldAll) {
+        if (e.id in consumed) continue;
+        try {
+            if (e.state == "open") {
+                logInfo("Closing held session %s (%s): network no longer assigned here", e.id, e.tag.name);
+                ctx.holder.close(e.id, "network no longer assigned");
+            } else {
+                ctx.holder.forget(e.id);
+            }
+        } catch (Exception ex) {
+            logWarn("Holder cleanup of %s failed: %s", e.id, ex.msg);
+        }
+    }
+
     if (orphanCount > 0) {
         logWarn("Network loading: skipped %d orphaned network(s) with no valid owner " ~
             "(disabled in MongoDB)", orphanCount);
     }
-    logInfo("Network loading: loaded %d networks (skipped=%d disabled)", loadedCount, skippedCount);
+    logInfo("Network loading: loaded %d networks (attached=%d to held sessions, skipped=%d disabled)",
+        loadedCount, attachedCount, skippedCount);
 
     ctx.connManager.startDeferredClients();
 }
@@ -398,7 +490,7 @@ void startHeartbeatTask(ref EngineContext ctx) {
     runTask(() nothrow {
         // Bootstrap drain recovery: on the first heartbeat cycle,
         // clear any stale draining flag that may have been left by a
-        // previous instance of this server that crashed mid-handoff.
+        // previous instance of this server that crashed mid-drain.
         // We do this before the main loop so the gateway sees the
         // cleared state immediately, not 10s later.
         int beat = 0;
@@ -433,6 +525,25 @@ void startHeartbeatTask(ref EngineContext ctx) {
 
                 ctx.localServer.lastHeartbeat = Clock.currTime.toUnixTime!long * 1000;
                 ctx.serverRegistry.updateHeartbeat(ctx.localServer.serverId);
+                // Holder identity/counters next to the heartbeat so operators
+                // can see the holder every engine rides (skipped when the
+                // holder is unreachable — the engine's own beat still counts).
+                if (ctx.holder !is null) {
+                    try {
+                        auto hs = ctx.holder.status();
+                        auto key = RedisKeys.server(ctx.localServer.serverId);
+                        auto rdb = ctx.redis.getDb();
+                        rdb.hset(key, "holderVersion", hs.holder);
+                        rdb.hset(key, "holderPid", hs.pid.to!string);
+                        rdb.hset(key, "holderOpen", hs.open.to!string);
+                        rdb.hset(key, "holderAttached", hs.attached.to!string);
+                        rdb.hset(key, "holderDetached", hs.detached.to!string);
+                    } catch (HolderUnavailableException) {
+                    } catch (Throwable e) {
+                        string m; try { m = e.msg; } catch (Throwable) { m = "unknown"; }
+                        try logDebug("Heartbeat: holder status skipped: %s", m); catch (Throwable) {}
+                    }
+                }
 
                 // Layer 1: TTL bump. Extend the lifetime of every state
                 // key (irc:state, scrollback, dedup) so a dead engine

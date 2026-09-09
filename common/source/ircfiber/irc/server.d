@@ -45,6 +45,15 @@ struct ConnectionServer {
     /// Whether the engine is in draining state (handoff in progress, about to exit).
     /// Set by markDraining() during graceful handoff; cleared by the next heartbeat.
     bool draining;
+    /// Unix timestamp (ms) at which this engine detached from its IRC
+    /// sessions for a hot swap (engine SIGTERM). Set by
+    /// `ServerRegistry.markHotSwap`, cleared by the next heartbeat or
+    /// re-registration. While set and within `HOTSWAP_GRACE_MS` the server
+    /// counts as alive even though no heartbeat arrives, so the gateway and
+    /// the other engines do not reassign its networks mid-swap. Stored as
+    /// its own Redis hash field (like `lastHeartbeat`) — deliberately NOT
+    /// part of the `data` JSON, which the engine rewrites every heartbeat.
+    long hotswapAt;
 
     /// Network IDs whose IRC registration timed out
     /// (REGISTRATION_OVERALL_TIMEOUT_SECS exceeded without 001). Surface so

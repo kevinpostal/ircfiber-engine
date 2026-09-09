@@ -11,7 +11,8 @@ import ircfiber.models.irc_event : IRCRawEvent;
 import ircfiber.models.network : Network, NetworkConfig;
 import ircfiber.irc.connection : PersistentIRCClient;
 import ircfiber.storage.redis : RedisStorage;
-import ircfiber.engine.handoff : HandoffState;
+import ircfiber.engine.holder_client : HolderClient, HolderEntry, AttachResult;
+import ircfiber.engine.session_snapshot : SessionSnapshot;
 import ircfiber.redis.protocol : RedisKeys;
 import ircfiber.logging : logJsonMap;
 import std.uuid : parseUUID;
@@ -41,12 +42,8 @@ final class ConnectionManager {
         /// Per-host circuit breakers for smart rate limiting.
         /// Keyed by host:port string (e.g. "irc.supernets.org:6697").
         HostCircuitBreaker[string] hostBreakers;
-        // TLS handoff records received during the handoff protocol.
-        // We defer the soft-reconnect until after the protocol's DONE
-        // marker, so the OLD engine can synchronously QUIT its live
-        // TLS socket before we attempt NICK (otherwise we collide and
-        // get a `_` suffix on every hot reload — bug Jul 4 2026).
-        HandoffRecord[] pendingHandoffRecords;
+        /// Client of this engine's connection holder (null only in tests).
+        HolderClient holder;
         /// Networks removed on this engine, `networkId` → unix ms.
         ///
         /// Stopping a client emits its farewell events (the QUIT echo and
@@ -61,10 +58,12 @@ final class ConnectionManager {
     }
 
     /// Creates a new connection manager with the given event channel.
-    this(Channel!IRCRawEvent eventChannel, RedisStorage redisStore = null, string sid = "") nothrow @safe {
+    this(Channel!IRCRawEvent eventChannel, RedisStorage redisStore = null, string sid = "",
+         HolderClient holderClient = null) nothrow @safe {
         this.mainEventChannel = eventChannel;
         this.redis = redisStore;
         this.serverId = sid;
+        this.holder = holderClient;
     }
 
     /// Networks whose IRC registration timed out (REGISTRATION_OVERALL_TIMEOUT_SECS
@@ -91,7 +90,7 @@ final class ConnectionManager {
             return;
         }
 
-        auto client = new PersistentIRCClient(config, mainEventChannel, redis, serverId, userId);
+        auto client = new PersistentIRCClient(config, mainEventChannel, redis, serverId, userId, holder);
         clients[key] = client;
         networkOwners[key] = userId;
         removedAtMs.remove(key);
@@ -110,7 +109,7 @@ final class ConnectionManager {
             return;
         }
 
-        auto client = new PersistentIRCClient(config, mainEventChannel, redis, serverId, userId);
+        auto client = new PersistentIRCClient(config, mainEventChannel, redis, serverId, userId, holder);
         clients[key] = client;
         networkOwners[key] = userId;
         client.start();
@@ -121,8 +120,10 @@ final class ConnectionManager {
     }
 
     /// Starts IRC clients for all networks that were added via addNetwork.
+    /// Clients attached to a held connection are already running.
     void startDeferredClients() {
         foreach (key, client; clients) {
+            if (client.getConnected) continue;
             client.start();
             logInfo("Started IRC client for %s", client.getConfig.name);
         }
@@ -196,7 +197,7 @@ final class ConnectionManager {
             if (!client.getConnected) continue;
             logInfo("Egress swap: bouncing %s so it re-dials through the new exit",
                 client.getConfig.name);
-            client.transportClose();
+            client.transportClose("egress retargeted");
             bounced++;
         }
         return bounced;
@@ -487,248 +488,137 @@ final class ConnectionManager {
         return (networkIdStr in clients) !is null;
     }
 
-    /// Shuts down all connections and clears state.
+    /// Decommission: QUIT every network, wait briefly for the servers to
+    /// close (so the holder sees upstream EOF and the UI gets the final
+    /// `ERROR :Closing Link`), then close whatever is still open through
+    /// the holder explicitly. Must run inside the event loop (the signal
+    /// watcher task drives it): the upstream sockets live in the holder
+    /// process, so nothing closes them "on exit" any more.
     void shutdown() {
+        import vibe.core.core : sleep;
+        import core.time : msecs;
         foreach (client; clients) {
             client.stop();
+        }
+        foreach (_; 0 .. 30) {
+            bool anyAlive;
+            foreach (client; clients) if (client.transportAlive) { anyAlive = true; break; }
+            if (!anyAlive) break;
+            sleep(100.msecs);
+        }
+        foreach (client; clients) {
+            try client.transportClose();
+            catch (Exception e) logWarn("shutdown: closing %s failed: %s", client.getConfig.name, e.msg);
         }
         clients = null;
         networkOwners = null;
     }
 
-    // ── Handoff API (engine reload) ──────────────────────────────────────────
+    // ── Hot-swap API (engine SIGTERM) ────────────────────────────────────────
 
-    /// Pause every connected client's event loop so a handoff can
-    /// capture a consistent snapshot of per-connection state. After
-    /// this call returns, no client will be performing I/O on its
-    /// socket. Caller MUST eventually call `resumeAllAfterHandoff()`
-    /// (or the engine will hang). Returns the list of clients paused
-    /// so the caller can iterate them in the same order.
-    PersistentIRCClient[] pauseAllForHandoff() {
+    /// Pause every client's event loop so the detach can publish an exact
+    /// snapshot of per-connection state. After this returns, no client is
+    /// performing I/O on its relay stream. Returns the clients paused so
+    /// the caller can iterate them in the same order.
+    PersistentIRCClient[] pauseAllForDetach() {
         PersistentIRCClient[] paused;
         foreach (key, client; clients) {
-            client.pauseForHandoff();
+            client.pauseForDetach();
             paused ~= client;
         }
-        // Give every event loop a chance to observe the pause. The
-        // loops check the counter at the next yield checkpoint; with
-        // PROCESS_READ_TIMEOUT_MS = 50ms worst case we wait a bit
-        // longer than that to be safe.
+        // Give every event loop a chance to observe the pause. The loops
+        // check the counter at the next yield checkpoint; with
+        // PROCESS_READ_TIMEOUT_MS = 50ms worst case we wait a bit longer
+        // than that to be safe.
         foreach (client; paused) {
-            client.waitForHandoffPause();
+            client.waitForDetachPause();
         }
         return paused;
     }
 
-    /// Release every client previously paused by
-    /// `pauseAllForHandoff()`. The clients resume I/O on the same
-    /// sockets — except those that have been adopted by a new engine,
-    /// which must be removed from the manager (via `removeNetwork`)
-    /// *before* this call to avoid double-using the FD.
-    void resumeAllAfterHandoff() {
-        foreach (key, client; clients) {
-            client.resumeAfterHandoff();
-        }
-    }
-
-    /// Build a (state, rawFd) pair for every connected client that
-    /// can be transferred (i.e. plain TCP, not TLS). TLS clients are
-    /// skipped — the new engine will soft-reconnect them.
-    HandoffRecord[] snapshotAllForHandoff() {
-        HandoffRecord[] out_;
-        foreach (key, client; clients) {
-            auto state = client.snapshotForHandoff();
-            // Override userId from the connection manager's authoritative
-            // map. The client doesn't know its owner — only the manager
-            // does via `networkOwners`. Without this fix, every handoff
-            // silently corrupts event routing by setting `networkOwners`
-            // to networkId→networkId instead of networkId→realUserUUID,
-            // causing `getOwnerId()` to return the wrong UUID and events
-            // to be published to the wrong Redis channel.
-            if (auto p = key in networkOwners) {
-                state.userId = (*p).toString();
-            }
-            int fd = -1;
-            if (state.transportWasPlain) {
-                fd = client.rawSocketFd();
-                if (fd < 0) {
-                    // Plain but not currently connected (e.g. mid-
-                    // reconnect). Tell the new engine to soft-reconnect.
-                    state.transportWasPlain = true;
-                    state.wasConnected = false;
-                }
-            }
-            out_ ~= HandoffRecord(state, fd);
-        }
-        return out_;
-    }
-
-    /// Mark every successfully handed-off client to QUIT and close
-    /// after the handoff pause is released. Called by the OLD engine's
-    /// `serveReload` after each record is ACK'd by the new engine.
-    ///
-    /// Without this, the OLD engine keeps its connection alive:
-    ///   - Plain TCP: the FD was transferred via SCM_RIGHTS, so the
-    ///     kernel-side socket is already gone in this process; the
-    ///     loop would spin reading a dead FD.
-    ///   - TLS: the FD was NOT transferred (TLS session state lives
-    ///     in userspace), so the new engine soft-reconnects with the
-    ///     same nick. The OLD engine's live TLS socket keeps the IRC
-    ///     server's nick registration alive → next connect gets a
-    ///     collision suffix (e.g. "Zod_").
-    ///
-    /// The flag is observed in `PersistentIRCClient.processEvents()`
-    /// after `handoffPauseCount` drops to zero, so the QUIT goes out
-    /// on the same socket before it closes — cleanly, no zombies.
-    void notifyHandoffComplete(HandoffRecord[] records) {
-        import std.datetime : Clock;
-        auto now = Clock.currTime.toUnixTime!long * 1000;
-        foreach (rec; records) {
-            const key = rec.state.config.id.toString();
-            if (auto p = key in clients) {
-                // For TLS handoffs the FD was NOT transferred — the OLD
-                // engine's live TLS socket still holds the IRC server's
-                // nick registration. Synchronously write QUIT now so the
-                // IRC server frees the nick BEFORE the new engine's
-                // soft-reconnect claims it. Without this the new engine
-                // races the OLD engine and falls back to a `_` suffix
-                // (`Zodiac` → `Zodiac_` → `Zodiac__`).
-                //
-                // Plain-TCP records already transferred the FD via
-                // SCM_RIGHTS; the OLD engine's socket is gone, so we
-                // just schedule the post-pause cleanup flag.
-                if (rec.fd < 0) {
-                    (*p).forcePostHandoffQuit(now);
-                    logInfo("Handoff: forced QUIT for TLS %s (live socket, fd not transferred)",
-                        rec.state.config.name);
-                } else {
-                    (*p).schedulePostHandoffQuit(now);
-                    logInfo("Handoff: scheduled QUIT for %s after handoff pause releases",
-                        rec.state.config.name);
-                }
-                logJsonMap("info", "handoff",
-                    "Post-handoff QUIT " ~ (rec.fd < 0 ? "forced" : "scheduled") ~
-                        " for " ~ rec.state.config.name,
-                    ["network": rec.state.config.name,
-                     "sessionNick": rec.state.sessionNick,
-                     "tls": (rec.fd < 0).to!string]);
+    /// Hot-swap detach of every client: publish META, close the relay
+    /// streams, leave every upstream socket with the holder. No QUIT, no
+    /// DISCONNECTED events. Bounded (each META write has a 10 s holder
+    /// timeout; the process exits right after this returns).
+    void detachAllForHotSwap() {
+        auto paused = pauseAllForDetach();
+        size_t live;
+        foreach (client; paused) {
+            try {
+                if (client.getConnected) live++;
+                client.detachForHotSwap();
+            } catch (Exception e) {
+                logWarn("detachForHotSwap failed for %s: %s", client.getConfig.name, e.msg);
             }
         }
+        logJsonMap("info", "connection",
+            "Detached all networks for hot swap",
+            ["clients": paused.length.to!string,
+             "live": live.to!string,
+             "event": "detach_all"]);
     }
 
-    /// Adopt a batch of handed-off connections. Each record contains
-    /// a serialised `HandoffState` and (optionally) a raw fd; TLS
-    /// records have fd == -1 and trigger a fresh `addNetwork` so
-    /// the new engine does a normal registration dance for them.
-    void adoptFromHandoff(HandoffRecord[] records) {
-        foreach (rec; records) {
-            HandoffState s = rec.state;
-            if (rec.fd < 0) {
-                // TLS / non-plain: queue the record so the soft-reconnect
-                // starts AFTER the handoff protocol completes. This is
-                // critical — if we soft-reconnect per-record, our NICK
-                // races the OLD engine's still-live TLS socket on the
-                // IRC server, hits 433, and falls back to a `_` suffix.
-                // The OLD engine's `notifyHandoffComplete` (called after
-                // the last ACK) now synchronously sends QUIT on its live
-                // TLS socket; `startPendingHandoffReconnects()` (called
-                // after we receive DONE) drains this queue.
-                logInfo("Handoff: TLS network %s queued for reconnect after handoff DONE (was nick=%s)",
-                    s.config.name, s.sessionNick);
-                pendingHandoffRecords ~= rec;
-                // Publish a synthetic DISCONNECTED event so the UI shows
-                // the brief transition before reconnecting.
-                try mainEventChannel.put(IRCRawEvent.makeDisconnected(
-                    s.config.name, s.config.id.toString(),
-                    "TLS connection requires soft-reconnect during engine hot-reload"));
-                catch (Exception) {}
-                continue;
-            }
-            // Plain: build a fresh client wrapping the adopted fd.
-            auto key = s.config.id.toString();
-            auto client = new PersistentIRCClient(s.config, mainEventChannel, redis, serverId);
-            clients[key] = client;
-            networkOwners[key] = parseUUID(s.userId.length ? s.userId : s.config.id.toString());
-            client.adoptAndStart(rec.fd, s);
-        }
-    }
-
-    /// Drain TLS handoff records queued by `adoptFromHandoff`. Called
-    /// from `adoptFromOldEngine` after the protocol's DONE marker is
-    /// received — by then the OLD engine has synchronously sent QUIT
-    /// on its live TLS sockets (via `notifyHandoffComplete`), so the
-    /// IRC server has freed the nicks. Safe to start our soft-reconnects
-    /// now without colliding.
-    void startPendingHandoffReconnects() {
-        if (pendingHandoffRecords.length == 0) {
-            logInfo("Handoff: no pending TLS reconnects to drain");
+    /// Attach a network to a connection the holder kept across the engine
+    /// restart (planned hot swap or crash). Creates the client exactly like
+    /// `addNetwork`, attaches, and restores `snapshot`. `ERR busy` means
+    /// another engine process still holds the relay (a slow shutdown of
+    /// the previous engine): the client stays `disconnected` and retries
+    /// the attach every 5 s — it never dials fresh while an open entry
+    /// exists for the network, that would double-socket the server. Any
+    /// other attach error falls back to a fresh dial.
+    void attachNetwork(NetworkConfig config, UUID userId, HolderEntry entry, SessionSnapshot snapshot) {
+        import ircfiber.engine.holder_client : HolderErrorException, HolderUnavailableException;
+        import vibe.core.core : runTask, sleep;
+        import core.time : seconds;
+        auto key = config.id.toString();
+        if (key in clients) {
+            logWarn("Network %s already managed", config.name);
             return;
         }
-        logInfo("Handoff: draining %d pending TLS reconnect(s)", pendingHandoffRecords.length);
-        foreach (rec; pendingHandoffRecords) {
-            HandoffState s = rec.state;
-            // Mirror the original TLS soft-reconnect logic from
-            // adoptFromHandoff. Keep them in lock-step so any future
-            // change to the TLS soft-reconnect path applies to both
-            // code paths (cold-start via handoff and any future
-            // re-drain paths).
-            auto cfg = s.config;
-            // NOTE: we deliberately do NOT overwrite `cfg.nick` with
-            // `s.sessionNick` here. That would propagate a 433 collision
-            // fallback (e.g. `Zodiac__`) back into the in-memory config,
-            // and on the next cold reconnect the engine would use the
-            // fallback as its starting nick — locking the user out of
-            // their intended nick once it frees up. The new client will
-            // start from `cfg.nick` (the user's configured value) and
-            // re-derive `requestedNick` from it; if a 433 fallback occurs
-            // the new connection.d logic detects it via `requestedNick`
-            // and clears the persisted nick instead of locking it in.
-            try {
-                auto db = redis.getDb();
-                db.del(RedisKeys.networkNick(cfg.id.toString()));
-            } catch (Exception) {}
-            const uid = parseUUID(s.userId.length ? s.userId : s.config.id.toString());
-            // Schedule the soft-reconnect on a separate fiber so we can
-            // apply a brief settling delay. The OLD engine's QUIT
-            // (synchronously written by `notifyHandoffComplete`) is
-            // on the wire before we reach this point, but the IRC
-            // server's processing latency plus our TCP+TLS handshake
-            // time mean a back-to-back NICK could still hit 433 on a
-            // busy network. 500ms gives the server ample time to
-            // release the nick registration and propagate the QUIT
-            // ERROR + socket close back to the OLD engine (which is
-            // also exiting via the postHandoffQuitAtMs early-check
-            // in `processEvents`).
-            import vibe.core.core : runTask, sleep;
-            import core.time : msecs;
-            string netName = cfg.name;
-            string netNick = cfg.nick;
-            UUID netUserId = uid;
-            NetworkConfig netCfg = cfg;
-            void scheduleReconnect() nothrow {
-                try {
-                    try sleep(500.msecs); catch (Exception) {}
-                    logInfo("Handoff: TLS network %s soft-reconnecting via new engine (nick=%s)",
-                        netName, netNick);
-                    addAndStartNetwork(netCfg, netUserId);
-                } catch (Exception e) {
-                    logWarn("Handoff: failed to soft-reconnect %s: %s", netName, e.msg);
-                }
-            }
-            try runTask(&scheduleReconnect);
-            catch (Exception e) logWarn("Handoff: failed to schedule reconnect for %s: %s", netName, e.msg);
-        }
-        pendingHandoffRecords = [];
-    }
-}
+        auto client = new PersistentIRCClient(config, mainEventChannel, redis, serverId, userId, holder);
+        clients[key] = client;
+        networkOwners[key] = userId;
+        removedAtMs.remove(key);
 
-/// A single handoff record the manager consumes (state + optional
-/// raw FD). Differs from the wire-format `HandoffRecord` in
-/// `ircfiber.engine.handoff` — that one carries raw JSON + raw FDs;
-/// this one carries parsed state ready for `adoptFromHandoff()`.
-struct HandoffRecord {
-    /// Parsed handoff state consumed by `adoptFromHandoff()`.
-    HandoffState state;
-    /// Raw file descriptor, or -1 for TLS / soft-reconnect records.
-    int fd;
+        bool tryAttach() {
+            AttachResult r;
+            try {
+                r = holder.attach(entry.id);
+            } catch (HolderErrorException e) {
+                if (e.code == "busy") {
+                    logJsonMap("error", "connection", "Another engine holds this connection — not dialing",
+                        ["network": config.name, "holderId": entry.id, "event": "attach_busy"]);
+                    client.emitLog("error", "Another engine holds this connection — not dialing");
+                    return false;
+                }
+                logJsonMap("warn", "connection", "Attach failed — dialing fresh",
+                    ["network": config.name, "holderId": entry.id, "code": e.code, "err": e.msg,
+                     "event": "attach_fail"]);
+                client.start();
+                return true;
+            } catch (Exception e) {
+                logJsonMap("warn", "connection", "Attach failed — dialing fresh",
+                    ["network": config.name, "holderId": entry.id, "err": e.msg, "event": "attach_fail"]);
+                client.start();
+                return true;
+            }
+            client.attachHeld(r, snapshot, snapshot.graceful);
+            return true;
+        }
+
+        if (tryAttach()) return;
+        runTask(() nothrow {
+            while (true) {
+                try sleep(5.seconds); catch (Exception) {}
+                if (key !in clients || clients[key] !is client) return;
+                bool done;
+                try done = tryAttach();
+                catch (Exception e) {
+                    string m; try { m = e.msg; } catch (Exception) { m = "unknown"; }
+                    try logWarn("attach retry for %s failed: %s", config.name, m); catch (Exception) {}
+                }
+                if (done) return;
+            }
+        });
+    }
 }

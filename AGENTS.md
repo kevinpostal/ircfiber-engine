@@ -349,24 +349,18 @@ Five production bugs fixed in one pass. All time-to-connect measurements taken
 from the live OVH engine against meth.cat (remote, ngircd) and IRC Fiber
 (local, ergo-2.18.0).
 
-## Direct engine IRC connection
+## Engine IRC connections go through the holder
 
-The engine opens IRC TCP/TLS sockets directly via
-`happyEyeballsConnect()` and `createTLSStreamWithTimeout()` in
-`source/ircfiber/irc/connection.d`. No holder daemon, no Unix-domain IPC.
-When the engine restarts (hard restart via `docker restart`):
+The engine's transport is always a vibe `TCPConnection` relay stream to
+the connection holder (`ircfiber.engine.holder_client`); TLS, SOCKS5 and
+Happy Eyeballs live in `engine/holder/source/holder/dial.d`. Egress
+policy (Mullvad slots, pins, bans) stays in `connection.d`
+(`happyEyeballsConnect`), which issues one holder `DIAL` per candidate
+egress. When the engine restarts, the sessions stay open in the holder and
+the new engine re-attaches — see "Engine Lifecycle" below. Holder down ⇒
+connect attempts retry every 5 s (`holder_unavailable_retry`), never a
+direct dial.
 
-- **All networks (plain TCP and TLS)** disconnect and auto-reconnect via
-  the engine backoff loop. Users see a brief `Connecting…` / `Reconnecting…`
-  card. This is intentional — the `SCM_RIGHTS` FD-transfer handoff
-  (`source/ircfiber/engine/handoff.d`) was removed 2026-08-08 as legacy
-  fragile code (Tailscale-bind redis bug, stale `irc:control:ovh` LPUSH
-  failures). Single-host deploys do not need zero-disconnect.
-
-The archived handoff daemon lives under `archived/conn-holder/` and the
-removed `handoff.d` / `reload_orchestrator.d` / `exec_reload.d` are kept
-only for reference — do not reintroduce `IRCFIBER_RELOAD_FROM_PID` or
-`make engine-handoff`.
 
 - `parser-test`           — IRC line parser
 - `consumer-test`         — reconnect-dedup helpers
@@ -405,27 +399,37 @@ within 75s.
 
 ---
 
-# IRC Fiber — Engine Lifecycle (Hard Restart Only)
+# IRC Fiber — Engine Lifecycle (Hot Swap via Connection Holder)
 
-> **Handoff removed (2026-08-08).** The previous `SCM_RIGHTS` graceful
-> hot-reload (`engine-handoff`, `reload_orchestrator.d`, `handoff.d`,
-> `exec_reload.d`, `IRCFIBER_RELOAD_FROM_PID`, Unix socket at
-> `/tmp/ircfiber-handoff-<serverId>.sock`) has been deleted. It was
-> fragile, left stale `irc:control:ovh` LPUSH failures on hosts where
-> redis binds to Tailscale IP `198.51.100.1`, and is unnecessary for a
-> single-host deployment. **All engine deploys now use hard restart:**
-> `docker restart ircfiber-engine-ovh` (+ gateway). Plain/TLS IRC
-> connections will briefly disconnect and auto-reconnect via the engine
-> backoff loop. Use `make update` (gateway+engine) or `docker restart`
-> directly — never `make handoff` / `engine-handoff`.
+> **Since 2026-09-09 every engine deploy is a hot swap.** The
+> `irc-fiber-holder` process (`engine/holder/`, dub subpackage
+> `irc-fiber:holder`, container `ircfiber-holder-<id>` / k8s
+> `ircfiber-holder-*`) owns every IRC TCP/SOCKS5/TLS socket and relays
+> plaintext IRC to the engine over `IRCFIBER_HOLDER_ADDR`
+> (`unix:///run/ircfiber/holder.sock` on docker, `tcp://…:7690` + token on
+> k8s). The engine never opens IRC sockets itself (`HolderClient.dial`,
+> holder IPC protocol v1 in `source/ircfiber/engine/holder_client.d`).
+>
+> - **SIGTERM** (docker stop / recreate, k8s Recreate) = hot swap: the
+>   engine publishes each session's `SessionSnapshot` as holder META,
+>   closes its relay streams and exits; the registry keeps it healthy for
+>   `HOTSWAP_GRACE_MS` (180 s, `hotswapAt`). The next engine attaches
+>   (`ConnectionManager.attachNetwork` → `PersistentIRCClient.attachHeld`)
+>   — same signon time, no QUIT, no `Connecting…` card.
+> - **SIGINT** (`make engine-decommission`, `kill -INT`) = decommission:
+>   QUIT every network, unregister, publish `irc:shutdown`.
+> - Engine crashes survive too: the holder auto-answers `PING`, buffers
+>   inbound lines (≤ 4 MiB, ≤ 600 s) and the returning engine re-syncs
+>   member lists with `NAMES`.
+> - Redeploying the **holder** reconnects every network (`make ship-holder`
+>   prints that banner) — do it rarely.
 
-The files `source/ircfiber/engine/handoff.d`,
-`reload_orchestrator.d`, `exec_reload.d` and the `pauseForHandoff` /
-`adoptAndStart` / `forcePostHandoffQuit` paths in `connection.d` /
-`manager.d` are legacy and must not be reintroduced. The deploy
-playbooks `deploy-handoff.yml` and the `handoff` Makefile target are
-removed; they previously did `redis-cli LPUSH irc:control:ovh` without
-`-h 198.51.100.1` and always failed on OVH.
+The former `SCM_RIGHTS`/exec-reload handoff (`handoff.d`,
+`reload_orchestrator.d`, `exec_reload.d`, `adopted_socket.d`,
+`IRCFIBER_RELOAD_FROM_PID`, `/tmp/ircfiber-handoff-*.sock`) is deleted.
+A direct-dial fallback in the engine must never be added back: two
+processes dialing the same server double-socket it. Proof of the swap:
+`scripts/e2e/hot_swap.sh` (`PASS graceful` / `PASS crash`).
 
 # IRC Fiber — DM Persistence Invariant (2026-08-08)
 

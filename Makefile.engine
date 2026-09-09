@@ -108,8 +108,8 @@ AR := →
 .PHONY: build build-gateway build-engine build-release build-debug build-ldc2 janitor-migrate frontend frontend-build frontend-dev frontend-install
 
 .PHONY: dev dev-docker dev-live dev-live-tunnel debug debug-live debug-host debug-all stop
-.PHONY: engine engine-rebuild engine-handoff engine-handoff-redis engine-restart engine-test
-.PHONY: engine-start engine-stop engine-restart-docker
+.PHONY: engine engine-rebuild engine-restart engine-test
+.PHONY: engine-start engine-stop engine-restart-docker holder-logs holder-status
 .PHONY: gateway gateway-rebuild gateway-restart gateway-start
 .PHONY: up down gateway-up gateway-down engine-up engine-down engine-logs gateway-logs
 .PHONY: status logs logs-engine logs-gateway logs-supervisor crash-logs
@@ -118,7 +118,7 @@ AR := →
 .PHONY: start run run-tailnet run-local run-gateway run-engine
 .PHONY: down-tailnet restart-web restart-engine-tailnet
 
-.PHONY: test test-frontend test-all test-watch test-coverage test-lib test-client handoff-test exec-reload-test exec-reload-it clean fmt fmt-check lint deps-check
+.PHONY: test test-frontend test-all test-watch test-coverage test-lib test-client clean fmt fmt-check lint deps-check
 .PHONY: dscanner-install dscanner-all dscanner-syntax dscanner-lint dscanner-unused \
         dscanner-complexity dscanner-imports dscanner-fix dscanner-size dscanner-outline
 .PHONY: ensure-colima docker-ctx docker-up docker-down docker-logs docker-build \
@@ -368,11 +368,13 @@ debug-all: ensure-colima ## Component > Full stack: gateway + engine (both) — 
 		elif find engine/source common/source deploy/roles/engine/files -type f -newer "$$stamp_eng" 2>/dev/null | grep -q .; then build_eng=1; fi; \
 		if [ ! -f "$$stamp_gw" ] || [ Containerfile -nt "$$stamp_gw" ] || [ backend/dub.sdl -nt "$$stamp_gw" ] || [ backend/dub.selections.json -nt "$$stamp_gw" ] || [ common/dub.sdl -nt "$$stamp_gw" ] || [ common/dub.selections.json -nt "$$stamp_gw" ] || [ frontend/package.json -nt "$$stamp_gw" ]; then build_gw=1; \
 		elif find backend/source backend/views common/source config public deploy/roles/gateway -type f -newer "$$stamp_gw" 2>/dev/null | grep -q .; then build_gw=1; fi; \
-		svcs=""; [ "$$build_gw" = "1" ] && svcs="$$svcs ircfiber-gateway"; [ "$$build_eng" = "1" ] && svcs="$$svcs ircfiber-engine"; \
+		svcs=""; [ "$$build_gw" = "1" ] && svcs="$$svcs ircfiber-gateway"; [ "$$build_eng" = "1" ] && svcs="$$svcs ircfiber-holder ircfiber-engine"; \
 		if [ -n "$$svcs" ]; then printf "\n%b\n" "$(_BCn)$(K)$(B)  Building changed image(s):$$svcs  $(R)"; DOCKER_BUILDKIT=1 docker compose build $$svcs; [ "$$build_gw" = "1" ] && touch "$$stamp_gw"; [ "$$build_eng" = "1" ] && touch "$$stamp_eng"; \
 		else printf "\n%b\n" "$(BG)$(OK) Images up-to-date — skipping docker build (cached) $(R) $(D)(touch Containerfile or the relevant source tree to force)$(R)"; fi; \
 		[ "$$build_gw" = "1" ] && docker rm -f ircfiber-gateway 2>/dev/null || true; [ "$$build_eng" = "1" ] && docker rm -f ircfiber-engine 2>/dev/null || true;
-	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Starting gateway + engine as separate containers  $(R)"
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Starting gateway + holder + engine as separate containers  $(R)"
+	@# Holder first (engine boot attaches to it); an unchanged holder is a no-op, never a reconnect.
+	@docker compose up -d --remove-orphans --no-deps ircfiber-holder
 	@if ! GATEWAY_HOST_PORT=$${GATEWAY_HOST_PORT:-8090} IRCD_HOST_PORT=$${IRCD_HOST_PORT:-6667} IRCD_HOST_PORT2=$${IRCD_HOST_PORT2:-6668} REDIS_HOST_PORT=$${REDIS_HOST_PORT:-6379} MONGO_HOST_PORT=$${MONGO_HOST_PORT:-27017} \
 	docker compose up -d --remove-orphans --no-deps ircfiber-gateway ircfiber-engine; then \
 		printf "%b\n" "$(Y)$(WR) up failed — cleaning stale names and retrying$(R)"; docker rm -f ircfiber-gateway ircfiber-engine 2>/dev/null || true; docker rm -f irc_redis_test irc_mongo_test ircd_test 2>/dev/null || true; \
@@ -494,7 +496,6 @@ stop: ## Component > Stop debug/debug-live + local docker stacks (tailnet + loca
 	else \
 		printf "%b\n" "$(Y)$(WR) redis-cli not installed — skipping Redis purge$(R)"; \
 	fi; \
-	rm -f /tmp/ircfiber-handoff-$${sid}.sock 2>/dev/null || true; \
 	printf '%b\n' "$(BG)$(OK) Stopped. (Vite dev server, if running, was not touched.)$(R)"
 
 # ─── COMPONENT OPERATIONS ───────────────────────────────────────────────────
@@ -512,22 +513,7 @@ engine: build-engine ## Component > Engine in foreground (no auto-restart) — c
 engine-rebuild: build-engine ## Component > Rebuild engine binary (no restart)
 	@printf '%b\n' "$(BG)$(OK) Engine binary rebuilt. Run \`make engine-restart\` (supervised) or \`make engine\` (foreground) to apply.$(R)"
 
-# Engine: handoff REMOVED — hard restart only (see AGENTS.md Engine Lifecycle)
-# The SCM_RIGHTS FD-transfer handoff was removed 2026-08-08. These targets
-# now do a hard restart (brief IRC disconnect, auto-reconnect). Do not
-# reintroduce handoff logic.
-engine-handoff: ## Component > Hot-reload engine (REMOVED — does hard restart)
-	@printf "%b\n" "$(Y)$(WR) engine-handoff is REMOVED — use hard restart$(R)"
-	@printf "%b\n" "$(C)  → hard restarting engine…$(R)"
-	@$(MAKE) --no-print-directory engine-restart
-
-engine-handoff-redis: ## Component > Trigger handoff via redis-cli (REMOVED)
-	@printf "%b\n" "$(Y)$(WR) engine-handoff-redis is REMOVED$(R)"
-	@printf "%b\n" "$(C)  Handoff code deleted 2026-08-08 — hard restart is the only path$(R)"
-	@printf "%b\n" "$(D)  Use: make engine-restart  or  docker restart ircfiber-engine-ovh$(R)"
-	@exit 1
 # Engine: kill the current engine — supervisor respawns with the latest binary.
-# Prefer `engine-handoff` for development to avoid closing IRC sockets.
 # Host supervisor variant — for `make debug-host`. Docker variant is `make engine-restart-docker`.
 engine-restart-host: ## Component > Restart engine (host supervisor)
 	@bash -c ' \
@@ -672,11 +658,11 @@ crash-logs: ## Component > List persistent crash dumps (use CAT=1 to view latest
 # ─── AUTO-REBUILD (file watch) ──────────────────────────────────────────────
 
 # Watch engine sources, rebuild + restart on change.
-watch-engine: ## Component > Watch engine/source/*.d — rebuild engine + hot-reload on save (preserves IRC sockets)
+watch-engine: ## Component > Watch engine/source/*.d — rebuild engine + restart on save
 	@bash -c ' \
 		printf "\n%b\n" "$(_BC)$(K)$(B)  Watching engine sources  $(R)"; \
 		printf "%b\n" "$(D)Polls every 2s. Install fswatch for instant: brew install fswatch$(R)"; \
-		printf "%b\n" "$(D)Triggers: make engine-rebuild + make engine-handoff (NO socket close)$(R)"; \
+		printf "%b\n" "$(D)Triggers: make engine-rebuild + make engine-restart$(R)"; \
 		if [ ! -f $(SUPERVISOR_PIDFILE) ]; then \
 			printf "%b\n" "$(Y)$(WR) No supervisor running. Start one first: make debug  or  make debug-live$(R)"; \
 			exit 1; \
@@ -688,9 +674,9 @@ watch-engine: ## Component > Watch engine/source/*.d — rebuild engine + hot-re
 			sleep 2; \
 			CURR=$$(echo "$$WATCH" | xargs stat -f %m 2>/dev/null | sort -n | tail -1); \
 			if [ "$$CURR" != "$$LAST" ]; then \
-				printf "\n%b\n" "$(Y)→ change detected, hot-reloading engine…$(R)"; \
+				printf "\n%b\n" "$(Y)→ change detected, restarting engine…$(R)"; \
 				$(MAKE) --no-print-directory engine-rebuild && \
-					$(MAKE) --no-print-directory engine-handoff; \
+					$(MAKE) --no-print-directory engine-restart; \
 				LAST=$$CURR; \
 			fi; \
 		done; \
@@ -1074,32 +1060,6 @@ test-client: ## Test > Frontend client tests only (headless Chromium — compone
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Running frontend client tests  $(R)"
 	@cd frontend && npm run test:client 2>&1 | tail -15
 
-handoff-test: ## Test > Standalone handoff SCM_RIGHTS tests (no vibe.d, no engine deps)
-	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Handoff tests  $(R)"
-	@$(DUB) build --config=handoff-test 2>&1 | tail -3
-	@./engine/handoff-test
-
-exec-reload-test: ## Test > exec(2)-based hot-reload: TCP socket identity survives fork+SCM_RIGHTS
-	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Exec-reload tests  $(R)"
-	@$(DUB) build --config=exec-reload-test 2>&1 | tail -3
-	@./engine/exec-reload-test
-# Full end-to-end exec-reload integration test against a mock IRC server.
-# Spawns a Python TCP listener, opens a connection from the OLD engine
-# path, execs into the NEW engine path, and verifies the same TCP socket
-# survives. Run from the repo root so the binary is in $PWD.
-exec-reload-it: ## Test > Full exec-reload flow: OLD engine → exec → NEW engine, mock IRC server
-	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Exec-reload integration test  $(R)"
-	@$(DUB) build --config=exec-reload-integration 2>&1 | tail -3
-	@chmod +x engine/source/exec_reload_mock_irc.py
-	@bash -c 'set -e; rm -f /tmp/exec-reload-test.result; \
-	  python3 engine/source/exec_reload_mock_irc.py 16667 /tmp/exec-reload-test.result & \
-	  MOCK_PID=$$!; \
-	  sleep 0.5; \
-	  ./exec-reload-integration old /tmp/exec-reload-test.snapshot /tmp/exec-reload-test.marker && \
-	  wait $$MOCK_PID 2>/dev/null || true; \
-	  echo; echo "--- mock_irc result file ---"; \
-	  cat /tmp/exec-reload-test.result 2>/dev/null || echo "(no result file)"'
-
 test-all: test test-frontend ## Test > D backend + frontend (everything)
 	@printf '\n%b\n' "$(BG)$(OK) All test suites passed$(R)"
 
@@ -1271,9 +1231,9 @@ docker-ctx: ## Docker > Show which docker daemon make targets are pinned to (nat
 
 docker-up: ensure-colima ## Docker > Start all services with Docker Compose
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Building Docker images — staged cache  $(R)"
-	@# Gateway and engine now build from separate targets (runtime-gateway/engine) — build both.
+	@# Gateway, holder and engine build from separate targets (runtime-gateway/holder/engine) — build all.
 	@# Uses BuildKit staged cache (--mount=type=cache for apt + /build/.dub): no source change → CACHED.
-	@DOCKER_BUILDKIT=1 docker compose build ircfiber-gateway ircfiber-engine
+	@DOCKER_BUILDKIT=1 docker compose build ircfiber-gateway ircfiber-holder ircfiber-engine
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting Docker Services  $(R)"
 	@docker compose up -d
 docker-down: ensure-colima ## Docker > Stop ALL IRC Fiber containers (3 compose stacks + loose containers)
@@ -1435,8 +1395,8 @@ gateway-down: docker-down-web ## Docker > Stop API container only
 gateway-start: gateway-up ## Docker > Alias: start gateway (detached, engine untouched)
 gateway-logs: logs-gateway ## Docker > Tail gateway container logs
 engine-up: engine-start ## Docker > Start Engine container only (alias)
-engine-start: ensure-colima ## Docker > Start Engine in background (detached) — holds IRC connection
-	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Engine (detached, holds IRC)  $(R)"
+engine-start: ensure-colima ## Docker > Start Holder + Engine in background (detached) — holder holds IRC sockets
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Holder + Engine (detached, holder holds IRC)  $(R)"
 	@if ! docker info >/dev/null 2>&1; then printf "%b\n" "$(Y)$(WR) Docker not running$(R)"; exit 1; fi
 	@# Ensure DBs + ircd are up (engine needs ircd, gateway does not)
 	@if docker compose -f deploy/local/docker-compose.yml ps redis mongo 2>/dev/null | grep -q "healthy"; then \
@@ -1450,9 +1410,14 @@ engine-start: ensure-colima ## Docker > Start Engine in background (detached) �
 	@stamp_eng=.docker-build-stamp-engine; build_eng=0; \
 		if [ ! -f "$$stamp_eng" ] || [ Containerfile -nt "$$stamp_eng" ] || [ engine/dub.sdl -nt "$$stamp_eng" ] || [ engine/dub.selections.json -nt "$$stamp_eng" ] || [ common/dub.sdl -nt "$$stamp_eng" ] || [ common/dub.selections.json -nt "$$stamp_eng" ]; then build_eng=1; \
 		elif find engine/source common/source deploy/roles/engine/files -type f -newer "$$stamp_eng" 2>/dev/null | grep -q .; then build_eng=1; fi; \
-		if [ "$$build_eng" = "1" ]; then printf "\n%b\n" "$(_BCn)$(K)$(B)  Building engine image  $(R)"; DOCKER_BUILDKIT=1 docker compose build ircfiber-engine; touch "$$stamp_eng"; \
-		else printf "%b\n" "$(BG)$(OK) Engine image up-to-date — skipping build (cached)$(R)"; fi; \
+		if [ "$$build_eng" = "1" ]; then printf "\n%b\n" "$(_BCn)$(K)$(B)  Building holder + engine images  $(R)"; DOCKER_BUILDKIT=1 docker compose build ircfiber-holder ircfiber-engine; touch "$$stamp_eng"; \
+		else printf "%b\n" "$(BG)$(OK) Holder + engine images up-to-date — skipping build (cached)$(R)"; fi; \
 		if [ "$$build_eng" = "1" ]; then docker rm -f ircfiber-engine 2>/dev/null || true; fi
+	@# The holder first: the engine's boot attaches to it (depends_on
+	@# service_healthy). A running holder is never recreated here — that
+	@# would reconnect every network; `docker compose up -d ircfiber-holder`
+	@# is a no-op when its image/config is unchanged.
+	@docker compose up -d --remove-orphans --no-deps ircfiber-holder
 	@if ! REDIS_HOST_PORT=$${REDIS_HOST_PORT:-6379} MONGO_HOST_PORT=$${MONGO_HOST_PORT:-27017} IRCD_HOST_PORT=$${IRCD_HOST_PORT:-6667} IRCD_HOST_PORT2=$${IRCD_HOST_PORT2:-6668} \
 	docker compose up -d --remove-orphans --no-deps ircfiber-engine; then \
 		printf "%b\n" "$(Y)$(WR) up failed — cleaning stale engine name and retrying$(R)"; docker rm -f ircfiber-engine 2>/dev/null || true; \
@@ -1462,19 +1427,27 @@ engine-start: ensure-colima ## Docker > Start Engine in background (detached) �
 	@if docker network inspect local_ircfiber_local >/dev/null 2>&1 && docker ps --format "{{.Names}}" 2>/dev/null | grep -q "^ircfiber-redis$$"; then \
 		if ! docker inspect ircfiber-engine --format "{{json .NetworkSettings.Networks}}" 2>/dev/null | grep -q "local_ircfiber_local"; then docker network connect local_ircfiber_local ircfiber-engine 2>/dev/null || true; docker restart ircfiber-engine >/dev/null 2>&1 || true; sleep 2; fi; \
 	fi
-	@printf '\n%b\n' "$(BG)$(OK) Engine running in background (detached)$(R) $(D)(ircfiber-engine)$(R)"
-	@printf '%b\n' "$(C)  ─ containers $(R)"; docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" | grep -E "ircfiber-engine|irc_redis|irc_mongo|ircd" | sed "s/^/    /" || true
-	@printf '%b\n' "$(D)  Tail: make engine-logs  |  restart: make engine-restart-docker  |  stop: make engine-down$(R)"
+	@printf '\n%b\n' "$(BG)$(OK) Holder + engine running in background (detached)$(R) $(D)(ircfiber-holder, ircfiber-engine)$(R)"
+	@printf '%b\n' "$(C)  ─ containers $(R)"; docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" | grep -E "ircfiber-holder|ircfiber-engine|irc_redis|irc_mongo|ircd" | sed "s/^/    /" || true
+	@printf '%b\n' "$(D)  Tail: make engine-logs / holder-logs  |  hot swap: make engine-restart-docker  |  holder: make holder-status  |  stop: make engine-down$(R)"
 engine-down: ## Docker > Stop Engine container only (gateway untouched)
 	@docker compose stop ircfiber-engine 2>/dev/null || docker compose -f deploy/local/docker-compose.yml stop ircfiber-engine 2>/dev/null || true
 	@printf '%b\n' "$(BG)$(OK) Engine stopped (gateway untouched)$(R)"
 engine-stop: engine-down ## Docker > Alias: stop engine
-engine-restart-docker: ## Docker > Restart engine (rebuild if needed, gateway untouched)
-	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Restarting engine (gateway untouched)  $(R)"
+# Recreates ONLY the engine: the holder keeps every IRC socket, the old
+# engine detaches on SIGTERM and the new one reattaches. This is the local
+# hot-swap demo — `make holder-status` before/after shows the same
+# connectedAtMs and attached == open.
+engine-restart-docker: ## Docker > Hot-swap engine (rebuild if needed; holder + gateway untouched, IRC sockets kept)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Hot-swapping engine (holder + gateway untouched)  $(R)"
 	@DOCKER_BUILDKIT=1 docker compose build ircfiber-engine 2>/dev/null || true
 	@docker compose up -d --force-recreate --no-deps ircfiber-engine
-	@printf '%b\n' "$(BG)$(OK) Engine restarted$(R)"
+	@printf '%b\n' "$(BG)$(OK) Engine hot-swapped$(R) $(D)(verify: make holder-status → detached 0, attached == open)$(R)"
 engine-logs: logs-engine ## Docker > Tail engine container logs (detached engine)
+holder-logs: ## Docker > Tail holder container logs
+	@docker compose logs -f ircfiber-holder
+holder-status: ## Docker > Holder STATUS JSON (open/attached/detached sessions)
+	@docker exec ircfiber-holder /app/irc-fiber-holder --status
 # Docker — interactive shells
 # ----------------------------------------------------------------------------
 # Usage:

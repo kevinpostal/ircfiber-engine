@@ -23,7 +23,7 @@ import ircfiber.redis.protocol : RedisKeys;
 /// sets `command = "NOTICE"` and tags the event with the phase name
 /// (`connecting`, `tcp_open`, `tls`, `tls_done`, `registering`, etc).
 /// We also exclude the synthetic CONNECT / DISCONNECT lifecycle events
-/// used by the engine to signal handoff boundaries — those are
+/// used by the engine to signal attempt boundaries — those are
 /// transient by design (one per attempt) and the engine's own
 /// in-memory ConnectionState is the authoritative source.
 private bool isTransientServerLogPhase(ref IRCRawEvent event) nothrow @safe {

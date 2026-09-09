@@ -56,7 +56,7 @@
  * drain pending records; the catch just turns the false alarm into a
  * clean "0" return.
  */
-module ircfiber.irc.tls_safe;
+module holder.tls_safe;
 
 import std.algorithm : canFind;
 import std.conv : to;

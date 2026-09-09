@@ -6,10 +6,18 @@ LOG=/var/log/ircfiber/monitor.log
 REDIS_DOCKER=ircfiber-redis
 GATEWAY=ircfiber-gateway
 ENGINE=ircfiber-engine-ovh
+HOLDER=ircfiber-holder-ovh
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 LOCK=/tmp/ircfiber-monitor.lock
 COOLDOWN_ENGINE=/tmp/ircfiber-monitor-engine-cooldown
 COOLDOWN_GATEWAY=/tmp/ircfiber-monitor-gateway-cooldown
+# The holder owns every IRC socket: restarting it reconnects every network,
+# so it gets its own strikes + a 30-min cooldown and is NEVER restarted for
+# engine-side signals (heartbeat_stale, assignments_empty, ...). Engine
+# restarts are hot swaps now (sockets stay in the holder).
+COOLDOWN_HOLDER=/tmp/ircfiber-monitor-holder-cooldown
+HOLDER_STATE=/tmp/ircfiber-monitor-holder-unhealthy
+HOLDER_STRIKES=3
 FAIL=0
 REASON=""
 STALE_STATE=/tmp/ircfiber-monitor-engine-stale
@@ -119,6 +127,22 @@ else
     logger -t ircfiber-monitor "WARN heartbeat_missing strike=${STRIKES}/${STALE_STRIKES} (deferring restart)"
   fi
 fi
+# ── Holder health (docker healthcheck = /app/irc-fiber-holder --check) ──
+# Only `unhealthy` counts; `starting`, a missing container or a missing
+# healthcheck never strike (a holder that is absent is a deploy concern).
+HOLDER_HEALTH=$(docker inspect -f '{{.State.Health.Status}}' $HOLDER 2>/dev/null | tr -d "\r")
+if [ "$HOLDER_HEALTH" = "unhealthy" ]; then
+  HSTRIKES=$(cat "$HOLDER_STATE" 2>/dev/null | tr -cd '0-9'); [ -z "$HSTRIKES" ] && HSTRIKES=0
+  HSTRIKES=$((HSTRIKES + 1)); echo "$HSTRIKES" > "$HOLDER_STATE"
+  if [ "$HSTRIKES" -ge "$HOLDER_STRIKES" ]; then
+    FAIL=1; REASON="${REASON} holder_unhealthy_x${HSTRIKES}"
+    logger -t ircfiber-monitor "FAIL holder_unhealthy strike=${HSTRIKES}/${HOLDER_STRIKES}"
+  else
+    logger -t ircfiber-monitor "WARN holder_unhealthy strike=${HSTRIKES}/${HOLDER_STRIKES} (deferring restart)"
+  fi
+else
+  rm -f "$HOLDER_STATE" 2>/dev/null || true
+fi
 # ── Enterprise assignments_empty: mirror-aware, strike-based, auto-heal ──
 # Old logic: HLEN==0 && AGE_S>=60 => immediate FAIL (killed engine on transient LRU eviction).
 # New: require mirrors also empty AND sustained strikes. If mirrors have data, canonical was
@@ -166,4 +190,38 @@ if [ -n "$GW_PID" ] && [[ "$GW_PID" =~ ^[0-9]+$ ]]; then FD=$(docker exec $GATEW
 if [ -n "$FD" ] && [[ "$FD" =~ ^[0-9]+$ ]] && [ "$FD" -gt 900 ] 2>/dev/null; then FAIL=1; REASON="${REASON} fd_high_${FD}"; fi
 if docker logs --tail 100 $GATEWAY 2>&1 | grep -q "Too many open files"; then FAIL=1; REASON="${REASON} too_many_open_files"; fi
 if ! curl --max-time 5 -k --resolve ircfiber.com:443:127.0.0.1 -s https://ircfiber.com/api/version 2>&1 | grep -q "engines"; then sleep 2; if ! curl --max-time 5 -k --resolve ircfiber.com:443:127.0.0.1 -s https://ircfiber.com/api/version 2>&1 | grep -q "engines"; then FAIL=1; REASON="${REASON} caddy_api_fail"; fi; fi
-if [ $FAIL -eq 1 ]; then echo "[$TIMESTAMP] FAIL $REASON hlen=${HLEN:-?} hb=${HB:-?} age=${AGE_S:-?}s fd=${FD:-?}" | tee -a "$LOG" 2>/dev/null || true; logger -t ircfiber-monitor "FAIL $REASON hlen=${HLEN:-?} hb=${HB:-?} age=${AGE_S:-?}s fd=${FD:-?}"; if echo "$REASON" | grep -qE "assignments_empty|heartbeat_stale|heartbeat_missing|redis_servers_empty"; then if [ -f "$COOLDOWN_ENGINE" ] && [ $(($(date +%s) - $(stat -c %Y "$COOLDOWN_ENGINE" 2>/dev/null || echo 0))) -lt 600 ]; then echo "[$TIMESTAMP] SKIP engine restart — cooldown active" | tee -a "$LOG" 2>/dev/null || true; else echo "[$TIMESTAMP] AUTO-RESTART engine $ENGINE due to $REASON" | tee -a "$LOG" 2>/dev/null || true; touch "$COOLDOWN_ENGINE"; docker restart $ENGINE 2>&1 | tee -a "$LOG" 2>/dev/null || true; fi; elif echo "$REASON" | grep -qE "fd_high|too_many_open_files|caddy_api_fail|api_version_fail"; then if [ -f "$COOLDOWN_GATEWAY" ] && [ $(($(date +%s) - $(stat -c %Y "$COOLDOWN_GATEWAY" 2>/dev/null || echo 0))) -lt 600 ]; then echo "[$TIMESTAMP] SKIP gateway restart — cooldown active" | tee -a "$LOG" 2>/dev/null || true; else echo "[$TIMESTAMP] AUTO-RESTART gateway $GATEWAY due to $REASON" | tee -a "$LOG" 2>/dev/null || true; touch "$COOLDOWN_GATEWAY"; docker restart $GATEWAY 2>&1 | tee -a "$LOG" 2>/dev/null || true; fi; fi; else echo "[$TIMESTAMP] OK hlen=${HLEN:-?} hb_age=${AGE_S:-?}s fd=${FD:-?}" | tee -a "$LOG" 2>/dev/null || true; fi
+cooldown_active() { [ -f "$1" ] && [ $(($(date +%s) - $(stat -c %Y "$1" 2>/dev/null || echo 0))) -lt "$2" ]; }
+if [ $FAIL -eq 1 ]; then
+  echo "[$TIMESTAMP] FAIL $REASON hlen=${HLEN:-?} hb=${HB:-?} age=${AGE_S:-?}s fd=${FD:-?} holder=${HOLDER_HEALTH:-?}" | tee -a "$LOG" 2>/dev/null || true
+  logger -t ircfiber-monitor "FAIL $REASON hlen=${HLEN:-?} hb=${HB:-?} age=${AGE_S:-?}s fd=${FD:-?} holder=${HOLDER_HEALTH:-?}"
+  # Engine-side signals restart the ENGINE only (a hot swap: the holder keeps
+  # every IRC socket). They never touch the holder.
+  if echo "$REASON" | grep -qE "assignments_empty|heartbeat_stale|heartbeat_missing|redis_servers_empty"; then
+    if cooldown_active "$COOLDOWN_ENGINE" 600; then
+      echo "[$TIMESTAMP] SKIP engine restart — cooldown active" | tee -a "$LOG" 2>/dev/null || true
+    else
+      echo "[$TIMESTAMP] AUTO-RESTART engine $ENGINE due to $REASON" | tee -a "$LOG" 2>/dev/null || true
+      touch "$COOLDOWN_ENGINE"; docker restart $ENGINE 2>&1 | tee -a "$LOG" 2>/dev/null || true
+    fi
+  elif echo "$REASON" | grep -qE "fd_high|too_many_open_files|caddy_api_fail|api_version_fail"; then
+    if cooldown_active "$COOLDOWN_GATEWAY" 600; then
+      echo "[$TIMESTAMP] SKIP gateway restart — cooldown active" | tee -a "$LOG" 2>/dev/null || true
+    else
+      echo "[$TIMESTAMP] AUTO-RESTART gateway $GATEWAY due to $REASON" | tee -a "$LOG" 2>/dev/null || true
+      touch "$COOLDOWN_GATEWAY"; docker restart $GATEWAY 2>&1 | tee -a "$LOG" 2>/dev/null || true
+    fi
+  fi
+  # Holder: only its own healthcheck (3 strikes) restarts it, at most once
+  # per 30 min — every IRC network reconnects when it does.
+  if echo "$REASON" | grep -q "holder_unhealthy"; then
+    if cooldown_active "$COOLDOWN_HOLDER" 1800; then
+      echo "[$TIMESTAMP] SKIP holder restart — cooldown active (30 min)" | tee -a "$LOG" 2>/dev/null || true
+    else
+      echo "[$TIMESTAMP] AUTO-RESTART holder $HOLDER due to holder_unhealthy (every IRC network reconnects)" | tee -a "$LOG" 2>/dev/null || true
+      touch "$COOLDOWN_HOLDER"; rm -f "$HOLDER_STATE" 2>/dev/null || true
+      docker restart $HOLDER 2>&1 | tee -a "$LOG" 2>/dev/null || true
+    fi
+  fi
+else
+  echo "[$TIMESTAMP] OK hlen=${HLEN:-?} hb_age=${AGE_S:-?}s fd=${FD:-?} holder=${HOLDER_HEALTH:-?}" | tee -a "$LOG" 2>/dev/null || true
+fi

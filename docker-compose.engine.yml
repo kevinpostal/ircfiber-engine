@@ -1,4 +1,35 @@
 services:
+  # Connection holder — owns every IRC TCP/SOCKS5/TLS socket and relays
+  # plaintext IRC to the engine over unix:///run/ircfiber/holder.sock.
+  # Rarely redeployed: recreating it reconnects every network; recreating
+  # only ircfiber-engine is a hot swap (sockets kept).
+  ircfiber-holder:
+    build:
+      context: .
+      dockerfile: Containerfile.engine
+      target: runtime-holder
+    container_name: ircfiber-holder
+    restart: unless-stopped
+    networks:
+      - irc_network
+    environment:
+      IRCFIBER_SERVER_ID: dockerengine1
+      IRCFIBER_HOLDER_ADDR: unix:///run/ircfiber/holder.sock
+      IRCFIBER_LOG_LEVEL: info
+    volumes:
+      - holder_run:/run/ircfiber
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    healthcheck:
+      test: ["CMD", "/app/irc-fiber-holder", "--check"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    stop_grace_period: 10s
+
   ircfiber-engine:
     build:
       context: .
@@ -11,6 +42,8 @@ services:
       - irc_network
       - signoz-network
     depends_on:
+      ircfiber-holder:
+        condition: service_healthy
       redis:
         condition: service_healthy
       mongo:
@@ -23,9 +56,11 @@ services:
       IRCFIBER_LOG_LEVEL: info
       IRCFIBER_SERVER_ID: dockerengine1
       IRCFIBER_BIND_ADDRESS: 0.0.0.0
+      IRCFIBER_HOLDER_ADDR: unix:///run/ircfiber/holder.sock
       IRCFIBER_OTEL_ENABLED: "${IRCFIBER_OTEL_ENABLED:-0}"
       IRCFIBER_OTEL_ENDPOINT: "${IRCFIBER_OTEL_ENDPOINT:-http://otel-collector:4318}"
-    volumes: []
+    volumes:
+      - holder_run:/run/ircfiber:ro
     ulimits:
       nofile:
         soft: 65536
@@ -44,6 +79,7 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+    stop_grace_period: 30s
 
   redis:
     image: redis:7-alpine
@@ -140,4 +176,6 @@ volumes:
   irc_fiber_logs:
     driver: local
   ircfiber_uploads:
+    driver: local
+  holder_run:
     driver: local

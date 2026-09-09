@@ -37,6 +37,15 @@ struct EngineConfigOverride {
     string egressNodeId;
 }
 
+/// How long (ms) an engine that detached from its IRC sessions for a hot
+/// swap stays alive in the registry without heartbeats. `markHotSwap`
+/// stamps `hotswapAt`; until this window elapses `heartbeatFresh` treats the
+/// server as live so the gateway's `healthCheckAll`, admin reassign paths and
+/// the other engines' boot-time reclaim never move its networks mid-swap.
+/// Shared by gateway and engines (not env-overridable): both sides must
+/// agree on the window or one of them reassigns early.
+enum HOTSWAP_GRACE_MS = 180_000;
+
 /**
  * Connection Server Registry
  * 
@@ -124,6 +133,9 @@ final class ServerRegistry {
 
         auto key = RedisKeys.server(server.serverId);
         db.hset(key, "data", server.toJson().toString());
+        // A fresh registration ends any hot-swap grace window left by the
+        // previous process (see markHotSwap).
+        try { db.hdel(key, "hotswapAt"); } catch (Exception) {}
 
         // Add to server list
         db.sadd(RedisKeys.serverList(), server.serverId);
@@ -214,6 +226,9 @@ final class ServerRegistry {
         auto now = Clock.currTime.toUnixTime!long * 1000;
         logInfo("updateHeartbeat: %s -> %s", serverId, now);
         db.hset(key, "lastHeartbeat", now.to!string);
+        // A live heartbeat ends the hot-swap grace window: the first beat
+        // of the replacement engine clears the stamp its predecessor left.
+        try { db.hdel(key, "hotswapAt"); } catch (Exception) {}
         db.sadd(RedisKeys.serverList(), serverId);
         // Heartbeat implies the engine is alive — clear stale draining
         // flags so a previously-draining engine that recovers becomes
@@ -228,6 +243,28 @@ final class ServerRegistry {
                 syncServerState(serverId, s);
             }
         } catch (Exception) {}
+    }
+
+    /**
+     * Mark a server as detaching for a hot swap.
+     *
+     * Called by the engine on SIGTERM right before it detaches from its
+     * holder-owned IRC sessions and exits. The replacement engine boots a
+     * few seconds later and its first `updateHeartbeat` clears the stamp.
+     * In between no heartbeats arrive, so `heartbeatFresh` falls back to
+     * `hotswapAt` and keeps the server alive for `HOTSWAP_GRACE_MS`; after
+     * that the ordinary stale-heartbeat reassignment applies.
+     *
+     * Beats first so `lastHeartbeat` and `hotswapAt` share one `now` and a
+     * swap started at the very end of a heartbeat interval still gets the
+     * full window.
+     */
+    void markHotSwap(string serverId) {
+        updateHeartbeat(serverId);
+        auto key = RedisKeys.server(serverId);
+        auto now = Clock.currTime.toUnixTime!long * 1000;
+        db.hset(key, "hotswapAt", now.to!string);
+        logInfo("markHotSwap: %s -> %s (grace %d ms)", serverId, now, HOTSWAP_GRACE_MS);
     }
     /// Persist the engine's full server state (priority, fallbackOnly,
     /// maxConnections, assignedNetworks) back to Redis so the gateway
@@ -300,23 +337,8 @@ final class ServerRegistry {
             auto server = ConnectionServer.fromJson(parseJson(data));
 
             // Override with live heartbeat/health fields (updated separately by engine)
-            // Robust: handle both plain number string and JSON-encoded number/string
-            // (previous manual Redis edits left `lastHeartbeat` as JSON object string,
-            // causing `to!long` on "{" to spam `Failed to parse server data` every 10s)
-            const hbStr = db.hget(key, "lastHeartbeat");
-            if (hbStr.length > 0) {
-                try {
-                    server.lastHeartbeat = hbStr.to!long;
-                } catch (Exception) {
-                    try {
-                        const hbJson = parseJsonString(hbStr);
-                        if (hbJson.type == Json.Type.int_) server.lastHeartbeat = hbJson.get!long;
-                        else if (hbJson.type == Json.Type.string) {
-                            try { server.lastHeartbeat = hbJson.get!string.to!long; } catch (Exception) {}
-                        }
-                    } catch (Exception) {}
-                }
-            }
+            server.lastHeartbeat = parseMsField(db.hget(key, "lastHeartbeat"), server.lastHeartbeat);
+            server.hotswapAt = parseMsField(db.hget(key, "hotswapAt"), server.hotswapAt);
 
             const healthStr = db.hget(key, "isHealthy");
             if (healthStr.length > 0) server.isHealthy = healthStr == "true";
@@ -329,6 +351,39 @@ final class ServerRegistry {
             logDebug("Failed to parse server data for %s: %s", serverId, e.msg);
             return ConnectionServer.init;
         }
+    }
+
+    /// Tolerant parse of a millisecond-timestamp hash field
+    /// (`lastHeartbeat`, `hotswapAt`). Accepts a plain number string or a
+    /// JSON-encoded number/string; anything else keeps `fallback`.
+    /// (Previous manual Redis edits left `lastHeartbeat` as a JSON object
+    /// string, and `to!long` on "{" spammed `Failed to parse server data`
+    /// every 10s.)
+    private static long parseMsField(string raw, long fallback) {
+        if (raw.length == 0) return fallback;
+        try {
+            return raw.to!long;
+        } catch (Exception) {
+            try {
+                const j = parseJsonString(raw);
+                if (j.type == Json.Type.int_) return j.get!long;
+                if (j.type == Json.Type.string) {
+                    try { return j.get!string.to!long; } catch (Exception) {}
+                }
+            } catch (Exception) {}
+        }
+        return fallback;
+    }
+
+    /// Liveness predicate shared by every health decision in this registry:
+    /// a server is fresh when it heartbeat within the last 60 s, or when it
+    /// stamped `hotswapAt` (engine detached for a hot swap) less than
+    /// `HOTSWAP_GRACE_MS` ago. The grace covers the heartbeat-less gap
+    /// between the old engine exiting and the new one's first beat, which
+    /// clears the stamp again.
+    private static bool heartbeatFresh(ref const ConnectionServer s, long now) {
+        return (now - s.lastHeartbeat) < 60_000
+            || (s.hotswapAt > 0 && (now - s.hotswapAt) < HOTSWAP_GRACE_MS);
     }
 
     /**
@@ -382,12 +437,13 @@ final class ServerRegistry {
     }
 
     /**
-     * Get only healthy servers (heartbeat within 60s).
+     * Get only healthy servers (heartbeat within 60s, or inside the
+     * hot-swap grace — see `heartbeatFresh`).
      */
     ConnectionServer[] getHealthyServers() {
         auto now = Clock.currTime.toUnixTime!long * 1000;
         return getAllServers()
-            .filter!(s => s.isHealthy && (now - s.lastHeartbeat) < 60_000)
+            .filter!(s => s.isHealthy && heartbeatFresh(s, now))
             .array;
     }
 
@@ -590,7 +646,7 @@ final class ServerRegistry {
         auto server = getServer(serverId);
         if (server.serverId.length == 0) return false;
         auto now = Clock.currTime.toUnixTime!long * 1000;
-        return server.isHealthy && (now - server.lastHeartbeat) < 60_000;
+        return server.isHealthy && heartbeatFresh(server, now);
     }
 
     /**
@@ -630,10 +686,13 @@ final class ServerRegistry {
         auto now = Clock.currTime.toUnixTime!long * 1000;
 
         // Phase 1: Check all registered servers for stale heartbeats
+        // A server that detached for a hot swap keeps its networks for
+        // HOTSWAP_GRACE_MS without heartbeats (heartbeatFresh); only past
+        // that do we mark it stale and reassign.
         foreach (s; getAllServers()) {
-            if (now - s.lastHeartbeat > 60_000) {
-                logWarn("Server %s heartbeat stale (last: %d ms ago), marking unhealthy",
-                    s.serverId, now - s.lastHeartbeat);
+            if (!heartbeatFresh(s, now)) {
+                logWarn("Server %s heartbeat stale (last: %d ms ago, hotswapAt: %d), marking unhealthy",
+                    s.serverId, now - s.lastHeartbeat, s.hotswapAt);
                 s.isHealthy = false;
                 auto key = RedisKeys.server(s.serverId);
                 db.hset(key, "data", s.toJson().toString());
@@ -663,7 +722,7 @@ final class ServerRegistry {
             const server = getServer(na.serverId);
             const serverIsAlive = server.serverId.length > 0
                 && server.isHealthy
-                && (now - server.lastHeartbeat) < 60_000;
+                && heartbeatFresh(server, now);
 
             if (serverIsAlive) {
                 // Server is healthy — ensure the lease exists for future
@@ -738,6 +797,9 @@ final class ServerRegistry {
         // the TTL key may still exist but the engine is gone. A stale
         // draining flag prevents the gateway from assigning new networks to
         // that server, so we clear it once the heartbeat is stale.
+        // Deliberately the raw 60 s test, not heartbeatFresh: a hot-swapping
+        // engine has no draining flag to protect, and a drained engine that
+        // has stopped beating should be cleaned up regardless of any grace.
         foreach (s; getAllServers()) {
             if (now - s.lastHeartbeat > 60_000 && isDraining(s.serverId)) {
                 logInfo("Health check: clearing stale draining for %s (heartbeat %d ms ago)",
@@ -1072,4 +1134,36 @@ final class ServerRegistry {
         } while (cursor != "0");
         return result;
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Hot-swap grace liveness tests (pure predicate, no Redis)
+// ═══════════════════════════════════════════════════════════════════════════
+unittest {
+    enum long now = 1_000_000_000;
+    ConnectionServer s;
+
+    // Fresh heartbeat, no hot swap: alive.
+    s.lastHeartbeat = now - 10_000;
+    assert(ServerRegistry.heartbeatFresh(s, now));
+
+    // Stale heartbeat, no hot swap: dead (the classic 60 s rule).
+    s.lastHeartbeat = now - 120_000;
+    assert(!ServerRegistry.heartbeatFresh(s, now));
+
+    // Stale heartbeat but hot swap stamped 30 s ago: still alive.
+    s.hotswapAt = now - 30_000;
+    assert(ServerRegistry.heartbeatFresh(s, now));
+
+    // Hot swap stamped 200 s ago (> HOTSWAP_GRACE_MS): dead again.
+    s.hotswapAt = now - 200_000;
+    assert(!ServerRegistry.heartbeatFresh(s, now));
+
+    // Exactly at the grace boundary is no longer fresh.
+    s.hotswapAt = now - HOTSWAP_GRACE_MS;
+    assert(!ServerRegistry.heartbeatFresh(s, now));
+
+    // A cleared stamp (0) never grants grace.
+    s.hotswapAt = 0;
+    assert(!ServerRegistry.heartbeatFresh(s, now));
 }

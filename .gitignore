@@ -9,6 +9,8 @@
 *.dll
 *.cg
 irc-fiber-engine
+irc-fiber-holder
+irc-fiber-holder-test-application
 *-test
 !*-test.d
 !*-test.py

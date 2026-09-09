@@ -41,7 +41,6 @@ import ircfiber.models.message;
 import ircfiber.models.ircchannel;
 import ircfiber.irc.chathistory;
 import ircfiber.irc.parser;
-import ircfiber.irc.tls_safe;
 import ircfiber.irc.server;
 import ircfiber.irc.sasl;
 import ircfiber.irc.connection;
@@ -85,7 +84,6 @@ int main() {
         ircfiber.models.ircchannel,
         ircfiber.irc.chathistory,
         ircfiber.irc.parser,
-        ircfiber.irc.tls_safe,
         ircfiber.irc.server,
         ircfiber.irc.sasl,
         ircfiber.irc.connection,

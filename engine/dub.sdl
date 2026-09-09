@@ -73,7 +73,7 @@ configuration "unit-test-real" {
     targetName "irc-fiber-test-real"
     mainSourceFile "source/app_test_real.d"
     versions "VibeUseFibers" "unitThreadedLight"
-    excludedSourceFiles "source/app_engine.d" "source/prefs_test.d" "source/parser_test.d" "source/consumer_test.d" "source/logging_format_test.d" "source/logging_test.d" "source/handoff_test_runner.d" "source/exec_reload_test_runner.d" "source/draining_test_runner.d"
+    excludedSourceFiles "source/app_engine.d" "source/prefs_test.d" "source/parser_test.d" "source/consumer_test.d" "source/logging_format_test.d" "source/logging_test.d" "source/draining_test_runner.d"
     dependency "irc-fiber-backend" path="../backend" configuration="library"
 }
 
@@ -146,25 +146,6 @@ configuration "sync" {
     targetType "executable"
     targetName "sync-redis-to-mongo"
     mainSourceFile "source/sync_redis_to_mongo.d"
-    versions "VibeUseFibers"
-}
-
-configuration "handoff-test" {
-    targetType "executable"
-    targetName "handoff-test"
-    mainSourceFile "source/handoff_test_runner.d"
-}
-
-configuration "exec-reload-test" {
-    targetType "executable"
-    targetName "exec-reload-test"
-    mainSourceFile "source/exec_reload_test_runner.d"
-}
-
-configuration "exec-reload-integration" {
-    targetType "executable"
-    targetName "exec-reload-integration"
-    mainSourceFile "source/exec_reload_integration.d"
     versions "VibeUseFibers"
 }
 
@@ -257,4 +238,17 @@ configuration "loadtest" {
     mainSourceFile "source/loadtest/main.d"
     versions "VibeUseFibers"
     dependency "vibe-d:redis" version="~>0.10.0"
+}
+
+subPackage {
+    name "holder"
+    targetType "executable"
+    targetName "irc-fiber-holder"
+    sourcePaths "holder/source"
+    sourceFiles "source/ircfiber/term_signal.d"
+    importPaths "holder/source" "source"
+    mainSourceFile "holder/source/holder/app.d"
+    versions "VibeUseFibers"
+    dependency "irc-fiber-common" path="../common"
+    dependency "vibe-d:tls" version="~>0.10.0"
 }
