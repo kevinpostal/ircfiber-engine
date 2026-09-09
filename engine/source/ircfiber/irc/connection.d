@@ -118,7 +118,9 @@ private immutable string[] DESIRED_CAPS_SASL = ["sasl"];
 // ── Tunables ──────────────────────────────────────────────────────────────────
 private enum RECONNECT_MAX_DELAY_SECS     = 60;
 private enum REGISTRATION_READ_TIMEOUT_MS = 100;
-private enum REGISTRATION_MAX_READS       = 400;   // more reads for CAP LS round-trips
+// Bounds the read loop on partial data; must cover
+// REGISTRATION_OVERALL_TIMEOUT_SECS at one 100 ms read per iteration.
+private enum REGISTRATION_MAX_READS       = 1200;
 private enum SASL_MAX_READS               = 100;
 private enum SASL_READ_TIMEOUT_MS         = 100;
 private enum PROCESS_READ_TIMEOUT_MS      = 50;
@@ -334,16 +336,24 @@ private bool canConnectToHostLocked(string host, int port) {
 private enum CONNECT_TIMEOUT_SECONDS               = 10;
 private enum TLS_HANDSHAKE_TIMEOUT_SECONDS         = 10;
 private enum HAPPY_EYEBALLS_RACE_TIMEOUT_SECONDS   = 15;
-// Hard upper bound on the CAP+NICK+USER+SASL handshake from the moment we
-// send the first registration byte to either RPL_WELCOME (001) or a fatal
-// error reply (e.g. 433 ERR_NICKNAMEINUSE, 464 ERR_PASSWDMISMATCH). 30s
-// is plenty for a healthy IRC server (CAP+SASL+001 typically completes
-// in <2s) and short enough that a black-holed server can't wedge a
-// network's join state forever. RFC 2812 §2.3 explicitly says "it is
-// not advised to wait forever for the reply" — this is the enforcement.
-// We surface stuck states via ircfiber.registration.timeout in the
-// admin API so operators can identify the offending peer.
-private enum REGISTRATION_OVERALL_TIMEOUT_SECS    = 30;
+// Upper bounds on the CAP+NICK+USER+SASL handshake, from the first
+// registration byte we send to either RPL_WELCOME (001) or a fatal error
+// reply (433, 464, …). RFC 2812 §2.3: "it is not advised to wait forever
+// for the reply" — this is the enforcement. Two tiers:
+//
+//   SILENT  (30 s): the server has sent us nothing at all. That is a
+//           black-holed peer (open TCP, never replies); waiting longer only
+//           wedges the network's join state.
+//   OVERALL (90 s): the server has sent at least one line, so it is alive
+//           and merely slow. The usual cause is the ident lookup: ircds
+//           connect back to port 113 and wait out their own timer before
+//           `No Ident response` → 001. Mullvad exits DROP inbound 113 (no
+//           RST), so e.g. DALnet (bahamut-2.2.4) sends `Checking Ident`
+//           at +0.4 s and 001 at +37 s — a 30 s cutoff never registered.
+//
+// Stuck states surface via ircfiber.registration.timeout in the admin API.
+private enum REGISTRATION_SILENT_TIMEOUT_SECS     = 30;
+private enum REGISTRATION_OVERALL_TIMEOUT_SECS    = 90;
 // Cap on the auto-appended-underscore fallback chain during registration.
 // After this many 433s we stop appending `_` (which produces the
 // `Zod___`, `Zod____`, ... ghost member entries that accumulate in
@@ -4931,12 +4941,12 @@ final class PersistentIRCClient {
         int scramStep = 0; // 0=not started, 1=sent client-first, 2=sent client-final
 
         // RFC 2812 §2.3 — "client should expect a reply as specified but it
-        // is not advised to wait forever for the reply." Bound the entire
-        // CAP+NICK+USER+SASL handshake to REGISTRATION_OVERALL_TIMEOUT_SECS
-        // so a black-holed server (open TCP, never sends 001) cannot wedge
-        // the network's join state forever. The 400-read loop bound below
-        // only protects against a tight loop on partial data; it does not
-        // protect against a peer that accepts bytes but never replies.
+        // is not advised to wait forever for the reply." Bound the
+        // CAP+NICK+USER+SASL handshake: REGISTRATION_SILENT_TIMEOUT_SECS
+        // while the server has sent nothing (black-holed peer),
+        // REGISTRATION_OVERALL_TIMEOUT_SECS once it has spoken (alive but
+        // slow — typically waiting out its own ident timer). The read-loop
+        // bound below only protects against a tight loop on partial data.
         immutable registrationStartMs = Clock.currTime.toUnixTime!long * 1000;
         // Mirrored onto the client so the JOIN-throttle retry can measure
         // the server's grace window after this function has returned.
@@ -4950,24 +4960,29 @@ final class PersistentIRCClient {
             = (registrationOverallTimeoutMs * REGISTRATION_WARN_AT_FRACTION_2) / 100;
 
         foreach (_; 0 .. REGISTRATION_MAX_READS) {
-            // Hard upper bound: if the server hasn't completed registration
-            // (sent 001) within REGISTRATION_OVERALL_TIMEOUT_SECS, give up
-            // and let the connection loop's exponential backoff schedule a
-            // retry. This is what RFC 2812 calls out as required behavior.
+            // Hard upper bound: give up and let the connection loop's
+            // exponential backoff schedule a retry. This is what RFC 2812
+            // calls out as required behavior.
             immutable nowMs = Clock.currTime.toUnixTime!long * 1000;
-            if (nowMs - registrationStartMs > registrationOverallTimeoutMs) {
+            immutable serverSilent = linesIn == 0;
+            immutable timeoutSecs = serverSilent
+                ? REGISTRATION_SILENT_TIMEOUT_SECS : REGISTRATION_OVERALL_TIMEOUT_SECS;
+            if (nowMs - registrationStartMs > timeoutSecs * 1000) {
                 if (!welcomed) {
                     registrationTimeoutSince = nowMs;
+                    immutable why = serverSilent
+                        ? "server sent nothing — black-holed"
+                        : "server replied but never completed registration";
                     logWarn("PersistentIRCClient[%s] registration TIMEOUT after %ds"
-                        ~ " (CAP+SASL+001 not received) — black-holed or slow"
-                        ~ " server; will retry with backoff",
-                        config.name, REGISTRATION_OVERALL_TIMEOUT_SECS);
+                        ~ " (CAP+SASL+001 not received; %s); will retry with backoff",
+                        config.name, timeoutSecs, why);
                     logJsonMap("warn", "connection",
                         "Registration timeout",
                         ["network":  config.name,
                          "networkId": config.id.toString(),
                          "host":     config.host ~ ":" ~ config.port.to!string,
                          "elapsed":  (nowMs - registrationStartMs).to!string,
+                         "linesIn":  linesIn.to!string,
                          "event":    "registration_timeout"]);
                     recordCounter("ircfiber.registration.timeout", 1,
                         ["network":  config.name,
@@ -4975,8 +4990,7 @@ final class PersistentIRCClient {
                          "host":     config.host ~ ":" ~ config.port.to!string]);
                     throw new Exception(
                         "Registration timeout: 001 not received within "
-                        ~ REGISTRATION_OVERALL_TIMEOUT_SECS.to!string
-                        ~ "s (likely black-holed server)");
+                        ~ timeoutSecs.to!string ~ "s (" ~ why ~ ")");
                 }
                 // welcomed == true means registration completed; remaining
                 // reads are post-001 MOTD/376 traffic. Let the existing
@@ -5042,6 +5056,7 @@ final class PersistentIRCClient {
                     auto line = partial[0 .. idx];
                     partial   = partial[idx + 2 .. $];
                     if (line.length == 0) continue;
+                    linesIn++;
 
                     auto evt = parseIRCLine(line);
                     // Set by a case below to keep this line out of the
