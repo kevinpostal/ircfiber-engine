@@ -2521,6 +2521,8 @@ final class PersistentIRCClient {
         bool                metaWarned;
         /// Own NICK/JOIN/PART/KICK/AWAY/005 applied since the last META write.
         bool                metaDirty;
+        /// A connection-loop fiber currently owns this client.
+        bool                loopRunning;
         // Tracks sessionNick before an optimistic NICK update in sendRaw.
         // The NICK handler checks this to correlate the server's echo back
         // to us post-optimistic-update, since event.nick (old nick) won't
@@ -2556,6 +2558,12 @@ final class PersistentIRCClient {
         TlsInfo             tlsInfo;
     }
 
+    /// Set by the manager while an attach to a held session is being
+    /// retried (`ERR busy`): `start()` must not dial fresh meanwhile — an
+    /// open holder entry for this network means the server already has
+    /// our session.
+    package(ircfiber) bool attachPending;
+
     /// Creates a new persistent IRC client.
     this(NetworkConfig cfg, Channel!IRCRawEvent ch, RedisStorage redisStore = null, string sid = "", UUID owner = UUID.init, HolderClient holderClient = null) {
         this.holder       = holderClient;
@@ -2581,9 +2589,13 @@ final class PersistentIRCClient {
     }
 
     /// Starts the connection loop in a background task. No-op for a
-    /// session that is already running (attached from the holder).
+    /// session that is already running (attached from the holder), while a
+    /// loop fiber already owns this client, or while the manager is still
+    /// retrying an attach to a held session (a fresh dial would double-
+    /// socket the server).
     void start() {
         if (state == ConnectionState.connected) return;
+        if (loopRunning || attachPending) return;
         // Set state immediately so any snapshot taken before the fiber runs
         // reflects the actual intent. Without this, a freshly created client
         // stays in 'disconnected' until the event loop schedules the fiber,
@@ -2594,9 +2606,20 @@ final class PersistentIRCClient {
         spawnConnectionLoop("connection_loop");
     }
 
-    /// Runs `runConnectionLoop()` on a fiber with one crash restart.
+    /// Runs `runConnectionLoop()` on a fiber with one crash restart. Exactly
+    /// one loop fiber per client: a second one (prod 2026-09-09 — attach
+    /// fallback `start()` + `startDeferredClients()` after the holder died
+    /// mid-boot) dials every reconnect twice and hands the second session
+    /// a `_` nick.
     private void spawnConnectionLoop(string label) {
+        if (loopRunning) {
+            logJsonMap("warn", "connection", "Connection loop already running — not starting another",
+                ["network": config.name, "label": label, "event": "loop_already_running"]);
+            return;
+        }
+        loopRunning = true;
         safeFiberRun(label, config.name, {
+            scope (exit) loopRunning = false;
             try {
                 runConnectionLoop();
             } catch (Throwable e) {

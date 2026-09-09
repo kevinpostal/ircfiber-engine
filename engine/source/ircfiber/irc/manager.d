@@ -589,19 +589,24 @@ final class ConnectionManager {
                     logJsonMap("error", "connection", "Another engine holds this connection — not dialing",
                         ["network": config.name, "holderId": entry.id, "event": "attach_busy"]);
                     client.emitLog("error", "Another engine holds this connection — not dialing");
+                    // startDeferredClients() must not dial this one fresh.
+                    client.attachPending = true;
                     return false;
                 }
                 logJsonMap("warn", "connection", "Attach failed — dialing fresh",
                     ["network": config.name, "holderId": entry.id, "code": e.code, "err": e.msg,
                      "event": "attach_fail"]);
+                client.attachPending = false;
                 client.start();
                 return true;
             } catch (Exception e) {
                 logJsonMap("warn", "connection", "Attach failed — dialing fresh",
                     ["network": config.name, "holderId": entry.id, "err": e.msg, "event": "attach_fail"]);
+                client.attachPending = false;
                 client.start();
                 return true;
             }
+            client.attachPending = false;
             client.attachHeld(r, snapshot, snapshot.graceful);
             return true;
         }
