@@ -1434,13 +1434,26 @@ private string egressPinFallbackCopy(string reason) nothrow {
     }
 }
 
-/// Egress policy loop: picks the egresses to try (direct-first for the
+/// First-party host on automatic egress: shared Mullvad exits are never
+/// used. A public exit's connectban bucket is shared with every stranger
+/// behind it, and stranger-driven reconnects loop-ban the exit (~8/hour
+/// trips threshold="8"); our session then dies as collateral, the Z-line
+/// host-bans the location for 12 h, and the ban policy fails everything
+/// over in circles. Direct is the internal alias and never shares a
+/// bucket, so for first-party it is direct or bust. An explicit exit pin
+/// still honours user choice (the fast path requires automatic egress).
+private bool firstPartyDirectOnly(string hostLower, string egressNodeId) @safe pure nothrow @nogc {
+    return hostLower == "irc.ircfiber.com" && egressNodeId.length == 0;
+}
+
+/// Egress policy loop: picks the egresses to try (direct-only for the
 /// first-party ircd, pins, rotation, host bans, direct fallback) and issues
 /// one holder `DIAL` per candidate through `happyEyeballsConnectWithProxy`.
 /// `tlsMode` (`none`/`implicit`/`starttls`) is performed by the holder as
 /// part of the dial, so a TLS failure on one exit moves on to the next; a
 /// `TLS handshake timed out` bans the exit for this host. `dr` carries the
 /// holder's `CONNECTED` facts for the winning dial.
+
 private TCPConnection happyEyeballsConnect(HolderClient holder, DialTag tag, string host, ushort port,
                                            string tlsMode, string egressNodeId,
                                            string ipv6BindAddr, ConnectProgress progress,
@@ -1448,15 +1461,17 @@ private TCPConnection happyEyeballsConnect(HolderClient holder, DialTag tag, str
     import std.string : toLower;
     auto hostLower = host.toLower();
     // Fast-path for the first-party InspIRCd instance (irc.ircfiber.com):
-    // On prod the host resolves via Docker alias to 172.30.0.5 internally.
-    // Trying Mullvad first wastes 12s (3 exits × 4s) and hits the public
-    // hairpin, which is flaky. Try direct first; fall back to Mullvad only
-    // if the internal path fails. This is what fixed the 2026-08-26 outage
-    // where every Mullvad exit was throttled and direct via public IP
-    // also failed, but direct via internal alias succeeded.
+    // On prod the host resolves via Docker alias internally. Direct is the
+    // internal alias and never shares a connectban bucket, so for
+    // first-party it is direct or bust: on failure the error propagates
+    // and the reconnect loop retries direct with backoff instead of
+    // failing over to a shared exit (see firstPartyDirectOnly). This is
+    // what fixed the 2026-08-26 outage where every Mullvad exit was
+    // throttled but direct via internal alias succeeded.
     // Skipped while the ircd has the direct address banned (connectban
-    // Z-line): the ban policy already failed the network over to an exit.
-    if (hostLower == "irc.ircfiber.com" && egressNodeId.length == 0 && !isDirectBannedForHost(hostLower)) {
+    // Z-line): then exits are the only path left, and the ban policy
+    // already failed the network over to one.
+    if (firstPartyDirectOnly(hostLower, egressNodeId) && !isDirectBannedForHost(hostLower)) {
         try {
             auto directConn = happyEyeballsConnectWithProxy(holder, tag, host, port, tlsMode, null, ipv6BindAddr, progress, dr);
             used = EgressUsed.init;
@@ -1464,7 +1479,8 @@ private TCPConnection happyEyeballsConnect(HolderClient holder, DialTag tag, str
         } catch (HolderUnavailableException e) {
             throw e;
         } catch (Exception e) {
-            logWarn("happyEyeballsConnect direct to %s failed (%s), trying Mullvad pool", host, e.msg);
+            logWarn("happyEyeballsConnect direct to %s failed (%s) — staying on direct, no exit failover", host, e.msg);
+            throw e;
         }
     }
     // Generic host-aware egress picker: no per-hostname hardcode.
@@ -8203,4 +8219,15 @@ private void processEvents() {
         if (reason.length > 0) sendRaw("PART " ~ channel ~ " :" ~ reason);
         else                    sendRaw("PART " ~ channel);
     }
+}
+
+@("firstPartyDirectOnly keeps first-party off shared exits")
+unittest {
+    assert(firstPartyDirectOnly("irc.ircfiber.com", ""));
+    assert(!firstPartyDirectOnly("irc.ircfiber.com", "de"),
+           "an explicit exit pin honours user choice");
+    assert(!firstPartyDirectOnly("irc.ircfiber.com", "direct"));
+    assert(!firstPartyDirectOnly("irc.example.org", ""),
+           "third-party hosts keep the pool");
+    assert(!firstPartyDirectOnly("", ""));
 }
