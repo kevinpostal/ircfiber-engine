@@ -167,6 +167,54 @@ private string webircPassword() {
     return cached;
 }
 
+/// WEBIRC-swap suppression after a Z-line kill, keyed `hostLower|ip`.
+/// Swapping into an address the server just banned gets this session killed
+/// with it (p34c3, 2026-09-10: every site attach re-asserted a Mullvad exit
+/// under an active connectban loop-ban, and each 5-minute ban reaped the
+/// swapped engine session). After applyBanPolicy records one,
+/// performRegistration skips asserting that IP for ZLINE_SWAP_SUPPRESS_MS
+/// and the session keeps the engine IP: slightly wrong geo display, stays
+/// alive. Recorded unconditionally when a fiber session dies asserting an
+/// IP — whether the ban targeted the asserted address or the socket, the
+/// next swap into it is unsafe either way.
+private enum ZLINE_SWAP_SUPPRESS_MS = 30 * 60 * 1000L; // 30 min
+private __gshared long[string] webircSwapSuppressedUntil;
+
+private string webircSuppressKey(string hostLower, string ip) @safe pure {
+    return hostLower ~ "|" ~ ip;
+}
+
+private void suppressWebircSwapFor(string host, string ip, long durationMs = ZLINE_SWAP_SUPPRESS_MS) {
+    if (host.length == 0 || ip.length == 0) return;
+    import std.string : toLower;
+    const hl = host.toLower();
+    const exp = nowMsSafe() + durationMs;
+    if (gMullvadLock !is null) synchronized (gMullvadLock) {
+        webircSwapSuppressedUntil[webircSuppressKey(hl, ip)] = exp;
+    } else {
+        webircSwapSuppressedUntil[webircSuppressKey(hl, ip)] = exp;
+    }
+    logWarn("WEBIRC swap suppressed: %s for %s for %d ms (until %d)", ip, hl, durationMs, exp);
+}
+
+private bool webircSwapSuppressed(string hostLower, string ip) {
+    if (hostLower.length == 0 || ip.length == 0) return false;
+    const now = nowMsSafe();
+    const k = webircSuppressKey(hostLower, ip);
+    if (gMullvadLock !is null) synchronized (gMullvadLock) {
+        if (auto p = k in webircSwapSuppressedUntil) {
+            if (now < *p) return true;
+            webircSwapSuppressedUntil.remove(k);
+        }
+        return false;
+    }
+    if (auto p = k in webircSwapSuppressedUntil) {
+        if (now < *p) return true;
+        webircSwapSuppressedUntil.remove(k);
+    }
+    return false;
+}
+
 /// True when `ip` parses and is a public unicast address: not loopback,
 /// RFC 1918, link-local, CGNAT, 0.0.0.0/8, IPv6 loopback/ULA/link-local or
 /// v4-mapped. Load-bearing, not hygiene: the gateway's client-IP resolver
@@ -4344,9 +4392,19 @@ final class PersistentIRCClient {
             const webSecret = fiber ? webircPassword() : "";
             if (fiber) clientIp = loadClientIp();
             if (fiber && webSecret.length && isPublicUnicast(clientIp)) {
-                sendRaw("WEBIRC " ~ webSecret ~ " ircfiber " ~ clientIp ~ " " ~ clientIp);
-                logJsonMap("info", "connection", "WEBIRC sent",
-                    ["network": config.name, "ip": clientIp, "event": "webirc_sent"]);
+                // A swap into an address the server just banned gets this
+                // session killed with it: stay on the engine IP until the
+                // suppression recorded by applyBanPolicy lapses (geo display
+                // goes slightly stale, session stays alive).
+                if (webircSwapSuppressed(config.host.toLower(), clientIp)) {
+                    logJsonMap("info", "connection", "WEBIRC skipped",
+                        ["network": config.name, "event": "webirc_skipped",
+                         "reason": "zline-suppressed", "ip": clientIp]);
+                } else {
+                    sendRaw("WEBIRC " ~ webSecret ~ " ircfiber " ~ clientIp ~ " " ~ clientIp);
+                    logJsonMap("info", "connection", "WEBIRC sent",
+                        ["network": config.name, "ip": clientIp, "event": "webirc_sent"]);
+                }
             } else if (fiber) {
                 logJsonMap("info", "connection", "WEBIRC skipped",
                     ["network": config.name, "event": "webirc_skipped",
@@ -5366,6 +5424,14 @@ private void processEvents() {
     /// Both branches tell the user what happened in the _server buffer.
     private void applyBanPolicy(string text) {
         import std.string : toLower;
+        // The swap that painted us with a banned address must not be
+        // repeated: a fiber session dying while asserting clientIp means
+        // that address is unsafe to assert until the ban is long gone
+        // (see webircSwapSuppressed). Unconditional: whether the ban hit
+        // the asserted address or the socket, re-asserting it next
+        // redial walks back into the kill zone either way.
+        if (clientIp.length) suppressWebircSwapFor(config.host, clientIp);
+
         const banKey = activeEgressLocationId.length > 0
             ? activeEgressLocationId : DIRECT_EGRESS_LABEL;
         const via = activeEgressLabel.length > 0
@@ -8230,4 +8296,24 @@ unittest {
     assert(!firstPartyDirectOnly("irc.example.org", ""),
            "third-party hosts keep the pool");
     assert(!firstPartyDirectOnly("", ""));
+}
+
+@("webircSwapSuppressed skips recently Z-lined addresses only")
+unittest {
+    assert(webircSuppressKey("irc.ircfiber.com", "1.2.3.4") == "irc.ircfiber.com|1.2.3.4");
+    assert(!webircSwapSuppressed("irc.ircfiber.com", "9.9.9.9"),
+           "an address never recorded is never suppressed");
+    assert(!webircSwapSuppressed("", "1.2.3.4") && !webircSwapSuppressed("irc.ircfiber.com", ""));
+    suppressWebircSwapFor("irc.ircfiber.com", "1.2.3.4");
+    assert(webircSwapSuppressed("irc.ircfiber.com", "1.2.3.4"));
+    assert(!webircSwapSuppressed("irc.ircfiber.com", "1.2.3.5"),
+           "suppression is per-address");
+    assert(!webircSwapSuppressed("irc.example.org", "1.2.3.4"),
+           "suppression is per-host");
+    suppressWebircSwapFor("irc.ircfiber.com", "5.6.7.8", 0);
+    assert(!webircSwapSuppressed("irc.ircfiber.com", "5.6.7.8"),
+           "a zero-duration record is already lapsed");
+    suppressWebircSwapFor("", "");
+    assert(!webircSwapSuppressed("irc.ircfiber.com", "9.9.9.9"),
+           "empty records change nothing");
 }
