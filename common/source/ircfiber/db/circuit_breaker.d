@@ -178,15 +178,20 @@ unittest {
     // Force open with 5 failures
     foreach (i; 0 .. 5) cb.recordFailure();
     assert(cb.isOpen);
-    // Artificially set cool down to 0
+    // Zero cool down so the next allowRequest() promotes to half-open.
     cb.coolDownMs_ = 0;
     assert(cb.allowRequest(), "breaker must enter half-open after cool down");
     assert(cb.isHalfOpen);
-    // Failure reopens
+    // Failure reopens and restarts the cool down.
     cb.recordFailure();
     assert(cb.isOpen, "breaker must reopen after half-open failure");
-    assert(!cb.allowRequest(), "reopened breaker must reject requests");
     assert(cb.failuresCount == 6, "failure counter must increment");
+    // Rejection is only observable while the cool down is unexpired — with
+    // coolDownMs_ still 0 the reopened breaker correctly promotes itself
+    // straight back to half-open, so restore a real cool down first.
+    cb.coolDownMs_ = 60_000;
+    assert(!cb.allowRequest(), "reopened breaker must reject requests during cool down");
+    assert(cb.isOpen, "rejected request must leave the breaker open");
 }
 
 @("MongoCircuitBreaker: singleton helpers work with null breaker (no crash)")

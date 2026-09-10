@@ -76,7 +76,9 @@ make -C .. ship-engine        # from ircfiber-infra: build on ubuntu-docker, pus
 
 ```bash
 dub --root=engine test && dub --root=common test
-./scripts/check-common-drift.sh --fetch
+# site/common is the source of truth — edits flow site -> engine via
+# site/scripts/sync-common.sh, so this side only checks:
+./scripts/check-common-drift.sh --fetch  # common in sync?
 python3 -m pytest tests/irc_parity -v  # against mock ircd
 ```
 

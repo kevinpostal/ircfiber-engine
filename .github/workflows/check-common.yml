@@ -1,0 +1,43 @@
+name: Check common
+
+# Symmetric half of site's guard: without this, a common/ change landing on
+# the engine side drifts silently until someone diffs the mirrors by hand.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'common/**'
+      - 'engine/dub.sdl'
+      - 'scripts/check-common-drift.sh'
+  pull_request:
+    paths:
+      - 'common/**'
+      - 'engine/dub.sdl'
+      - 'scripts/check-common-drift.sh'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # site/common is the source of truth — engine-side changes to common/
+      # belong in site/common first, then site/scripts/sync-common.sh.
+      - name: No drift vs site/common
+        env:
+          PEER_TOKEN: ${{ secrets.SUPERPROJECT_PAT }}
+        run: |
+          if [ -n "$PEER_TOKEN" ]; then
+            export PEER_REPO_URL="https://x-access-token:$PEER_TOKEN@github.com/kevinpostal/ircfiber-site.git"
+          fi
+          ./scripts/check-common-drift.sh --fetch
+
+      - uses: dlang-community/setup-dlang@v2
+        with:
+          compiler: ldc-latest
+
+      - name: Test common and resolve it from engine
+        run: |
+          dub test --root=common --compiler=ldc2
+          dub describe --root=engine > /dev/null

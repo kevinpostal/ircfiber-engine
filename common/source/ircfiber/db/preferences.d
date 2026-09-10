@@ -694,13 +694,26 @@ unittest {
     assert(!r3.needsRepair, "needsRepair must be false when all fields are correct type");
 }
 
-@("prefsRepo.save atomicity: concurrent saves produce strictly monotonic prefVersion")
+@("prefsRepo.mutate serializes concurrent read-modify-writes: prefVersion ends at N")
 unittest {
     // Requires a local Redis on 127.0.0.1:6379. Skip if unavailable
     // (e.g. CI runners without Redis) — the roundtrip test above is
     // sufficient for CI; this one is for the dev box.
-    import std.parallelism : parallel;
-    import std.range : iota;
+    //
+    // The savers are vibe.d tasks, not std.parallelism workers: vibe's Redis
+    // ConnectionPool asserts "called from a foreign thread" the moment a
+    // non-vibe thread touches it, so the std.parallelism version could never
+    // pass on a box that actually has Redis. Tasks are also the concurrency
+    // model the gateway serves requests with, and they interleave at every
+    // Redis round trip.
+    //
+    // The savers go through mutate(), not raw load()/save(): save() is atomic
+    // for the counter only, and a hand-rolled load → modify → save is a
+    // documented lost update (see PreferencesRepository.userLocks). mutate()
+    // serializes per user with a TaskMutex, so N concurrent appends must all
+    // survive with prefVersion ending exactly at N.
+    import vibe.core.core : runTask, runEventLoop, exitEventLoop, setTimer, Task;
+    import core.time : seconds;
     import std.conv : to;
 
     RedisStorage redis;
@@ -726,18 +739,57 @@ unittest {
     auto repo = new PreferencesRepository(redis);
     enum N = 50;
 
-    // Fire N saves in parallel from N workers. Each worker loads the
-    // current prefs, appends a unique pinned channel, and saves. Without
-    // the atomic Lua script, two workers could observe the same
-    // prefVersion and produce duplicates — exactly the bug this task
-    // fixes. With the Lua script, every save increments by exactly 1
-    // from the previous Redis state, so prefVersion must end at N.
-    foreach (i; iota(N).parallel) {
-        auto p = repo.load(userId);
-        p.pinnedChannels ~= "net1:#parallel-" ~ i.to!string;
-        const v = repo.save(userId, p);
-        assert(v >= 1, "save() must return the bumped prefVersion");
-    }
+    long[] versions;
+    string[] saverErrors;
+    string timeout;
+    string setupError;
+    // NOTE: vibe runTask delegates must be nothrow — every throwing call
+    // lives inside try/catch and failures are collected for asserts below.
+    runTask(() @system nothrow {
+        try {
+            auto watchdog = setTimer(30.seconds, {
+                timeout = "concurrent mutate test timed out";
+                exitEventLoop();
+            });
+            scope (exit) {
+                watchdog.stop();
+                exitEventLoop();
+            }
+            Task[] savers;
+            foreach (i; 0 .. N) {
+                savers ~= runTask((int k) @system nothrow {
+                    try {
+                        versions ~= repo.mutate(userId, (ref UserPreferences p) {
+                            p.pinnedChannels ~= "net1:#parallel-" ~ k.to!string;
+                            return true;
+                        });
+                    } catch (Exception e) {
+                        try saverErrors ~= e.msg;
+                        catch (Exception) {}
+                    }
+                }, i);
+            }
+            foreach (t; savers) {
+                try t.join();
+                catch (Exception e) {
+                    try saverErrors ~= e.msg;
+                    catch (Exception) {}
+                }
+            }
+        } catch (Exception e) {
+            try setupError = e.msg;
+            catch (Exception) {}
+            exitEventLoop();
+        }
+    });
+    runEventLoop();
+
+    assert(setupError.length == 0, setupError);
+
+    assert(timeout.length == 0, timeout);
+    assert(saverErrors.length == 0, saverErrors.length ? saverErrors[0] : "saver failed");
+    assert(versions.length == N, "every saver must return a prefVersion");
+    foreach (v; versions) assert(v >= 1, "save() must return the bumped prefVersion");
 
     // Final load must show prefVersion == N with no duplicates / skips.
     const saved = repo.load(userId);

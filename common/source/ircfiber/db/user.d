@@ -47,6 +47,12 @@ final class UserRepository {
         }
         try collection.createIndex(Bson(["bncToken": Bson(1)]));
         catch (Exception e) logWarn("users bncToken index: %s", e.msg);
+        try {
+            IndexOptions o;
+            o.unique = true;
+            o.sparse = true;
+            collection.createIndex(Bson(["oauthIdentities.provider": Bson(1), "oauthIdentities.subject": Bson(1)]), o);
+        } catch (Exception e) logWarn("users oauthIdentities index: %s", e.msg);
     }
 
     /// Finds a user by username.
@@ -82,6 +88,30 @@ final class UserRepository {
         return docFromBson(doc);
     }
 
+    /// Finds a user by linked OAuth identity. `$elemMatch` keeps provider
+    /// and subject bound to the same array element (dot-notation across
+    /// array elements could false-match across two identities).
+    User findByOAuth(string provider, string subject) {
+        if (provider.length == 0 || subject.length == 0) return User.init;
+        auto doc = collection.findOne(Bson(["oauthIdentities": Bson(["$elemMatch": Bson(["provider": Bson(provider), "subject": Bson(subject)])])]));
+        if (doc.isNull) return User.init;
+        return docFromBson(doc);
+    }
+
+    /// Finds a user whose email matches case-insensitively (anchored
+    /// literal regex, same idiom as `findByUsernameCI`). Used by social
+    /// signup to link a verified provider email onto an existing row.
+    User findByEmailCI(string email) {
+        if (email.length == 0) return User.init;
+        auto doc = collection.findOne(Bson([
+            "email": Bson([
+                "$regex": Bson("^" ~ escapeRegexLiteral(email) ~ "$"),
+                "$options": Bson("i")
+            ])
+        ]));
+        if (doc.isNull) return User.init;
+        return docFromBson(doc);
+    }
     /// Finds a user by ID.
     User findById(UUID id) {
         auto doc = collection.findOne(["id": id.toString()]);
@@ -140,6 +170,22 @@ final class UserRepository {
         return cast(int) collection.countDocuments(Bson.emptyObject);
     }
 
+    /// Users created by `!adduser` (`provisionedFrom` non-empty), newest
+    /// first is left to the caller — Mongo returns natural order here and
+    /// the admin list is small. Legacy rows without the key never match
+    /// (`$exists` guard), so no migration is needed.
+    User[] listProvisioned(int limit = 200) {
+        User[] results;
+        FindOptions findOpts;
+        findOpts.limit = limit;
+        auto filter = Bson(["provisionedFrom": Bson(["$exists": Bson(true), "$ne": Bson("")])]);
+        foreach (doc; collection.find(filter, findOpts)) {
+            if (doc.isNull) continue;
+            results ~= docFromBson(doc);
+        }
+        return results;
+    }
+
     /// Finds all users with limit and offset.
     User[] findAll(int limit, int) {
         User[] results;
@@ -171,6 +217,57 @@ final class UserRepository {
         return ids;
     }
 
+    /// Bulk-campaign audience. Shared filter: subscribed rows with a
+    /// non-empty email, plus optional role (element of the `roles` array),
+    /// `createdAt` range (unix ms; 0/negative = open) and `q` substring on
+    /// username+email (same escaped-regex idiom as `search`). No new index:
+    /// sub-500 collections scan fine on `username_ci_unique` + `bncToken_1`.
+    long countCampaignAudience(string role, long createdAfterMs, long createdBeforeMs, string q) {
+        return cast(long) collection.countDocuments(campaignAudienceFilter(role, createdAfterMs, createdBeforeMs, q));
+    }
+
+    /// Same filters but INCLUDING opted-out rows (only the opt-out clause
+    /// is dropped): the campaign send reports `skippedUnsubscribed` as this
+    /// minus `countCampaignAudience`.
+    long countCampaignAudienceTotal(string role, long createdAfterMs, long createdBeforeMs, string q) {
+        return cast(long) collection.countDocuments(campaignAudienceFilter(role, createdAfterMs, createdBeforeMs, q, false));
+    }
+
+    /// Same filter as `countCampaignAudience`, `limit` applied.
+    User[] fetchCampaignAudience(string role, long createdAfterMs, long createdBeforeMs, string q, int limit) {
+        User[] results;
+        FindOptions campaignOpts;
+        campaignOpts.limit = limit;
+        foreach (doc; collection.find(campaignAudienceFilter(role, createdAfterMs, createdBeforeMs, q), campaignOpts)) {
+            if (doc.isNull) continue;
+            results ~= docFromBson(doc);
+        }
+        return results;
+    }
+
+    /// List-Unsubscribe consumer: flips the first row whose email matches
+    /// case-insensitively (anchored literal regex, same idiom as
+    /// `findByUsernameCI`). Returns whether a row was updated.
+    bool setEmailUnsubscribed(string email) {
+        if (email.length == 0) return false;
+        auto doc = collection.findOne(Bson([
+            "email": Bson([
+                "$regex": Bson("^" ~ escapeRegexLiteral(email) ~ "$"),
+                "$options": Bson("i")
+            ])
+        ]));
+        if (doc.isNull) return false;
+        try {
+            collection.updateOne(
+                Bson(["id": Bson(doc["id"].get!string)]),
+                Bson(["$set": Bson(["emailUnsubscribed": Bson(true)])]));
+            return true;
+        } catch (Exception e) {
+            logWarn("users setEmailUnsubscribed failed: %s", e.msg);
+            return false;
+        }
+    }
+
     /// Searches users by username or email substring.
     User[] search(string query, int limit) {
         User[] results;
@@ -198,11 +295,17 @@ final class UserRepository {
         fields["passwordHash"] = Bson(u.passwordHash);
         fields["roles"] = Bson(u.roles.map!(r => Bson(r)).array);
         fields["signupIp"] = Bson(u.signupIp);
+        fields["provisionedFrom"] = Bson(u.provisionedFrom);
         fields["lastLoginIp"] = Bson(u.lastLoginIp);
         // Cast to double to avoid vibe.d BSON long_/double_ type mismatch
         fields["lastLoginAt"] = Bson(cast(double) u.lastLoginAt.toUnixTime);
         fields["createdAt"] = Bson(cast(double) u.createdAt.toUnixTime);
         fields["loginIps"] = Bson(u.loginIps.map!(r => Bson(r)).array);
+        fields["emailUnsubscribed"] = Bson(u.emailUnsubscribed);
+        Bson[] ids;
+        foreach (o; u.oauthIdentities)
+            ids ~= Bson(["provider": Bson(o.provider), "subject": Bson(o.subject)]);
+        fields["oauthIdentities"] = Bson(ids);
         return Bson(fields);
     }
 
@@ -231,6 +334,7 @@ final class UserRepository {
             u.roles = deserializeBson!(string[])(doc["roles"]);
         if (doc["signupIp"].type != Bson.Type.null_)
             u.signupIp = doc["signupIp"].get!string;
+        try { if (doc["provisionedFrom"].type != Bson.Type.null_) u.provisionedFrom = doc["provisionedFrom"].get!string; } catch (Exception) {}
         if (doc["lastLoginIp"].type != Bson.Type.null_)
             u.lastLoginIp = doc["lastLoginIp"].get!string;
         if (doc["lastLoginAt"].type != Bson.Type.null_) {
@@ -243,8 +347,50 @@ final class UserRepository {
         }
         if (doc["loginIps"].type != Bson.Type.null_)
             u.loginIps = deserializeBson!(string[])(doc["loginIps"]);
+        // Missing key (pre-campaign rows) reads as false: still subscribed.
+        // Tolerant: a wrongly typed value keeps false rather than throwing.
+        try { if (doc["emailUnsubscribed"].type == Bson.Type.bool_) u.emailUnsubscribed = doc["emailUnsubscribed"].get!bool; } catch (Exception) {}
+        // Missing key (pre-OAuth rows) reads as []: unlinked.
+        try {
+            if (doc["oauthIdentities"].type == Bson.Type.array)
+                foreach (e; doc["oauthIdentities"])
+                    u.oauthIdentities ~= OAuthIdentity(e["provider"].get!string, e["subject"].get!string);
+        } catch (Exception) { u.oauthIdentities = []; }
         return u;
     }
+}
+
+/**
+ * Shared bulk-campaign audience filter (free function so backend unit tests
+ * can assert its shape without a Mongo connection; the repository methods
+ * above are thin wrappers over it).
+ *
+ * Base: subscribed rows with a non-empty email. `createdAt` is stored as
+ * double unix seconds, so the ms bounds convert (`/ 1000.0`); 0/negative
+ * means open on that side.
+ */
+/// `onlySubscribed=false` drops just the opt-out clause (the email
+/// presence clause stays): the campaign send counts `skippedUnsubscribed`
+/// as the difference between the two counts.
+Bson campaignAudienceFilter(string role, long createdAfterMs, long createdBeforeMs, string q, bool onlySubscribed = true) {
+    Bson[] andParts = [
+        Bson(["email": Bson(["$exists": Bson(true), "$ne": Bson("")])]),
+    ];
+    if (onlySubscribed)
+        andParts ~= Bson(["emailUnsubscribed": Bson(["$ne": Bson(true)])]);
+    if (role.length > 0)
+        andParts ~= Bson(["roles": Bson(role)]);
+    if (createdAfterMs > 0 || createdBeforeMs > 0) {
+        Bson[string] range;
+        if (createdAfterMs > 0) range["$gte"] = Bson(cast(double) createdAfterMs / 1000.0);
+        if (createdBeforeMs > 0) range["$lte"] = Bson(cast(double) createdBeforeMs / 1000.0);
+        andParts ~= Bson(["createdAt": Bson(range)]);
+    }
+    if (q.length > 0) {
+        auto rx = Bson(["$regex": Bson(escapeRegexLiteral(q)), "$options": Bson("i")]);
+        andParts ~= Bson(["$or": Bson([Bson(["username": rx]), Bson(["email": rx])])]);
+    }
+    return Bson(["$and": Bson(andParts)]);
 }
 
 /**

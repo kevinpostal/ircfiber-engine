@@ -1,5 +1,4 @@
-# common — duplicated until ircfiber-common package
+# common — mirror of ircfiber-common
 
-This `common/` is duplicated in `ircfiber-site` and `ircfiber-engine` (Option A).
-Keep in sync via cherry-pick. Drift check: `scripts/check-common-drift.sh` fails PR if drift >0.
-Follow-up: extract `kevinpostal/ircfiber-common` as dub package `irc-fiber-common` version `~>0.3.0`.
+This `common/` is a mirror of `site/common` (source of truth) and the canonical `kevinpostal/ircfiber-common` repo (dub package `irc-fiber-common`, tagged `common-v0.3.x`).
+Do not edit here — edit `site/common/`, then run `site/scripts/sync-common.sh` (copies `source/` + `dub.sdl` only). Guards: `site/scripts/check-common-drift.sh --fetch` fails CI on drift; `site/scripts/check-common-version.sh` checks version + dep strings (`~>0.3.1`).
