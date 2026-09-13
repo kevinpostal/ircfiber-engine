@@ -96,6 +96,9 @@ final class BufferManager {
         enum MAX_SCROLLBACK = 5000;
         enum KEY_PREFIX = "scrollback:";
         enum TTL_DAYS = 30;
+        enum UNREAD_CHUNK = 100;      // LRANGE slice per round trip
+        enum UNREAD_MAX_SCAN = 1000;  // hard cap on rows scanned per buffer
+        static immutable string[] UNREAD_COMMANDS = ["PRIVMSG", "NOTICE", "INVITE", "WALLOPS"];
         // Dedup-set key namespace: `dedup:<networkId>:<channel>`.
         //
         // Each buffer has a paired Redis SET holding the dedup key (msgid
@@ -261,6 +264,47 @@ final class BufferManager {
             if (legacyRes.length > 0) return legacyRes;
         }
         return res;
+    }
+
+    /// Chat entries (PRIVMSG / NOTICE / INVITE / WALLOPS) strictly newer than
+    /// `afterTs` (ms), oldest-first, at most `limit` — the NEWEST `limit` when
+    /// more exist. Feeds the connect-time sync's per-buffer unread tail
+    /// (IRCCloud OOB backlog). Bounded newest-first scan in UNREAD_CHUNK
+    /// slices: a slice with no newer row ends the scan (a CHATHISTORY
+    /// backfill batch of older rows can sit above live traffic, so the
+    /// first old row must not), as does UNREAD_MAX_SCAN. Empty `serverId`
+    /// reads the legacy non-namespaced key. Never throws on bad rows.
+    Json[] getUnreadTail(string serverId, string networkId, string channel, long afterTs, long limit) @trusted {
+        import std.algorithm : canFind;
+        auto norm = normalizeChannel(channel);
+        auto key = serverId.length
+            ? KEY_PREFIX ~ serverId ~ ":" ~ networkId ~ ":" ~ norm
+            : KEY_PREFIX ~ networkId ~ ":" ~ norm;
+        auto db = redis.getDb();
+        Json[] messages;
+        for (long start = 0; start < UNREAD_MAX_SCAN && messages.length < limit; start += UNREAD_CHUNK) {
+            auto results = db.lrange!(ubyte[])(key, start, start + UNREAD_CHUNK - 1);
+            long rows = 0;
+            bool sawNewer = false;
+            foreach (raw; results) {
+                rows++;
+                Json msg;
+                try {
+                    auto r = sanitizeUtf8(() @trusted { return cast(string) raw.idup; } ());
+                    msg = parseJson(r);
+                } catch (Exception e) { continue; }
+                auto tp = "t" in msg;
+                if (tp is null || tp.type != Json.Type.int_ || tp.get!long <= afterTs) continue;
+                sawNewer = true;
+                auto cp = "c" in msg;
+                if (cp is null || cp.type != Json.Type.string || !UNREAD_COMMANDS.canFind(cp.get!string)) continue;
+                messages ~= msg;
+                if (messages.length >= limit) break;
+            }
+            if (!sawNewer || rows < UNREAD_CHUNK) break;
+        }
+        messages.reverse;
+        return messages;
     }
 
     /**
@@ -802,4 +846,55 @@ final class BufferManager {
         db.expire(key, 86_400 * TTL_DAYS);
         return true;
     }
+}
+
+@("BufferManager.getUnreadTail returns newest chat rows after lastSeen, oldest-first, capped")
+unittest {
+    // Requires a local Redis on 127.0.0.1:6379; skipped when unavailable.
+    import std.uuid : randomUUID;
+    RedisStorage redis;
+    try {
+        redis = new RedisStorage();
+        redis.connect();
+    } catch (Exception e) {
+        logWarn("Skipping BufferManager.getUnreadTail test: Redis unavailable (%s)", e.msg);
+        return;
+    }
+    const netId = "netT-" ~ randomUUID().toString();
+    const key = "scrollback:srvT:" ~ netId ~ ":#tail";
+    const legacyKey = "scrollback:" ~ netId ~ ":#tail";
+    void cleanup() {
+        try { redis.getDb().del(key); redis.getDb().del(legacyKey); }
+        catch (Exception) {}
+    }
+    cleanup();
+    scope (exit) cleanup();
+
+    auto db = redis.getDb();
+    // LPUSH oldest first so slice 0 is the newest, as appendMessage does.
+    db.lpush(key, `{"t":100,"c":"PRIVMSG","n":"a","x":"old"}`);
+    db.lpush(key, `{"t":200,"c":"JOIN","n":"b","x":""}`);
+    db.lpush(key, `{"t":300,"c":"PRIVMSG","n":"b","x":"one"}`);
+    db.lpush(key, `{"t":400,"c":"NOTICE","n":"c","x":"two"}`);
+    db.lpush(key, `{"t":500,"c":"PRIVMSG","n":"d","x":"three"}`);
+    db.lpush(legacyKey, `{"t":600,"c":"PRIVMSG","n":"e","x":"legacy"}`);
+
+    auto bm = new BufferManager(redis);
+
+    auto tail = bm.getUnreadTail("srvT", netId, "#tail", 150, 100);
+    assert(tail.length == 3);
+    assert(tail[0]["x"].get!string == "one");
+    assert(tail[1]["x"].get!string == "two");
+    assert(tail[2]["x"].get!string == "three");
+
+    auto capped = bm.getUnreadTail("srvT", netId, "#tail", 150, 2);
+    assert(capped.length == 2);
+    assert(capped[0]["x"].get!string == "two");
+    assert(capped[1]["x"].get!string == "three");
+
+    assert(bm.getUnreadTail("srvT", netId, "#tail", 500, 100).length == 0);
+
+    auto legacy = bm.getUnreadTail("", netId, "#tail", 0, 100);
+    assert(legacy.length == 1);
+    assert(legacy[0]["x"].get!string == "legacy");
 }
