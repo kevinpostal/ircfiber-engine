@@ -10,7 +10,7 @@ import vibe.core.log;
 import ircfiber.db.mongo : AppMongoConnection;
 
 /// Wire values of `SupportIssueRecord.kind`.
-immutable string[] supportKinds = ["bug", "feature", "question", "other"];
+immutable string[] supportKinds = ["bug", "feature", "question", "other", "task"];
 /// Wire values of `SupportIssueRecord.status`.
 immutable string[] supportStatuses = ["open", "in_progress", "resolved", "closed"];
 /// Wire values of `SupportIssueRecord.priority`.
