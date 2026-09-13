@@ -5,11 +5,20 @@ import std.datetime : DateTime, SysTime, Clock, unixTimeToStdTime;
 import vibe.data.json;
 import vibe.data.bson;
 
-/// One linked social-login identity: provider name ("github") plus the
-/// provider-side user id as a string.
+/// One linked social-login identity: provider name ("github"), the
+/// provider-side user id, and the usage stamps the admin Social login
+/// page reports. A row written before usage tracking reads back with
+/// `SysTime.init` stamps and `useCount` 0 — no migration.
 struct OAuthIdentity {
     string provider;
     string subject;
+    /// First time this identity was linked to the account.
+    SysTime linkedAt;
+    /// Most recent completed social login through this identity.
+    SysTime lastUsedAt;
+    /// Completed social logins through this identity; the link or signup
+    /// that created it counts as the first.
+    long useCount;
 }
 /// User account
 struct User {
@@ -43,11 +52,33 @@ struct User {
     SysTime createdAt;
     /// IP history (de-duplicated list of login IPs)
     string[] loginIps;
+    /// Records one completed social login through (`provider`, `subject`):
+    /// appends the identity when absent (`linkedAt`/`lastUsedAt` = `now`,
+    /// `useCount` 1), otherwise bumps `lastUsedAt`/`useCount` and
+    /// back-fills `linkedAt` for identities stored before usage tracking.
+    /// In-place only; the caller persists with `UserRepository.update`.
+    void recordOAuthLogin(string provider, string subject, SysTime now) {
+        foreach (ref o; oauthIdentities) {
+            if (o.provider != provider || o.subject != subject) continue;
+            if (o.linkedAt.toUnixTime() <= 0) o.linkedAt = now;
+            o.lastUsedAt = now;
+            o.useCount++;
+            return;
+        }
+        oauthIdentities ~= OAuthIdentity(provider, subject, now, now, 1);
+    }
+
     /// Serialize to JSON
     Json toJson() const {
         Json[] ids;
         foreach (o; oauthIdentities)
-            ids ~= Json(["provider": Json(o.provider), "subject": Json(o.subject)]);
+            ids ~= Json([
+                "provider": Json(o.provider),
+                "subject": Json(o.subject),
+                "linkedAt": Json(o.linkedAt.toUnixTime()),
+                "lastUsedAt": Json(o.lastUsedAt.toUnixTime()),
+                "useCount": Json(o.useCount)
+            ]);
         return Json([
             "id": Json(id.toString()),
             "username": Json(username),
@@ -96,8 +127,17 @@ struct User {
         // Missing key (pre-OAuth rows) reads as []: unlinked.
         if (auto pr = "oauthIdentities" in json) {
             try {
-                foreach (e; (*pr).get!(Json[]))
-                    u.oauthIdentities ~= OAuthIdentity(e["provider"].get!string, e["subject"].get!string);
+                foreach (e; (*pr).get!(Json[])) {
+                    OAuthIdentity o;
+                    o.provider = e["provider"].get!string;
+                    o.subject = e["subject"].get!string;
+                    const lk = e["linkedAt"].opt!long;
+                    if (lk > 0) o.linkedAt = SysTime(unixTimeToStdTime(lk));
+                    const lu = e["lastUsedAt"].opt!long;
+                    if (lu > 0) o.lastUsedAt = SysTime(unixTimeToStdTime(lu));
+                    o.useCount = e["useCount"].opt!long;
+                    u.oauthIdentities ~= o;
+                }
             } catch (Exception) { u.oauthIdentities = []; }
         }
         return u;

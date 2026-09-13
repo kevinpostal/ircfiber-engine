@@ -112,6 +112,37 @@ final class UserRepository {
         if (doc.isNull) return User.init;
         return docFromBson(doc);
     }
+
+    /// Number of users with at least one identity for `provider`
+    /// (`""` = any). Index-backed by `oauthIdentities.provider`.
+    long countOAuthLinked(string provider) {
+        return cast(long) collection.countDocuments(oauthLinkedFilter(provider));
+    }
+
+    /// Number of accounts created through social signup (`""` = any provider).
+    long countOAuthSignups(string provider) {
+        return cast(long) collection.countDocuments(oauthSignupFilter(provider));
+    }
+
+    /// Number of users whose social login was used at or after
+    /// `sinceUnixSec` (`provider` `""` = any).
+    long countOAuthActiveSince(long sinceUnixSec, string provider) {
+        return cast(long) collection.countDocuments(oauthActiveSinceFilter(sinceUnixSec, provider));
+    }
+
+    /// Every user holding at least one social identity, capped at `limit`.
+    /// Mongo natural order (no sort, like `listProvisioned`); the admin
+    /// handler orders the rows it returns.
+    User[] listWithOAuth(int limit = 500) {
+        User[] results;
+        FindOptions findOpts;
+        findOpts.limit = limit;
+        foreach (doc; collection.find(oauthLinkedFilter(""), findOpts)) {
+            if (doc.isNull) continue;
+            results ~= docFromBson(doc);
+        }
+        return results;
+    }
     /// Finds a user by ID.
     User findById(UUID id) {
         auto doc = collection.findOne(["id": id.toString()]);
@@ -304,7 +335,14 @@ final class UserRepository {
         fields["emailUnsubscribed"] = Bson(u.emailUnsubscribed);
         Bson[] ids;
         foreach (o; u.oauthIdentities)
-            ids ~= Bson(["provider": Bson(o.provider), "subject": Bson(o.subject)]);
+            ids ~= Bson([
+                "provider": Bson(o.provider),
+                "subject": Bson(o.subject),
+                // Doubles for the same reason as lastLoginAt above.
+                "linkedAt": Bson(cast(double) o.linkedAt.toUnixTime),
+                "lastUsedAt": Bson(cast(double) o.lastUsedAt.toUnixTime),
+                "useCount": Bson(cast(double) o.useCount)
+            ]);
         fields["oauthIdentities"] = Bson(ids);
         return Bson(fields);
     }
@@ -353,8 +391,17 @@ final class UserRepository {
         // Missing key (pre-OAuth rows) reads as []: unlinked.
         try {
             if (doc["oauthIdentities"].type == Bson.Type.array)
-                foreach (e; doc["oauthIdentities"])
-                    u.oauthIdentities ~= OAuthIdentity(e["provider"].get!string, e["subject"].get!string);
+                foreach (e; doc["oauthIdentities"]) {
+                    OAuthIdentity o;
+                    o.provider = e["provider"].get!string;
+                    o.subject = e["subject"].get!string;
+                    const lk = readBsonTimestamp(e["linkedAt"]);
+                    if (lk > 0) o.linkedAt = SysTime(unixTimeToStdTime(lk));
+                    const lu = readBsonTimestamp(e["lastUsedAt"]);
+                    if (lu > 0) o.lastUsedAt = SysTime(unixTimeToStdTime(lu));
+                    o.useCount = readBsonTimestamp(e["useCount"]);
+                    u.oauthIdentities ~= o;
+                }
         } catch (Exception) { u.oauthIdentities = []; }
         return u;
     }
@@ -391,6 +438,38 @@ Bson campaignAudienceFilter(string role, long createdAfterMs, long createdBefore
         andParts ~= Bson(["$or": Bson([Bson(["username": rx]), Bson(["email": rx])])]);
     }
     return Bson(["$and": Bson(andParts)]);
+}
+
+/**
+ * Social-login adoption filters (admin Social login page). Free functions
+ * so tests can assert their shape without Mongo; the repository methods
+ * above are thin `countDocuments` wrappers.
+ *
+ * `provider == ""` means "any provider". `$elemMatch` keeps provider and
+ * stamp bound to the same array element, the same reason `findByOAuth`
+ * uses it.
+ */
+Bson oauthLinkedFilter(string provider) {
+    if (provider.length == 0)
+        return Bson(["oauthIdentities.0": Bson(["$exists": Bson(true)])]);
+    return Bson(["oauthIdentities": Bson(["$elemMatch": Bson(["provider": Bson(provider)])])]);
+}
+
+/// Accounts *created* through social signup: `provisionedFrom` is
+/// `"oauth:<provider>"` (set by the OAuth callback's new-account path).
+Bson oauthSignupFilter(string provider) {
+    if (provider.length == 0)
+        return Bson(["provisionedFrom": Bson(["$regex": Bson("^oauth:")])]);
+    return Bson(["provisionedFrom": Bson("oauth:" ~ provider)]);
+}
+
+/// Users with an identity used at or after `sinceUnixSec` (stamps are
+/// stored as double unix seconds).
+Bson oauthActiveSinceFilter(long sinceUnixSec, string provider) {
+    Bson[string] match;
+    if (provider.length > 0) match["provider"] = Bson(provider);
+    match["lastUsedAt"] = Bson(["$gte": Bson(cast(double) sinceUnixSec)]);
+    return Bson(["oauthIdentities": Bson(["$elemMatch": Bson(match)])]);
 }
 
 /**
