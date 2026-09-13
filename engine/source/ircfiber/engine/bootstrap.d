@@ -262,8 +262,8 @@ EngineContext bootstrapEngine() {
     // vibe.d event loop. Redis operations (HGET, SMEMBERS, HSET) need the
     // event loop to process I/O — calling them here would hang on Linux
     // (epoll driver) because the event loop isn't running yet.
-    // See startNetworkLoadingTask() called from runNormalEngineAfterBootstrap()
-    // which runs the actual network load inside a runTask after runApplication().
+    // See loadNetworksWithRetry(), run from the registration task in
+    // app_engine.d inside a runTask after runApplication().
     logInfo("Bootstrap: network loading deferred to event loop");
 
     return EngineContext(connManager, redis, bufferManager, messageRepo, networkRepo,
@@ -461,17 +461,34 @@ void loadNetworks(ref EngineContext ctx) {
     ctx.connManager.startDeferredClients();
 }
 
-/// Start the network loading task. Called before runApplication() — all
-/// runTask futures execute after the event loop starts, ensuring Redis
-/// operations (SMEMBERS, HGET, HSET, SCAN) have I/O processing available.
-void startNetworkLoadingTask(ref EngineContext ctx) {
-    runTask(() nothrow {
+/// `loadNetworks` with bounded retry. Must run inside a runTask so the Redis
+/// and Mongo operations have a running event loop to process I/O.
+///
+/// Retries because a host reboot starts mongod and the engine at the same
+/// time: the first `findAll()` then hits a mongod that is still starting
+/// ("not master and slaveOk=false"), the one-shot load threw, and the
+/// engine sat with zero connections until an operator restarted it by hand
+/// (prod, 2026-09-13 — 50 user networks stayed offline after a reboot).
+/// Every attempt is idempotent: `addNetwork` skips networks the manager
+/// already holds, and held holder sessions are consumed only once.
+void loadNetworksWithRetry(ref EngineContext ctx) {
+    enum attempts = 60;          // 60 × 5 s ≈ 5 min of mongod startup slack
+    enum retryDelay = 5.seconds;
+    foreach (attempt; 1 .. attempts + 1) {
         try {
             loadNetworks(ctx);
+            return;
         } catch (Exception e) {
-            logError("Network loading task failed: %s", e.msg);
+            if (attempt == attempts) {
+                logError("Network loading failed after %d attempts: %s — no networks are connected",
+                    attempts, e.msg);
+                return;
+            }
+            logWarn("Network loading attempt %d/%d failed (%s) — retrying in %s",
+                attempt, attempts, e.msg, retryDelay);
+            sleep(retryDelay);
         }
-    });
+    }
 }
 
 /**

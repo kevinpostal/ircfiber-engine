@@ -13,7 +13,7 @@ import vibe.core.log;
 
 import ircfiber.logging : logException, configureLogging, setLoggingEnabled, isLoggingEnabled;
 import ircfiber.engine.bootstrap : bootstrapEngine, startHeartbeatTask,
-    startOrphanReaperTask, loadNetworks, EngineContext;
+    startOrphanReaperTask, loadNetworksWithRetry, EngineContext;
 import ircfiber.tracing : configureTracing, startTracingExporter,
     isEnvEnabled, setTracingEnabled, isTracingEnabled;
 import ircfiber.observability : configureMetrics, setMetricsEnabled, isMetricsEnabled;
@@ -142,7 +142,7 @@ void main() {
                 string m; try { m = e.msg; } catch (Throwable) { m = "unknown"; }
                 try logWarn("Initial heartbeat failed: %s", m); catch (Throwable) {}
             }
-            loadNetworks(ctx);
+            loadNetworksWithRetry(ctx);
         } catch (Throwable e) {
             logException("registration", e, "Registration task failed");
         }
