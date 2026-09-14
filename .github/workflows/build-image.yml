@@ -1,0 +1,82 @@
+---
+# Fallback image builder for `make ship MODE=ci` (repo root Makefile).
+#
+# The normal path builds on the ubuntu-docker builder, whose warm BuildKit
+# cache mounts make a one-file change an incremental compile. That host is a
+# container on a disk we do not control, so when it runs out of space this
+# workflow produces the identical image with no builder involvement at all:
+# the laptop dispatches it, then swaps prod onto the digest it pushed.
+#
+# There is no dub/npm warmth here — RUN --mount=type=cache contents are never
+# exported to any cache backend — so expect a cold compile. The gha cache
+# still saves the unchanged image layers (apt, ldc, node_modules install).
+name: Build image
+
+on:
+  workflow_dispatch:
+    inputs:
+      containerfile:
+        description: Containerfile path, repo-relative
+        default: Containerfile.engine
+      target:
+        description: Build stage to publish
+        default: runtime-engine
+      image:
+        description: GHCR image name under ghcr.io/<owner>/
+        default: ircfiber-engine
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Makefile gates the deploy on /api/version reporting this exact
+      # commit, so the baked metadata has to match what the builder would
+      # have produced byte for byte.
+      - id: meta
+        run: |
+          set -euo pipefail
+          {
+            echo "sha=$(git rev-parse HEAD)"
+            echo "short=$(git rev-parse --short=12 HEAD)"
+            echo "describe=$(git describe --always --long)"
+            echo "branch=${GITHUB_REF_NAME}"
+            echo "built=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "message=$(git log -1 --pretty=%s | tr -d "'\"")"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ inputs.containerfile }}
+          target: ${{ inputs.target }}
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/${{ inputs.image }}:sha-${{ steps.meta.outputs.short }}
+          cache-from: type=gha,scope=${{ inputs.image }}-${{ inputs.target }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.image }}-${{ inputs.target }}
+          build-args: |
+            GIT_HASH=${{ steps.meta.outputs.sha }}
+            GIT_SHORT=${{ steps.meta.outputs.short }}
+            GIT_DESCRIBE=${{ steps.meta.outputs.describe }}
+            GIT_BRANCH=${{ steps.meta.outputs.branch }}
+            BUILD_TIME=${{ steps.meta.outputs.built }}
+            GIT_MESSAGE=${{ steps.meta.outputs.message }}
+
+      # The Makefile resolves the digest from GHCR itself; this is for humans
+      # reading the run.
+      - run: |
+          echo "image: ghcr.io/${{ github.repository_owner }}/${{ inputs.image }}:sha-${{ steps.meta.outputs.short }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "digest: ${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
