@@ -938,10 +938,6 @@ test: ## Test > D backend unit tests (fast)
 	@$(DUB) build --config=unittest -b unittest 2>&1 | tail -5
 	@timeout 30 ./engine/irc-fiber-test 2>&1 | tail -20; code=$${PIPESTATUS[0]}; if [ $$code -eq 124 ]; then printf '\n%b\n' "$(Y)$(WR) test binary hung (timeout 30s) — vibe eventcore leak?$(R)"; exit 1; fi; exit $$code
 
-test-real: ## Test > Real unittest driver (replaces no-op unitThreadedLight)
-	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building real unittest driver  $(R)"
-	@$(DUB) build --config=unit-test-real -b unittest 2>&1 | tail -3
-	@timeout 30 ./engine/irc-fiber-test-real 2>&1 | tail -30; code=$${PIPESTATUS[0]}; if [ $$code -eq 124 ]; then printf '\n%b\n' "$(Y)$(WR) test-real hung (timeout 30s)$(R)"; exit 1; fi; exit $$code
 prefs-test: ## Test > User-preferences defensive-parse suite (skips if Redis missing)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Prefs defensive-parse tests  $(R)"
 	@$(DUB) build --config=prefs-test 2>&1 | tail -3
@@ -1035,18 +1031,6 @@ test-fast: pacer-test ## Test > All fast standalone test suites (pacer/prefs/par
 		$(DUB) build --config=$$t 2>&1 | tail -1; \
 		./engine/$$t 2>&1 | tail -3; \
 	done
-
-# Real-CI runner. Builds with `-b unittest` so the compiler emits
-# unittest instances that `__traits(getUnitTests)` can enumerate at
-# runtime. Uses the heavy unit-threaded runner's `disableDefaultRunner`
-# mixin to skip D's runtime auto-unittest hook (which would hang on
-# vibe-d's leaked fibers past main()) so MY main() is the
-# authoritative test executor. Result: every unittest block in modules
-# imported by app_test_real.d runs exactly once.
-unit-test-real: ## Test > Real unittest driver (replaces no-op unitThreadedLight)
-	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Building real unittest driver  $(R)"
-	@$(DUB) build --config=unit-test-real --compiler=ldc2 --build=debug -b unittest 2>&1 | tail -3
-	@./engine/irc-fiber-test-real
 
 test-frontend: ## Test > Svelte/Vitest frontend tests (both projects)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Running frontend tests  $(R)"

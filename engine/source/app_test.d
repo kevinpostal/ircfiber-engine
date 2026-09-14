@@ -16,13 +16,25 @@ mixin disableDefaultRunner;
 
 pragma(msg, "[app_test] module loaded");
 
-import ircfiber.auth;
-import ircfiber.models.user;
-import ircfiber.models.network;
-import ircfiber.models.irc_event;
-import ircfiber.models.message;
-import ircfiber.models.ircchannel;
+// Engine-LOCAL modules only, and that is load-bearing twice over:
+//
+//  * `ircfiber.auth` lived here from when one repo held gateway and engine.
+//    After the split `engine/backend/` is a dub stub with no sources, so the
+//    import failed the whole config ("unable to read module `auth`") and the
+//    engine had no runnable unittest target at all.
+//  * `ircfiber.models.*` come from the irc-fiber-common DEPENDENCY, which dub
+//    builds without `-unittest`. Enumerating their unittests here emitted
+//    references to symbols that were never compiled, so the link failed with
+//    dozens of "__unittest_L…FZv, symbol(s) not found".
+//
+// Both are covered where they live: `dub test --root=common` (site/common)
+// and the backend's own narrow `*-test` configs.
 import ircfiber.irc.chathistory;
+import ircfiber.irc.connection;
+import ircfiber.irc.parser;
+import ircfiber.irc.sasl;
+import ircfiber.irc.pacer;
+import ircfiber.irc.reconnect;
 
 private uint g_passed;
 private uint g_failed;
@@ -50,12 +62,11 @@ private bool runModuleTests(M...)() if (M.length > 0) {
 int main() {
     writefln("IRC Fiber unittest suite (run with -b unittest)");
     cast(void) runModuleTests!(
-        ircfiber.auth,
-        ircfiber.models.user,
-        ircfiber.models.network,
-        ircfiber.models.irc_event,
-        ircfiber.models.message,
-        ircfiber.models.ircchannel,
+        ircfiber.irc.connection,
+        ircfiber.irc.parser,
+        ircfiber.irc.sasl,
+        ircfiber.irc.pacer,
+        ircfiber.irc.reconnect,
         ircfiber.irc.chathistory
     )();
     writefln("\n%d passed, %d failed", g_passed, g_failed);

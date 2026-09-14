@@ -143,6 +143,14 @@ struct IRCRawEvent {
         // names the original message's label so the UI can replace it.
         auto editOf = getTag("edit_of");
         if (editOf.length) j["eo"] = Json(editOf);
+        // IRCCloud `from_mode`: the author's channel status prefix at send
+        // time, stamped by the engine from its roster. The message carries
+        // it so history keeps `<&sq>` after the author quits or is
+        // de-opped — deriving it from the live roster (the old frontend
+        // behaviour) loses the glyph in exactly those cases. Absent when
+        // the author held no status, which must read like an empty value.
+        auto fromMode = getTag("from_mode");
+        if (fromMode.length) j["fm"] = Json(fromMode);
         // W1-T08: temp_unavailable event carries countdown_ms + serverTs
         if (command == "temp_unavailable") {
             auto cd = getTag("countdown_ms");
@@ -471,6 +479,27 @@ unittest {
     event.addTag("edit_of", "lbl-1");
     auto json = event.toCompactJson();
     assert(json["eo"].get!string == "lbl-1");
+}
+
+@("IRCRawEvent toCompactJson ships from_mode as 'fm'")
+unittest {
+    auto event = IRCRawEvent("libera", "PRIVMSG");
+    event.nick = "sq";
+    event.channel = "#ircfiber";
+    event.addTag("from_mode", "&");
+    auto json = event.toCompactJson();
+    assert(json["fm"].get!string == "&");
+}
+
+@("IRCRawEvent toCompactJson omits 'fm' for an author with no status")
+unittest {
+    // Absence is the "no prefix" encoding — the renderer treats a missing
+    // key and an empty one identically, and old stored rows have neither.
+    auto event = IRCRawEvent("libera", "PRIVMSG");
+    event.nick = "plain";
+    event.channel = "#ircfiber";
+    auto json = event.toCompactJson();
+    assert(("fm" in json) is null);
 }
 
 @("makeServerLog produces a NOTICE-shaped event with phase tag")

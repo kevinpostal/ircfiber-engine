@@ -499,6 +499,13 @@ final class BufferManager {
         // to know which msgs came from the upstream).
         auto batch = event.getTag("batch");
         if (batch.length) msg["batch"] = Json(batch);
+        // Author's channel status at send time (engine `from_mode` tag).
+        // This row is hand-built rather than `toCompactJson`, so the key
+        // has to be repeated here or Redis scrollback — the FIRST tier
+        // every history read hits — would serve messages without it and
+        // the prefix would vanish on reload.
+        auto fromMode = event.getTag("from_mode");
+        if (fromMode.length) msg["fm"] = Json(sanitizeUtf8(fromMode));
 
         // eid is set by the processor before the event reaches the buffer;
         // it's required for scrollback ordering and stream resume.

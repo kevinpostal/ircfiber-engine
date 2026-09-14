@@ -1689,6 +1689,42 @@ private string nickPrefix(string nick) {
     return nick[0 .. nickPrefixRun(nick)];
 }
 
+/// The single strongest status char across a member's prefix runs.
+///
+/// A roster can hold the same member more than once — the bare nick from
+/// our own JOIN echo plus the prefixed form from 353 — and a run itself can
+/// carry several chars (`~@`). `nickPrefixChars` is ordered most- to
+/// least-privileged, so the lowest index in it wins. "" when the member
+/// holds no status anywhere.
+string strongestPrefix(const(string)[] runs) @safe pure nothrow {
+    string best;
+    size_t bestRank = nickPrefixChars.length;
+    foreach (run; runs) {
+        foreach (c; run) {
+            size_t rank = nickPrefixChars.length;
+            foreach (i, p; nickPrefixChars) if (p == c) { rank = i; break; }
+            if (rank < bestRank) { bestRank = rank; best = [c].idup; }
+        }
+    }
+    return best;
+}
+
+@safe unittest {
+    // Ranking, not first-seen: 353's `@nick` must not beat `~nick`.
+    assert(strongestPrefix(["@", "~"]) == "~");
+    assert(strongestPrefix(["~", "@"]) == "~");
+    assert(strongestPrefix(["", "+"]) == "+");
+    assert(strongestPrefix(["~@+"]) == "~");
+    assert(strongestPrefix(["%", "&"]) == "&");
+    // An IRC operator entry outranks channel status (IRCCloud shows `*`).
+    assert(strongestPrefix(["@", "*"]) == "*");
+    // No status anywhere => no tag, which must read like an empty value.
+    assert(strongestPrefix([]) == "");
+    assert(strongestPrefix(["", ""]) == "");
+    // Junk in a roster entry is ignored rather than emitted.
+    assert(strongestPrefix(["z"]) == "");
+}
+
 /// Sweeps per channel per connection before the engine gives up asking.
 enum int MAX_WHO_ENRICH_ATTEMPTS = 3;
 
@@ -6834,6 +6870,16 @@ private void processEvents() {
             }
         }
 
+        // IRCCloud `from_mode`: the author's channel status AT SEND TIME.
+        //
+        // The frontend used to derive the `@`/`&` glyph from the live
+        // roster, so a message lost its prefix the moment its author quit
+        // or was de-opped — and every history row rendered bare, because
+        // scrollback is read before NAMES completes. Stamping it here makes
+        // the mode a property of the message, which is what it actually is.
+        if (event.command == "PRIVMSG" || event.command == "NOTICE")
+            stampAuthorMode(event);
+
         eventChannel.put(event);
 
         // Broadcast QUIT / NICK / CHGHOST events to each affected channel
@@ -7045,6 +7091,40 @@ private void processEvents() {
         if (auto l = key in chanFloodLimit) return *l;
         return ChannelLineLimit.init;
     }
+
+    /// Records the author's highest channel status prefix on a chat event
+    /// as the `from_mode` tag (single char: `~ & @ % +`, or `*`/`!` for an
+    /// IRC operator entry). No tag at all when the author holds no status,
+    /// is unknown to the roster, or the target is a query — absent and
+    /// empty must read the same downstream.
+    ///
+    /// `channelUsers` is keyed inconsistently across its write sites (JOIN
+    /// normalizes, 353 uses the raw `params[2]`, MODE uses the raw target),
+    /// so both the raw and the normalized/lowered key are tried. It can
+    /// also hold the same member twice — the bare nick from a JOIN echo and
+    /// the prefixed form from 353 — so every match contributes and the
+    /// highest-ranked run wins, exactly like `refreshFloodExemption`.
+    private void stampAuthorMode(ref IRCRawEvent event) {
+        if (event.nick.length == 0 || event.channel.length == 0) return;
+        if (event.channel[0] != '#' && event.channel[0] != '&') return;
+
+        string[]* members = event.channel in channelUsers;
+        if (members is null) {
+            auto key = normalizeChannelName(event.channel).toLower();
+            members = key in channelUsers;
+        }
+        if (members is null) return;
+
+        string[] runs;
+        foreach (entry; *members) {
+            auto bare = stripNickPrefix(entry);
+            if (!sameNick(bare, event.nick)) continue;
+            runs ~= nickPrefix(entry);
+        }
+        auto best = strongestPrefix(runs);
+        if (best.length) event.addTag("from_mode", best);
+    }
+
 
     /// Recomputes whether our own status on `channel` exempts us from `+f`
     /// and records it. Called whenever NAMES or a MODE change could have
