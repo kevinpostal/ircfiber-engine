@@ -126,13 +126,16 @@ struct UserPreferences {
     long prefVersion;
 
     /// Whether to show mode-prefix glyphs (@, +, %, etc.) in the member
-    /// list. Default true so existing users keep their current view.
+    /// list. Default FALSE: a new account starts with the clean IRCCloud
+    /// look (band colour carries the rank). Accounts that already have a
+    /// stored prefs document are unaffected — `toJson` always writes the
+    /// field, so their saved value wins over this default.
     /// Synced cross-tab via localStorage + cross-device via pref_update
     /// (`showMemberPrefixes` key) + `stat_user` boot seed. The setter writes
     /// to localStorage immediately so a fast refresh (<500ms debounce) keeps
     /// the choice; the Settings UI also POSTs to
     /// `/api/me/show-member-prefixes` which then fans out via WS.
-    bool showMemberPrefixes = true;
+    bool showMemberPrefixes = false;
 
     /// Global notification preferences — flat bools keep `prefVersion` fan-out
     /// uniform (one counter for all prefs) and avoid a nested `notificationPrefs`
