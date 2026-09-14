@@ -16,6 +16,9 @@ import vibe.data.json : Json, serializeToJson;
 import ircfiber.db.preferences : UserPreferences, PreferencesRepository;
 import ircfiber.db.prefs_cache : PrefsCache;
 import ircfiber.storage.redis : RedisStorage;
+import vibe.data.bson : Bson;
+import ircfiber.db.mongo : AppMongoConnection;
+import ircfiber.db.prefs_mongo : PREFS_COLLECTION, loadPrefsDoc;
 
 /// Tracks the number of passing checks.
 int passed;
@@ -280,11 +283,102 @@ void runCacheTests() {
     }
 }
 
+/// Runs the MongoDB durability scenarios: pins must survive a total loss
+/// of the Redis key (requires both Redis and MongoDB).
+void runDurabilityTests() {
+    stderr.writeln("\n[durable] prefs survive a Redis flush (requires Redis + MongoDB)");
+
+    RedisStorage redis;
+    try {
+        redis = new RedisStorage();
+        redis.connect();
+    } catch (Exception e) {
+        stderr.writeln("  ⊘ SKIP — Redis unavailable (", e.msg, ")");
+        return;
+    }
+
+    try {
+        // The URI needs a path component: AppMongoConnection appends
+        // `?replicaSet=rs0`, and vibe-d rejects `host:port?query` without
+        // a `/db` in between.
+        AppMongoConnection.connect("mongodb://127.0.0.1:27017/ircfiber_prefstest",
+            "ircfiber_prefstest");
+        // vibe-d connects lazily — force one round trip so an absent Mongo
+        // is a clean SKIP here instead of a failure mid-assertion.
+        AppMongoConnection.getDb()[PREFS_COLLECTION]
+            .findOne(Bson(["_id": Bson("__probe__")]));
+    } catch (Exception e) {
+        stderr.writeln("  ⊘ SKIP — MongoDB unavailable (", e.msg, ")");
+        return;
+    }
+    void dropTestDocs() {
+        try AppMongoConnection.getDb()[PREFS_COLLECTION].deleteMany(Bson.emptyObject);
+        catch (Exception) {}
+    }
+    scope (exit) dropTestDocs();
+
+    try {
+        auto userId = randomUUID();
+        string key = "prefs:" ~ userId.toString();
+        void cleanup() { try redis.getDb().del(key); catch (Exception) {} }
+        cleanup();
+        scope (exit) cleanup();
+
+        // Own cache instance so the 30 s LRU cannot mask a Redis miss.
+        auto cache = new PrefsCache(16, dur!"seconds"(30));
+        auto repo = new PreferencesRepository(redis, cache);
+
+        UserPreferences p;
+        p.pinnedChannels = ["net1:#durable", "net2:#foo.bar"];
+        auto v1 = repo.save(userId, p);
+        check!("durable: save() returned a non-zero prefVersion")(v1 != 0);
+
+        // Separates a write-side failure from a read-side one when this
+        // scenario regresses.
+        auto stored = loadPrefsDoc(userId.toString());
+        check!("durable: MongoDB holds the document after save")
+            (stored.found && stored.prefVersion == v1,
+             "found=" ~ stored.found.to!string ~ " prefVersion=" ~ stored.prefVersion.to!string);
+
+        // Simulate total Redis loss (flush, eviction, restart without AOF).
+        redis.getDb().del(key);
+        cache.remove(userId);
+        check!("durable: precondition — Redis key is gone")(!redis.exists(key));
+
+        auto loaded = repo.load(userId);
+        check!("durable: pinned channels survive a Redis flush")
+            (loaded.pinnedChannels == ["net1:#durable", "net2:#foo.bar"],
+             "got " ~ loaded.pinnedChannels.to!string);
+        check!("durable: prefVersion survives a Redis flush")
+            (loaded.prefVersion == v1,
+             "got " ~ loaded.prefVersion.to!string ~ ", want " ~ v1.to!string);
+        check!("durable: Redis was rehydrated from MongoDB")
+            (redis.getDb().get(key).length > 0);
+
+        // Monotonicity: the frontend's last-write-wins gate rejects any
+        // prefVersion that is not strictly greater than the one it holds,
+        // so the counter must resume from the restored value, not from 1.
+        cache.remove(userId);
+        auto v2 = repo.save(userId, loaded);
+        check!("durable: prefVersion stays monotonic after rehydration")
+            (v2 == v1 + 1, "got " ~ v2.to!string ~ ", want " ~ (v1 + 1).to!string);
+
+        repo.deleteForUser(userId);
+        auto gone = repo.load(userId);
+        check!("durable: deleteForUser leaves nothing to resurrect")
+            (gone.pinnedChannels.length == 0 && gone.prefVersion == 0);
+    } catch (Exception e) {
+        ++failed;
+        stderr.writeln("  ✗ durable: unexpected exception — ", e.msg);
+    }
+}
+
 int main() {
     stderr.writeln("ircfiber.db.preferences smoke tests");
     runFromJsonTests();
     runRepairTests();
     runCacheTests();
+    runDurabilityTests();
     stderr.writeln("\n", passed, " passed, ", failed, " failed");
     return failed == 0 ? 0 : 1;
 }

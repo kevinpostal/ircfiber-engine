@@ -7,6 +7,7 @@ import vibe.core.sync : TaskMutex;
 import ircfiber.logging : logJsonMap;
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.db.prefs_cache : PrefsCache;
+import ircfiber.db.prefs_mongo : loadPrefsDoc, savePrefsDoc, deletePrefsDoc;
 
 /// Maps a `vibe.data.json.Json.Type` enum value to its string name so it can
 /// be emitted as a Loki label / log field. Kept private — only the pref
@@ -437,6 +438,33 @@ return newPrefVersion`;
         this.cache_ = cache !is null ? cache : defaultCache();
     }
 
+    /// Restores prefs from the durable Mongo copy when Redis has nothing
+    /// usable, and writes them straight back into Redis.
+    ///
+    /// The Redis rehydration is NOT an optimisation. `INCR_AND_SET_LUA`
+    /// derives the next prefVersion from whatever is in Redis; with an
+    /// empty key the counter restarts at 1, and the frontend's
+    /// last-write-wins gate (strictly-greater on `lastServerPrefVersion`)
+    /// would then reject every `stat_user` until the counter climbed back
+    /// past its old value. Restoring the blob verbatim keeps it monotonic.
+    private UserPreferences restoreFromDurable(UUID userId, string key, out bool found) {
+        found = false;
+        auto doc = loadPrefsDoc(userId.toString());
+        if (!doc.found) return UserPreferences.init;
+        UserPreferences prefs;
+        try {
+            prefs = UserPreferences.fromJson(doc.blob, userId).prefs;
+        } catch (Exception e) {
+            logWarn("prefs: durable copy for %s failed to deserialize: %s", userId, e.msg);
+            return UserPreferences.init;
+        }
+        redis.setJson(key, doc.blob);   // plain SET — no version bump
+        cache_.set(userId, prefs);
+        found = true;
+        logInfo("prefs: restored %s from MongoDB (prefVersion %d)", userId, prefs.prefVersion);
+        return prefs;
+    }
+
     /// Loads preferences for a user.
     ///
     /// Checks the in-memory LRU cache first. On cache miss, falls through
@@ -450,7 +478,9 @@ return newPrefVersion`;
     /// malformed JSON, missing Redis, etc.) are caught, logged as
     /// `prefs_load_fail`, and self-heal by deleting the corrupt blob —
     /// the next `save()` writes a clean record.
-    UserPreferences load(UUID userId) {
+    /// `bypassCache` skips the in-process LRU (30 s TTL, no cross-replica
+    /// invalidation) so a fresh login always sees another device's writes.
+    UserPreferences load(UUID userId, bool bypassCache = false) {
         // NOTE: prefs are Redis-backed. Do NOT gate on the Mongo circuit
         // breaker — that blocks prefs-test and early startup before Mongo
         // is connected. The breaker only protects Mongo paths
@@ -458,8 +488,10 @@ return newPrefVersion`;
 
 
         // Fast path: check the in-memory LRU cache first.
-        if (auto cached = cache_.get(userId)) {
-            return cached.get;
+        if (!bypassCache) {
+            if (auto cached = cache_.get(userId)) {
+                return cached.get;
+            }
         }
 
         auto key = KEY_PREFIX ~ userId.toString();
@@ -475,8 +507,11 @@ return newPrefVersion`;
             logLoadFail(userId, "redis get: " ~ e.msg);
             return UserPreferences.init;
         }
-        if (raw.length == 0)
-            return UserPreferences.init;
+        if (raw.length == 0) {
+            bool restored;
+            auto durable = restoreFromDurable(userId, key, restored);
+            return restored ? durable : UserPreferences.init;
+        }
 
         Json json;
         try {
@@ -485,7 +520,9 @@ return newPrefVersion`;
             logLoadFail(userId, "parse: " ~ e.msg);
             redis.del(key);
             logLoadRepaired(userId);
-            return UserPreferences.init;
+            bool restored;
+            auto durable = restoreFromDurable(userId, key, restored);
+            return restored ? durable : UserPreferences.init;
         }
         if (json.type == Json.Type.null_ || json.type == Json.Type.undefined)
             return UserPreferences.init;
@@ -527,7 +564,9 @@ return newPrefVersion`;
             logLoadFail(userId, "fromJson: " ~ e.msg);
             redis.del(key);
             logLoadRepaired(userId);
-            return UserPreferences.init;
+            bool restored;
+            auto durable = restoreFromDurable(userId, key, restored);
+            return restored ? durable : UserPreferences.init;
         }
     }
 
@@ -576,9 +615,13 @@ return newPrefVersion`;
             // next successful save will repair it. We do NOT swallow
             // the failure silently — callers will see prefVersion=0.
             redis.setJson(key, prefs.toJson());
+            savePrefsDoc(userId.toString(), prefs.toJson(), prefs.prefVersion);
             return 0;
         }
 
+        // Write through to the durable copy. Redis stays authoritative on
+        // read; this is what survives a flush or a corrupt-blob repair.
+        savePrefsDoc(userId.toString(), prefs.toJson(), prefs.prefVersion);
         return newVersion;
     }
 
@@ -627,6 +670,18 @@ return newPrefVersion`;
     /// Convenience overload for callers that always save.
     long mutate(UUID userId, scope void delegate(ref UserPreferences) apply) {
         return mutate(userId, (ref UserPreferences p) { apply(p); return true; });
+    }
+
+    /// Erases every copy of a user's preferences: Redis, the in-process
+    /// cache, and the durable Mongo document. Callers that only DEL the
+    /// Redis key would see the prefs resurrected by `load()`'s fallback.
+    void deleteForUser(UUID userId) {
+        try
+            redis.del(KEY_PREFIX ~ userId.toString());
+        catch (Exception e)
+            logWarn("prefs: redis del failed for %s: %s", userId, e.msg);
+        cache_.remove(userId);
+        deletePrefsDoc(userId.toString());
     }
 }
 
