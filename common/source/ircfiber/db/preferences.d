@@ -8,6 +8,7 @@ import ircfiber.logging : logJsonMap;
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.db.prefs_cache : PrefsCache;
 import ircfiber.db.prefs_mongo : loadPrefsDoc, savePrefsDoc, deletePrefsDoc;
+import ircfiber.redis.protocol : RedisKeys;
 
 /// Maps a `vibe.data.json.Json.Type` enum value to its string name so it can
 /// be emitted as a Loki label / log field. Kept private — only the pref
@@ -73,6 +74,23 @@ int clampBncPlaybackLines(int v) @safe pure nothrow @nogc {
     if (v < 0) return 0;
     if (v > BNC_PLAYBACK_MAX) return BNC_PLAYBACK_MAX;
     return v;
+}
+
+/// Hard ceiling for simultaneously attached bouncer clients per account.
+enum int BNC_MAX_CLIENTS_CEILING = 32;
+/// Longest stored auto-away message.
+enum size_t BNC_AWAY_MAX = 200;
+
+/// Clamps a requested client cap into `[0, BNC_MAX_CLIENTS_CEILING]`.
+int clampBncMaxClients(int v) @safe pure nothrow @nogc {
+    if (v < 0) return 0;
+    if (v > BNC_MAX_CLIENTS_CEILING) return BNC_MAX_CLIENTS_CEILING;
+    return v;
+}
+
+/// Truncates an auto-away message to `BNC_AWAY_MAX` bytes.
+string truncateBncAway(string v) @safe pure nothrow {
+    return v.length > BNC_AWAY_MAX ? v[0 .. BNC_AWAY_MAX] : v;
 }
 
 /// User preference settings.
@@ -148,9 +166,19 @@ struct UserPreferences {
 
     /// Lines per buffer the bouncer replays when a client without
     /// `draft/chathistory` attaches (ZNC "playback buffer"). 0 disables.
-    /// Set from the "Connect with another client…" dialog via
-    /// `/api/me/bnc-playback-lines`; read by the bnc process on attach.
+    /// Set from Settings → Bouncer → Access via
+    /// `/api/me/bouncer/settings`; read by the bnc process on attach.
     int bncPlaybackLines = BNC_PLAYBACK_DEFAULT;
+    /// Reject a bouncer client that attaches without TLS.
+    bool bncRequireTls = false;
+    /// When non-empty, a bouncer client's IP must match one of these
+    /// CIDRs (`ircfiber.ipintel.cidr.cidrContains`).
+    string[] bncAllowedCidrs;
+    /// Max simultaneously attached bouncer clients (0 = unlimited).
+    int bncMaxClients = 0;
+    /// Sent as `AWAY :<message>` on the network when this account's last
+    /// bouncer client detaches, cleared on attach. Empty disables it.
+    string bncAwayMessage;
     /// Serializes to JSON.
     Json toJson() const {
         auto j = Json.emptyObject;
@@ -194,6 +222,10 @@ struct UserPreferences {
         j["autoDismissNotifs"] = Json(autoDismissNotifs);
         j["muteAll"] = Json(muteAll);
         j["bncPlaybackLines"] = Json(bncPlaybackLines);
+        j["bncRequireTls"] = Json(bncRequireTls);
+        j["bncAllowedCidrs"] = bncAllowedCidrs is null ? Json.emptyArray : serializeToJson(bncAllowedCidrs);
+        j["bncMaxClients"] = Json(bncMaxClients);
+        j["bncAwayMessage"] = Json(bncAwayMessage);
         return j;
     }
     /// Deserializes from JSON. The optional `userId` enables structured
@@ -351,6 +383,44 @@ struct UserPreferences {
                 needsRepair = true;
             }
         }
+        if (auto v = "bncRequireTls" in json) {
+            if (v.type == Json.Type.bool_)
+                p.bncRequireTls = v.get!bool;
+            else {
+                logFieldInvalid(userId, "bncRequireTls", v.type, "bool");
+                needsRepair = true;
+            }
+        }
+        if (auto v = "bncAllowedCidrs" in json) {
+            if (v.type == Json.Type.array) {
+                try p.bncAllowedCidrs = deserializeJson!(string[])(*v);
+                catch (Exception) {
+                    logFieldInvalid(userId, "bncAllowedCidrs", v.type, "array of string");
+                    p.bncAllowedCidrs = [];
+                    needsRepair = true;
+                }
+            } else {
+                logFieldInvalid(userId, "bncAllowedCidrs", v.type, "array");
+                p.bncAllowedCidrs = [];
+                needsRepair = true;
+            }
+        }
+        if (auto v = "bncMaxClients" in json) {
+            if (v.type == Json.Type.int_)
+                p.bncMaxClients = clampBncMaxClients(cast(int) v.get!long);
+            else {
+                logFieldInvalid(userId, "bncMaxClients", v.type, "int");
+                needsRepair = true;
+            }
+        }
+        if (auto v = "bncAwayMessage" in json) {
+            if (v.type == Json.Type.string)
+                p.bncAwayMessage = truncateBncAway(v.get!string);
+            else {
+                logFieldInvalid(userId, "bncAwayMessage", v.type, "string");
+                needsRepair = true;
+            }
+        }
         return LoadResult(p, needsRepair);
     }
 }
@@ -369,6 +439,21 @@ final class PreferencesRepository {
         if (defaultCache_ is null)
             defaultCache_ = new PrefsCache();
         return defaultCache_;
+    }
+
+    /// Publishes a `pref_update` frame on the user's event channel, the
+    /// single implementation shared by the REST handlers and the bouncer.
+    void publishPrefUpdate(string userId, string prefKey, Json value, long prefVersion) {
+        try {
+            auto json = Json.emptyObject;
+            json["type"] = Json("pref_update");
+            json["key"] = Json(prefKey);
+            json["value"] = value;
+            json["prefVersion"] = Json(prefVersion);
+            redis.publish(RedisKeys.events(userId), json.toString());
+        } catch (Exception e) {
+            logWarn("prefs: pref_update publish failed for %s/%s: %s", userId, prefKey, e.msg);
+        }
     }
 
     /// Lua script for atomic increment-and-set. Reads the existing JSON

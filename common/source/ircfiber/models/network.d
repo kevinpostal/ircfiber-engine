@@ -1,7 +1,7 @@
 module ircfiber.models.network;
 
 import std.algorithm : canFind, uniq, map, startsWith;
-import std.array : array;
+import std.array : array, appender;
 import std.string : strip;
 import std.uuid;
 import std.uni : toLower;
@@ -64,6 +64,26 @@ string normalizeAutoJoinChannel(string name) @safe {
     return "#" ~ trimmed.toLower();
 }
 
+/// Longest ident accepted. InspIRCd 4 advertises `USERLEN=10` and most
+/// ircds truncate at 10; keeping the stored value inside that bound means
+/// the registered ident is what the user sees.
+enum size_t IDENT_MAX = 10;
+
+/// Sanitises a user-supplied ident: keeps `[A-Za-z0-9_.-]`, drops every
+/// other byte (spaces, `@`, `!`, `:` would corrupt the USER line), then
+/// truncates to `IDENT_MAX`. Returns "" when nothing survives, which means
+/// "use the nick".
+string sanitizeIdent(string raw) @safe pure {
+    auto app = appender!string();
+    foreach (char c; raw) {
+        if (app.data.length >= IDENT_MAX) break;
+        const keep = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+            || (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-';
+        if (keep) app.put(c);
+    }
+    return app.data;
+}
+
 /// Deduplicate and normalize a list of IRC channel names for auto-join.
 /// Case-insensitive: "#Zod" and "#ZOD" collapse to one entry.
 /// Bare names are auto-prefixed with `#` so `testing` → `#testing` and
@@ -116,6 +136,11 @@ struct NetworkConfig {
     string nick;
     /// The real name
     string realName;
+    /// IRC username sent as the first `USER` parameter (ZNC/ircd "ident").
+    /// Empty — the default, and what every existing network has — means
+    /// "use the nick", which is exactly what the engine sent before this
+    /// field existed, so untouched networks register identically.
+    string ident;
     /// Whether the network is disabled (admin-initiated disconnect that
     /// persists across redeploys). Disabled networks are not loaded
     /// during engine bootstrap and must be manually re-enabled.
@@ -173,6 +198,7 @@ struct NetworkConfig {
             "partedChannels": serializeToJson(partedChannels),
             "nick": Json(nick),
             "realName": Json(realName),
+            "ident": Json(ident),
             "disabled": Json(disabled),
             "nspass": Json(nspass),
             "commands": Json(commands),
@@ -225,6 +251,15 @@ unittest {
     assert(json["tls"].get!string == "required");
     assert(json["nick"].get!string == "testnick");
     assert(json["autoJoinDelaySeconds"].get!int == 6);
+}
+
+@("sanitizeIdent keeps ident-safe bytes and caps length")
+unittest {
+    assert(sanitizeIdent("zodiac") == "zodiac");
+    assert(sanitizeIdent("zod iac!") == "zodiac");
+    assert(sanitizeIdent("averylongidentvalue").length == 10);
+    assert(sanitizeIdent("  ") == "");
+    assert(sanitizeIdent("a_b.c-d") == "a_b.c-d");
 }
 
 @("Network toJson merges config and state")

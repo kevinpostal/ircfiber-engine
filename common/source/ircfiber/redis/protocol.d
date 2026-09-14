@@ -101,6 +101,9 @@ struct RedisKeys {
     /// members (record expired) are pruned by the reader.
     static string bncClients() { return "irc:bnc:clients"; }
 
+    /// Per-user bouncer event trail (LPUSH, capped 50, 90-day TTL).
+    static string bncAudit(string userId) { return "irc:bnc:audit:" ~ userId; }
+
     /// Routing config key (per-host max connections, etc.)
     static string routingConfig() { return "irc:routing:config"; }
 

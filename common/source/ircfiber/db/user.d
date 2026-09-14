@@ -170,12 +170,24 @@ final class UserRepository {
         catch (Exception) return "";
     }
 
+    /// When the current bouncer password was generated (0 when unknown or
+    /// none is set). Kept off `User` for the same reason the token is.
+    long getBncTokenCreatedAt(UUID id) {
+        auto doc = collection.findOne(["id": id.toString()]);
+        if (doc.isNull) return 0;
+        try return doc["bncTokenCreatedAtMs"].get!long;
+        catch (Exception) return 0;
+    }
+
     /// Sets (or, with an empty token, clears) the user's bouncer password.
+    /// The creation timestamp rides along so the UI can show the password's
+    /// age; clearing the token clears it too.
     void setBncToken(UUID id, string token) {
         auto selector = Bson(["id": Bson(id.toString())]);
+        const nowMs = Clock.currTime(UTC()).toUnixTime() * 1000L;
         auto update = token.length
-            ? Bson(["$set": Bson(["bncToken": Bson(token)])])
-            : Bson(["$unset": Bson(["bncToken": Bson("")])]);
+            ? Bson(["$set": Bson(["bncToken": Bson(token), "bncTokenCreatedAtMs": Bson(nowMs)])])
+            : Bson(["$unset": Bson(["bncToken": Bson(""), "bncTokenCreatedAtMs": Bson("")])]);
         collection.updateOne(selector, update);
     }
 

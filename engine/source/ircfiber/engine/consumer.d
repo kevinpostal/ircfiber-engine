@@ -9,7 +9,7 @@ import vibe.data.json : parseJsonString, Json, deserializeJson;
 
 import ircfiber.engine.bootstrap : EngineContext;
 import ircfiber.redis.protocol : RedisKeys, ControlMessage, IRCCommand;
-import ircfiber.models.network : NetworkConfig, TLSMode, SASLMechanism;
+import ircfiber.models.network : NetworkConfig, TLSMode, SASLMechanism, sanitizeIdent;
 import ircfiber.models.irc_event : IRCRawEvent;
 import ircfiber.logging : logJsonMap;
 import ircfiber.storage.buffer : BufferManager;
@@ -476,6 +476,7 @@ private NetworkConfig parseNetworkConfig(Json j) {
     cfg.nick = j["nick"].get!string;
     if (j["realName"].type != Json.Type.undefined) cfg.realName = j["realName"].get!string;
     else cfg.realName = cfg.nick;
+    if (j["ident"].type != Json.Type.undefined) cfg.ident = sanitizeIdent(j["ident"].get!string);
     if (j["nspass"].type != Json.Type.undefined) cfg.nspass = j["nspass"].get!string;
     if (j["commands"].type != Json.Type.undefined) cfg.commands = j["commands"].get!string;
     if (j["serverPass"].type != Json.Type.undefined) cfg.serverPass = j["serverPass"].get!string;

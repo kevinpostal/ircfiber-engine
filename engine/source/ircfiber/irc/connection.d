@@ -4475,7 +4475,9 @@ final class PersistentIRCClient {
         // PASS must be sent before NICK/USER per RFC 1459 §4.1
         if (config.serverPass.length > 0) sendRaw("PASS " ~ config.serverPass);
         sendRaw("NICK " ~ sessionNick);
-        sendRaw("USER " ~ sessionNick ~ " 0 * :" ~ config.realName);
+        // `config.ident` is the user-chosen IRC username ("ident"); empty —
+        // the default — keeps the historical `USER <nick>` line byte-for-byte.
+        sendRaw("USER " ~ (config.ident.length ? config.ident : sessionNick) ~ " 0 * :" ~ config.realName);
 
         ubyte[STREAM_BUFFER_SIZE] buf;
         string partial;

@@ -189,6 +189,7 @@ final class NetworkRepository {
                 "partedChannels": Bson(config.partedChannels.map!(c => Bson(c)).array),
                 "nick": Bson(config.nick),
                 "realName": Bson(config.realName),
+                "ident": Bson(config.ident),
                 "disabled": Bson(config.disabled),
                 "systemManaged": Bson(config.systemManaged),
                 "autoJoinDelaySeconds": Bson(config.autoJoinDelaySeconds),
@@ -257,6 +258,7 @@ final class NetworkRepository {
                 cfg.partedChannels = deserializeJson!(string[])(elem["partedChannels"]);
             cfg.nick = elem["nick"].get!string;
             cfg.realName = elem["realName"].get!string;
+            try { cfg.ident = elem["ident"].get!string; } catch (Exception) {}
             try { cfg.disabled = elem["disabled"].get!bool; } catch (Exception) {}
             try { cfg.nspass = elem["nspass"].get!string; } catch (Exception) {}
             try { cfg.commands = elem["commands"].get!string; } catch (Exception) {}
@@ -291,6 +293,7 @@ final class NetworkRepository {
             try { cfg.partedChannels = deserializeBson!(string[])(doc["partedChannels"]); } catch (Exception) {}
         try { cfg.nick = doc["nick"].get!string; } catch (Exception) {}
         try { cfg.realName = doc["realName"].get!string; } catch (Exception) {}
+        try { cfg.ident = doc["ident"].get!string; } catch (Exception) {}
         try { cfg.disabled = doc["disabled"].get!bool; } catch (Exception) {}
         try { cfg.systemManaged = doc["systemManaged"].get!bool; } catch (Exception) {}
         try {
