@@ -5926,6 +5926,11 @@ private void processEvents() {
                     // member lists immediately, mimicking IRCCloud's realtime
                     // event-driven member list architecture.
                     if (isSelf) {
+                        // The base (channel-less) NICK event is published for EVERY user's
+                        // rename and lands in the frontend's `_server` buffer. Stamp our own so
+                        // the server log can word it in the first person without guessing from
+                        // the live nick (the roster has already moved to `newNick` by then).
+                        event.addTag("self_echo", "true");
                         auto youChange = IRCRawEvent(config.name, "you_nickchange");
                         youChange.networkId = config.id.toString();
                         youChange.nick = event.nick;
