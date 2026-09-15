@@ -38,8 +38,18 @@ import ircfiber.redis.protocol : TlsInfo;
 
 /// Protocol version this client speaks.
 enum HOLDER_PROTO = 1;
-/// Longest IPC line either side may send (1 MiB).
-enum HOLDER_MAX_LINE = 1024 * 1024;
+/// Longest IPC line this client may RECEIVE (64 MiB).
+///
+/// `LIST` answers with every held connection INCLUDING its `META`, which
+/// `bootstrap` needs to restore each session, so the reply grows with the
+/// number of connected users: 66 sessions of a few hundred KB each is
+/// already tens of MiB, far past the 1 MiB request cap this used to
+/// share. Reading a response with the request cap made `list()` — and so
+/// every engine hot swap — fail once the network had enough users.
+/// The real fix is for `LIST` to stop carrying `META` and for callers to
+/// fetch it per session with `INFO`; that is a protocol change for the
+/// holder and both its clients, so until then the read is bounded here.
+enum HOLDER_MAX_RESPONSE = 64 * 1024 * 1024;
 /// Default holder address (docker: shared named volume).
 enum HOLDER_DEFAULT_ADDR = "unix:///run/ircfiber/holder.sock";
 
@@ -298,7 +308,7 @@ private long unixMsNow() {
 
 /// Reads one `\n`-terminated IPC line (CR stripped). Throws on EOF/timeout.
 private string readIpcLine(TCPConnection c) {
-    auto raw = readLine(c, HOLDER_MAX_LINE, "\n");
+    auto raw = readLine(c, HOLDER_MAX_RESPONSE, "\n");
     auto line = cast(string) raw.idup;
     if (line.length && line[$ - 1] == '\r') line = line[0 .. $ - 1];
     return line;

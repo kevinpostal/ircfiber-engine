@@ -49,6 +49,13 @@ enum long   QUIT_GRACE_PERIOD_MS   = 2_000;
 enum size_t MAX_LINE               = 1 << 20;
 /// Largest accepted `META` payload.
 enum size_t MAX_META               = 8 << 20;
+/// Longest accepted response line, read by the `--status` / `--list`
+/// client. `LIST` answers with every held connection including its
+/// `META`, so the reply grows with the number of connected users and
+/// passed MAX_LINE (a *request* limit) once the network had a few dozen
+/// sessions — which failed `--list` outright, and with it the engine
+/// deploy gate that compares the session list either side of a swap.
+enum size_t MAX_RESPONSE           = 64 << 20;
 /// Wire message the holder sends upstream when the engine never came back.
 enum string QUIT_ENGINE_UNAVAILABLE          = "engine unavailable";
 enum string QUIT_ENGINE_UNAVAILABLE_OVERFLOW = "engine unavailable (buffer overflow)";

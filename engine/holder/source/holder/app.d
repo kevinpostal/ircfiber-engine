@@ -124,7 +124,7 @@ private Json roundTrip(ref TCPConnection conn, string line) {
     import vibe.stream.operations : readLine;
     conn.write(cast(const(ubyte)[]) (line ~ "\n"));
     conn.flush();
-    auto resp = cast(string) readLine(conn, MAX_LINE, "\n");
+    auto resp = cast(string) readLine(conn, MAX_RESPONSE, "\n");
     if (resp.length >= 3 && resp[0 .. 3] == "OK ") return parseJsonString(resp[3 .. $]);
     stderr.writeln("irc-fiber-holder: ", resp);
     return Json(null);
