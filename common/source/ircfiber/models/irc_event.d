@@ -133,12 +133,14 @@ struct IRCRawEvent {
         // from the wire (see parser.d tag loop).
         auto typingTag = getTag("+typing");
         if (typingTag.length) j["typing"] = Json(typingTag);
-        // IRCv3 replies and reactions (client-only draft tags): the
-        // msgid a PRIVMSG answers, and on a TAGMSG the emoji added to or
-        // removed from that msgid. Values are already unescaped by the
-        // parser. Persisted scrollback uses this projection too, so `rp`
-        // on a PRIVMSG row survives a reload.
-        auto replyTag = getTag("+draft/reply");
+        // IRCv3 replies and reactions: the msgid a PRIVMSG answers
+        // (ratified `+reply`, `+draft/reply` from pre-ratification
+        // clients), and on a TAGMSG the emoji added to or removed from
+        // that msgid. Values are already unescaped by the parser.
+        // Persisted scrollback uses this projection too, so `rp` on a
+        // PRIVMSG row survives a reload.
+        auto replyTag = getTag("+reply");
+        if (!replyTag.length) replyTag = getTag("+draft/reply"); // pre-ratification clients
         if (replyTag.length) j["rp"] = Json(replyTag);
         auto reactTag = getTag("+draft/react");
         if (reactTag.length) j["rx"] = Json(reactTag);
@@ -487,7 +489,7 @@ unittest {
 @("IRCRawEvent toCompactJson ships reply and reaction tags as rp/rx/ux")
 unittest {
     auto reply = IRCRawEvent("libera", "PRIVMSG");
-    reply.addTag("+draft/reply", "dc-123");
+    reply.addTag("+reply", "dc-123");
     auto rj = reply.toCompactJson();
     assert(rj["rp"].get!string == "dc-123");
     assert(("rx" in rj) is null);

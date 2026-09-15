@@ -362,7 +362,7 @@ final class ConnectionManager {
     }
 
     /// Sends a message to a target on a network, with optional client
-    /// tags (`+draft/reply`, for example).
+    /// tags (`+reply`, for example).
     void sendMessage(UUID networkId, string target, string text,
                      string[string] tags = null) {
         if (auto client = getClient(networkId)) {

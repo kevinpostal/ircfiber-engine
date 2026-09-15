@@ -287,7 +287,7 @@ struct IRCCommand {
     long timestampMs;
     /// The label for IRCv3 labeled-response
     string label;
-    /// Client-only message tags to send with a `msg` (`+draft/reply`, for
+    /// Client-only message tags to send with a `msg` (`+reply`, for
     /// example), unescaped; the connection escapes them for the wire.
     string[string] tags;
 
