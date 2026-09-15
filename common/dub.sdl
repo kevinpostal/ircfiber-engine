@@ -18,8 +18,6 @@ dependency "vibe-d:redis" version="~>0.10.0"
 dependency "vibe-d:mongodb" version="~>0.10.0"
 dependency "diet-ng" version="~>1.8"
 
-dependency "unit-threaded" version="~>2.2.0"
-
 configuration "library" {
     targetType "library"
 }
