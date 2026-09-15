@@ -416,9 +416,9 @@ private void handleNetworkCommand(ref EngineContext ctx, string networkId, IRCCo
     switch (cmd.cmd) {
         case "msg":
             if (cmd.label.length > 0) {
-                ctx.connManager.sendLabeledMessage(nid, cmd.target, cmd.text, cmd.label);
+                ctx.connManager.sendLabeledMessage(nid, cmd.target, cmd.text, cmd.label, cmd.tags);
             } else {
-                ctx.connManager.sendMessage(nid, cmd.target, cmd.text);
+                ctx.connManager.sendMessage(nid, cmd.target, cmd.text, cmd.tags);
             }
             break;
         case "editmsg":

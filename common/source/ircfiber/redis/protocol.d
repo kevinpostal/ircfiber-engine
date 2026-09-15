@@ -287,6 +287,9 @@ struct IRCCommand {
     long timestampMs;
     /// The label for IRCv3 labeled-response
     string label;
+    /// Client-only message tags to send with a `msg` (`+draft/reply`, for
+    /// example), unescaped; the connection escapes them for the wire.
+    string[string] tags;
 
     /// Converts to JSON
     Json toJson() const {
@@ -298,6 +301,11 @@ struct IRCCommand {
         if (userId.length) j["userId"] = Json(userId);
         j["timestampMs"] = Json(timestampMs);
         if (label.length) j["label"] = Json(label);
+        if (tags.length) {
+            auto t = Json.emptyObject;
+            foreach (k, v; tags) t[k] = Json(v);
+            j["tags"] = t;
+        }
         return j;
     }
 
@@ -311,6 +319,11 @@ struct IRCCommand {
         if (j["userId"].type != Json.Type.undefined) c.userId = j["userId"].get!string;
         if (j["timestampMs"].type != Json.Type.undefined) c.timestampMs = j["timestampMs"].get!long;
         if (j["label"].type != Json.Type.undefined) c.label = j["label"].get!string;
+        if (j["tags"].type == Json.Type.object) {
+            foreach (string k, Json v; j["tags"]) {
+                if (v.type == Json.Type.string) c.tags[k] = v.get!string;
+            }
+        }
         return c;
     }
 }

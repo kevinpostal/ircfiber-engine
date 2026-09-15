@@ -8037,16 +8037,31 @@ private void processEvents() {
         writeRaw(line);
     }
 
-    /// Sends a PRIVMSG to a target.
-    void sendMessage(string target, string text) {
-        sendUserMessage("PRIVMSG", target, text, "");
+    /// Sends a PRIVMSG to a target, with optional client tags.
+    void sendMessage(string target, string text, string[string] tags = null) {
+        sendUserMessage("PRIVMSG", target, text, "", tags);
     }
 
     /// Sends a labeled PRIVMSG when labeled-response cap is active.
-    /// The label is registered in `pendingLabels` so the echo-message
+    /// The label is echoed back by the server on the echo-message, so
     /// correlation in `processLine()` can suppress the duplicate.
-    void sendLabeledMessage(string target, string text, string label) {
-        sendUserMessage("PRIVMSG", target, text, label);
+    void sendLabeledMessage(string target, string text, string label,
+                            string[string] tags = null) {
+        sendUserMessage("PRIVMSG", target, text, label, tags);
+    }
+
+    /// The `@tags ` prefix of an outgoing line: the label when the server
+    /// negotiated labeled-response, plus every client tag the user
+    /// attached when it negotiated message-tags, values escaped per the
+    /// message-tags specification. Empty when there is nothing to send.
+    private string tagPrefix(string label, const string[string] tags) {
+        import ircfiber.irc.parser : escapeTagValue;
+        string[] parts;
+        if (label.length) parts ~= "label=" ~ label;
+        if (tags.length && hasCap("message-tags")) {
+            foreach (k, v; tags) parts ~= k ~ "=" ~ escapeTagValue(v);
+        }
+        return parts.length ? "@" ~ parts.join(";") ~ " " : "";
     }
 
     /// One logical user message → protocol lines on the wire.
@@ -8068,7 +8083,7 @@ private void processEvents() {
     ///     — so it is admitted as a unit or not at all.
     ///  4. Otherwise the lines are queued behind the fake-lag pacer.
     private void sendUserMessage(string command, string target, string text,
-                                 string label) {
+                                 string label, string[string] tags = null) {
         const budget = linePayloadBudget(target, command);
         bool[] concat;
         auto lines = splitMessage(text, budget, concat);
@@ -8081,13 +8096,14 @@ private void processEvents() {
         if (label.length > 0)
             pendingLabels[label] = Clock.currTime.toUnixTime!long * 1000;
 
-        if (lines.length > 1 && tryMultilineBatch(command, target, lines, concat, labeled ? label : "")) {
+        const prefix = tagPrefix(labeled ? label : "", tags);
+        if (lines.length > 1 && tryMultilineBatch(command, target, lines, concat, prefix)) {
             // Batch accepted.
         } else {
             foreach (i, line; lines) {
                 if (line.length == 0) continue;   // no blank bare messages
-                string wire = (labeled && i == 0)
-                    ? "@label=" ~ label ~ " " ~ command ~ " " ~ target ~ " :" ~ line
+                string wire = i == 0
+                    ? prefix ~ command ~ " " ~ target ~ " :" ~ line
                     : command ~ " " ~ target ~ " :" ~ line;
                 enqueuePaced(wire);
             }
@@ -8104,8 +8120,9 @@ private void processEvents() {
 
     /// Writes `lines` as one `draft/multiline` BATCH, or returns false when
     /// the server's limits (or its current fake lag) do not allow it.
+    /// `prefix` is the `@tags ` prefix for the opening line, or empty.
     private bool tryMultilineBatch(string command, string target,
-                                   string[] lines, bool[] concat, string label) {
+                                   string[] lines, bool[] concat, string prefix) {
         const ml = multilineLimits();
         if (!ml.usable()) return false;
         if (state != ConnectionState.connected) return false;
@@ -8132,7 +8149,7 @@ private void processEvents() {
         scope (exit) chargeSuppressed = false;
         try {
             auto open = "BATCH +" ~ ref_ ~ " draft/multiline " ~ target;
-            writeRaw(label.length > 0 ? "@label=" ~ label ~ " " ~ open : open);
+            writeRaw(prefix ~ open);
             foreach (i, line; lines) {
                 const bool isConcat = i < concat.length && concat[i];
                 auto tags = isConcat

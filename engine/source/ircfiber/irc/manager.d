@@ -361,17 +361,20 @@ final class ConnectionManager {
         return [];
     }
 
-    /// Sends a message to a target on a network.
-    void sendMessage(UUID networkId, string target, string text) {
+    /// Sends a message to a target on a network, with optional client
+    /// tags (`+draft/reply`, for example).
+    void sendMessage(UUID networkId, string target, string text,
+                     string[string] tags = null) {
         if (auto client = getClient(networkId)) {
-            client.sendMessage(target, text);
+            client.sendMessage(target, text, tags);
         }
     }
 
     /// Sends a labeled message to a target on a network.
-    void sendLabeledMessage(UUID networkId, string target, string text, string label) {
+    void sendLabeledMessage(UUID networkId, string target, string text, string label,
+                            string[string] tags = null) {
         if (auto client = getClient(networkId)) {
-            client.sendLabeledMessage(target, text, label);
+            client.sendLabeledMessage(target, text, label, tags);
         }
     }
 

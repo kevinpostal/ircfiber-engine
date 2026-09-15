@@ -133,6 +133,17 @@ struct IRCRawEvent {
         // from the wire (see parser.d tag loop).
         auto typingTag = getTag("+typing");
         if (typingTag.length) j["typing"] = Json(typingTag);
+        // IRCv3 replies and reactions (client-only draft tags): the
+        // msgid a PRIVMSG answers, and on a TAGMSG the emoji added to or
+        // removed from that msgid. Values are already unescaped by the
+        // parser. Persisted scrollback uses this projection too, so `rp`
+        // on a PRIVMSG row survives a reload.
+        auto replyTag = getTag("+draft/reply");
+        if (replyTag.length) j["rp"] = Json(replyTag);
+        auto reactTag = getTag("+draft/react");
+        if (reactTag.length) j["rx"] = Json(reactTag);
+        auto unreactTag = getTag("+draft/unreact");
+        if (unreactTag.length) j["ux"] = Json(unreactTag);
         // IRCv3 account-tag: per-message author account name. Shipped so
         // the frontend can render account identity without a WHOIS round
         // trip, and so the bouncer can re-emit `account=` to clients that
@@ -471,6 +482,28 @@ unittest {
     auto event = IRCRawEvent("libera", "PRIVMSG");
     auto json = event.toCompactJson();
     assert(("a" in json) is null);
+}
+
+@("IRCRawEvent toCompactJson ships reply and reaction tags as rp/rx/ux")
+unittest {
+    auto reply = IRCRawEvent("libera", "PRIVMSG");
+    reply.addTag("+draft/reply", "dc-123");
+    auto rj = reply.toCompactJson();
+    assert(rj["rp"].get!string == "dc-123");
+    assert(("rx" in rj) is null);
+
+    auto react = IRCRawEvent("libera", "TAGMSG");
+    react.addTag("+draft/reply", "dc-123");
+    react.addTag("+draft/react", "\xF0\x9F\x91\x8D");
+    auto xj = react.toCompactJson();
+    assert(xj["rp"].get!string == "dc-123");
+    assert(xj["rx"].get!string == "\xF0\x9F\x91\x8D");
+
+    auto unreact = IRCRawEvent("libera", "TAGMSG");
+    unreact.addTag("+draft/unreact", "\xF0\x9F\x91\x8D");
+    auto uj = unreact.toCompactJson();
+    assert(uj["ux"].get!string == "\xF0\x9F\x91\x8D");
+    assert(("rx" in uj) is null);
 }
 
 @("IRCRawEvent toCompactJson ships edit_of as 'eo'")

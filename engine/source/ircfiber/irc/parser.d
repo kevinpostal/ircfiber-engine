@@ -44,6 +44,76 @@ public string parseIsupportPrefix(string prefixToken) {
     return prefixToken[close + 1 .. $];
 }
 
+/// Escapes a message-tag value for the wire (IRCv3 message-tags): `;`
+/// becomes `\:`, space `\s`, backslash `\\`, CR `\r`, LF `\n`. Every
+/// client tag the engine sends goes through here; `unescapeTagValue`
+/// is its inverse and runs on every tag the parser reads.
+public string escapeTagValue(string raw) {
+    string outp;
+    outp.reserve(raw.length);
+    foreach (char c; raw) {
+        switch (c) {
+            case ';':  outp ~= "\\:"; break;
+            case ' ':  outp ~= "\\s"; break;
+            case '\\': outp ~= "\\\\"; break;
+            case '\r': outp ~= "\\r"; break;
+            case '\n': outp ~= "\\n"; break;
+            default:   outp ~= c; break;
+        }
+    }
+    return outp;
+}
+
+/// The inverse of `escapeTagValue`, as the specification asks of a
+/// parser: a backslash before any other character yields that character
+/// and a trailing lone backslash is dropped. Values without a backslash
+/// (every tag the engine handled before reply/react values) come back
+/// unchanged.
+public string unescapeTagValue(string escaped) {
+    if (escaped.indexOf('\\') < 0) return escaped;
+    string outp;
+    outp.reserve(escaped.length);
+    for (size_t i = 0; i < escaped.length; ++i) {
+        if (escaped[i] != '\\') {
+            outp ~= escaped[i];
+            continue;
+        }
+        if (++i >= escaped.length) break;
+        switch (escaped[i]) {
+            case ':': outp ~= ';'; break;
+            case 's': outp ~= ' '; break;
+            case 'r': outp ~= '\r'; break;
+            case 'n': outp ~= '\n'; break;
+            default:  outp ~= escaped[i]; break;
+        }
+    }
+    return outp;
+}
+
+@("escapeTagValue and unescapeTagValue round-trip the message-tags table")
+unittest {
+    const raw = "a;b c\\d\r\n";
+    const escaped = "a\\:b\\sc\\\\d\\r\\n";
+    assert(escapeTagValue(raw) == escaped);
+    assert(unescapeTagValue(escaped) == raw);
+    assert(escapeTagValue("") == "");
+    // Lenient parse: unknown escape yields the char, trailing lone
+    // backslash is dropped, plain values are untouched.
+    assert(unescapeTagValue("\\x\\") == "x");
+    assert(unescapeTagValue("plain") == "plain");
+}
+
+@("parser unescapes every inbound tag value")
+unittest {
+    NetworkConfig cfg;
+    cfg.id = parseUUID("00000000-0000-0000-0000-000000000001");
+    cfg.name = "libera";
+    auto ev = parseIRCLinePublic(
+        "@+draft/reply=dc-1\\:2;msgid=abc :n!u@h TAGMSG #c", cfg);
+    assert(ev.getTag("+draft/reply") == "dc-1;2");
+    assert(ev.getTag("msgid") == "abc");
+}
+
 /// Parses a raw IRC line into an `IRCRawEvent`.
 public IRCRawEvent parseIRCLinePublic(string line, NetworkConfig config) {
     import std.algorithm : filter;
@@ -99,7 +169,7 @@ public IRCRawEvent parseIRCLinePublic(string line, NetworkConfig config) {
                 if (tag.length == 0) continue;
                 auto eq = tag.indexOf("=");
                 if (eq > 0) {
-                    event.addTag(tag[0 .. eq], tag[eq + 1 .. $]);
+                    event.addTag(tag[0 .. eq], unescapeTagValue(tag[eq + 1 .. $]));
                 } else {
                     // Valueless tag — record as present with empty value.
                     event.addTag(tag, "");
