@@ -27,7 +27,9 @@ import vibe.data.json : Json;
 
 import ircfiber.irc.server : ConnectionServer;
 import ircfiber.irc.connection : parseJoinThrottleSeconds, remainingJoinDelayMs, joinBatches,
-    memberNeedsRealname, channelNeedsRealnameWho, MAX_WHO_ENRICH_ATTEMPTS;
+    memberNeedsRealname, channelNeedsRealnameWho, MAX_WHO_ENRICH_ATTEMPTS,
+    upsertRosterEntry, applyNamesBurst;
+import std.string : indexOf;
 
 /// Tracks the number of passing checks.
 int passed;
@@ -191,6 +193,67 @@ void main() {
         !channelNeedsRealnameWho(["a"], null, null, MAX_WHO_ENRICH_ATTEMPTS));
     ok("an empty channel needs no WHO",
         !channelNeedsRealnameWho([], null, null, 0));
+
+    // ── Channel roster identity (#tclmafia showed two Zodiacs) ───────────
+    // The member list carried `Zodiac` AND `Zodiac_` for one person. The
+    // roster on the held connection held four entries for that member: the
+    // bare nick from our JOIN echo, two hostmask forms straddling an ident
+    // change (`~Zodiac` → `~Zodiac_`), and the nick from before a 433
+    // fallback, six hours stale. 353 only ever appended, so nothing could
+    // remove any of them.
+    stderr.writeln("\n[connection.roster] one member, one entry");
+
+    /// Whether `roster` names `nick` (entries here carry no mode prefix).
+    bool names(string[] roster, string nick) {
+        foreach (e; roster) {
+            const bang = e.indexOf("!");
+            if ((bang > 0 ? e[0 .. bang] : e) == nick) return true;
+        }
+        return false;
+    }
+
+    const cloak = "@m4rrk4b62eyterscuiypip5ub6.gangnet.ru";
+    string[] folded;
+    foreach (e; ["Zodiac_", "Zodiac_!~Zodiac" ~ cloak, "Zodiac_!~Zodiac_" ~ cloak])
+        folded = upsertRosterEntry(folded, e, "rfc1459");
+    ok("every spelling of one member folds to a single entry",
+        folded == ["Zodiac_!~Zodiac_" ~ cloak], "got: " ~ folded.to!string);
+    ok("a bare JOIN echo does not deop a member the server gave status",
+        upsertRosterEntry(["@pyylmao"], "pyylmao", "rfc1459") == ["@pyylmao"]);
+    ok("a newly stated prefix is adopted and the hostmask survives",
+        upsertRosterEntry(["kernelstub!~k@host"], "@kernelstub", "rfc1459")
+            == ["@kernelstub!~k@host"]);
+    ok("casemapping decides what counts as one member",
+        upsertRosterEntry(["a[b"], "a{b", "rfc1459").length == 1
+        && upsertRosterEntry(["a[b"], "a{b", "ascii").length == 2);
+    ok("a trailing underscore is a different member, not a duplicate",
+        upsertRosterEntry(["Zodiac"], "Zodiac_", "rfc1459").length == 2);
+
+    string[] held;
+    foreach (e; ["root!~root@cd42.gangnet.ru",
+                 "Zodiac!~Zodiac@q6hg.gangnet.ru",
+                 "kernelstub",
+                 "Zodiac_",
+                 "Zodiac_!~Zodiac" ~ cloak])
+        held = upsertRosterEntry(held, e, "rfc1459");
+    ok("the stale nick and the live one are two members until a resync",
+        held.length == 4 && names(held, "Zodiac") && names(held, "Zodiac_"),
+        "got: " ~ held.to!string);
+
+    string[] burst;
+    foreach (e; ["root!~root@cd42.gangnet.ru",
+                 "kernelstub!~kernelstub@gt3t.gangnet.ru",
+                 "Zodiac_!~Zodiac_" ~ cloak])
+        burst = upsertRosterEntry(burst, e, "rfc1459");
+    auto rebased = applyNamesBurst(held, burst);
+    ok("a completed NAMES drops the member the server no longer names",
+        !names(rebased, "Zodiac"), "got: " ~ rebased.to!string);
+    ok("the members the server did name survive the re-baseline",
+        rebased.length == 3 && names(rebased, "Zodiac_")
+        && names(rebased, "root") && names(rebased, "kernelstub"),
+        "got: " ~ rebased.to!string);
+    ok("an empty burst never wipes a roster",
+        applyNamesBurst(held, []) == held);
 
     stderr.writeln("\n[", passed, " passed, ", failed, " failed]");
     if (failed > 0) core.stdc.stdlib.exit(1);

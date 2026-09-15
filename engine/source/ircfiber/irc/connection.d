@@ -1689,6 +1689,61 @@ private string nickPrefix(string nick) {
     return nick[0 .. nickPrefixRun(nick)];
 }
 
+/// A NAMES burst is milliseconds of wire. A pending one still open after
+/// this lost its 366 (the connection dropped mid-reply), so the next NAMES
+/// starts a new burst instead of appending to it — otherwise a member who
+/// left in between would be resurrected by the merge.
+private enum NAMES_BURST_STALE_SECS = 60;
+
+/// Folds `entry` (`[prefix]nick[!user@host]`) into `roster`, keyed on the
+/// bare nick per CASEMAPPING `mapping`: one member is one entry, whatever
+/// spelling the server used.
+///
+/// IRC hands the same member out several ways — bare from a JOIN echo,
+/// `nick!user@host` from 353 under userhost-in-names, and a re-identted
+/// form once the ircd re-derives the ident from a new nick (`~Zodiac` →
+/// `~Zodiac_`). An exact-string `canFind` treats all of those as strangers,
+/// so the roster grew one "member" per spelling: #tclmafia held `Zodiac_`
+/// three times over.
+///
+/// The merge keeps the richer half of each side: a prefix run the server
+/// just stated wins, an absent one keeps what we already hold (a bare JOIN
+/// echo must not silently deop anybody), and a hostmask is never traded
+/// back for a bare nick.
+string[] upsertRosterEntry(string[] roster, string entry, string mapping) {
+    if (entry.length == 0) return roster;
+    const bare = stripNickPrefix(entry);
+    if (bare.length == 0) return roster;
+    foreach (i, existing; roster) {
+        if (!nicksEqualMapped(stripNickPrefix(existing), bare, mapping)) continue;
+        // `!` is itself a prefix char (ojoin), so the hostmask can only be
+        // looked for past the prefix run.
+        const newBody = entry[nickPrefixRun(entry) .. $];
+        const oldBody = existing[nickPrefixRun(existing) .. $];
+        const newPrefix = nickPrefix(entry);
+        roster[i] = (newPrefix.length ? newPrefix : nickPrefix(existing))
+                  ~ (newBody.indexOf("!") > 0 ? newBody : oldBody);
+        return roster;
+    }
+    return roster ~ entry;
+}
+
+/// The roster a completed NAMES burst installs over the one we held.
+///
+/// The burst is the server's whole answer for the channel, so a member it
+/// does not name is gone. That is the only thing that purges an entry no
+/// event ever removed: a QUIT that landed while this engine was detached,
+/// or our own pre-fallback nick after a 433 chain (`Zodiac` → `Zodiac_`),
+/// which renames nothing because a pre-registration fallback gets no NICK
+/// echo. Before this, 353 appended into the live roster and NAMES was
+/// additive-only — a rejoin could add members but never drop one.
+///
+/// An empty burst is never authoritative: a truncated reply must not wipe a
+/// roster (we are in the channel, so the server always names at least us).
+string[] applyNamesBurst(string[] previous, string[] burst) {
+    return burst.length ? burst : previous;
+}
+
 /// The single strongest status char across a member's prefix runs.
 ///
 /// A roster can hold the same member more than once — the bare nick from
@@ -2389,6 +2444,16 @@ final class PersistentIRCClient {
         string[string]      channelState;
         string[string]      channelTopics;
         string[][string]    channelUsers;
+        // RPL_NAMREPLY accumulation, per channel. 353 lines land here and
+        // the 366 that closes the burst swaps the result into
+        // `channelUsers` (applyNamesBurst), which is what makes a NAMES
+        // able to DROP a member. Holding the live roster untouched until
+        // the burst completes means a NAMES that never finishes leaves the
+        // member list exactly as it was.
+        string[][string]    namesBurst;
+        // Unix seconds each pending burst started — see
+        // NAMES_BURST_STALE_SECS.
+        long[string]        namesBurstAt;
         long[string]        lastWhoTime;  // throttle: chan→last WHO timestamp
         // Sweeps already sent per channel on this connection; capped by
         // MAX_WHO_ENRICH_ATTEMPTS so a server that answers WHO without
@@ -3073,11 +3138,14 @@ final class PersistentIRCClient {
              "uptimeSecs": upSecs.to!string,
              "egress": activeEgressLabel.length ? activeEgressLabel : "direct",
              "event": "attached"]);
-        if (!graceful || s.usersDropped) {
-            // Crash path: member lists may have drifted while no engine was
-            // reading. NAMES is paced by writeRaw like any other line.
-            foreach (chan; channelState.byKey) sendRaw("NAMES " ~ chan);
-        }
+        // Membership is only ever as good as the last NAMES. Whatever the
+        // detach looked like, no engine was interpreting this socket for a
+        // while (`s.usersDropped` says the snapshot did not even carry the
+        // rosters), so re-baseline every channel: with the 353/366 burst
+        // swap a NAMES now DROPS members who left instead of merely
+        // re-adding the ones still here, which is what a resync was always
+        // meant to do. Paced by writeRaw like any other line.
+        foreach (chan; channelState.byKey) sendRaw("NAMES " ~ chan);
         // Fresh META from the attached engine: the previous one was the
         // detach snapshot (`graceful == true`), and a crash before the next
         // upkeep write must not be mistaken for a planned swap.
@@ -3420,10 +3488,16 @@ final class PersistentIRCClient {
     /// rfc1459). Replaces bare `==` at every site that matches an event
     /// nick against the channel roster or the session nick.
     bool sameNick(string a, string b) {
-        string mapping = "rfc1459";
+        return nicksEqualMapped(stripNickPrefix(a), stripNickPrefix(b), casemapping());
+    }
+
+    /// The server's ISUPPORT CASEMAPPING, defaulting to rfc1459 (the
+    /// common one). Shared by `sameNick` and every roster fold, so the two
+    /// can never disagree about whether two spellings are one member.
+    string casemapping() {
         if (auto m = "CASEMAPPING" in isupportMap)
-            if (m.length) mapping = *m;
-        return nicksEqualMapped(stripNickPrefix(a), stripNickPrefix(b), mapping);
+            if (m.length) return *m;
+        return "rfc1459";
     }
 
     /// Returns all negotiated capabilities.
@@ -4628,6 +4702,18 @@ final class PersistentIRCClient {
                         // ── 001 welcomed ─────────────────────────────────────
                         case "001":
                             welcomed = true;
+                            // A new registration is a new IRC session:
+                            // every membership fact we hold belongs to the
+                            // socket that just died, and each rejoin's
+                            // NAMES burst rebuilds it from the server.
+                            // Keeping it is how our own pre-fallback nick
+                            // survived a 433 chain — a fallback sent
+                            // before registration gets no NICK echo, so
+                            // nothing renamed the old entry and `Zodiac`
+                            // sat in #tclmafia beside `Zodiac_` for hours.
+                            channelUsers = null;
+                            namesBurst = null;
+                            namesBurstAt = null;
                             // Registration completed. Reset the fallback
                             // counter so the next reconnect attempts the
                             // user's configured nick from scratch — if
@@ -5640,12 +5726,13 @@ private void processEvents() {
                             ownHostmask = event.prefix;
                         // Add our nick to channelUsers immediately so the
                         // current user always appears in the member list,
-                        // even if the IRC server omits us from RPL_NAMREPLY
-                        // (353).  The 353 handler dedups at line 2013, so
-                        // adding here early is safe — 353 won't duplicate.
-                        if (chan !in channelUsers) channelUsers[chan] = [];
-                        if (!channelUsers[chan].canFind(event.nick))
-                            channelUsers[chan] ~= event.nick;
+                        // even if the IRC server omits us from
+                        // RPL_NAMREPLY (353). The fold keys on the bare
+                        // nick, so this bare echo merges into the
+                        // hostmask form 353 already stored instead of
+                        // standing beside it as a second member.
+                        channelUsers[chan] = upsertRosterEntry(
+                            channelUsers.get(chan, null), event.nick, casemapping());
                         bool wasAutoJoin = config.autoJoinChannels.canFind(chan);
                         if (!wasAutoJoin)
                             config.autoJoinChannels ~= chan;
@@ -5669,7 +5756,15 @@ private void processEvents() {
                              "event": "join"]);
                     } else {
                         // extended-join: params may be [channel, account, realname]
-                        channelUsers[chan] ~= event.nick;
+                        // Fold on the bare nick: a JOIN we see twice (a
+                        // netsplit heal re-announcing the channel, or a
+                        // JOIN for somebody 353 already named with their
+                        // hostmask) must not add a second entry for one
+                        // member. This raw append is how `kernelstub` and
+                        // `kernelstub!~kernelstub@host` both ended up in
+                        // the #tclmafia roster.
+                        channelUsers[chan] = upsertRosterEntry(
+                            channelUsers.get(chan, null), event.nick, casemapping());
                         // IRCv3 extended-join: extract account name from params[1]
                         // ("*" means not logged in; empty string means not provided).
                         if (params.length >= 3) {
@@ -6049,14 +6144,33 @@ private void processEvents() {
                              "reason":    "join-echo-dropped-but-names-arrived",
                              "event":     "channelstate_self_heal"]);
                     }
-                    if (chan !in channelUsers) channelUsers[chan] = [];
+                    // Accumulate into the pending burst instead of the
+                    // live roster: 353 used to append straight into
+                    // channelUsers, which made NAMES additive-only — a
+                    // rejoin, a reconnect or an explicit resync could add
+                    // members but never drop one, so anybody who left
+                    // unseen stayed in the list for the life of the
+                    // connection. The 366 below installs the burst.
+                    {
+                        import std.datetime : Clock;
+                        const burstNow = Clock.currTime.toUnixTime!long;
+                        auto lastLineAt = chan in namesBurstAt;
+                        if (chan !in namesBurst || lastLineAt is null
+                            || burstNow - *lastLineAt > NAMES_BURST_STALE_SECS)
+                            namesBurst[chan] = null;
+                        // Stamped per LINE, not per burst: a channel big
+                        // enough to have its NAMES paced over minutes must
+                        // not have the burst reset out from under its own
+                        // tail, which would install half a roster.
+                        namesBurstAt[chan] = burstNow;
+                    }
                     foreach (n; nicks) {
                         if (n.length == 0) continue;
                         // userhost-in-names format: [mode]nick!user@host
                         // Store the full string (as-is) for the frontend,
                         // but extract ident at the engine level too.
-                        if (!channelUsers[chan].canFind(n))
-                            channelUsers[chan] ~= n;
+                        namesBurst[chan] = upsertRosterEntry(
+                            namesBurst[chan], n, casemapping());
                         auto bare = stripNickPrefix(n);
                         auto bang = n.indexOf("!");
                         if (bang > 0) {
@@ -6071,11 +6185,14 @@ private void processEvents() {
                         ["network": config.name,
                          "channel": chan,
                          "count": nicks.length.to!string,
-                         "totalUsers": channelUsers[chan].length.to!string,
+                         "burstUsers": namesBurst[chan].length.to!string,
+                         "totalUsers": channelUsers.get(chan, null).length.to!string,
                          "realnames": realnames.length.to!string,
                          "event": "numeric"]);
                     // If we have many users but no realnames, trigger WHO to populate them.
                     // This handles the initial NAMES burst where 366 may be delayed or missed.
+                    // Reads the burst, which is the fresher view of the
+                    // channel while one is open.
                     {
                         import std.datetime : Clock;
                         const whoNow = Clock.currTime.toUnixTime!long;
@@ -6083,8 +6200,8 @@ private void processEvents() {
                         auto ap = chan in whoEnrichAttempts;
                         const attempts = ap ? *ap : 0;
                         needsWho = channelNeedsRealnameWho(
-                            channelUsers[chan], realnames, realnameProbed, attempts);
-                        if (needsWho && channelUsers[chan].length > 5
+                            namesBurst[chan], realnames, realnameProbed, attempts);
+                        if (needsWho && namesBurst[chan].length > 5
                             && (chan !in lastWhoTime || whoNow - lastWhoTime[chan] >= 2)) {
                             sendRaw("WHO " ~ chan);
                             lastWhoTime[chan] = whoNow;
@@ -6110,6 +6227,27 @@ private void processEvents() {
                     ["network": config.name, "channel": params.length>=2?params[1]:"?", "event": "rpl_endofnames"]);
                 if (params.length >= 2) {
                     auto chan = params[1];
+                    // Install the burst: the server just named everybody in
+                    // the channel, so a member it left out is gone. This is
+                    // the only thing that purges a roster entry no event
+                    // removed — a QUIT that landed while this engine was
+                    // detached, or our own pre-fallback nick after a 433
+                    // chain (`Zodiac` beside `Zodiac_`).
+                    if (auto burst = chan in namesBurst) {
+                        auto held = channelUsers.get(chan, null);
+                        auto rebased = applyNamesBurst(held, *burst);
+                        namesBurst.remove(chan);
+                        namesBurstAt.remove(chan);
+                        if (rebased.length != held.length)
+                            logJsonMap("info", "protocol",
+                                "NAMES re-baselined the channel roster",
+                                ["network": config.name, "channel": chan,
+                                 "was": held.length.to!string,
+                                 "now": rebased.length.to!string,
+                                 "event": "roster_rebased"]);
+                        channelUsers[chan] = rebased;
+                        metaDirty = true;
+                    }
                     // Our own prefix is now known for this channel, so we
                     // can tell whether `+f` even applies to us, and ask the
                     // server what its effective limit actually is.
