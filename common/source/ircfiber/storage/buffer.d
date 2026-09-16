@@ -198,6 +198,40 @@ final class BufferManager {
         return NOISE.canFind(cmd);
     }
 
+    /// Whether a stored scrollback ROW is noise, which the command alone
+    /// cannot decide for TAGMSG. A reaction TAGMSG (IRCv3
+    /// `+draft/react` / `+draft/unreact`, compact keys `rx` / `ux`) is
+    /// message STATE, not an event the timeline renders: it names the
+    /// row it belongs to with `rp` and the client folds it into that
+    /// row's reaction chips. Dropping it here is what made a Discord
+    /// heart vanish on reload while the live TAGMSG had rendered it.
+    /// Every other TAGMSG — `+typing` above all — stays noise.
+    static bool isScrollbackNoiseRow(Json msg) @trusted {
+        string cmd;
+        if (auto c = "c" in msg) {
+            if (c.type == Json.Type.string) cmd = c.get!string;
+        }
+        if (cmd.length == 0) {
+            if (auto c = "command" in msg) {
+                if (c.type == Json.Type.string) cmd = c.get!string;
+            }
+        }
+        if (cmd == "TAGMSG")
+            return !isReactionRow(msg);
+        return isScrollbackNoiseCommand(cmd);
+    }
+
+    /// A TAGMSG row carrying an emoji for the msgid in `rp`.
+    static bool isReactionRow(Json msg) @trusted {
+        static bool hasString(Json m, string key) @trusted {
+            if (auto v = key in m)
+                return v.type == Json.Type.string && v.get!string.length > 0;
+            return false;
+        }
+        if (!hasString(msg, "rp")) return false;
+        return hasString(msg, "rx") || hasString(msg, "ux");
+    }
+
     private Json[] _getRecentFiltered(string key, long count, long before, long after,
                                       long beforeIdx = -1, bool filterNoise = false) @trusted {
         auto db = redis.getDb();
@@ -226,10 +260,7 @@ final class BufferManager {
                     const ts = msg["t"].get!long;
                     if (ts <= after) continue;
                 }
-                if (filterNoise && "c" in msg) {
-                    const cmd = msg["c"].get!string;
-                    if (isScrollbackNoiseCommand(cmd)) continue;
-                }
+                if (filterNoise && isScrollbackNoiseRow(msg)) continue;
                 messages ~= msg;
                 if (messages.length >= count) break;
             } catch (Exception e) {
@@ -853,6 +884,35 @@ final class BufferManager {
         db.expire(key, 86_400 * TTL_DAYS);
         return true;
     }
+}
+
+@("isScrollbackNoiseRow keeps reaction TAGMSGs and drops typing ones")
+unittest {
+    // A Discord ❤️ relayed as `+draft/react` must survive scrollback:
+    // it is the only record the chip has after a reload.
+    auto react = parseJsonString(
+        `{"c":"TAGMSG","n":"digits","rp":"dc-1549598693991383115","rx":"\u2764\ufe0f"}`);
+    assert(!BufferManager.isScrollbackNoiseRow(react));
+    assert(BufferManager.isReactionRow(react));
+
+    auto unreact = parseJsonString(`{"c":"TAGMSG","n":"digits","rp":"dc-1","ux":"\u2764"}`);
+    assert(!BufferManager.isScrollbackNoiseRow(unreact));
+
+    // Typing has no target row and would replay as an invisible row.
+    auto typing = parseJsonString(`{"c":"TAGMSG","n":"stanzi","typing":"active"}`);
+    assert(BufferManager.isScrollbackNoiseRow(typing));
+    assert(!BufferManager.isReactionRow(typing));
+
+    // An emoji without the msgid it belongs to cannot be folded anywhere.
+    auto orphan = parseJsonString(`{"c":"TAGMSG","n":"stanzi","rx":"\u2764"}`);
+    assert(BufferManager.isScrollbackNoiseRow(orphan));
+
+    // Everything else keeps the command-only verdict, including the
+    // long-form `command` key the REST envelope can carry.
+    assert(!BufferManager.isScrollbackNoiseRow(
+        parseJsonString(`{"c":"PRIVMSG","n":"stanzi","x":"good evening!"}`)));
+    assert(BufferManager.isScrollbackNoiseRow(parseJsonString(`{"c":"315"}`)));
+    assert(BufferManager.isScrollbackNoiseRow(parseJsonString(`{"command":"QUIT"}`)));
 }
 
 @("BufferManager.getUnreadTail returns newest chat rows after lastSeen, oldest-first, capped")

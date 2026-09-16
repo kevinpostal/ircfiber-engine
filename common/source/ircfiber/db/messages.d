@@ -35,7 +35,7 @@ final class MessageRepository {
 
     /// Docs store the IRC command inside the `payload` JSON string
     /// (`"c":"315"`). Exclude the noise commands the chat UI cannot
-    /// render (mirrors `BufferManager.isScrollbackNoiseCommand`) so the
+    /// render (mirrors `BufferManager.isScrollbackNoiseRow`) so the
     /// Mongo fall-through returns REAL messages, not a wall of invisible
     /// WHO/NAMES/TAGMSG rows that push PRIVMSGs out of the visible
     /// window. Only applied to channel buffers — the `_server` log
@@ -43,20 +43,28 @@ final class MessageRepository {
     private static immutable string NOISE_PAYLOAD_RE =
         `"c"\s*:\s*"(315|352|332|333|353|354|366|367|368|376|422|311|312|313|317|318|319|330|301|671|401|324|329|303|PONG|TAGMSG|QUIT|you_nickchange)"`;
 
+    /// A reaction TAGMSG (`+draft/react` / `+draft/unreact`, compact keys
+    /// `rx` / `ux`, naming its target row in `rp`) is message state the
+    /// client folds into that row's chips, so it is exempt from the
+    /// TAGMSG exclusion above — otherwise a reaction only ever existed
+    /// for clients that were connected when it happened. Typing TAGMSGs
+    /// have no `rp`/`rx` and stay excluded. Mirrors
+    /// `BufferManager.isScrollbackNoiseRow`.
+    private static immutable string REACT_PAYLOAD_RE =
+        `"(rx|ux)"\s*:\s*"`;
+
     /// Positive match for chat rows only (bouncer playback / CHATHISTORY):
     /// the limit must apply to PRIVMSG/NOTICE, not to JOIN/MODE churn.
     private static immutable string CHAT_PAYLOAD_RE = `"c"\s*:\s*"(PRIVMSG|NOTICE)"`;
 
-    private static Bson noisePayloadExclusion() @trusted {
-        return Bson([
-            "payload": Bson(["$not": Bson(BsonRegex(NOISE_PAYLOAD_RE, ""))])
-        ]);
-    }
-
     private static void applyNoiseExclusion(ref Bson filter, string channel) {
-        if (channel != "_server") {
-            filter["payload"] = noisePayloadExclusion()["payload"];
-        }
+        if (channel == "_server")
+            return;
+        /* Keep a row when it is not noise, OR when it is a reaction. */
+        filter["$or"] = Bson([
+            Bson(["payload": Bson(["$not": Bson(BsonRegex(NOISE_PAYLOAD_RE, ""))])]),
+            Bson(["payload": Bson(["$regex": Bson(REACT_PAYLOAD_RE)])])
+        ]);
     }
 
     /// Creates a repository bound to the messages collection.
