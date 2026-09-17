@@ -5990,16 +5990,32 @@ private void processEvents() {
                         }
                     }
                     // Two paths for detecting this is OUR nick change:
-                    // 1. Normal — event.nick (old nick) matches current sessionNick.
+                    // 1. Server-initiated — event.nick (old nick) matches
+                    //    current sessionNick and we never asked for it: a
+                    //    services enforcement (`Guest12345` / UID when a
+                    //    registered nick goes unidentified), an oper SANICK,
+                    //    a collision. Track it, but do NOT persist it: the
+                    //    persisted nick is "what the user last chose", and a
+                    //    forced rename is exactly what the next reconnect
+                    //    must undo. Persisting it made a Guest nick sticky —
+                    //    the reconnect requested `Guest12345`, collided with
+                    //    its own still-quitting session, and fell into the
+                    //    random-suffix escape hatch (Sep 17 2026, 36 users).
                     // 2. Optimistic — user sent /nick via sendRaw which already
                     //    updated sessionNick. The old nick before the update is
-                    //    tracked in optimisticNickOld. We match against that.
+                    //    tracked in optimisticNickOld. We match against that;
+                    //    this is the only self-rename worth remembering.
                     bool isSelf = false;
                     if (sameNick(event.nick, sessionNick)) {
                         isSelf = true;
                         sessionNick = newNick;
                         metaDirty = true;
-                        persistNick(sessionNick);
+                        logJsonMap("info", "connection",
+                            "Server-initiated self nick change — not persisting",
+                            ["network": config.name,
+                             "oldNick": event.nick,
+                             "newNick": newNick,
+                             "event":   "forced_nick_change"]);
                     } else if (optimisticNickOld.length > 0 && sameNick(event.nick, optimisticNickOld)) {
                         isSelf = true;
                         sessionNick = newNick;
