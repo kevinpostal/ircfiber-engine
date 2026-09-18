@@ -85,7 +85,8 @@ struct RedisKeys {
     /// Per-user event stream (IRCCloud-style). Every event published
     /// to the user's pub/sub channel is also LPUSHed here. On reconnect,
     /// the gateway replays events with eid > sinceEid from this list.
-    /// LTRIM keeps the list bounded for memory safety.
+    /// LTRIM keeps the list bounded for memory safety; EXPIRE
+    /// `StateTTL.USER_STREAM_TTL` is re-set on every append.
     static string userStream(string userId) { return "irc:stream:" ~ userId; }
 
     /// Per-network hash: field = bouncer clientid, value = last eid delivered to it.
@@ -269,6 +270,10 @@ struct StateTTL {
     /// TTL for `irc:control:<server>` control queue. Bumped every
     /// heartbeat; if engine dies, queue evicts within this TTL.
     enum CONTROL_QUEUE_TTL = 300;
+
+    /// TTL for `irc:stream:<user>` replay lists. Re-set on every append;
+    /// matches the 30-day scrollback retention (storage/buffer.d TTL_DAYS).
+    enum USER_STREAM_TTL = 30 * 86_400;
 }
 
 /// IRC command message

@@ -5,7 +5,8 @@ import std.conv;
 import std.algorithm;
 import std.array;
 import std.json;
-import std.datetime : Clock;
+import std.datetime : Clock, days;
+import vibe.core.core : runTask;
 import vibe.db.mongo.mongo;
 import vibe.db.mongo.cursor;     // FindOptions
 import vibe.data.bson;
@@ -17,13 +18,33 @@ import ircfiber.models.network : normalizeChannelName;
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.storage.buffer : sanitizeUtf8;
 
+/// Days a `messages` row stays in Mongo before the TTL monitor deletes it.
+/// Read once per process by `MessageRepository.ensureIndexes`.
+enum MESSAGE_RETENTION_DAYS_DEFAULT = 30;
+
+/// `IRCFIBER_MESSAGE_RETENTION_DAYS` (positive int) or the default.
+/// Non-numeric / <= 0 values fall back to the default with a WARN line.
+int messageRetentionDays() @trusted {
+    import std.process : environment;
+    const raw = environment.get("IRCFIBER_MESSAGE_RETENTION_DAYS", "");
+    if (raw.length == 0) return MESSAGE_RETENTION_DAYS_DEFAULT;
+    try {
+        const v = raw.to!int;
+        if (v > 0) return v;
+    } catch (Exception) {}
+    logWarn("IRCFIBER_MESSAGE_RETENTION_DAYS=%s invalid; using %s", raw, MESSAGE_RETENTION_DAYS_DEFAULT);
+    return MESSAGE_RETENTION_DAYS_DEFAULT;
+}
+
 /**
- * Permanent message storage (IRCCloud-style).
+ * Rolling message storage (IRCCloud-style).
  *
- * MongoDB stores every message that ever passed through the engine.
- * Redis keeps a hot cache of the most recent N messages for fast access.
- * When the cache is exhausted (e.g. very old history), the REST API
- * falls through to MongoDB for true infinite scrollback.
+ * MongoDB stores every message the engine sees; rows expire after
+ * `messageRetentionDays()` via the `tsAt` TTL index (Mongo's TTL monitor
+ * deletes them in the background). Redis keeps a hot cache of the most
+ * recent N messages for fast access. When the cache is exhausted, the
+ * REST API falls through to MongoDB for scrollback within the retention
+ * window.
  *
  * Each document is indexed by (serverId, networkId, channel, t, msgid)
  * for efficient paginated queries. The full compact JSON payload is
@@ -67,14 +88,21 @@ final class MessageRepository {
         ]);
     }
 
+    /// The gateway constructs a repository per request; the index and
+    /// backfill work below must run once per process, not per request.
+    private static bool indexesEnsured;
+
     /// Creates a repository bound to the messages collection.
     this() {
         collection = AppMongoConnection.getDb()["messages"];
         ensureIndexes();
     }
 
-    /// Build the primary compound index for paginated queries.
+    /// Build the compound query indexes, the `tsAt` TTL index (retention),
+    /// and backfill `tsAt` on legacy rows in the background.
     private void ensureIndexes() @trusted {
+        if (indexesEnsured) return;
+        indexesEnsured = true;
         try {
             // Primary compound index: pagination by timestamp
             collection.createIndex(
@@ -97,6 +125,46 @@ final class MessageRepository {
         } catch (Exception e) {
             logWarn("Failed to create messages compound index: %s", e.msg);
         }
+
+        const retentionDays = messageRetentionDays();
+        try {
+            IndexOptions o;
+            o.expireAfter = retentionDays.days;
+            collection.createIndex(Bson(["tsAt": Bson(1)]), o);
+        } catch (Exception e) {
+            // IndexOptionsConflict (code 85): index exists with a different
+            // expireAfterSeconds. Change it in place instead of drop+recreate.
+            try {
+                auto cmd = Bson.emptyObject;              // field order matters: command name first
+                cmd["collMod"] = Bson("messages");
+                auto idx = Bson.emptyObject;
+                idx["keyPattern"] = Bson(["tsAt": Bson(1)]);
+                idx["expireAfterSeconds"] = Bson(cast(long) retentionDays * 86_400);
+                cmd["index"] = idx;
+                AppMongoConnection.runCommand(cmd);
+                logInfo("messages TTL index retention set to %s days via collMod", retentionDays);
+            } catch (Exception e2) {
+                logWarn("messages TTL index: createIndex (%s) and collMod (%s) both failed; "
+                    ~ "retention NOT enforced — db.messages.dropIndex(\"tsAt_1\") and restart",
+                    e.msg, e2.msg);
+            }
+        }
+
+        // Rows written before `tsAt` existed never age out unless they get
+        // one. `{tsAt: {$exists: false}}` is served by the non-sparse tsAt_1
+        // index, so after the first run this is a cheap seek returning 0.
+        // Runs in a fiber so engine boot and gateway requests never block.
+        runTask({
+            try {
+                auto filter = Bson(["tsAt": Bson(["$exists": Bson(false)])]);
+                Bson[] pipeline = [Bson(["$set": Bson(["tsAt": Bson(["$toDate": Bson("$t")])])])];
+                auto res = collection.updateMany(filter, Bson(pipeline));
+                if (res.modifiedCount > 0)
+                    logInfo("messages retention backfill: set tsAt on %s legacy rows", res.modifiedCount);
+            } catch (Exception e) {
+                logWarn("messages retention backfill failed: %s", e.msg);
+            }
+        });
     }
 
     /// Normalize channel name via the canonical helper in
@@ -126,8 +194,9 @@ final class MessageRepository {
         }
     }
 
-    /// Append a compact message JSON to permanent storage. Called from
-    /// the event processor for every event the engine sees.
+    /// Append a compact message JSON to storage. Called from the event
+    /// processor for every event the engine sees. `tsAt` mirrors `t` as a
+    /// BSON Date so the TTL index can age the row out.
     void appendMessage(string serverId, string networkId, string channel, Json message) @trusted {
         if (serverId.length == 0) {
             logError("MessageRepository.appendMessage: serverId is empty");
@@ -170,7 +239,9 @@ final class MessageRepository {
         if (eid > 0) jdoc["eid"] = Json(eid);
 
         try {
-            collection.insertOne(Bson(jdoc));
+            auto doc = Bson(jdoc);
+            doc["tsAt"] = Bson(BsonDate(ts));
+            collection.insertOne(doc);
         } catch (Exception e) {
             logDebug("Mongo insert (probably duplicate): %s", e.msg);
         }

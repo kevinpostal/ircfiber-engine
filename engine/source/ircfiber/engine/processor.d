@@ -9,7 +9,7 @@ import ircfiber.models.irc_event : IRCRawEvent;
 import ircfiber.models.network : Network;
 import ircfiber.engine.bootstrap : EngineContext;
 import ircfiber.engine.state : writeStateSnapshotForNetwork;
-import ircfiber.redis.protocol : RedisKeys;
+import ircfiber.redis.protocol : RedisKeys, StateTTL;
 
 /// IRC server-log phase events that are purely transient connection-state
 /// (TCP open, TLS handshake, registration steps). They never appear in
@@ -183,6 +183,7 @@ void startEventProcessor(ref EngineContext ctx) {
                         auto streamKey = RedisKeys.userStream(userIdStr);
                         ctx.redis.getDb().lpush(streamKey, msg);
                         ctx.redis.getDb().ltrim(streamKey, 0, 999);
+                        ctx.redis.getDb().expire(streamKey, StateTTL.USER_STREAM_TTL);
                     }
                 }
 
