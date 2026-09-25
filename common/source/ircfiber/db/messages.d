@@ -75,8 +75,11 @@ final class MessageRepository {
         `"(rx|ux)"\s*:\s*"`;
 
     /// Positive match for chat rows only (bouncer playback / CHATHISTORY):
-    /// the limit must apply to PRIVMSG/NOTICE, not to JOIN/MODE churn.
-    private static immutable string CHAT_PAYLOAD_RE = `"c"\s*:\s*"(PRIVMSG|NOTICE)"`;
+    /// the limit must apply to PRIVMSG/NOTICE/REDACT, not to JOIN/MODE churn.
+    /// REDACT rides the same window so cap-negotiated bouncer clients replay
+    /// tombstone state (clients without draft/message-redaction get nothing:
+    /// formatEvent drops REDACT for them).
+    private static immutable string CHAT_PAYLOAD_RE = `"c"\s*:\s*"(PRIVMSG|NOTICE|REDACT)"`;
 
     private static void applyNoiseExclusion(ref Bson filter, string channel) {
         if (channel == "_server")

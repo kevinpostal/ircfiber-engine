@@ -6541,20 +6541,17 @@ private void processEvents() {
                 // Record it so the next paste chunks correctly instead of
                 // failing again.
                 applyMultilineFail(event);
+                auto fp = event.getParams();
+                if (fp.length >= 3 && fp[0] == "REDACT" && event.channel.length == 0)
+                    event.channel = fp[2]; // FAIL REDACT <code> <target> … → the target buffer
                 break;
 
             // ── Message redaction (draft/message-redaction cap) ────────────
-            // `REDACT <target> <msgid> [<reason>]` — publishes into the
-            // target buffer so the frontend can tombstone the message by
-            // msgid. Routed explicitly because the trailing channel walk
-            // only matches #-channels while a DM redaction targets a
-            // bare nick.
-            case "REDACT": {
-                auto rp = event.getParams();
-                if (rp.length > 0 && event.channel.length == 0)
-                    event.channel = normalizeChannelName(rp[0]);
+            // `REDACT <target> <msgid> [<reason>]` — channel targets resolve
+            // via the generic first channel-like param walk below; DM
+            // redactions resolve via the DM fallback below.
+            case "REDACT":
                 break;
-            }
 
             // ── Monitor replies (IRCv3 monitor, ISUPPORT MONITOR) ──────────
             // 730 RPL_MONONLINE / 731 RPL_MONOFFLINE / 732 RPL_MONLIST /
@@ -6936,7 +6933,7 @@ private void processEvents() {
         // DM fallback: parser no longer sets channel for non-channel PRIVMSG
         // (see parser.d). Resolve to counterparty here session-aware.
         if (event.channel.length == 0
-            && (event.command == "PRIVMSG" || event.command == "NOTICE")) {
+            && (event.command == "PRIVMSG" || event.command == "NOTICE" || event.command == "REDACT")) {
             auto p = event.getParams();
             if (p.length > 0 && p[0].length > 0
                 && p[0][0] != '#' && p[0][0] != '&'
@@ -8353,17 +8350,6 @@ private void processEvents() {
         if (!monitorSupported()) return;
         auto line = buildMonitorLine(verb, targets);
         if (line is null) return;
-        sendRaw(line);
-    }
-
-    /// Sends a message redaction using the draft/message-redaction cap:
-    /// `REDACT <target> <msgid> [<reason>]`. Silent no-op when the cap
-    /// was not negotiated.
-    void sendRedactMessage(string target, string msgid, string reason = "") {
-        if (!hasCap("draft/message-redaction")) return;
-        if (target.length == 0 || msgid.length == 0) return;
-        auto line = "REDACT " ~ target ~ " " ~ msgid;
-        if (reason.length > 0) line ~= " :" ~ reason;
         sendRaw(line);
     }
 
