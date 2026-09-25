@@ -421,11 +421,6 @@ private void handleNetworkCommand(ref EngineContext ctx, string networkId, IRCCo
                 ctx.connManager.sendMessage(nid, cmd.target, cmd.text, cmd.tags);
             }
             break;
-        case "editmsg":
-            if (cmd.label.length > 0) {
-                ctx.connManager.sendEditMessage(nid, cmd.target, cmd.label, cmd.text);
-            }
-            break;
         case "join":
             ctx.connManager.joinChannel(nid, cmd.target.length ? cmd.target : cmd.channel);
             break;

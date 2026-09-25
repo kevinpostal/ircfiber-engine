@@ -378,13 +378,6 @@ final class ConnectionManager {
         }
     }
 
-    /// Sends an edit message using the draft/edit-message IRCv3 cap.
-    void sendEditMessage(UUID networkId, string target, string originalLabel, string newBody) {
-        if (auto client = getClient(networkId)) {
-            client.sendEditMessage(target, originalLabel, newBody);
-        }
-    }
-
     /// Joins a channel on a network.
     void joinChannel(UUID networkId, string channel) {
         if (auto client = getClient(networkId)) {

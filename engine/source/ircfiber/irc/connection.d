@@ -6967,18 +6967,15 @@ private void processEvents() {
             || event.command == "TAGMSG" || event.command == "FAIL"
             || event.command == "WARN" || event.command == "NOTE") {
             auto msgLabel = event.getTag("label");
-            if (msgLabel.length > 0 && clearPendingLabel(msgLabel)) {
+            if (msgLabel.length > 0 && clearPendingLabel(msgLabel))
                 event.addTag("labeled_echo", "true");
-            } else if (msgLabel.length > 0 && event.nick.length > 0
-                && !sameNick(event.nick, sessionNick)
-                && (event.command == "PRIVMSG" || event.command == "NOTICE")) {
-                // Remote edit (draft/edit-message from another client):
-                // the label names the original message but we never sent
-                // it, so it is not in pendingLabels. Tag it so the
-                // frontend can replace the original in place instead of
-                // appending a duplicate.
-                event.addTag("edit_of", msgLabel);
-            }
+            // draft/edit-message: a PRIVMSG tagged `+draft/edit=<msgid>`
+            // replaces that message. Applies to remote edits and to the
+            // echo of our own (both carry the tag); the frontend folds it
+            // onto the row with that msgid instead of appending a row.
+            auto editTag = event.getTag("+draft/edit");
+            if (editTag.length > 0 && (event.command == "PRIVMSG" || event.command == "NOTICE"))
+                event.addTag("edit_of", editTag);
             // IRCv3 account-tag: track the author's account name for
             // identity display without a WHOIS round trip.
             auto acctTag = event.getTag("account");
@@ -8359,35 +8356,6 @@ private void processEvents() {
     void sendSetName(string realname) {
         if (realname.length == 0) return;
         sendRaw("SETNAME :" ~ realname);
-    }
-
-    /// Sends an edited PRIVMSG using the draft/edit-message IRCv3 cap.
-    /// Re-uses the original message's label so the echo replaces the
-    /// existing message in-place on the frontend.
-    void sendEditMessage(string target, string originalLabel, string newBody) {
-        if (!hasCap("draft/edit-message")) return; // silent no-op
-        // An edit replaces one existing row, so the label must stay on the
-        // first line regardless of labeled-response — but the body still
-        // needs the same sanitising, byte-splitting and pacing as any other
-        // user message.
-        const budget = linePayloadBudget(target, "PRIVMSG");
-        bool[] concat;
-        auto lines = splitMessage(newBody, budget, concat);
-        if (lines.length == 0 || (lines.length == 1 && lines[0].length == 0)) return;
-        pendingLabels[originalLabel] = Clock.currTime.toUnixTime!long * 1000;
-        foreach (i, line; lines) {
-            if (line.length == 0) continue;
-            enqueuePaced(i == 0
-                ? "@label=" ~ originalLabel ~ " PRIVMSG " ~ target ~ " :" ~ line
-                : "PRIVMSG " ~ target ~ " :" ~ line);
-        }
-        if (!hasCap("echo-message")) {
-            foreach (i, line; lines) {
-                if (line.length == 0) continue;
-                emitSyntheticSelfMessage(target, line, "PRIVMSG",
-                                         i == 0 ? originalLabel : "");
-            }
-        }
     }
 
     /// Sends a labeled NOTICE when labeled-response cap is active.

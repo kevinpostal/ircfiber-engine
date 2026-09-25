@@ -537,6 +537,12 @@ final class BufferManager {
         // the prefix would vanish on reload.
         auto fromMode = event.getTag("from_mode");
         if (fromMode.length) msg["fm"] = Json(sanitizeUtf8(fromMode));
+        // draft/edit-message: the msgid this PRIVMSG replaces (engine
+        // `edit_of` tag, compact `eo`). Same reason as `fm` — hand-built
+        // row, so the key must be repeated or reloads render every edit
+        // as its own row instead of folding it onto the original.
+        auto editOf = event.getTag("edit_of");
+        if (editOf.length) msg["eo"] = Json(sanitizeUtf8(editOf));
 
         // eid is set by the processor before the event reaches the buffer;
         // it's required for scrollback ordering and stream resume.
