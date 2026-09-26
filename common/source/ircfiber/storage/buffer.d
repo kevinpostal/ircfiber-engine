@@ -543,6 +543,11 @@ final class BufferManager {
         // as its own row instead of folding it onto the original.
         auto editOf = event.getTag("edit_of");
         if (editOf.length) msg["eo"] = Json(sanitizeUtf8(editOf));
+        // IRCv3 account-tag (compact `a`). Same reason as `fm` — hand-built
+        // row, so the key must be repeated or reloads render history rows
+        // without the services badge.
+        auto acct = event.getTag("account");
+        if (acct.length && acct != "*") msg["a"] = Json(sanitizeUtf8(acct));
 
         // eid is set by the processor before the event reaches the buffer;
         // it's required for scrollback ordering and stream resume.

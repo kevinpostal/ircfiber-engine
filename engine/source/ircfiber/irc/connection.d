@@ -5878,6 +5878,7 @@ private void processEvents() {
                         }
                     }
                 }
+                accounts.remove(event.nick);
                 // Skip logging our own QUITs when we're about to reconnect
                 // (it just adds noise during reconnect storms).
                 if (event.nick != sessionNick) {
@@ -5988,6 +5989,13 @@ private void processEvents() {
                                 // Don't break — keep mutating duplicates.
                             }
                         }
+                    }
+                    // Keep the nick-keyed services-account cache in step with
+                    // the roster rename, else the sync snapshot reports the
+                    // account under the old nick and the badge drops off.
+                    if (auto p = event.nick in accounts) {
+                        accounts[newNick] = *p;
+                        accounts.remove(event.nick);
                     }
                     // Two paths for detecting this is OUR nick change:
                     // 1. Server-initiated — event.nick (old nick) matches

@@ -193,6 +193,10 @@ void startEventProcessor(ref EngineContext ctx) {
                     || event.command == "JOIN"
                     || event.command == "PART" || event.command == "KICK"
                     || event.command == "366"
+                    // account-notify: a login/logout must republish the
+                    // `accounts` map so member-list badges don't wait for
+                    // the next JOIN/heartbeat.
+                    || event.command == "ACCOUNT"
                     // W1-T01: CONNECTION_RETRY_STATUS + CONNECTION_FAIL
                     // are the synthetic events that carry structured
                     // retry/fail payloads to the frontend. Writing a
