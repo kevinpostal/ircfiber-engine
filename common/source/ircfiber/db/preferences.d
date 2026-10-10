@@ -458,8 +458,8 @@ final class PreferencesRepository {
 
     /// Lua script for atomic increment-and-set. Reads the existing JSON
     /// at KEYS[1], computes `newPrefVersion = (existing + 1) or 1`, and
-    /// writes the supplied JSON (ARGV[1]) with `prefVersion` overwritten
-    /// to that atomic value. Returns the value it wrote.
+    /// writes ARGV[1] with its leading `"prefVersion":0` replaced by that
+    /// value. Returns the value it wrote.
     ///
     /// Why Lua and not MULTI/EXEC? Vibe-d's RedisDatabase doesn't expose
     /// a typed MULTI/EXEC builder (see the `TODO: Transactions` comment
@@ -468,10 +468,17 @@ final class PreferencesRepository {
     /// the single-threaded server, so the GET+SET pair is observably
     /// atomic from every other client's perspective.
     ///
+    /// The payload is spliced as a string, never decoded and re-encoded:
+    /// Redis's bundled cjson has no `empty_array`, so a cjson round trip
+    /// turns every `[]` into `{}`. That made each save corrupt the empty
+    /// array fields, each load "repair" them, and the repair save corrupt
+    /// them again — an endless loop bumping prefVersion on every load.
+    ///
     /// KEYS[1] = prefs:<userId>
-    /// ARGV[1] = JSON to write (prefVersion in it is ignored; the Lua
-    ///           overwrites it with the freshly-computed value)
+    /// ARGV[1] = JSON to write; must start with `PAYLOAD_PREFIX`
+    ///           (see `versionedPayload`)
     /// Returns the new prefVersion.
+    private enum PAYLOAD_PREFIX = `{"prefVersion":0,`;
     private enum INCR_AND_SET_LUA = `local current = redis.call('GET', KEYS[1])
 local newPrefVersion = 1
 if current then
@@ -480,41 +487,22 @@ if current then
         newPrefVersion = tonumber(parsed.prefVersion) + 1
     end
 end
-local ok2, newDoc = pcall(cjson.decode, ARGV[1])
-if not ok2 or type(newDoc) ~= 'table' then
-    return redis.error_reply('preferences.d: invalid JSON in ARGV[1]')
+local prefix = '` ~ PAYLOAD_PREFIX ~ `'
+local doc = ARGV[1]
+if string.sub(doc, 1, #prefix) ~= prefix or not pcall(cjson.decode, doc) then
+    return redis.error_reply('preferences.d: ARGV[1] must be JSON starting with ' .. prefix)
 end
-newDoc.prefVersion = newPrefVersion
--- Fix: cjson encodes an empty Lua table as {} (object). Our payload has
--- three array fields that must be [] when empty, not {}. After decode,
--- an empty JSON array becomes an empty Lua table (next() == nil). Mark
--- those tables as cjson.empty_array so encode produces [].
--- Without this, every save of an empty pinnedChannels wrote {} to Redis,
--- and the next load saw object != array, logged prefs_field_invalid,
--- and triggered an infinite repair loop (seen as repeated warnings every
--- 30s for the same user).
-if type(newDoc.pinnedChannels) == 'table' and next(newDoc.pinnedChannels) == nil then
-    newDoc.pinnedChannels = cjson.empty_array
-elseif newDoc.pinnedChannels == nil or newDoc.pinnedChannels == cjson.null then
-    newDoc.pinnedChannels = cjson.empty_array
-end
-if type(newDoc.archivedChannels) == 'table' and next(newDoc.archivedChannels) == nil then
-    newDoc.archivedChannels = cjson.empty_array
-elseif newDoc.archivedChannels == nil or newDoc.archivedChannels == cjson.null then
-    newDoc.archivedChannels = cjson.empty_array
-end
-if type(newDoc.networkOrder) == 'table' and next(newDoc.networkOrder) == nil then
-    newDoc.networkOrder = cjson.empty_array
-elseif newDoc.networkOrder == nil or newDoc.networkOrder == cjson.null then
-    newDoc.networkOrder = cjson.empty_array
-end
-if type(newDoc.ignores) == 'table' and next(newDoc.ignores) == nil then
-    newDoc.ignores = cjson.empty_array
-elseif newDoc.ignores == nil or newDoc.ignores == cjson.null then
-    newDoc.ignores = cjson.empty_array
-end
-redis.call('SET', KEYS[1], cjson.encode(newDoc))
+redis.call('SET', KEYS[1], '{"prefVersion":' .. string.format('%d', newPrefVersion) .. ',' .. string.sub(doc, #prefix + 1))
 return newPrefVersion`;
+
+    /// `prefs` as JSON with `"prefVersion":0` first, the shape
+    /// `INCR_AND_SET_LUA` splices the real version into.
+    private static string versionedPayload(const ref UserPreferences prefs) {
+        auto j = prefs.toJson();
+        j.remove("prefVersion");
+        const rest = j.toString();   // "{...}", never empty: toJson always emits every field
+        return PAYLOAD_PREFIX ~ rest[1 .. $];
+    }
 
     /// Creates a new preferences repository, optionally using a shared
     /// LRU cache. When `cache` is null (the common case), the process-wide
@@ -672,13 +660,10 @@ return newPrefVersion`;
         // NOTE: see load() — don't gate Redis prefs on the Mongo breaker.
 
         auto key = KEY_PREFIX ~ userId.toString();
-        // Zero out prefVersion before sending — the Lua is authoritative
-        // for the increment, so any caller-supplied value would be
-        // discarded anyway. Sending a known-zero avoids polluting Redis
-        // storage with stale caller-side numbers during a concurrent
-        // collision.
+        // The Lua is authoritative for prefVersion; zero it so the cached
+        // copy below never carries a stale caller-side number.
         prefs.prefVersion = 0;
-        auto payload = prefs.toJson().toString();
+        const payload = versionedPayload(prefs);
 
         long newVersion = 0;
         try {
@@ -1040,4 +1025,40 @@ unittest {
     assert(!redis.exists(key),
         "load() must delete the corrupt key as a self-heal so the next " ~
         "load does not re-trigger the warning");
+}
+
+@("prefsRepo.save keeps every empty array field an array in Redis (no repair loop)")
+unittest {
+    // Requires local Redis (same gate as the atomicity test above).
+    RedisStorage redis;
+    try {
+        redis = new RedisStorage();
+        redis.connect();
+    } catch (Exception e) {
+        logWarn("Skipping prefsRepo empty-array test: Redis unavailable (%s)", e.msg);
+        return;
+    }
+
+    auto userId = randomUUID();
+    string key = "prefs:" ~ userId.toString();
+    void cleanup() {
+        try redis.getDb().del(key);
+        catch (Exception) {}
+    }
+    cleanup();
+    scope (exit) cleanup();
+
+    // The save Lua re-encodes with cjson, which turns an empty array into {}
+    // unless the field is re-marked. Every array field of toJson must come
+    // back as an array, or the next load repairs and re-saves forever.
+    auto repo = new PreferencesRepository(redis, new PrefsCache());
+    repo.save(userId, UserPreferences.init);
+    const stored = parseJsonString(redis.getDb().get(key));
+    foreach (string field, v; UserPreferences.init.toJson()) {
+        if (v.type != Json.Type.array) continue;
+        assert(stored[field].type == Json.Type.array,
+            "empty " ~ field ~ " must stay [] after save");
+    }
+    assert(!UserPreferences.fromJson(stored).needsRepair,
+        "a freshly saved default record must not need repair");
 }
