@@ -105,6 +105,13 @@ struct RedisKeys {
     /// Per-user bouncer event trail (LPUSH, capped 50, 90-day TTL).
     static string bncAudit(string userId) { return "irc:bnc:audit:" ~ userId; }
 
+    /// Per-user, per-network set of bouncer devices already announced in the
+    /// network's server log (`id:<clientid>`, or `ip:<addr>` for clients
+    /// without one). 90-day TTL refreshed on every attach.
+    static string bncKnownDevices(string userId, string networkId) {
+        return "irc:bnc:known:" ~ userId ~ ":" ~ networkId;
+    }
+
     /// Routing config key (per-host max connections, etc.)
     static string routingConfig() { return "irc:routing:config"; }
 
