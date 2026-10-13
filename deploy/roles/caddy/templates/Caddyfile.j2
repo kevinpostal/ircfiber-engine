@@ -21,6 +21,24 @@
 #     otherwise.
 {%- set serve_hosts = ([ircfiber_domain] + (caddy_extra_serve_hosts | default([]))) | unique %}
 {%- set use_internal_ca = not (ircfiber_use_lets_encrypt | default(true) | bool) %}
+{%- set gw_host = gateway_backend_host | default('ircfiber-gateway') %}
+{%- set gw_port = (gateway_backend_port | default(gateway_http_port)) | string %}
+{%- if gateway_bluegreen_enabled | default(false) | bool %}
+{%- set gw_upstreams = gw_host ~ ':' ~ gw_port ~ ' ' ~ gw_host ~ '-green:' ~ gw_port %}
+{%- elif (gateway_replica_count | default(1) | int) == 1 %}
+{%- set gw_upstreams = gw_host ~ ':' ~ gw_port %}
+{%- else %}
+{%- set gw_upstreams = range(gateway_replica_count | int) | map('string') | map('regex_replace', '^(.*)$', gw_host ~ '-\\1:' ~ gw_port) | join(' ') %}
+{%- endif %}
+
+# Admin gate for routes that inject the SigNoz API key: the gateway answers
+# /api/admin/me with 200 only for an admin session (the browser's cookie is
+# forwarded), so the key never serves an anonymous internet request.
+(signoz_admin_gate) {
+    forward_auth {{ gw_upstreams }} {
+        uri /api/admin/me
+    }
+}
 
 # Snippet containing the shared per-site config (proxy + headers + log).
 # Imported into every site block below so we don't duplicate 60 lines
@@ -74,6 +92,7 @@
     # from the proxy setup. Dedicated block to avoid affecting the document/
     # asset paths proxied by /signoz/* below.
     handle_path /signoz/ws/logs/* {
+        import signoz_admin_gate
         reverse_proxy signoz:8080 {
             header_up SIGNOZ-API-KEY "{$SIGNOZ_API_KEY}"
             header_down -X-Frame-Options
@@ -89,6 +108,7 @@
         }
     }
     handle_path /signoz {
+        import signoz_admin_gate
         reverse_proxy signoz:8080 {
             header_up SIGNOZ-API-KEY "{$SIGNOZ_API_KEY}"
             header_down -X-Frame-Options
@@ -99,6 +119,7 @@
         }
     }
     handle_path /signoz/* {
+        import signoz_admin_gate
         reverse_proxy signoz:8080 {
             header_up SIGNOZ-API-KEY "{$SIGNOZ_API_KEY}"
             header_down -X-Frame-Options
@@ -109,6 +130,7 @@
         }
     }
     handle @signoz_api {
+        import signoz_admin_gate
         reverse_proxy signoz:8080 {
             header_up SIGNOZ-API-KEY "{$SIGNOZ_API_KEY}"
             transport http {
