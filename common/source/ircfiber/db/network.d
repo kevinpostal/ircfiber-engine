@@ -53,6 +53,12 @@ final class NetworkRepository {
         NetworkConfig config;
         /// Owning user ID.
         UUID userId;
+
+        /// True when the network exists and belongs to `user`. A document
+        /// without a `userId` belongs to nobody — never to whoever asks.
+        bool isOwnedBy(UUID user) const @safe pure nothrow @nogc {
+            return config.id != UUID.init && userId != UUID.init && userId == user;
+        }
     }
 
     /// Finds all networks for a user, using Redis cache when available.
@@ -308,4 +314,22 @@ final class NetworkRepository {
         try { cfg.operPassword = doc["operPassword"].get!string; } catch (Exception) {}
         return cfg;
     }
+}
+
+@("NetworkWithUser.isOwnedBy fails closed")
+unittest {
+    const owner = parseUUID("11111111-1111-1111-1111-111111111111");
+    const other = parseUUID("22222222-2222-2222-2222-222222222222");
+    NetworkRepository.NetworkWithUser owned;
+    owned.config.id = parseUUID("33333333-3333-3333-3333-333333333333");
+    owned.userId = owner;
+    assert(owned.isOwnedBy(owner));
+    assert(!owned.isOwnedBy(other));
+    auto ownerless = owned;
+    ownerless.userId = UUID.init;
+    assert(!ownerless.isOwnedBy(other));
+    assert(!ownerless.isOwnedBy(UUID.init));
+    NetworkRepository.NetworkWithUser missing;
+    assert(!missing.isOwnedBy(owner));
+    assert(!missing.isOwnedBy(UUID.init));
 }
