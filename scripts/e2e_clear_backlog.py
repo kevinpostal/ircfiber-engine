@@ -12,8 +12,10 @@ PASS = "testpass123"
 
 GW = os.path.join(os.path.dirname(__file__), "..", "irc-fiber")
 ENV = os.environ.copy()
+# IRCFIBER_MONGO_URL carries the Mongo password: export it, never commit it.
+if not ENV.get("IRCFIBER_MONGO_URL"):
+    sys.exit("export IRCFIBER_MONGO_URL=mongodb://ircfiber:<password>@<tailnet-ip>:27017/ircfiber")
 ENV.update({
-    "IRCFIBER_MONGO_URL": "mongodb://ircfiber:jqgwEv3GJwwizulaj3Fnbd8imqcMH4Gh@100.126.197.92:27017/ircfiber",
     "IRCFIBER_REDIS_URL": "redis://100.126.197.92:6379/0",
     "IRCFIBER_SERVER_ID": "localdebug",
     "IRCFIBER_BIND_ADDRESS": "127.0.0.1",

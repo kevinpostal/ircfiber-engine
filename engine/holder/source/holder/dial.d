@@ -28,6 +28,8 @@ import vibe.core.task : Task;
 import vibe.stream.tls : TLSContext, TLSContextKind, TLSPeerValidationMode, TLSStream,
     createTLSContext, createTLSStream;
 import ircfiber.async : safeFiberRun;
+import ircfiber.netaddr : dialableAddresses, isInternalOnlyName, isIpLiteral,
+    isPrivateAllowedHost, isPublicUnicast;
 import ircfiber.redis.protocol : TlsInfo;
 import holder.protocol : DialRequest, EventLine, TlsInfoJson, ircVerb;
 
@@ -76,6 +78,56 @@ struct DialOutcome {
 long unixMsNow() @safe {
     import std.datetime.systime : unixTimeToStdTime;
     return (Clock.currStdTime - unixTimeToStdTime(0)) / 10_000;
+}
+
+// ── Destination policy ──────────────────────────────────────────────────────
+// The host and port of every dial come from a user's network settings. The
+// holder runs next to Redis, Mongo, the ircd's WEBIRC listener and the
+// tailnet (host network mode on prod), none of which authenticate a peer
+// that is already inside, and the engine relays raw lines the user types
+// (`/raw`) straight onto the socket. So a user-chosen destination must be
+// public: only the hosted ircd may resolve to an internal address.
+
+/// Names allowed to resolve to an internal address: the hosted ircd
+/// (`DEFAULT_FIBER_HOST`, a Docker alias on prod) plus the comma-separated
+/// `IRCFIBER_DIAL_PRIVATE_HOSTS` (dev ircds).
+string[] privateAllowHosts() {
+    import std.process : environment;
+    import ircfiber.default_network : DEFAULT_FIBER_HOST;
+    string[] hosts = [DEFAULT_FIBER_HOST];
+    foreach (h; environment.get("IRCFIBER_DIAL_PRIVATE_HOSTS", "").split(","))
+        if (h.strip.length) hosts ~= h.strip;
+    return hosts;
+}
+
+/// Why a SOCKS5 dial to `target` must be refused, "" when it may proceed.
+/// The exit resolves names, so this checks what can be known locally: an
+/// IP literal must be public, an internal-only name (single label,
+/// `*.ts.net`, `*.local`, …) is refused, and a name that resolves here to
+/// any non-public address is refused (the sidecar's tailnet routes those
+/// to our own peers instead of the exit). `resolved` is the local answer,
+/// empty when the name does not resolve here.
+string proxiedDialBlockReason(string target, const string[] resolved, const string[] allow) @safe {
+    if (isPrivateAllowedHost(target, allow)) return "";
+    if (isIpLiteral(target))
+        return isPublicUnicast(target) ? "" : target ~ " is not a public address";
+    if (isInternalOnlyName(target)) return target ~ " is an internal name";
+    foreach (ip; resolved)
+        if (!isPublicUnicast(ip)) return target ~ " resolves to a private address";
+    return "";
+}
+
+@("proxiedDialBlockReason refuses internal targets, allows public ones")
+unittest {
+    const allow = ["irc.ircfiber.com"];
+    assert(proxiedDialBlockReason("irc.libera.chat", ["203.0.113.4"], allow) == "");
+    assert(proxiedDialBlockReason("irc.libera.chat", [], allow) == "");
+    assert(proxiedDialBlockReason("irc.ircfiber.com", ["172.30.0.7"], allow) == "");
+    assert(proxiedDialBlockReason("100.94.72.103", [], allow).length);
+    assert(proxiedDialBlockReason("127.0.0.1", [], allow).length);
+    assert(proxiedDialBlockReason("redis", [], allow).length);
+    assert(proxiedDialBlockReason("ircfiber-prod-1.tail1.ts.net", [], allow).length);
+    assert(proxiedDialBlockReason("rebind.example", ["203.0.113.4", "100.94.72.103"], allow).length);
 }
 
 // ── Host normalisation ──────────────────────────────────────────────────────
@@ -319,6 +371,28 @@ private TCPConnection happyEyeballsDirect(string host, ushort port, string ipv6B
     if (addrs.length == 0) {
         report(emit, "attempt_fail", "DNS lookup for " ~ host ~ " returned no addresses.");
         throw new DialFailed("dns", "DNS resolution failed for " ~ host);
+    }
+    if (!isPrivateAllowedHost(stripHostBrackets(host), privateAllowHosts())) {
+        // Connect only to addresses resolved and vetted here: a name that
+        // did not resolve comes back as itself, and connectTCP would then
+        // resolve it again, unchecked.
+        string[] ips;
+        foreach (a; addrs) {
+            if (!isIpLiteral(a.ip)) {
+                report(emit, "attempt_fail", "DNS lookup for " ~ host ~ " failed.");
+                throw new DialFailed("dns", "DNS resolution failed for " ~ host);
+            }
+            ips ~= a.ip;
+        }
+        const allowed = dialableAddresses(stripHostBrackets(host), ips, privateAllowHosts());
+        if (allowed.length == 0) {
+            report(emit, "attempt_fail", host ~ " resolves only to private or internal addresses"
+                ~ " — refusing to connect.");
+            throw new DialFailed("blocked", "blocked: " ~ host ~ " is not a public address");
+        }
+        ResolvedAddr[] kept;
+        foreach (a; addrs) if (allowed.canFind(a.ip)) kept ~= a;
+        addrs = kept;
     }
 
     auto interleaved = interleaveAddressFamilies(addrs);
@@ -697,6 +771,14 @@ DialOutcome dialUpstream(ref DialRequest req, EventSink emit) {
         // One CONNECT with the hostname: the exit resolves it (see
         // socks5ConnectViaProxy). The engine already emitted the `attempt`
         // line for proxied dials; on failure it composes `attempt_fail`.
+        {
+            string[] resolved;
+            if (!isIpLiteral(target) && !isPrivateAllowedHost(target, privateAllowHosts()))
+                foreach (a; resolveAllAddresses(target, req.port))
+                    if (isIpLiteral(a.ip)) resolved ~= a.ip;
+            const why = proxiedDialBlockReason(target, resolved, privateAllowHosts());
+            if (why.length) throw new DialFailed("blocked", "blocked: " ~ why);
+        }
         try {
             o.conn = socks5ConnectViaProxy(req.proxy.host, req.proxy.port, target, req.port, connectTimeout);
         } catch (Exception e) {

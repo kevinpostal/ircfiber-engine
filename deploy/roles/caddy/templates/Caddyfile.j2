@@ -28,6 +28,15 @@
 (common_site_config) {
     encode zstd gzip
 
+    # Client-IP headers are trusted only from cloudflared, which reaches
+    # Caddy over the Docker network. A client connecting straight to the
+    # origin (80/443 are open, bnc.<domain> is unproxied) could otherwise
+    # choose the IP the gateway logs, rate-limits and hands the ircd via
+    # WEBIRC. Caddy itself replaces X-Forwarded-For for untrusted peers.
+    @untrusted_client_ip not remote_ip private_ranges
+    request_header @untrusted_client_ip -CF-Connecting-IP
+    request_header @untrusted_client_ip -X-Real-IP
+
     # Health endpoints — serve directly with 200, never go to the upstream.
     @health path /health /api/health
     handle @health {
@@ -123,6 +132,8 @@
     # Strips the /grafana prefix before forwarding to the Grafana container.
     handle_path /grafana/* {
         reverse_proxy ircfiber-grafana:3000 {
+            # Never let a client assert a Grafana identity (auth proxy).
+            header_up -X-WebAuth-User
             transport http {
                 dial_timeout 10s
             }

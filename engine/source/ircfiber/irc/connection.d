@@ -215,55 +215,12 @@ private bool webircSwapSuppressed(string hostLower, string ip) {
     return false;
 }
 
-/// True when `ip` parses and is a public unicast address: not loopback,
-/// RFC 1918, link-local, CGNAT, 0.0.0.0/8, IPv6 loopback/ULA/link-local or
-/// v4-mapped. Load-bearing, not hygiene: the gateway's client-IP resolver
-/// trusts CF-Connecting-IP / X-Forwarded-For / X-Real-IP from any peer, and
-/// the address forwarded via WEBIRC is what the ircd classifies on — a
-/// forged 172.30.0.9 would land in the engine's own connect class,
-/// 127.0.0.1 in `localhost`. A private address is never a legitimate
-/// browser origin here, so the session keeps the engine's IP instead.
-package bool isPublicUnicast(string ip) {
-    import core.sys.posix.arpa.inet : inet_pton;
-    import core.sys.posix.sys.socket : AF_INET, AF_INET6;
-    import std.string : strip, toStringz;
-
-    ip = ip.strip;
-    if (ip.length == 0 || ip.length > 45) return false;
-    ubyte[16] b;
-    if (inet_pton(AF_INET, ip.toStringz, b.ptr) == 1) {
-        const o1 = b[0], o2 = b[1];
-        if (o1 == 0 || o1 == 10 || o1 == 127) return false;        // 0/8, 10/8, loopback
-        if (o1 == 100 && o2 >= 64 && o2 <= 127) return false;       // CGNAT 100.64/10
-        if (o1 == 169 && o2 == 254) return false;                   // link-local
-        if (o1 == 172 && o2 >= 16 && o2 <= 31) return false;        // 172.16/12
-        if (o1 == 192 && o2 == 168) return false;                   // 192.168/16
-        if (o1 >= 224) return false;                                // multicast / reserved
-        return true;
-    }
-    if (inet_pton(AF_INET6, ip.toStringz, b.ptr) == 1) {
-        bool allZero = true;
-        foreach (i; 0 .. 15) if (b[i] != 0) { allZero = false; break; }
-        if (allZero && b[15] <= 1) return false;                    // :: and ::1
-        if ((b[0] & 0xFE) == 0xFC) return false;                    // ULA fc00::/7
-        if (b[0] == 0xFE && (b[1] & 0xC0) == 0x80) return false;    // link-local fe80::/10
-        if (b[0] == 0xFF) return false;                             // multicast
-        bool mapped = true;                                         // ::ffff:a.b.c.d
-        foreach (i; 0 .. 10) if (b[i] != 0) { mapped = false; break; }
-        if (mapped && b[10] == 0xFF && b[11] == 0xFF) return false;
-        return true;
-    }
-    return false;
-}
-
-unittest {
-    assert(isPublicUnicast("203.0.113.7"));
-    assert(isPublicUnicast("2001:db8::1"));
-    foreach (bad; ["", "nope", "127.0.0.1", "10.1.2.3", "172.30.0.9", "192.168.1.1",
-                   "100.64.0.1", "169.254.1.1", "0.0.0.0", "224.0.0.1",
-                   "::1", "::", "fd00:f1b3:1::e", "fe80::1", "::ffff:203.0.113.7", "ff02::1"])
-        assert(!isPublicUnicast(bad), bad);
-}
+/// `isPublicUnicast` (shared with the holder's dial guard): load-bearing,
+/// not hygiene. The address forwarded via WEBIRC is what the ircd
+/// classifies on — a forged 172.30.0.9 would land in the engine's own
+/// connect class, 127.0.0.1 in `localhost`. A private address is never a
+/// legitimate browser origin here, so the session keeps the engine's IP.
+import ircfiber.netaddr : isPublicUnicast;
 
 // ── Per-host circuit breaker ─────────────────────────────────────────────────
 // Prevents hammering unresponsive servers with rapid reconnect attempts.

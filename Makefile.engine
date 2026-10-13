@@ -183,8 +183,10 @@ AR := →
 # TAILNET OVERRIDES
 #   make debug-live IRCFIBER_SERVER_ID=mybox   (set a unique engine id)
 # ──────────────────────────────────────────────────────────────────────────
-# Tailnet connection settings (used by debug-live)
-TAILNET_MONGO_URL ?= mongodb://ircfiber:jqgwEv3GJwwizulaj3Fnbd8imqcMH4Gh@198.51.100.1:27017/ircfiber
+# Tailnet connection settings (used by debug-live). TAILNET_MONGO_URL
+# carries the Mongo password: export it (vault_mongo_app_password), never
+# default it here.
+TAILNET_MONGO_URL ?=
 TAILNET_REDIS_URL ?= redis://198.51.100.1:6379/0
 
 # Local docker connection settings (used by debug)
@@ -447,7 +449,8 @@ debug-host: ensure-colima build-gateway build-engine ## Component > Full stack H
 # banner above still prints to this terminal.
 debug-live: ensure-colima frontend-build ## Component > Gateway + engine in Docker against TAILNET DBs — ctrl-c to stop
 	@printf '\n\033[46m\033[30m\033[1m  Gateway + engine (docker) → tailnet DBs  \033[0m\n'
-	@printf '\033[2m  Mongo: %s\033[0m\n' "$(TAILNET_MONGO_URL)"
+	@test -n "$(TAILNET_MONGO_URL)" || { printf '\033[31m✗ export TAILNET_MONGO_URL=mongodb://ircfiber:<password>@<tailnet-ip>:27017/ircfiber\033[0m\n'; exit 1; }
+	@printf '\033[2m  Mongo: %s\033[0m\n' "$(lastword $(subst @, ,$(TAILNET_MONGO_URL)))"
 	@printf '\033[2m  Redis: %s\033[0m\n' "$(TAILNET_REDIS_URL)"
 	@printf '\033[2m  Gateway: http://127.0.0.1:$(TAILNET_GATEWAY_PORT)  (Vite: make dev-live)\033[0m\n'
 	@printf '\033[2m  Containerfile target: builder (compiles gateway+engine on first run)\033[0m\n'

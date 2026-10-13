@@ -1,6 +1,7 @@
 ---
-# Grafana admin password — required on first boot. Override in host_vars.
-grafana_admin_password: "{{ vault_grafana_admin_password | default('CHANGE_ME_GRAPHANA_PASSWORD') }}"
+# Grafana admin password — required, from vault (no fallback: a default
+# here would be a committed, publicly reachable admin password).
+grafana_admin_password: "{{ vault_grafana_admin_password }}"
 
 # Where Grafana serves. Internal container port is 3000; Caddy proxies
 # /grafana/* to it on the public domain.
@@ -20,10 +21,13 @@ grafana_root_url: "https://{{ ircfiber_domain | default('ircfiber.com') }}{{ gra
 grafana_session_lifetime_days: 7
 # Disable user signup — admin-only access.
 grafana_disable_signup: true
-# Auto-login via Caddy reverse-proxy basic auth header — see caddy
-# templates for the matching header injection. When true, Grafana trusts
-# the X-WEBAUTH-USER header from the reverse proxy.
-grafana_auth_proxy_enabled: true
+# Grafana's auth proxy trusts an X-WebAuth-User header. Caddy forwards
+# /grafana/* from the internet and nothing authenticates the request
+# first, so with this on anyone could send `X-WebAuth-User: admin` and be
+# the Grafana server admin. Off: Grafana's own login (admin password
+# above). Only enable behind a proxy that authenticates and sets the
+# header itself (Caddy also strips any client-supplied copy).
+grafana_auth_proxy_enabled: false
 
 # SigNoz combined image
 signoz_version: "v0.131.1"
@@ -94,8 +98,6 @@ signoz_api_key_file: "/etc/ircfiber/signoz-mcp/.api_key"
 
 # JWT secret used to sign SigNoz session tokens. SigNoz v0.131+ refuses
 # to start serving authenticated queries without this and logs a
-# CRITICAL SECURITY ISSUE warning on every boot. Override in host_vars
-# or vault. The default below is a stable per-deployment fallback so
-# the service stays up across reboots without operator intervention;
-# production deployments should override it.
-signoz_jwt_secret: "{{ vault_signoz_jwt_secret | default('ircfiber-signoz-dev-jwt-secret-change-in-prod-9e3a7f2b') }}"
+# CRITICAL SECURITY ISSUE warning on every boot. Required, from vault: a
+# known value lets anyone mint a SigNoz admin token.
+signoz_jwt_secret: "{{ vault_signoz_jwt_secret }}"

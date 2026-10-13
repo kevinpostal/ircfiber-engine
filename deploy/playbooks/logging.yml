@@ -16,9 +16,9 @@
 #   Retention: 30 days default (configurable in defaults/main.yml).
 #
 # Auth:
-#   Grafana runs with auth_proxy_enabled — trusts the X-WebAuth-User
-#   header set by Caddy. The container is NOT exposed publicly without
-#   Caddy in front. NEVER bind the Grafana port to the host.
+#   Grafana uses its own login (grafana_auth_proxy_enabled: false); Caddy
+#   strips any client-supplied X-WebAuth-User. NEVER bind the Grafana
+#   port to the host.
 
 - name: Deploy IRC Fiber logging stack
   hosts: ircfiber

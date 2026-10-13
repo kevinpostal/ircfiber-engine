@@ -4,10 +4,11 @@ set -euo pipefail
 HOST="${1:-203.0.113.10}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519_ircfiber}"
 SSH="ssh -F /dev/null -o IdentitiesOnly=yes -i $SSH_KEY deploy@$HOST"
+# Carries the Mongo password: export it (vault_mongo_app_password), never commit it.
+MONGO_URL="${IRCFIBER_MONGO_URL:?export IRCFIBER_MONGO_URL=mongodb://ircfiber:<password>@172.30.0.1:27017/ircfiber}"
 
-$SSH bash -s <<'EOSSH'
+$SSH "MONGO_URL=$(printf %q "$MONGO_URL") bash -s" <<'EOSSH'
 set -euo pipefail
-MONGO_URL="mongodb://ircfiber:jqgwEv3GJwwizulaj3Fnbd8imqcMH4Gh@172.30.0.1:27017/ircfiber"
 MONGO_COUNT=$(docker exec ircfiber-mongo mongosh --quiet "$MONGO_URL" --eval 'db.networks.countDocuments({disabled:{$ne:true}})' 2>&1 | grep -E '^[0-9]+$' | tail -1)
 MONGO_TOTAL=$(docker exec ircfiber-mongo mongosh --quiet "$MONGO_URL" --eval 'db.networks.countDocuments()' 2>&1 | grep -E '^[0-9]+$' | tail -1)
 REDIS_HLEN=$(docker exec ircfiber-redis redis-cli HLEN irc:assignments 2>&1)

@@ -6,11 +6,12 @@ set -euo pipefail
 HOST="${1:-203.0.113.10}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519_ircfiber}"
 SSH="ssh -F /dev/null -o IdentitiesOnly=yes -i $SSH_KEY deploy@$HOST"
+# Carries the Mongo password: export it (vault_mongo_app_password), never commit it.
+MONGO_URL="${IRCFIBER_MONGO_URL:?export IRCFIBER_MONGO_URL=mongodb://ircfiber:<password>@172.30.0.1:27017/ircfiber}"
 
 echo "==> Rebuilding irc:assignments on $HOST from MongoDB (skip disabled)..."
-$SSH bash -s <<'EOSSH'
+$SSH "MONGO_URL=$(printf %q "$MONGO_URL") bash -s" <<'EOSSH'
 set -euo pipefail
-MONGO_URL="mongodb://ircfiber:jqgwEv3GJwwizulaj3Fnbd8imqcMH4Gh@172.30.0.1:27017/ircfiber"
 # Get all non-disabled network ids via mongosh
 IDS=$(docker exec ircfiber-mongo mongosh --quiet "$MONGO_URL" --eval 'db.networks.find({disabled:{$ne:true}},{id:1,_id:0}).toArray().forEach(x=>print(x.id))' 2>&1 | grep -E '^[0-9a-f-]{36}$')
 COUNT=$(echo "$IDS" | wc -l | tr -d ' ')
