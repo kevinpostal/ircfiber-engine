@@ -44,6 +44,8 @@ enum STARTTLS_REPLY_TIMEOUT_MS             = 15_000;
 enum DNS_CACHE_TTL_MS                      = 30_000;
 /// Read chunk while waiting for the STARTTLS reply.
 private enum STARTTLS_READ_BUFFER          = 8192;
+/// Most bytes kept while waiting for 670 (partial line + NOTICEs relayed later).
+private enum size_t MAX_PRE_TLS_BYTES      = 64 * 1024;
 
 /// A `DIAL` that did not reach `CONNECTED`. `phase` is the wire `FAILED`
 /// phase; `msg` is the exception text of the moved code verbatim (the
@@ -718,6 +720,12 @@ private void awaitStarttlsGoAhead(ref TCPConnection conn, Duration timeout, ref 
         auto received = conn.read(buf[], IOMode.once);
         if (received == 0) { yield(); continue; }
         partial ~= buf[0 .. received];
+        // A server that streams without line endings (or floods notices
+        // instead of 670) must not grow the holder without bound: it owns
+        // every IRC socket of the engine.
+        if (partial.length + preTlsLines.length > MAX_PRE_TLS_BYTES)
+            throw new DialFailed("starttls", "server sent over "
+                ~ MAX_PRE_TLS_BYTES.to!string ~ " bytes before answering STARTTLS");
         ptrdiff_t idx;
         while ((idx = (cast(string) partial).indexOf("\n")) >= 0) {
             auto line = partial[0 .. idx + 1];

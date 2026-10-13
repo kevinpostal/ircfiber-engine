@@ -114,6 +114,22 @@ unittest {
     assert(ev.getTag("msgid") == "abc");
 }
 
+/// Longest unterminated server line the engine buffers. IRC lines are 512
+/// bytes (8 KiB with tags, the parser's cap); this many bytes with no CRLF
+/// is a broken or hostile server. Buffering it unbounded would grow the
+/// shared engine process until it is OOM-killed with every user's session.
+enum size_t MAX_UNTERMINATED_LINE_BYTES = 64 * 1024;
+
+/// Throws when `partial` — the bytes after the last CRLF of the read
+/// buffer — exceeds `MAX_UNTERMINATED_LINE_BYTES`; the caller's connection
+/// loop treats it as a disconnect.
+void enforceLineBound(const(char)[] partial) @safe pure {
+    import std.conv : to;
+    if (partial.length > MAX_UNTERMINATED_LINE_BYTES)
+        throw new Exception("server sent " ~ partial.length.to!string
+            ~ " bytes without a line ending");
+}
+
 /// Parses a raw IRC line into an `IRCRawEvent`.
 public IRCRawEvent parseIRCLinePublic(string line, NetworkConfig config) {
     import std.algorithm : filter;

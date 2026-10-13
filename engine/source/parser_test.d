@@ -14,7 +14,8 @@ import std.uuid : parseUUID, randomUUID;
 import std.conv : to;
 
 import ircfiber.irc.parser : parseIRCLinePublic, parseIRCLineNamed, parseIsupportPrefix,
-    ChannelListRow, parseChannelListRow, parseBatchOpen, parseBatchClose;
+    ChannelListRow, parseChannelListRow, parseBatchOpen, parseBatchClose,
+    enforceLineBound, MAX_UNTERMINATED_LINE_BYTES;
 import ircfiber.models.network : NetworkConfig;
 import ircfiber.models.irc_event : IRCRawEvent;
 
@@ -447,9 +448,23 @@ void runBatchTests() {
     }
 }
 
+/// A server streaming bytes without CRLF must not grow the engine's read
+/// buffer without bound.
+void runLineBoundTests() {
+    import std.array : replicate;
+    bool threw(const(char)[] partial) {
+        try { enforceLineBound(partial); return false; }
+        catch (Exception) return true;
+    }
+    check!("line bound: normal partial line accepted")(!threw("PRIVMSG #c :hel"));
+    check!("line bound: at cap accepted")(!threw("a".replicate(MAX_UNTERMINATED_LINE_BYTES)));
+    check!("line bound: past cap rejected")(threw("a".replicate(MAX_UNTERMINATED_LINE_BYTES + 1)));
+}
+
 int main() {
     stderr.writeln("ircfiber.irc.parser smoke tests");
     runDefensiveTests();
+    runLineBoundTests();
     runRFC2812Tests();
     runIRCv3Tests();
     runSquashedErrorTests();

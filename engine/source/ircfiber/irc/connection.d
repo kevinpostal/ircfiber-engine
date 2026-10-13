@@ -37,7 +37,7 @@ import ircfiber.observability : recordCounter, recordGauge, recordHistogram;
 import ircfiber.tracing : withSpan, Span;
 import ircfiber.async : safeFiberRun;
 import ircfiber.irc.ipv6 : ipv6ForUser, normalizePrefix;
-import ircfiber.irc.parser : ChannelListRow, parseChannelListRow;
+import ircfiber.irc.parser : ChannelListRow, parseChannelListRow, enforceLineBound;
 import ircfiber.irc.pacer : FakeLagPacer, FloodLimits, ChannelLineLimit, LineRateWindow,
     MultilineLimits, UNKNOWN_USER_LIMITS, KNOWN_USER_LIMITS, parseMultilineCap,
     parseChannelFloodLines, payloadBudget, sanitizeLine, splitMessage,
@@ -4634,6 +4634,7 @@ final class PersistentIRCClient {
                 yield();
             } else {
                 partial ~= sanitizeUtf8(cast(string) buf[0 .. received]);
+                enforceLineBound(partial);
 
                 ptrdiff_t idx;
                 while ((idx = partial.indexOf("\r\n")) >= 0) {
@@ -5330,6 +5331,7 @@ private void processEvents() {
                 lastPongReceivedSecs = now;
                 idleEmitted = false;
                 partial ~= sanitizeUtf8(cast(string) buffer[0 .. received]);
+                enforceLineBound(partial);
 
                 ptrdiff_t idx;
                 while ((idx = partial.indexOf("\r\n")) >= 0) {
