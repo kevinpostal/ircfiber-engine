@@ -107,20 +107,26 @@ final class MessageRepository {
         if (indexesEnsured) return;
         indexesEnsured = true;
         // Key order is the index: equality fields first, the sorted/ranged
-        // field last. Built field by field — a `Bson(["a": …, "b": …])`
-        // literal is an associative array whose iteration order is unspecified,
-        // and prod ended up with `t_-1_networkId_1_channel_1_serverId_1`, which
-        // turns every newest-N read on a busy channel into a 17 s fetch-and-filter
-        // walk over all networks (#superbowl, 2026-10-25).
+        // field last, and only fields every query carries in front. Built
+        // field by field — a `Bson(["a": …, "b": …])` literal is an
+        // associative array whose iteration order is unspecified, and prod
+        // ended up with `t_-1_networkId_1_channel_1_serverId_1`, which turns
+        // every newest-N read on a busy channel into a 17 s fetch-and-filter
+        // walk over all networks (#superbowl, 2026-10-25). `serverId` is no
+        // key at all: reads for a network without an engine assignment (bnc
+        // CHATHISTORY while the engine is down, REST history) omit it, and a
+        // leading `serverId` turns those into full collection scans.
         try {
             // Primary compound index: pagination by timestamp
-            collection.createIndex(indexKeys(["serverId", "networkId", "channel"], "t"));
-            // eid index: fast cursor lookups for eid-based pagination
-            collection.createIndex(indexKeys(["serverId", "networkId", "channel"], "eid"));
+            collection.createIndex(indexKeys(["networkId", "channel"], "t"));
+            // eid index: cursor lookups and eid-based pagination; the
+            // network-wide replay (`getAfterEidForNetwork`) sorts on its keys
+            // across channels and fetches only the rows it returns.
+            collection.createIndex(indexKeys(["networkId", "channel"], "eid"));
         } catch (Exception e) {
             logWarn("Failed to create messages compound index: %s", e.msg);
         }
-        dropScrambledIndexes();
+        dropSupersededIndexes();
 
         const retentionDays = messageRetentionDays();
         try {
@@ -171,25 +177,28 @@ final class MessageRepository {
         return keys;
     }
 
-    /// The same fields in associative-array order, which earlier builds created
-    /// (sorted field first). Superseded by the ordered indexes above; dropped
-    /// once those exist so writes stop maintaining two copies. Best-effort.
-    private void dropScrambledIndexes() @trusted {
-        static immutable string[] legacy = [
+    /// Earlier layouts of the same two indexes: associative-array order
+    /// (sorted field first) from builds before 2026-10-25, then briefly
+    /// `serverId` first. Dropped once the current pair exists so writes stop
+    /// maintaining copies. Best-effort.
+    private void dropSupersededIndexes() @trusted {
+        static immutable string[] superseded = [
             "t_-1_networkId_1_channel_1_serverId_1",
             "networkId_1_eid_-1_channel_1_serverId_1",
+            "serverId_1_networkId_1_channel_1_t_-1",
+            "serverId_1_networkId_1_channel_1_eid_-1",
         ];
         try {
             bool[string] present;
             foreach (idx; collection.listIndexes()) present[idx["name"].get!string] = true;
-            if ("serverId_1_networkId_1_channel_1_t_-1" !in present
-                || "serverId_1_networkId_1_channel_1_eid_-1" !in present) return;
-            foreach (name; legacy)
+            if ("networkId_1_channel_1_t_-1" !in present
+                || "networkId_1_channel_1_eid_-1" !in present) return;
+            foreach (name; superseded)
                 if (name in present) {
                     collection.dropIndex(name);
-                    logInfo("messages: dropped scrambled index %s", name);
+                    logInfo("messages: dropped superseded index %s", name);
                 }
-        } catch (Exception e) logWarn("messages scrambled index drop: %s", e.msg);
+        } catch (Exception e) logWarn("messages superseded index drop: %s", e.msg);
     }
 
     /// Normalize channel name via the canonical helper in
