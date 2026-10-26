@@ -999,6 +999,7 @@ unittest {
     try {
         redis = new RedisStorage();
         redis.connect();
+        redis.ping();
     } catch (Exception e) {
         logWarn("Skipping prefsRepo load-repair test: Redis unavailable (%s)", e.msg);
         return;
@@ -1035,6 +1036,7 @@ unittest {
     try {
         redis = new RedisStorage();
         redis.connect();
+        redis.ping();
     } catch (Exception e) {
         logWarn("Skipping prefsRepo empty-array test: Redis unavailable (%s)", e.msg);
         return;
