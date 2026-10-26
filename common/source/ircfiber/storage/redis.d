@@ -31,6 +31,13 @@ final class RedisStorage {
         logInfo("Connected to Redis at %s:%s", host, port);
     }
 
+    /// One round trip (`PING`). `connect()` is lazy — the socket opens on the
+    /// first command — so this is how a caller learns Redis is really there.
+    /// Throws when it does not answer.
+    void ping() @trusted {
+        client.ping();
+    }
+
     /// Connects to Redis from a URL.
     void connectFromUrl(string url) @trusted {
         if (url.startsWith("redis://")) {

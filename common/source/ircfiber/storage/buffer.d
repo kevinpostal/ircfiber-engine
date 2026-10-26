@@ -934,6 +934,7 @@ unittest {
     try {
         redis = new RedisStorage();
         redis.connect();
+        redis.ping();
     } catch (Exception e) {
         logWarn("Skipping BufferManager.getUnreadTail test: Redis unavailable (%s)", e.msg);
         return;

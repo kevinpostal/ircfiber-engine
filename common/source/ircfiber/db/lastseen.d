@@ -65,6 +65,7 @@ unittest {
     try {
         redis = new RedisStorage();
         redis.connect();
+        redis.ping();
     } catch (Exception e) {
         logWarn("Skipping LastSeenRepository test: Redis unavailable (%s)", e.msg);
         return;
