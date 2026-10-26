@@ -4888,6 +4888,13 @@ final class PersistentIRCClient {
             // server responses (CAP LS, 001) entirely, causing a 40s timeout.
             auto received = readFromStream(buf[], REGISTRATION_READ_TIMEOUT_MS.msecs);
             if (received == 0) {
+                // waitForData returns at once on a closed stream. Without
+                // this check a server that hangs up before replying (a
+                // TLS-only port dialled in plain text, e.g. Libera's 7000)
+                // raced this loop to its end, "timed out" in the same second
+                // and went on to write auto-joins into a dead socket, which
+                // surfaced as "Connection closed while writing data".
+                if (!transportAlive || relayClosed()) throw new Exception(registrationClosedReason());
                 // waitForData already blocked for the full timeout above;
                 // a minimal yield prevents tight-looping the event loop.
                 yield();
@@ -5501,6 +5508,26 @@ final class PersistentIRCClient {
                 sendRaw(trimmed);
             }
         }
+    }
+
+    /// Disconnect reason when the server hangs up during registration
+    /// without an ERROR line. Silence from the first byte on a plain-text
+    /// connection is what a TLS-only port answers, so say so.
+    private string registrationClosedReason() const {
+        if (linesIn > 0) return "Server closed the connection during registration";
+        return "Server closed the connection without replying"
+            ~ (config.tls == TLSMode.disabled
+                ? " — if this port expects TLS (6697 and 7000 usually do), turn TLS on" : "");
+    }
+
+    /// The holder hung up the relay: the IRC server closed its socket.
+    /// `transportAlive` cannot tell — vibe-core counts a half-closed (peer
+    /// EOF) socket as connected. Non-blocking: data still to read is kept in
+    /// the stream's buffer for the next read.
+    private bool relayClosed() {
+        import vibe.core.net : WaitForDataStatus;
+        try return connection.waitForDataEx(0.seconds) == WaitForDataStatus.noMoreData;
+        catch (Exception) return true;
     }
 
     // ── SASL AUTHENTICATE message fragmentation ──────────────────────────────
@@ -8004,6 +8031,11 @@ private void processEvents() {
                         "error":     e.msg,
                         "event":     "transport_write_fail"
                     ]);
+                // A server that hangs up before saying a word (a TLS-only
+                // port dialled in plain text) fails our first registration
+                // writes; name that instead of the socket error.
+                if (state == ConnectionState.connecting && linesIn == 0)
+                    throw new Exception(registrationClosedReason());
                 throw e;
             }
         } else {
