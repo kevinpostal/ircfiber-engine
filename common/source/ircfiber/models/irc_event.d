@@ -158,7 +158,7 @@ struct IRCRawEvent {
         if (editOf.length) j["eo"] = Json(editOf);
         // IRCCloud `from_mode`: the author's channel status prefix at send
         // time, stamped by the engine from its roster. The message carries
-        // it so history keeps `<&sq>` after the author quits or is
+        // it so history keeps `<&oper1>` after the author quits or is
         // de-opped — deriving it from the live roster (the old frontend
         // behaviour) loses the glyph in exactly those cases. Absent when
         // the author held no status, which must read like an empty value.
@@ -519,7 +519,7 @@ unittest {
 @("IRCRawEvent toCompactJson ships from_mode as 'fm'")
 unittest {
     auto event = IRCRawEvent("libera", "PRIVMSG");
-    event.nick = "sq";
+    event.nick = "oper1";
     event.channel = "#ircfiber";
     event.addTag("from_mode", "&");
     auto json = event.toCompactJson();

@@ -205,6 +205,11 @@ struct RedisKeys {
     /// Commands older than 60 s are dropped by the consumer.
     static string supportBotControl() { return "irc:support:bot:control"; }
 
+    /// Reporter follow-ups per user in the current hour: INCR + 1 h EXPIRE,
+    /// checked by POST /api/support/issues/:id/comments (every follow-up
+    /// fans out to #support and staff mail, so it is capped like reports).
+    static string supportCommentRate(string userId) { return "irc:support:ratelimit:comments:" ~ userId; }
+
     /// Run records published by the k3s `ircfiber-redis-backup` CronJob
     /// (LPUSH + LTRIM 0 59). Read by GET /api/admin/backups; the Mongo job
     /// writes its own records to the `backup_runs` collection instead,
