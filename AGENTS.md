@@ -489,13 +489,13 @@ scp irc-fiber deploy@server:/tmp/  # ← do not do this
 
 ## Deploy flow (`make ship` from ircfiber-infra)
 
-Images are built on the builder host (`ubuntu-docker`), pushed to GHCR, and
-pulled by prod **by digest**; the laptop never carries image bytes:
-1. `git push` HEAD → builder (`~/ircfiber-build/site`, ref `ship`); builder checks it out and asserts the SHA.
-2. `docker buildx build --target runtime-gateway --push` → `ghcr.io/kevinpostal/irc-fiber-gateway:sha-<short>`; digest captured from `--metadata-file`.
-3. `playbooks/gateway-deploy.yml -e gateway_image_ref=<repo>@<digest>`: pull, tag `irc-fiber-gateway:deploy`, start green, wait `/health`, swap, assert the running container's image id == requested.
-4. Laptop gates on `GET /api/version .commit == HEAD`, then promotes `:prod` (`imagetools create`, manifest-only).
-`make ship-engine` is the same shape for the engine (hard restart; gate polls `.engines[].gitShort`).
+Images are built **on the prod host** and never leave it: no registry, nothing
+built or stored on GitHub. The laptop moves only git objects:
+1. `git push` HEAD → prod (`~deploy/ircfiber-build/site`, ref `ship`); prod checks it out and asserts the SHA.
+2. `docker buildx build --builder ircfiber --load --target runtime-gateway` → `irc-fiber-gateway:sha-<short>` in prod's docker; the image id is read back with `docker image inspect`. The `ircfiber` builder (docker-container driver) is capped at 5 GB RAM and a low CPU share so a compile yields to the live containers; its BuildKit cache (dub/npm mounts) lives on the prod disk.
+3. `playbooks/gateway-deploy.yml -e gateway_image_ref=sha256:<id>`: tag `irc-fiber-gateway:deploy`, start green, wait `/health`, swap, assert the running container's image id == requested.
+4. Laptop gates on `GET /api/version .commit == HEAD`, then promotes the local tag `irc-fiber-gateway:prod`.
+`make ship-engine` is the same shape for the engine (`~deploy/ircfiber-build/engine`, `ircfiber-engine`; hot swap; gate polls `.engines[].gitShort`).
 `make swap` redeploys `:prod`; `make rollback` swaps to the local `:blue-prev` anchor and does not move `:prod`.
 
 ## Build identity and caching
@@ -510,7 +510,7 @@ are independent stages that BuildKit runs concurrently, and a frontend-only
 change never recompiles D (and vice versa). There is no `CACHE_BUST`, no
 `dub --force`: the build context is a git checkout, so BuildKit's content
 hashing of every `COPY` is the whole invalidation story, and the dub/npm cache
-mounts on the builder make a one-file change an incremental compile.
+mounts in the prod builder make a one-file change an incremental compile.
 
 ## Admin SPA deployment
 
