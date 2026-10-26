@@ -106,23 +106,22 @@ final class MessageRepository {
     private void ensureIndexes() @trusted {
         if (indexesEnsured) return;
         indexesEnsured = true;
-        // Key order is the index: equality fields first, the sorted/ranged
-        // field last, and only fields every query carries in front. Built
-        // field by field — a `Bson(["a": …, "b": …])` literal is an
-        // associative array whose iteration order is unspecified, and prod
-        // ended up with `t_-1_networkId_1_channel_1_serverId_1`, which turns
-        // every newest-N read on a busy channel into a 17 s fetch-and-filter
-        // walk over all networks (#superbowl, 2026-10-25). `serverId` is no
-        // key at all: reads for a network without an engine assignment (bnc
-        // CHATHISTORY while the engine is down, REST history) omit it, and a
-        // leading `serverId` turns those into full collection scans.
+        // Key order is the index: equality fields first, then the sorted or
+        // ranged field, then fields only some reads filter on. Built field by
+        // field — a `Bson(["a": …, "b": …])` literal is an associative array
+        // whose iteration order is unspecified, and prod ended up with
+        // `t_-1_networkId_1_channel_1_serverId_1`, which turns every newest-N
+        // read on a busy channel into a 17 s fetch-and-filter walk over all
+        // networks (#superbowl, 2026-10-25). `serverId` never leads: reads for
+        // a network without an engine assignment (bnc CHATHISTORY while the
+        // engine is down, REST history) omit it. Trailing, it still filters in
+        // the index for the reads that carry it (REST backlog count).
         try {
             // Primary compound index: pagination by timestamp
-            collection.createIndex(indexKeys(["networkId", "channel"], "t"));
-            // eid index: cursor lookups and eid-based pagination; the
-            // network-wide replay (`getAfterEidForNetwork`) sorts on its keys
-            // across channels and fetches only the rows it returns.
-            collection.createIndex(indexKeys(["networkId", "channel"], "eid"));
+            collection.createIndex(indexKeys(["networkId", "channel", "-t", "serverId"]));
+            // eid index: the network-wide replay (`getAfterEidForNetwork`) walks
+            // eid in order and stops at its limit; eid cursor lookups are one key.
+            collection.createIndex(indexKeys(["networkId", "-eid", "channel", "serverId"]));
         } catch (Exception e) {
             logWarn("Failed to create messages compound index: %s", e.msg);
         }
@@ -169,30 +168,34 @@ final class MessageRepository {
         });
     }
 
-    /// `{eq[0]: 1, …, eq[$-1]: 1, sorted: -1}` in exactly that order.
-    private static Bson indexKeys(string[] eq, string sorted) @trusted {
+    /// Index key document with the fields in exactly this order; a leading
+    /// `-` makes the key descending (`["networkId", "-t"]`).
+    private static Bson indexKeys(string[] fields) @trusted {
         auto keys = Bson.emptyObject;
-        foreach (f; eq) keys[f] = Bson(1);
-        keys[sorted] = Bson(-1);
+        foreach (f; fields) {
+            if (f.length > 1 && f[0] == '-') keys[f[1 .. $]] = Bson(-1);
+            else keys[f] = Bson(1);
+        }
         return keys;
     }
 
-    /// Earlier layouts of the same two indexes: associative-array order
-    /// (sorted field first) from builds before 2026-10-25, then briefly
-    /// `serverId` first. Dropped once the current pair exists so writes stop
-    /// maintaining copies. Best-effort.
+    /// Earlier layouts: associative-array order (`t` first) from builds
+    /// before 2026-10-25, and the `serverId`-first and `serverId`-less pairs
+    /// briefly deployed that day. Dropped once the current pair exists so
+    /// writes stop maintaining copies. Best-effort.
     private void dropSupersededIndexes() @trusted {
         static immutable string[] superseded = [
             "t_-1_networkId_1_channel_1_serverId_1",
-            "networkId_1_eid_-1_channel_1_serverId_1",
             "serverId_1_networkId_1_channel_1_t_-1",
             "serverId_1_networkId_1_channel_1_eid_-1",
+            "networkId_1_channel_1_t_-1",
+            "networkId_1_channel_1_eid_-1",
         ];
         try {
             bool[string] present;
             foreach (idx; collection.listIndexes()) present[idx["name"].get!string] = true;
-            if ("networkId_1_channel_1_t_-1" !in present
-                || "networkId_1_channel_1_eid_-1" !in present) return;
+            if ("networkId_1_channel_1_t_-1_serverId_1" !in present
+                || "networkId_1_eid_-1_channel_1_serverId_1" !in present) return;
             foreach (name; superseded)
                 if (name in present) {
                     collection.dropIndex(name);
