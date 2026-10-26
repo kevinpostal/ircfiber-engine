@@ -1,5 +1,8 @@
 module ircfiber.db.preferences;
 
+import std.algorithm.searching : canFind;
+import std.string : strip;
+import std.uni : icmp;
 import std.uuid;
 import vibe.data.json;
 import vibe.core.log;
@@ -93,6 +96,16 @@ string truncateBncAway(string v) @safe pure nothrow {
     return v.length > BNC_AWAY_MAX ? v[0 .. BNC_AWAY_MAX] : v;
 }
 
+/// `modeIndicator` values (web Settings → Messages → Mode indicators, iOS Settings → Display).
+immutable string[] DISPLAY_MODE_INDICATORS = ["dots", "symbols", "hidden"];
+/// `timestampFormat` values; "auto" follows the device/browser locale.
+immutable string[] DISPLAY_TIMESTAMP_FORMATS = ["auto", "12h", "24h"];
+/// The boolean account display prefs, in wire order.
+immutable string[] DISPLAY_BOOL_PREFS = ["showUserIcons", "monospaceFont", "enlargeEmoji", "coloriseMentions", "formatColors"];
+/// Highlight words per account, and the longest word in bytes.
+enum MAX_HIGHLIGHT_WORDS = 100;
+enum MAX_HIGHLIGHT_WORD_BYTES = 64;
+
 /// User preference settings.
 struct UserPreferences {
     /// Pinned channels in "networkId:#channel" format.
@@ -163,6 +176,21 @@ struct UserPreferences {
     bool notificationSound = true;
     bool autoDismissNotifs = true;
     bool muteAll = false;
+    /// Account-wide chat display prefs (web Settings → Interface/Messages, iOS Settings → Display).
+    /// Flat like the notification prefs; fanned out as one `displayPrefs` object
+    /// (`displayPrefsJson`). Defaults equal the web's DEFAULT_PREFS. `displayPrefsSet` stays false
+    /// until the first POST /api/me/display-prefs; the first web client after the upgrade then
+    /// seeds the account from its localStorage values.
+    bool displayPrefsSet = false;
+    bool showUserIcons = true;
+    bool monospaceFont = true;
+    string modeIndicator = "dots";
+    bool enlargeEmoji = true;
+    bool coloriseMentions = true;
+    bool formatColors = true;
+    string timestampFormat = "auto";
+    /// Words highlighted like the own nick (whole word, case-insensitive); web and app share them.
+    string[] highlightWords;
 
     /// Lines per buffer the bouncer replays when a client without
     /// `draft/chathistory` attaches (ZNC "playback buffer"). 0 disables.
@@ -221,6 +249,12 @@ struct UserPreferences {
         j["notificationSound"] = Json(notificationSound);
         j["autoDismissNotifs"] = Json(autoDismissNotifs);
         j["muteAll"] = Json(muteAll);
+        j["displayPrefsSet"] = Json(displayPrefsSet);
+        static foreach (key; DISPLAY_BOOL_PREFS)
+            j[key] = Json(__traits(getMember, this, key));
+        j["modeIndicator"] = Json(modeIndicator);
+        j["timestampFormat"] = Json(timestampFormat);
+        j["highlightWords"] = highlightWords is null ? Json.emptyArray : serializeToJson(highlightWords);
         j["bncPlaybackLines"] = Json(bncPlaybackLines);
         j["bncRequireTls"] = Json(bncRequireTls);
         j["bncAllowedCidrs"] = bncAllowedCidrs is null ? Json.emptyArray : serializeToJson(bncAllowedCidrs);
@@ -375,6 +409,49 @@ struct UserPreferences {
                 needsRepair = true;
             }
         }
+        if (auto v = "displayPrefsSet" in json) {
+            if (v.type == Json.Type.bool_)
+                p.displayPrefsSet = v.get!bool;
+            else {
+                logFieldInvalid(userId, "displayPrefsSet", v.type, "bool");
+                needsRepair = true;
+            }
+        }
+        static foreach (key; DISPLAY_BOOL_PREFS) {
+            if (auto v = key in json) {
+                if (v.type == Json.Type.bool_)
+                    __traits(getMember, p, key) = v.get!bool;
+                else {
+                    logFieldInvalid(userId, key, v.type, "bool");
+                    needsRepair = true;
+                }
+            }
+        }
+        if (auto v = "modeIndicator" in json) {
+            if (v.type == Json.Type.string && DISPLAY_MODE_INDICATORS.canFind(v.get!string))
+                p.modeIndicator = v.get!string;
+            else {
+                logFieldInvalid(userId, "modeIndicator", v.type, "one of dots, symbols, hidden");
+                needsRepair = true;
+            }
+        }
+        if (auto v = "timestampFormat" in json) {
+            if (v.type == Json.Type.string && DISPLAY_TIMESTAMP_FORMATS.canFind(v.get!string))
+                p.timestampFormat = v.get!string;
+            else {
+                logFieldInvalid(userId, "timestampFormat", v.type, "one of auto, 12h, 24h");
+                needsRepair = true;
+            }
+        }
+        if (auto v = "highlightWords" in json) {
+            if (v.type == Json.Type.array)
+                p.highlightWords = normalizeHighlightWords(*v);
+            else {
+                logFieldInvalid(userId, "highlightWords", v.type, "array");
+                p.highlightWords = [];
+                needsRepair = true;
+            }
+        }
         if (auto v = "bncPlaybackLines" in json) {
             if (v.type == Json.Type.int_)
                 p.bncPlaybackLines = clampBncPlaybackLines(cast(int) v.get!long);
@@ -423,6 +500,89 @@ struct UserPreferences {
         }
         return LoadResult(p, needsRepair);
     }
+}
+
+/// A JSON array of `items`; never JSON null, even for a null slice.
+Json stringArrayJson(const string[] items) {
+    auto j = Json.emptyArray;
+    foreach (s; items)
+        j ~= Json(s);
+    return j;
+}
+
+/// The account display prefs as one object: `displayPrefsSet` plus the seven
+/// synced keys. This is the `displayPrefs` value of GET /api/me, `stat_user`
+/// and the `displayPrefs` pref_update.
+Json displayPrefsJson(const ref UserPreferences p) {
+    auto j = Json.emptyObject;
+    j["displayPrefsSet"] = Json(p.displayPrefsSet);
+    static foreach (key; DISPLAY_BOOL_PREFS)
+        j[key] = Json(__traits(getMember, p, key));
+    j["modeIndicator"] = Json(p.modeIndicator);
+    j["timestampFormat"] = Json(p.timestampFormat);
+    return j;
+}
+
+/// Validates a POST /api/me/display-prefs body without applying it. Returns
+/// "" when valid, else the 400 error text. Unknown keys are ignored (as in
+/// `updateNotificationPrefs`); `any` is true when a recognised key is present.
+string checkDisplayPrefsPatch(Json patch, out bool any) {
+    if (patch.type != Json.Type.object)
+        return "body must be object";
+    static foreach (key; DISPLAY_BOOL_PREFS) {
+        if (auto v = key in patch) {
+            if (v.type != Json.Type.bool_)
+                return key ~ " must be boolean";
+            any = true;
+        }
+    }
+    if (auto v = "modeIndicator" in patch) {
+        if (v.type != Json.Type.string || !DISPLAY_MODE_INDICATORS.canFind(v.get!string))
+            return "modeIndicator must be one of dots, symbols, hidden";
+        any = true;
+    }
+    if (auto v = "timestampFormat" in patch) {
+        if (v.type != Json.Type.string || !DISPLAY_TIMESTAMP_FORMATS.canFind(v.get!string))
+            return "timestampFormat must be one of auto, 12h, 24h";
+        any = true;
+    }
+    return "";
+}
+
+/// Writes each recognised key present in `patch` and marks the account's
+/// display prefs as set. The caller must have passed `patch` through
+/// `checkDisplayPrefsPatch` first.
+void applyDisplayPrefsPatch(ref UserPreferences p, Json patch) {
+    static foreach (key; DISPLAY_BOOL_PREFS) {
+        if (auto v = key in patch)
+            __traits(getMember, p, key) = v.get!bool;
+    }
+    if (auto v = "modeIndicator" in patch)
+        p.modeIndicator = v.get!string;
+    if (auto v = "timestampFormat" in patch)
+        p.timestampFormat = v.get!string;
+    p.displayPrefsSet = true;
+}
+
+/// Cleans a highlight-word list: keeps strings only, trims them, drops empty
+/// words and words over `MAX_HIGHLIGHT_WORD_BYTES`, and drops case-insensitive
+/// duplicates (first spelling wins, input order kept). A non-array yields [].
+/// The `MAX_HIGHLIGHT_WORDS` cap is the caller's to enforce.
+string[] normalizeHighlightWords(Json arr) {
+    if (arr.type != Json.Type.array)
+        return [];
+    string[] words;
+    foreach (item; arr) {
+        if (item.type != Json.Type.string)
+            continue;
+        string w = item.get!string.strip;
+        if (w.length == 0 || w.length > MAX_HIGHLIGHT_WORD_BYTES)
+            continue;
+        if (words.canFind!((a, b) => icmp(a, b) == 0)(w))
+            continue;
+        words ~= w;
+    }
+    return words;
 }
 
 /// Repository for user preferences.
@@ -1064,4 +1224,115 @@ unittest {
     }
     assert(!UserPreferences.fromJson(stored).needsRepair,
         "a freshly saved default record must not need repair");
+}
+
+@("display prefs and highlight words round-trip; legacy blobs get the defaults")
+unittest {
+    UserPreferences p;
+    p.displayPrefsSet = true;
+    p.showUserIcons = false;
+    p.monospaceFont = false;
+    p.modeIndicator = "symbols";
+    p.enlargeEmoji = false;
+    p.coloriseMentions = false;
+    p.formatColors = false;
+    p.timestampFormat = "24h";
+    p.highlightWords = ["deploy", "prod"];
+    const r = UserPreferences.fromJson(p.toJson());
+    assert(!r.needsRepair);
+    assert(r.prefs.displayPrefsSet && !r.prefs.showUserIcons && !r.prefs.monospaceFont);
+    assert(!r.prefs.enlargeEmoji && !r.prefs.coloriseMentions && !r.prefs.formatColors);
+    assert(r.prefs.modeIndicator == "symbols" && r.prefs.timestampFormat == "24h");
+    assert(r.prefs.highlightWords == ["deploy", "prod"]);
+    const dp = displayPrefsJson(r.prefs);
+    assert(dp["displayPrefsSet"].get!bool && !dp["showUserIcons"].get!bool);
+    assert(dp["modeIndicator"].get!string == "symbols" && dp["timestampFormat"].get!string == "24h");
+
+    // A blob saved before these fields existed decodes to the defaults.
+    auto legacy = Json.emptyObject;
+    legacy["pinnedChannels"] = serializeToJson(["net1:#a"]);
+    const l = UserPreferences.fromJson(legacy);
+    assert(!l.needsRepair);
+    assert(!l.prefs.displayPrefsSet && l.prefs.showUserIcons && l.prefs.monospaceFont);
+    assert(l.prefs.enlargeEmoji && l.prefs.coloriseMentions && l.prefs.formatColors);
+    assert(l.prefs.modeIndicator == "dots" && l.prefs.timestampFormat == "auto");
+    assert(l.prefs.highlightWords.length == 0);
+    // An empty list is stored and sent as [], never null.
+    assert(UserPreferences.init.toJson()["highlightWords"].type == Json.Type.array);
+    assert(stringArrayJson(null).type == Json.Type.array);
+}
+
+@("fromJson repairs an unknown modeIndicator/timestampFormat to the default")
+unittest {
+    auto j = Json.emptyObject;
+    j["modeIndicator"] = Json("stars");
+    j["timestampFormat"] = Json("relative");
+    const r = UserPreferences.fromJson(j);
+    assert(r.needsRepair);
+    assert(r.prefs.modeIndicator == "dots");
+    assert(r.prefs.timestampFormat == "auto");
+
+    auto k = Json.emptyObject;
+    k["modeIndicator"] = Json(3);
+    k["showUserIcons"] = Json("no");
+    k["highlightWords"] = Json("deploy");
+    const s = UserPreferences.fromJson(k);
+    assert(s.needsRepair);
+    assert(s.prefs.modeIndicator == "dots" && s.prefs.showUserIcons);
+    assert(s.prefs.highlightWords.length == 0);
+}
+
+@("checkDisplayPrefsPatch: type and enum errors, unknown keys ignored, any flag")
+unittest {
+    bool any;
+    assert(checkDisplayPrefsPatch(Json.emptyArray, any) == "body must be object");
+    auto j = Json.emptyObject;
+    j["showUserIcons"] = Json("yes");
+    assert(checkDisplayPrefsPatch(j, any) == "showUserIcons must be boolean");
+    j = Json.emptyObject;
+    j["modeIndicator"] = Json("stars");
+    assert(checkDisplayPrefsPatch(j, any) == "modeIndicator must be one of dots, symbols, hidden");
+    j = Json.emptyObject;
+    j["timestampFormat"] = Json("relative");
+    assert(checkDisplayPrefsPatch(j, any) == "timestampFormat must be one of auto, 12h, 24h");
+    j = Json.emptyObject;
+    j["bogus"] = Json(1);
+    j["displayPrefsSet"] = Json(true);
+    assert(checkDisplayPrefsPatch(j, any) == "");
+    assert(!any, "unknown and server-managed keys do not count");
+    j["formatColors"] = Json(false);
+    assert(checkDisplayPrefsPatch(j, any) == "");
+    assert(any);
+}
+
+@("applyDisplayPrefsPatch writes only the given keys and sets displayPrefsSet")
+unittest {
+    UserPreferences p;
+    p.monospaceFont = false;
+    auto patch = Json.emptyObject;
+    patch["showUserIcons"] = Json(false);
+    patch["timestampFormat"] = Json("12h");
+    patch["bogus"] = Json(1);
+    applyDisplayPrefsPatch(p, patch);
+    assert(p.displayPrefsSet);
+    assert(!p.showUserIcons && p.timestampFormat == "12h");
+    assert(!p.monospaceFont, "keys absent from the patch keep their value");
+    assert(p.modeIndicator == "dots" && p.enlargeEmoji && p.coloriseMentions && p.formatColors);
+}
+
+@("normalizeHighlightWords trims, drops empty/oversized/non-strings, dedupes case-insensitively")
+unittest {
+    import std.array : replicate;
+
+    auto j = Json.emptyArray;
+    j ~= Json("  Deploy ");
+    j ~= Json("deploy");
+    j ~= Json("");
+    j ~= Json(7);
+    j ~= Json(replicate("x", MAX_HIGHLIGHT_WORD_BYTES + 1));
+    j ~= Json("prod");
+    assert(normalizeHighlightWords(j) == ["Deploy", "prod"]);
+    const longest = replicate("y", MAX_HIGHLIGHT_WORD_BYTES);
+    assert(normalizeHighlightWords(serializeToJson([longest])) == [longest]);
+    assert(normalizeHighlightWords(Json("deploy")).length == 0);
 }
