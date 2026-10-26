@@ -23,28 +23,40 @@ import core.time : seconds, Duration, msecs;
 // The control consumer is a single fiber (startControlConsumer), so this
 // module-local map is touched only on one thread — no locks needed.
 //
-// Map keyed by `networkId.toString()` → unix-ms timestamp of when the
-// reconnect was dispatched. Entries auto-expire after RECONNECT_DEDUP_TTL
-// so a failed addAndStartNetwork doesn't permanently block subsequent
-// reconnects. `clearReconnectInFlight` is called after the connection
-// actually transitions to connected, OR from a small post-dispatch delay.
-private long[string] pendingReconnects;
+// Map keyed by `networkId.toString()` → when the reconnect was dispatched
+// and with which configuration. Entries auto-expire after
+// RECONNECT_DEDUP_TTL so a failed addAndStartNetwork doesn't permanently
+// block subsequent reconnects. `clearReconnectInFlight` is called after the
+// connection actually transitions to connected, OR from a small
+// post-dispatch delay.
+//
+// Only a reconnect carrying the *same* configuration is a duplicate (a
+// double-click, a gateway retry). One with a changed configuration — a SASL
+// edit that re-enables a network the engine parked — must replace the
+// client: dropping it left the parked client idling while Mongo said
+// enabled, until the next engine restart.
+private struct PendingReconnect {
+    long atMs;
+    string config;
+}
+private PendingReconnect[string] pendingReconnects;
 private enum RECONNECT_DEDUP_TTL_MS = 5_000;
 
-/// Returns true iff a reconnect for `networkId` is currently in flight.
-bool isReconnectInFlight(string networkId) {
-    if (auto t = networkId in pendingReconnects) {
-        if (Clock.currTime.toUnixTime!long * 1000 - *t < RECONNECT_DEDUP_TTL_MS)
-            return true;
+/// Returns true iff a reconnect for `networkId` with this `config` (its
+/// serialized JSON) is currently in flight.
+bool isReconnectInFlight(string networkId, string config = "") {
+    if (auto p = networkId in pendingReconnects) {
+        if (Clock.currTime.toUnixTime!long * 1000 - p.atMs < RECONNECT_DEDUP_TTL_MS)
+            return p.config == config;
         // Stale — TTL expired, drop it
         pendingReconnects.remove(networkId);
     }
     return false;
 }
 
-/// Marks a reconnect for `networkId` as in flight.
-void markReconnectInFlight(string networkId) {
-    pendingReconnects[networkId] = Clock.currTime.toUnixTime!long * 1000;
+/// Marks a reconnect for `networkId` with this `config` as in flight.
+void markReconnectInFlight(string networkId, string config = "") {
+    pendingReconnects[networkId] = PendingReconnect(Clock.currTime.toUnixTime!long * 1000, config);
 }
 
 /// Clears the in-flight reconnect marker for `networkId`.
@@ -282,8 +294,10 @@ private void handleControlMessage(ref EngineContext ctx, ControlMessage msg) {
                 // dedup, the second one calls `removeNetwork` on the
                 // freshly-started client, dropping the live connection
                 // and producing a "connect→remove" loop. Block the
-                // second one and let the original proceed.
-                if (isReconnectInFlight(msg.networkId)) {
+                // second one and let the original proceed — unless it
+                // carries a different configuration (see pendingReconnects).
+                const configKey = msg.config.toString();
+                if (isReconnectInFlight(msg.networkId, configKey)) {
                     logJsonMap("debug", "consumer",
                         "Reconnect dedup — another reconnectNetwork is in-flight",
                         [
@@ -293,7 +307,7 @@ private void handleControlMessage(ref EngineContext ctx, ControlMessage msg) {
                     return; // Discard silently — the in-flight one will
                             // produce its own user-visible events.
                 }
-                markReconnectInFlight(msg.networkId);
+                markReconnectInFlight(msg.networkId, configKey);
 
                 auto cfg = parseNetworkConfig(msg.config);
                 // Emit a "queued" notice *immediately* so the frontend

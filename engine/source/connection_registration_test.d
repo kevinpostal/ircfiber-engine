@@ -28,7 +28,8 @@ import vibe.data.json : Json;
 import ircfiber.irc.server : ConnectionServer;
 import ircfiber.irc.connection : parseJoinThrottleSeconds, remainingJoinDelayMs, joinBatches,
     memberNeedsRealname, channelNeedsRealnameWho, MAX_WHO_ENRICH_ATTEMPTS,
-    upsertRosterEntry, applyNamesBurst;
+    upsertRosterEntry, applyNamesBurst, isSaslRequiredRefusal, extractServerReason,
+    saslMechanismOffered;
 import std.string : indexOf;
 
 /// Tracks the number of passing checks.
@@ -254,6 +255,57 @@ void main() {
         "got: " ~ rebased.to!string);
     ok("an empty burst never wipes a roster",
         applyNamesBurst(held, []) == held);
+
+    // ── SASL-required refusals (irc.libera.chat, 2026-10-26) ─────────────
+    // Wire text captured through the prod egresses. The engine retried the
+    // gate for 11 h because it read as neither a ban nor a throttle; the
+    // account-exempt K-line read as a ban and host-banned the exit for
+    // every network, including ones that log in.
+    stderr.writeln("\n[connection.sasl-gate] refusal classification");
+    const liberaGate = "Closing Link: 2a02:6ea0:d406:3::e012 (SASL authentication to a NickServ "
+        ~ "account with a verified email address is required to connect from your current network. "
+        ~ "Please see https://libera.chat/guides/sasl for configuration assistance.)";
+    const liberaSaslKline = "You are banned from this server- SASL authentication to a verified "
+        ~ "NickServ account is required. Refer to https://libera.chat/guides/sasl and email "
+        ~ "bans@libera.chat when resolved. (2026/10/26 17.02)";
+    const liberaBotKline = "You are banned from this server- Your bot is not permitted to connect to "
+        ~ "Libera Chat. Please email bans@libera.chat if you think this network ban was set in error. "
+        ~ "(2026/10/26 17.03)";
+    ok("Libera's per-network gate demands SASL", isSaslRequiredRefusal(liberaGate));
+    ok("Libera's account-exempt K-line demands SASL", isSaslRequiredRefusal(liberaSaslKline));
+    ok("a K-line that SASL cannot lift is not a SASL demand", !isSaslRequiredRefusal(liberaBotKline));
+    ok("UnrealIRCd's require-authentication wording demands SASL",
+        isSaslRequiredRefusal("You need to authenticate via SASL to use this server"));
+    ok("a failed SASL login is not a SASL demand",
+        !isSaslRequiredRefusal("SASL authentication failed"));
+    ok("empty text is not a SASL demand", !isSaslRequiredRefusal(""));
+
+    stderr.writeln("\n[connection.reason] server reason extraction");
+    ok("a Solanum Closing Link yields its parenthesised reason",
+        extractServerReason(liberaGate).length > 0
+        && extractServerReason(liberaGate)[0 .. 4] == "SASL"
+        && extractServerReason(liberaGate)[$ - 1] == '.',
+        "got: " ~ extractServerReason(liberaGate));
+    ok("a 465 ban text yields no reason, not its trailing timestamp",
+        extractServerReason(liberaSaslKline) == "", "got: " ~ extractServerReason(liberaSaslKline));
+    ok("an InspIRCd Closing link yields the bracketed reason, not the hostmask",
+        extractServerReason("Closing link: (~u@1.2.3.4) [Registration timeout]") == "Registration timeout");
+    ok("an InspIRCd quit drops the Quit: prefix",
+        extractServerReason("Closing link: (~u@1.2.3.4) [Quit: bye]") == "bye");
+    ok("an UnrealIRCd bracketed address keeps the parenthesised reason",
+        extractServerReason("Closing Link: [1.2.3.4] (Too many unknown connections from your IP)")
+            == "Too many unknown connections from your IP");
+    ok("a quit reason is unwrapped", extractServerReason("Closing Link: 1.2.3.4 (Quit: bye)") == "bye");
+    ok("a reason with its own parentheses stays whole",
+        extractServerReason("Closing Link: host (Banned (spam))") == "Banned (spam)");
+
+    stderr.writeln("\n[connection.sasl-mechs] offered mechanism check");
+    const liberaMechs = "ECDSA-NIST256P-CHALLENGE,EXTERNAL,PLAIN,SCRAM-SHA-512";
+    ok("Libera offers PLAIN", saslMechanismOffered(liberaMechs, "PLAIN"));
+    ok("Libera does not offer SCRAM-SHA-256", !saslMechanismOffered(liberaMechs, "SCRAM-SHA-256"));
+    ok("a prefix of an offered mechanism is not offered", !saslMechanismOffered(liberaMechs, "SCRAM-SHA"));
+    ok("mechanism names compare case-insensitively", saslMechanismOffered("plain,external", "PLAIN"));
+    ok("an unstated list means try it", saslMechanismOffered("", "SCRAM-SHA-256"));
 
     stderr.writeln("\n[", passed, " passed, ", failed, " failed]");
     if (failed > 0) core.stdc.stdlib.exit(1);

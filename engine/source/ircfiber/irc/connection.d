@@ -456,6 +456,14 @@ private enum TS_CMD_TIMEOUT_SECS        = 10;
 /// Catalog refresh interval — the relay list changes rarely.
 private enum EGRESS_CATALOG_TTL_MS      = 15 * 60 * 1000L;
 private __gshared long[string][string] hostEgressBanUntil;
+/// Per-host SASL gate: hostLower -> egress key -> expiryMs. Routes a server
+/// refused *unless the connection logs in with SASL* (`isSaslRequiredRefusal`,
+/// e.g. Libera's "SASL … is required to connect from your current network"
+/// on every Mullvad exit). Kept apart from hostEgressBanUntil because the
+/// refusal does not apply to networks that authenticate: only networks
+/// without SASL order these routes last and stop failing over to them.
+/// Same keys and lifetime (HOST_EGRESS_BAN_MS) as the ban table.
+private __gshared long[string][string] hostSaslGateUntil;
 shared static this() {
     // Enterprise: single global mutex protects all __gshared Mullvad state.
     // vibe.d fibers are cooperative but connection loops run on different
@@ -726,6 +734,57 @@ private void banEgressForHost(string host, string locationId, long durationMs = 
     logWarn("Mullvad host-ban: egress %s banned for %s for %d ms (until %d)", locationId, hl, durationMs, exp);
 }
 
+/// Remembers that `host` refuses connections that do not log in with SASL
+/// when they come from `key` (a location id, `slot:<label>` or
+/// DIRECT_EGRESS_LABEL). See hostSaslGateUntil.
+private void gateEgressForHost(string host, string key) {
+    if (host.length == 0 || key.length == 0) return;
+    import std.string : toLower;
+    auto hl = host.toLower();
+    const exp = Clock.currTime.toUnixTime!long * 1000 + HOST_EGRESS_BAN_MS;
+    if (gMullvadLock !is null) synchronized (gMullvadLock) {
+        hostSaslGateUntil[hl][key.toLower()] = exp;
+    } else {
+        hostSaslGateUntil[hl][key.toLower()] = exp;
+    }
+    logWarn("SASL gate: %s refuses unauthenticated connections via %s (remembered until %d)", hl, key, exp);
+}
+
+/// Is `key` SASL-gated for this host right now? Caller holds gMullvadLock
+/// (or runs before it exists), like isEgressBannedForHost.
+private bool isEgressSaslGatedLocked(string hostLower, string key) {
+    import std.string : toLower;
+    if (hostLower.length == 0 || key.length == 0) return false;
+    auto outer = hostLower in hostSaslGateUntil;
+    if (outer is null) return false;
+    const k = key.toLower();
+    if (auto expiry = k in *outer) {
+        if (Clock.currTime.toUnixTime!long * 1000 < *expiry) return true;
+        (*outer).remove(k);
+        if ((*outer).length == 0) hostSaslGateUntil.remove(hostLower);
+    }
+    return false;
+}
+
+private bool isEgressSaslGatedForHost(string hostLower, string key) {
+    if (gMullvadLock !is null) synchronized (gMullvadLock) return isEgressSaslGatedLocked(hostLower, key);
+    return isEgressSaslGatedLocked(hostLower, key);
+}
+
+/// Any unexpired SASL gate recorded for this host? Caller holds the lock.
+private bool hostHasSaslGatesLocked(string hostLower) {
+    auto outer = hostLower in hostSaslGateUntil;
+    if (outer is null) return false;
+    const now = Clock.currTime.toUnixTime!long * 1000;
+    foreach (_, exp; *outer) if (now < exp) return true;
+    return false;
+}
+
+private bool hostHasSaslGates(string hostLower) {
+    if (gMullvadLock !is null) synchronized (gMullvadLock) return hostHasSaslGatesLocked(hostLower);
+    return hostHasSaslGatesLocked(hostLower);
+}
+
 private MullvadProxy*[] getHealthyProxiesForHost(string hostLower) {
     // The host-aware path skips the unlocked getHealthyProxies() wrapper, so
     // it must load the pool itself (the wrapper is the only other caller of
@@ -762,26 +821,38 @@ private MullvadProxy*[] getHealthyProxiesForHostLocked(string hostLower) {
 /// can pin it ("direct") the same way it pins a Mullvad label.
 enum DIRECT_EGRESS_LABEL = "direct";
 
-/// True when, after `bannedKey` was just banned for `hostLower`, at least
-/// one other route to the host remains: a healthy exit whose location is not
-/// host-banned, a free controllable slot that could be retargeted to an
-/// unbanned location, or the direct path if that is not host-banned. Drives
-/// the ban policy: failover now vs. wait out the ban window.
-private bool hasAlternativeEgressForHost(string hostLower, string bannedKey) {
+/// True when, after `bannedKey` was just banned (or SASL-gated) for
+/// `hostLower`, at least one other route to the host remains: a healthy exit
+/// whose location is not host-banned, a free controllable slot that could be
+/// retargeted to an unbanned location, or the direct path if that is not
+/// host-banned. Drives the ban and SASL-gate policies: fail over now vs.
+/// wait out the ban window / park.
+///
+/// `unauthenticated` (the network has no SASL) also rules out SASL-gated
+/// routes, and — once the host has any SASL gate — stops counting a free
+/// slot: a retarget lands on another exit of the same VPN provider, which
+/// the gate refuses just the same, and the picker only retargets when no
+/// exit is healthy, so counting the slot would fail over through gated
+/// exits forever.
+private bool hasAlternativeEgressForHost(string hostLower, string bannedKey, bool unauthenticated = false) {
     loadMullvadPool();
     bool check() {
-        foreach (p; getHealthyProxiesForHostLocked(hostLower))
-            if (slotBanKey(p) != bannedKey) return true;
+        const skipGated = unauthenticated && hostHasSaslGatesLocked(hostLower);
+        foreach (p; getHealthyProxiesForHostLocked(hostLower)) {
+            const key = slotBanKey(p);
+            if (key != bannedKey && !(skipGated && isEgressSaslGatedLocked(hostLower, key))) return true;
+        }
         // A free controllable slot is an alternative in itself: it can be
         // retargeted to any city in the catalog that is not host-banned.
         const now = Clock.currTime.toUnixTime!long * 1000;
-        if (gExitRelays.length > 0) {
+        if (!skipGated && gExitRelays.length > 0) {
             foreach (ref pr; mullvadPool)
                 if (pr.controlSocket.length > 0 && pr.activeConns == 0
                     && now >= pr.heldUntilMs && pr.state != "retargeting")
                     return true;
         }
-        return bannedKey != DIRECT_EGRESS_LABEL && !isEgressBannedForHost(hostLower, DIRECT_EGRESS_LABEL);
+        return bannedKey != DIRECT_EGRESS_LABEL && !isEgressBannedForHost(hostLower, DIRECT_EGRESS_LABEL)
+            && !(skipGated && isEgressSaslGatedLocked(hostLower, DIRECT_EGRESS_LABEL));
     }
     if (gMullvadLock !is null) synchronized (gMullvadLock) return check();
     return check();
@@ -1452,15 +1523,17 @@ private bool firstPartyDirectOnly(string hostLower, string egressNodeId) @safe p
 }
 
 /// Egress policy loop: picks the egresses to try (direct-only for the
-/// first-party ircd, pins, rotation, host bans, direct fallback) and issues
-/// one holder `DIAL` per candidate through `happyEyeballsConnectWithProxy`.
-/// `tlsMode` (`none`/`implicit`/`starttls`) is performed by the holder as
-/// part of the dial, so a TLS failure on one exit moves on to the next; a
-/// `TLS handshake timed out` bans the exit for this host. `dr` carries the
-/// holder's `CONNECTED` facts for the winning dial.
+/// first-party ircd, pins, rotation, host bans, SASL gates, direct
+/// fallback) and issues one holder `DIAL` per candidate through
+/// `happyEyeballsConnectWithProxy`. `tlsMode` (`none`/`implicit`/`starttls`)
+/// is performed by the holder as part of the dial, so a TLS failure on one
+/// exit moves on to the next; a `TLS handshake timed out` bans the exit for
+/// this host. `unauthenticated` (the network has no SASL) orders routes the
+/// host SASL-gates last. `dr` carries the holder's `CONNECTED` facts for the
+/// winning dial.
 
 private TCPConnection happyEyeballsConnect(HolderClient holder, DialTag tag, string host, ushort port,
-                                           string tlsMode, string egressNodeId,
+                                           string tlsMode, string egressNodeId, bool unauthenticated,
                                            string ipv6BindAddr, ConnectProgress progress,
                                            out EgressUsed used, out DialResult dr) {
     import std.string : toLower;
@@ -1559,19 +1632,33 @@ private TCPConnection happyEyeballsConnect(HolderClient holder, DialTag tag, str
         }
     }
     if (egressBusyNote.length > 0) report(progress, "info", egressBusyNote);
+    // SASL-gated routes (unauthenticated networks only): the host refuses
+    // this network there until it logs in, so they go after every other
+    // route, direct included. They are dialled only when nothing else is
+    // left — that attempt is what lets applySaslGatePolicy park the network
+    // with the right message instead of failing over in circles.
+    MullvadProxy*[] gated;
     if (!pinDirect) {
         foreach (p; healthyForHost) {
             bool already = false;
             foreach (q; toTry) if (q is p) { already = true; break; }
-            if (!already) toTry ~= p;
+            if (already) continue;
+            if (unauthenticated && isEgressSaslGatedForHost(hostLower, slotBanKey(p))) gated ~= p;
+            else toTry ~= p;
         }
     }
     // Direct fallback — the sidecars are egress, not a proxy mesh; the bare
     // host IP is the last resort. Skipped while the host has it banned and
     // an exit is still available; kept when it is the only route (or
     // pinned) so the attempt surfaces the ban instead of failing silently.
-    if (pinDirect || toTry.length == 0 || !isDirectBannedForHost(hostLower)) toTry ~= null;
-    else logWarn("Direct egress is host-banned for %s — trying %d exit(s) only", hostLower, cast(int) toTry.length);
+    const directBanned = !pinDirect && isDirectBannedForHost(hostLower);
+    const directGated = !pinDirect && unauthenticated
+        && isEgressSaslGatedForHost(hostLower, DIRECT_EGRESS_LABEL);
+    if (pinDirect || (!directBanned && !directGated)) toTry ~= null;
+    toTry ~= gated;
+    if (directGated && !directBanned) toTry ~= null;
+    if (toTry.length == 0) toTry ~= null;
+    else if (directBanned) logWarn("Direct egress is host-banned for %s — trying %d exit(s) only", hostLower, cast(int) toTry.length);
     Exception lastErr;
     foreach (proxy; toTry) {
         try {
@@ -2094,11 +2181,14 @@ struct RetryStatus {
 /// (per plan B2 — MUST be nested, not flat).
 package(ircfiber) struct FailInfo {
     /// One of: "connecting_failed" | "killed" | "socket_closed" |
-    /// "ssl_verify_error" | "connecting_restricted" | "connection_blocked"
+    /// "ssl_verify_error" | "connecting_restricted" | "connection_blocked" |
+    /// "sasl_required" | "sasl_failed" (the last two only from
+    /// `parkNetwork`: the network is parked until its SASL settings change).
     string type_;
     /// Raw reason key (matches IRCCloud's RENDER_REASONS table).
     /// Examples: "econnrefused", "nxdomain", "ssl_certificate_error",
-    /// "killed", "crash", "pool_lost".
+    /// "killed", "crash", "pool_lost". For the SASL types: the complete
+    /// user-facing sentence.
     string reason;
     /// When `type_=="killed"`, carries the kill description
     /// (e.g. "(Ghost)" for supernets.org's UnrealIRCd ghost
@@ -2290,13 +2380,108 @@ unittest {
     assert(parseJoinThrottleSeconds("connected for at least 99999 seconds") == 600);
 }
 
-/// Thrown when services definitively reject our SASL credential (904/905).
-/// The stored password does not match the live NickServ account, so every
-/// reconnect would re-enter the same nick war. The run loop catches this
-/// separately from generic failures and parks the network (persisted
-/// `disabled`, same as the admin-disconnect path) instead of backing off
-/// and retrying forever. A proven credential — NickServ-password site login
-/// or admin link/reset — re-enables via `reconnectNetwork`.
+/// Lower-case phrases that, next to "sasl", mark a server refusal as a
+/// demand to log in rather than a ban of the address. See
+/// `isSaslRequiredRefusal`.
+private immutable string[] SASL_REQUIRED_MARKERS = [
+    "required", "need to identify", "need to authenticate",
+    "must identify", "must authenticate",
+];
+
+/// True when a server's refusal names SASL as the way in, i.e. it rejects
+/// this *unauthenticated* connection rather than the address:
+///   - Libera's per-network gate (NOTICE, then ERROR "Closing Link: <ip>
+///     (…)"): "SASL authentication to a NickServ account with a verified
+///     email address is required to connect from your current network."
+///   - Libera's account-exempt K-lines (465): "You are banned from this
+///     server- SASL authentication to a verified NickServ account is
+///     required."
+///   - Solanum `need_sasl` auth blocks and UnrealIRCd `require
+///     authentication` ("You need to identify/authenticate via SASL …").
+/// Both Libera forms were captured from irc.libera.chat through the prod
+/// Mullvad exits on 2026-10-26. A network that logs in with SASL gets in
+/// through the same address, so these must never become egress bans.
+bool isSaslRequiredRefusal(string text) @safe pure nothrow {
+    import std.string : indexOf, toLower;
+    if (text.length == 0) return false;
+    string lower;
+    try { lower = toLower(text); } catch (Exception) { return false; }
+    if (lower.indexOf("sasl") < 0) return false;
+    foreach (marker; SASL_REQUIRED_MARKERS)
+        if (lower.indexOf(marker) >= 0) return true;
+    return false;
+}
+
+/// The human reason inside a server's ERROR text, or "" when it has none:
+///   "Closing Link: 1.2.3.4 (Quit: bye)"                  → "bye"
+///   "Closing Link: 2a02:6ea0::e012 (SASL … (x) …)"       → "SASL … (x) …"  (Solanum, UnrealIRCd)
+///   "Closing link: (~u@1.2.3.4) [Registration timeout]"  → "Registration timeout" (InspIRCd)
+/// Anything that is not a Closing Link line yields "": a 465 ban text such
+/// as Libera's "You are banned from this server- … (2026/10/26 02.00)" ends
+/// in a timestamp, which used to surface as "Disconnected: 2026/10/26 02.00".
+string extractServerReason(string errorText) @safe pure nothrow {
+    import std.algorithm.searching : startsWith;
+    import std.string : indexOf, lastIndexOf, strip, toLower;
+    try {
+        auto quit = errorText.indexOf("(Quit:");
+        if (quit >= 0) {
+            quit += 6;
+            const end = errorText.indexOf(")", quit);
+            if (end > quit) return errorText[quit .. end].strip();
+        }
+        if (!toLower(errorText).startsWith("closing link")) return "";
+        const lastParen = errorText.lastIndexOf(')');
+        const lastBracket = errorText.lastIndexOf(']');
+        if (lastBracket > lastParen) {
+            // InspIRCd: the (user@host) group comes first, the reason is the
+            // trailing [bracket] group.
+            const open = errorText.lastIndexOf('[');
+            if (open < 0 || open >= lastBracket) return "";
+            auto reason = errorText[open + 1 .. lastBracket].strip();
+            return reason.startsWith("Quit:") ? reason[5 .. $].strip() : reason;
+        }
+        // Solanum / UnrealIRCd: "<host> (reason)". From the first "(" so a
+        // reason carrying its own parentheses stays whole.
+        const open = errorText.indexOf('(');
+        if (open >= 0 && lastParen > open) return errorText[open + 1 .. lastParen].strip();
+    } catch (Exception) {}
+    return "";
+}
+
+/// Whether a server's SASL mechanism list — the CAP 302 `sasl=` value or
+/// the 908 RPL_SASLMECHS list, comma-separated — includes `mech`
+/// (ASCII case-insensitive). An empty list means the server did not say,
+/// which callers treat as "try it".
+bool saslMechanismOffered(string offered, string mech) @safe pure nothrow @nogc {
+    import std.ascii : toUpper;
+    if (offered.length == 0) return true;
+    size_t start = 0;
+    foreach (i; 0 .. offered.length + 1) {
+        if (i < offered.length && offered[i] != ',') continue;
+        auto m = offered[start .. i];
+        start = i + 1;
+        while (m.length && m[0] == ' ') m = m[1 .. $];
+        while (m.length && m[$ - 1] == ' ') m = m[0 .. $ - 1];
+        if (m.length != mech.length) continue;
+        bool same = true;
+        foreach (j, c; m) if (toUpper(c) != toUpper(mech[j])) { same = false; break; }
+        if (same) return true;
+    }
+    return false;
+}
+
+/// Thrown when the network must stop reconnecting until the user acts:
+///   - services definitively rejected our SASL credential or mechanism
+///     (904/905, or the server does not offer the configured mechanism);
+///   - the server only admits SASL-authenticated connections from every
+///     route we have (`applySaslGatePolicy`), or admits none even after a
+///     successful login (unverified account).
+/// Retrying would hammer the server with connections it has already said
+/// it will refuse — the pattern that gets a whole egress K-lined as a bot.
+/// The run loop catches this separately from generic failures and idles
+/// (persisted `disabled`, same as the admin-disconnect path). A user
+/// Reconnect, a SASL edit, or for the Fiber network a NickServ-password
+/// site login re-enables it via `reconnectNetwork`.
 class SaslParkedException : Exception {
     this(string msg) { super(msg); }
 }
@@ -2501,6 +2686,9 @@ final class PersistentIRCClient {
         /// identified to services, so the server's looser `known-users`
         /// flood limits apply.
         bool                saslSucceeded;
+        /// This connection's 908 RPL_SASLMECHS list ("" = none seen), so the
+        /// 904 that follows can say the mechanism is unsupported.
+        string              saslMechsReply;
         /// Set while a multiline batch is being written, so `writeRaw` does
         /// not charge each line individually.
         bool                chargeSuppressed;
@@ -3585,11 +3773,11 @@ final class PersistentIRCClient {
                     }
                     continue;
                 }
-                // SASL park (parkOnSaslRejection already persisted `disabled`,
+                // SASL park (parkNetwork already persisted `disabled`,
                 // mirrored it in-memory, tore the socket down and emitted the
                 // user-visible error): skip the disconnect/backoff machinery
-                // and idle exactly like the admin-disabled path. A proven
-                // credential re-enables via control and this loop resumes.
+                // and idle exactly like the admin-disabled path. A Reconnect
+                // or SASL edit replaces this client via `reconnectNetwork`.
                 if (auto se = cast(SaslParkedException) e) {
                     string seMsg;
                     try { seMsg = se.msg; } catch (Throwable) { seMsg = "SASL rejected"; }
@@ -3626,7 +3814,7 @@ final class PersistentIRCClient {
 
                 string displayReason = reason;
                 if (lastErrorText.length > 0) {
-                    const extracted = extractQuitReason(lastErrorText);
+                    const extracted = extractServerReason(lastErrorText);
                     if (extracted.length > 0) displayReason = extracted;
                 }
                 if (displayReason != lastEmittedReason) {
@@ -4200,7 +4388,7 @@ final class PersistentIRCClient {
             releaseEgressSlot();
             auto tag = DialTag(config.id.toString(), ownerId.toString(), config.name, "");
             connection = happyEyeballsConnect(holder, tag, config.host, config.port, tlsMode,
-                config.egressNodeId, ipv6Bind, &onDialEvent, used, dr);
+                config.egressNodeId, config.sasl == SASLMechanism.none, ipv6Bind, &onDialEvent, used, dr);
             holderConnId = dr.id;
             activeEgressLabel = used.label;
             activeEgressHost = used.host;
@@ -4266,6 +4454,7 @@ final class PersistentIRCClient {
         // the reconnect it caused. Queued user lines survive too — they
         // were never delivered.
         saslSucceeded = false;
+        saslMechsReply = "";
         pacer.resetAccrual();
         pacer.adopt(assumedFloodLimits());
         chargeSuppressed = false;
@@ -4406,38 +4595,108 @@ final class PersistentIRCClient {
         publishMeta(false);
     }
 
-    /// Definitive SASL rejection (904/905): services are reachable and refuse
-    /// the stored credential, so the password no longer matches the live
-    /// NickServ account (rotated on IRC, dropped and re-registered, or lost
-    /// in an Anope restart). Persist `disabled` — survives restarts, skips
-    /// bootstrap, renders as admin-disabled — mirror it in-memory so the run
-    /// loop idles, and tear the half-registered socket down. Recovery is a
-    /// proven credential: NickServ-password site login or admin link/reset,
-    /// both of which re-enable and push `reconnectNetwork`. The account name
-    /// is logged; the credential never is.
-    private void parkOnSaslRejection(string detail) {
+    /// True for the first-party network (irc.ircfiber.com), whose SASL
+    /// account IRC Fiber provisions itself.
+    private bool isFiberNetwork() const {
+        import std.uni : toLower;
+        import ircfiber.default_network : DEFAULT_FIBER_HOST;
+        return config.host.toLower == DEFAULT_FIBER_HOST;
+    }
+
+    /// Parks the network until the user acts: persists `disabled` (survives
+    /// restarts, skips bootstrap), mirrors it in-memory so the run loop
+    /// idles, tears the half-registered socket down and says why — the
+    /// `_server` log, DISCONNECTED (the bouncer relays it to `*status`) and,
+    /// when `failType` is set, a CONNECTION_FAIL whose banner opens the
+    /// network's SASL settings. The caller throws
+    /// `SaslParkedException(msg)` right after. Recovery: Reconnect, a SASL
+    /// edit in the network form, or for the Fiber network a
+    /// NickServ-password site login — each re-enables and pushes
+    /// `reconnectNetwork`. The account name is logged; the credential never is.
+    private void parkNetwork(string msg, string failType, string event) {
         import ircfiber.db.network : NetworkRepository;
-        const msg = "SASL " ~ saslMechanismName(config.sasl) ~ " rejected for account \"" ~
-            config.saslUsername ~ "\" (" ~ detail ~ ") — stored credential does not match " ~
-            "the live NickServ account. Parked (disabled); log into the site with " ~
-            "the NickServ password to reconnect.";
         try {
             (new NetworkRepository()).setDisabled(config.id, true);
         } catch (Exception e) {
-            logWarn("sasl_park[%s]: persisting disabled failed: %s", config.name, e.msg);
+            logWarn("park[%s]: persisting disabled failed: %s", config.name, e.msg);
         }
         config.disabled = true;
-        try transportClose(); catch (Exception e) logWarn("sasl_park[%s]: transport close failed: %s", config.name, e.msg);
+        try transportClose(); catch (Exception e) logWarn("park[%s]: transport close failed: %s", config.name, e.msg);
         state = ConnectionState.disconnected;
+        lastDisconnectReason = msg;
         emitLog("error", msg);
-        logWarn("sasl_park[%s]: %s", config.name, msg);
-        logJsonMap("warn", "auth", "SASL rejected — parking network",
+        logWarn("park[%s]: %s", config.name, msg);
+        logJsonMap("warn", "auth", "Parking network until the user acts",
             ["network": config.name, "host": config.host,
-             "account": config.saslUsername, "event": "sasl_parked"]);
-        recordCounter("ircfiber.sasl.parked", 1, ["network": config.name, "host": config.host]);
+             "account": config.saslUsername, "event": event]);
+        recordCounter("ircfiber.sasl.parked", 1, ["network": config.name, "host": config.host, "event": event]);
+        // Before the CONNECTION_FAIL: the frontend clears failInfo on a zero
+        // retry status, so the reverse order would erase the banner.
+        emitZeroRetryStatus();
+        if (failType.length) {
+            FailInfo info;
+            info.type_ = failType;
+            info.reason = msg;
+            lastFailInfo = info;
+            try eventChannel.put(IRCRawEvent.makeConnectionFail(config.name, config.id.toString(),
+                info.type_, info.reason, info.killedReason, info.sslVerifyError));
+            catch (Exception) {}
+        }
         try eventChannel.put(IRCRawEvent.makeDisconnected(config.name, config.id.toString(), msg));
         catch (Exception) {}
-        emitZeroRetryStatus();
+    }
+
+    /// Where the SASL settings live, named in every park message for a
+    /// user-managed network. The banner shows the message on one line, so
+    /// each message leads with this instruction; the server's own words are
+    /// already in the `_server` log as its ERROR/465 line.
+    private enum SASL_SETTINGS_HINT = "Edit network → Advanced options → SASL authentication";
+
+    /// The park message when the server only admits SASL logins and the
+    /// network has none.
+    private string saslRequiredMessage() const {
+        return config.host ~ " only accepts IRC Fiber connections that log in with SASL. Add your account under "
+            ~ SASL_SETTINGS_HINT ~ ", then Save — not reconnecting until then.";
+    }
+
+    /// Definitive SASL rejection (904/905): services are reachable and refuse
+    /// the stored credential or mechanism. On the Fiber network the password
+    /// no longer matches the live NickServ account (rotated on IRC, dropped
+    /// and re-registered, or lost in an Anope restart), and a NickServ-password
+    /// site login is the fix. Elsewhere the user typed the account, so point
+    /// them at the form — and when the server's 908 list lacks the mechanism,
+    /// say so (Libera offers SCRAM-SHA-512 but not SCRAM-SHA-256). Returns
+    /// the user-facing message for the caller's SaslParkedException.
+    private string parkOnSaslRejection(string detail) {
+        const mech = saslMechanismName(config.sasl);
+        if (isFiberNetwork()) {
+            const msg = "SASL " ~ mech ~ " rejected for account \"" ~
+                config.saslUsername ~ "\" (" ~ detail ~ ") — stored credential does not match " ~
+                "the live NickServ account. Parked (disabled); log into the site with " ~
+                "the NickServ password to reconnect.";
+            parkNetwork(msg, "", "sasl_parked");
+            return msg;
+        }
+        if (saslMechsReply.length && !saslMechanismOffered(saslMechsReply, mech))
+            return parkOnUnsupportedMechanism(saslMechsReply);
+        const msg = config.host ~ " rejected the SASL " ~ mech ~ " login for \"" ~ config.saslUsername
+            ~ "\" — check the account name and password under " ~ SASL_SETTINGS_HINT
+            ~ ", then Save. Server said: \"" ~ detail ~ "\".";
+        parkNetwork(msg, "sasl_failed", "sasl_parked");
+        return msg;
+    }
+
+    /// The server does not offer the configured mechanism (`offered` is its
+    /// comma-separated list). Every attempt would fail the same way, so park
+    /// and name what it does offer. Returns the user-facing message.
+    private string parkOnUnsupportedMechanism(string offered) {
+        import std.array : replace;
+        const mech = saslMechanismName(config.sasl);
+        const pick = saslMechanismOffered(offered, "PLAIN") ? "PLAIN" : "a mechanism it offers";
+        const msg = config.host ~ " does not support SASL " ~ mech ~ " — choose " ~ pick ~ " under "
+            ~ SASL_SETTINGS_HINT ~ ", then Save. It offers " ~ offered.replace(",", ", ") ~ ".";
+        parkNetwork(msg, isFiberNetwork() ? "" : "sasl_failed", "sasl_mechanism_parked");
+        return msg;
     }
 
     // ── Registration (CAP + NICK + USER + SASL) ───────────────────────────────
@@ -4892,6 +5151,13 @@ final class PersistentIRCClient {
                                 }
                                 // If SASL was acked, start authentication
                                 if (ackedCaps.get("sasl", false) && !saslDone && config.sasl != SASLMechanism.none) {
+                                    // CAP 302 servers list their mechanisms in
+                                    // `sasl=`; one we cannot use fails every
+                                    // attempt the same way, so park with the list
+                                    // instead of collecting a 904.
+                                    const offered = capValues.get("sasl", "");
+                                    if (!saslMechanismOffered(offered, saslMechanismName(config.sasl)))
+                                        throw new SaslParkedException(parkOnUnsupportedMechanism(offered));
                                     emitLog("sasl_start",
                                         "Starting SASL " ~ saslMechanismName(config.sasl) ~ " authentication");
                                     logJsonMap("info", "auth",
@@ -5088,12 +5354,16 @@ final class PersistentIRCClient {
                         case "904": // ERR_SASLFAIL
                         case "905": // ERR_SASLTOOLONG
                             // Definitive: services are reachable and refuse the
-                            // stored credential. Retrying would re-enter the
-                            // same nick war forever — park instead. 906
-                            // (aborted, usually our own timeout) stays on the
-                            // retry path below.
-                            parkOnSaslRejection(evt.text);
-                            throw new SaslParkedException("SASL authentication failed: " ~ evt.text);
+                            // stored credential (or, after a 908, the
+                            // mechanism). Retrying would re-enter the same nick
+                            // war forever — park instead. 906 (aborted, usually
+                            // our own timeout) stays on the retry path below.
+                            throw new SaslParkedException(parkOnSaslRejection(evt.text));
+                        case "908": { // RPL_SASLMECHS — what the server offers; precedes 904 for an unsupported mechanism
+                            auto mechParams = evt.getParams();
+                            if (mechParams.length >= 2) saslMechsReply = mechParams[1];
+                            break;
+                        }
                         case "906": // ERR_SASLABORTED
                             emitLog("sasl_fail", "SASL authentication aborted");
                             logJsonMap("warn", "auth",
@@ -5114,17 +5384,15 @@ final class PersistentIRCClient {
 
                         case "465": // ERR_YOUREBANNEDCREEP — server ban during registration
                             lastErrorText = evt.text;
-                            if (isBanError(evt.text)) applyBanPolicy(evt.text);
-                            else if (isThrottleError(evt.text)) throttledUntil = Clock.currTime.toUnixTime!long * 1000 + 300_000;
                             evt.network = config.name; evt.timestampMs = resolveTimestamp(evt); eventChannel.put(evt);
+                            applyRegistrationRefusal(evt.text);
                             throw new Exception("Server banned connection during registration: " ~ evt.text);
                         case "ERROR":
                             lastErrorText = evt.text;
-                            if (isBanError(evt.text)) applyBanPolicy(evt.text);
-                            else if (isThrottleError(evt.text)) throttledUntil = Clock.currTime.toUnixTime!long * 1000 + 300_000;
                             evt.network     = config.name;
                             evt.timestampMs = resolveTimestamp(evt);
                             eventChannel.put(evt);
+                            applyRegistrationRefusal(evt.text);
                             throw new Exception("Server closed connection during registration: " ~ evt.text);
 
                         default:
@@ -5492,6 +5760,82 @@ private void processEvents() {
         return false;
     }
 
+    /// "Mullvad exit Zürich (ip)" / "the direct host IP (ip)" for the egress
+    /// of the current connection, as the ban and SASL-gate copy names it.
+    private string egressVia() {
+        return activeEgressLabel.length > 0
+            ? "Mullvad exit " ~ egressDisplay() ~ (activeEgressIp.length ? " (" ~ activeEgressIp ~ ")" : "")
+            : "the direct host IP" ~ (activeLocalIp.length ? " (" ~ activeLocalIp ~ ")" : "");
+    }
+
+    /// The egress key of the current connection in the per-host ban and
+    /// SASL-gate tables.
+    private string activeEgressKey() const {
+        return activeEgressLocationId.length > 0 ? activeEgressLocationId : DIRECT_EGRESS_LABEL;
+    }
+
+    /// A refusal while registering (465, or ERROR before 001). SASL demands
+    /// go first — Libera's account-exempt K-line also says "banned", but only
+    /// bans connections that do not log in — then bans, then throttles. May
+    /// throw SaslParkedException (applySaslGatePolicy, applyBanPolicy).
+    private void applyRegistrationRefusal(string text) {
+        if (isSaslRequiredRefusal(text)) applySaslGatePolicy(text);
+        else if (isBanError(text)) applyBanPolicy(text, true);
+        else if (isThrottleError(text)) throttledUntil = Clock.currTime.toUnixTime!long * 1000 + 300_000;
+    }
+
+    /// The server refused this connection until it logs in with SASL
+    /// (`isSaslRequiredRefusal`).
+    ///
+    /// Without SASL configured that is a fact about the route: remember it
+    /// for the host (hostSaslGateUntil — other networks without SASL then
+    /// order the route last) and fail over to a route the host has not gated.
+    /// With none left, park and ask for the account: every further attempt
+    /// is refused the same way. On 2026-10-26 this loop ran 11 h against
+    /// irc.libera.chat, alternating two gated Mullvad exits every 1–60 min
+    /// and never reaching a route that could work.
+    ///
+    /// With SASL configured, a refusal after 903 means the account itself
+    /// does not qualify (Libera: no verified email) — park too. One where the
+    /// login never completed (services down, `sasl` withdrawn) waits out the
+    /// ban window instead, since it can clear on its own.
+    private void applySaslGatePolicy(string text) {
+        import std.string : toLower;
+        const key = activeEgressKey();
+        if (config.sasl == SASLMechanism.none) {
+            gateEgressForHost(config.host, key);
+            logJsonMap("warn", "connection", "Server requires SASL via this egress",
+                ["network": config.name, "host": config.host, "egress": key, "message": text,
+                 "event": "egress_sasl_gate"]);
+            // A pin is honoured like a banned pin is: no failover behind the
+            // user's back, and SASL makes the pinned route work anyway.
+            const pinned = pinCoversBanKey(config.egressNodeId.toLower(), key);
+            if (!pinned && hasAlternativeEgressForHost(config.host.toLower(), key, true)) {
+                throttledUntil = 0;
+                emitLog("info", config.host ~ " only admits SASL logins via " ~ egressVia()
+                    ~ " — trying a different route.");
+                logJsonMap("warn", "connection", "SASL gate — failing over to another egress",
+                    ["network": config.name, "host": config.host, "egress": key, "event": "sasl_gate_failover"]);
+                return;
+            }
+            const msg = saslRequiredMessage();
+            parkNetwork(msg, "sasl_required", "sasl_required_parked");
+            throw new SaslParkedException(msg);
+        }
+        if (saslSucceeded) {
+            const msg = config.host ~ " accepted the SASL login for \"" ~ config.saslUsername
+                ~ "\" but still refused the connection — the account probably needs a verified email "
+                ~ "address. Confirm it with the network's NickServ, then Reconnect.";
+            parkNetwork(msg, "sasl_required", "sasl_unverified_parked");
+            throw new SaslParkedException(msg);
+        }
+        throttledUntil = Clock.currTime.toUnixTime!long * 1000 + 30 * 60 * 1000;
+        emitLog("info", config.host ~ " requires SASL, but the SASL " ~ saslMechanismName(config.sasl)
+            ~ " login did not complete on this connection — retrying in 30 minutes.");
+        logJsonMap("warn", "connection", "SASL required but login incomplete — 30m backoff",
+            ["network": config.name, "host": config.host, "egress": key, "event": "sasl_gate_incomplete"]);
+    }
+
     /// Server banned us (Z/G/K-line, "banned from", ...). Ban the egress
     /// that was in use for this host — the bare host IP counts as an
     /// egress too (DIRECT_EGRESS_LABEL) — then either fail over right
@@ -5501,11 +5845,15 @@ private void processEvents() {
     ///     the reconnect loop retries on the normal short backoff and the
     ///     picker, which now skips the banned egress, lands on a
     ///     different IP. This is the whole point of the Mullvad pool: a
-    ///     ban on one address must not cost the user 30 minutes.
+    ///     ban on one address must not cost the user 30 minutes. For a
+    ///     network without SASL, routes the host SASL-gates do not count.
+    ///   - only SASL-gated routes remain, the network has no SASL and
+    ///     `mayPark` (registration-time refusals) → park and ask for the
+    ///     account (Libera: K-lined direct IP, gated Mullvad exits).
     ///   - nothing else to try (empty pool, everything banned, or the user
     ///     pinned the banned route) → keep the 30-minute window as before.
-    /// Both branches tell the user what happened in the _server buffer.
-    private void applyBanPolicy(string text) {
+    /// Every branch tells the user what happened in the _server buffer.
+    private void applyBanPolicy(string text, bool mayPark = false) {
         import std.string : toLower;
         // The swap that painted us with a banned address must not be
         // repeated: a fiber session dying while asserting clientIp means
@@ -5515,11 +5863,10 @@ private void processEvents() {
         // redial walks back into the kill zone either way.
         if (clientIp.length) suppressWebircSwapFor(config.host, clientIp);
 
-        const banKey = activeEgressLocationId.length > 0
-            ? activeEgressLocationId : DIRECT_EGRESS_LABEL;
-        const via = activeEgressLabel.length > 0
-            ? "Mullvad exit " ~ egressDisplay() ~ (activeEgressIp.length ? " (" ~ activeEgressIp ~ ")" : "")
-            : "the direct host IP" ~ (activeLocalIp.length ? " (" ~ activeLocalIp ~ ")" : "");
+        const banKey = activeEgressKey();
+        const via = egressVia();
+        const hostLower = config.host.toLower();
+        const unauthenticated = config.sasl == SASLMechanism.none;
         banEgressForHost(config.host, banKey);
         logJsonMap("warn", "connection", "Egress host-banned after G/K/Z-line",
             ["network": config.name, "host": config.host, "egress": banKey, "event": "egress_host_ban"]);
@@ -5527,11 +5874,18 @@ private void processEvents() {
         // when it is the country/city pin that resolved to this location, or
         // when it is the label of a static slot.
         const pinnedBanned = pinCoversBanKey(config.egressNodeId.toLower(), banKey);
-        if (!pinnedBanned && hasAlternativeEgressForHost(config.host.toLower(), banKey)) {
+        if (!pinnedBanned && hasAlternativeEgressForHost(hostLower, banKey, unauthenticated)) {
             throttledUntil = 0;
             emitLog("info", "Banned via " ~ via ~ " — retrying through a different exit.");
             logJsonMap("warn", "connection", "Server BAN detected — failing over to another egress",
                 ["network": config.name, "message": text, "egress": banKey, "event": "server_ban_failover"]);
+        } else if (mayPark && unauthenticated && !pinnedBanned && hostHasSaslGates(hostLower)) {
+            emitLog("info", "Banned via " ~ via ~ ", and every other route only admits connections that log in with SASL.");
+            const msg = saslRequiredMessage();
+            logJsonMap("error", "connection", "Server BAN with only SASL-gated routes left — parking",
+                ["network": config.name, "message": text, "egress": banKey, "event": "server_ban_sasl_only"]);
+            parkNetwork(msg, "sasl_required", "sasl_required_parked");
+            throw new SaslParkedException(msg);
         } else {
             throttledUntil = Clock.currTime.toUnixTime!long * 1000 + 30 * 60 * 1000;
             emitLog("info", "Banned via " ~ via ~ " and no other exit is available"
@@ -7939,21 +8293,6 @@ private void processEvents() {
             default:
                 return false;
         }
-    }
-
-    private string extractQuitReason(string errorText) {
-        auto start = errorText.indexOf("(Quit:");
-        if (start >= 0) {
-            start += 6;
-            auto end = errorText.indexOf(")", start);
-            if (end > start) return errorText[start .. end].strip();
-        }
-        auto lastOpen  = errorText.lastIndexOf("(");
-        if (lastOpen >= 0) {
-            auto lastClose = errorText.lastIndexOf(")");
-            if (lastClose > lastOpen) return errorText[lastOpen + 1 .. lastClose].strip();
-        }
-        return "";
     }
 
     /// W1-T01 (plan R1): substring-keyed map from disconnect reason

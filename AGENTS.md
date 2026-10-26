@@ -197,6 +197,7 @@ Banner states (W3-T01 / W3-rev1):
 | `fail-blocked` | `failInfo.type === 'connection_blocked'` | `Disconnected - Connections to this server have been blocked` |
 | `fail-connecting` | `failInfo.type === 'connecting_failed'` | `Failed to connect - {renderReason(reason)}` |
 | `fail-socket` | `failInfo.type === 'socket_closed'` | `Disconnected: {renderReason(reason)}` |
+| `fail-sasl` | `failInfo.type` ∈ `sasl_required`, `sasl_failed` (engine parked the network: the server only admits SASL logins, or rejected the configured one) | `{failInfo.reason}` — the engine's full sentence, wrapped; clicking opens Edit network on its SASL settings, and saving changed SASL settings re-enables + reconnects |
 | `disconnected` | disconnected (no failInfo) | `Disconnected: {renderReason(disconnectReason)}` (legacy string fallback) |
 
 Inline warnings (always appended, never replace the headline):

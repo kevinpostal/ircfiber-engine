@@ -63,6 +63,17 @@ void runDedupTests() {
     clearReconnectInFlight("does-not-exist");
     check!("clear of unknown ID is no-op")
         (!isReconnectInFlight("does-not-exist"));
+
+    // 6. a changed configuration is not a duplicate: a SASL edit that
+    //    re-enables a parked network inside the window must replace the
+    //    client, not be dropped (the parked client kept idling while Mongo
+    //    said enabled).
+    markReconnectInFlight("network-D", `{"sasl":"plain","saslPassword":"wrong"}`);
+    check!("same configuration inside the window is a duplicate")
+        (isReconnectInFlight("network-D", `{"sasl":"plain","saslPassword":"wrong"}`));
+    check!("changed configuration inside the window is not a duplicate")
+        (!isReconnectInFlight("network-D", `{"sasl":"scramSha256","saslPassword":"secret"}`));
+    clearReconnectInFlight("network-D");
 }
 
 /// Runs the stale-TTL auto-expiry test scenarios.
