@@ -106,28 +106,21 @@ final class MessageRepository {
     private void ensureIndexes() @trusted {
         if (indexesEnsured) return;
         indexesEnsured = true;
+        // Key order is the index: equality fields first, the sorted/ranged
+        // field last. Built field by field — a `Bson(["a": …, "b": …])`
+        // literal is an associative array whose iteration order is unspecified,
+        // and prod ended up with `t_-1_networkId_1_channel_1_serverId_1`, which
+        // turns every newest-N read on a busy channel into a 17 s fetch-and-filter
+        // walk over all networks (#superbowl, 2026-10-25).
         try {
             // Primary compound index: pagination by timestamp
-            collection.createIndex(
-                Bson([
-                    "serverId": Bson(1),
-                    "networkId": Bson(1),
-                    "channel": Bson(1),
-                    "t": Bson(-1)
-                ])
-            );
+            collection.createIndex(indexKeys(["serverId", "networkId", "channel"], "t"));
             // eid index: fast cursor lookups for eid-based pagination
-            collection.createIndex(
-                Bson([
-                    "serverId": Bson(1),
-                    "networkId": Bson(1),
-                    "channel": Bson(1),
-                    "eid": Bson(-1)
-                ])
-            );
+            collection.createIndex(indexKeys(["serverId", "networkId", "channel"], "eid"));
         } catch (Exception e) {
             logWarn("Failed to create messages compound index: %s", e.msg);
         }
+        dropScrambledIndexes();
 
         const retentionDays = messageRetentionDays();
         try {
@@ -168,6 +161,35 @@ final class MessageRepository {
                 logWarn("messages retention backfill failed: %s", e.msg);
             }
         });
+    }
+
+    /// `{eq[0]: 1, …, eq[$-1]: 1, sorted: -1}` in exactly that order.
+    private static Bson indexKeys(string[] eq, string sorted) @trusted {
+        auto keys = Bson.emptyObject;
+        foreach (f; eq) keys[f] = Bson(1);
+        keys[sorted] = Bson(-1);
+        return keys;
+    }
+
+    /// The same fields in associative-array order, which earlier builds created
+    /// (sorted field first). Superseded by the ordered indexes above; dropped
+    /// once those exist so writes stop maintaining two copies. Best-effort.
+    private void dropScrambledIndexes() @trusted {
+        static immutable string[] legacy = [
+            "t_-1_networkId_1_channel_1_serverId_1",
+            "networkId_1_eid_-1_channel_1_serverId_1",
+        ];
+        try {
+            bool[string] present;
+            foreach (idx; collection.listIndexes()) present[idx["name"].get!string] = true;
+            if ("serverId_1_networkId_1_channel_1_t_-1" !in present
+                || "serverId_1_networkId_1_channel_1_eid_-1" !in present) return;
+            foreach (name; legacy)
+                if (name in present) {
+                    collection.dropIndex(name);
+                    logInfo("messages: dropped scrambled index %s", name);
+                }
+        } catch (Exception e) logWarn("messages scrambled index drop: %s", e.msg);
     }
 
     /// Normalize channel name via the canonical helper in
