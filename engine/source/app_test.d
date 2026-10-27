@@ -35,6 +35,7 @@ import ircfiber.irc.parser;
 import ircfiber.irc.sasl;
 import ircfiber.irc.pacer;
 import ircfiber.irc.reconnect;
+import ircfiber.engine.session_snapshot;
 
 private uint g_passed;
 private uint g_failed;
@@ -67,7 +68,8 @@ int main() {
         ircfiber.irc.sasl,
         ircfiber.irc.pacer,
         ircfiber.irc.reconnect,
-        ircfiber.irc.chathistory
+        ircfiber.irc.chathistory,
+        ircfiber.engine.session_snapshot
     )();
     writefln("\n%d passed, %d failed", g_passed, g_failed);
     exit(g_failed == 0 ? 0 : 1);

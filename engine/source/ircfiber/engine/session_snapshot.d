@@ -73,6 +73,10 @@ struct SessionSnapshot {
     string[] ackedCaps;
     /// Active query PM targets.
     string[] queryBuffers;
+    /// Folded DM nick → the counterparty's services account / user@host,
+    /// as their latest message showed them (the DM nick-follow identity).
+    string[string] queryAccounts;
+    string[string] queryHosts;
     /// Connect attempts before this session (flushed to the next CONNECT).
     string[] failureReasons;
     /// Lines buffered but not yet written. On a graceful detach this also
@@ -167,6 +171,8 @@ Json toJSON(ref SessionSnapshot s) {
     j["serverSoftware"] = s.serverSoftware;
     j["ackedCaps"] = jsonArrayOf(s.ackedCaps);
     j["queryBuffers"] = jsonArrayOf(s.queryBuffers);
+    j["queryAccounts"] = stringMapToJSON(s.queryAccounts);
+    j["queryHosts"] = stringMapToJSON(s.queryHosts);
     j["failureReasons"] = jsonArrayOf(s.failureReasons);
     j["outboundQueue"] = jsonArrayOf(s.outboundQueue);
     j["channelState"] = stringMapToJSON(s.channelState);
@@ -290,6 +296,8 @@ SessionSnapshot fromJSON(Json j) {
 
     if (isArr(j["ackedCaps"])) foreach (v; j["ackedCaps"]) s.ackedCaps ~= str(v);
     if (isArr(j["queryBuffers"])) foreach (v; j["queryBuffers"]) s.queryBuffers ~= str(v);
+    if (isObj(j["queryAccounts"])) foreach (string k, v; j["queryAccounts"]) s.queryAccounts[k] = str(v);
+    if (isObj(j["queryHosts"])) foreach (string k, v; j["queryHosts"]) s.queryHosts[k] = str(v);
     if (isArr(j["failureReasons"])) foreach (v; j["failureReasons"]) s.failureReasons ~= str(v);
     if (isArr(j["outboundQueue"])) foreach (v; j["outboundQueue"]) s.outboundQueue ~= str(v);
 
@@ -339,6 +347,8 @@ unittest {
     s.pendingLabels["abc"] = 42;
     s.egressLabel = "de";
     s.outboundQueue = ["PRIVMSG #staff :hi"];
+    s.queryHosts["p34c3"] = "~user@788114F4.IP";
+    s.queryAccounts["p34c3"] = "p34c3";
     auto j = toJSON(s);
     auto back = fromJSON(j);
     assert(back.sessionNick == "Zodiac" && back.wasConnected && back.graceful);
@@ -346,6 +356,9 @@ unittest {
     assert(back.ackedCaps == ["sasl", "multi-prefix"]);
     assert(back.pendingLabels["abc"] == 42);
     assert(back.egressLabel == "de" && back.outboundQueue == ["PRIVMSG #staff :hi"]);
+    // A hot swap must not forget who each DM partner is, or every
+    // conversation stops following its partner's renames until they speak.
+    assert(back.queryHosts["p34c3"] == "~user@788114F4.IP" && back.queryAccounts["p34c3"] == "p34c3");
 
     auto bad = Json.emptyObject;
     bad["schemaTag"] = "IRCFv0";

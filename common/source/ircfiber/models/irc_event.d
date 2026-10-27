@@ -123,6 +123,11 @@ struct IRCRawEvent {
         if (phase.length) j["phase"] = Json(phase);
         auto selfEcho = getTag("self_echo");
         if (selfEcho.length) j["se"] = Json(selfEcho);
+        // A counterparty's NICK that the engine verified is the person a
+        // DM was held with (connection.d `dmFollowsNick`): only then does
+        // the conversation follow the rename, in storage and in the UI.
+        auto queryFollow = getTag("query_follow");
+        if (queryFollow.length) j["qf"] = Json(queryFollow);
         // IRCv3 typing indicator (message-tags ext): TAGMSG events carry
         // +typing=active|done. Ship the value so the frontend can clear
         // the indicator on `done` instead of treating every TAGMSG as

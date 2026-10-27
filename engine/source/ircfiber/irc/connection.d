@@ -1971,6 +1971,55 @@ unittest {
     assert(!nicksEqualMapped("Zod", "Zod_", "rfc1459"));
 }
 
+/// `nick` folded per CASEMAPPING — the key for nick-indexed maps, so the
+/// spellings `nicksEqualMapped` treats as one nick share one entry. Pure.
+string foldNickMapped(string nick, string mapping) @safe pure nothrow {
+    string folded;
+    folded.reserve(nick.length);
+    foreach (c; nick) folded ~= foldCaseChar(c, mapping);
+    return folded;
+}
+
+@("foldNickMapped gives every spelling of one nick one key")
+unittest {
+    foreach (m; ["ascii", "rfc1459", "rfc1459-strict"])
+        foreach (pair; [["Bob", "bob"], ["a[b]", "A{B}"], ["x^y", "X~Y"], ["pizza``", "p34c3"]])
+            assert((foldNickMapped(pair[0], m) == foldNickMapped(pair[1], m))
+                   == nicksEqualMapped(pair[0], pair[1], m));
+}
+
+/// Whether the user renaming away from a tracked DM nick is the person that
+/// conversation was held with, so the DM may follow the rename. A nick is
+/// not an identity: anyone can take one the moment its holder drops it, and
+/// following on the nick alone carried a conversation onto whoever held the
+/// nick last. The services account decides when both sides carry one, else
+/// user@host; when neither side proves it, the DM stays where it is. Pure.
+bool dmFollowsNick(string knownAccount, string knownHostmask,
+                   string account, string hostmask) @safe pure nothrow {
+    if (knownAccount.length && account.length)
+        return nicksEqualMapped(knownAccount, account, "ascii");
+    return knownHostmask.length && hostmask.length
+        && nicksEqualMapped(knownHostmask, hostmask, "ascii");
+}
+
+@("dmFollowsNick follows only the person the DM was held with")
+unittest {
+    // Same user@host, no services account on either side: they renamed.
+    assert(dmFollowsNick("", "~user@788114F4.IP", "", "~user@788114f4.ip"));
+    // Someone else briefly holding the nick (the p34c3 -> pizza` report).
+    assert(!dmFollowsNick("", "~user@788114F4.IP", "", "~stillfree@B6A09300.IP"));
+    // The account decides when both carry one: a new address is still them…
+    assert(dmFollowsNick("p34c3", "~user@1.IP", "P34C3", "~user@2.IP"));
+    // …and the old address under another account is not.
+    assert(!dmFollowsNick("p34c3", "~user@1.IP", "other", "~user@1.IP"));
+    // An account on one side only falls back to user@host.
+    assert(dmFollowsNick("p34c3", "~user@1.IP", "", "~user@1.IP"));
+    assert(!dmFollowsNick("", "~user@1.IP", "p34c3", "~user@2.IP"));
+    // Nothing known about the counterparty: a nick alone never follows.
+    assert(!dmFollowsNick("", "", "", "~user@1.IP"));
+    assert(!dmFollowsNick("", "~user@1.IP", "", ""));
+}
+
 // ── MONITOR command builder (IRCv3 monitor) ───────────────────────────────────
 // Verbs: "+" / "-" (targets required, comma-separated nicks),
 // "C" (clear), "L" (list), "S" (status query). Returns null when the
@@ -2618,6 +2667,12 @@ final class PersistentIRCClient {
         // Ident (username) extracted from nick!user@host in JOIN/353
         string[string]      idents;
         string[]            queryBuffers;
+        /// Each DM counterparty as their own latest message showed them,
+        /// keyed by `foldNick`: services account (account-tag /
+        /// account-notify) and user@host. A NICK away from a tracked query
+        /// moves the conversation only when `dmFollowsNick` matches these.
+        string[string]      queryAccounts;
+        string[string]      queryHosts;
                 string              lastErrorText;
                 string[]            failureReasons;
                  // Tracks when the server told us we're throttled (unix ms).
@@ -3118,6 +3173,8 @@ final class PersistentIRCClient {
         s.awayMessage = awayMessage;
         s.ackedCaps = getAckedCaps();
         s.queryBuffers = queryBuffers.dup;
+        s.queryAccounts = queryAccounts.dup;
+        s.queryHosts = queryHosts.dup;
         s.failureReasons = failureReasons.dup;
         s.outboundQueue = outboundQueue.dup;
         if (graceful && pacedQueue.length > 0) s.outboundQueue ~= pacedQueue.dup;
@@ -3207,6 +3264,8 @@ final class PersistentIRCClient {
         awayMessage = s.awayMessage;
         foreach (cap; s.ackedCaps) ackedCaps[cap] = true;
         queryBuffers = s.queryBuffers.dup;
+        queryAccounts = s.queryAccounts.dup;
+        queryHosts = s.queryHosts.dup;
         failureReasons = s.failureReasons.dup;
         outboundQueue = s.outboundQueue.dup;
         channelState = s.channelState.dup;
@@ -3634,6 +3693,12 @@ final class PersistentIRCClient {
     /// nick against the channel roster or the session nick.
     bool sameNick(string a, string b) {
         return nicksEqualMapped(stripNickPrefix(a), stripNickPrefix(b), casemapping());
+    }
+
+    /// `nick` without status prefixes, folded per CASEMAPPING: the key of
+    /// the DM identity maps (`queryAccounts`, `queryHosts`).
+    string foldNick(string nick) {
+        return foldNickMapped(stripNickPrefix(nick), casemapping());
     }
 
     /// The server's ISUPPORT CASEMAPPING, defaulting to rfc1459 (the
@@ -6330,6 +6395,12 @@ private void processEvents() {
                             }
                         }
                     }
+                    // Who is renaming, for the DM identity check below: the
+                    // NICK's account-tag, else what account-notify last said.
+                    string renamerAccount = event.getTag("account");
+                    if (renamerAccount.length == 0)
+                        if (auto p = event.nick in accounts)
+                            if (*p != "*") renamerAccount = *p;
                     // Keep the nick-keyed services-account cache in step with
                     // the roster rename, else the sync snapshot reports the
                     // account under the old nick and the badge drops off.
@@ -6398,22 +6469,43 @@ private void processEvents() {
                         eventChannel.put(youChange);
                     } else {
                         // Query-partner NICK following (IRCCloud rename
-                        // model): keep the tracked counterparty on the new
-                        // nick so sync + future echoes use it. If the new
-                        // nick is already tracked separately, drop the stale
-                        // entry instead of merging — never destroy history.
-                        // (Redis/Mongo key migration happens in the event
-                        // processor, which owns the stores.)
-                        ptrdiff_t oldIdx = -1, newIdx = -1;
-                        foreach (i, q; queryBuffers) {
-                            if (oldIdx < 0 && sameNick(q, event.nick)) oldIdx = i;
-                            if (newIdx < 0 && sameNick(q, newNick)) newIdx = i;
-                        }
-                        if (oldIdx >= 0 && newIdx < 0) {
-                            queryBuffers[oldIdx] = newNick;
-                        } else if (oldIdx >= 0 && newIdx >= 0 && newIdx != oldIdx) {
-                            queryBuffers[oldIdx] = queryBuffers[$ - 1];
-                            queryBuffers.length--;
+                        // model), for the same person only: a nick is no
+                        // identity. A stranger who held a DM partner's old
+                        // nick for seconds and renamed away used to drag
+                        // the whole conversation onto their nick chain.
+                        // On a match, keep the tracked counterparty on the
+                        // new nick so sync + future echoes use it, and tag
+                        // the event `query_follow`: the event processor
+                        // then moves the stored history and the frontend
+                        // renames its buffer. If the new nick is already
+                        // tracked separately, drop the stale entry instead
+                        // of merging — never destroy history.
+                        const oldKey = foldNick(event.nick);
+                        if (dmFollowsNick(queryAccounts.get(oldKey, ""), queryHosts.get(oldKey, ""),
+                                          renamerAccount, event.hostmask)) {
+                            ptrdiff_t oldIdx = -1, newIdx = -1;
+                            foreach (i, q; queryBuffers) {
+                                if (oldIdx < 0 && sameNick(q, event.nick)) oldIdx = i;
+                                if (newIdx < 0 && sameNick(q, newNick)) newIdx = i;
+                            }
+                            if (oldIdx >= 0 && newIdx < 0) {
+                                queryBuffers[oldIdx] = newNick;
+                                event.addTag("query_follow", "true");
+                            } else if (oldIdx >= 0 && newIdx >= 0 && newIdx != oldIdx) {
+                                queryBuffers[oldIdx] = queryBuffers[$ - 1];
+                                queryBuffers.length--;
+                            }
+                            const newKey = foldNick(newNick);
+                            if (newKey != oldKey) {
+                                if (auto a = oldKey in queryAccounts) {
+                                    queryAccounts[newKey] = *a;
+                                    queryAccounts.remove(oldKey);
+                                }
+                                if (auto h = oldKey in queryHosts) {
+                                    queryHosts[newKey] = *h;
+                                    queryHosts.remove(oldKey);
+                                }
+                            }
                         }
                     }
                     logJsonMap("info", "protocol",
@@ -6433,6 +6525,13 @@ private void processEvents() {
                             break;
                         }
                     }
+                }
+                // A DM counterparty with a new user@host is still them.
+                {
+                    auto hp = event.getParams();
+                    const key = foldNick(event.nick);
+                    if (hp.length >= 2 && (key in queryHosts) !is null)
+                        queryHosts[key] = hp[0] ~ "@" ~ hp[1];
                 }
                 break;
 
@@ -6841,6 +6940,13 @@ private void processEvents() {
                     auto ap = event.getParams();
                     if (ap.length >= 1 && ap[0].length > 0 && event.nick.length > 0) {
                         accounts[event.nick] = ap[0];
+                        // A DM counterparty logging in or out ("*") stays
+                        // comparable for `dmFollowsNick`.
+                        const key = foldNick(event.nick);
+                        if ((key in queryHosts) !is null || (key in queryAccounts) !is null) {
+                            if (ap[0] == "*") queryAccounts.remove(key);
+                            else queryAccounts[key] = ap[0];
+                        }
                         // Colon-less `ACCOUNT acct` parses with empty text;
                         // the timeline renders msg.text, so normalize it.
                         if (event.text.length == 0)
@@ -7259,6 +7365,15 @@ private void processEvents() {
                         queryBuffers ~= other;
                     } else if (!outgoing && queryBuffers[found] != other) {
                         queryBuffers[found] = other;
+                    }
+                    // Who they are, for `dmFollowsNick`: their latest
+                    // message's account-tag and user@host.
+                    if (!outgoing) {
+                        const key = foldNick(other);
+                        const acct = event.getTag("account");
+                        if (acct.length) queryAccounts[key] = acct;
+                        else queryAccounts.remove(key);
+                        if (event.hostmask.length) queryHosts[key] = event.hostmask;
                     }
                 }
             }

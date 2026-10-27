@@ -218,27 +218,22 @@ void startEventProcessor(ref EngineContext ctx) {
                 // NICK-follow storage rename (IRCCloud rename model): when a
                 // DM counterparty changes nick, migrate the Redis
                 // scrollback keys + Mongo channel field so history follows
-                // the conversation across reloads/backfill. Base event only
-                // (channel empty; per-channel dups must not re-run it).
+                // the conversation across reloads/backfill. Only for the
+                // base event the connection tagged `query_follow`, i.e. the
+                // renamer is verifiably the person the DM was held with
+                // (connection.d `dmFollowsNick`) — never on the nick alone,
+                // and never on the per-channel dups.
                 // Runs INLINE (not runTask): a follow-up PRIVMSG under the
                 // new nick must append after the rename, otherwise RENAMENX
                 // sees an existing destination and the history splits.
                 // Best-effort try/catch: storage must never break the loop.
-                if (foundNet && event.command == "NICK" && event.channel.length == 0) {
+                if (foundNet && event.command == "NICK" && event.channel.length == 0
+                    && event.getTag("query_follow").length > 0) {
                     try {
                         auto nickParams = event.getParams();
-                        if (nickParams.length > 0) {
+                        if (nickParams.length > 0 && event.nick.length > 0) {
                             string newNick = nickParams[$ - 1];
-                            auto nickClient = ctx.connManager.getClient(matchedNet.config.id);
-                            import std.uni : icmp;
-                            bool ownChange = nickClient !is null
-                                && event.nick.length > 0
-                                && icmp(event.nick, nickClient.getCurrentNick) == 0;
-                            // Only DM scrollback keys (bare nicks) can match
-                            // an old nick — channel keys carry a prefix — so
-                            // this is a no-op unless they DM'd. Never touch
-                            // our own change (counterparties are unchanged).
-                            if (!ownChange && event.nick.length > 0 && newNick.length > 0) {
+                            if (newNick.length > 0) {
                                 ctx.bufferManager.renameBuffer(
                                     serverId, event.networkId, event.nick, newNick);
                                 ctx.messageRepo.renameChannel(
