@@ -8982,3 +8982,49 @@ unittest {
     assert(!webircSwapSuppressed("irc.ircfiber.com", "9.9.9.9"),
            "empty records change nothing");
 }
+
+@("a DM follows its partner's NICK, never a stranger holding the nick")
+unittest {
+    import std.typecons : tuple;
+    import vibe.core.channel : createChannel;
+
+    // Feeds raw lines to a fresh client nicked `me`; returns it with the
+    // last channel-less (base) NICK event it emitted.
+    static auto run(string[] lines) {
+        NetworkConfig cfg;
+        cfg.nick = "me";
+        auto ch = createChannel!IRCRawEvent();
+        auto c = new PersistentIRCClient(cfg, ch);
+        foreach (l; lines) c.processLine(l);
+        ch.close(); // an open, empty channel blocks tryConsumeOne
+        IRCRawEvent nick, e;
+        while (ch.tryConsumeOne(e))
+            if (e.command == "NICK" && e.channel.length == 0) nick = e;
+        return tuple(c, nick);
+    }
+
+    // The partner renames (same user@host): the DM and its history follow.
+    auto partner = run([":bob!~b@h1.IP PRIVMSG me :hi", ":bob!~b@h1.IP NICK :robert"]);
+    assert(partner[0].getQueryBuffers() == ["robert"]);
+    assert(partner[1].getTag("query_follow") == "true");
+
+    // Someone else holding the nick renames away (the p34c3 -> pizza`
+    // report): the DM stays, and nothing downstream is told to move it.
+    auto stranger = run([":p34c3!~user@788114F4.IP PRIVMSG me :whats up",
+                         ":p34c3!~stillfree@B6A09300.IP NICK :pizza`"]);
+    assert(stranger[0].getQueryBuffers() == ["p34c3"]);
+    assert(stranger[1].getTag("query_follow") == "");
+
+    // The services account decides when both sides carry one, and the
+    // identity moves with the nick, so a second rename follows too.
+    auto chain = run(["@account=p34c3 :p34c3!~user@1.IP PRIVMSG me :yo",
+                      "@account=p34c3 :p34c3!~user@1.IP NICK :smirn0ff",
+                      "@account=p34c3 :smirn0ff!~user@1.IP NICK :sm1rn0ff"]);
+    assert(chain[0].getQueryBuffers() == ["sm1rn0ff"]);
+    assert(chain[1].getTag("query_follow") == "true");
+
+    // Only our own outgoing DMs: nobody's identity is known, so no follow.
+    auto outgoing = run([":me!~me@h0.IP PRIVMSG carol :hello", ":carol!~c@h3.IP NICK :caroline"]);
+    assert(outgoing[0].getQueryBuffers() == ["carol"]);
+    assert(outgoing[1].getTag("query_follow") == "");
+}
