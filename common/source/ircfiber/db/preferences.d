@@ -101,7 +101,7 @@ immutable string[] DISPLAY_MODE_INDICATORS = ["dots", "symbols", "hidden"];
 /// `timestampFormat` values; "auto" follows the device/browser locale.
 immutable string[] DISPLAY_TIMESTAMP_FORMATS = ["auto", "12h", "24h"];
 /// The boolean account display prefs, in wire order.
-immutable string[] DISPLAY_BOOL_PREFS = ["showUserIcons", "monospaceFont", "enlargeEmoji", "coloriseMentions", "formatColors"];
+immutable string[] DISPLAY_BOOL_PREFS = ["showUserIcons", "monospaceFont", "enlargeEmoji", "coloriseMentions", "formatColors", "showTimestamps"];
 /// Highlight words per account, and the longest word in bytes.
 enum MAX_HIGHLIGHT_WORDS = 100;
 enum MAX_HIGHLIGHT_WORD_BYTES = 64;
@@ -188,6 +188,7 @@ struct UserPreferences {
     bool enlargeEmoji = true;
     bool coloriseMentions = true;
     bool formatColors = true;
+    bool showTimestamps = true;
     string timestampFormat = "auto";
     /// Words highlighted like the own nick (whole word, case-insensitive); web and app share them.
     string[] highlightWords;
@@ -510,7 +511,7 @@ Json stringArrayJson(const string[] items) {
     return j;
 }
 
-/// The account display prefs as one object: `displayPrefsSet` plus the seven
+/// The account display prefs as one object: `displayPrefsSet` plus the eight
 /// synced keys. This is the `displayPrefs` value of GET /api/me, `stat_user`
 /// and the `displayPrefs` pref_update.
 Json displayPrefsJson(const ref UserPreferences p) {
@@ -1236,16 +1237,17 @@ unittest {
     p.enlargeEmoji = false;
     p.coloriseMentions = false;
     p.formatColors = false;
+    p.showTimestamps = false;
     p.timestampFormat = "24h";
     p.highlightWords = ["deploy", "prod"];
     const r = UserPreferences.fromJson(p.toJson());
     assert(!r.needsRepair);
     assert(r.prefs.displayPrefsSet && !r.prefs.showUserIcons && !r.prefs.monospaceFont);
-    assert(!r.prefs.enlargeEmoji && !r.prefs.coloriseMentions && !r.prefs.formatColors);
+    assert(!r.prefs.enlargeEmoji && !r.prefs.coloriseMentions && !r.prefs.formatColors && !r.prefs.showTimestamps);
     assert(r.prefs.modeIndicator == "symbols" && r.prefs.timestampFormat == "24h");
     assert(r.prefs.highlightWords == ["deploy", "prod"]);
     const dp = displayPrefsJson(r.prefs);
-    assert(dp["displayPrefsSet"].get!bool && !dp["showUserIcons"].get!bool);
+    assert(dp["displayPrefsSet"].get!bool && !dp["showUserIcons"].get!bool && !dp["showTimestamps"].get!bool);
     assert(dp["modeIndicator"].get!string == "symbols" && dp["timestampFormat"].get!string == "24h");
 
     // A blob saved before these fields existed decodes to the defaults.
@@ -1254,7 +1256,7 @@ unittest {
     const l = UserPreferences.fromJson(legacy);
     assert(!l.needsRepair);
     assert(!l.prefs.displayPrefsSet && l.prefs.showUserIcons && l.prefs.monospaceFont);
-    assert(l.prefs.enlargeEmoji && l.prefs.coloriseMentions && l.prefs.formatColors);
+    assert(l.prefs.enlargeEmoji && l.prefs.coloriseMentions && l.prefs.formatColors && l.prefs.showTimestamps);
     assert(l.prefs.modeIndicator == "dots" && l.prefs.timestampFormat == "auto");
     assert(l.prefs.highlightWords.length == 0);
     // An empty list is stored and sent as [], never null.
@@ -1303,6 +1305,9 @@ unittest {
     j["formatColors"] = Json(false);
     assert(checkDisplayPrefsPatch(j, any) == "");
     assert(any);
+    j = Json.emptyObject;
+    j["showTimestamps"] = Json(false);
+    assert(checkDisplayPrefsPatch(j, any) == "" && any, "showTimestamps alone is a display pref (iOS sends single-key patches)");
 }
 
 @("applyDisplayPrefsPatch writes only the given keys and sets displayPrefsSet")
