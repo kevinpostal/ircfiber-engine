@@ -18,6 +18,8 @@ struct PushDevice {
     string bundleId;
     /// Device model as reported by the app (`iPhone16,1`).
     string model;
+    /// The app's install id (`X-IRCFiber-Device`); empty for registrations made without it.
+    string deviceId;
     /// First registration (unix ms).
     long createdAt;
     /// Latest registration (unix ms).
@@ -27,7 +29,7 @@ struct PushDevice {
     Bson toBson() const @trusted {
         return Bson([
             "_id": Bson(token), "userId": Bson(userId), "environment": Bson(environment),
-            "bundleId": Bson(bundleId), "model": Bson(model),
+            "bundleId": Bson(bundleId), "model": Bson(model), "deviceId": Bson(deviceId),
             "createdAt": Bson(createdAt), "lastSeenAt": Bson(lastSeenAt),
         ]);
     }
@@ -40,6 +42,8 @@ struct PushDevice {
         d.environment = b["environment"].get!string;
         d.bundleId = b["bundleId"].get!string;
         d.model = b["model"].get!string;
+        auto id = b["deviceId"];
+        d.deviceId = id.type == Bson.Type.string ? id.get!string : "";
         d.createdAt = b["createdAt"].get!long;
         d.lastSeenAt = b["lastSeenAt"].get!long;
         return d;
@@ -76,6 +80,7 @@ final class PushDeviceRepository {
         setDoc["environment"] = Bson(d.environment);
         setDoc["bundleId"] = Bson(d.bundleId);
         setDoc["model"] = Bson(d.model);
+        setDoc["deviceId"] = Bson(d.deviceId);
         setDoc["lastSeenAt"] = Bson(d.lastSeenAt);
         auto selector = Bson(["_id": Bson(d.token)]);
         if (collection.updateOne(selector, Bson(["$set": setDoc])).matchedCount > 0) return;
@@ -123,6 +128,14 @@ final class PushDeviceRepository {
         collection.deleteOne(Bson(["_id": Bson(token)]));
     }
 
+    /// Removes every registration one install of the user's made ("Remove" in
+    /// Settings → Sessions → Mobile devices); returns how many. 0 without
+    /// querying for an empty `deviceId`, which would match the legacy ones.
+    size_t removeByDevice(string userId, string deviceId) @trusted {
+        if (!deviceId.length) return 0;
+        return cast(size_t) collection.deleteMany(Bson(["userId": Bson(userId), "deviceId": Bson(deviceId)])).deletedCount;
+    }
+
     /// Removes every device of a user (account deletion).
     void removeAllForUser(string userId) @trusted {
         collection.deleteMany(Bson(["userId": Bson(userId)]));
@@ -137,9 +150,21 @@ unittest {
     d.environment = "sandbox";
     d.bundleId = "com.ircfiber.ios";
     d.model = "iPhone16,1";
+    d.deviceId = "11111111-2222-4333-8444-555555555555";
     d.createdAt = 1_765_000_000_000;
     d.lastSeenAt = 1_765_000_100_000;
     auto b = d.toBson();
     assert(b["_id"].get!string == "ab12");
     assert(PushDevice.fromBson(b) == d);
+}
+
+@("PushDevice registered before install ids decodes with an empty deviceId")
+unittest {
+    auto b = Bson([
+        "_id": Bson("ab12"), "userId": Bson("u1"), "environment": Bson("production"),
+        "bundleId": Bson("com.ircfiber.ios"), "model": Bson("iPhone16,1"),
+        "createdAt": Bson(1L), "lastSeenAt": Bson(2L),
+    ]);
+    const d = PushDevice.fromBson(b);
+    assert(d.deviceId == "" && d.token == "ab12" && d.lastSeenAt == 2);
 }

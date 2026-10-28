@@ -102,9 +102,110 @@ immutable string[] DISPLAY_MODE_INDICATORS = ["dots", "symbols", "hidden"];
 immutable string[] DISPLAY_TIMESTAMP_FORMATS = ["auto", "12h", "24h"];
 /// The boolean account display prefs, in wire order.
 immutable string[] DISPLAY_BOOL_PREFS = ["showUserIcons", "monospaceFont", "enlargeEmoji", "coloriseMentions", "formatColors", "showTimestamps"];
+/// Mobile device profiles kept per account; creating one past this drops the one seen least recently.
+enum MAX_DEVICE_PROFILES = 20;
+/// The iOS app's install id header; selects the device's own settings profile.
+enum DEVICE_HEADER = "X-IRCFiber-Device";
+/// The iOS app's hardware model header (`iPhone17,1`), shown in Settings → Sessions → Mobile devices.
+enum DEVICE_MODEL_HEADER = "X-IRCFiber-Device-Model";
+/// `lastSeenAt` is rewritten at most this often by reads, so GET /api/me stays read-only in steady state.
+enum long DEVICE_SEEN_GRANULARITY_MS = 3_600_000;
+/// Bool fields a device profile shares with the account's flat fields, in wire order.
+immutable string[] DEVICE_BOOL_PREFS = ["showMemberPrefixes", "desktopNotifications", "notificationSound", "autoDismissNotifs", "muteAll", "displayPrefsSet", "showUserIcons", "monospaceFont", "enlargeEmoji", "coloriseMentions", "formatColors", "showTimestamps"];
+/// The settings a device profile keeps apart from the web's: everything in it but `displayPrefsSet` and the metadata.
+private immutable string[] DEVICE_SETTINGS = ["showMemberPrefixes", "desktopNotifications", "notificationSound", "autoDismissNotifs", "muteAll", "showUserIcons", "monospaceFont", "modeIndicator", "enlargeEmoji", "coloriseMentions", "formatColors", "showTimestamps", "timestampFormat"];
+/// The notification prefs (POST /api/me/notification-prefs), in wire order.
+immutable string[] NOTIFICATION_PREFS = ["desktopNotifications", "notificationSound", "autoDismissNotifs", "muteAll"];
 /// Highlight words per account, and the longest word in bytes.
 enum MAX_HIGHLIGHT_WORDS = 100;
 enum MAX_HIGHLIGHT_WORD_BYTES = 64;
+
+/// One iOS install's own display, member-list and notification settings (`UserPreferences.devices`).
+/// The settings fields have the names, types and defaults of the account's flat fields, so
+/// `displayPrefsJson`, `applyDisplayPrefsPatch` and `applyNotificationPatch` take either.
+struct DeviceProfile {
+    bool showMemberPrefixes = false;
+    bool desktopNotifications = true;
+    bool notificationSound = true;
+    bool autoDismissNotifs = true;
+    bool muteAll = false;
+    /// Always true: a profile starts as a copy of settings the account already has, so the app
+    /// never runs a first-time seed from its own storage.
+    bool displayPrefsSet = true;
+    bool showUserIcons = true;
+    bool monospaceFont = true;
+    string modeIndicator = "dots";
+    bool enlargeEmoji = true;
+    bool coloriseMentions = true;
+    bool formatColors = true;
+    bool showTimestamps = true;
+    string timestampFormat = "auto";
+    /// Hardware model from `DEVICE_MODEL_HEADER` (`iPhone17,1`); "" until the app sends a valid one.
+    string model;
+    /// Unix ms of the device's first request.
+    long createdAt;
+    /// Unix ms of the last settings change.
+    long updatedAt;
+    /// Unix ms of the device's last request, at `DEVICE_SEEN_GRANULARITY_MS` granularity.
+    long lastSeenAt;
+
+    /// Serializes every field under its own name.
+    Json toJson() const {
+        auto j = Json.emptyObject;
+        static foreach (key; DEVICE_BOOL_PREFS)
+            j[key] = Json(__traits(getMember, this, key));
+        j["modeIndicator"] = Json(modeIndicator);
+        j["timestampFormat"] = Json(timestampFormat);
+        j["model"] = Json(model);
+        j["createdAt"] = Json(createdAt);
+        j["updatedAt"] = Json(updatedAt);
+        j["lastSeenAt"] = Json(lastSeenAt);
+        return j;
+    }
+
+    /// Decodes a stored profile. A present field of the wrong type (or an unknown enum value, or a
+    /// malformed model) keeps its default and sets `bad`; missing fields keep their defaults and
+    /// unknown keys are ignored.
+    static DeviceProfile fromJson(Json j, out bool bad) {
+        DeviceProfile d;
+        static foreach (key; DEVICE_BOOL_PREFS) {
+            if (auto v = key in j) {
+                if (v.type == Json.Type.bool_)
+                    __traits(getMember, d, key) = v.get!bool;
+                else
+                    bad = true;
+            }
+        }
+        if (auto v = "modeIndicator" in j) {
+            if (v.type == Json.Type.string && DISPLAY_MODE_INDICATORS.canFind(v.get!string))
+                d.modeIndicator = v.get!string;
+            else
+                bad = true;
+        }
+        if (auto v = "timestampFormat" in j) {
+            if (v.type == Json.Type.string && DISPLAY_TIMESTAMP_FORMATS.canFind(v.get!string))
+                d.timestampFormat = v.get!string;
+            else
+                bad = true;
+        }
+        if (auto v = "model" in j) {
+            // "" is a stored "no model yet", not damage.
+            if (v.type == Json.Type.string && (v.get!string.length == 0 || isDeviceModel(v.get!string)))
+                d.model = v.get!string;
+            else
+                bad = true;
+        }
+        static foreach (key; ["createdAt", "updatedAt", "lastSeenAt"]) {
+            if (auto v = key in j) {
+                if (v.type == Json.Type.int_)
+                    __traits(getMember, d, key) = v.get!long;
+                else
+                    bad = true;
+            }
+        }
+        return d;
+    }
+}
 
 /// User preference settings.
 struct UserPreferences {
@@ -176,7 +277,7 @@ struct UserPreferences {
     bool notificationSound = true;
     bool autoDismissNotifs = true;
     bool muteAll = false;
-    /// Account-wide chat display prefs (web Settings → Interface/Messages, iOS Settings → Display).
+    /// The web's chat display prefs (web Settings → Interface/Messages; each iOS install keeps its own in `devices`).
     /// Flat like the notification prefs; fanned out as one `displayPrefs` object
     /// (`displayPrefsJson`). Defaults equal the web's DEFAULT_PREFS. `displayPrefsSet` stays false
     /// until the first POST /api/me/display-prefs; the first web client after the upgrade then
@@ -190,6 +291,9 @@ struct UserPreferences {
     bool formatColors = true;
     bool showTimestamps = true;
     string timestampFormat = "auto";
+    /// Each iOS install's own settings, keyed by its lower-case install id (`X-IRCFiber-Device`);
+    /// the flat fields above are the web's.
+    DeviceProfile[string] devices;
     /// Words highlighted like the own nick (whole word, case-insensitive); web and app share them.
     string[] highlightWords;
 
@@ -255,6 +359,10 @@ struct UserPreferences {
             j[key] = Json(__traits(getMember, this, key));
         j["modeIndicator"] = Json(modeIndicator);
         j["timestampFormat"] = Json(timestampFormat);
+        auto devs = Json.emptyObject;
+        foreach (id, ref d; devices)
+            devs[id] = d.toJson();
+        j["devices"] = devs;
         j["highlightWords"] = highlightWords is null ? Json.emptyArray : serializeToJson(highlightWords);
         j["bncPlaybackLines"] = Json(bncPlaybackLines);
         j["bncRequireTls"] = Json(bncRequireTls);
@@ -444,6 +552,22 @@ struct UserPreferences {
                 needsRepair = true;
             }
         }
+        if (auto v = "devices" in json) {
+            if (v.type != Json.Type.object) {
+                logFieldInvalid(userId, "devices", v.type, "object");
+                needsRepair = true;
+            } else {
+                foreach (string id, entry; *v) {
+                    if (!isDeviceId(id) || entry.type != Json.Type.object) {
+                        needsRepair = true;
+                        continue;
+                    }
+                    bool bad;
+                    p.devices[id] = DeviceProfile.fromJson(entry, bad);
+                    if (bad) needsRepair = true;
+                }
+            }
+        }
         if (auto v = "highlightWords" in json) {
             if (v.type == Json.Type.array)
                 p.highlightWords = normalizeHighlightWords(*v);
@@ -511,10 +635,10 @@ Json stringArrayJson(const string[] items) {
     return j;
 }
 
-/// The account display prefs as one object: `displayPrefsSet` plus the eight
-/// synced keys. This is the `displayPrefs` value of GET /api/me, `stat_user`
-/// and the `displayPrefs` pref_update.
-Json displayPrefsJson(const ref UserPreferences p) {
+/// The display prefs of the account or of a device profile as one object:
+/// `displayPrefsSet` plus the eight synced keys. This is the `displayPrefs`
+/// value of GET /api/me, `stat_user` and the `displayPrefs` pref_update.
+Json displayPrefsJson(P)(const ref P p) {
     auto j = Json.emptyObject;
     j["displayPrefsSet"] = Json(p.displayPrefsSet);
     static foreach (key; DISPLAY_BOOL_PREFS)
@@ -550,10 +674,10 @@ string checkDisplayPrefsPatch(Json patch, out bool any) {
     return "";
 }
 
-/// Writes each recognised key present in `patch` and marks the account's
-/// display prefs as set. The caller must have passed `patch` through
-/// `checkDisplayPrefsPatch` first.
-void applyDisplayPrefsPatch(ref UserPreferences p, Json patch) {
+/// Writes each recognised key present in `patch` into the account or a device
+/// profile and marks its display prefs as set. The caller must have passed
+/// `patch` through `checkDisplayPrefsPatch` first.
+void applyDisplayPrefsPatch(P)(ref P p, Json patch) {
     static foreach (key; DISPLAY_BOOL_PREFS) {
         if (auto v = key in patch)
             __traits(getMember, p, key) = v.get!bool;
@@ -563,6 +687,111 @@ void applyDisplayPrefsPatch(ref UserPreferences p, Json patch) {
     if (auto v = "timestampFormat" in patch)
         p.timestampFormat = v.get!string;
     p.displayPrefsSet = true;
+}
+
+/// Writes each notification pref `patch` holds as a bool into the account or a
+/// device profile; true when any was there. The caller answers a non-bool with 400.
+bool applyNotificationPatch(P)(ref P p, Json patch) {
+    bool any;
+    static foreach (key; NOTIFICATION_PREFS) {
+        if (auto v = key in patch) {
+            if (v.type == Json.Type.bool_) {
+                __traits(getMember, p, key) = v.get!bool;
+                any = true;
+            }
+        }
+    }
+    return any;
+}
+
+/// Whether `s` is an install id as the app sends it: a canonical 36-character UUID, in any case.
+bool isDeviceId(string s) @safe {
+    if (s.length != 36) return false;
+    try {
+        cast(void) UUID(s);
+        return true;
+    } catch (Exception) {
+        return false;
+    }
+}
+
+/// Whether `s` is a hardware model identifier (`iPhone17,1`): 1–32 of `[A-Za-z0-9,._-]`.
+bool isDeviceModel(string s) @safe pure {
+    import std.ascii : isAlphaNum;
+
+    if (s.length == 0 || s.length > 32) return false;
+    foreach (char c; s)
+        if (!isAlphaNum(c) && c != ',' && c != '.' && c != '_' && c != '-') return false;
+    return true;
+}
+
+/// The web's settings as a device profile, metadata zero: what a new device
+/// starts from and what "Reset to web settings" copies back.
+DeviceProfile accountProfile(const ref UserPreferences p) {
+    DeviceProfile d;
+    static foreach (key; DEVICE_SETTINGS)
+        __traits(getMember, d, key) = __traits(getMember, p, key);
+    return d;
+}
+
+/// Copies the settings of `from` into `to`, keeping `to`'s model and timestamps.
+void copySettings(ref DeviceProfile to, const ref DeviceProfile from) {
+    static foreach (key; DEVICE_SETTINGS)
+        __traits(getMember, to, key) = __traits(getMember, from, key);
+}
+
+/// This device's profile, created on first contact as a copy of the web's
+/// settings. Also keeps the device's model and, at `DEVICE_SEEN_GRANULARITY_MS`
+/// granularity, when it was last seen. `changed` means the blob must be saved.
+/// Creating a profile past `MAX_DEVICE_PROFILES` drops the one seen least
+/// recently (ties: the smallest id).
+///
+/// `deviceId` must already be valid and lower-case; `model` is "" when absent
+/// or invalid. The pointer is into `p.devices`, valid until it next changes.
+DeviceProfile* ensureDeviceProfile(ref UserPreferences p, string deviceId, string model, long nowMs, out bool changed) {
+    if (auto prof = deviceId in p.devices) {
+        if (model.length && model != prof.model) {
+            prof.model = model;
+            changed = true;
+        }
+        if (nowMs - prof.lastSeenAt >= DEVICE_SEEN_GRANULARITY_MS) {
+            prof.lastSeenAt = nowMs;
+            changed = true;
+        }
+        return prof;
+    }
+    while (p.devices.length >= MAX_DEVICE_PROFILES) {
+        string oldest;
+        long oldestSeen;
+        foreach (id, ref d; p.devices) {
+            if (!oldest.length || d.lastSeenAt < oldestSeen || (d.lastSeenAt == oldestSeen && id < oldest)) {
+                oldest = id;
+                oldestSeen = d.lastSeenAt;
+            }
+        }
+        p.devices.remove(oldest);
+    }
+    auto fresh = accountProfile(p);
+    fresh.model = model;
+    fresh.createdAt = fresh.updatedAt = fresh.lastSeenAt = nowMs;
+    p.devices[deviceId] = fresh;
+    changed = true;
+    return deviceId in p.devices;
+}
+
+/// The mute and sound a push to one APNs registration follows.
+struct PushNotify {
+    bool muteAll;
+    bool sound;
+}
+
+/// The device profile's mute and sound when `deviceId` names a stored one,
+/// else the account's (a registration made without an install id).
+PushNotify pushNotifyFor(const ref UserPreferences p, string deviceId) {
+    if (deviceId.length)
+        if (auto d = deviceId in p.devices)
+            return PushNotify(d.muteAll, d.notificationSound);
+    return PushNotify(p.muteAll, p.notificationSound);
 }
 
 /// Cleans a highlight-word list: keeps strings only, trims them, drops empty
@@ -1340,4 +1569,157 @@ unittest {
     const longest = replicate("y", MAX_HIGHLIGHT_WORD_BYTES);
     assert(normalizeHighlightWords(serializeToJson([longest])) == [longest]);
     assert(normalizeHighlightWords(Json("deploy")).length == 0);
+}
+
+@("device profiles round-trip; malformed entries are dropped or defaulted and flag a repair")
+unittest {
+    enum a = "11111111-2222-4333-8444-555555555555";
+    enum b = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    UserPreferences p;
+    DeviceProfile d1;
+    d1.showUserIcons = false;
+    d1.muteAll = true;
+    d1.modeIndicator = "symbols";
+    d1.timestampFormat = "24h";
+    d1.model = "iPhone17,1";
+    d1.createdAt = 1;
+    d1.updatedAt = 2;
+    d1.lastSeenAt = 3;
+    DeviceProfile d2;
+    d2.showMemberPrefixes = true;
+    d2.notificationSound = false;
+    p.devices[a] = d1;
+    p.devices[b] = d2;
+    const r = UserPreferences.fromJson(p.toJson());
+    assert(!r.needsRepair, "a stored profile without a model is not damage");
+    assert(r.prefs.devices.length == 2);
+    assert(r.prefs.devices[a] == d1 && r.prefs.devices[b] == d2);
+    // An account without devices stores {} and reads back none.
+    assert(UserPreferences.init.toJson()["devices"].type == Json.Type.object);
+    const none = UserPreferences.fromJson(UserPreferences.init.toJson());
+    assert(!none.needsRepair && none.prefs.devices.length == 0);
+
+    auto devs = Json.emptyObject;
+    devs["not-a-uuid"] = Json.emptyObject;
+    auto broken = Json.emptyObject;
+    broken["showUserIcons"] = Json("x");
+    devs[a] = broken;
+    auto j = Json.emptyObject;
+    j["devices"] = devs;
+    const s = UserPreferences.fromJson(j);
+    assert(s.needsRepair);
+    assert(s.prefs.devices.keys == [a]);
+    assert(s.prefs.devices[a].showUserIcons, "a wrong-typed field keeps its default");
+
+    auto k = Json.emptyObject;
+    k["devices"] = Json.emptyArray;
+    const t = UserPreferences.fromJson(k);
+    assert(t.needsRepair && t.prefs.devices.length == 0);
+}
+
+@("ensureDeviceProfile seeds from the web, then writes only for a new model or an hour later")
+unittest {
+    enum id = "11111111-2222-4333-8444-555555555555";
+    enum long now = 1_800_000_000_000;
+    UserPreferences p;
+    p.showUserIcons = false;
+    p.muteAll = true;
+    p.timestampFormat = "12h";
+    bool changed;
+    auto prof = ensureDeviceProfile(p, id, "iPhone17,1", now, changed);
+    assert(changed);
+    assert(!prof.showUserIcons && prof.muteAll && prof.timestampFormat == "12h");
+    assert(prof.displayPrefsSet, "a device answers displayPrefsSet even before the web set its prefs");
+    assert(prof.model == "iPhone17,1");
+    assert(prof.createdAt == now && prof.updatedAt == now && prof.lastSeenAt == now);
+
+    prof = ensureDeviceProfile(p, id, "iPhone17,1", now + 10 * 60_000, changed);
+    assert(!changed, "a request 10 minutes later writes nothing");
+    assert(prof.lastSeenAt == now);
+    prof = ensureDeviceProfile(p, id, "", now + 2 * 3_600_000, changed);
+    assert(changed && prof.lastSeenAt == now + 2 * 3_600_000);
+    assert(prof.model == "iPhone17,1", "a request without a model keeps the stored one");
+    prof = ensureDeviceProfile(p, id, "iPhone18,2", now + 2 * 3_600_000, changed);
+    assert(changed && prof.model == "iPhone18,2");
+    assert(prof.createdAt == now && p.devices.length == 1);
+}
+
+@("ensureDeviceProfile drops the profile seen least recently past MAX_DEVICE_PROFILES")
+unittest {
+    import std.format : format;
+
+    UserPreferences p;
+    foreach (i; 1 .. MAX_DEVICE_PROFILES + 1) {
+        DeviceProfile d;
+        d.lastSeenAt = i;
+        p.devices[format("%08x-0000-4000-8000-000000000000", i)] = d;
+    }
+    bool changed;
+    ensureDeviceProfile(p, "ffffffff-0000-4000-8000-000000000000", "", 100, changed);
+    assert(changed && p.devices.length == MAX_DEVICE_PROFILES);
+    assert("00000001-0000-4000-8000-000000000000" !in p.devices);
+    assert("00000002-0000-4000-8000-000000000000" in p.devices);
+    assert("ffffffff-0000-4000-8000-000000000000" in p.devices);
+}
+
+@("a device's patches leave the web's settings alone; copySettings restores the web's")
+unittest {
+    enum id = "11111111-2222-4333-8444-555555555555";
+    UserPreferences p;
+    bool changed;
+    auto prof = ensureDeviceProfile(p, id, "iPad16,3", 1000, changed);
+    auto patch = Json.emptyObject;
+    patch["showUserIcons"] = Json(false);
+    applyDisplayPrefsPatch(*prof, patch);
+    auto notif = Json.emptyObject;
+    notif["muteAll"] = Json(true);
+    notif["notificationSound"] = Json("loud");
+    assert(applyNotificationPatch(*prof, notif));
+    prof.showMemberPrefixes = true;
+    assert(!prof.showUserIcons && prof.muteAll && prof.notificationSound, "a non-bool is not applied");
+    assert(p.showUserIcons && !p.muteAll && !p.showMemberPrefixes, "the web's settings are untouched");
+    assert(!displayPrefsJson(*prof)["showUserIcons"].get!bool && displayPrefsJson(p)["showUserIcons"].get!bool);
+
+    const web = accountProfile(p);
+    copySettings(*prof, web);
+    assert(prof.showUserIcons && !prof.muteAll && !prof.showMemberPrefixes);
+    assert(prof.model == "iPad16,3" && prof.createdAt == 1000, "a reset keeps the device's identity");
+    assert(!applyNotificationPatch(p, Json.emptyObject));
+}
+
+@("pushNotifyFor: a device's own mute and sound, else the account's")
+unittest {
+    enum muted = "11111111-2222-4333-8444-555555555555";
+    enum silent = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    UserPreferences p;
+    DeviceProfile m;
+    m.muteAll = true;
+    p.devices[muted] = m;
+    DeviceProfile s;
+    s.notificationSound = false;
+    p.devices[silent] = s;
+    assert(pushNotifyFor(p, muted) == PushNotify(true, true));
+    assert(pushNotifyFor(p, silent) == PushNotify(false, false));
+    assert(pushNotifyFor(p, "") == PushNotify(false, true));
+    assert(pushNotifyFor(p, "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee") == PushNotify(false, true));
+    p.muteAll = true;
+    assert(pushNotifyFor(p, silent) == PushNotify(false, false), "the account's mute does not reach a device");
+    assert(pushNotifyFor(p, "") == PushNotify(true, true));
+}
+
+@("isDeviceId takes canonical UUIDs in either case; isDeviceModel takes model identifiers")
+unittest {
+    import std.array : replicate;
+    import std.uni : toUpper;
+
+    assert(isDeviceId("11111111-2222-4333-8444-555555555555"));
+    assert(isDeviceId(toUpper("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")));
+    assert(!isDeviceId(""));
+    assert(!isDeviceId("11111111222243338444555555555555"));
+    assert(!isDeviceId("nope"));
+    assert(!isDeviceId("11111111-2222-4333-8444-55555555555g"));
+    assert(isDeviceModel("iPhone17,1") && isDeviceModel("x86_64") && isDeviceModel(replicate("a", 32)));
+    assert(!isDeviceModel(""));
+    assert(!isDeviceModel(replicate("a", 33)));
+    assert(!isDeviceModel("a b"));
 }
