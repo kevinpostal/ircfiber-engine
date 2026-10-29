@@ -5541,6 +5541,23 @@ final class PersistentIRCClient {
                 ch = "#" ~ ch;
             autoJoin ~= ch[0 .. 1] ~ ch[1 .. $].toLower();
         }
+        // channelState is never wiped on a real reconnect (only PART/KICK
+        // remove a key, ~6227/6254) but channelUsers just was, at 001
+        // above, and the IRC server has genuinely forgotten every
+        // membership the dead TCP session held — NAMES alone (the
+        // attachHeld resync at line 3352) can't refill a roster for a
+        // channel we are no longer actually in. A channel the user
+        // manually /joined but never added to the persisted
+        // autoJoinChannels list used to sit out of this JOIN burst, so
+        // channelState kept reporting isJoined:true forever with an
+        // empty roster: the buffer looked joined with zero members and
+        // no way to self-heal short of an explicit /part + /join.
+        // (Reproduced on #superbowl / Super Nets, whose ircd throttles
+        // JOIN — see autoJoinDelaySeconds above — and so reconnects often.)
+        foreach (chan; channelState.byKey) {
+            auto ch = normalizeChannelName(chan);
+            if (!autoJoin.canFind(ch)) autoJoin ~= ch;
+        }
         foreach (batch; joinBatches(autoJoin))
             sendRaw("JOIN " ~ batch);
 
