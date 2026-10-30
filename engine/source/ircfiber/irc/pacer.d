@@ -2,7 +2,7 @@ module ircfiber.irc.pacer;
 
 import std.algorithm : canFind, max, min;
 import std.array : appender, split;
-import std.ascii : isDigit;
+import std.ascii : isDigit, isHexDigit;
 import std.conv : to;
 import std.string : indexOf, startsWith, strip, toLower;
 import std.utf : stride;
@@ -967,6 +967,45 @@ string sanitizeLine(string s) pure nothrow @safe {
     return buf.data;
 }
 
+/// Byte range of one in-progress mIRC color escape that a line splitter
+/// must never cut inside. `start`/`end` are the first and one-past-last
+/// byte of the escape's *parameters* (after the `\x03`/`\x04` control
+/// byte, through the end of its digits/comma/digits) — cutting at `start`
+/// (right after the control byte) or anywhere before `end` separates the
+/// digits from the byte that makes them a color code, which renders as
+/// literal visible text in front of an uncolored glyph.
+private struct ColorEscapeSpan { size_t start; size_t end; }
+
+/// Scans `line` once for `\x03` (mIRC decimal fg[,bg], <=2 digits each) and
+/// `\x04` (hex fg[,bg], <=6 hex digits each) color escapes, mirroring the
+/// exact digit-consumption rules the frontend renderer
+/// (`site/frontend/src/lib/ircFormatting.ts` `parseIrcFormatting`) uses, so
+/// a span here is exactly what that parser treats as one token.
+private ColorEscapeSpan[] colorEscapeSpans(string line) pure nothrow @safe {
+    auto out_ = appender!(ColorEscapeSpan[]);
+    size_t i = 0;
+    while (i < line.length) {
+        immutable c = line[i];
+        if (c != '\x03' && c != '\x04') { i++; continue; }
+        immutable bool hex = c == '\x04';
+        immutable size_t maxDigits = hex ? 6 : 2;
+        size_t j = i + 1;
+        size_t n = 0;
+        while (j < line.length && n < maxDigits
+               && (hex ? isHexDigit(line[j]) : isDigit(line[j]))) { j++; n++; }
+        if (j < line.length && line[j] == ',') {
+            size_t k = j + 1;
+            size_t bn = 0;
+            while (k < line.length && bn < maxDigits
+                   && (hex ? isHexDigit(line[k]) : isDigit(line[k]))) { k++; bn++; }
+            if (bn > 0) j = k;
+        }
+        if (j > i + 1) out_ ~= ColorEscapeSpan(i + 1, j);
+        i = j;
+    }
+    return out_.data;
+}
+
 /// Splits `text` into chunks of at most `maxBytes` UTF-8 bytes, never
 /// splitting a code point.
 ///
@@ -974,9 +1013,22 @@ string sanitizeLine(string s) pure nothrow @safe {
 /// the end of the chunk — the IRCv3 multiline recommendation, so a
 /// `draft/multiline-concat` rejoin and the non-multiline fallback both read
 /// correctly. A single word longer than the budget is hard-broken.
+///
+/// Never breaks inside an mIRC color escape (`\x03` decimal fg[,bg] or
+/// `\x04` hex fg[,bg]) either: img2irc art rows pack one such escape per
+/// cell with no spaces between cells, so on any row wider than the budget
+/// the old space-only rule hard-broke mid-escape, leaving the color digits
+/// as literal visible text in the next PRIVMSG with the glyph after them
+/// left uncolored. `colorEscapeSpans` finds every token's parameter span
+/// once per call; the scan below refuses to end a chunk inside one,
+/// falling back to the token's start exactly like it falls back to the
+/// last space — this only *moves* the cut point, so concatenating the
+/// parts still reproduces `text` byte for byte.
 string[] splitUtf8(string text, size_t maxBytes) pure nothrow @safe {
     if (maxBytes == 0) maxBytes = 1;
     if (text.length <= maxBytes) return text.length ? [text] : [""];
+
+    const spans = colorEscapeSpans(text);
 
     auto out_ = appender!(string[]);
     size_t start = 0;
@@ -987,6 +1039,8 @@ string[] splitUtf8(string text, size_t maxBytes) pure nothrow @safe {
         }
         size_t i = start;
         size_t lastSpaceEnd = 0;
+        size_t lastSafeEnd = 0;
+        size_t spanIdx = 0;
         while (i < text.length) {
             size_t n = 1;
             try n = stride(text, i);
@@ -994,6 +1048,10 @@ string[] splitUtf8(string text, size_t maxBytes) pure nothrow @safe {
             if (i + n - start > maxBytes) break;
             i += n;
             if (text[i - 1] == ' ') lastSpaceEnd = i;
+            while (spanIdx < spans.length && spans[spanIdx].end <= i) spanIdx++;
+            immutable bool unsafe = spanIdx < spans.length
+                && spans[spanIdx].start <= i && i < spans[spanIdx].end;
+            if (!unsafe) lastSafeEnd = i;
         }
         // A single code point wider than the budget still has to advance.
         if (i == start) {
@@ -1002,7 +1060,9 @@ string[] splitUtf8(string text, size_t maxBytes) pure nothrow @safe {
             catch (Exception) n = 1;
             i = start + n;
         }
-        const end = (lastSpaceEnd > start) ? lastSpaceEnd : i;
+        const end = (lastSpaceEnd > start) ? lastSpaceEnd
+                   : (lastSafeEnd > start) ? lastSafeEnd
+                   : i;
         out_ ~= text[start .. end];
         start = end;
     }
@@ -1434,6 +1494,42 @@ string[] splitMessage(string text, size_t maxBytes, out bool[] concatFlags)
     auto inj = splitMessage("safe\rQUIT :bye", 400, flags);
     assert(inj == ["safeQUIT :bye"]);
     assert(flags == [false]);
+}
+
+@safe unittest {
+    // Color-escape-aware splitting: img2irc rows pack one `\x03FG,BG<glyph>`
+    // token per cell with no spaces, so a tight budget must still never cut
+    // inside a token's digits — that would leave raw digits as literal text
+    // in the next chunk with the glyph after them uncolored (the bug fixed
+    // here; confirmed live via Convert-to-IRC sends on ircfiber.com).
+    string row;
+    foreach (i; 0 .. 40) row ~= "\x03" ~ (40 + i % 58).to!string ~ ",16\u2588"; // ~9 bytes/cell, no spaces
+    bool[] flags;
+    auto parts = splitMessage(row, 40, flags);
+    assert(parts.length > 1, "row must need multiple wire lines at this budget");
+    foreach (idx, p; parts) {
+        if (p.length == 0) continue;
+        // A chunk starting with a bare digit or comma proves a token's
+        // control byte was left behind in the previous chunk.
+        assert(p[0] != ',' && !isHexDigit(p[0]),
+               "chunk " ~ idx.to!string ~ " starts mid-escape: " ~ p[0 .. min(p.length, 10)]);
+    }
+    string rejoined;
+    foreach (p; parts) rejoined ~= p;
+    assert(rejoined == row, "multiline-concat invariant: parts must reproduce the input");
+
+    // Same guarantee for \x04 hex-color escapes.
+    string hexRow;
+    foreach (i; 0 .. 30) hexRow ~= "\x04FF00" ~ (1 + i % 9).to!string ~ "0,00FF00\u2588";
+    auto hexParts = splitMessage(hexRow, 35, flags);
+    assert(hexParts.length > 1);
+    foreach (p; hexParts) {
+        if (p.length == 0) continue;
+        assert(p[0] != ',' && !isHexDigit(p[0]), "hex chunk starts mid-escape: " ~ p[0 .. min(p.length, 10)]);
+    }
+    string hexRejoined;
+    foreach (p; hexParts) hexRejoined ~= p;
+    assert(hexRejoined == hexRow);
 }
 
 @safe unittest {
