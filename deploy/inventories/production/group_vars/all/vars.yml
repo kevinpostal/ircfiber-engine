@@ -155,7 +155,7 @@ ircfiber_ipv6_pool_host: ""
 # the boot location.
 #
 # Keep identical to
-# site/deploy/inventories/production/host_vars/vps-efb4b52d.yml — this copy
+# site/deploy/inventories/production/host_vars/vps-833a04ee.yml — this copy
 # re-renders IRCFIBER_MULLVAD_POOL through the engine role, so
 # drift makes the gateway and engine disagree about slot labels.
 #

@@ -87,7 +87,7 @@ deploy/
 - A Docker registry (Docker Hub free tier, GitHub Container Registry, or private). Set `docker_registry_url` in `group_vars/all.yml`.
 - An Ansible control machine (laptop, CI runner) with `ansible-core` ≥ 2.14. **The control node must be able to reach target hosts by their Tailscale name or 100.x.x.x IP** — either join the same tailnet, or run `tailscaled` locally with `--accept-routes`.
 
-> **Important:** rename the Tailscale device to something stable (e.g. `ircfiber-prod-1`) before adding it to your inventory. The random `izt4n520nxas8w06c5zfc9z.tail544547.ts.net` names change whenever the host re-registers, and they leak your tailnet ID. Run `ssh root@HOST tailscale set --hostname=ircfiber-prod-1` once.
+> **Important:** rename the Tailscale device to something stable (e.g. `vps-833a04ee`) before adding it to your inventory. The random `izt4n520nxas8w06c5zfc9z.tail544547.ts.net` names change whenever the host re-registers, and they leak your tailnet ID. Run `ssh root@HOST tailscale set --hostname=vps-833a04ee` once.
 
 ## First-time setup
 
@@ -109,7 +109,7 @@ ansible-vault encrypt inventories/production/group_vars/vault.yml
 #    (random MagicDNS names like 'izt4n520nxas8w06c5zfc9z.tail544547.ts.net'
 #     change if the host ever re-registers, which would silently break
 #     your inventory. Tailnet IDs also leak the org's Tailscale account.)
-ssh root@<host> tailscale set --hostname=ircfiber-prod-1
+ssh root@<host> tailscale set --hostname=vps-833a04ee
 
 # 5. Edit the inventory to use the new hostname
 $EDITOR inventories/production/hosts.ini
@@ -117,7 +117,7 @@ $EDITOR inventories/production/hosts.ini
 # 6. Verify you can reach the host by its Tailscale name
 #    (your control node must be on the same tailnet, or use the
 #    100.x.x.x IP directly)
-ssh deploy@ircfiber-prod-1    # should fail — user doesn't exist yet
+ssh deploy@vps-833a04ee    # should fail — user doesn't exist yet
 
 # 7. Bootstrap: create the non-root 'deploy' user
 #    IMPORTANT: use `-e ansible_user=root`, not `--user root`.
@@ -303,7 +303,7 @@ ansible-vault edit inventories/production/group_vars/vault.yml
 $EDITOR inventories/production/group_vars/all.yml
 #   cloudflare_zone: "your-domain.com"
 $EDITOR inventories/production/host_vars/<hostname>.yml
-#   cloudflare_target_ip: "47.236.247.169"
+#   cloudflare_target_ip: "15.204.87.133"
 
 # 4. Make sure the zone's nameservers are delegated to Cloudflare
 #    (otherwise records created here won't resolve publicly).

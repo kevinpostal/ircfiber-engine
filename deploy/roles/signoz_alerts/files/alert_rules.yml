@@ -307,7 +307,7 @@
   annotations:
     summary: "Engine silent >2 min"
     description: "No logs from ircfiber-engine in 2 min — crash loop, OOM, or Fluent Bit down. Check `docker ps; docker logs ircfiber-engine-ovh --tail 100; docker inspect`."
-    runbook: "ssh deploy@15.204.93.54 'docker ps --filter name=engine; docker logs ircfiber-engine-ovh --tail 200'"
+    runbook: "ssh deploy@15.204.87.133 'docker ps --filter name=engine; docker logs ircfiber-engine-ovh --tail 200'"
 
 # 9. Engine boot failure — Mongo/Redis connection errors in logs
 - name: "engine_boot_failure"
@@ -375,7 +375,7 @@
   annotations:
     summary: "Fluent Bit pipeline silent"
     description: "No Fluent Bit logs in 5 min — log shipper down, Docker json-file driver misconfigured, or SIGNOZ queue full. Check `docker logs ircfiber-fluent-bit`."
-    runbook: "ssh deploy@15.204.93.54 'docker logs ircfiber-fluent-bit --tail 100; docker ps --filter name=fluent'"
+    runbook: "ssh deploy@15.204.87.133 'docker logs ircfiber-fluent-bit --tail 100; docker ps --filter name=fluent'"
 
 # 11. Gateway fiber wedge (long-running fibers > 0 for 30 consecutive seconds)
 - alert: GatewayFiberWedge

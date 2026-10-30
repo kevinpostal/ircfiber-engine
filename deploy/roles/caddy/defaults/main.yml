@@ -12,7 +12,7 @@ caddy_config_dir: /etc/ircfiber/caddy
 # When a *.ts.net entry is present, Caddy will obtain a real cert via the
 # built-in Tailscale cert manager (provided caddy_tailscale_socket points
 # at a working tailscaled.sock). No browser cert warning, no manual trust.
-# Example: caddy_extra_serve_hosts: ["ircfiber-prod-1.tail544547.ts.net"]
+# Example: caddy_extra_serve_hosts: ["ircfiber-vps-833a04ee.tail544547.ts.net"]
 caddy_extra_serve_hosts: []  # yamllint disable-line rule:line-length
 # Path on the HOST where tailscaled exposes its local API socket. Caddy
 # uses this to fetch TLS certificates for *.ts.net hostnames via Tailscale's

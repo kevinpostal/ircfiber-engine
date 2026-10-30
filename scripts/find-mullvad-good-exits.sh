@@ -4,8 +4,8 @@
 # Usage: ./scripts/find-mullvad-good-exits.sh [limit]  # default 40
 set -uo pipefail
 
-HOST="vps-efb4b52d"
-SSH="ssh -n -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no deploy@203.0.113.10"
+HOST="vps-833a04ee"
+SSH="ssh -n -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o StrictHostKeyChecking=no deploy@15.204.87.133"
 LIMIT=${1:-40}
 TEST_SIDECAR="tailscale-mullvad-nl"
 
@@ -79,7 +79,7 @@ if [ ${#GOOD[@]} -ge 3 ]; then
     echo "  - { name: \"$SHORT\", exit_node: \"$IP\" } # $HN"
   done
   echo ""
-  echo "Then: ansible-playbook -i deploy/inventories/production/hosts.ini deploy/playbooks/engine.yml -l vps-efb4b52d --vault-password-file deploy/.vault_pass.txt"
+  echo "Then: ansible-playbook -i deploy/inventories/production/hosts.ini deploy/playbooks/engine.yml -l vps-833a04ee --vault-password-file deploy/.vault_pass.txt"
   echo "Or manual: update /etc/ircfiber/engine/env-ovh pool and restart engine"
 else
   echo "Not enough good exits (need 3, got ${#GOOD[@]}), try larger limit."

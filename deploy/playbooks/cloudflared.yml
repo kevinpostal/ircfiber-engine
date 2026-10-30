@@ -8,7 +8,7 @@
 # First-time setup:
 #   1. Create a named tunnel in Cloudflare Zero Trust dashboard:
 #        https://one.dash.cloudflare.com/ → Networks → Tunnels →
-#        "Add a tunnel" → named tunnel (e.g. "ircfiber-prod-1")
+#        "Add a tunnel" → named tunnel (e.g. "vps-833a04ee")
 #   2. Copy the tunnel token.
 #   3. Put the token in the encrypted vault:
 #        ansible-vault edit inventories/production/group_vars/vault.yml

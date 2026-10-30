@@ -2,14 +2,14 @@
 # ============================================================================
 # Sync local Docker Mongo + Redis → tailnet
 # ----------------------------------------------------------------------------
-# One-way sync of local dev state into the tailnet stack on ircfiber-prod-1.
+# One-way sync of local dev state into the tailnet stack on vps-833a04ee.
 # Idempotent in the sense that re-running produces the same end state, but
 # each run does destructive work (Mongo --drop, Redis RDB + AOF wipe + restart).
 #
 # Defaults to interactive confirmation. Pass `-e sync_yes=true` to skip.
 #
 # Configuration (override per call as needed):
-#   sync_tailnet_host=root@ircfiber-prod-1.tail544547.ts.net
+#   sync_tailnet_host=root@ircfiber-vps-833a04ee.tail544547.ts.net
 #   sync_mongo_local_container=irc_mongo_test
 #   sync_redis_local_container=irc_redis_test
 #   sync_mongo_tailnet_container=ircfiber-mongo
@@ -35,7 +35,7 @@
   connection: local
   gather_facts: false
   vars:
-    tailnet_host: "root@ircfiber-prod-1.tail544547.ts.net"
+    tailnet_host: "root@ircfiber-vps-833a04ee.tail544547.ts.net"
     mongo_local_container: "irc_mongo_test"
     redis_local_container: "irc_redis_test"
     mongo_tailnet_container: "ircfiber-mongo"
@@ -121,7 +121,7 @@
   connection: local
   gather_facts: false
   vars:
-    tailnet_host: "root@ircfiber-prod-1.tail544547.ts.net"
+    tailnet_host: "root@ircfiber-vps-833a04ee.tail544547.ts.net"
     mongo_local_container: "irc_mongo_test"
     mongo_tailnet_container: "ircfiber-mongo"
     mongo_db: "ircfiber"
@@ -201,7 +201,7 @@
   connection: local
   gather_facts: false
   vars:
-    tailnet_host: "root@ircfiber-prod-1.tail544547.ts.net"
+    tailnet_host: "root@ircfiber-vps-833a04ee.tail544547.ts.net"
     redis_local_container: "irc_redis_test"
     redis_tailnet_container: "ircfiber-redis"
     rdb_local_path: "/tmp/ircfiber-redis-sync.rdb"

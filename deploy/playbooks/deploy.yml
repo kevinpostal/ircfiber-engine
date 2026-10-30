@@ -4,10 +4,10 @@
 # gateway & engine containers. Expects the host to already be bootstrapped.
 #
 # Usage:
-#   ansible-playbook playbooks/deploy.yml -l ircfiber-prod-1 --ask-vault-pass
+#   ansible-playbook playbooks/deploy.yml -l vps-833a04ee --ask-vault-pass
 #
 # First-time setup (run once):
-#   ansible-playbook playbooks/site.yml -l ircfiber-prod-1 --ask-vault-pass
+#   ansible-playbook playbooks/site.yml -l vps-833a04ee --ask-vault-pass
 
 - name: Rsync repo & rebuild image
   hosts: ircfiber

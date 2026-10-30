@@ -28,7 +28,7 @@ DUB_PKG     := $(HOME)/.dub/packages
 
 # Dev backend selection for `make run` / `make start` / `make dev`.
 # Default is `tailnet` — points the Vite dev server at the tailnet
-# gateway (https://vps-efb4b52d.tail544547.ts.net). Override per-call:
+# gateway (https://ircfiber-vps-833a04ee.tail544547.ts.net). Override per-call:
 #
 #   make run                      # tailnet (default)
 #   make run-tailnet              # explicit tailnet
@@ -38,7 +38,7 @@ DUB_PKG     := $(HOME)/.dub/packages
 #
 # For the D backend runner (the previous `make run`), use `make run-gateway`.
 BACKEND ?= local
-VITE_BACKEND_URL ?= https://vps-efb4b52d.tail544547.ts.net
+VITE_BACKEND_URL ?= https://ircfiber-vps-833a04ee.tail544547.ts.net
 TAILNET_GATEWAY_PORT ?= 18090
 
 ifeq ($(BACKEND),tailnet)
@@ -282,13 +282,13 @@ dev-live: ## Component > Frontend dev (Vite) against LIVE DBs (tailnet) — need
 	@$(MAKE) --no-print-directory dev BACKEND=tailnet
 
 dev-live-tunnel: ## Component > ssh -L tunnel OVH gateway (172.30.0.2:8090) → local :$(TAILNET_GATEWAY_PORT) for dev-live (no docker build)
-	@port=$(TAILNET_GATEWAY_PORT); gw_ip=$$(ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o ConnectTimeout=5 deploy@203.0.113.10 'sudo docker inspect -f "{{.NetworkSettings.Networks.ircfiber_net.IPAddress}}" ircfiber-gateway 2>/dev/null || echo 172.30.0.2'); \
+	@port=$(TAILNET_GATEWAY_PORT); gw_ip=$$(ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -o ConnectTimeout=5 deploy@$(_target_ssh) 'sudo docker inspect -f "{{.NetworkSettings.Networks.ircfiber_net.IPAddress}}" ircfiber-gateway 2>/dev/null || echo 172.30.0.2'); \
 	if lsof -ti :$$port -sTCP:LISTEN >/dev/null 2>&1; then echo "Port :$$port already in use — kill the owner or run: lsof -ti :$$port | xargs kill"; exit 1; fi; \
 	if [ -z "$$gw_ip" ]; then gw_ip=172.30.0.2; fi; echo "OVH gateway IP: $$gw_ip"; \
 	printf '\n\033[46m\033[30m\033[1m  Tunnel OVH gateway $$gw_ip:8090 → 127.0.0.1:$$port  \033[0m\n'; \
-	printf '\033[2m  ssh -L $$port:$$gw_ip:8090 deploy@203.0.113.10 (via -F /dev/null -i ~/.ssh/id_ed25519_ircfiber)\033[0m\n'; \
+	printf '\033[2m  ssh -L $$port:$$gw_ip:8090 deploy@$(_target_ssh) (via -F /dev/null -i ~/.ssh/id_ed25519_ircfiber)\033[0m\n'; \
 	printf '\033[33m⚠ Keep this terminal open — ctrl-c closes the tunnel. In another terminal: make dev-live\033[0m\n'; \
-	ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -L $$port:$$gw_ip:8090 -N deploy@203.0.113.10
+	ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -L $$port:$$gw_ip:8090 -N deploy@$(_target_ssh)
 # then launches the Vite dev server with HMR. Fastest full-stack dev cycle:
 #   - Docker runs backend
 #   - Vite serves frontend with live reload on save
@@ -1666,8 +1666,8 @@ sync-redis-to-tailnet: ## Data > Sync only local Redis → tailnet
 # Vault pass: by default reads deploy/.vault_pass.txt (resolves relative to
 # the deploy/ cwd of every consuming recipe). Set VAULT_PASS_FILE to override.
 _vault_arg = --vault-password-file $(or $(VAULT_PASS_FILE),.vault_pass.txt)
-_target      = $(or $(TARGET),vps-efb4b52d)
-_target_ssh   = $(or $(TARGET_SSH),203.0.113.10)
+_target      = $(or $(TARGET),$(shell awk '/^\[ircfiber\]/{f=1; next} f && /^\#/{next} f && NF{print $$1; exit}' deploy/inventories/production/hosts.ini 2>/dev/null))
+_target_ssh   = $(or $(TARGET_SSH),$(shell grep -m1 'ansible_host=' deploy/inventories/production/hosts.ini 2>/dev/null | sed -E 's/.*ansible_host=([^ ]+).*/\1/'))
 _playbook    = cd deploy && ansible-playbook -l $(_target) $(_vault_arg)
 
 # Show running container images and versions on the target.

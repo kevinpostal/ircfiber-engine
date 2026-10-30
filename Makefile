@@ -82,7 +82,7 @@ help: ## Root > Show this help + use-case matrix (site + engine)
 	@printf '    Terminal 1: \033[92mmake engine-start\033[0m   engine in background (holds IRC)\n'
 	@printf '    Terminal 2: \033[92mmake debug\033[0m           gateway only\n'
 	@printf '    Terminal 3: \033[92mmake dev\033[0m             Vite HMR\n'
-	@printf '  \033[36mDeploy (OVH vps-efb4b52d, ansible — no manual docker build)\033[0m\n'
+	@printf '  \033[36mDeploy (OVH vps-833a04ee, ansible — no manual docker build)\033[0m\n'
 	@printf '    \033[92mmake -C .. ship\033[0m          site only (gateway+frontend, blue/green, engine stays up)\n'
 	@printf '    \033[92mmake -C .. ship-engine\033[0m   engine only (IRC daemon, hard restart)\n'
 	@printf '  \033[36mObserve\033[0m\n'

@@ -475,7 +475,7 @@ The same validator is embedded as a preflight task in the `logging` role, so `an
 
 # IRC Fiber — Deploy Architecture
 
-Local dev is on Apple Silicon (ARM64). The production server `vps-efb4b52d` (203.0.113.10) is **x86_64**. **Never** compile D binaries locally and SCP them — they produce `exec format error` on the server.
+Local dev is on Apple Silicon (ARM64). The production server `vps-833a04ee` (15.204.87.133) is **x86_64**. **Never** compile D binaries locally and SCP them — they produce `exec format error` on the server.
 Always build via the **remote BuildKit** (docker build on the server) or use `make update` which handles this automatically. The only exception is frontend dist assets (`public/dist/`) which are platform-independent JS/CSS/HTML and can be pushed directly via the SSH tar pipe in the Makefile.
 
 ```bash

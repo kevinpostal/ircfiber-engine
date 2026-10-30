@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # check-assignments.sh — health check for irc:assignments vs Mongo
 set -euo pipefail
-HOST="${1:-203.0.113.10}"
+HOST="${1:-15.204.87.133}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519_ircfiber}"
 SSH="ssh -F /dev/null -o IdentitiesOnly=yes -i $SSH_KEY deploy@$HOST"
 # Carries the Mongo password: export it (vault_mongo_app_password), never commit it.

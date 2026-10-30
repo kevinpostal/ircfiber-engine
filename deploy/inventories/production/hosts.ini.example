@@ -22,14 +22,17 @@
 # =============================================================================
 
 [ircfiber]
-vps-efb4b52d ansible_host=203.0.113.10 ansible_user=deploy ansible_ssh_private_key_file=/Users/zodiac/.ssh/id_ed25519_ircfiber
+# IdentitiesOnly: a Host * IdentityAgent (1Password) otherwise offers its keys
+# first and sshd drops the login with "Too many authentication failures".
+vps-833a04ee ansible_host=15.204.87.133 ansible_user=deploy ansible_ssh_private_key_file=/Users/zodiac/.ssh/id_ed25519_ircfiber ansible_ssh_common_args='-o IdentitiesOnly=yes'
 
 [ircfiber_backend]
-vps-efb4b52d
+vps-833a04ee
 
 [ircfiber_gw]
-vps-efb4b52d
+vps-833a04ee
 
 [ircfiber_engines]
-vps-efb4b52d ircfiber_engine_id=ovh ircfiber_engine_bind_address=0.0.0.0 ircfiber_engine_admin_port=8091
-# Example — replace 203.0.113.10 with your host
+vps-833a04ee ircfiber_engine_id=ovh ircfiber_engine_bind_address=0.0.0.0 ircfiber_engine_admin_port=8091
+# vps-833a04ee / 15.204.87.133 is the current prod host (see AGENTS.md) —
+# replace both with your own when bootstrapping a different host.
