@@ -108,6 +108,8 @@ enum MAX_DEVICE_PROFILES = 20;
 enum DEVICE_HEADER = "X-IRCFiber-Device";
 /// The iOS app's hardware model header (`iPhone17,1`), shown in Settings → Sessions → Mobile devices.
 enum DEVICE_MODEL_HEADER = "X-IRCFiber-Device-Model";
+enum DEVICE_OS_VERSION_HEADER = "X-IRCFiber-Device-OS";
+enum DEVICE_APP_VERSION_HEADER = "X-IRCFiber-Device-App-Version";
 /// `lastSeenAt` is rewritten at most this often by reads, so GET /api/me stays read-only in steady state.
 enum long DEVICE_SEEN_GRANULARITY_MS = 3_600_000;
 /// Bool fields a device profile shares with the account's flat fields, in wire order.
@@ -154,6 +156,12 @@ struct DeviceProfile {
     string bncToken;
     /// Unix ms the token above was minted; 0 when unset.
     long bncTokenCreatedAtMs;
+    /// Software version this install last reported, `X-IRCFiber-Device-OS` ("18.1") and
+    /// X-IRCFiber-Device-App-Version` ("1.1.0 (3)"); "" until the app sends one.
+    string osVersion;
+    string appVersion;
+    /// Client IP at the device's last request (`getClientIp`); "" until known.
+    string lastIp;
 
     /// Serializes every field under its own name.
     Json toJson() const {
@@ -168,6 +176,9 @@ struct DeviceProfile {
         j["lastSeenAt"] = Json(lastSeenAt);
         j["bncToken"] = Json(bncToken);
         j["bncTokenCreatedAtMs"] = Json(bncTokenCreatedAtMs);
+        j["osVersion"] = Json(osVersion);
+        j["appVersion"] = Json(appVersion);
+        j["lastIp"] = Json(lastIp);
         return j;
     }
 
@@ -220,6 +231,24 @@ struct DeviceProfile {
         if (auto v = "bncTokenCreatedAtMs" in j) {
             if (v.type == Json.Type.int_)
                 d.bncTokenCreatedAtMs = v.get!long;
+            else
+                bad = true;
+        }
+        if (auto v = "osVersion" in j) {
+            if (v.type == Json.Type.string && (v.get!string.length == 0 || isDeviceOsVersion(v.get!string)))
+                d.osVersion = v.get!string;
+            else
+                bad = true;
+        }
+        if (auto v = "appVersion" in j) {
+            if (v.type == Json.Type.string && (v.get!string.length == 0 || isDeviceAppVersion(v.get!string)))
+                d.appVersion = v.get!string;
+            else
+                bad = true;
+        }
+        if (auto v = "lastIp" in j) {
+            if (v.type == Json.Type.string)
+                d.lastIp = v.get!string;
             else
                 bad = true;
         }
@@ -745,6 +774,22 @@ bool isDeviceModel(string s) @safe pure {
     return true;
 }
 
+/// Whether `s` is an OS version as the app sends it (`18.1`, `17.5.1`): 1–16 of `[0-9.]`.
+bool isDeviceOsVersion(string s) @safe pure {
+    if (s.length == 0 || s.length > 16) return false;
+    foreach (c; s) if (c != '.' && (c < '0' || c > '9')) return false;
+    return true;
+}
+
+/// Whether `s` is an app version as the app sends it (`1.1.0 (3)`): 1–32 of `[0-9A-Za-z.() -]`.
+bool isDeviceAppVersion(string s) @safe pure {
+    import std.ascii : isAlphaNum;
+
+    if (s.length == 0 || s.length > 32) return false;
+    foreach (c; s) if (!isAlphaNum(c) && c != '.' && c != '(' && c != ')' && c != ' ' && c != '-') return false;
+    return true;
+}
+
 /// The web's settings as a device profile, metadata zero: what a new device
 /// starts from and what "Reset to web settings" copies back.
 DeviceProfile accountProfile(const ref UserPreferences p) {
@@ -768,10 +813,23 @@ void copySettings(ref DeviceProfile to, const ref DeviceProfile from) {
 ///
 /// `deviceId` must already be valid and lower-case; `model` is "" when absent
 /// or invalid. The pointer is into `p.devices`, valid until it next changes.
-DeviceProfile* ensureDeviceProfile(ref UserPreferences p, string deviceId, string model, long nowMs, out bool changed) {
+DeviceProfile* ensureDeviceProfile(ref UserPreferences p, string deviceId, string model, long nowMs,
+        out bool changed, string osVersion = "", string appVersion = "", string clientIp = "") {
     if (auto prof = deviceId in p.devices) {
         if (model.length && model != prof.model) {
             prof.model = model;
+            changed = true;
+        }
+        if (osVersion.length && osVersion != prof.osVersion) {
+            prof.osVersion = osVersion;
+            changed = true;
+        }
+        if (appVersion.length && appVersion != prof.appVersion) {
+            prof.appVersion = appVersion;
+            changed = true;
+        }
+        if (clientIp.length && clientIp != prof.lastIp) {
+            prof.lastIp = clientIp;
             changed = true;
         }
         if (nowMs - prof.lastSeenAt >= DEVICE_SEEN_GRANULARITY_MS) {
@@ -793,6 +851,9 @@ DeviceProfile* ensureDeviceProfile(ref UserPreferences p, string deviceId, strin
     }
     auto fresh = accountProfile(p);
     fresh.model = model;
+    fresh.osVersion = osVersion;
+    fresh.appVersion = appVersion;
+    fresh.lastIp = clientIp;
     fresh.createdAt = fresh.updatedAt = fresh.lastSeenAt = nowMs;
     p.devices[deviceId] = fresh;
     changed = true;
@@ -1662,6 +1723,37 @@ unittest {
     prof = ensureDeviceProfile(p, id, "iPhone18,2", now + 2 * 3_600_000, changed);
     assert(changed && prof.model == "iPhone18,2");
     assert(prof.createdAt == now && p.devices.length == 1);
+}
+
+@("ensureDeviceProfile updates osVersion, appVersion and lastIp independently of model")
+unittest {
+    enum id = "22222222-3333-4444-8555-666666666666";
+    enum long now = 1_800_000_000_000;
+    UserPreferences p;
+    bool changed;
+    auto prof = ensureDeviceProfile(p, id, "iPhone17,1", now, changed, "18.1", "1.0.0 (1)", "203.0.113.5");
+    assert(changed);
+    assert(prof.model == "iPhone17,1");
+    assert(prof.osVersion == "18.1" && prof.appVersion == "1.0.0 (1)" && prof.lastIp == "203.0.113.5");
+
+    // A request 10 minutes later with no change writes nothing.
+    prof = ensureDeviceProfile(p, id, "iPhone17,1", now + 10 * 60_000, changed, "18.1", "1.0.0 (1)", "203.0.113.5");
+    assert(!changed, "a request with nothing new writes nothing");
+
+    // OS version alone changes — model, app version and IP untouched.
+    prof = ensureDeviceProfile(p, id, "iPhone17,1", now + 10 * 60_000, changed, "18.2", "1.0.0 (1)", "203.0.113.5");
+    assert(changed && prof.osVersion == "18.2");
+    assert(prof.model == "iPhone17,1" && prof.appVersion == "1.0.0 (1)" && prof.lastIp == "203.0.113.5");
+
+    // App version alone changes.
+    prof = ensureDeviceProfile(p, id, "iPhone17,1", now + 10 * 60_000, changed, "18.2", "1.1.0 (2)", "203.0.113.5");
+    assert(changed && prof.appVersion == "1.1.0 (2)");
+    assert(prof.osVersion == "18.2" && prof.lastIp == "203.0.113.5");
+
+    // IP alone changes.
+    prof = ensureDeviceProfile(p, id, "iPhone17,1", now + 10 * 60_000, changed, "18.2", "1.1.0 (2)", "198.51.100.9");
+    assert(changed && prof.lastIp == "198.51.100.9");
+    assert(prof.osVersion == "18.2" && prof.appVersion == "1.1.0 (2)");
 }
 
 @("ensureDeviceProfile drops the profile seen least recently past MAX_DEVICE_PROFILES")
