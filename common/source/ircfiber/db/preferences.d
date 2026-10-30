@@ -148,6 +148,12 @@ struct DeviceProfile {
     long updatedAt;
     /// Unix ms of the device's last request, at `DEVICE_SEEN_GRANULARITY_MS` granularity.
     long lastSeenAt;
+    /// This install's own bouncer password, minted by POST /api/me/bouncer-token;
+    /// "" until minted. NOT in DEVICE_SETTINGS/DEVICE_BOOL_PREFS, so copySettings
+    /// and accountProfile (the web<->device sync) never touch it.
+    string bncToken;
+    /// Unix ms the token above was minted; 0 when unset.
+    long bncTokenCreatedAtMs;
 
     /// Serializes every field under its own name.
     Json toJson() const {
@@ -160,6 +166,8 @@ struct DeviceProfile {
         j["createdAt"] = Json(createdAt);
         j["updatedAt"] = Json(updatedAt);
         j["lastSeenAt"] = Json(lastSeenAt);
+        j["bncToken"] = Json(bncToken);
+        j["bncTokenCreatedAtMs"] = Json(bncTokenCreatedAtMs);
         return j;
     }
 
@@ -202,6 +210,18 @@ struct DeviceProfile {
                 else
                     bad = true;
             }
+        }
+        if (auto v = "bncToken" in j) {
+            if (v.type == Json.Type.string)
+                d.bncToken = v.get!string;
+            else
+                bad = true;
+        }
+        if (auto v = "bncTokenCreatedAtMs" in j) {
+            if (v.type == Json.Type.int_)
+                d.bncTokenCreatedAtMs = v.get!long;
+            else
+                bad = true;
         }
         return d;
     }
