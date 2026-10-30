@@ -3927,16 +3927,23 @@ final class PersistentIRCClient {
                     if (activeEgressLocationId.length > 0) banEgressForHost(config.host, activeEgressLocationId);
                     recordHostFailure(config.host, config.port);
                 }
-                // A silent-drop reconnect (PONG timeout or idle half-open) means
-                // this egress held a dead connection open for 60-300s without
-                // ever surfacing a TCP/TLS-level error — the same failure
-                // signature as a wedged TLS handshake, just discovered later.
-                // Feed it into the same egress-health machinery the TLS-timeout
-                // path above uses so the next attempt — for this network *and*
-                // every other tenant sharing this sidecar — skips the exit that
-                // just black-holed us instead of round-robin handing it right
-                // back out.
-                if (reason.canFind("PONG timeout") || reason.canFind("Idle half-open detected")) {
+                // A silent-drop reconnect means this egress held a dead
+                // connection open without ever surfacing a TCP/TLS-level
+                // error — the same failure signature as a wedged TLS
+                // handshake, just discovered later (by the 120s PONG
+                // watchdog, the idle-half-open reaper, or a direct
+                // `transportAlive` check in processEvents()/writeRaw()).
+                // Feed it into the same egress-health machinery the
+                // TLS-timeout path above uses so the next attempt — for
+                // this network *and* every other tenant sharing this
+                // sidecar — skips the exit that just black-holed us
+                // instead of round-robin handing it right back out.
+                // (Registration-phase closes are excluded: `relayClosed()`
+                // and `!transportAlive` share one message there —
+                // "Server closed the connection…" — so it can't tell a
+                // dead egress from a real server refusal.)
+                if (reason.canFind("PONG timeout") || reason.canFind("Idle half-open detected")
+                    || reason.canFind("transport not alive") || reason.canFind("transport dead")) {
                     recordCounter("ircfiber.keepalive.timeout_disconnect", 1, ["host": config.host, "egress": activeEgressLabel]);
                     if (activeEgressLocationId.length > 0) banEgressForHost(config.host, activeEgressLocationId);
                     if (activeEgressLabel.length > 0) recordMullvadFailure(activeEgressLabel);
