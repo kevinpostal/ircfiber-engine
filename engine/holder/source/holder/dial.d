@@ -300,8 +300,8 @@ private void report(EventSink emit, string phase, string text) {
 // split-horizon (on prod `irc.ircfiber.com` is a Docker alias → fd00:f1b3:1::7,
 // unreachable from a remote sidecar) and the exit's answer is the one that
 // matches the address the IRC network will see anyway.
-TCPConnection socks5ConnectViaProxy(string proxyHost, ushort proxyPort, string target, ushort targetPort,
-                                    Duration connectTimeout) {
+TCPConnection socks5ConnectViaProxy(string proxyHost, ushort proxyPort, string username, string password,
+                                    string target, ushort targetPort, Duration connectTimeout) {
     import core.sys.posix.arpa.inet : inet_pton;
     import core.sys.posix.sys.socket : AF_INET, AF_INET6;
     auto proxyConn = connectTCP(proxyHost, proxyPort, null, 0, connectTimeout);
@@ -310,11 +310,33 @@ TCPConnection socks5ConnectViaProxy(string proxyHost, ushort proxyPort, string t
     // like every other connect step (an unbounded read here wedged fibers on
     // a hung sidecar). Reset afterwards — the socket carries TLS + IRC next.
     proxyConn.readTimeout = HAPPY_EYEBALLS_RACE_TIMEOUT_SECONDS.seconds;
-    ubyte[3] greet = [0x05, 0x01, 0x00];
-    proxyConn.write(greet[]);
+    // RFC 1929 username/password (NordVPN-style static credentialed proxies)
+    // offered alongside the no-auth method Mullvad sidecars use; when both
+    // username and password are empty this reproduces the exact prior byte
+    // sequence and accept condition — zero behavior change for no-auth slots.
+    const useAuth = username.length > 0 || password.length > 0;
+    ubyte[] greet;
+    if (useAuth) { greet ~= cast(ubyte)0x05; greet ~= cast(ubyte)0x02; greet ~= cast(ubyte)0x00; greet ~= cast(ubyte)0x02; }
+    else { greet ~= cast(ubyte)0x05; greet ~= cast(ubyte)0x01; greet ~= cast(ubyte)0x00; }
+    proxyConn.write(greet);
     ubyte[2] greetResp;
     proxyConn.read(greetResp[]);
-    if (greetResp[0] != 0x05 || greetResp[1] != 0x00) throw new Exception("SOCKS5 proxy auth failed");
+    if (greetResp[0] != 0x05) throw new Exception("SOCKS5 proxy auth failed");
+    if (greetResp[1] == 0x02) {
+        if (!useAuth) throw new Exception("SOCKS5 proxy requires username/password authentication");
+        if (username.length > 255 || password.length > 255)
+            throw new Exception("SOCKS5 username/password must each be 255 bytes or fewer");
+        ubyte[] auth;
+        auth ~= cast(ubyte)0x01;
+        auth ~= cast(ubyte) username.length; auth ~= cast(const(ubyte)[]) username;
+        auth ~= cast(ubyte) password.length; auth ~= cast(const(ubyte)[]) password;
+        proxyConn.write(auth);
+        ubyte[2] authResp;
+        proxyConn.read(authResp[]);
+        if (authResp[0] != 0x01 || authResp[1] != 0x00) throw new Exception("SOCKS5 proxy rejected username/password");
+    } else if (greetResp[1] != 0x00) {
+        throw new Exception("SOCKS5 proxy auth failed");
+    }
     ubyte[] req;
     req ~= cast(ubyte)0x05; req ~= cast(ubyte)0x01; req ~= cast(ubyte)0x00;
     ubyte[4] ip4;
@@ -341,6 +363,105 @@ TCPConnection socks5ConnectViaProxy(string proxyHost, ushort proxyPort, string t
     if (remain > 0) { ubyte[] tmp = new ubyte[remain]; proxyConn.read(tmp); }
     proxyConn.readTimeout = Duration.max;
     return proxyConn;
+}
+
+@("socks5ConnectViaProxy performs RFC 1929 username/password auth")
+unittest {
+    import vibe.core.core : runTask, runEventLoop, exitEventLoop, setTimer;
+    import std.socket : TcpSocket, InternetAddress, Socket;
+    import core.thread : Thread;
+
+    enum goodUser = "testuser";
+    enum goodPass = "testpass";
+
+    // Minimal blocking SOCKS5 server speaking only RFC 1929: offers method
+    // 0x02, checks exactly one credential pair per connection, then answers
+    // CONNECT with a trivial success reply. Runs on a plain OS thread, fully
+    // outside vibe's fiber scheduler (mirrors egress.d::probeExits' own
+    // background-Thread pattern) so it cannot deadlock the event loop the
+    // client side drives via connectTCP below. No network access, no real
+    // credentials — deterministic.
+    static void recvExact(Socket s, ubyte[] buf) {
+        size_t got = 0;
+        while (got < buf.length) {
+            auto n = s.receive(buf[got .. $]);
+            if (n <= 0) throw new Exception("fake SOCKS5 server: connection closed early");
+            got += n;
+        }
+    }
+    static void serveOne(TcpSocket listener) {
+        auto client = listener.accept();
+        scope (exit) client.close();
+        ubyte[2] greetHdr;
+        recvExact(client, greetHdr[]);
+        auto methods = new ubyte[greetHdr[1]];
+        recvExact(client, methods);
+        ubyte[2] chosen = [0x05, 0x02];
+        client.send(chosen[]);
+        ubyte[2] authHdr;
+        recvExact(client, authHdr[]);
+        auto uname = new ubyte[authHdr[1]];
+        recvExact(client, uname);
+        ubyte[1] plenBuf;
+        recvExact(client, plenBuf[]);
+        auto pass = new ubyte[plenBuf[0]];
+        recvExact(client, pass);
+        bool ok = uname == cast(const ubyte[]) goodUser && pass == cast(const ubyte[]) goodPass;
+        ubyte[2] authResp = [0x01, ok ? 0x00 : 0x01];
+        client.send(authResp[]);
+        if (!ok) return;
+        ubyte[4] connHdr;
+        recvExact(client, connHdr[]);
+        size_t addrLen;
+        if (connHdr[3] == 0x01) addrLen = 4;
+        else if (connHdr[3] == 0x04) addrLen = 16;
+        else if (connHdr[3] == 0x03) { ubyte[1] l; recvExact(client, l[]); addrLen = l[0]; }
+        auto rest = new ubyte[addrLen + 2];
+        recvExact(client, rest);
+        ubyte[10] connResp = [0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+        client.send(connResp[]);
+    }
+
+    auto listener = new TcpSocket();
+    listener.bind(new InternetAddress("127.0.0.1", 0));
+    listener.listen(2);
+    scope (exit) listener.close();
+    ushort proxyPort = (cast(InternetAddress) listener.localAddress).port;
+
+    auto server = new Thread({
+        serveOne(listener); // first connection: matching credentials
+        serveOne(listener); // second connection: mismatched password
+    });
+    server.isDaemon = true;
+    server.start();
+
+    bool okConnected;
+    string okError, failError, timedOut;
+    runTask(() nothrow {
+        auto watchdog = setTimer(10.seconds, { timedOut = "test timed out"; exitEventLoop(); });
+        scope (exit) { watchdog.stop(); exitEventLoop(); }
+        try {
+            auto conn = socks5ConnectViaProxy("127.0.0.1", proxyPort, goodUser, goodPass,
+                "example.com", 80, 5.seconds);
+            okConnected = true;
+            try conn.close(); catch (Exception) {}
+        } catch (Exception e) {
+            try okError = e.msg; catch (Exception) {}
+        }
+        try {
+            socks5ConnectViaProxy("127.0.0.1", proxyPort, goodUser, "wrongpass",
+                "example.com", 80, 5.seconds);
+        } catch (Exception e) {
+            try failError = e.msg; catch (Exception) {}
+        }
+    });
+    runEventLoop();
+    server.join();
+
+    assert(timedOut.length == 0, timedOut);
+    assert(okConnected, "matching credentials must succeed: " ~ okError);
+    assert(failError.canFind("rejected"),
+        "mismatched password must throw 'rejected': got " ~ failError);
 }
 
 // ── Happy Eyeballs (direct) ─────────────────────────────────────────────────
@@ -788,7 +909,7 @@ DialOutcome dialUpstream(ref DialRequest req, EventSink emit) {
             if (why.length) throw new DialFailed("blocked", "blocked: " ~ why);
         }
         try {
-            o.conn = socks5ConnectViaProxy(req.proxy.host, req.proxy.port, target, req.port, connectTimeout);
+            o.conn = socks5ConnectViaProxy(req.proxy.host, req.proxy.port, req.proxy.username, req.proxy.password, target, req.port, connectTimeout);
         } catch (Exception e) {
             const l = e.msg.toLower();
             throw new DialFailed(l.canFind("socks") ? "socks5" : "tcp", e.msg);

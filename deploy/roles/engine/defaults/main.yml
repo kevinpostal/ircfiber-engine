@@ -19,3 +19,20 @@ mullvad_sidecars: []
 #   - { name: "us", exit_node: "us-nyc-wg-001.mullvad.ts.net" }
 mullvad_sidecar_image: "tailscale/tailscale:stable"
 mullvad_sidecar_socks_port: 1055
+
+# NordVPN SOCKS5 proxies — no sidecar, no license, no retargeting: each
+# entry dials NordVPN's own public proxy host directly with RFC1929
+# username/password auth. Each entry falls back to the shared
+# vault_nordvpn_socks_username/password (vault.example.yml) when it sets no
+# username/password of its own — set them per-entry to spread load across
+# more than one NordVPN account, since each account has its own
+# connection-concurrency limit. Renders IRCFIBER_NORDVPN_POOL as
+# socks5://<name>:<user>:<pass>@<host>:<port>, merged into the same
+# picker/ban/circuit-breaker pool as mullvad_sidecars.
+nordvpn_proxies: []
+# Example (two static exits, verified reachable; second entry shows a
+# per-entry credential override for a second NordVPN account):
+# nordvpn_proxies:
+#   - { name: "nord-nl", host: "nl.socks.nordhold.net", port: 1080 }
+#   - { name: "nord-us-atl", host: "atlanta.us.socks.nordhold.net", port: 1080,
+#       username: "{{ vault_nordvpn_socks_username_2 }}", password: "{{ vault_nordvpn_socks_password_2 }}" }

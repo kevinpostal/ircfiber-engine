@@ -424,11 +424,22 @@ private struct MullvadProxy {
     /// Slot is reserved (retarget in flight) or in its post-release sticky
     /// hold until this unix-ms timestamp.
     long heldUntilMs;
+    /// RFC 1929 SOCKS5 credentials for a credentialed static slot (e.g.
+    /// NordVPN); "" for Mullvad's no-auth sidecars.
+    string username;
+    string password;
 }
 private __gshared MullvadProxy[] mullvadPool;
 private __gshared size_t mullvadRR;
 private __gshared bool mullvadPoolLoaded;
 private __gshared Object gMullvadLock;
+/// Set once from bootstrap.d right after the engine's Redis connection is
+/// established (mirrors NetworkRepository.initRedis). Lets
+/// loadNordvpnPoolUnlocked fill credential-less entries from
+/// RedisKeys.nordvpnCreds() without threading redis through getHealthyProxies.
+private __gshared RedisStorage gEgressRedis;
+
+void setEgressRedis(RedisStorage redis) { gEgressRedis = redis; }
 /// Mullvad relay catalog as the slots' own tailscaled reports it, plus the
 /// unix-ms it was last rebuilt. Guarded by gMullvadLock.
 private __gshared ExitRelay[] gExitRelays;
@@ -648,6 +659,75 @@ private void loadMullvadPoolUnlocked() {
             sock.length ? "true" : "false", sock.length ? sock : "-");
     }
     logInfo("Mullvad pool loaded: %d slots", cast(int) mullvadPool.length);
+    loadNordvpnPoolUnlocked();
+}
+
+// Reads IRCFIBER_NORDVPN_POOL directly via getenv. Grammar:
+// socks5://<label>:<username>:<password>@<host>:<port> (per-entry
+// credentials) or socks5://<label>@<host>:<port> (credential-less — filled
+// from the shared IRCFIBER_NORDVPN_USERNAME/_PASSWORD env pair, or the
+// admin-settable Redis override via gEgressRedis when either half of the
+// env pair is empty). label is mandatory (no safe way to derive one from a
+// shared public NordVPN hostname the way mullvadLabelFromHost() does for
+// Mullvad). Must match the gateway's parser
+// (site/backend/source/ircfiber/egress.d::parseNordvpnPool).
+// Caller holds gMullvadLock (called only from loadMullvadPoolUnlocked).
+private void loadNordvpnPoolUnlocked() {
+    import core.stdc.stdlib : getenv;
+    import core.stdc.string : strlen;
+    auto envp = getenv(toStringz("IRCFIBER_NORDVPN_POOL"));
+    if (envp is null) return;
+    auto raw = envp[0 .. strlen(envp)].idup;
+    if (raw.length == 0) return;
+    string sharedUser = envRaw("IRCFIBER_NORDVPN_USERNAME");
+    string sharedPass = envRaw("IRCFIBER_NORDVPN_PASSWORD");
+    if ((sharedUser.length == 0 || sharedPass.length == 0) && gEgressRedis !is null) {
+        try {
+            auto rawCreds = gEgressRedis.getDb().get(RedisKeys.nordvpnCreds());
+            if (rawCreds.length > 0) {
+                import vibe.data.json : parseJsonString;
+                auto j = parseJsonString(rawCreds);
+                if (sharedUser.length == 0) sharedUser = j["username"].opt!string("");
+                if (sharedPass.length == 0) sharedPass = j["password"].opt!string("");
+            }
+        } catch (Exception e) { logWarn("NordVPN pool: shared credential read failed: %s", e.msg); }
+    }
+    foreach (idx, entry; raw.split(",")) {
+        auto e = entry.strip();
+        if (e.length == 0) continue;
+        auto p = e.indexOf("://");
+        if (p >= 0) e = e[p+3 .. $];
+        auto at = e.indexOf("@");
+        if (at < 0) { logWarn("NordVPN pool: entry %d missing label@ — skipped", idx); continue; }
+        auto userinfo = e[0 .. at].split(":");
+        e = e[at+1 .. $];
+        string label, username, password;
+        if (userinfo.length == 1) {
+            label = userinfo[0].strip().toLower();
+            username = sharedUser;
+            password = sharedPass;
+        } else if (userinfo.length == 3) {
+            label = userinfo[0].strip().toLower();
+            username = userinfo[1].strip();
+            password = userinfo[2].strip();
+            if (username.length == 0 || password.length == 0) {
+                logWarn("NordVPN pool: entry needs label:username:password — skipped (host=%s)", e); continue;
+            }
+        } else {
+            logWarn("NordVPN pool: entry %d malformed userinfo — skipped", idx); continue;
+        }
+        if (label.length == 0) { logWarn("NordVPN pool: empty label — skipped"); continue; }
+        auto colon = e.lastIndexOf(":");
+        string host; ushort port = 1080;
+        if (colon >= 0) { host = e[0 .. colon].strip(); try { port = e[colon+1 .. $].strip().to!ushort; } catch (Exception) {} }
+        else host = e;
+        if (host.length == 0) { logWarn("NordVPN pool: empty host for label=%s — skipped", label); continue; }
+        MullvadProxy np;
+        np.host = host; np.port = port; np.label = label; np.state = "ready";
+        np.username = username; np.password = password;
+        mullvadPool ~= np;
+        logInfo("NordVPN pool: %s:%d (label=%s) — credentials redacted from logs", host, port, label);
+    }
 }
 
 private MullvadProxy*[] getHealthyProxies() {
@@ -1421,7 +1501,7 @@ private TCPConnection happyEyeballsConnectWithProxy(HolderClient holder, DialTag
     req.sni = stripHostBrackets(host);
     if (proxy !is null) {
         req.hasProxy = true;
-        req.proxy = DialProxy(proxy.host, proxy.port);
+        req.proxy = DialProxy(proxy.host, proxy.port, proxy.username, proxy.password);
     }
     req.bindIp6 = proxy is null ? ipv6BindAddr : "";
     req.connectTimeoutMs = CONNECT_TIMEOUT_SECONDS * 1000;

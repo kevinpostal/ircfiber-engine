@@ -113,6 +113,8 @@ struct DialTag {
 struct DialProxy {
     string host;
     ushort port;
+    string username;
+    string password;
 }
 
 /// One dial attempt through exactly one egress.
@@ -143,6 +145,8 @@ struct DialRequest {
             auto p = Json.emptyObject;
             p["host"] = proxy.host;
             p["port"] = cast(int) proxy.port;
+            if (proxy.username.length) p["username"] = proxy.username;
+            if (proxy.password.length) p["password"] = proxy.password;
             j["proxy"] = p;
         } else {
             j["proxy"] = Json(null);

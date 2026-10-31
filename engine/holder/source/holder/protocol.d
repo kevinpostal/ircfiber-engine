@@ -121,6 +121,8 @@ struct Tag {
 struct ProxySpec {
     string host;
     ushort port;
+    string username;
+    string password;
 }
 
 /// `DIAL` request payload.
@@ -163,6 +165,8 @@ struct DialRequest {
             if (r.proxy.host.length == 0 || pp <= 0 || pp > 65_535)
                 throw new Exception("DIAL: proxy needs host and port");
             r.proxy.port = cast(ushort) pp;
+            r.proxy.username = jstr(p, "username");
+            r.proxy.password = jstr(p, "password");
         }
         r.bindIp6 = jstr(j, "bindIp6");
         r.connectTimeoutMs = jlong(j, "connectTimeoutMs", r.connectTimeoutMs);
@@ -185,6 +189,8 @@ struct DialRequest {
             auto p = Json.emptyObject;
             p["host"] = proxy.host;
             p["port"] = cast(int) proxy.port;
+            if (proxy.username.length) p["username"] = proxy.username;
+            if (proxy.password.length) p["password"] = proxy.password;
             j["proxy"] = p;
         } else {
             j["proxy"] = Json(null);

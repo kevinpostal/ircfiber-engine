@@ -8,6 +8,12 @@
 # --- Tailscale ----------------------------------------------------------------
 vault_tailscale_authkey: "tskey-auth-REPLACE-ME"
 
+# --- NordVPN SOCKS5 proxy (service credentials, not your NordVPN login) ------
+# Generate at https://my.nordaccount.com/dashboard/nordvpn/ → "Set up NordVPN
+# manually" → Service credentials. Shared by every host in nordvpn_proxies.
+vault_nordvpn_socks_username: "REPLACE-ME"
+vault_nordvpn_socks_password: "REPLACE-ME"
+
 # --- Docker registry ----------------------------------------------------------
 vault_docker_registry_username: "REPLACE-ME"
 vault_docker_registry_password: "REPLACE-ME"

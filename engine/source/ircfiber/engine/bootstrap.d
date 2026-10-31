@@ -23,6 +23,7 @@ import ircfiber.irc.manager : ConnectionManager;
 import ircfiber.irc.server : ConnectionServer;
 import ircfiber.irc.registry : ServerRegistry;
 import ircfiber.irc.engine_janitor : EngineJanitor, purgeLocalServerNamespace, bumpServerStateTTLs;
+import ircfiber.irc.connection : setEgressRedis;
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.storage.buffer : BufferManager;
 import ircfiber.db.mongo : AppMongoConnection;
@@ -124,6 +125,7 @@ EngineContext bootstrapEngine() {
     foreach (attempt; 0 .. 30) {
         try {
             redis.connectFromUrl(redisUrl);
+            setEgressRedis(redis);
             break;
         } catch (Exception e) {
             if (attempt == 29) {

@@ -69,6 +69,13 @@ struct RedisKeys {
     /// EXPIRE 1800 — the catalog changes rarely and must survive a few
     /// missed refreshes so the picker never goes blank.
     static string egressCatalog(string serverId) { return "irc:egress:catalog:" ~ serverId; }
+
+    /// Shared NordVPN SOCKS5 credential pair (admin-settable, like the OAuth
+    /// provider overrides in ircfiber.oauth): `{"username":…, "password":…}`.
+    /// Read by the gateway (ircfiber.nordvpn_creds) and the engine
+    /// (loadNordvpnPoolUnlocked) to fill any pool entry that specifies no
+    /// credentials of its own.
+    static string nordvpnCreds() { return "irc:egress:nordvpn:creds"; }
     
     /// Legacy state key (non-namespaced)
     static string state_legacy(string networkId) { return "irc:state:" ~ networkId; }
