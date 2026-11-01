@@ -6450,7 +6450,7 @@ private void processEvents() {
             // but no realnames (e.g. snapshot-loaded state after a restart),
             // trigger WHO to populate them. Rate-limited to 60s per check
             // and 2s per channel via lastWhoTime.
-            if (now - lastWhoEnrichCheck >= 60) {
+            if (now - lastWhoEnrichCheck >= 60 && !pacer.isArmed()) {
                 lastWhoEnrichCheck = now;
                 foreach (chan, users; channelUsers) {
                     if (users.length == 0) continue;
@@ -7026,7 +7026,6 @@ private void processEvents() {
             }
 
             case "403": // ERR_NOSUCHCHANNEL
-            case "405": // ERR_TOOMANYCHANNELS
             case "471": // ERR_CHANNELISFULL
             case "473": // ERR_INVITEONLYCHAN
             case "474": // ERR_BANNEDFROMCHAN
@@ -7037,6 +7036,23 @@ private void processEvents() {
                 // a later throttle retry does not re-ask for it.
                 auto ps = event.getParams();
                 if (ps.length > 1) clearPendingJoin(ps[1]);
+                break;
+            }
+
+            // SuperNets' channel-targeted flood warning rides numeric 405
+            // (ERR_TOOMANYCHANNELS is its RFC meaning, but this ircd reuses
+            // it for ":<server> 405 <nick> <channel> :<flood text>", e.g.
+            // the colourised "slow down nerd" — see the unittest below).
+            // Still clears a pending join the same as any other channel
+            // refusal above; additionally arms the pacer when
+            // isFloodNotice(event.text) matches, narrow enough that a real
+            // ERR_TOOMANYCHANNELS ("You have joined too many channels") on
+            // another network is never mistaken for a flood signal.
+            case "405": {
+                auto ps = event.getParams();
+                if (ps.length > 1) clearPendingJoin(ps[1]);
+                if (isFloodNotice(event.text))
+                    onFloodComplaint("405", event.text);
                 break;
             }
             case "433": // ERR_NICKNAMEINUSE
@@ -7363,7 +7379,8 @@ private void processEvents() {
                         needsWho = channelNeedsRealnameWho(
                             namesBurst[chan], realnames, realnameProbed, attempts);
                         if (needsWho && namesBurst[chan].length > 5
-                            && (chan !in lastWhoTime || whoNow - lastWhoTime[chan] >= 2)) {
+                            && (chan !in lastWhoTime || whoNow - lastWhoTime[chan] >= 2)
+                            && !pacer.isArmed()) {
                             sendRaw("WHO " ~ chan);
                             lastWhoTime[chan] = whoNow;
                             whoEnrichAttempts[chan] = attempts + 1;
@@ -7428,7 +7445,8 @@ private void processEvents() {
                                 "users": channelUsers[chan].length.to!string,
                                 "realnames": realnames.length.to!string,
                                 "event": "rpl_endofnames_check"]);
-                        if (needsWho && (chan !in lastWhoTime || whoNow - lastWhoTime[chan] >= 2)) {
+                        if (needsWho && (chan !in lastWhoTime || whoNow - lastWhoTime[chan] >= 2)
+                            && !pacer.isArmed()) {
                             sendRaw("WHO " ~ chan);
                             lastWhoTime[chan] = whoNow;
                             whoEnrichAttempts[chan] = attempts + 1;
@@ -9656,6 +9674,20 @@ unittest {
     evt.text   = "slow down nerd";
     assert(PersistentIRCClient.isServerPrefix(evt) && PersistentIRCClient.isFloodNotice(evt.text),
            "this is exactly the notice the pacer must arm on — regression for the nick==hostname bug");
+}
+
+@("SuperNets' flood-complaint numeric 405 (\"slow down nerd\") arms the pacer like a flood NOTICE")
+unittest {
+    import vibe.core.channel : createChannel;
+    NetworkConfig cfg;
+    cfg.nick = "Zodiac";
+    auto ch = createChannel!IRCRawEvent();
+    auto c = new PersistentIRCClient(cfg, ch);
+    assert(!c.pacer.isArmed(), "fresh client starts unarmed");
+    c.processLine(":contra.supernets.org 405 Zodiac #superbowl :\x1F\x0304slow down nerd\x0F");
+    assert(c.pacer.isArmed(),
+           "a channel-targeted 405 carrying a flood phrase must tighten the pacer");
+    ch.close();
 }
 
 @("firstPartyDirectOnly keeps first-party off shared exits")
