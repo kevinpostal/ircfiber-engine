@@ -677,13 +677,18 @@ private void loadMullvadPoolUnlocked() {
 }
 
 // Reads IRCFIBER_NORDVPN_POOL directly via getenv. Grammar:
-// socks5://<label>:<username>:<password>@<host>:<port> (per-entry
-// credentials) or socks5://<label>@<host>:<port> (credential-less — filled
-// from the shared IRCFIBER_NORDVPN_USERNAME/_PASSWORD env pair, or the
+// socks5://<label>:<username>:<password>@<host>:<port>[#<countryCode>,<country>,<city>]
+// (per-entry credentials) or socks5://<label>@<host>:<port>[#...] (credential-less
+// — filled from the shared IRCFIBER_NORDVPN_USERNAME/_PASSWORD env pair, or the
 // admin-settable Redis override via gEgressRedis when either half of the
 // env pair is empty). label is mandatory (no safe way to derive one from a
 // shared public NordVPN hostname the way mullvadLabelFromHost() does for
-// Mullvad). Must match the gateway's parser
+// Mullvad). The optional `#...` suffix is this static entry's fixed exit
+// location — unlike a Mullvad slot, a static entry is never retargeted
+// and has no live status to query, so without this its EgressSlotView
+// carries an empty city/country forever and NetworkForm/admin pages fall
+// back to printing the raw label instead of "Stockholm, Sweden" the way
+// Mullvad slots display. Must match the gateway's parser
 // (site/backend/source/ircfiber/egress.d::parseNordvpnPool).
 // Caller holds gMullvadLock (called only from loadMullvadPoolUnlocked).
 private void loadNordvpnPoolUnlocked() {
@@ -711,6 +716,20 @@ private void loadNordvpnPoolUnlocked() {
         if (e.length == 0) continue;
         auto p = e.indexOf("://");
         if (p >= 0) e = e[p+3 .. $];
+        // Location suffix, if present — strip before host:port parsing so
+        // it never gets mistaken for part of the port. Pipe-separated,
+        // NOT comma: raw.split(",") above already split the whole pool
+        // string by comma to get one `entry` per proxy, so a comma here
+        // would silently fracture this one entry into several bogus ones.
+        string countryCode, country, city;
+        auto hash = e.indexOf("#");
+        if (hash >= 0) {
+            auto meta = e[hash+1 .. $].split("|");
+            if (meta.length >= 1) countryCode = meta[0].strip();
+            if (meta.length >= 2) country = meta[1].strip();
+            if (meta.length >= 3) city = meta[2].strip();
+            e = e[0 .. hash];
+        }
         auto at = e.indexOf("@");
         if (at < 0) { logWarn("NordVPN pool: entry %d missing label@ — skipped", idx); continue; }
         auto userinfo = e[0 .. at].split(":");
@@ -739,8 +758,10 @@ private void loadNordvpnPoolUnlocked() {
         MullvadProxy np;
         np.host = host; np.port = port; np.label = label; np.state = "ready";
         np.username = username; np.password = password;
+        np.exitCountryCode = countryCode; np.exitCountry = country; np.exitCity = city;
         mullvadPool ~= np;
-        logInfo("NordVPN pool: %s:%d (label=%s) — credentials redacted from logs", host, port, label);
+        logInfo("NordVPN pool: %s:%d (label=%s, %s) — credentials redacted from logs", host, port, label,
+            city.length > 0 ? city ~ ", " ~ country : "no location configured");
     }
 }
 

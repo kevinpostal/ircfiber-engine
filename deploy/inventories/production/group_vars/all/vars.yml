@@ -199,16 +199,16 @@ mullvad_sidecars:
 # purely from contention with this box's own background refresher/sweep,
 # not a real per-host answer.
 nordvpn_proxies:
-  - { name: "nord-se-sto-1", host: "socks-se8.nordvpn.com", port: 1080 }  # Stockholm, SE (was se13 — stopped authenticating 2026-11-01, see matrix)
-  - { name: "nord-se-sto-2", host: "socks-se14.nordvpn.com", port: 1080 } # Stockholm, SE
-  - { name: "nord-se-sto-3", host: "socks-se15.nordvpn.com", port: 1080 } # Stockholm, SE
-  - { name: "nord-se-sto-4", host: "socks-se17.nordvpn.com", port: 1080 } # Stockholm, SE
-  - { name: "nord-se-sto-5", host: "socks-se18.nordvpn.com", port: 1080 } # Stockholm, SE
-  - { name: "nord-se-sto-6", host: "socks-se9.nordvpn.com", port: 1080 }  # Stockholm, SE (was se20 — stopped authenticating)
-  - { name: "nord-se-sto-7", host: "socks-se12.nordvpn.com", port: 1080 } # Stockholm, SE (was nord-us-chi-1/us34 — stopped authenticating; Stockholm has proven far more reliable than the US cities tried for this account)
-  - { name: "nord-us-chi-2", host: "socks-us35.nordvpn.com", port: 1080 } # Chicago, US
-  - { name: "nord-us-chi-3", host: "socks-us36.nordvpn.com", port: 1080 } # Chicago, US
-  - { name: "nord-us-chi-4", host: "socks-us38.nordvpn.com", port: 1080 } # Chicago, US
+  - { name: "nord-se-sto-1", host: "socks-se8.nordvpn.com", port: 1080, countryCode: "se", country: "Sweden", city: "Stockholm" }  # was se13 — stopped authenticating 2026-11-01, see matrix
+  - { name: "nord-se-sto-2", host: "socks-se14.nordvpn.com", port: 1080, countryCode: "se", country: "Sweden", city: "Stockholm" }
+  - { name: "nord-se-sto-3", host: "socks-se15.nordvpn.com", port: 1080, countryCode: "se", country: "Sweden", city: "Stockholm" }
+  - { name: "nord-se-sto-4", host: "socks-se17.nordvpn.com", port: 1080, countryCode: "se", country: "Sweden", city: "Stockholm" }
+  - { name: "nord-se-sto-5", host: "socks-se18.nordvpn.com", port: 1080, countryCode: "se", country: "Sweden", city: "Stockholm" }
+  - { name: "nord-se-sto-6", host: "socks-se9.nordvpn.com", port: 1080, countryCode: "se", country: "Sweden", city: "Stockholm" }  # was se20 — stopped authenticating
+  - { name: "nord-se-sto-7", host: "socks-se12.nordvpn.com", port: 1080, countryCode: "se", country: "Sweden", city: "Stockholm" } # was nord-us-chi-1/us34 — stopped authenticating; Stockholm has proven far more reliable than the US cities tried for this account
+  - { name: "nord-us-chi-2", host: "socks-us35.nordvpn.com", port: 1080, countryCode: "us", country: "United States", city: "Chicago" }
+  - { name: "nord-us-chi-3", host: "socks-us36.nordvpn.com", port: 1080, countryCode: "us", country: "United States", city: "Chicago" }
+  - { name: "nord-us-chi-4", host: "socks-us38.nordvpn.com", port: 1080, countryCode: "us", country: "United States", city: "Chicago" }
 
 # --- Gateway defaults ---------------------------------------------------------
 ircfiber_gateway_log_level: "info"
