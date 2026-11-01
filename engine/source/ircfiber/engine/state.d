@@ -110,8 +110,25 @@ private void publishEgressState(ref EngineContext ctx, string serverId) {
         refreshEgressState();
         auto slots = egressSlotViews();
         auto slotsKey = RedisKeys.egressSlots(serverId);
-        foreach (v; slots)
+        bool[string] currentLabels;
+        foreach (v; slots) {
+            currentLabels[v.label] = true;
             ctx.redis.getDb().hset(slotsKey, v.label, slotViewToJson(v).toString());
+        }
+        // Prune fields for labels no longer in the pool. HSET only ever
+        // adds/updates fields — without this, a label removed by a config
+        // change (IRCFIBER_NORDVPN_POOL edited, engine restarted) sits in
+        // the hash forever, since the key's own 60s EXPIRE keeps getting
+        // pushed back by every live write below and never actually lapses.
+        // Confirmed live: three same-day pool edits left 20 stale label
+        // fields alongside the 10 actually configured, each shown to
+        // users as a pickable "Connect via" exit that doesn't exist.
+        try {
+            foreach (field; ctx.redis.getDb().hkeys(slotsKey))
+                if (field !in currentLabels) ctx.redis.getDb().hdel(slotsKey, field);
+        } catch (Exception e) {
+            logWarn("Failed to prune stale egress slot fields: %s", e.msg);
+        }
         if (slots.length > 0) ctx.redis.getDb().expire(slotsKey, 60);
         auto catalogKey = RedisKeys.egressCatalog(serverId);
         auto locs = egressLocations();
