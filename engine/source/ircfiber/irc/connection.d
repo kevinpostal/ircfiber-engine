@@ -956,6 +956,18 @@ private MullvadProxy*[] getHealthyProxiesForHostLocked(string hostLower) {
 /// can pin it ("direct") the same way it pins a Mullvad label.
 enum DIRECT_EGRESS_LABEL = "direct";
 
+/// Pin value requesting "any healthy exit on the static (NordVPN-like)
+/// tier, automatic selection within it, never Mullvad" — the same
+/// ranking tierAndOrderProxies' static half uses (most-recent-success
+/// descending), but without the Mullvad-first ordering Automatic always
+/// applies. Some networks (e.g. SuperNets) want to stay off Mullvad and
+/// only use the shared NordVPN pool, while still getting automatic
+/// failover among whichever of those exits is currently not banned/dead
+/// for that host — a single static-label pin is a worse fit since
+/// NordVPN's shared-account contention means *which* entry works shifts
+/// over time (see tierAndOrderProxies' own doc comment).
+enum NORDVPN_TIER_EGRESS_LABEL = "nordvpn";
+
 /// True when, after `bannedKey` was just banned (or SASL-gated) for
 /// `hostLower`, at least one other route to the host remains: a healthy exit
 /// whose location is not host-banned, a free controllable slot that could be
@@ -1674,6 +1686,9 @@ private string egressPinFallbackCopy(string reason) nothrow {
             return "Could not switch an exit to that location — connecting via another exit.";
         case "no-catalog":
             return "No exit locations are available on this server — connecting via another exit.";
+        case "no-healthy-static":
+            return "No NordVPN exit is currently healthy for this server — "
+                ~ "connecting directly instead.";
         default:
             return "That location is not available on this server — connecting via another exit.";
     }
@@ -1781,6 +1796,40 @@ unittest {
     assert(single.length == 1 && single[0].label == "de" && rr2 == 5);
 }
 
+/// Static (NordVPN-like) tier only, ranked by most-recent-success
+/// descending — same ranking as tierAndOrderProxies' static half, for a
+/// "nordvpn" pin that wants automatic failover within that tier without
+/// ever trying Mullvad. `healthy` is expected to already be host-ban and
+/// global-health filtered (getHealthyProxiesForHost's output), same
+/// precondition tierAndOrderProxies has.
+private MullvadProxy*[] staticTierOnly(MullvadProxy*[] healthy) {
+    MullvadProxy*[] staticTier;
+    foreach (p; healthy) if (p.controlSocket.length == 0) staticTier ~= p;
+    if (staticTier.length > 1) staticTier.sort!((a, b) => a.lastSuccessMs > b.lastSuccessMs);
+    return staticTier;
+}
+
+@("staticTierOnly: Mullvad entries excluded, static tier ranked by recent success")
+unittest {
+    MullvadProxy de, nordA, nordB, nordC;
+    de.label = "de"; de.controlSocket = "/ctl/de.sock";
+    nordA.label = "nordA"; nordA.lastSuccessMs = 100;
+    nordB.label = "nordB"; nordB.lastSuccessMs = 300; // most recently successful
+    nordC.label = "nordC"; nordC.lastSuccessMs = 0;   // never succeeded
+
+    auto healthy = [&de, &nordA, &nordB, &nordC];
+    auto ordered = staticTierOnly(healthy);
+
+    assert(ordered.length == 3, "Mullvad entry excluded");
+    assert(ordered[0].label == "nordB");
+    assert(ordered[1].label == "nordA");
+    assert(ordered[2].label == "nordC");
+
+    assert(staticTierOnly([&de]).length == 0, "Mullvad-only input yields nothing");
+    MullvadProxy*[] empty;
+    assert(staticTierOnly(empty).length == 0);
+}
+
 private TCPConnection happyEyeballsConnect(HolderClient holder, DialTag tag, string host, ushort port,
                                            string tlsMode, string egressNodeId, bool unauthenticated,
                                            string ipv6BindAddr, ConnectProgress progress,
@@ -1834,8 +1883,23 @@ private TCPConnection happyEyeballsConnect(HolderClient holder, DialTag tag, str
     // told them to pick another route; honour the pin and let the ban
     // window run.
     const pinDirect = egressNodeId.length > 0 && egressNodeId.toLower() == DIRECT_EGRESS_LABEL;
+    const pinNordvpnTier = egressNodeId.length > 0 && egressNodeId.toLower() == NORDVPN_TIER_EGRESS_LABEL;
     string egressBusyNote;
-    if (egressNodeId.length > 0 && !pinDirect) {
+    if (pinNordvpnTier) {
+        // "nordvpn" pin: automatic selection within the static tier only
+        // (never Mullvad), host-ban and global-health aware since
+        // healthyForHost already filters both — same preconditions
+        // tierAndOrderProxies' Automatic path relies on.
+        toTry ~= staticTierOnly(healthyForHost);
+        if (toTry.length == 0) {
+            logWarn("NordVPN tier pin unavailable for %s — no healthy static exit, falling back to direct",
+                hostLower);
+            logJsonMap("warn", "connection", "Egress pin unavailable",
+                ["host": hostLower, "pin": egressNodeId, "reason": "no-healthy-static",
+                 "event": "egress_busy"]);
+            egressBusyNote = egressPinFallbackCopy("no-healthy-static");
+        }
+    } else if (egressNodeId.length > 0 && !pinDirect) {
         // Country/city pin: reuse a slot already on that location, else
         // retarget an idle one. A slot carrying live connections is never
         // touched, so honouring this pin cannot drop another network.
@@ -1879,6 +1943,11 @@ private TCPConnection happyEyeballsConnect(HolderClient holder, DialTag tag, str
     MullvadProxy*[] gated;
     if (!pinDirect) {
         foreach (p; healthyForHost) {
+            // A "nordvpn" pin never falls through to Mullvad, not even as
+            // a gated last resort — Direct is the only non-static fallback
+            // it allows (the unconditional direct-fallback block below,
+            // unchanged, already covers that).
+            if (pinNordvpnTier && p.controlSocket.length > 0) continue;
             bool already = false;
             foreach (q; toTry) if (q is p) { already = true; break; }
             if (already) continue;
