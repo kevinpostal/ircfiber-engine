@@ -6,7 +6,7 @@ import std.base64 : Base64;
 import std.conv : to;
 import std.datetime : Clock, SysTime;
 import std.uni : toLower;
-import std.algorithm : canFind, countUntil, remove;
+import std.algorithm : canFind, countUntil, remove, sort;
 import std.socket : getAddress, AddressFamily;
 import std.uuid : UUID, randomUUID, parseUUID;
 import std.typecons : Nullable;
@@ -429,6 +429,11 @@ private struct MullvadProxy {
     /// NordVPN); "" for Mullvad's no-auth sidecars.
     string username;
     string password;
+    /// Unix ms of this slot's last successful dial, any host; 0 = never
+    /// (this process). Used to rank the static (NordVPN-like) tier by
+    /// most-recently-proven-live instead of blind round robin — see
+    /// happyEyeballsConnect's tiering comment.
+    long lastSuccessMs;
 }
 private __gshared MullvadProxy[] mullvadPool;
 private __gshared size_t mullvadRR;
@@ -756,11 +761,12 @@ private MullvadProxy*[] getHealthyProxiesLocked() {
 }
 
 private void recordMullvadSuccess(string label) {
+    const now = Clock.currTime.toUnixTime!long * 1000;
     if (gMullvadLock !is null) synchronized (gMullvadLock) {
-        foreach (ref pr; mullvadPool) if (pr.label == label) { pr.failCount = 0; pr.deadUntilMs = 0; break; }
+        foreach (ref pr; mullvadPool) if (pr.label == label) { pr.failCount = 0; pr.deadUntilMs = 0; pr.lastSuccessMs = now; break; }
         return;
     }
-    foreach (ref pr; mullvadPool) if (pr.label == label) { pr.failCount = 0; pr.deadUntilMs = 0; break; }
+    foreach (ref pr; mullvadPool) if (pr.label == label) { pr.failCount = 0; pr.deadUntilMs = 0; pr.lastSuccessMs = now; break; }
 }
 private void recordMullvadFailure(string label) {
     if (gMullvadLock !is null) synchronized (gMullvadLock) {
@@ -1674,6 +1680,86 @@ private bool firstPartyDirectOnly(string hostLower, string egressNodeId) @safe p
 /// host SASL-gates last. `dr` carries the holder's `CONNECTED` facts for the
 /// winning dial.
 
+/// Reliability tiering + smart routing for Automatic egress. Mullvad's
+/// independent per-city sidecars have no shared-account contention and are
+/// consistently far more reliable than a static credentialed provider's
+/// exits (e.g. NordVPN), which all share one account's own
+/// concurrent-session ceiling — confirmed empirically 2026-11-01: even
+/// with zero self-contention in how the daily sweep measures them, only
+/// ~1 of 10 configured NordVPN entries authenticated at any given moment,
+/// and *which* one shifts over time.
+///
+/// Splits `healthy` into the Mullvad (controllable) and static
+/// (NordVPN-like) tiers and returns Mullvad-first, so a user's first
+/// attempt is never wasted on a static exit whose account-mate is the
+/// reason it's about to fail. Within the Mullvad tier: `rrIndex` (the
+/// caller's `mullvadRR`, mutated in place) rotates the start point per
+/// call for load spreading — without this, every network on a
+/// many-network host (e.g. 6x SuperNets) would try the same exit first,
+/// hammering its 32/10m limit into "Too many unknown connections"; with
+/// rotation they spread across exits and stay under per-IP limits.
+/// Session-limit throttling (isThrottleError) already bans a hammered
+/// exit for 12h via banEgressForHost, but rotation prevents the initial
+/// herd. Within the static tier: sorted by most-recent-success
+/// (lastSuccessMs) descending rather than rotated, since with only ~1 of
+/// N typically live, round-robining through the rest wastes real
+/// connection attempts on entries that are currently dead.
+///
+/// Pure aside from `rrIndex` (an explicit ref parameter, not the global
+/// directly) so the tiering invariant is unit-tested without touching
+/// gMullvadLock/mullvadPool. Caller holds gMullvadLock while mutating the
+/// shared rrIndex, same as every other mullvadRR use in this module.
+private MullvadProxy*[] tierAndOrderProxies(MullvadProxy*[] healthy, ref size_t rrIndex) {
+    MullvadProxy*[] mullvadTier, staticTier;
+    foreach (p; healthy) (p.controlSocket.length > 0 ? mullvadTier : staticTier) ~= p;
+    if (mullvadTier.length > 1) {
+        const startIdx = rrIndex++ % mullvadTier.length;
+        if (startIdx != 0) mullvadTier = mullvadTier[startIdx .. $] ~ mullvadTier[0 .. startIdx];
+    }
+    if (staticTier.length > 1) staticTier.sort!((a, b) => a.lastSuccessMs > b.lastSuccessMs);
+    return mullvadTier ~ staticTier;
+}
+
+@("tierAndOrderProxies: Mullvad tier first, static tier ranked by recent success, rotation only within Mullvad")
+unittest {
+    MullvadProxy de, ch, us, nordA, nordB, nordC;
+    de.label = "de"; de.controlSocket = "/ctl/de.sock";
+    ch.label = "ch"; ch.controlSocket = "/ctl/ch.sock";
+    us.label = "us"; us.controlSocket = "/ctl/us.sock";
+    nordA.label = "nordA"; nordA.lastSuccessMs = 100;
+    nordB.label = "nordB"; nordB.lastSuccessMs = 300; // most recently successful
+    nordC.label = "nordC"; nordC.lastSuccessMs = 0;   // never succeeded
+
+    auto healthy = [&de, &nordA, &ch, &nordB, &us, &nordC];
+    size_t rr = 0;
+    auto ordered = tierAndOrderProxies(healthy, rr);
+
+    assert(ordered.length == 6);
+    // Every Mullvad entry sorts before every static entry.
+    bool[string] mullvadLabels = ["de": true, "ch": true, "us": true];
+    size_t firstStaticIdx = size_t.max;
+    foreach (i, p; ordered) if (p.label !in mullvadLabels) { firstStaticIdx = i; break; }
+    assert(firstStaticIdx == 3, "exactly the 3 Mullvad entries lead");
+    foreach (p; ordered[0 .. 3]) assert(p.label in mullvadLabels);
+    // Static tier: most-recent-success first, regardless of input order.
+    assert(ordered[3].label == "nordB");
+    assert(ordered[4].label == "nordA");
+    assert(ordered[5].label == "nordC");
+    // Mullvad tier rotated by rrIndex (started at 0, length 3 -> startIdx 0 -> unrotated this call).
+    assert(ordered[0].label == "de" && ordered[1].label == "ch" && ordered[2].label == "us");
+    assert(rr == 1, "rrIndex advanced exactly once");
+
+    // Next call rotates: startIdx = 1 % 3 = 1 -> ch, us, de.
+    auto ordered2 = tierAndOrderProxies(healthy, rr);
+    assert(ordered2[0].label == "ch" && ordered2[1].label == "us" && ordered2[2].label == "de");
+
+    // A single Mullvad entry never rotates (nothing to rotate among) and
+    // rrIndex is left untouched.
+    size_t rr2 = 5;
+    auto single = tierAndOrderProxies([&de], rr2);
+    assert(single.length == 1 && single[0].label == "de" && rr2 == 5);
+}
+
 private TCPConnection happyEyeballsConnect(HolderClient holder, DialTag tag, string host, ushort port,
                                            string tlsMode, string egressNodeId, bool unauthenticated,
                                            string ipv6BindAddr, ConnectProgress progress,
@@ -1710,26 +1796,16 @@ private TCPConnection happyEyeballsConnect(HolderClient holder, DialTag tag, str
     //   by getHealthyProxiesForHost(hostLower) so a G-lined exit for one
     //   host never blocks it for another.
     auto healthyForHost = getHealthyProxiesForHost(hostLower);
-    // Smart routing: spread load for hosts with many networks (e.g. 6x SuperNets)
-    // by rotating the healthy list per call via global round-robin. Without this,
-    // all 6 networks for irc.supernets.org would try de first at the same time,
-    // hammering that exit's 32/10m limit and getting "Too many unknown connections".
-    // With rotation, they try de, ch, nl, se, gb, us respectively, spreading 6 conns
-    // across 6 exits (1 per IP) and staying under per-IP limits. Session-limit
-    // throttling (isThrottleError) already bans the hammered exit for 12h via
-    // banEgressForHost, but rotation prevents the initial herd.
-    if (healthyForHost.length > 1 && egressNodeId.length == 0) {
-        size_t startIdx = 0;
+    // Reliability tiering + smart routing (Automatic only — a pin/location
+    // request bypasses this entirely): see tierAndOrderProxies' own doc
+    // comment for why Mullvad goes first and the static tier is ranked by
+    // recent success instead of rotated.
+    if (egressNodeId.length == 0 && healthyForHost.length > 1) {
         if (gMullvadLock !is null) synchronized (gMullvadLock) {
-            startIdx = mullvadRR++ % healthyForHost.length;
+            healthyForHost = tierAndOrderProxies(healthyForHost, mullvadRR);
         } else {
-            startIdx = mullvadRR++ % healthyForHost.length;
+            healthyForHost = tierAndOrderProxies(healthyForHost, mullvadRR);
         }
-        if (startIdx != 0) {
-            auto rotated = healthyForHost[startIdx .. $] ~ healthyForHost[0 .. startIdx];
-            healthyForHost = rotated;
-        }
-        logDebug("Mullvad smart routing for %s: startIdx=%d", hostLower, startIdx);
     }
     MullvadProxy*[] toTry;
     // Pinned "direct": the user asked for the bare host IP — never route
