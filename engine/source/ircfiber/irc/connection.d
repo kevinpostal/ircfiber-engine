@@ -369,6 +369,12 @@ private enum REGISTRATION_MAX_FALLBACK_ATTEMPTS  = 3;
 // and the suffix is short enough to fit comfortably inside IRC's 9-31
 // char nick limit on most servers.
 private enum REGISTRATION_RANDOM_SUFFIX_HEX_LEN  = 5;
+// How long to wait after sending `NickServ GHOST` before retrying NICK.
+// Anope/Atheme process GHOST synchronously and kill the target session
+// in well under a second in practice; this just gives the server a
+// moment to act before we re-ask for the nick, bounded well short of
+// the ~30-60s ghost-protection timeout we'd otherwise have to wait out.
+private enum GHOST_RECLAIM_WAIT_MS              = 2000;
 // Fractions of REGISTRATION_OVERALL_TIMEOUT_SECS at which we emit a
 // warning event so operators can see the registration is in progress
 // (e.g. 50% / 75%). Helps diagnose slow networks without waiting
@@ -2938,6 +2944,14 @@ final class PersistentIRCClient {
         // this false clears the persisted key so the next reconnect
         // retries the configured nick. Reset at every attempt start.
         bool                randomNickPersisted;
+        // True when this registration attempt has already tried a
+        // NickServ GHOST reclaim of the primary requested nick after a
+        // 433 collision. Capped at one attempt per registration attempt
+        // so a GHOST that doesn't stick (wrong/rotated password, network
+        // without services) falls straight through to the existing
+        // `_`-append chain instead of looping. Reset at every attempt
+        // start alongside randomNickPersisted.
+        bool                ghostReclaimAttempted;
         bool                isAway = false;
         string              awayMessage;
         string[string]      channelState;
@@ -3259,6 +3273,7 @@ final class PersistentIRCClient {
         // current one (the nick counter is part of attempt-scoped state).
         this.registrationFallbackAttempts = 0;
         this.randomNickPersisted = false;
+        this.ghostReclaimAttempted = false;
     }
 
     /// Starts the connection loop in a background task. No-op for a
@@ -5156,6 +5171,7 @@ final class PersistentIRCClient {
         // must not shield this attempt's plain `_` fallback from the
         // 001 handler's clearPersistedNick below.
         randomNickPersisted = false;
+        ghostReclaimAttempted = false;
         // PASS must be sent before NICK/USER per RFC 1459 §4.1
         if (config.serverPass.length > 0) sendRaw("PASS " ~ config.serverPass);
         sendRaw("NICK " ~ sessionNick);
@@ -5374,6 +5390,49 @@ final class PersistentIRCClient {
                         case "433":
                         case "432":
                             registrationFallbackAttempts++;
+                            // A 433 on the exact nick we asked for, when we
+                            // hold a services credential for it, almost
+                            // always means a stale session of OUR OWN is
+                            // still holding it: our previous connection
+                            // died in a way that skipped a clean QUIT
+                            // (transport loss, egress rotation — see the
+                            // "Ghost failure detected" backoff above), and
+                            // ghost protection keeps the server-side socket
+                            // alive for up to ~30-60s. Minting a `_`-suffix
+                            // sibling nick here used to register a brand
+                            // new session instead — a flappy connection
+                            // left a trail of `Zodiac_`, `Zodiac__`, … ghost
+                            // entries sitting in every auto-join channel
+                            // until the network eventually timed each one
+                            // out. Reclaim the nick outright via NickServ
+                            // GHOST instead so a self-collision self-heals
+                            // in ~2s with no ghost entry left behind.
+                            // Guarded to at most one attempt per
+                            // registration attempt, only against the
+                            // primary requested nick (never an
+                            // already-fallen-back nick — ghosting `Zodiac_`
+                            // because `Zodiac__` is taken could kill a
+                            // different, unrelated collision's session),
+                            // and only when a credential proves we own the
+                            // nick's services account, so this never
+                            // touches a stranger's session.
+                            if (!ghostReclaimAttempted && sessionNick == requestedNick) {
+                                ghostReclaimAttempted = true;
+                                const ghostPass = config.nspass.length > 0 ? config.nspass
+                                    : (config.sasl != SASLMechanism.none ? config.saslPassword : "");
+                                if (ghostPass.length > 0) {
+                                    registrationFallbackAttempts--; // doesn't consume the `_`-chain budget
+                                    logJsonMap("info", "connection",
+                                        "Nick in use, likely by our own stale session — reclaiming via NickServ GHOST",
+                                        ["network": config.name, "nick": requestedNick,
+                                         "event": "nickserv_ghost_attempt"]);
+                                    recordCounter("ircfiber.nick.ghost_attempt", 1, ["network": config.name]);
+                                    sendRaw("PRIVMSG NickServ :GHOST " ~ requestedNick ~ " " ~ ghostPass);
+                                    sleep(GHOST_RECLAIM_WAIT_MS.msecs);
+                                    sendRaw("NICK " ~ requestedNick);
+                                    break;
+                                }
+                            }
                             if (registrationFallbackAttempts <= REGISTRATION_MAX_FALLBACK_ATTEMPTS) {
                                 // The classic `Zod` → `Zod_` → `Zod__` chain.
                                 // Each fallback _is_ a NICK change on the
