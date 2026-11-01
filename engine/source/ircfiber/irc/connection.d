@@ -2743,6 +2743,116 @@ unittest {
     assert(parseJoinThrottleSeconds("connected for at least 99999 seconds") == 600);
 }
 
+/// Membership flap guard. A client stuck in a reconnect or re-JOIN loop
+/// makes the ircd echo a fresh JOIN/PART/QUIT (each with its own msgid, so
+/// storage dedup keeps every one) per iteration — 163 JOINs and 116 QUITs
+/// from one nick in under a second on 2026-10-31 — and each is a row in
+/// every member's channel view.
+///
+/// State and display are separate: the roster takes every line, so it is
+/// never wrong. Only publishing is gated, per member per channel (our own
+/// membership and KICKs never are):
+///  - an echo (a line that changes nothing, e.g. JOIN while joined, once we
+///    have published that member) is never published and costs nothing;
+///  - the first MEMBER_FLAP_BURST lines in a MEMBER_FLAP_WINDOW_MS window are
+///    relayed live, so ordinary churn (quit + rejoin, even twice) shows
+///    exactly as before, with no delay;
+///  - past that the member is flapping and further lines are held. Once it
+///    settles (MEMBER_FLAP_QUIET_MS without a line), or every
+///    MEMBER_FLAP_MAX_HOLD_MS while a storm goes on, the newest held line is
+///    relayed iff the roster now differs from what downstream last saw.
+/// Downstream therefore always converges on the true membership, with at
+/// most BURST + 1 rows per member per channel per storm.
+struct MemberFlap {
+    string chan;          /// roster key; "" for a QUIT from a nick in no tracked channel
+    string nick;
+    bool   published;     /// membership downstream last saw
+    long   windowStartMs; /// start of the current burst window
+    uint   relayed;       /// lines relayed live in this window
+    long   lastLineMs;    /// newest line, relayed or held
+    long   holdSinceMs;   /// when this storm's first line was held; 0 = not holding
+    IRCRawEvent pending;  /// newest held line, relayed on settle
+}
+
+enum MEMBER_FLAP_WINDOW_MS   = 10_000;
+enum MEMBER_FLAP_BURST       = 4;
+enum MEMBER_FLAP_QUIET_MS    = 3_000;
+enum MEMBER_FLAP_MAX_HOLD_MS = 30_000;
+
+/// Counts one membership line against `f`'s budget. True: relay it now
+/// (`f.published` becomes `isIn`). False: hold it. Once holding, a member
+/// stays held until `settleMemberFlap` releases it, even across a window.
+bool admitMemberFlap(ref MemberFlap f, bool isIn, long nowMs) @safe pure nothrow {
+    f.lastLineMs = nowMs;
+    if (nowMs - f.windowStartMs >= MEMBER_FLAP_WINDOW_MS) {
+        f.windowStartMs = nowMs;
+        f.relayed = 0;
+    }
+    if (f.holdSinceMs == 0 && f.relayed < MEMBER_FLAP_BURST) {
+        f.relayed++;
+        f.published = isIn;
+        return true;
+    }
+    if (f.holdSinceMs == 0) f.holdSinceMs = nowMs;
+    return false;
+}
+
+enum MemberFlapDue { wait, settle, forget }
+
+/// What the sweep does with `f` at `nowMs`: `settle` a holding member once it
+/// went quiet or has been held MAX_HOLD; `forget` an idle one whose window
+/// is over (nothing held, nothing left to count); otherwise `wait`.
+MemberFlapDue memberFlapDue(const ref MemberFlap f, long nowMs) @safe pure nothrow {
+    if (f.holdSinceMs == 0)
+        return nowMs - f.lastLineMs >= MEMBER_FLAP_WINDOW_MS ? MemberFlapDue.forget : MemberFlapDue.wait;
+    if (nowMs - f.lastLineMs >= MEMBER_FLAP_QUIET_MS || nowMs - f.holdSinceMs >= MEMBER_FLAP_MAX_HOLD_MS)
+        return MemberFlapDue.settle;
+    return MemberFlapDue.wait;
+}
+
+@("admitMemberFlap relays ordinary churn live and holds a storm")
+unittest {
+    MemberFlap f;
+    // quit, rejoin, quit, rejoin: all live.
+    foreach (i; 0 .. MEMBER_FLAP_BURST)
+        assert(admitMemberFlap(f, i % 2 == 1, 1_000 + i));
+    assert(f.published);
+    // The next line in the window is held, and holding sticks even after
+    // the window rolls over — only the sweep ends a storm.
+    assert(!admitMemberFlap(f, false, 1_100));
+    assert(f.published, "a held line does not move what downstream saw");
+    assert(!admitMemberFlap(f, true, 1_000 + MEMBER_FLAP_WINDOW_MS + 1));
+    assert(f.holdSinceMs == 1_100);
+}
+
+@("admitMemberFlap restores the full budget once the window has passed")
+unittest {
+    MemberFlap f;
+    foreach (i; 0 .. MEMBER_FLAP_BURST) assert(admitMemberFlap(f, i % 2 == 0, 1_000));
+    // Spent but not holding: the next window is a fresh budget.
+    foreach (i; 0 .. MEMBER_FLAP_BURST)
+        assert(admitMemberFlap(f, i % 2 == 0, 1_000 + MEMBER_FLAP_WINDOW_MS));
+    assert(!admitMemberFlap(f, true, 1_000 + MEMBER_FLAP_WINDOW_MS));
+}
+
+@("memberFlapDue settles on quiet or max hold, forgets idle members")
+unittest {
+    MemberFlap f;
+    assert(admitMemberFlap(f, true, 1_000));
+    assert(memberFlapDue(f, 1_000 + MEMBER_FLAP_WINDOW_MS - 1) == MemberFlapDue.wait);
+    assert(memberFlapDue(f, 1_000 + MEMBER_FLAP_WINDOW_MS) == MemberFlapDue.forget);
+
+    MemberFlap h;
+    h.holdSinceMs = 5_000;
+    h.lastLineMs = 5_000;
+    assert(memberFlapDue(h, 5_000 + MEMBER_FLAP_QUIET_MS - 1) == MemberFlapDue.wait);
+    assert(memberFlapDue(h, 5_000 + MEMBER_FLAP_QUIET_MS) == MemberFlapDue.settle);
+    // A storm that never goes quiet still settles every MAX_HOLD.
+    h.lastLineMs = 5_000 + MEMBER_FLAP_MAX_HOLD_MS - 1;
+    assert(memberFlapDue(h, 5_000 + MEMBER_FLAP_MAX_HOLD_MS - 1) == MemberFlapDue.wait);
+    assert(memberFlapDue(h, 5_000 + MEMBER_FLAP_MAX_HOLD_MS) == MemberFlapDue.settle);
+}
+
 /// Lower-case phrases that, next to "sasl", mark a server refusal as a
 /// demand to log in rather than a ban of the address. See
 /// `isSaslRequiredRefusal`.
@@ -2875,12 +2985,12 @@ final class PersistentIRCClient {
         /// keeps answering "wait" cannot become a JOIN loop.
         int                 joinThrottleRounds;
         bool                joinThrottleRetryInFlight;
-        /// Echo flood guard: last relayed JOIN (key `joinEchoKey`) and QUIT
-        /// (key `foldNick`; QUIT is network-wide on the wire) per connection.
-        /// A client re-sending JOIN/QUIT gets a fresh ircd echo each time,
-        /// each with its own msgid, so storage dedup cannot catch it.
-        long[string]        lastJoinEchoMs;
-        long[string]        lastQuitEchoMs;
+        /// Membership flap guard (see `MemberFlap`), keyed by `memberKey`.
+        /// Bounded by MEMBER_FLAP_MAX_TRACKED; reset per socket. The epoch
+        /// is bumped per socket so a sweep task of the old one stands down.
+        MemberFlap[string]  memberFlaps;
+        uint                memberFlapEpoch;
+        bool                memberFlapSweepArmed;
 
         // Set when REGISTRATION_OVERALL_TIMEOUT_SECS elapses without 001
         // (or a fatal registration error). unix-ms of the most recent
@@ -3901,29 +4011,139 @@ final class PersistentIRCClient {
         joinsAwaitingConfirm = [];
         joinThrottleRounds = 0;
         joinThrottleRetryInFlight = false;
-        // Nothing to debounce against on a fresh socket.
-        lastJoinEchoMs = null;
-        lastQuitEchoMs = null;
+        // A fresh socket gets a fresh NAMES; nothing held is owed any more.
+        memberFlaps = null;
+        memberFlapEpoch++;
+        memberFlapSweepArmed = false;
     }
 
-    /// Repeated JOIN/QUIT echoes for the same key inside this window are dropped.
-    private enum JOIN_QUIT_ECHO_FLOOD_WINDOW_MS = 3_000;
+    /// Members tracked by the flap guard at once. Past it the guard fails
+    /// open (relays live) rather than growing without bound in a channel
+    /// with heavy churn; idle members are forgotten after one window.
+    private enum MEMBER_FLAP_MAX_TRACKED = 8_192;
+    /// How often the sweep settles held members.
+    private enum MEMBER_FLAP_SWEEP_MS = 500;
 
-    /// True when `key` was last seen within JOIN_QUIT_ECHO_FLOOD_WINDOW_MS.
-    /// Records `nowMs` as the new "last seen" only when allowing the event
-    /// through, so sustained flooding still lets one line through per
-    /// window instead of latching shut forever.
-    private bool floodGuarded(ref long[string] lastSeenMs, string key, long nowMs) nothrow {
-        if (auto last = key in lastSeenMs) {
-            if (nowMs - *last < JOIN_QUIT_ECHO_FLOOD_WINDOW_MS) return true;
-        }
-        lastSeenMs[key] = nowMs;
+    /// Flap-guard key for one member of one channel. Channel "" holds a
+    /// QUIT from a nick in none of our tracked channels.
+    private string memberKey(string chan, string nick) {
+        return chan ~ "\0" ~ foldNick(nick);
+    }
+
+    private bool rosterHas(string chan, string nick) {
+        foreach (u; channelUsers.get(chan, null))
+            if (sameNick(u, nick)) return true;
         return false;
     }
 
-    /// Flood-guard key for one nick's JOIN echo in one channel.
-    private string joinEchoKey(string chan, string nick) {
-        return chan ~ "\0" ~ foldNick(nick);
+    /// Runs one membership line of another user's (applied to the roster
+    /// already) through the flap guard. Null: publish it now. Otherwise it
+    /// is held, and the caller stores in `pending` the line the sweep
+    /// relays if the member settles in this state.
+    ///
+    /// An echo — a line that changes nothing, about a member whose state we
+    /// already published — is held without spending budget: a client
+    /// re-sending JOIN gets one row, not one per echo. A member we have not
+    /// published yet is relayed even when the roster already lists them,
+    /// since that entry may be a ghost a missed QUIT left behind.
+    private MemberFlap* holdMembership(string chan, string nick, bool wasIn, bool isIn) {
+        const key = memberKey(chan, nick);
+        const nowMs = unixMsNow();
+        auto f = key in memberFlaps;
+        if (f is null) {
+            if (memberFlaps.length >= MEMBER_FLAP_MAX_TRACKED) return null;
+            MemberFlap fresh;
+            fresh.chan = chan;
+            fresh.nick = nick;
+            fresh.published = wasIn;
+            memberFlaps[key] = fresh;
+            f = key in memberFlaps;
+        } else if (wasIn == isIn && f.published == isIn) {
+            f.lastLineMs = nowMs; // keeps the record (and so this rule) alive
+            return f;
+        }
+        armMemberFlapSweep();
+        return admitMemberFlap(*f, isIn, nowMs) ? null : f;
+    }
+
+    /// Relays `f`'s held line iff the roster now differs from what
+    /// downstream last saw and the line says what the roster says (a NAMES
+    /// rebase may have moved the roster since the line was held).
+    private void releaseHeld(ref MemberFlap f) {
+        if (f.pending.command.length > 0) {
+            const isIn = f.chan.length > 0 && rosterHas(f.chan, f.nick);
+            if (isIn != f.published && (f.pending.command == "JOIN") == isIn) {
+                eventChannel.put(f.pending);
+                f.published = isIn;
+            }
+        }
+        f.pending = IRCRawEvent.init;
+    }
+
+    /// The sweep: settles members whose storm is over (or has been held
+    /// MAX_HOLD) and forgets idle ones. See `memberFlapDue`.
+    private void settleMemberFlaps(long nowMs) {
+        string[] idle;
+        foreach (key, ref f; memberFlaps) {
+            final switch (memberFlapDue(f, nowMs)) {
+                case MemberFlapDue.wait:
+                    break;
+                case MemberFlapDue.forget:
+                    idle ~= key;
+                    break;
+                case MemberFlapDue.settle:
+                    releaseHeld(f);
+                    // Still storming (MAX_HOLD, not quiet): keep holding.
+                    f.holdSinceMs = nowMs - f.lastLineMs >= MEMBER_FLAP_QUIET_MS ? 0 : nowMs;
+                    break;
+            }
+        }
+        foreach (k; idle) memberFlaps.remove(k);
+    }
+
+    /// A rename moves the member to a new key: release what is held for the
+    /// old nick now, so it lands before the NICK line that renames it.
+    private void flushMemberFlaps(string nick) {
+        const suffix = "\0" ~ foldNick(nick);
+        string[] gone;
+        foreach (key, ref f; memberFlaps) {
+            if (key.endsWith(suffix)) {
+                releaseHeld(f);
+                gone ~= key;
+            }
+        }
+        foreach (k; gone) memberFlaps.remove(k);
+    }
+
+    /// We left `chan`: nothing about its members is owed downstream.
+    private void forgetMemberFlaps(string chan) {
+        const prefix = chan ~ "\0";
+        string[] gone;
+        foreach (key, _; memberFlaps)
+            if (key.startsWith(prefix)) gone ~= key;
+        foreach (k; gone) memberFlaps.remove(k);
+    }
+
+    private void armMemberFlapSweep() nothrow {
+        if (memberFlapSweepArmed) return;
+        memberFlapSweepArmed = true;
+        const epoch = memberFlapEpoch;
+        try {
+            runTask({
+                try {
+                    while (memberFlapEpoch == epoch && memberFlaps.length > 0) {
+                        sleep(MEMBER_FLAP_SWEEP_MS.msecs);
+                        if (memberFlapEpoch == epoch) settleMemberFlaps(unixMsNow());
+                    }
+                } catch (Exception e) {
+                    logWarn("Membership flap sweep failed for %s: %s", config.name, e.msg);
+                }
+                // A newer socket's sweep owns the flag now.
+                if (memberFlapEpoch == epoch) memberFlapSweepArmed = false;
+            });
+        } catch (Exception) {
+            memberFlapSweepArmed = false;
+        }
     }
 
     /// Max channels tracked for the throttle retry. The auto-join burst is
@@ -6549,14 +6769,6 @@ private void processEvents() {
                 auto params = event.getParams();
                 if (params.length > 0) {
                     auto chan = normalizeChannelName(params[0]);
-                    // Flood guard: a client re-sending JOIN for a channel it
-                    // is already in gets a fresh ircd echo every time (no
-                    // protocol-level dedup there), which would otherwise
-                    // flood every other member's channel view with repeat
-                    // "X joined" rows. Drop repeats inside the window
-                    // entirely — same effect as never receiving the line.
-                    if (floodGuarded(lastJoinEchoMs, joinEchoKey(chan, event.nick), nowMsSafe()))
-                        return;
                     channelState[chan] = "";
                     if (sameNick(event.nick, sessionNick)) {
                         // Confirmed: the throttle retry must not re-ask.
@@ -6610,6 +6822,7 @@ private void processEvents() {
                         // member. This raw append is how `kernelstub` and
                         // `kernelstub!~kernelstub@host` both ended up in
                         // the #tclmafia roster.
+                        const wasIn = rosterHas(chan, event.nick);
                         channelUsers[chan] = upsertRosterEntry(
                             channelUsers.get(chan, null), event.nick, casemapping());
                         // IRCv3 extended-join: extract account name from params[1]
@@ -6635,6 +6848,13 @@ private void processEvents() {
                                 if (at > 0)
                                     idents[event.nick] = userAt[0 .. at];
                             }
+                        }
+                        // Flap guard (see `MemberFlap`): the roster and the
+                        // identity above are current either way; a held
+                        // JOIN publishes nothing and skips the WHOIS.
+                        if (auto f = holdMembership(chan, event.nick, wasIn, true)) {
+                            f.pending = event;
+                            return;
                         }
                         // Fallback: send WHOIS to discover the realname when
                         // extended-join didn't carry it (the older spec
@@ -6665,10 +6885,8 @@ private void processEvents() {
                 auto params = event.getParams();
                 if (params.length > 0) {
                     auto chan = normalizeChannelName(params[0]);
-                    // A PART ends the membership the guard debounces against:
-                    // an immediate rejoin (/cycle) is a real JOIN, not an echo.
-                    lastJoinEchoMs.remove(joinEchoKey(chan, event.nick));
                     if (sameNick(event.nick, sessionNick)) {
+                        forgetMemberFlaps(chan);
                         channelState.remove(chan);
                         metaDirty = true;
                         channelUsers.remove(chan);
@@ -6678,7 +6896,12 @@ private void processEvents() {
                         if (!config.partedChannels.canFind(chan))
                             config.partedChannels ~= chan;
                     } else {
+                        const wasIn = rosterHas(chan, event.nick);
                         removeFromUsers(chan, event.nick);
+                        if (auto f = holdMembership(chan, event.nick, wasIn, false)) {
+                            f.pending = event; // flap guard, as for JOIN
+                            return;
+                        }
                     }
                     logJsonMap("debug", "protocol",
                         "PART",
@@ -6695,8 +6918,8 @@ private void processEvents() {
                 if (params.length >= 2) {
                     auto chan       = normalizeChannelName(params[0]);
                     auto targetNick = params[1];
-                    lastJoinEchoMs.remove(joinEchoKey(chan, targetNick)); // see PART
                     if (targetNick == sessionNick) {
+                        forgetMemberFlaps(chan);
                         channelState.remove(chan);
                         metaDirty = true;
                         channelUsers.remove(chan);
@@ -6707,6 +6930,14 @@ private void processEvents() {
                             config.partedChannels ~= chan;
                     } else {
                         removeFromUsers(chan, targetNick);
+                        // A kick is an operator's act, never the member's
+                        // flapping: always relayed, and it supersedes
+                        // whatever the flap guard was holding for them.
+                        if (auto f = memberKey(chan, targetNick) in memberFlaps) {
+                            f.published = false;
+                            f.holdSinceMs = 0;
+                            f.pending = IRCRawEvent.init;
+                        }
                     }
                     logJsonMap("info", "protocol",
                         "KICK",
@@ -6720,15 +6951,24 @@ private void processEvents() {
                 break;
 
             case "QUIT":
-                // Flood guard: see JOIN. The first QUIT in the window already
-                // removed the nick from every roster; repeats carry nothing.
-                if (floodGuarded(lastQuitEchoMs, foldNick(event.nick), nowMsSafe()))
-                    return;
+                // The roster loses the nick everywhere; the flap guard (see
+                // `MemberFlap`) decides per channel whether that row is
+                // published now or held. Our own QUIT is never gated.
+                const selfQuit = sameNick(event.nick, sessionNick);
+                bool quitInAny;
                 foreach (chan, ref users; channelUsers) {
                     foreach (i, u; users) {
                         if (sameNick(u, event.nick)) {
-                            quitChannels ~= chan;
                             users = users.remove(i);
+                            quitInAny = true;
+                            auto f = selfQuit ? null : holdMembership(chan, event.nick, true, false);
+                            if (f is null) {
+                                quitChannels ~= chan;
+                            } else {
+                                f.pending = event;
+                                f.pending.channel = chan;
+                                f.pending.id = randomUUID().toString();
+                            }
                             break;
                         }
                     }
@@ -6744,6 +6984,13 @@ private void processEvents() {
                          "reason": event.text,
                          "event": "quit"]);
                 }
+                // The channel-less line goes out with the relayed channel
+                // rows; when every one is held, so is it. A nick in no
+                // tracked channel has nothing to hold, but its repeats still
+                // count against the budget.
+                if (!selfQuit && (quitInAny ? quitChannels.length == 0
+                                            : holdMembership("", event.nick, false, false) !is null))
+                    return;
                 break;
 
                         case "ERROR":
@@ -6828,6 +7075,7 @@ private void processEvents() {
                 auto params = event.getParams();
                 if (params.length > 0) {
                     const newNick = params[$ - 1];
+                    flushMemberFlaps(event.nick);
                     foreach (chan, ref users; channelUsers) {
                         // Mutate EVERY entry that matches the old nick. The
                         // same user can appear twice in channelUsers — once
@@ -9487,72 +9735,109 @@ unittest {
     assert(outgoing[1].getTag("query_follow") == "");
 }
 
-@("JOIN/QUIT echo flood: repeats inside the window are dropped, PART re-arms, window re-arms")
+@("membership flap guard: churn is live, a storm is coalesced, downstream converges on the roster")
 unittest {
+    import std.algorithm : count, filter;
+    import std.array : array;
+    import std.conv : text;
+    import std.typecons : tuple;
     import vibe.core.channel : createChannel;
 
-    // Feeds raw lines to a fresh client nicked `me`; returns every event it
-    // emitted for `command`.
-    static IRCRawEvent[] run(string[] lines, string command) {
+    // Feeds raw lines to a fresh client nicked `me`; `settle` then runs the
+    // sweep as if the storm went quiet long ago. Returns the client and
+    // every event it emitted, in order.
+    static auto run(string[] lines, bool settle = false) {
         NetworkConfig cfg;
         cfg.nick = "me";
         auto ch = createChannel!IRCRawEvent();
         auto c = new PersistentIRCClient(cfg, ch);
         foreach (l; lines) c.processLine(l);
+        if (settle) c.settleMemberFlaps(unixMsNow() + MEMBER_FLAP_MAX_HOLD_MS);
         ch.close(); // an open, empty channel blocks tryConsumeOne
         IRCRawEvent[] got;
         IRCRawEvent e;
-        while (ch.tryConsumeOne(e))
-            if (e.command == command) got ~= e;
-        return got;
+        while (ch.tryConsumeOne(e)) got ~= e;
+        return tuple(c, got);
+    }
+    static size_t n(IRCRawEvent[] evs, string command, string chan = null) {
+        return evs.count!(e => e.command == command && (chan is null || e.channel == chan));
+    }
+    static bool inRoster(PersistentIRCClient c, string chan, string nick) {
+        return c.getChannelUsers().get(chan, null).canFind!(u => stripNickPrefix(u) == nick);
+    }
+    // The 2026-10-31 shape: a client looping JOIN #support, JOIN #ircfiber,
+    // QUIT — every echo with its own msgid.
+    static string[] storm(int cycles) {
+        string[] lines;
+        foreach (i; 0 .. cycles) {
+            const id = i.text;
+            lines ~= "@msgid=s" ~ id ~ " :BoLiCy!u@h JOIN #support";
+            lines ~= "@msgid=i" ~ id ~ " :BoLiCy!u@h JOIN #ircfiber";
+            lines ~= "@msgid=q" ~ id ~ " :BoLiCy!u@h QUIT :bye";
+        }
+        return lines;
     }
 
-    // The incident: the same JOIN echoed again and again, each with its own
-    // msgid (so storage dedup keeps every one) — one row, not five. A case
-    // variant of the nick is the same member.
-    string[] joins;
-    foreach (i; 0 .. 5)
-        joins ~= "@msgid=j" ~ cast(char)('0' + i) ~ " :"
-            ~ (i == 3 ? "bolicy" : "BoLiCy") ~ "!u@h JOIN #chan";
-    auto j = run(joins, "JOIN");
-    assert(j.length == 1, "repeat JOIN echoes inside the window are dropped");
-    assert(j[0].nick == "BoLiCy");
-    // Another channel or another nick is its own key.
-    assert(run([":BoLiCy!u@h JOIN #chan", ":BoLiCy!u@h JOIN #other",
-                ":alice!u@h JOIN #chan"], "JOIN").length == 3);
+    // Ordinary churn is untouched: quit + rejoin, /cycle, and our own
+    // rejoins all publish live, every line.
+    auto churn = run([":alice!u@h JOIN #c", ":alice!u@h QUIT :ping timeout", ":alice!u@h JOIN #c"])[1];
+    assert(n(churn, "JOIN") == 2 && n(churn, "QUIT", "") == 1 && n(churn, "QUIT", "#c") == 1);
+    auto cycle = run([":alice!u@h JOIN #c", ":alice!u@h PART #c", ":alice!u@h JOIN #c"])[1];
+    assert(n(cycle, "JOIN") == 2 && n(cycle, "PART") == 1);
+    string[] own;
+    foreach (i; 0 .. 6) own ~= [":me!u@h JOIN #c", ":me!u@h PART #c"];
+    assert(n(run(own)[1], "JOIN") == 6, "our own membership is never gated");
 
-    // QUIT: one network-wide QUIT, fanned out to each channel the nick was
-    // in before it — repeats neither re-publish nor re-fan-out.
-    string[] quits = [":BoLiCy!u@h JOIN #a", ":BoLiCy!u@h JOIN #b"];
-    foreach (i; 0 .. 5)
-        quits ~= "@msgid=q" ~ cast(char)('0' + i) ~ " :BoLiCy!u@h QUIT :bye";
-    auto q = run(quits, "QUIT");
-    size_t base;
-    string[] fanned;
-    foreach (e; q) {
-        if (e.channel.length == 0) base++;
-        else fanned ~= e.channel;
+    // The incident: 80 cycles become BURST rows per channel, and the
+    // roster is right throughout.
+    auto s = run(storm(80));
+    assert(n(s[1], "JOIN") == 4, "2 JOIN + 2 QUIT per channel, then held");
+    assert(n(s[1], "QUIT", "") == 2 && n(s[1], "QUIT", "#support") == 2 && n(s[1], "QUIT", "#ircfiber") == 2);
+    assert(!inRoster(s[0], "#support", "BoLiCy"));
+    // It ended where downstream already is (gone): settling adds nothing.
+    auto settled = run(storm(80), true)[1];
+    assert(n(settled, "JOIN") == 4 && n(settled, "QUIT") == 6);
+
+    // A storm that ends joined: held until it settles, then exactly one
+    // JOIN per channel — the newest real line — so downstream converges.
+    auto tail = storm(80) ~ ["@msgid=last-s :BoLiCy!u@h JOIN #support",
+                             "@msgid=last-i :BoLiCy!u@h JOIN #ircfiber"];
+    auto held = run(tail);
+    assert(n(held[1], "JOIN") == 4);
+    assert(inRoster(held[0], "#support", "BoLiCy") && inRoster(held[0], "#ircfiber", "BoLiCy"),
+           "the roster takes held lines");
+    auto conv = run(tail, true)[1];
+    auto joins = conv.filter!(e => e.command == "JOIN").array;
+    assert(joins.length == 6);
+    assert([joins[4].getTag("msgid"), joins[5].getTag("msgid")].canFind("last-s")
+           && [joins[4].getTag("msgid"), joins[5].getTag("msgid")].canFind("last-i"));
+
+    // Pure echoes (JOIN while joined, in any case spelling) cost nothing.
+    string[] echoes;
+    foreach (i; 0 .. 10) echoes ~= "@msgid=e" ~ i.text ~ " :" ~ (i == 3 ? "bolicy" : "BoLiCy") ~ "!u@h JOIN #c";
+    assert(n(run(echoes, true)[1], "JOIN") == 1);
+    // Same for a repeated QUIT from a nick in none of our channels.
+    string[] orphans;
+    foreach (i; 0 .. 5) orphans ~= "@msgid=o" ~ i.text ~ " :ghost!u@h QUIT :bye";
+    assert(n(run(orphans, true)[1], "QUIT", "") == 1);
+
+    // A KICK is always relayed and supersedes the held JOIN.
+    string[] kicked;
+    foreach (i; 0 .. 5) kicked ~= [":bob!u@h JOIN #c", ":bob!u@h QUIT :x"];
+    kicked ~= [":bob!u@h JOIN #c", ":op!u@h KICK #c Bob :out"];
+    auto k = run(kicked, true)[1];
+    assert(n(k, "KICK") == 1 && n(k, "JOIN") == 2, "nothing replayed for a kicked member");
+
+    // A rename releases what is held for the old nick before the NICK row.
+    string[] renamed;
+    foreach (i; 0 .. 5) renamed ~= [":bob!u@h JOIN #c", ":bob!u@h QUIT :x"];
+    renamed ~= [":bob!u@h JOIN #c", ":bob!u@h NICK :robert"];
+    auto r = run(renamed)[1];
+    assert(n(r, "JOIN") == 3);
+    size_t lastJoin, firstNick = size_t.max;
+    foreach (i, e; r) {
+        if (e.command == "JOIN") lastJoin = i;
+        if (e.command == "NICK" && firstNick == size_t.max) firstNick = i;
     }
-    assert(base == 1, "repeat QUIT echoes inside the window are dropped");
-    assert(fanned.length == 2 && fanned.canFind("#a") && fanned.canFind("#b"));
-
-    // A PART ends the membership, so an immediate rejoin is a real JOIN
-    // (/cycle) — for us and for anyone else; same for being kicked.
-    assert(run([":alice!u@h JOIN #chan", ":alice!u@h PART #chan",
-                ":alice!u@h JOIN #chan"], "JOIN").length == 2);
-    assert(run([":me!u@h JOIN #chan", ":me!u@h PART #chan",
-                ":me!u@h JOIN #chan"], "JOIN").length == 2);
-    assert(run([":alice!u@h JOIN #chan", ":op!u@h KICK #chan Alice :out",
-                ":alice!u@h JOIN #chan"], "JOIN").length == 2);
-
-    // The window re-arms rather than latching shut: a dropped repeat does
-    // not extend it, and the first line past it goes through.
-    NetworkConfig cfg;
-    auto c = new PersistentIRCClient(cfg, createChannel!IRCRawEvent());
-    long[string] seen;
-    enum w = PersistentIRCClient.JOIN_QUIT_ECHO_FLOOD_WINDOW_MS;
-    assert(!c.floodGuarded(seen, "k", 1_000));
-    assert(c.floodGuarded(seen, "k", 1_000 + w - 1));
-    assert(!c.floodGuarded(seen, "k", 1_000 + w));
-    assert(c.floodGuarded(seen, "k", 1_000 + w + 1));
+    assert(lastJoin < firstNick);
 }
