@@ -174,19 +174,41 @@ mullvad_sidecars:
 # --- NordVPN SOCKS5 proxies (static exits, no sidecar/retargeting) ----------
 # Keep identical to
 # site/deploy/inventories/production/host_vars/vps-833a04ee.yml — see that
-# file for the full explanation and source (NordVPN's official qBittorrent
-# setup guide, support.nordvpn.com, checked 2026-10-31). Shared credentials
-# live at https://ircfiber.com/admin#/nordvpn, not here.
+# file for the full explanation and source. Shared credentials live at
+# https://ircfiber.com/admin#/nordvpn, not here.
+#
+# Replaced 2026-11-01: every *.socks.nordhold.net host above (NordVPN's own
+# qBittorrent/support-doc hostnames) rejected this account's credentials on
+# every single attempt across two full, clean, uncontended sweeps of all 76
+# SOCKS5-capable servers NordVPN's public API lists
+# (api.nordvpn.com/v1/servers?filters[servers_technologies][identifier]=socks)
+# — not a bad password (confirmed independently via raw `curl --socks5`,
+# bypassing this codebase entirely) but that legacy domain itself not
+# authenticating for this account. The hosts below are the ones that DID
+# authenticate AND completed a real SOCKS5 CONNECT + IRC registration
+# attempt against irc.libera.chat (refused only by Libera's own blanket
+# "SASL required from VPN/datacenter ranges" policy, which
+# isSaslRequiredRefusal/hostSaslGateUntil in connection.d already routes
+# around for any network that gates the same way — not a per-IP ban).
+# Limited to Stockholm/Chicago: no Amsterdam-area host authenticated in
+# either sweep (0 of 16 attempts) — this account appears unprovisioned for
+# NL on the current SOCKS5 fleet. Re-run `/tmp/nordscan.py`-style serial
+# testing (concurrency=1 — NordVPN enforces a tight per-account concurrent-
+# session cap, see NORDVPN_BATCH_SIZE/IPINFO_BATCH_SIZE in the site repo)
+# before trusting any other host from the API list; many came back rejected
+# purely from contention with this box's own background refresher/sweep,
+# not a real per-host answer.
 nordvpn_proxies:
-  - { name: "nord-nl-ams", host: "amsterdam.nl.socks.nordhold.net", port: 1080 }     # Amsterdam, NL
-  - { name: "nord-se-sto", host: "stockholm.se.socks.nordhold.net", port: 1080 }     # Stockholm, SE
-  - { name: "nord-us-atl", host: "atlanta.us.socks.nordhold.net", port: 1080 }       # Atlanta, US
-  - { name: "nord-us-chi", host: "chicago.us.socks.nordhold.net", port: 1080 }       # Chicago, US
-  - { name: "nord-us-dal", host: "dallas.us.socks.nordhold.net", port: 1080 }        # Dallas, US
-  - { name: "nord-us-lax", host: "los-angeles.us.socks.nordhold.net", port: 1080 }   # Los Angeles, US
-  - { name: "nord-us-nyc", host: "new-york.us.socks.nordhold.net", port: 1080 }      # New York, US
-  - { name: "nord-us-phx", host: "phoenix.us.socks.nordhold.net", port: 1080 }       # Phoenix, US
-  - { name: "nord-us-sfo", host: "san-francisco.us.socks.nordhold.net", port: 1080 } # San Francisco, US
+  - { name: "nord-se-sto-1", host: "socks-se13.nordvpn.com", port: 1080 } # Stockholm, SE
+  - { name: "nord-se-sto-2", host: "socks-se14.nordvpn.com", port: 1080 } # Stockholm, SE
+  - { name: "nord-se-sto-3", host: "socks-se15.nordvpn.com", port: 1080 } # Stockholm, SE
+  - { name: "nord-se-sto-4", host: "socks-se17.nordvpn.com", port: 1080 } # Stockholm, SE
+  - { name: "nord-se-sto-5", host: "socks-se18.nordvpn.com", port: 1080 } # Stockholm, SE
+  - { name: "nord-se-sto-6", host: "socks-se20.nordvpn.com", port: 1080 } # Stockholm, SE
+  - { name: "nord-us-chi-1", host: "socks-us34.nordvpn.com", port: 1080 } # Chicago, US
+  - { name: "nord-us-chi-2", host: "socks-us35.nordvpn.com", port: 1080 } # Chicago, US
+  - { name: "nord-us-chi-3", host: "socks-us36.nordvpn.com", port: 1080 } # Chicago, US
+  - { name: "nord-us-chi-4", host: "socks-us38.nordvpn.com", port: 1080 } # Chicago, US
 
 # --- Gateway defaults ---------------------------------------------------------
 ircfiber_gateway_log_level: "info"
