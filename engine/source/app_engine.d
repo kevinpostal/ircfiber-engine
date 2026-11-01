@@ -20,6 +20,7 @@ import ircfiber.observability : configureMetrics, setMetricsEnabled, isMetricsEn
 import ircfiber.engine.consumer : startControlConsumer, startCommandConsumers;
 import ircfiber.engine.processor : startEventProcessor;
 import ircfiber.engine.state : startStateSnapshotter, writeStateSnapshots;
+import ircfiber.irc.connection : startDailyReachabilityRefresh;
 import ircfiber.redis.protocol : RedisKeys;
 import ircfiber.logging : logJsonMap;
 import ircfiber.term_signal : installTermSignalFlag, termSignal;
@@ -178,6 +179,8 @@ void main() {
               catch (Throwable e) { logException("command_consumers", e, "Command consumers crashed"); } });
     runSafe({ try { startStateSnapshotter(ctx); }
               catch (Throwable e) { logException("state_snapshotter", e, "State snapshotter crashed"); } });
+    runSafe({ try { startDailyReachabilityRefresh(); }
+              catch (Throwable e) { logException("daily_reachability_refresh", e, "Daily reachability refresh crashed"); } });
 
     // ── Signals ─────────────────────────────────────────────────────
     // SIGTERM = hot swap: detach every session (META + close the relay,

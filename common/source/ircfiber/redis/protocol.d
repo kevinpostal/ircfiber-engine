@@ -76,6 +76,42 @@ struct RedisKeys {
     /// (loadNordvpnPoolUnlocked) to fill any pool entry that specifies no
     /// credentials of its own.
     static string nordvpnCreds() { return "irc:egress:nordvpn:creds"; }
+
+    /// Latest reachability result for one proxy label against every host the
+    /// daily sweep (ircfiber.web.admin.egress_reachability) has tested it
+    /// against: hash field `<host>:<port>` (host lowercased) -> JSON
+    /// `{reachable,reachedIrcd,registered,banned,throttled,error,ms,checkedAt}`.
+    /// No TTL — staleness is visible per field via `checkedAt`; this hash is
+    /// the source the admin matrix reads and the source
+    /// egressReachabilityBanned() below is derived from.
+    static string egressReachability(string label) { return "irc:egress:reach:" ~ label; }
+
+    /// Sparse snapshot of currently-banned (host, egress-ban-key) pairs from
+    /// the daily sweep: JSON array of `{host,banKey}` (banKey matches the
+    /// engine's own slotBanKey() shape: a Mullvad slot's current locationId,
+    /// or "slot:<label>" for a static/NordVPN entry or a Mullvad slot with no
+    /// known location). Written by the gateway sweep, read every ~10 min by
+    /// the engine's startDailyReachabilityRefresh (connection.d) into its
+    /// in-process dailyReachabilityBanned table. EXPIRE 93600 (26h) — survives
+    /// a slightly-delayed next daily run; a genuinely stopped sweep still
+    /// clears itself out within a day instead of lying forever.
+    static string egressReachabilityBanned() { return "irc:egress:reach:banned"; }
+
+    /// Daily-sweep job status: JSON `{running,lastRunStartedAt,lastRunFinishedAt,
+    /// hostsChecked,probesRun,lastError}`. Written by the sweep, read by
+    /// `GET /api/admin/egress-reachability/status`.
+    static string egressReachabilityStatus() { return "irc:egress:reach:status"; }
+
+    /// Single-flight lock for the daily sweep (`SET token NX EX`), so two
+    /// gateway replicas (or an admin-triggered run-now overlapping the
+    /// scheduled one) never run it concurrently.
+    static string egressReachabilityLock() { return "irc:egress:reach:lock"; }
+
+    /// Kill switch: missing key (the default) means enabled, matching
+    /// isNickservSyncEnabled's fail-open convention
+    /// (services/nickserv_sync.d:99-104). Set to anything to pause the sweep
+    /// without a redeploy.
+    static string egressReachabilitySweepEnabled() { return "irc:config:egressReachabilitySweep"; }
     
     /// Legacy state key (non-namespaced)
     static string state_legacy(string networkId) { return "irc:state:" ~ networkId; }

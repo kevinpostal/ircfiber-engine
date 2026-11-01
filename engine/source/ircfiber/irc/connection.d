@@ -20,7 +20,7 @@ import vibe.core.net : connectTCP, TCPConnection;
 import vibe.core.task : Task;
 import vibe.data.json : Json;
 import vibe.stream.operations : IOMode;
-import core.time : Duration, dur, msecs, seconds;
+import core.time : Duration, dur, msecs, seconds, minutes;
 
 import ircfiber.models.irc_event : IRCRawEvent;
 import ircfiber.models.network : NetworkConfig, SASLMechanism, TLSMode, normalizeChannelName;
@@ -28,6 +28,7 @@ import ircfiber.redis.protocol : RedisKeys, TlsInfo;
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.irc.reconnect : ExponentialBackoff;
 import ircfiber.irc.sasl : buildSaslPlainPayload, ScramSha256Client;
+import ircfiber.irc.ban_classify : isBanError, isThrottleError;
 import ircfiber.storage.buffer : sanitizeUtf8;
 import ircfiber.engine.session_snapshot : SessionSnapshot, ServerFeaturesSnapshot, SESSION_SNAPSHOT_SCHEMA, toJSON;
 import ircfiber.engine.holder_client : HolderClient, DialTag, DialProxy, DialRequest, DialResult, DialEvent,
@@ -475,6 +476,14 @@ private __gshared long[string][string] hostEgressBanUntil;
 /// without SASL order these routes last and stop failing over to them.
 /// Same keys and lifetime (HOST_EGRESS_BAN_MS) as the ban table.
 private __gshared long[string][string] hostSaslGateUntil;
+/// host(lower) -> banKey -> true, for pairs the daily gateway sweep found
+/// banned (ircfiber.web.admin.egress_reachability). Replaced wholesale
+/// every ~10 min by startDailyReachabilityRefresh() below — unlike
+/// hostEgressBanUntil, entries have no individual expiry; "is this still
+/// banned" is answered by the next refresh overwriting the whole table,
+/// not a per-entry TTL. Guarded by the same gMullvadLock as every other
+/// table in this file.
+private __gshared bool[string][string] dailyReachabilityBanned;
 shared static this() {
     // Enterprise: single global mutex protects all __gshared Mullvad state.
     // vibe.d fibers are cooperative but connection loops run on different
@@ -788,7 +797,26 @@ private bool isEgressBannedForHost(string hostLower, string locationId) {
             if ((*outer).length == 0) hostEgressBanUntil.remove(hostLower);
         }
     }
+    if (auto outer = hostLower in dailyReachabilityBanned) {
+        if (locationId in *outer) return true;
+    }
     return false;
+}
+
+// `isEgressBannedForHost` and `dailyReachabilityBanned` are both
+// module-private, so this unittest lives here rather than in
+// connection_registration_test.d (a separate module — D's `private` is
+// strictly module-scoped, not package-scoped, so a symbol here is
+// inaccessible even via `import ircfiber.irc.connection : …;` from
+// another module). Matches this file's own convention of a `unittest`
+// block directly below the function it covers (see
+// `remainingJoinDelayMs`/`parseJoinThrottleSeconds` further down).
+@("isEgressBannedForHost consults the daily reachability sweep's findings")
+unittest {
+    dailyReachabilityBanned["irc.example.org"]["slot:nord-nl-ams"] = true;
+    scope(exit) dailyReachabilityBanned.remove("irc.example.org");
+    assert(isEgressBannedForHost("irc.example.org", "slot:nord-nl-ams"));
+    assert(!isEgressBannedForHost("irc.example.org", "slot:other"));
 }
 
 /// Per-host ban key for a slot. A ban must follow the *address*, not the
@@ -1148,6 +1176,40 @@ void refreshEgressState() nothrow {
     if (idxs.length == 0) return;
     if (lastAt != 0 && nowMsSafe() - lastAt < EGRESS_CATALOG_TTL_MS) return;
     foreach (i; idxs) refreshSlotFromStatus(i);
+}
+
+/// Pulls RedisKeys.egressReachabilityBanned() and replaces
+/// dailyReachabilityBanned wholesale. Started as its own task from
+/// app_engine.d (not state.d's 10s snapshotter) — this data only changes
+/// once a day at the source, so a 10 min poll is already far more
+/// frequent than it needs to be and keeps the staleness window small
+/// regardless.
+void startDailyReachabilityRefresh() nothrow {
+    runTask(() nothrow {
+        while (true) {
+            try {
+                if (gEgressRedis !is null) {
+                    auto raw = gEgressRedis.getDb().get(RedisKeys.egressReachabilityBanned());
+                    if (raw.length > 0) {
+                        import vibe.data.json : parseJsonString, Json;
+                        auto arr = parseJsonString(raw);
+                        bool[string][string] fresh;
+                        if (arr.type == Json.Type.array) {
+                            foreach (item; arr) {
+                                auto h = item["host"].get!string.toLower();
+                                auto k = item["banKey"].get!string.toLower();
+                                if (h.length && k.length) fresh[h][k] = true;
+                            }
+                        }
+                        withPoolLock({ dailyReachabilityBanned = fresh; });
+                    }
+                }
+            } catch (Exception e) {
+                try { logWarn("daily reachability refresh failed: %s", e.msg); } catch (Exception) {}
+            }
+            try sleep(10.minutes); catch (Exception) {}
+        }
+    });
 }
 
 /// Copy-by-value snapshot of one slot, taken under the lock, for publishing.
@@ -8448,54 +8510,6 @@ private void processEvents() {
                 }
             }
         }
-    }
-
-    /// Keywords servers use to indicate the client is connecting too fast
-    /// and should wait before trying again.
-    private static immutable string[] THROTTLE_KEYWORDS = [
-        "throttled", "reconnecting too fast", "excess flood",
-        "too many connections", "rate limit", "try again later",
-        "slow down", "you are banned", "temporary ban",
-    ];
-
-    /// Keywords that indicate a hard ban (ZLINE/GLINE/KLINE/ELINE) — the
-    /// server has explicitly rejected this IP/nick and will keep rejecting
-    /// until the ban expires (often hours/days). We treat this as a
-    /// non-retriable block with a much longer backoff so we don't hammer
-    /// and don't freeze the UI on a 5s loop that immediately re-hits the
-    /// same wall and then parks for 5 min with no countdown.
-    private static immutable string[] BAN_KEYWORDS = [
-        "z-lined", "z:lined", "zline", "z:line",
-        "g-lined", "g:lined", "gline", "g:line",
-        "k-lined", "k:lined", "kline", "k:line",
-        "d-lined", "d:lined", "dline", "d:line",
-        "e-lined", "e:lined", "eline",
-        "enter the void",
-        "you are banned",
-        "banned from",
-        "permanently banned",
-    ];
-
-    /// Returns `true` if `text` contains any throttle-related keywords.
-    private static bool isThrottleError(string text) {
-        if (text.length == 0) return false;
-        import std.string : toLower;
-        auto lower = toLower(text);
-        foreach (kw; THROTTLE_KEYWORDS) {
-            if (lower.indexOf(kw) >= 0) return true;
-        }
-        return false;
-    }
-
-    /// Returns `true` if `text` indicates a hard ban.
-    private static bool isBanError(string text) {
-        if (text.length == 0) return false;
-        import std.string : toLower;
-        auto lower = toLower(text);
-        foreach (kw; BAN_KEYWORDS) {
-            if (lower.indexOf(kw) >= 0) return true;
-        }
-        return false;
     }
 
     /// Numeric replies worth logging at warn/error level. These signal
