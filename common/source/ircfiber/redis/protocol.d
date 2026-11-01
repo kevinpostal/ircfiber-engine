@@ -77,6 +77,16 @@ struct RedisKeys {
     /// credentials of its own.
     static string nordvpnCreds() { return "irc:egress:nordvpn:creds"; }
 
+    /// Cached SOCKS5 reachability + exit-IP/ASN probe for one egress pool
+    /// entry (label): `{healthy,error,checkedAt,ipinfo:{...}}`. Written by
+    /// the gateway's background refresher (ircfiber.web.admin.egress_probe)
+    /// every 20s instead of on every admin page poll — apiMullvadStatus
+    /// reads this and falls back to a live probe only on a miss. EXPIRE 90
+    /// — a few missed refresh cycles still serve the last-known answer; a
+    /// genuinely stopped refresher eventually goes stale rather than
+    /// lying forever. Not per-server: the pool itself is gateway-global.
+    static string egressProbe(string label) { return "irc:egress:probe:" ~ label; }
+
     /// Latest reachability result for one proxy label against every host the
     /// daily sweep (ircfiber.web.admin.egress_reachability) has tested it
     /// against: hash field `<host>:<port>` (host lowercased) -> JSON

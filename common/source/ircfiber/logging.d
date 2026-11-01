@@ -192,6 +192,14 @@ void logException(string component,
         // still ships the error record. The periodic heartbeat flush remains
         // the primary path; this just eliminates the 10s window.
         try flushAndSendLogs(); catch (Throwable) {}
+        // Bugsink: independent on/off switch from the OTLP logs flush
+        // above — IRCFIBER_BUGSINK_ENABLED gates this separately so ops can
+        // silence error reporting (e.g. Bugsink itself is down) without
+        // touching tracing/metrics/logs.
+        try {
+            import ircfiber.errors : captureException, isErrorReportingEnabled;
+            if (isErrorReportingEnabled()) captureException(component, e, context, extra);
+        } catch (Throwable) {}
     } catch (Throwable secondary) {
         // We are already in an error path — never throw from here.
         try {
