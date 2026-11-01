@@ -7477,13 +7477,21 @@ private void processEvents() {
                     // Server-sourced flood warnings ("Message to #chan
                     // throttled due to flooding", "You must wait…") are the
                     // only notice we act on; a user saying "flood" is not a
-                    // signal, so this requires a server prefix (no nick).
-                    if (event.nick.length == 0 && isFloodNotice(event.text))
+                    // signal, so this requires a server prefix. The parser
+                    // has no "no prefix" case for a bare hostname — with no
+                    // `!user@host` to split off, `event.nick` ends up
+                    // holding the whole prefix (e.g. a real server sent
+                    // `:openwater.supernets.org NOTICE Zodiac :slow down
+                    // nerd`, and `event.nick` reads
+                    // "openwater.supernets.org") — so `nick.length == 0`
+                    // alone misses every real-world server notice and the
+                    // pacer never arms.
+                    if (isServerPrefix(event) && isFloodNotice(event.text))
                         onFloodComplaint("notice", event.text);
                     // Reply to our `MODE <chan> f` probe. This is the only
                     // way to read the numbers behind `+F <profile>`, whose
                     // limits are otherwise server-side config.
-                    if (event.nick.length == 0) applyEffectiveFloodNotice(event.text);
+                    if (isServerPrefix(event)) applyEffectiveFloodNotice(event.text);
                 }
                 break;
 
@@ -8380,6 +8388,18 @@ private void processEvents() {
             || t.canFind("too fast")
             || t.canFind("slow down")
             || t.canFind("rate limit");
+    }
+
+    /// True when `event.prefix` names a server rather than a user: empty
+    /// (synthetic events), or no `!user@host` portion with a dot in the
+    /// bare name. IRC nicknames cannot contain a dot (RFC 2812), so
+    /// `foo.bar.net` can only be a server hostname — the parser still
+    /// assigns it to `event.nick` for lack of anywhere else to put it
+    /// (see parser.d), which is why the callers above cannot just check
+    /// `event.nick.length == 0`.
+    private static bool isServerPrefix(ref const IRCRawEvent event) {
+        if (event.nick.length == 0) return true;
+        return event.prefix.indexOf("!") < 0 && event.prefix.indexOf(".") >= 0;
     }
 
     /// `FAIL BATCH MULTILINE_MAX_LINES <limit>` / `MULTILINE_MAX_BYTES
@@ -9307,6 +9327,42 @@ private void processEvents() {
         if (reason.length > 0) sendRaw("PART " ~ channel ~ " :" ~ reason);
         else                    sendRaw("PART " ~ channel);
     }
+}
+
+@("isServerPrefix recognizes a bare server hostname even though the parser has nowhere else to put it but `nick`")
+unittest {
+    // Real traffic that triggered this: `:openwater.supernets.org NOTICE
+    // Zodiac :slow down nerd` — parser.d has no "!user@host" to split off,
+    // so `event.nick` ends up holding the server hostname itself.
+    auto fromServer = IRCRawEvent("Super Nets", "NOTICE");
+    fromServer.prefix = "openwater.supernets.org";
+    fromServer.nick   = "openwater.supernets.org";
+    assert(PersistentIRCClient.isServerPrefix(fromServer));
+
+    auto fromUser = IRCRawEvent("Super Nets", "NOTICE");
+    fromUser.prefix = "bob!bob@example.com";
+    fromUser.nick   = "bob";
+    assert(!PersistentIRCClient.isServerPrefix(fromUser));
+
+    auto fromPseudoClient = IRCRawEvent("Super Nets", "NOTICE");
+    fromPseudoClient.prefix = "NickServ";
+    fromPseudoClient.nick   = "NickServ";
+    assert(!PersistentIRCClient.isServerPrefix(fromPseudoClient),
+           "a bare pseudo-client nick with no dot is still a nick, not a server");
+
+    IRCRawEvent synthetic;
+    assert(PersistentIRCClient.isServerPrefix(synthetic),
+           "no prefix at all (synthetic/local event) still counts as server-sourced");
+}
+
+@("a real slow-down NOTICE from a bare server hostname is recognized as a flood complaint")
+unittest {
+    auto evt = IRCRawEvent("Super Nets", "NOTICE");
+    evt.prefix = "openwater.supernets.org";
+    evt.nick   = "openwater.supernets.org";
+    evt.text   = "slow down nerd";
+    assert(PersistentIRCClient.isServerPrefix(evt) && PersistentIRCClient.isFloodNotice(evt.text),
+           "this is exactly the notice the pacer must arm on — regression for the nick==hostname bug");
 }
 
 @("firstPartyDirectOnly keeps first-party off shared exits")
