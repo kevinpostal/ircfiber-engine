@@ -787,6 +787,38 @@ private MullvadProxy*[] getHealthyProxiesLocked() {
     return healthy;
 }
 
+/// "Mullvad" / "NordVPN" prefix for logs and UI text, resolved by provider
+/// rather than hardcoded: Mullvad slots are Tailscale-controlled
+/// (controlSocket set); NordVPN/static slots are not — see MullvadProxy's
+/// controlSocket doc and tierAndOrderProxies, which key off the same field.
+/// Keying off controlSocket (not credential presence) stays correct even
+/// when a static slot's shared creds are temporarily empty. Looks the slot
+/// up by label at display time instead of threading a provider field
+/// through DialEvent/EgressUsed/SessionSnapshot; falls back to "Mullvad"
+/// if the slot is gone from the pool (e.g. reattached after a restart).
+private string egressProviderName(string label) {
+    if (label.length == 0) return "Mullvad";
+    if (gMullvadLock !is null) synchronized (gMullvadLock) {
+        foreach (ref pr; mullvadPool) if (pr.label == label) return pr.controlSocket.length > 0 ? "Mullvad" : "NordVPN";
+        return "Mullvad";
+    }
+    foreach (ref pr; mullvadPool) if (pr.label == label) return pr.controlSocket.length > 0 ? "Mullvad" : "NordVPN";
+    return "Mullvad";
+}
+
+@("egressProviderName: NordVPN (static, no controlSocket) vs Mullvad (controlSocket) vs unknown label")
+unittest {
+    auto saved = mullvadPool.dup;
+    scope(exit) mullvadPool = saved;
+    mullvadPool = null;
+    mullvadPool ~= MullvadProxy("sidecar.ts.net", 1080, "de", 0, 0, "/ctl/de.sock");
+    mullvadPool ~= MullvadProxy("socks-se12.nordvpn.com", 1080, "nord-se-sto-7", 0, 0, "");
+    assert(egressProviderName("de") == "Mullvad");
+    assert(egressProviderName("nord-se-sto-7") == "NordVPN");
+    assert(egressProviderName("gone-from-pool") == "Mullvad");
+    assert(egressProviderName("") == "Mullvad");
+}
+
 private void recordMullvadSuccess(string label) {
     const now = Clock.currTime.toUnixTime!long * 1000;
     if (gMullvadLock !is null) synchronized (gMullvadLock) {
@@ -801,7 +833,7 @@ private void recordMullvadFailure(string label) {
             pr.failCount++;
             if (pr.failCount >= 3) {
                 pr.deadUntilMs = Clock.currTime.toUnixTime!long * 1000 + 30_000;
-                logWarn("Mullvad proxy %s (%s:%d) marked dead for 30s after 3 fails", label, pr.host, pr.port);
+                logWarn("%s proxy %s (%s:%d) marked dead for 30s after 3 fails", pr.controlSocket.length > 0 ? "Mullvad" : "NordVPN", label, pr.host, pr.port);
             }
             break;
         }
@@ -811,7 +843,7 @@ private void recordMullvadFailure(string label) {
         pr.failCount++;
         if (pr.failCount >= 3) {
             pr.deadUntilMs = Clock.currTime.toUnixTime!long * 1000 + 30_000;
-            logWarn("Mullvad proxy %s (%s:%d) marked dead for 30s after 3 fails", label, pr.host, pr.port);
+            logWarn("%s proxy %s (%s:%d) marked dead for 30s after 3 fails", pr.controlSocket.length > 0 ? "Mullvad" : "NordVPN", label, pr.host, pr.port);
         }
         break;
     }
@@ -1594,9 +1626,9 @@ private TCPConnection happyEyeballsConnectWithProxy(HolderClient holder, DialTag
                                                     string tlsMode, MullvadProxy* proxy,
                                                     string ipv6BindAddr, ConnectProgress progress,
                                                     out DialResult dr) {
-    if (proxy !is null) logInfo("Mullvad egress %s (%s:%d) for %s:%d", proxy.label, proxy.host, proxy.port, host, port);
+    if (proxy !is null) logInfo("%s egress %s (%s:%d) for %s:%d", proxy.controlSocket.length > 0 ? "Mullvad" : "NordVPN", proxy.label, proxy.host, proxy.port, host, port);
     else if (ipv6BindAddr.length > 0) logInfo("IPv6 per-user egress %s for %s:%d", ipv6BindAddr, host, port);
-    const egressLabel = proxy !is null ? "Mullvad exit " ~ proxy.label : (ipv6BindAddr.length > 0 ? "ipv6:" ~ ipv6BindAddr : "direct");
+    const egressLabel = proxy !is null ? (proxy.controlSocket.length > 0 ? "Mullvad exit " : "NordVPN exit ") ~ proxy.label : (ipv6BindAddr.length > 0 ? "ipv6:" ~ ipv6BindAddr : "direct");
     if (holder is null) throw new HolderUnavailableException("no connection holder configured");
 
     DialRequest req;
@@ -4538,7 +4570,7 @@ final class PersistentIRCClient {
                         banEgressForHost(config.host, banKey, TLS_CLOSED_ROTATE_BAN_MS);
                         consecutiveTlsClosed = 0;
                         emitLog("info", "TLS handshake keeps being closed via "
-                            ~ (activeEgressLabel.length ? "Mullvad exit " ~ egressDisplay() : "the direct host IP")
+                            ~ (activeEgressLabel.length ? egressProviderName(activeEgressLabel) ~ " exit " ~ egressDisplay() : "the direct host IP")
                             ~ " — likely an IP ban on that address; switching to a different exit.");
                         logJsonMap("warn", "connection", "Repeated TLS close — rotating egress",
                             ["network": config.name, "host": config.host, "egress": banKey, "event": "egress_tls_close_rotate"]);
@@ -6506,11 +6538,12 @@ private void processEvents() {
         return false;
     }
 
-    /// "Mullvad exit Zürich (ip)" / "the direct host IP (ip)" for the egress
-    /// of the current connection, as the ban and SASL-gate copy names it.
+    /// "Mullvad exit Zürich (ip)" / "NordVPN exit Stockholm, Sweden (ip)" /
+    /// "the direct host IP (ip)" for the egress of the current connection,
+    /// as the ban and SASL-gate copy names it.
     private string egressVia() {
         return activeEgressLabel.length > 0
-            ? "Mullvad exit " ~ egressDisplay() ~ (activeEgressIp.length ? " (" ~ activeEgressIp ~ ")" : "")
+            ? egressProviderName(activeEgressLabel) ~ " exit " ~ egressDisplay() ~ (activeEgressIp.length ? " (" ~ activeEgressIp ~ ")" : "")
             : "the direct host IP" ~ (activeLocalIp.length ? " (" ~ activeLocalIp ~ ")" : "");
     }
 
