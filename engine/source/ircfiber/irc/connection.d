@@ -2875,6 +2875,12 @@ final class PersistentIRCClient {
         /// keeps answering "wait" cannot become a JOIN loop.
         int                 joinThrottleRounds;
         bool                joinThrottleRetryInFlight;
+        /// Echo flood guard: last relayed JOIN (key `joinEchoKey`) and QUIT
+        /// (key `foldNick`; QUIT is network-wide on the wire) per connection.
+        /// A client re-sending JOIN/QUIT gets a fresh ircd echo each time,
+        /// each with its own msgid, so storage dedup cannot catch it.
+        long[string]        lastJoinEchoMs;
+        long[string]        lastQuitEchoMs;
 
         // Set when REGISTRATION_OVERALL_TIMEOUT_SECS elapses without 001
         // (or a fatal registration error). unix-ms of the most recent
@@ -3895,6 +3901,29 @@ final class PersistentIRCClient {
         joinsAwaitingConfirm = [];
         joinThrottleRounds = 0;
         joinThrottleRetryInFlight = false;
+        // Nothing to debounce against on a fresh socket.
+        lastJoinEchoMs = null;
+        lastQuitEchoMs = null;
+    }
+
+    /// Repeated JOIN/QUIT echoes for the same key inside this window are dropped.
+    private enum JOIN_QUIT_ECHO_FLOOD_WINDOW_MS = 3_000;
+
+    /// True when `key` was last seen within JOIN_QUIT_ECHO_FLOOD_WINDOW_MS.
+    /// Records `nowMs` as the new "last seen" only when allowing the event
+    /// through, so sustained flooding still lets one line through per
+    /// window instead of latching shut forever.
+    private bool floodGuarded(ref long[string] lastSeenMs, string key, long nowMs) nothrow {
+        if (auto last = key in lastSeenMs) {
+            if (nowMs - *last < JOIN_QUIT_ECHO_FLOOD_WINDOW_MS) return true;
+        }
+        lastSeenMs[key] = nowMs;
+        return false;
+    }
+
+    /// Flood-guard key for one nick's JOIN echo in one channel.
+    private string joinEchoKey(string chan, string nick) {
+        return chan ~ "\0" ~ foldNick(nick);
     }
 
     /// Max channels tracked for the throttle retry. The auto-join burst is
@@ -6520,6 +6549,14 @@ private void processEvents() {
                 auto params = event.getParams();
                 if (params.length > 0) {
                     auto chan = normalizeChannelName(params[0]);
+                    // Flood guard: a client re-sending JOIN for a channel it
+                    // is already in gets a fresh ircd echo every time (no
+                    // protocol-level dedup there), which would otherwise
+                    // flood every other member's channel view with repeat
+                    // "X joined" rows. Drop repeats inside the window
+                    // entirely — same effect as never receiving the line.
+                    if (floodGuarded(lastJoinEchoMs, joinEchoKey(chan, event.nick), nowMsSafe()))
+                        return;
                     channelState[chan] = "";
                     if (sameNick(event.nick, sessionNick)) {
                         // Confirmed: the throttle retry must not re-ask.
@@ -6628,6 +6665,9 @@ private void processEvents() {
                 auto params = event.getParams();
                 if (params.length > 0) {
                     auto chan = normalizeChannelName(params[0]);
+                    // A PART ends the membership the guard debounces against:
+                    // an immediate rejoin (/cycle) is a real JOIN, not an echo.
+                    lastJoinEchoMs.remove(joinEchoKey(chan, event.nick));
                     if (sameNick(event.nick, sessionNick)) {
                         channelState.remove(chan);
                         metaDirty = true;
@@ -6655,6 +6695,7 @@ private void processEvents() {
                 if (params.length >= 2) {
                     auto chan       = normalizeChannelName(params[0]);
                     auto targetNick = params[1];
+                    lastJoinEchoMs.remove(joinEchoKey(chan, targetNick)); // see PART
                     if (targetNick == sessionNick) {
                         channelState.remove(chan);
                         metaDirty = true;
@@ -6679,6 +6720,10 @@ private void processEvents() {
                 break;
 
             case "QUIT":
+                // Flood guard: see JOIN. The first QUIT in the window already
+                // removed the nick from every roster; repeats carry nothing.
+                if (floodGuarded(lastQuitEchoMs, foldNick(event.nick), nowMsSafe()))
+                    return;
                 foreach (chan, ref users; channelUsers) {
                     foreach (i, u; users) {
                         if (sameNick(u, event.nick)) {
@@ -9440,4 +9485,74 @@ unittest {
     auto outgoing = run([":me!~me@h0.IP PRIVMSG carol :hello", ":carol!~c@h3.IP NICK :caroline"]);
     assert(outgoing[0].getQueryBuffers() == ["carol"]);
     assert(outgoing[1].getTag("query_follow") == "");
+}
+
+@("JOIN/QUIT echo flood: repeats inside the window are dropped, PART re-arms, window re-arms")
+unittest {
+    import vibe.core.channel : createChannel;
+
+    // Feeds raw lines to a fresh client nicked `me`; returns every event it
+    // emitted for `command`.
+    static IRCRawEvent[] run(string[] lines, string command) {
+        NetworkConfig cfg;
+        cfg.nick = "me";
+        auto ch = createChannel!IRCRawEvent();
+        auto c = new PersistentIRCClient(cfg, ch);
+        foreach (l; lines) c.processLine(l);
+        ch.close(); // an open, empty channel blocks tryConsumeOne
+        IRCRawEvent[] got;
+        IRCRawEvent e;
+        while (ch.tryConsumeOne(e))
+            if (e.command == command) got ~= e;
+        return got;
+    }
+
+    // The incident: the same JOIN echoed again and again, each with its own
+    // msgid (so storage dedup keeps every one) — one row, not five. A case
+    // variant of the nick is the same member.
+    string[] joins;
+    foreach (i; 0 .. 5)
+        joins ~= "@msgid=j" ~ cast(char)('0' + i) ~ " :"
+            ~ (i == 3 ? "bolicy" : "BoLiCy") ~ "!u@h JOIN #chan";
+    auto j = run(joins, "JOIN");
+    assert(j.length == 1, "repeat JOIN echoes inside the window are dropped");
+    assert(j[0].nick == "BoLiCy");
+    // Another channel or another nick is its own key.
+    assert(run([":BoLiCy!u@h JOIN #chan", ":BoLiCy!u@h JOIN #other",
+                ":alice!u@h JOIN #chan"], "JOIN").length == 3);
+
+    // QUIT: one network-wide QUIT, fanned out to each channel the nick was
+    // in before it — repeats neither re-publish nor re-fan-out.
+    string[] quits = [":BoLiCy!u@h JOIN #a", ":BoLiCy!u@h JOIN #b"];
+    foreach (i; 0 .. 5)
+        quits ~= "@msgid=q" ~ cast(char)('0' + i) ~ " :BoLiCy!u@h QUIT :bye";
+    auto q = run(quits, "QUIT");
+    size_t base;
+    string[] fanned;
+    foreach (e; q) {
+        if (e.channel.length == 0) base++;
+        else fanned ~= e.channel;
+    }
+    assert(base == 1, "repeat QUIT echoes inside the window are dropped");
+    assert(fanned.length == 2 && fanned.canFind("#a") && fanned.canFind("#b"));
+
+    // A PART ends the membership, so an immediate rejoin is a real JOIN
+    // (/cycle) — for us and for anyone else; same for being kicked.
+    assert(run([":alice!u@h JOIN #chan", ":alice!u@h PART #chan",
+                ":alice!u@h JOIN #chan"], "JOIN").length == 2);
+    assert(run([":me!u@h JOIN #chan", ":me!u@h PART #chan",
+                ":me!u@h JOIN #chan"], "JOIN").length == 2);
+    assert(run([":alice!u@h JOIN #chan", ":op!u@h KICK #chan Alice :out",
+                ":alice!u@h JOIN #chan"], "JOIN").length == 2);
+
+    // The window re-arms rather than latching shut: a dropped repeat does
+    // not extend it, and the first line past it goes through.
+    NetworkConfig cfg;
+    auto c = new PersistentIRCClient(cfg, createChannel!IRCRawEvent());
+    long[string] seen;
+    enum w = PersistentIRCClient.JOIN_QUIT_ECHO_FLOOD_WINDOW_MS;
+    assert(!c.floodGuarded(seen, "k", 1_000));
+    assert(c.floodGuarded(seen, "k", 1_000 + w - 1));
+    assert(!c.floodGuarded(seen, "k", 1_000 + w));
+    assert(c.floodGuarded(seen, "k", 1_000 + w + 1));
 }
