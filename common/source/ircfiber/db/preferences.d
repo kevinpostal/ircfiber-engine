@@ -101,6 +101,10 @@ string truncateBncAway(string v) @safe pure nothrow {
 immutable string[] DISPLAY_MODE_INDICATORS = ["dots", "symbols", "hidden"];
 /// `timestampFormat` values; "auto" follows the device/browser locale.
 immutable string[] DISPLAY_TIMESTAMP_FORMATS = ["auto", "12h", "24h"];
+/// `textSize` client-pref values: the web Text size presets.
+immutable string[] TEXT_SIZE_VALUES = ["s", "m", "l", "xl", "xxl"];
+/// `chatScalePct`: message-text size in percent, 80–140 in steps of 5.
+bool isChatScalePct(long v) @safe pure nothrow @nogc { return v >= 80 && v <= 140 && v % 5 == 0; }
 /// The boolean account display prefs, in wire order.
 immutable string[] DISPLAY_BOOL_PREFS = ["showUserIcons", "monospaceFont", "enlargeEmoji", "coloriseMentions", "formatColors", "showTimestamps"];
 /// Device profiles kept per account (web browsers and app installs); creating one past this
@@ -127,7 +131,7 @@ enum long DEVICE_SEEN_GRANULARITY_MS = 3_600_000;
 /// Bool fields a device profile shares with the account's flat fields, in wire order.
 immutable string[] DEVICE_BOOL_PREFS = ["showMemberPrefixes", "desktopNotifications", "notificationSound", "autoDismissNotifs", "muteAll", "displayPrefsSet", "showUserIcons", "monospaceFont", "enlargeEmoji", "coloriseMentions", "formatColors", "showTimestamps"];
 /// The settings a device profile keeps apart from the web's: everything in it but `displayPrefsSet` and the metadata.
-private immutable string[] DEVICE_SETTINGS = ["showMemberPrefixes", "desktopNotifications", "notificationSound", "autoDismissNotifs", "muteAll", "showUserIcons", "monospaceFont", "modeIndicator", "enlargeEmoji", "coloriseMentions", "formatColors", "showTimestamps", "timestampFormat"];
+private immutable string[] DEVICE_SETTINGS = ["showMemberPrefixes", "desktopNotifications", "notificationSound", "autoDismissNotifs", "muteAll", "showUserIcons", "monospaceFont", "modeIndicator", "enlargeEmoji", "coloriseMentions", "formatColors", "showTimestamps", "timestampFormat", "chatScalePct"];
 /// The notification prefs (POST /api/me/notification-prefs), in wire order.
 immutable string[] NOTIFICATION_PREFS = ["desktopNotifications", "notificationSound", "autoDismissNotifs", "muteAll"];
 /// Highlight words per account, and the longest word in bytes.
@@ -151,7 +155,7 @@ struct ClientPrefSpec {
 /// Per-device web client prefs, in wire order (the frontend keeps the identical list).
 immutable ClientPrefSpec[] CLIENT_PREFS = [
     ClientPrefSpec("theme", ClientPrefKind.enum_, ["dark", "midnight", "dusk", "tropic", "emerald", "sand", "orchid"]),
-    ClientPrefSpec("fontSize", ClientPrefKind.int_, null, 10, 18),
+    ClientPrefSpec("textSize", ClientPrefKind.enum_, TEXT_SIZE_VALUES),
     ClientPrefSpec("compactMode", ClientPrefKind.bool_),
     ClientPrefSpec("sidebarLeft", ClientPrefKind.bool_),
     ClientPrefSpec("messageLayout", ClientPrefKind.enum_, ["compact", "comfortable", "separate"]),
@@ -192,6 +196,8 @@ struct DeviceProfile {
     bool formatColors = true;
     bool showTimestamps = true;
     string timestampFormat = "auto";
+    /// Message-text size in percent (80–140, step 5); the web Advanced "Message text" multiplier.
+    int chatScalePct = 100;
     /// Hardware model from `DEVICE_MODEL_HEADER` (`iPhone17,1`); "" until the app sends a valid one.
     string model;
     /// Unix ms of the device's first request.
@@ -232,6 +238,7 @@ struct DeviceProfile {
             j[key] = Json(__traits(getMember, this, key));
         j["modeIndicator"] = Json(modeIndicator);
         j["timestampFormat"] = Json(timestampFormat);
+        j["chatScalePct"] = Json(chatScalePct);
         j["model"] = Json(model);
         j["createdAt"] = Json(createdAt);
         j["updatedAt"] = Json(updatedAt);
@@ -271,6 +278,12 @@ struct DeviceProfile {
         if (auto v = "timestampFormat" in j) {
             if (v.type == Json.Type.string && DISPLAY_TIMESTAMP_FORMATS.canFind(v.get!string))
                 d.timestampFormat = v.get!string;
+            else
+                bad = true;
+        }
+        if (auto v = "chatScalePct" in j) {
+            if (v.type == Json.Type.int_ && isChatScalePct(v.get!long))
+                d.chatScalePct = cast(int) v.get!long;
             else
                 bad = true;
         }
@@ -433,6 +446,8 @@ struct UserPreferences {
     bool formatColors = true;
     bool showTimestamps = true;
     string timestampFormat = "auto";
+    /// Message-text size in percent (80–140, step 5); the web Advanced "Message text" multiplier.
+    int chatScalePct = 100;
     /// Account UI language: "" follows the browser/device, else a SUPPORTED_LANGUAGES code.
     /// Account-wide (web and every iOS install); not part of DeviceProfile.
     string language = "";
@@ -515,6 +530,7 @@ struct UserPreferences {
             j[key] = Json(__traits(getMember, this, key));
         j["modeIndicator"] = Json(modeIndicator);
         j["timestampFormat"] = Json(timestampFormat);
+        j["chatScalePct"] = Json(chatScalePct);
         j["language"] = Json(language);
         j["clientPrefs"] = clientPrefs.clone;
         auto devs = Json.emptyObject;
@@ -711,6 +727,14 @@ struct UserPreferences {
                 needsRepair = true;
             }
         }
+        if (auto v = "chatScalePct" in json) {
+            if (v.type == Json.Type.int_ && isChatScalePct(v.get!long))
+                p.chatScalePct = cast(int) v.get!long;
+            else {
+                logFieldInvalid(userId, "chatScalePct", v.type, "integer 80–140, step 5");
+                needsRepair = true;
+            }
+        }
         if (auto v = "language" in json) {
             if (v.type == Json.Type.string && (v.get!string.length == 0 || isSupportedLanguage(v.get!string)))
                 p.language = v.get!string;
@@ -828,6 +852,7 @@ Json displayPrefsJson(P)(const ref P p) {
         j[key] = Json(__traits(getMember, p, key));
     j["modeIndicator"] = Json(p.modeIndicator);
     j["timestampFormat"] = Json(p.timestampFormat);
+    j["chatScalePct"] = Json(p.chatScalePct);
     return j;
 }
 
@@ -854,6 +879,29 @@ string checkDisplayPrefsPatch(Json patch, out bool any) {
             return "timestampFormat must be one of auto, 12h, 24h";
         any = true;
     }
+    if (auto v = "chatScalePct" in patch) {
+        if (v.type != Json.Type.int_ || !isChatScalePct(v.get!long))
+            return "chatScalePct must be an integer from 80 to 140 in steps of 5";
+        any = true;
+    }
+    return "";
+}
+
+/// Validates a POST /api/admin/config/text-defaults body. "" when valid, else
+/// the 400 text; `any` is true when a recognised key is present. "" / 0 mean "unset".
+string checkTextDefaultsPatch(Json patch, out bool any) {
+    if (patch.type != Json.Type.object)
+        return "body must be object";
+    if (auto v = "textSize" in patch) {
+        if (v.type != Json.Type.string || (v.get!string.length && !TEXT_SIZE_VALUES.canFind(v.get!string)))
+            return "textSize must be empty or one of s, m, l, xl, xxl";
+        any = true;
+    }
+    if (auto v = "chatScalePct" in patch) {
+        if (v.type != Json.Type.int_ || (v.get!long != 0 && !isChatScalePct(v.get!long)))
+            return "chatScalePct must be 0 or 80–140 in steps of 5";
+        any = true;
+    }
     return "";
 }
 
@@ -869,6 +917,8 @@ void applyDisplayPrefsPatch(P)(ref P p, Json patch) {
         p.modeIndicator = v.get!string;
     if (auto v = "timestampFormat" in patch)
         p.timestampFormat = v.get!string;
+    if (auto v = "chatScalePct" in patch)
+        p.chatScalePct = cast(int) v.get!long;
     p.displayPrefsSet = true;
 }
 
@@ -966,6 +1016,15 @@ Json sanitizeClientPrefs(Json stored, out bool bad) {
     if (stored.type != Json.Type.object) {
         bad = true;
         return clean;
+    }
+    if (stored.type == Json.Type.object && "textSize" !in stored) {
+        if (auto fs = "fontSize" in stored) {
+            if (fs.type == Json.Type.int_) {
+                const n = fs.get!long;
+                stored = stored.clone;
+                stored["textSize"] = Json(n <= 12 ? "s" : n <= 14 ? "m" : n <= 16 ? "l" : n <= 17 ? "xl" : "xxl");
+            }
+        }
     }
     size_t kept;
     foreach (ref spec; CLIENT_PREFS) {
@@ -1955,6 +2014,23 @@ unittest {
     j = Json.emptyObject;
     j["showTimestamps"] = Json(false);
     assert(checkDisplayPrefsPatch(j, any) == "" && any, "showTimestamps alone is a display pref (iOS sends single-key patches)");
+    j = Json.emptyObject;
+    j["chatScalePct"] = Json(80);
+    assert(checkDisplayPrefsPatch(j, any) == "" && any);
+    j["chatScalePct"] = Json(115);
+    assert(checkDisplayPrefsPatch(j, any) == "" && any);
+    j["chatScalePct"] = Json(140);
+    assert(checkDisplayPrefsPatch(j, any) == "" && any);
+    j["chatScalePct"] = Json(75);
+    assert(checkDisplayPrefsPatch(j, any) == "chatScalePct must be an integer from 80 to 140 in steps of 5");
+    j["chatScalePct"] = Json(145);
+    assert(checkDisplayPrefsPatch(j, any).length);
+    j["chatScalePct"] = Json(112);
+    assert(checkDisplayPrefsPatch(j, any).length);
+    j["chatScalePct"] = Json(1.1);
+    assert(checkDisplayPrefsPatch(j, any).length);
+    j["chatScalePct"] = Json("110");
+    assert(checkDisplayPrefsPatch(j, any).length);
 }
 
 @("applyDisplayPrefsPatch writes only the given keys and sets displayPrefsSet")
@@ -1970,6 +2046,80 @@ unittest {
     assert(!p.showUserIcons && p.timestampFormat == "12h");
     assert(!p.monospaceFont, "keys absent from the patch keep their value");
     assert(p.modeIndicator == "dots" && p.enlargeEmoji && p.coloriseMentions && p.formatColors);
+    assert(p.chatScalePct == 100, "absent key keeps the default");
+    patch = Json.emptyObject;
+    patch["chatScalePct"] = Json(130);
+    applyDisplayPrefsPatch(p, patch);
+    assert(p.chatScalePct == 130);
+}
+
+@("chatScalePct round-trips on the account and a device; an invalid value repairs to the default")
+unittest {
+    UserPreferences p;
+    p.chatScalePct = 125;
+    const r = UserPreferences.fromJson(p.toJson());
+    assert(!r.needsRepair);
+    assert(r.prefs.chatScalePct == 125);
+
+    DeviceProfile d;
+    d.chatScalePct = 125;
+    bool dBad;
+    const rd = DeviceProfile.fromJson(d.toJson(), dBad);
+    assert(!dBad);
+    assert(rd.chatScalePct == 125);
+
+    auto j = Json.emptyObject;
+    j["chatScalePct"] = Json(7);
+    const s = UserPreferences.fromJson(j);
+    assert(s.needsRepair);
+    assert(s.prefs.chatScalePct == 100);
+
+    bool bad;
+    const sd = DeviceProfile.fromJson(j, bad);
+    assert(bad);
+    assert(sd.chatScalePct == 100);
+}
+
+@("sanitizeClientPrefs migrates a legacy fontSize to textSize and flags repair")
+unittest {
+    auto stored = Json.emptyObject;
+    stored["fontSize"] = Json(17);
+    bool bad;
+    const clean = sanitizeClientPrefs(stored, bad);
+    assert(bad);
+    assert(clean.length == 1 && clean["textSize"].get!string == "xl");
+}
+
+@("checkTextDefaultsPatch validates admin org text defaults; empty/0 mean unset")
+unittest {
+    bool any;
+    auto j = Json.emptyObject;
+    j["textSize"] = Json("");
+    assert(checkTextDefaultsPatch(j, any) == "" && any);
+    any = false;
+    j = Json.emptyObject;
+    j["textSize"] = Json("xl");
+    assert(checkTextDefaultsPatch(j, any) == "" && any);
+    any = false;
+    j = Json.emptyObject;
+    j["chatScalePct"] = Json(0);
+    assert(checkTextDefaultsPatch(j, any) == "" && any);
+    any = false;
+    j = Json.emptyObject;
+    j["chatScalePct"] = Json(110);
+    assert(checkTextDefaultsPatch(j, any) == "" && any);
+    j = Json.emptyObject;
+    j["textSize"] = Json("huge");
+    assert(checkTextDefaultsPatch(j, any).length);
+    j = Json.emptyObject;
+    j["chatScalePct"] = Json(115.0);
+    assert(checkTextDefaultsPatch(j, any).length);
+    j = Json.emptyObject;
+    j["chatScalePct"] = Json(150);
+    assert(checkTextDefaultsPatch(j, any).length);
+    assert(checkTextDefaultsPatch(Json.emptyArray, any) == "body must be object");
+    any = false;
+    assert(checkTextDefaultsPatch(Json.emptyObject, any) == "" && !any);
 }
 
 @("normalizeHighlightWords trims, drops empty/oversized/non-strings, dedupes case-insensitively")
@@ -2167,13 +2317,11 @@ unittest {
     assert(err("theme", Json(true)).length);
     assert(err("linkPreviewSize", Json("large")) == "");
     // int range, inclusive bounds
-    assert(err("fontSize", Json(10)) == "" && err("fontSize", Json(18)) == "");
-    assert(err("fontSize", Json(9)) == "fontSize must be an integer from 10 to 18");
-    assert(err("fontSize", Json(19)).length);
-    assert(err("fontSize", Json(14.5)).length, "a float is not an integer");
-    assert(err("fontSize", Json("14")).length);
     assert(err("defaultScrollPreset", Json(0)) == "" && err("defaultScrollPreset", Json(4)) == "");
-    assert(err("defaultScrollPreset", Json(-1)).length && err("defaultScrollPreset", Json(5)).length);
+    assert(err("defaultScrollPreset", Json(-1)) == "defaultScrollPreset must be an integer from 0 to 4");
+    assert(err("defaultScrollPreset", Json(5)).length);
+    assert(err("defaultScrollPreset", Json(2.5)).length, "a float is not an integer");
+    assert(err("defaultScrollPreset", Json("2")).length);
     // intEnum
     assert(err("awayAfterMinutes", Json(30)) == "");
     assert(err("awayAfterMinutes", Json(10)) == "awayAfterMinutes must be one of 5, 15, 30, 60");
@@ -2197,18 +2345,18 @@ unittest {
 unittest {
     auto base = Json.emptyObject;
     base["theme"] = Json("dusk");
-    base["fontSize"] = Json(12);
+    base["textSize"] = Json("s");
     Json prefs = base;
     auto patch = Json.emptyObject;
-    patch["fontSize"] = Json(null);
+    patch["textSize"] = Json(null);
     patch["compactMode"] = Json(true);
     patch["inlineTweets"] = Json(true);
     applyClientPrefsPatch(prefs, patch);
     assert(prefs["theme"].get!string == "dusk");
-    assert("fontSize" !in prefs, "null deletes the key");
+    assert("textSize" !in prefs, "null deletes the key");
     assert(prefs["compactMode"].get!bool);
     assert("inlineTweets" !in prefs);
-    assert(base["fontSize"].get!long == 12 && "compactMode" !in base, "the old object is untouched");
+    assert(base["textSize"].get!string == "s" && "compactMode" !in base, "the old object is untouched");
 }
 
 @("clientPrefs round-trip on the account and a device; bad stored keys are dropped and flag a repair")
@@ -2246,13 +2394,13 @@ unittest {
 
     auto badCp = Json.emptyObject;
     badCp["theme"] = Json("light");
-    badCp["fontSize"] = Json(16);
+    badCp["textSize"] = Json("l");
     badCp["inlineTweets"] = Json(true);
     auto j = Json.emptyObject;
     j["clientPrefs"] = badCp;
     const s = UserPreferences.fromJson(j);
     assert(s.needsRepair);
-    assert(s.prefs.clientPrefs.length == 1 && s.prefs.clientPrefs["fontSize"].get!long == 16);
+    assert(s.prefs.clientPrefs.length == 1 && s.prefs.clientPrefs["textSize"].get!string == "l");
     j["clientPrefs"] = Json.emptyArray;
     const t = UserPreferences.fromJson(j);
     assert(t.needsRepair && t.prefs.clientPrefs.type == Json.Type.object && t.prefs.clientPrefs.length == 0);
@@ -2265,7 +2413,7 @@ unittest {
     bool bad;
     const dd = DeviceProfile.fromJson(devJ, bad);
     assert(bad);
-    assert(dd.clientPrefs.length == 1 && dd.clientPrefs["fontSize"].get!long == 16);
+    assert(dd.clientPrefs.length == 1 && dd.clientPrefs["textSize"].get!string == "l");
     assert(dd.kind == DEVICE_KIND_APP && dd.name == "" && !dd.clientPrefsSet);
     assert(dd.autoName == "Chrome on macOS");
 }
@@ -2331,7 +2479,8 @@ unittest {
     bool changed;
     auto prof = ensureDeviceProfile(p, id, "", 1000, changed, "", "", "", DEVICE_KIND_WEB, "Safari on macOS");
     auto devPrefs = Json.emptyObject;
-    devPrefs["fontSize"] = Json(16);
+    devPrefs["textSize"] = Json("l");
+    prof.chatScalePct = 130;
     prof.clientPrefs = devPrefs;
     prof.muteAll = true;
     prof.monospaceFont = false;
@@ -2339,10 +2488,11 @@ unittest {
 
     makeAccountDefaults(p, *prof);
     assert(p.clientPrefs == devPrefs && p.muteAll && !p.monospaceFont && p.displayPrefsSet);
+    assert(p.chatScalePct == 130, "makeAccountDefaults copies chatScalePct via DEVICE_SETTINGS");
     auto patch = Json.emptyObject;
-    patch["fontSize"] = Json(17);
+    patch["textSize"] = Json("xl");
     applyClientPrefsPatch(prof.clientPrefs, patch);
-    assert(p.clientPrefs["fontSize"].get!long == 16, "the defaults are a copy");
+    assert(p.clientPrefs["textSize"].get!string == "l", "the defaults are a copy");
 
     p.muteAll = false;
     resetDeviceToAccount(*prof, p);
