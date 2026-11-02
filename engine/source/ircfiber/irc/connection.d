@@ -3190,6 +3190,15 @@ final class PersistentIRCClient {
         // `_`-append chain instead of looping. Reset at every attempt
         // start alongside randomNickPersisted.
         bool                ghostReclaimAttempted;
+        // A post-registration SASL PLAIN login is in flight (`startLateSasl`):
+        // we registered while services were split and the ircd announced
+        // `CAP NEW sasl` when they relinked. Reset at every attempt start.
+        bool                lateSaslPending;
+        // The nick services enforcement took from us (`Zodiac` before the
+        // forced rename to `Guest12345`). A late SASL login restores it.
+        // Empty when the current nick was not forced. Reset at every
+        // attempt start and by any nick change we asked for.
+        string              forcedFromNick;
         bool                isAway = false;
         string              awayMessage;
         string[string]      channelState;
@@ -5620,6 +5629,8 @@ final class PersistentIRCClient {
         // 001 handler's clearPersistedNick below.
         randomNickPersisted = false;
         ghostReclaimAttempted = false;
+        lateSaslPending = false;
+        forcedFromNick = "";
         // PASS must be sent before NICK/USER per RFC 1459 §4.1
         if (config.serverPass.length > 0) sendRaw("PASS " ~ config.serverPass);
         sendRaw("NICK " ~ sessionNick);
@@ -6236,7 +6247,10 @@ final class PersistentIRCClient {
 
         // MONITOR is per connection: re-arm the persisted list.
         if (monitorSupported() && config.monitoredNicks.length)
-            foreach (l; monitorLines("+", config.monitoredNicks, monitorLimit())) sendRaw(l);
+            foreach (l; monitorLines("+", config.monitoredNicks, monitorLimit())) {
+                sendRaw(l);
+                logInfo("%s sent (monitor re-armed for %s)", l, config.name);
+            }
 
         // ── Post-registration commands ─────────────────────────────────────
         // NickServ IDENTIFY (if configured) — sent BEFORE user-supplied
@@ -7510,6 +7524,9 @@ private void processEvents() {
                         isSelf = true;
                         sessionNick = newNick;
                         metaDirty = true;
+                        // Keep the first nick taken from us: a later forced
+                        // rename (Guest → UID) must not overwrite it.
+                        if (forcedFromNick.length == 0) forcedFromNick = event.nick;
                         logJsonMap("info", "connection",
                             "Server-initiated self nick change — not persisting",
                             ["network": config.name,
@@ -7521,6 +7538,7 @@ private void processEvents() {
                         sessionNick = newNick;
                         metaDirty = true;
                         optimisticNickOld = "";
+                        forcedFromNick = "";
                         persistNick(sessionNick);
                     }
                     // IRCCloud-style you_nickchange: emit a dedicated message
@@ -8221,6 +8239,27 @@ private void processEvents() {
                 clearPendingLabel(event.getTag("label"));
                 return;
 
+            // ── Late SASL login (startLateSasl) ─────────────────────────────
+            // Outside a late login these keep their old path (published).
+            case "AUTHENTICATE": {
+                if (!lateSaslPending) break;
+                auto ap = event.getParams();
+                if (ap.length > 0 && ap[0] == "+") {
+                    sendSaslAuthenticate(buildSaslPlainPayload(config.saslUsername, config.saslPassword));
+                } else {
+                    sendRaw("AUTHENTICATE *");
+                    finishLateSasl(false, "unexpected challenge");
+                }
+                return; // the exchange itself is not a row
+            }
+            case "903": // RPL_SASLSUCCESS
+            case "907": // ERR_SASLALREADY: logged in either way
+                if (lateSaslPending) finishLateSasl(true, event.text);
+                break;
+            case "902": case "904": case "905": case "906":
+                if (lateSaslPending) finishLateSasl(false, event.text);
+                break;
+
             // ── CAP after registration (cap-notify NEW/DEL, late ACKs) ─────
             // State follows the server; the line is still published so the
             // frontend's capability set updates live.
@@ -8827,6 +8866,7 @@ private void processEvents() {
             if (registered) {
                 if (newly.canFind("draft/metadata-2")) publishOwnMetadata();
                 if (newly.canFind("draft/read-marker")) reseedReadMarkers();
+                if (newly.canFind("sasl") && lateSaslPending) sendRaw("AUTHENTICATE PLAIN");
                 return;
             }
             if (capReqOutstanding > 0) --capReqOutstanding;
@@ -8881,7 +8921,10 @@ private void processEvents() {
             }
             maybeEndCap(capLine);
         } else if (sub == "NAK") {
-            if (registered) return;
+            if (registered) {
+                if (lateSaslPending && capLine.split(" ").canFind("sasl")) lateSaslPending = false;
+                return;
+            }
             if (capReqOutstanding > 0) --capReqOutstanding;
             // Ignore NAK'd caps; they just won't be used. If the
             // server NAK'd the request carrying sasl, the server does
@@ -8905,8 +8948,13 @@ private void processEvents() {
             foreach (cap; capLine.split(" ")) {
                 auto capName = capNameOf(cap);
                 if (capName.length == 0 || hasCap(capName) || !desired.canFind(capName)) continue;
-                // SASL is a registration-time exchange only.
-                if (registered && capName == "sasl") continue;
+                // During registration SASL runs through the ACK above. After
+                // it, `CAP NEW sasl` means services just (re)linked: log in
+                // now if we registered without them.
+                if (registered && capName == "sasl") {
+                    startLateSasl();
+                    continue;
+                }
                 sendRaw("CAP REQ :" ~ capName);
                 if (!registered && !capEndSent) ++capReqOutstanding;
             }
@@ -8918,6 +8966,51 @@ private void processEvents() {
                 capValues.remove(capName);
             }
         }
+    }
+
+    /// Services relinked after we registered without them. An ircd restart
+    /// races Anope's uplink: the engine reconnects first, the ircd offers
+    /// no `sasl`, and NickServ renames the unidentified session to Guest a
+    /// minute later (2026-11-02, appreview/faggy/SisU). Log in over SASL
+    /// now. PLAIN only, and never `NickServ IDENTIFY`: echo-message would
+    /// write that PRIVMSG, password included, into the NickServ buffer.
+    private void startLateSasl() {
+        if (lateSaslPending || servicesAccount.length > 0) return;
+        if (config.sasl != SASLMechanism.plain || config.saslUsername.strip().length == 0
+                || config.saslPassword.length == 0) return;
+        if (!saslMechanismOffered(capValues.get("sasl", ""), "PLAIN")) return;
+        lateSaslPending = true;
+        logJsonMap("info", "auth",
+            "Services available after registration — starting SASL",
+            ["network": config.name, "host": config.host,
+             "account": config.saslUsername, "event": "sasl_late_start"]);
+        sendRaw("CAP REQ :sasl");
+    }
+
+    /// Ends a `startLateSasl` exchange. A refusal only logs: the session is
+    /// live, and parking it would disconnect a working connection over a
+    /// login it never needed to register. Success takes back the nick
+    /// services enforcement renamed us away from.
+    private void finishLateSasl(bool ok, string detail) {
+        lateSaslPending = false;
+        if (!ok) {
+            logJsonMap("warn", "auth",
+                "Late SASL login failed",
+                ["network": config.name, "host": config.host,
+                 "account": config.saslUsername, "detail": detail,
+                 "event": "sasl_late_fail"]);
+            return;
+        }
+        saslSucceeded = true;
+        pacer.adopt(KNOWN_USER_LIMITS);
+        logJsonMap("info", "auth",
+            "Late SASL login succeeded",
+            ["network": config.name, "host": config.host,
+             "account": config.saslUsername, "event": "sasl_late_success"]);
+        recordCounter("ircfiber.sasl.late_success", 1, ["network": config.name, "host": config.host]);
+        const restore = forcedFromNick;
+        forcedFromNick = "";
+        if (restore.length > 0 && !sameNick(sessionNick, restore)) sendRaw("NICK " ~ restore);
     }
 
     /// Sends `CAP END` once SASL is settled and every registration REQ has
@@ -10818,16 +10911,63 @@ unittest {
         auto got = drain(t);
         assert(got.count!(e => e.command == "CAP") == 3, "post-registration CAP lines are published");
     }
-    // A post-registration NEW never re-opens SASL.
-    {
+    // Services relinking after registration (`CAP NEW sasl`) logs a
+    // credentialed, unidentified session in over SASL and takes back the
+    // nick NickServ enforcement renamed it away from.
+    static auto makeSasl() {
         NetworkConfig cfg;
         cfg.nick = "me";
         cfg.sasl = SASLMechanism.plain;
+        cfg.saslUsername = "me";
+        cfg.saslPassword = "secretpw";
         auto ch = createChannel!IRCRawEvent();
-        auto c = new PersistentIRCClient(cfg, ch);
+        return tuple(new PersistentIRCClient(cfg, ch), ch);
+    }
+    {
+        auto t = makeSasl();
+        auto c = t[0];
+        c.processLine(":me!u@h NICK Guest123");
+        assert(c.sessionNick == "Guest123");
+        c.processLine(":s CAP Guest123 NEW :sasl=EXTERNAL,PLAIN");
+        assert(c.outboundQueue.canFind("CAP REQ :sasl"));
+        c.processLine(":s CAP Guest123 ACK :sasl");
+        assert(c.outboundQueue.canFind("AUTHENTICATE PLAIN"));
+        c.processLine("AUTHENTICATE +");
+        assert(c.outboundQueue.canFind("AUTHENTICATE " ~ buildSaslPlainPayload("me", "secretpw")));
+        assert(!c.outboundQueue.canFind!(l => l.startsWith("PRIVMSG NickServ")), "never IDENTIFY over PRIVMSG");
+        c.processLine(":s 900 Guest123 Guest123!u@h me :You are now logged in as me");
+        c.processLine(":s 903 Guest123 :SASL authentication successful");
+        assert(c.outboundQueue[$ - 1] == "NICK me", c.outboundQueue.join(" | "));
+        assert(!c.lateSaslPending && c.forcedFromNick.length == 0);
+        auto got = drain(t);
+        assert(!got.canFind!(e => e.command == "AUTHENTICATE"), "the exchange is not published");
+    }
+    // Already identified, no credential, or a refusal: no login, no NICK.
+    {
+        auto t = makeSasl();
+        auto c = t[0];
+        c.processLine(":s 900 me me!u@h me :You are now logged in as me");
         c.processLine(":s CAP me NEW :sasl");
         assert(!c.outboundQueue.canFind("CAP REQ :sasl"));
-        ch.close();
+        drain(t);
+    }
+    {
+        auto t = make();
+        t[0].processLine(":s CAP me NEW :sasl");
+        assert(!t[0].outboundQueue.canFind("CAP REQ :sasl"));
+        drain(t);
+    }
+    {
+        auto t = makeSasl();
+        auto c = t[0];
+        c.processLine(":me!u@h NICK Guest123");
+        c.processLine(":s CAP Guest123 NEW :sasl");
+        c.processLine(":s CAP Guest123 ACK :sasl");
+        c.processLine("AUTHENTICATE +");
+        c.processLine(":s 904 Guest123 :SASL authentication failed");
+        assert(!c.lateSaslPending);
+        assert(!c.outboundQueue.canFind("NICK me"));
+        drain(t);
     }
 
     // Registration-time split REQ: stable and draft caps go out separately
