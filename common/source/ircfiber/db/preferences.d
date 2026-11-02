@@ -365,6 +365,13 @@ struct UserPreferences {
     /// Sent as `AWAY :<message>` on the network when this account's last
     /// bouncer client detaches, cleared on attach. Empty disables it.
     string bncAwayMessage;
+    /// When true, the account's regular IRC Fiber login password
+    /// (`users.passwordHash`, verified by `ircfiber.auth.verifyPassword`)
+    /// also authenticates bouncer clients (SASL PLAIN / PASS), alongside
+    /// the dedicated `bncToken`. On by default. Admin revoke
+    /// (`web/admin/bnc.d` `apiBncRevoke`) clears it; the self-service
+    /// dedicated-password Revoke does not.
+    bool bncAllowPasswordAuth = true;
     /// Serializes to JSON.
     Json toJson() const {
         auto j = Json.emptyObject;
@@ -423,6 +430,7 @@ struct UserPreferences {
         j["bncAllowedCidrs"] = bncAllowedCidrs is null ? Json.emptyArray : serializeToJson(bncAllowedCidrs);
         j["bncMaxClients"] = Json(bncMaxClients);
         j["bncAwayMessage"] = Json(bncAwayMessage);
+        j["bncAllowPasswordAuth"] = Json(bncAllowPasswordAuth);
         return j;
     }
     /// Deserializes from JSON. The optional `userId` enables structured
@@ -682,6 +690,14 @@ struct UserPreferences {
                 p.bncAwayMessage = truncateBncAway(v.get!string);
             else {
                 logFieldInvalid(userId, "bncAwayMessage", v.type, "string");
+                needsRepair = true;
+            }
+        }
+        if (auto v = "bncAllowPasswordAuth" in json) {
+            if (v.type == Json.Type.bool_)
+                p.bncAllowPasswordAuth = v.get!bool;
+            else {
+                logFieldInvalid(userId, "bncAllowPasswordAuth", v.type, "bool");
                 needsRepair = true;
             }
         }
