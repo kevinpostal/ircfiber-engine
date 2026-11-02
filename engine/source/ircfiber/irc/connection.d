@@ -2207,6 +2207,72 @@ bool channelNeedsRealnameWho(const string[] members,
     return false;
 }
 
+/// One WHO written to the server whose RPL_ENDOFWHO (315) has not arrived.
+/// A server answers commands in the order it reads them, so the oldest
+/// pending WHO owns every 352/354 row that arrives. That ownership is what
+/// separates a client's own WHO (the E2EE roster probe `WHO #chan %na`, a
+/// `/raw WHO`) from the engine's realname sweep: the sweep's rows feed
+/// engine state and stay unpublished, a client's rows go to the client.
+struct PendingWho {
+    string mask;    /// the WHO target as sent; 315 echoes it back
+    string fields;  /// WHOX field letters (`na` for `%na`), "" for plain WHO
+    bool   client;  /// a client sent it: its replies are published
+    long   sentAt;  /// unix seconds; an answer that never comes ages out
+}
+
+/// Seconds a WHO may go unanswered before it stops owning reply rows.
+enum long WHO_REPLY_TIMEOUT_SECS = 30;
+
+/// WHOs tracked at once; past it the oldest is forgotten.
+enum size_t MAX_PENDING_WHOS = 64;
+
+/// Splits an outgoing `WHO <mask> [%fields[,token]]` line. False when
+/// `line` is not a WHO with a target. `fields` is "" for a plain WHO.
+bool parseWhoLine(string line, out string mask, out string fields) @safe pure {
+    import std.array : split;
+    import std.string : indexOf, toUpper;
+    auto parts = line.split();
+    if (parts.length < 2 || parts[0].toUpper != "WHO") return false;
+    mask = parts[1];
+    if (parts.length > 2 && parts[2].length > 1 && parts[2][0] == '%') {
+        const spec = parts[2][1 .. $];
+        const comma = spec.indexOf(',');
+        fields = comma >= 0 ? spec[0 .. comma] : spec;
+    }
+    return true;
+}
+
+/// Field `f` of a WHOX (354) row answering a request for `fields`, ""
+/// when the request did not ask for it. A row carries the requested
+/// fields in the spec's fixed order `tcuihsnfdlaor`, whatever order the
+/// request named them in; `params[0]` is our own nick.
+string whoxField(const string[] params, string fields, char f) @safe pure {
+    import std.string : indexOf;
+    if (fields.indexOf(f) < 0) return "";
+    size_t i = 1;
+    foreach (c; "tcuihsnfdlaor") {
+        if (c == f) return i < params.length ? params[i] : "";
+        if (fields.indexOf(c) >= 0) i++;
+    }
+    return "";
+}
+
+@safe unittest {
+    string mask, fields;
+    assert(parseWhoLine("WHO #c %na", mask, fields) && mask == "#c" && fields == "na");
+    assert(parseWhoLine("who #c %tcuhnfar,152", mask, fields) && fields == "tcuhnfar");
+    assert(parseWhoLine("WHO #c", mask, fields) && mask == "#c" && fields == "");
+    assert(parseWhoLine("WHO nick o", mask, fields) && fields == "");
+    assert(!parseWhoLine("WHOIS bob", mask, fields));
+    assert(!parseWhoLine("WHO", mask, fields));
+
+    // Rows follow the spec order, not the request order.
+    assert(whoxField(["me", "bob", "acct"], "an", 'n') == "bob");
+    assert(whoxField(["me", "bob", "acct"], "na", 'a') == "acct");
+    assert(whoxField(["me", "152", "#c", "u", "h", "bob", "H", "acct", "R"], "tcuhnfar", 'a') == "acct");
+    assert(whoxField(["me", "bob"], "n", 'a') == "");
+}
+
 /// Channel status mode letter → the prefix char it renders as, `'\0'` for a
 /// mode that takes no member target. `y`/`Y` are InspIRCd's operprefix and
 /// ojoin modes: without them a `MODE #chan +yo nick1 nick2` consumed no
@@ -3219,6 +3285,11 @@ final class PersistentIRCClient {
         // MAX_WHO_ENRICH_ATTEMPTS so a server that answers WHO without
         // naming every member cannot keep the sweep alive forever.
         int[string]         whoEnrichAttempts;
+        // Every WHO sent and not yet closed by its 315, oldest first (see
+        // `PendingWho`). Not cleared on reconnect: a WHO queued in
+        // `outboundQueue` while the socket was down is still owed an
+        // answer, and one lost with the old socket ages out.
+        PendingWho[]        pendingWhos;
         long                lastWhoisTime; // throttle: 1/s for WHOIS queries
         // IRCCloud-style realname cache. Populated from extended-join
         // (realname param) and RPL_WHOISUSER (311). Used to render the
@@ -7019,6 +7090,42 @@ private void processEvents() {
         return "WHO " ~ chan;
     }
 
+    /// Records a WHO line on its way out (see `PendingWho`); any other
+    /// line is ignored. `client` marks a WHO a client asked for.
+    private void trackWho(string line, bool client) {
+        string mask, fields;
+        if (!parseWhoLine(line, mask, fields)) return;
+        if (pendingWhos.length >= MAX_PENDING_WHOS) pendingWhos = pendingWhos[1 .. $];
+        pendingWhos ~= PendingWho(mask, fields, client, Clock.currTime.toUnixTime!long);
+    }
+
+    /// The WHO the next 352/354 row answers — the oldest one pending, once
+    /// those the server left unanswered past WHO_REPLY_TIMEOUT_SECS are
+    /// dropped. False when nothing is pending.
+    private bool whoReplyOwner(out PendingWho owner) {
+        const now = Clock.currTime.toUnixTime!long;
+        size_t i = 0;
+        while (i < pendingWhos.length && now - pendingWhos[i].sentAt > WHO_REPLY_TIMEOUT_SECS) i++;
+        pendingWhos = pendingWhos[i .. $];
+        if (pendingWhos.length == 0) return false;
+        owner = pendingWhos[0];
+        return true;
+    }
+
+    /// Closes the WHO that a 315 for `mask` ends; true when a client sent
+    /// it. Older entries were never answered (a server that refused the
+    /// WHO with 263 sends no 315), so they are dropped with it.
+    private bool closeWho(string mask) {
+        const cm = casemapping();
+        const key = foldNickMapped(mask, cm);
+        foreach (i, w; pendingWhos) {
+            if (foldNickMapped(w.mask, cm) != key) continue;
+            pendingWhos = pendingWhos[i + 1 .. $];
+            return w.client;
+        }
+        return false;
+    }
+
     /// One WHO (352) or WHOX (354, query type 152) row. Records the
     /// realname, ident, away (`G`/`H`), bot flag and — WHOX only —
     /// services account (`"0"` = logged out, `""` = not reported), and
@@ -7942,7 +8049,8 @@ private void processEvents() {
             // ── WHO reply (RPL_WHOREPLY, 352) ────────────────────────────────
             // Only promotes BARE entries (no existing prefix) so explicit
             // MODE changes like +v are not overwritten by a WHO response
-            // that may arrive after the MODE.
+            // that may arrive after the MODE. Published only when a
+            // client's own WHO owns the row (see `PendingWho`).
             case "352": {
                 auto mp = event.getParams();
                 logJsonMap("debug", "protocol",
@@ -7968,6 +8076,8 @@ private void processEvents() {
                     // [me, chan, user, host, server, nick, flags, trailing]
                     applyWhoReply(mp[1], mp[2], mp[3], mp[5], mp[6], rn, "");
                 }
+                PendingWho owner;
+                if (whoReplyOwner(owner) && owner.client) break;
                 return;
             }
 
@@ -7990,11 +8100,12 @@ private void processEvents() {
                 break;
             }
 
-            // ── End of WHO (RPL_ENDOFWHO, 315) — no-op for state ───────────
+            // ── End of WHO (RPL_ENDOFWHO, 315) ─────────────────────────────
             // WHO reply (352) rows themselves are consumed above (realname
-            // cache + channelUsers prefix promotion) and are never
-            // published. The matching 315 terminator has no state and no
-            // UI consumer — returning here keeps it off the eventChannel
+            // cache + channelUsers prefix promotion) and are only
+            // published for a client's own WHO. The terminator of the
+            // engine's sweep has no state and no UI consumer — returning
+            // here keeps it off the eventChannel
             // and out of Redis scrollback. Without this, SuperNets
             // (which re-WHOs every few seconds to refresh realnames)
             // floods each channel's scrollback with one 315 row per
@@ -8008,27 +8119,40 @@ private void processEvents() {
             // again forever.
             case "315": {
                 auto p = event.getParams();
+                bool forClient = false;
                 if (p.length >= 2) {
+                    forClient = closeWho(p[1]);
                     if (auto members = p[1] in channelUsers)
                         foreach (u; *members) {
                             const bare = stripNickPrefix(u);
                             if (bare.length) realnameProbed[bare] = true;
                         }
                 }
+                if (forClient) break;
                 return;
             }
 
             // ── WHOX reply (RPL_WHOX, 354) ─────────────────────────────────
-            // Only our own `%tcuhnfar,152` query (see `whoLine`) is read —
+            // Our own `%tcuhnfar,152` query (see `whoLine`) is read —
             // [me, 152, chan, user, host, nick, flags, account, realname] —
-            // and fed through the same path as 352. Every 354 stays off
-            // the eventChannel: on SuperNets / UnrealIRCd a channel's WHOX
-            // is a 2000+ line flood the frontend has no consumer for.
+            // and fed through the same path as 352; it stays off the
+            // eventChannel: on SuperNets / UnrealIRCd a channel's WHOX is a
+            // 2000+ line flood the frontend has no consumer for. A row
+            // owned by a client's WHOX (the E2EE roster probe
+            // `WHO #chan %na`) is published to it instead, and its nick →
+            // account pair, when asked for, lands in `accounts` too so the
+            // synced roster carries it.
             case "354": {
                 auto p = event.getParams();
                 if (p.length >= 8 && p[1] == "152")
                     applyWhoReply(p[2], p[3], p[4], p[5], p[6], event.text, p[7]);
-                return;
+                PendingWho owner;
+                if (!whoReplyOwner(owner) || !owner.client) return;
+                const nick = whoxField(p, owner.fields, 'n');
+                const acct = whoxField(p, owner.fields, 'a');
+                if (nick.length > 0 && acct == "0") accounts.remove(nick);
+                else if (nick.length > 0 && acct.length > 0) accounts[nick] = acct;
+                break;
             }
 
             // ── Away notify (away-notify cap) ─────────────────────────────────
@@ -10085,8 +10209,9 @@ private void processEvents() {
 
     // ── Public API ────────────────────────────────────────────────────────────
 
-    /// Sends a raw IRC line.
-    void sendRaw(string line) {
+    /// Sends a raw IRC line. `fromClient` marks a line a client typed or
+    /// sent (the `raw` command), whose WHO replies are published to it.
+    void sendRaw(string line, bool fromClient = false) {
         // Track own away status
         if (line == "AWAY" || line == "away") {
             isAway = false;
@@ -10118,6 +10243,11 @@ private void processEvents() {
         // retry has to re-send (421 names the command, never the channel).
         if (line.length >= 5 && icmp(line[0 .. 5], "JOIN ") == 0) {
             recordPendingJoins(line[5 .. $]);
+        }
+        // Every WHO — the engine's sweep and a client's own — funnels
+        // through here too, in the order the server will answer them.
+        if (line.length >= 4 && icmp(line[0 .. 4], "WHO ") == 0) {
+            trackWho(line, fromClient);
         }
         if (state == ConnectionState.disconnected ||
             (state == ConnectionState.connecting && !transportAlive)) {
@@ -10923,7 +11053,7 @@ unittest {
     assert(whox[0].getAccounts()["bob"] == "acct");
     assert(whox[0].getIdents()["bob"] == "ident");
     assert(whox[0].getRealnames()["bob"] == "Real Name");
-    assert(whox[1].count!(e => e.command == "354") == 0, "354 is never published");
+    assert(whox[1].count!(e => e.command == "354") == 0, "an unrequested 354 is never published");
     // A later row without the flags: present, not a bot, logged out.
     auto whox2 = run([":s 005 me WHOX BOT=b :are supported",
                       ":s 354 me 152 #c ident host bob Gb acct :Real Name",
@@ -10934,6 +11064,37 @@ unittest {
     // whoLine asks for WHOX only when the server has it.
     assert(whox[0].whoLine("#c") == "WHO #c %tcuhnfar,152");
     assert(run([])[0].whoLine("#c") == "WHO #c");
+
+    // A client's own WHOX (the E2EE roster probe) is answered to it, and
+    // the engine's sweep queued behind it stays private.
+    {
+        auto t = make();
+        t[0].processLine(":s 005 me WHOX :are supported");
+        t[0].sendRaw("WHO #c %na", true);
+        t[0].sendRaw(t[0].whoLine("#c"));
+        foreach (l; [":s 354 me bob acct", ":s 354 me carol 0", ":s 315 me #c :End of /WHO list.",
+                     ":s 354 me 152 #c u h dave H dacct :Dave", ":s 315 me #c :End of /WHO list."])
+            t[0].processLine(l);
+        auto got = drain(t);
+        assert(got.count!(e => e.command == "354") == 2, "the client's rows only");
+        assert(got.count!(e => e.command == "315") == 1, "the client's terminator only");
+        assert(t[0].getAccounts()["bob"] == "acct");
+        assert(("carol" in t[0].getAccounts()) is null);
+        assert(t[0].getAccounts()["dave"] == "dacct");
+        assert(t[0].pendingWhos.length == 0);
+    }
+    // Plain WHO: 352 rows follow the same ownership.
+    {
+        auto t = make();
+        t[0].sendRaw("WHO #c");
+        t[0].sendRaw("WHO #d", true);
+        foreach (l; [":s 352 me #c u h s bob H :0 Bob", ":s 315 me #c :End",
+                     ":s 352 me #d u h s eve H :0 Eve", ":s 315 me #D :End"])
+            t[0].processLine(l);
+        auto got = drain(t);
+        assert(got.count!(e => e.command == "352") == 1 && got.count!(e => e.command == "315") == 1);
+        assert(t[0].getRealnames()["bob"] == "Bob" && t[0].getRealnames()["eve"] == "Eve");
+    }
 
     // CHGHOST rewrites every roster entry for the nick.
     auto chg = run([":me!u@h JOIN #c", ":me!u@h JOIN #d", ":a!u@h JOIN #c", ":a!u@h JOIN #d",

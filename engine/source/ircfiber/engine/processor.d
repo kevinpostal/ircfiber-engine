@@ -89,8 +89,14 @@ void startEventProcessor(ref EngineContext ctx) {
                 // CHANNEL_LIST chunks are publish-only: they are a live
                 // reply to a /LIST request, not scrollback. Never written
                 // to Redis scrollback, Mongo, or the user stream (a 20k
-                // channel network would otherwise fill all three).
-                const bool transientList = event.command == "CHANNEL_LIST";
+                // channel network would otherwise fill all three). WHO
+                // replies (352/354/315) are the same: the connection only
+                // publishes the ones answering a client's own WHO, and a
+                // big channel's roster would otherwise land row by row in
+                // the `_server` scrollback.
+                const bool transientList = event.command == "CHANNEL_LIST"
+                    || event.command == "352" || event.command == "354"
+                    || event.command == "315";
 
                 // draft/channel-rename: move the channel's Redis scrollback
                 // and Mongo rows to the new name BEFORE this event is stored
@@ -214,6 +220,9 @@ void startEventProcessor(ref EngineContext ctx) {
                     // `accounts` map so member-list badges don't wait for
                     // the next JOIN/heartbeat.
                     || event.command == "ACCOUNT"
+                    // End of a client's WHO: a `WHO #chan %na` (the E2EE
+                    // roster probe) has filled `accounts` for the channel.
+                    || event.command == "315"
                     // draft/metadata-2: a key change republishes the
                     // `userMetadata` / `channelMetadata` maps so a
                     // reloading client sees it at once.

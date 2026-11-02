@@ -438,10 +438,10 @@ final class ConnectionManager {
         }
     }
 
-    /// Sends a raw IRC line to a network.
+    /// Sends a raw IRC line a client asked for to a network.
     void sendRaw(UUID networkId, string line) {
         if (auto client = getClient(networkId)) {
-            client.sendRaw(line);
+            client.sendRaw(line, true);
         }
     }
 
