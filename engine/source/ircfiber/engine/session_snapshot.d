@@ -94,8 +94,14 @@ struct SessionSnapshot {
     string[string] realnames;
     /// Nick → account name (extended-join / account-notify).
     string[string] accounts;
-    /// Nick → avatar URL (draft/metadata-2 `avatar` key).
-    string[string] avatars;
+    /// Nick → away message ("" = away without text).
+    string[string] away;
+    /// Nick → "1" for users flagged as bots.
+    string[string] bots;
+    /// Nick → key → value (draft/metadata-2 user keys).
+    string[string][string] userMetadata;
+    /// Lowercased channel → key → value (draft/metadata-2 channel keys).
+    string[string][string] channelMetadata;
     /// Nick → ident.
     string[string] idents;
     /// Label → sent-at unix ms (labeled-response).
@@ -104,6 +110,9 @@ struct SessionSnapshot {
     string[string] channelLatestMsgid;
     /// Lowercased channel → earliest msgid.
     string[string] channelEarliestMsgid;
+    /// Lowercased channel → server-time ms of the latest/earliest msgid.
+    long[string] channelLatestTs;
+    long[string] channelEarliestTs;
     /// Lowercased channel → chathistory fetch in flight.
     bool[string] chathistoryInFlight;
     /// True if the upstream transport is plain TCP (informational; the
@@ -182,11 +191,16 @@ Json toJSON(ref SessionSnapshot s) {
     j["channelUsers"] = stringListMapToJSON(s.channelUsers);
     j["realnames"] = stringMapToJSON(s.realnames);
     j["accounts"] = stringMapToJSON(s.accounts);
-    j["avatars"] = stringMapToJSON(s.avatars);
+    j["away"] = stringMapToJSON(s.away);
+    j["bots"] = stringMapToJSON(s.bots);
+    j["userMetadata"] = nestedStringMapToJSON(s.userMetadata);
+    j["channelMetadata"] = nestedStringMapToJSON(s.channelMetadata);
     j["idents"] = stringMapToJSON(s.idents);
     j["pendingLabels"] = longMapToJSON(s.pendingLabels);
     j["channelLatestMsgid"] = stringMapToJSON(s.channelLatestMsgid);
     j["channelEarliestMsgid"] = stringMapToJSON(s.channelEarliestMsgid);
+    j["channelLatestTs"] = longMapToJSON(s.channelLatestTs);
+    j["channelEarliestTs"] = longMapToJSON(s.channelEarliestTs);
     j["chathistoryInFlight"] = boolMapToJSON(s.chathistoryInFlight);
 
     j["egressLabel"] = s.egressLabel;
@@ -239,6 +253,26 @@ private Json stringListMapToJSON(string[][string] m) {
     auto v = Json.emptyObject;
     foreach (k, arr; m) v[k] = jsonArrayOf(arr);
     return v;
+}
+
+/// `outer → inner → value` (metadata maps) as nested JSON objects.
+Json nestedStringMapToJSON(string[string][string] m) {
+    auto v = Json.emptyObject;
+    foreach (k, inner; m) v[k] = stringMapToJSON(inner);
+    return v;
+}
+
+/// Reverse of `nestedStringMapToJSON`; tolerates any non-object shape.
+string[string][string] nestedStringMapFromJSON(Json j) {
+    string[string][string] m;
+    if (!isObj(j)) return m;
+    foreach (string k, inner; j) {
+        if (!isObj(inner)) continue;
+        string[string] row;
+        foreach (string ik, iv; inner) if (iv.type == Json.Type.string) row[ik] = iv.get!string;
+        if (row.length) m[k] = row;
+    }
+    return m;
 }
 
 private string str(Json j) { return j.type == Json.Type.string ? j.get!string : ""; }
@@ -315,11 +349,16 @@ SessionSnapshot fromJSON(Json j) {
     }
     if (isObj(j["realnames"])) foreach (string k, v; j["realnames"]) s.realnames[k] = str(v);
     if (isObj(j["accounts"])) foreach (string k, v; j["accounts"]) s.accounts[k] = str(v);
-    if (isObj(j["avatars"])) foreach (string k, v; j["avatars"]) s.avatars[k] = str(v);
+    if (isObj(j["away"])) foreach (string k, v; j["away"]) s.away[k] = str(v);
+    if (isObj(j["bots"])) foreach (string k, v; j["bots"]) s.bots[k] = str(v);
+    s.userMetadata = nestedStringMapFromJSON(j["userMetadata"]);
+    s.channelMetadata = nestedStringMapFromJSON(j["channelMetadata"]);
     if (isObj(j["idents"])) foreach (string k, v; j["idents"]) s.idents[k] = str(v);
     if (isObj(j["pendingLabels"])) foreach (string k, v; j["pendingLabels"]) s.pendingLabels[k] = integer(v);
     if (isObj(j["channelLatestMsgid"])) foreach (string k, v; j["channelLatestMsgid"]) s.channelLatestMsgid[k] = str(v);
     if (isObj(j["channelEarliestMsgid"])) foreach (string k, v; j["channelEarliestMsgid"]) s.channelEarliestMsgid[k] = str(v);
+    if (isObj(j["channelLatestTs"])) foreach (string k, v; j["channelLatestTs"]) s.channelLatestTs[k] = integer(v);
+    if (isObj(j["channelEarliestTs"])) foreach (string k, v; j["channelEarliestTs"]) s.channelEarliestTs[k] = integer(v);
     if (isObj(j["chathistoryInFlight"])) foreach (string k, v; j["chathistoryInFlight"]) s.chathistoryInFlight[k] = boolean(v);
 
     s.egressLabel = str(j["egressLabel"]);

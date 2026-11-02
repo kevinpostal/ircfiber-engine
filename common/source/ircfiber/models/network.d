@@ -187,6 +187,12 @@ struct NetworkConfig {
     /// sync so the engine can resolve the effective avatar without a
     /// round trip to Mongo.
     string defaultAvatarUrl = "";
+    /// Denormalized copy of the owner's profile metadata (`PROFILE_KEYS`
+    /// from `ircfiber.metadata`), kept in sync like `defaultAvatarUrl` so
+    /// the engine can publish it on connect without a Mongo round trip.
+    string[string] profileMetadata;
+    /// Persisted MONITOR list; replayed by the engine after every reconnect.
+    string[] monitoredNicks;
     /// Avatar actually published: the override if set, else the default.
     string effectiveAvatarUrl() const @safe pure nothrow {
         return avatarUrl.length ? avatarUrl : defaultAvatarUrl;
@@ -217,9 +223,49 @@ struct NetworkConfig {
             "autoJoinDelaySeconds": Json(autoJoinDelaySeconds),
             "egressNodeId": Json(egressNodeId),
             "avatarUrl": Json(avatarUrl),
-            "defaultAvatarUrl": Json(defaultAvatarUrl)
+            "defaultAvatarUrl": Json(defaultAvatarUrl),
+            "profileMetadata": serializeToJson(profileMetadata),
+            "monitoredNicks": serializeToJson(monitoredNicks)
         ]);
     }
+}
+
+/// Field key half used in `irc:lastseen`: "_server"/"" unchanged;
+/// name[0]=='#' → toLower; anything else → RFC 1459 fold (A-Z→a-z, [→{,
+/// ]→}, \→|, ^→~). Mirrors the frontend's `normalizeChannelName`
+/// (`site/frontend/src/lib/utils.ts`) exactly — including its `^`→`~`
+/// direction — so web, bouncer and engine write identical fields.
+string lastSeenBufferKey(string name) @safe pure nothrow {
+    if (name.length == 0 || name == "_server") return name;
+    if (name[0] == '#') {
+        try return toLower(name);
+        catch (Exception) {
+            // Invalid UTF-8: fall back to an ASCII-only lowercase.
+        }
+        auto lowered = appender!string();
+        foreach (char c; name) lowered.put((c >= 'A' && c <= 'Z') ? cast(char)(c + 32) : c);
+        return lowered.data;
+    }
+    auto folded = appender!string();
+    foreach (char c; name) {
+        if (c >= 'A' && c <= 'Z') folded.put(cast(char)(c + 32));
+        else if (c == '[') folded.put('{');
+        else if (c == ']') folded.put('}');
+        else if (c == '\\') folded.put('|');
+        else if (c == '^') folded.put('~');
+        else folded.put(c);
+    }
+    return folded.data;
+}
+
+@("lastSeenBufferKey mirrors the frontend normalizeChannelName")
+unittest {
+    assert(lastSeenBufferKey("#Chan") == "#chan");
+    assert(lastSeenBufferKey("Nick[x]") == "nick{x}");
+    assert(lastSeenBufferKey("A\\B^") == "a|b~");
+    assert(lastSeenBufferKey("#[Foo]") == "#[foo]");
+    assert(lastSeenBufferKey("_server") == "_server");
+    assert(lastSeenBufferKey("") == "");
 }
 
 /// Network state
@@ -263,6 +309,8 @@ unittest {
     assert(json["tls"].get!string == "required");
     assert(json["nick"].get!string == "testnick");
     assert(json["autoJoinDelaySeconds"].get!int == 6);
+    assert(json["profileMetadata"].type == Json.Type.object);
+    assert(json["monitoredNicks"].type == Json.Type.array);
 }
 
 @("sanitizeIdent keeps ident-safe bytes and caps length")

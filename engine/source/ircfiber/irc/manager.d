@@ -338,9 +338,34 @@ final class ConnectionManager {
         return null;
     }
 
-    string[string] getAvatars(UUID networkId) {
+    /// Nick → away message ("" = away without text); absent = present.
+    string[string] getAway(UUID networkId) {
         if (auto client = getClient(networkId)) {
-            return client.getAvatars;
+            return client.getAway;
+        }
+        return null;
+    }
+
+    /// Nick → "1" for users flagged as bots.
+    string[string] getBots(UUID networkId) {
+        if (auto client = getClient(networkId)) {
+            return client.getBots;
+        }
+        return null;
+    }
+
+    /// draft/metadata-2 user keys: nick → key → value.
+    string[string][string] getUserMetadata(UUID networkId) {
+        if (auto client = getClient(networkId)) {
+            return client.getUserMetadata;
+        }
+        return null;
+    }
+
+    /// draft/metadata-2 channel keys: lowercase channel → key → value.
+    string[string][string] getChannelMetadata(UUID networkId) {
+        if (auto client = getClient(networkId)) {
+            return client.getChannelMetadata;
         }
         return null;
     }
@@ -388,6 +413,14 @@ final class ConnectionManager {
                             string[string] tags = null) {
         if (auto client = getClient(networkId)) {
             client.sendLabeledMessage(target, text, label, tags);
+        }
+    }
+
+    /// Pushes a read marker upstream (draft/read-marker); no-op without
+    /// the cap or a live connection.
+    void sendMarkRead(UUID networkId, string target, long timestampMs) {
+        if (auto client = getClient(networkId)) {
+            client.sendMarkRead(target, timestampMs);
         }
     }
 

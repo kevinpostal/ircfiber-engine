@@ -92,6 +92,23 @@ void startEventProcessor(ref EngineContext ctx) {
                 // channel network would otherwise fill all three).
                 const bool transientList = event.command == "CHANNEL_LIST";
 
+                // draft/channel-rename: move the channel's Redis scrollback
+                // and Mongo rows to the new name BEFORE this event is stored
+                // under it, so history follows the rename. Same best-effort
+                // shape as the NICK-follow rename below: storage must never
+                // break the loop.
+                if (event.command == "RENAME") {
+                    try {
+                        auto rp = event.getParams();
+                        if (rp.length >= 2 && rp[0].length > 0 && rp[1].length > 0) {
+                            ctx.bufferManager.renameBuffer(serverId, event.networkId, rp[0], rp[1]);
+                            ctx.messageRepo.renameChannel(serverId, event.networkId, rp[0], rp[1]);
+                        }
+                    } catch (Exception e) {
+                        logWarn("RENAME storage rename failed: %s", e.msg);
+                    }
+                }
+
                 // Store buffer with server namespace (prevents ID collision).
                 // The buffer is the source of truth for the _server
                 // channel scrollback; the MongoDB write below makes it
@@ -197,9 +214,16 @@ void startEventProcessor(ref EngineContext ctx) {
                     // `accounts` map so member-list badges don't wait for
                     // the next JOIN/heartbeat.
                     || event.command == "ACCOUNT"
-                    // draft/metadata-2: an avatar change republishes the
-                    // `avatars` map so a reloading client sees it at once.
+                    // draft/metadata-2: a key change republishes the
+                    // `userMetadata` / `channelMetadata` maps so a
+                    // reloading client sees it at once.
                     || event.command == "METADATA"
+                    // Member state the snapshot carries (away, host,
+                    // realname, caps, renamed channel, MONITOR status).
+                    || event.command == "AWAY" || event.command == "CHGHOST"
+                    || event.command == "SETNAME" || event.command == "CAP"
+                    || event.command == "RENAME"
+                    || event.command == "730" || event.command == "731"
                     // W1-T01: CONNECTION_RETRY_STATUS + CONNECTION_FAIL
                     // are the synthetic events that carry structured
                     // retry/fail payloads to the frontend. Writing a
@@ -249,7 +273,8 @@ void startEventProcessor(ref EngineContext ctx) {
                 }
 
                 // Persist autoJoinChannels changes to MongoDB when we join/part/kick
-                if (foundNet && (event.command == "JOIN" || event.command == "PART" || event.command == "KICK")) {
+                if (foundNet && (event.command == "JOIN" || event.command == "PART" || event.command == "KICK"
+                                 || event.command == "RENAME")) {
                     auto client = ctx.connManager.getClient(matchedNet.config.id);
                     if (client !is null) {
                         bool isOwnEvent = false;
@@ -262,6 +287,9 @@ void startEventProcessor(ref EngineContext ctx) {
                             if (params.length >= 2 && params[1] == client.getCurrentNick) {
                                 isOwnEvent = true;
                             }
+                        } else if (event.command == "RENAME") {
+                            // Whoever renamed it, our autojoin list followed.
+                            isOwnEvent = true;
                         }
                         if (isOwnEvent) {
                             runTask(() nothrow {

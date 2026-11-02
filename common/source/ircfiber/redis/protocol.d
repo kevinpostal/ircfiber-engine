@@ -559,8 +559,14 @@ struct NetworkStateSnapshot {
     Json realnames;
     /// extended-join account cache: nick → account name
     Json accounts;
-    /// IRCv3 draft/metadata-2 avatar cache: nick → avatar URL
-    Json avatars;
+    /// IRCv3 draft/metadata-2 user cache: nick → {key: value}
+    Json userMetadata;
+    /// IRCv3 draft/metadata-2 channel cache: lowercased channel → {key: value}
+    Json channelMetadata;
+    /// Away cache: nick → away message (`""` = away with no text)
+    Json away;
+    /// Bot-mode cache: array of nicks
+    Json bots;
     /// Ident cache from userhost-in-names: nick → ident
     Json idents;
     /// The owner user identifier
@@ -656,7 +662,10 @@ struct NetworkStateSnapshot {
         if (users.type != Json.Type.undefined) j["users"] = users;
         if (realnames.type != Json.Type.undefined) j["realnames"] = realnames;
         if (accounts.type != Json.Type.undefined) j["accounts"] = accounts;
-        if (avatars.type != Json.Type.undefined) j["avatars"] = avatars;
+        if (userMetadata.type != Json.Type.undefined) j["userMetadata"] = userMetadata;
+        if (channelMetadata.type != Json.Type.undefined) j["channelMetadata"] = channelMetadata;
+        if (away.type != Json.Type.undefined) j["away"] = away;
+        if (bots.type != Json.Type.undefined) j["bots"] = bots;
         if (idents.type != Json.Type.undefined) j["idents"] = idents;
         if (ownerId.length) j["ownerId"] = Json(ownerId);
         if (serverId.length) j["serverId"] = Json(serverId);
@@ -728,7 +737,10 @@ struct NetworkStateSnapshot {
         if (j["users"].type != Json.Type.undefined) s.users = j["users"];
         if (j["realnames"].type != Json.Type.undefined) s.realnames = j["realnames"];
         if (j["accounts"].type != Json.Type.undefined) s.accounts = j["accounts"];
-        if (j["avatars"].type != Json.Type.undefined) s.avatars = j["avatars"];
+        if (j["userMetadata"].type != Json.Type.undefined) s.userMetadata = j["userMetadata"];
+        if (j["channelMetadata"].type != Json.Type.undefined) s.channelMetadata = j["channelMetadata"];
+        if (j["away"].type != Json.Type.undefined) s.away = j["away"];
+        if (j["bots"].type != Json.Type.undefined) s.bots = j["bots"];
         if (j["idents"].type != Json.Type.undefined) s.idents = j["idents"];
         if (j["ownerId"].type != Json.Type.undefined) s.ownerId = j["ownerId"].get!string;
         if (j["serverId"].type != Json.Type.undefined) s.serverId = j["serverId"].get!string;

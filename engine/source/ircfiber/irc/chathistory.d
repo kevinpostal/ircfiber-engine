@@ -106,20 +106,52 @@ struct ChathistoryPayload {
 }
 
 /// Parses a `channel:command:refMsgid:limit` payload into a `ChathistoryPayload`.
+/// Channel and command end at the first two colons and the limit follows
+/// the last one; everything in between is the reference, so a
+/// `timestamp=…` selector (which contains colons) survives intact.
 ChathistoryPayload parseChathistoryPayload(string text) @safe {
+    import std.string : indexOf, lastIndexOf;
     ChathistoryPayload p;
-    string[] parts;
-    size_t prev = 0;
-    foreach (i, ch; text) {
-        if (ch == ':') { parts ~= text[prev .. i]; prev = i + 1; }
+    const c1 = text.indexOf(':');
+    if (c1 < 0) return p;
+    const c2r = text[c1 + 1 .. $].indexOf(':');
+    if (c2r < 0) return p;
+    const c2 = c1 + 1 + c2r;
+    const rest = text[c2 + 1 .. $];
+    p.channel = text[0 .. c1];
+    p.command = text[c1 + 1 .. c2];
+    const last = rest.lastIndexOf(':');
+    if (last < 0) {
+        p.refMsgid = rest;
+        p.limit = 100;
+    } else {
+        p.refMsgid = rest[0 .. last];
+        p.limit = parseLimit(rest[last + 1 .. $]);
     }
-    parts ~= text[prev .. $];
-    if (parts.length < 3) return p;
-    p.channel = parts[0];
-    p.command = parts[1];
-    p.refMsgid = parts[2];
-    p.limit    = parts.length >= 4 ? parseLimit(parts[3]) : 100;
     return p;
+}
+
+/// `ms` (unix milliseconds) as an IRCv3 server-time / `timestamp=` value:
+/// `YYYY-MM-DDThh:mm:ss.sssZ`.
+string isoTimestampMs(long ms) @safe {
+    import std.datetime.systime : SysTime;
+    import std.datetime.timezone : UTC;
+    import std.format : format;
+    const t = SysTime.fromUnixTime(ms / 1000, UTC());
+    return format("%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+        t.year, cast(int) t.month, t.day, t.hour, t.minute, t.second, ms % 1000);
+}
+
+/// Unix milliseconds of an ISO 8601 / server-time value; 0 when unparsable.
+long parseIsoTimestampMs(string s) @safe {
+    import std.datetime.systime : SysTime;
+    if (s.length == 0) return 0;
+    try {
+        auto st = SysTime.fromISOExtString(s);
+        return st.toUnixTime!long * 1000 + st.fracSecs.total!"msecs";
+    } catch (Exception) {
+        return 0;
+    }
 }
 
 private int parseLimit(string s) @safe {
@@ -270,4 +302,29 @@ unittest {
 unittest {
     const p = parseChathistoryPayload("only:two");
     assert(p.channel.length == 0, p.channel);
+}
+
+@("parseChathistoryPayload keeps colons inside a timestamp selector")
+unittest {
+    const p = parseChathistoryPayload("#c:BEFORE:timestamp=2026-09-07T03:00:00.000Z:50");
+    assert(p.channel == "#c", p.channel);
+    assert(p.command == "BEFORE", p.command);
+    assert(p.refMsgid == "timestamp=2026-09-07T03:00:00.000Z", p.refMsgid);
+    assert(p.limit == 50, p.limit.to!string);
+    const b = parseChathistoryPayload(
+        "#c:BETWEEN:timestamp=2026-09-01T00:00:00.000Z,timestamp=2026-09-07T00:00:00.000Z:20");
+    assert(b.refMsgid == "timestamp=2026-09-01T00:00:00.000Z,timestamp=2026-09-07T00:00:00.000Z", b.refMsgid);
+    assert(b.limit == 20, b.limit.to!string);
+}
+
+@("isoTimestampMs / parseIsoTimestampMs round-trip at millisecond precision")
+unittest {
+    assert(isoTimestampMs(0) == "1970-01-01T00:00:00.000Z", isoTimestampMs(0));
+    const ms = 1_788_750_000_123L;
+    const s = isoTimestampMs(ms);
+    assert(s == "2026-09-07T03:00:00.123Z", s);
+    assert(parseIsoTimestampMs(s) == ms);
+    assert(parseIsoTimestampMs("2026-09-07T03:00:00Z") == ms - 123);
+    assert(parseIsoTimestampMs("garbage") == 0);
+    assert(parseIsoTimestampMs("") == 0);
 }

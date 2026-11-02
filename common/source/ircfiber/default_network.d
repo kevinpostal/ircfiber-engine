@@ -187,7 +187,9 @@ NetworkConfig ensureDefaultFiberNetwork(
     }
 
     auto cfg = buildDefaultFiberNetwork(user);
-    cfg.defaultAvatarUrl = new UserRepository().getAvatarUrl(user.id);
+    auto userRepo = new UserRepository();
+    cfg.defaultAvatarUrl = userRepo.getAvatarUrl(user.id);
+    cfg.profileMetadata = userRepo.getProfile(user.id);
     networkRepo.save(cfg, user.id);
 
     // Race guard: concurrent logins can both pass the `existing` check

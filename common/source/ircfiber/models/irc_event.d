@@ -147,10 +147,23 @@ struct IRCRawEvent {
         auto replyTag = getTag("+reply");
         if (!replyTag.length) replyTag = getTag("+draft/reply"); // pre-ratification clients
         if (replyTag.length) j["rp"] = Json(replyTag);
-        auto reactTag = getTag("+draft/react");
+        // Ratified `+react`/`+unreact` first, pre-ratification `+draft/…`
+        // as the fallback.
+        auto reactTag = getTag("+react");
+        if (!reactTag.length) reactTag = getTag("+draft/react");
         if (reactTag.length) j["rx"] = Json(reactTag);
-        auto unreactTag = getTag("+draft/unreact");
+        auto unreactTag = getTag("+unreact");
+        if (!unreactTag.length) unreactTag = getTag("+draft/unreact");
         if (unreactTag.length) j["ux"] = Json(unreactTag);
+        // IRCv3 bot-mode `bot` tag (value-less, so presence is the signal).
+        if (hasTag("bot")) j["b"] = Json(true);
+        // draft/oper-tag: present = sender is an oper; the value (oper
+        // account name) may be empty.
+        if (hasTag("draft/oper")) j["op"] = Json(getTag("draft/oper"));
+        // `+channel-context`: the channel a private message relates to.
+        auto channelContext = getTag("+channel-context");
+        if (!channelContext.length) channelContext = getTag("+draft/channel-context");
+        if (channelContext.length) j["cc"] = Json(channelContext);
         // IRCv3 account-tag: per-message author account name. Shipped so
         // the frontend can render account identity without a WHOIS round
         // trip, and so the bouncer can re-emit `account=` to clients that
@@ -233,6 +246,16 @@ struct IRCRawEvent {
             }
         } catch (Exception) {}
         return "";
+    }
+
+    /// Whether a tag is present at all. Value-less tags (e.g. `bot`) make
+    /// `getTag` return `""`, so presence needs this.
+    bool hasTag(string key) const @safe {
+        try {
+            auto tags = parseJsonString(tagsJson);
+            return tags.type == Json.Type.object && (key in tags) !is null;
+        } catch (Exception) {}
+        return false;
     }
 
     /// Get the label tag (for labeled-response).
@@ -511,6 +534,48 @@ unittest {
     auto uj = unreact.toCompactJson();
     assert(uj["ux"].get!string == "\xF0\x9F\x91\x8D");
     assert(("rx" in uj) is null);
+}
+
+@("IRCRawEvent toCompactJson prefers ratified +react/+unreact over draft")
+unittest {
+    auto react = IRCRawEvent("libera", "TAGMSG");
+    react.addTag("+react", "a");
+    react.addTag("+draft/react", "b");
+    assert(react.toCompactJson()["rx"].get!string == "a");
+
+    auto unreact = IRCRawEvent("libera", "TAGMSG");
+    unreact.addTag("+unreact", "c");
+    auto uj = unreact.toCompactJson();
+    assert(uj["ux"].get!string == "c");
+    assert(("rx" in uj) is null);
+}
+
+@("IRCRawEvent hasTag detects value-less tags; compact JSON ships b/op/cc")
+unittest {
+    auto e = IRCRawEvent("libera", "PRIVMSG");
+    assert(!e.hasTag("bot"));
+    auto plain = e.toCompactJson();
+    assert(("b" in plain) is null);
+    assert(("op" in plain) is null);
+    assert(("cc" in plain) is null);
+
+    e.addTag("bot", "");
+    e.addTag("draft/oper", "");
+    e.addTag("+draft/channel-context", "#dev");
+    assert(e.hasTag("bot"));
+    assert(e.getTag("bot") == "");
+    auto j = e.toCompactJson();
+    assert(j["b"].get!bool);
+    assert(j["op"].get!string == "");
+    assert(j["cc"].get!string == "#dev");
+
+    auto e2 = IRCRawEvent("libera", "PRIVMSG");
+    e2.addTag("draft/oper", "admin");
+    e2.addTag("+channel-context", "#a");
+    e2.addTag("+draft/channel-context", "#b");
+    auto j2 = e2.toCompactJson();
+    assert(j2["op"].get!string == "admin");
+    assert(j2["cc"].get!string == "#a");
 }
 
 @("IRCRawEvent toCompactJson ships edit_of as 'eo'")

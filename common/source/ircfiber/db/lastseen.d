@@ -1,8 +1,10 @@
 module ircfiber.db.lastseen;
 
 import std.conv : to;
+import std.string : indexOf;
 import std.uuid;
 import vibe.core.log;
+import vibe.data.json;
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.redis.protocol : RedisKeys;
 
@@ -40,6 +42,17 @@ return 0`;
         return result;
     }
 
+    /// One persisted field, or 0 when it is missing or unparsable.
+    long get(UUID userId, string field) {
+        try {
+            const value = redis.getDb().hget!string(RedisKeys.lastSeen(userId.toString()), field);
+            if (value.length == 0) return 0;
+            return value.to!long;
+        } catch (Exception) {
+            return 0;
+        }
+    }
+
     /// Merges `incoming` advance-only and returns only the fields that
     /// actually changed (missing before, or strictly newer than stored).
     long[string] merge(UUID userId, long[string] incoming) {
@@ -56,6 +69,27 @@ return 0`;
         }
         return changed;
     }
+}
+
+/// `heartbeat_echo` event for the per-user pub/sub channel: the changed
+/// last-seen entries (`"<networkId>:<bufferKey>"` → unix ms) regrouped as
+/// `{type:"heartbeat_echo", seenEids:{<networkId>:{<buffer>:<ms>}}}`.
+/// Published by the WebSocket heartbeat and by the bouncer's MARKREAD so
+/// every session of the user — browser tabs and bnc clients — converges.
+Json heartbeatEchoJson(long[string] changed) {
+    auto echo = Json.emptyObject;
+    echo["type"] = Json("heartbeat_echo");
+    auto seen = Json.emptyObject;
+    foreach (field, t; changed) {
+        const sep = field.indexOf(':');
+        if (sep <= 0) continue;
+        const nid = field[0 .. sep];
+        const buf = field[sep + 1 .. $];
+        if (seen[nid].type != Json.Type.object) seen[nid] = Json.emptyObject;
+        seen[nid][buf] = Json(t);
+    }
+    echo["seenEids"] = seen;
+    return echo;
 }
 
 @("LastSeenRepository.merge is advance-only and returns only changed fields")
@@ -100,4 +134,7 @@ unittest {
     const stored = repo.load(userId);
     assert(stored["net1:#dev"] == 1000);
     assert(stored["net1:alice"] == 600);
+
+    assert(repo.get(userId, "net1:#dev") == 1000);
+    assert(repo.get(userId, "net1:missing") == 0);
 }

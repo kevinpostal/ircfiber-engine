@@ -251,13 +251,24 @@ void writeStateSnapshotForNetwork(ref EngineContext ctx, Network net, string ser
     }
     snap.accounts = accountsJson;
 
-    // Avatars from draft/metadata-2 (`METADATA <nick> avatar`)
-    auto netAvatars = ctx.connManager.getAvatars(net.config.id);
-    auto avatarsJson = Json.emptyObject;
-    if (netAvatars !is null) {
-        foreach (k, v; netAvatars) avatarsJson[k] = Json(v);
+    // draft/metadata-2 keys (`METADATA <target> <key>`): nick → {key: value}
+    // and lowercase channel → {key: value}.
+    {
+        import ircfiber.engine.session_snapshot : nestedStringMapToJSON;
+        snap.userMetadata = nestedStringMapToJSON(ctx.connManager.getUserMetadata(net.config.id));
+        snap.channelMetadata = nestedStringMapToJSON(ctx.connManager.getChannelMetadata(net.config.id));
     }
-    snap.avatars = avatarsJson;
+
+    // away-notify / WHO flags: nick → away message ("" = away, no text).
+    auto netAway = ctx.connManager.getAway(net.config.id);
+    auto awayJson = Json.emptyObject;
+    foreach (k, v; netAway) awayJson[k] = Json(v);
+    snap.away = awayJson;
+
+    // bot-mode: the nicks flagged as bots.
+    auto botsJson = Json.emptyArray;
+    foreach (k; ctx.connManager.getBots(net.config.id).byKey) botsJson ~= Json(k);
+    snap.bots = botsJson;
 
     // Idents from userhost-in-names / extended-join
     auto netIdents = ctx.connManager.getIdents(net.config.id);

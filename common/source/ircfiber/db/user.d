@@ -210,6 +210,25 @@ final class UserRepository {
         collection.updateOne(selector, update);
     }
 
+    /// Returns the user's profile metadata (`PROFILE_KEYS` from
+    /// `ircfiber.metadata` → value); empty when none is set. Kept off
+    /// `User` for the same reason as `avatarUrl`.
+    string[string] getProfile(UUID id) {
+        auto doc = collection.findOne(["id": id.toString()]);
+        if (doc.isNull) return null;
+        try return deserializeBson!(string[string])(doc["profile"]);
+        catch (Exception) return null;
+    }
+
+    /// Sets (or, with an empty map, clears) the user's profile metadata.
+    void setProfile(UUID id, string[string] profile) {
+        auto selector = Bson(["id": Bson(id.toString())]);
+        auto update = profile.length
+            ? Bson(["$set": Bson(["profile": serializeToBson(profile)])])
+            : Bson(["$unset": Bson(["profile": Bson("")])]);
+        collection.updateOne(selector, update);
+    }
+
     /// Every user that currently has a bouncer password. Admin-only (the
     /// bouncer page); the token itself is never returned.
     User[] listWithBncToken() {

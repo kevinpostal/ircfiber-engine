@@ -201,7 +201,9 @@ final class NetworkRepository {
                 "autoJoinDelaySeconds": Bson(config.autoJoinDelaySeconds),
                 "egressNodeId": Bson(config.egressNodeId),
                 "avatarUrl": Bson(config.avatarUrl),
-                "defaultAvatarUrl": Bson(config.defaultAvatarUrl)
+                "defaultAvatarUrl": Bson(config.defaultAvatarUrl),
+                "profileMetadata": serializeToBson(config.profileMetadata),
+                "monitoredNicks": Bson(config.monitoredNicks.map!(n => Bson(n)).array)
             ])
         ]);
         UpdateOptions options;
@@ -283,6 +285,8 @@ final class NetworkRepository {
             try { cfg.egressNodeId = elem["egressNodeId"].get!string; } catch (Exception) {}
             try { cfg.avatarUrl = elem["avatarUrl"].get!string; } catch (Exception) {}
             try { cfg.defaultAvatarUrl = elem["defaultAvatarUrl"].get!string; } catch (Exception) {}
+            try { cfg.profileMetadata = deserializeJson!(string[string])(elem["profileMetadata"]); } catch (Exception) {}
+            try { cfg.monitoredNicks = deserializeJson!(string[])(elem["monitoredNicks"]); } catch (Exception) {}
             result ~= cfg;
         }
         return result;
@@ -313,6 +317,8 @@ final class NetworkRepository {
         try { cfg.egressNodeId = doc["egressNodeId"].get!string; } catch (Exception) {}
         try { cfg.avatarUrl = doc["avatarUrl"].get!string; } catch (Exception) {}
         try { cfg.defaultAvatarUrl = doc["defaultAvatarUrl"].get!string; } catch (Exception) {}
+        try { cfg.profileMetadata = deserializeBson!(string[string])(doc["profileMetadata"]); } catch (Exception) {}
+        try { cfg.monitoredNicks = deserializeBson!(string[])(doc["monitoredNicks"]); } catch (Exception) {}
         try { cfg.nspass = doc["nspass"].get!string; } catch (Exception) {}
         try { cfg.commands = doc["commands"].get!string; } catch (Exception) {}
         try { cfg.serverPass = doc["serverPass"].get!string; } catch (Exception) {}

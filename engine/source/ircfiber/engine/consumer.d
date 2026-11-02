@@ -458,6 +458,11 @@ private void handleNetworkCommand(ref EngineContext ctx, string networkId, IRCCo
             }
             ctx.connManager.requestChathistory(nid, p.channel, p.command, p.refMsgid, p.limit);
             break;
+        case "markread":
+            // draft/read-marker: a web/bouncer read advanced `irc:lastseen`;
+            // push it upstream (no-op without the cap).
+            ctx.connManager.sendMarkRead(nid, cmd.target, cmd.timestampMs);
+            break;
         default:
             logWarn("Unknown network command: %s", cmd.cmd);
     }
@@ -502,6 +507,12 @@ private NetworkConfig parseNetworkConfig(Json j) {
     if (j["egressNodeId"].type == Json.Type.string) cfg.egressNodeId = j["egressNodeId"].get!string;
     if (j["avatarUrl"].type == Json.Type.string) cfg.avatarUrl = j["avatarUrl"].get!string;
     if (j["defaultAvatarUrl"].type == Json.Type.string) cfg.defaultAvatarUrl = j["defaultAvatarUrl"].get!string;
+    if (j["profileMetadata"].type == Json.Type.object)
+        foreach (string k, v; j["profileMetadata"])
+            if (v.type == Json.Type.string) cfg.profileMetadata[k] = v.get!string;
+    if (j["monitoredNicks"].type == Json.Type.array)
+        foreach (v; j["monitoredNicks"])
+            if (v.type == Json.Type.string) cfg.monitoredNicks ~= v.get!string;
     if (j["systemManaged"].type == Json.Type.bool_) cfg.systemManaged = j["systemManaged"].get!bool;
     return cfg;
 }

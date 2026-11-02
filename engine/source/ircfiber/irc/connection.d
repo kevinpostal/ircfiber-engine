@@ -23,7 +23,9 @@ import vibe.stream.operations : IOMode;
 import core.time : Duration, dur, msecs, seconds, minutes;
 
 import ircfiber.models.irc_event : IRCRawEvent;
-import ircfiber.models.network : NetworkConfig, SASLMechanism, TLSMode, normalizeChannelName;
+import ircfiber.models.network : NetworkConfig, SASLMechanism, TLSMode, normalizeChannelName, lastSeenBufferKey;
+import ircfiber.metadata : USER_METADATA_KEYS, CHANNEL_METADATA_KEYS, PROFILE_KEYS, isValidMetadataValue;
+import ircfiber.db.lastseen : LastSeenRepository, heartbeatEchoJson;
 import ircfiber.redis.protocol : RedisKeys, TlsInfo;
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.irc.reconnect : ExponentialBackoff;
@@ -111,6 +113,13 @@ private immutable string[] DESIRED_CAPS_BASE = [
     "draft/message-redaction",
     "draft/multiline",
     "draft/metadata-2",
+    "extended-monitor",
+    "no-implicit-names",
+    "draft/pre-away",
+    "draft/read-marker",
+    "draft/channel-rename",
+    "draft/extended-isupport",
+    "draft/oper-tag",
 ];
 
 private immutable string[] DESIRED_CAPS_SASL = ["sasl"];
@@ -2404,49 +2413,76 @@ unittest {
     assert(buildMonitorLine("X", "alice") is null);
 }
 
-// ── draft/metadata-2 avatars ─────────────────────────────────────────────────
-
-/// Longest avatar URL we keep from a `METADATA <nick> avatar` value.
-private enum MAX_AVATAR_URL_LENGTH = 2048;
-
-/// Whether a metadata `avatar` value is a URL the client may render:
-/// http(s) only (no `javascript:` / `data:`), bounded length.
-bool isAcceptableAvatarUrl(string value) @safe pure nothrow {
-    import std.uni : sicmp;
-    if (value.length == 0 || value.length > MAX_AVATAR_URL_LENGTH) return false;
-    return (value.length >= 7 && sicmp(value[0 .. 7], "http://") == 0)
-        || (value.length >= 8 && sicmp(value[0 .. 8], "https://") == 0);
+/// `MONITOR <verb> a,b,…` lines for `nicks`, each holding at most
+/// `maxEntries` targets (0 = unlimited, the ISUPPORT `MONITOR` value) and
+/// at most `maxBytes` bytes. Empty for no nicks.
+string[] monitorLines(string verb, const string[] nicks, size_t maxEntries, size_t maxBytes = 400) @safe pure {
+    string[] lines;
+    const head = "MONITOR " ~ verb ~ " ";
+    string cur;
+    size_t count;
+    foreach (n; nicks) {
+        if (n.length == 0) continue;
+        const full = (maxEntries > 0 && count >= maxEntries)
+            || (count > 0 && head.length + cur.length + 1 + n.length > maxBytes);
+        if (full) { lines ~= head ~ cur; cur = ""; count = 0; }
+        cur = count ? cur ~ "," ~ n : n;
+        ++count;
+    }
+    if (count) lines ~= head ~ cur;
+    return lines;
 }
 
-/// Lines that move our published `avatar` key from `oldUrl` to `newUrl`:
-/// nothing when unchanged, a SET with value, or a valueless SET to clear.
-string[] avatarCommands(string oldUrl, string newUrl) @safe pure {
-    if (oldUrl == newUrl) return [];
-    if (newUrl.length) return ["METADATA * SET avatar :" ~ newUrl];
-    return ["METADATA * SET avatar"];
-}
-
-@("isAcceptableAvatarUrl takes bounded http(s) URLs only")
+@("monitorLines chunks by entry count and line length")
 unittest {
-    assert(isAcceptableAvatarUrl("https://x/a.webp"));
-    assert(isAcceptableAvatarUrl("HTTP://x/a.webp"));
-    assert(!isAcceptableAvatarUrl(""));
-    assert(!isAcceptableAvatarUrl("javascript:alert(1)"));
-    assert(!isAcceptableAvatarUrl("data:image/png;base64,AAAA"));
-    assert(!isAcceptableAvatarUrl("https://"[0 .. 7]));
-    char[] big = new char[MAX_AVATAR_URL_LENGTH];
-    big[] = 'a';
-    big[0 .. 8] = "https://";
-    assert(isAcceptableAvatarUrl(big.idup));
-    assert(!isAcceptableAvatarUrl(big.idup ~ "a"));
+    assert(monitorLines("+", [], 0) == []);
+    assert(monitorLines("+", ["a", "b", "c"], 0) == ["MONITOR + a,b,c"]);
+    assert(monitorLines("-", ["a", "b", "c"], 2) == ["MONITOR - a,b", "MONITOR - c"]);
+    // "MONITOR + " is 10 bytes; 10 + "aaaa,bbbb" = 19 fits a 19-byte cap.
+    assert(monitorLines("+", ["aaaa", "bbbb", "cccc"], 0, 19) == ["MONITOR + aaaa,bbbb", "MONITOR + cccc"]);
 }
 
-@("avatarCommands publishes, clears, or stays quiet")
+// ── draft/metadata-2 own keys ────────────────────────────────────────────────
+// Value validation lives in `ircfiber.metadata.isValidMetadataValue`.
+
+/// Lines that move our published metadata `key` from `oldValue` to
+/// `newValue`: nothing when unchanged, a SET with value, or a valueless
+/// SET to clear.
+string[] metadataCommands(string key, string oldValue, string newValue) @safe pure {
+    if (oldValue == newValue) return [];
+    if (newValue.length) return ["METADATA * SET " ~ key ~ " :" ~ newValue];
+    return ["METADATA * SET " ~ key];
+}
+
+/// Moves `m[from]` to `m[to]` (no-op when `from` is absent or equal).
+void moveKey(V)(ref V[string] m, string from, string to) {
+    if (from == to) return;
+    if (auto p = from in m) {
+        auto v = *p;
+        m.remove(from);
+        m[to] = v;
+    }
+}
+
+/// Deep copy of an `outer → key → value` metadata map (`.dup` alone would
+/// share the inner maps).
+string[string][string] dupNested(const string[string][string] m) @safe pure nothrow {
+    string[string][string] r;
+    foreach (k, inner; m) {
+        string[string] row;
+        foreach (ik, iv; inner) row[ik] = iv;
+        r[k] = row;
+    }
+    return r;
+}
+
+@("metadataCommands publishes, clears, or stays quiet")
 unittest {
-    assert(avatarCommands("", "https://u") == ["METADATA * SET avatar :https://u"]);
-    assert(avatarCommands("https://u", "") == ["METADATA * SET avatar"]);
-    assert(avatarCommands("https://u", "https://u") == []);
-    assert(avatarCommands("", "") == []);
+    assert(metadataCommands("avatar", "", "https://u") == ["METADATA * SET avatar :https://u"]);
+    assert(metadataCommands("avatar", "https://u", "") == ["METADATA * SET avatar"]);
+    assert(metadataCommands("avatar", "https://u", "https://u") == []);
+    assert(metadataCommands("avatar", "", "") == []);
+    assert(metadataCommands("pronouns", "", "they/them") == ["METADATA * SET pronouns :they/them"]);
 }
 
 // ── Lag probe + TLS detail helpers ───────────────────────────────────────────
@@ -2675,6 +2711,14 @@ private void applyIsupport(
     ref string[string] map,
     string token,
 ) {
+    // `-TOKEN` withdraws a previously advertised token (RFC 2812 / modern
+    // 005, also how draft/extended-isupport updates arrive). The 005
+    // callers skip params[0] already, so a pre-registration `005 *` from
+    // the ISUPPORT command lands here unchanged.
+    if (token.length > 1 && token[0] == '-') {
+        map.remove(toUpper(token[1 .. $]));
+        return;
+    }
     auto eq = token.indexOf("=");
     string key = eq >= 0 ? token[0 .. eq] : token;
     string val = eq >= 0 ? token[eq + 1 .. $] : "";
@@ -3180,9 +3224,17 @@ final class PersistentIRCClient {
         bool[string]        realnameProbed;
         // IRCv3 extended-join / account-notify: nick → account name (or "*" for none)
         string[string]      accounts;
-        // draft/metadata-2: nick → avatar URL (`METADATA <nick> avatar`).
+        // away-notify / WHO flags: nick → away message ("" = away without
+        // text). Absent = present. Moves on NICK, dropped on QUIT.
+        string[string]      away;
+        // bot-mode (WHO flag / 335): nick → "1". Same lifecycle as `away`.
+        string[string]      bots;
+        // draft/metadata-2: nick → key → value for USER_METADATA_KEYS.
         // Same lifecycle as `accounts`: moves on NICK, dropped on QUIT.
-        string[string]      avatars;
+        string[string][string] userMetadata;
+        // draft/metadata-2: lowercase channel → key → value for
+        // CHANNEL_METADATA_KEYS. Dropped with the channel, moved on RENAME.
+        string[string][string] channelMetadata;
         // Our services account from 900 RPL_LOGGEDIN; keys our entry in the
         // public-avatar registry (`RedisKeys.publicAvatars`).
         string              servicesAccount;
@@ -3218,6 +3270,15 @@ final class PersistentIRCClient {
         /// them via CAP DEL + CAP NEW when we move between its
         /// known-users / unknown-users groups.
         string[string]      capValues;
+        /// CAP REQ lines sent during registration that are still waiting
+        /// for their ACK/NAK; `CAP END` goes out when this reaches zero.
+        int                 capReqOutstanding;
+        /// Registration handshake state (reset by `performRegistration`):
+        /// SASL finished (or not configured), `CAP END` already sent, and
+        /// the cap names the server offered in `CAP LS`.
+        bool                saslDone;
+        bool                capEndSent;
+        string[]            serverCaps;
 
         // ── Outbound flood pacing ────────────────────────────────────────
         /// Local model of the server's fake-lag accumulator. See
@@ -3285,10 +3346,22 @@ final class PersistentIRCClient {
         /// query is issued at most once per channel per connection.
         bool[string]        chanFloodProbed;
 
-        // IRCv3 BATCH tracking
-        string              activeBatchRef;
-        string              activeBatchType;
-        string              activeBatchTarget;
+        // IRCv3 BATCH tracking, keyed by reference tag. Batches nest
+        // (labeled-response around chathistory), so every open batch is
+        // tracked; a line's own `batch` tag picks its entry. Multiline
+        // batches buffer their lines here until `BATCH -ref`.
+        static struct OpenBatch {
+            string type;
+            string target;
+            string label;
+            string[] lines;
+            bool[] concat;
+            string cmd;
+            IRCRawEvent first;
+            /// Ref of the batch this one is nested in ("" = top level).
+            string parent;
+        }
+        OpenBatch[string]   openBatches;
 
         // ISUPPORT features
         ServerFeatures      serverFeatures;
@@ -3330,6 +3403,10 @@ final class PersistentIRCClient {
         // (including those arriving inside a chathistory batch).
         string[string]      channelLatestMsgid;  // keyed by lowercase channel
         string[string]      channelEarliestMsgid;
+        /// server-time (unix ms) of the message behind each msgid above.
+        /// Msgids are opaque, so these timestamps decide which is newer.
+        long[string]        channelLatestTs;     // keyed by lowercase channel
+        long[string]        channelEarliestTs;
 
         // Pending chathistory request bookkeeping. Tracks in-flight LATEST /
         // BEFORE / AFTER / AROUND requests so we can throttle and so the
@@ -3707,11 +3784,16 @@ final class PersistentIRCClient {
         foreach (k, v; channelUsers) s.channelUsers[k] = v.dup;
         s.realnames = realnames.dup;
         s.accounts = accounts.dup;
-        s.avatars = avatars.dup;
+        s.away = away.dup;
+        s.bots = bots.dup;
+        s.userMetadata = dupNested(userMetadata);
+        s.channelMetadata = dupNested(channelMetadata);
         s.idents = idents.dup;
         s.pendingLabels = pendingLabels.dup;
         s.channelLatestMsgid = channelLatestMsgid.dup;
         s.channelEarliestMsgid = channelEarliestMsgid.dup;
+        s.channelLatestTs = channelLatestTs.dup;
+        s.channelEarliestTs = channelEarliestTs.dup;
         s.chathistoryInFlight = chathistoryInFlight.dup;
         s.transportWasPlain = !tlsInfoValid;
         s.wasConnected = (state == ConnectionState.connected);
@@ -3797,11 +3879,16 @@ final class PersistentIRCClient {
         foreach (k, v; s.channelUsers) channelUsers[k] = v.dup;
         realnames = s.realnames.dup;
         accounts = s.accounts.dup;
-        avatars = s.avatars.dup;
+        away = s.away.dup;
+        bots = s.bots.dup;
+        userMetadata = dupNested(s.userMetadata);
+        channelMetadata = dupNested(s.channelMetadata);
         idents = s.idents.dup;
         pendingLabels = s.pendingLabels.dup;
         channelLatestMsgid = s.channelLatestMsgid.dup;
         channelEarliestMsgid = s.channelEarliestMsgid.dup;
+        channelLatestTs = s.channelLatestTs.dup;
+        channelEarliestTs = s.channelEarliestTs.dup;
         chathistoryInFlight = s.chathistoryInFlight.dup;
         serverFeatures.network = s.serverFeatures.network;
         serverFeatures.prefix = s.serverFeatures.prefix;
@@ -3986,7 +4073,10 @@ final class PersistentIRCClient {
     @property string[][string] getChannelUsers()       { return channelUsers; }
     @property string[string]  getRealnames()          { return realnames; }
     @property string[string]  getAccounts()           { return accounts; }
-    @property string[string]  getAvatars()            { return avatars; }
+    @property string[string]  getAway()               { return away; }
+    @property string[string]  getBots()               { return bots; }
+    @property string[string][string] getUserMetadata()    { return userMetadata; }
+    @property string[string][string] getChannelMetadata() { return channelMetadata; }
     @property string[string]  getIdents()             { return idents; }
     @property string[]        getQueryBuffers()         { return queryBuffers.dup; }
     @property ServerFeatures  getServerFeatures()      { return serverFeatures; }
@@ -4378,17 +4468,33 @@ final class PersistentIRCClient {
         return result;
     }
 
-    /// Updates the network configuration.
+    /// Updates the network configuration. Our own metadata keys and the
+    /// MONITOR list are diffed and pushed live; while disconnected nothing
+    /// goes out, the next registration publishes whatever is current then.
     void updateConfig(NetworkConfig cfg) {
         const oldAvatar = config.effectiveAvatarUrl();
+        auto oldProfile = config.profileMetadata.dup;
+        auto oldMonitor = config.monitoredNicks.dup;
         config = cfg; ipv6BindResolved = false; ipv6BindCache = "";
         const newAvatar = config.effectiveAvatarUrl();
-        if (oldAvatar == newAvatar) return;
-        // While disconnected nothing goes out: the next registration
-        // publishes whatever URL is current then.
-        if (state == ConnectionState.connected && hasCap("draft/metadata-2"))
-            foreach (l; avatarCommands(oldAvatar, newAvatar)) sendRaw(l);
-        syncPublicAvatar();
+        const live = state == ConnectionState.connected;
+        if (live && hasCap("draft/metadata-2")) {
+            foreach (l; metadataCommands("avatar", oldAvatar, newAvatar)) sendRaw(l);
+            foreach (k; PROFILE_KEYS)
+                foreach (l; metadataCommands(k, oldProfile.get(k, ""), config.profileMetadata.get(k, "")))
+                    sendRaw(l);
+        }
+        if (live && monitorSupported()) {
+            bool[string] before, after;
+            foreach (n; oldMonitor) before[foldNick(n)] = true;
+            foreach (n; config.monitoredNicks) after[foldNick(n)] = true;
+            string[] removed, added;
+            foreach (n; oldMonitor) if (!(foldNick(n) in after)) removed ~= n;
+            foreach (n; config.monitoredNicks) if (!(foldNick(n) in before)) added ~= n;
+            foreach (l; monitorLines("-", removed, monitorLimit())) sendRaw(l);
+            foreach (l; monitorLines("+", added, monitorLimit())) sendRaw(l);
+        }
+        if (oldAvatar != newAvatar) syncPublicAvatar();
     }
 
     /// Owner UUID (for per-user IPv6). Exposed for the manager / session snapshot.
@@ -5237,9 +5343,8 @@ final class PersistentIRCClient {
         // per TCP connection, so it dies with the old socket; the same goes
         // for in-flight CHATHISTORY flags the dead connection can never
         // answer (they would suppress fresh backfills forever).
-        activeBatchRef = "";
-        activeBatchType = "";
-        activeBatchTarget = "";
+        openBatches = null;
+        capReqOutstanding = 0;
         chathistoryInFlight.clear();
         serverFeatures = ServerFeatures.init;
         // Drop any tokens leftover from the previous connection attempt;
@@ -5457,9 +5562,6 @@ final class PersistentIRCClient {
     // ── Registration (CAP + NICK + USER + SASL) ───────────────────────────────
 
     private void performRegistration() {
-        // Build cap list
-        string[] desiredCaps = desiredCapList();
-
         // WEBIRC before anything else, and only to irc.ircfiber.com: the ircd
         // swaps this session's address for the user's own (and re-matches
         // the connect class on the `webirc="ircfiber"` constraint) before
@@ -5529,11 +5631,12 @@ final class PersistentIRCClient {
         string partial;
         bool welcomed    = false; // 001 received (for timeout warning)
         bool motdDone    = false; // 376/422 received (end of MOTD)
-        bool saslDone    = (config.sasl == SASLMechanism.none);
-        bool capEndSent  = false;
-        bool capReqSent  = false;
-        bool capLsDone   = false;
-        string[] serverCaps;
+        // CAP handshake state lives on the client so `handleCapLine` (also
+        // used after registration) can drive it.
+        saslDone    = (config.sasl == SASLMechanism.none);
+        capEndSent  = false;
+        serverCaps  = null;
+        capReqOutstanding = 0;
 
         // SCRAM state (may be null)
         ScramSha256Client* scram = null;
@@ -5692,7 +5795,10 @@ final class PersistentIRCClient {
                             // nothing renamed the old entry and `Zodiac`
                             // sat in #tclmafia beside `Zodiac_` for hours.
                             channelUsers = null;
-                            avatars = null;
+                            userMetadata = null;
+                            channelMetadata = null;
+                            away = null;
+                            bots = null;
                             namesBurst = null;
                             namesBurstAt = null;
                             // Registration completed. Reset the fallback
@@ -5878,197 +5984,9 @@ final class PersistentIRCClient {
                             break;
                         }
 
-                        // ── CAP LS / ACK / NAK ────────────────────────────────
+                        // ── CAP LS / ACK / NAK / NEW / DEL ────────────────────
                         case "CAP":
-                            auto params = evt.getParams();
-                            if (params.length < 2) break;
-
-                            // params[0] = our nick (or *), params[1] = subcommand
-                            const sub = params.length >= 2 ? params[1] : "";
-                            auto capLine = params.length >= 3 ? params[$ - 1] : "";
-
-                            if (sub == "LS") {
-                                // Accumulate caps (multi-line uses trailing '*')
-                                const bool isMultiline = (params.length >= 3 && params[2] == "*");
-                                recordCapValues(capLine);
-                                foreach (cap; capLine.split(" ")) {
-                                    auto eqPos = cap.indexOf("=");
-                                    auto capName = eqPos >= 0 ? cap[0 .. eqPos] : cap;
-                                    if (capName.length > 0) serverCaps ~= capName;
-                                }
-                                if (!isMultiline) {
-                                    capLsDone = true;
-                                    // Request only caps we want AND the server offers
-                                    string[] toRequest;
-                                    foreach (desired; desiredCaps) {
-                                        if (serverCaps.canFind(desired)) toRequest ~= desired;
-                                    }
-                                    // ── ngIRCd workaround ───────────────────────────────
-                                    // ngIRCd 27 only offers `multi-prefix` and stalls if
-                                    // the client sends `CAP REQ :multi-prefix` AFTER it
-                                    // has already sent NICK/USER (which the engine does
-                                    // immediately after CAP LS). Manual test:
-                                    //   CAP LS + NICK+USER, LS=multi-prefix, REQ -> ACK but no 001
-                                    //   CAP LS + NICK+USER, LS=multi-prefix, END -> immediate 001 + MOTD
-                                    // So when the server's entire cap list is a single
-                                    // `multi-prefix` entry, skip the REQ and go straight
-                                    // to CAP END. The cap is non-essential for local
-                                    // testing and this avoids a 30s registration timeout
-                                    // that wedges the LocalIRCD network.
-                                    const bool singleMultiPrefixOnly = serverCaps.length == 1
-                                        && serverCaps[0] == "multi-prefix"
-                                        && toRequest.length == 1
-                                        && toRequest[0] == "multi-prefix";
-                                    if (singleMultiPrefixOnly) {
-                                        logJsonMap("info", "connection",
-                                            "Skipping CAP REQ for single multi-prefix (ngIRCd workaround)",
-                                            ["network": config.name,
-                                             "host": config.host, "port": config.port.to!string,
-                                             "event": "cap_skipped_ngircd"]);
-                                        toRequest = [];
-                                    }
-                                    if (toRequest.length > 0) {
-                                        sendRaw("CAP REQ :" ~ toRequest.join(" "));
-                                        capReqSent = true;
-                                        logJsonMap("debug", "connection",
-                                            "CAP REQ sent",
-                                            ["network": config.name,
-                                             "host": config.host, "port": config.port.to!string,
-                                             "caps": toRequest.join(" "),
-                                             "event": "cap_negotiating"]);
-                                        recordCounter("ircfiber.cap.negotiating", 1,
-                                            ["network": config.name, "host": config.host,
-                                             "port": config.port.to!string]);
-                                    } else {
-                                        if (saslDone && !capEndSent) {
-                                            sendRaw("CAP END");
-                                            capEndSent = true;
-                                            logJsonMap("info", "connection",
-                                                "CAP negotiation complete",
-                                                ["network": config.name,
-                                                 "acks": "0",
-                                                 "event": "cap_negotiated"]);
-                                        }
-                                    }
-                                }
-                            } else if (sub == "ACK") {
-                                foreach (cap; capLine.split(" ")) {
-                                    auto c = cap.strip();
-                                    if (c.length > 0) ackedCaps[c] = true;
-                                }
-                                // If SASL was acked, start authentication
-                                if (ackedCaps.get("sasl", false) && !saslDone && config.sasl != SASLMechanism.none) {
-                                    // CAP 302 servers list their mechanisms in
-                                    // `sasl=`; one we cannot use fails every
-                                    // attempt the same way, so park with the list
-                                    // instead of collecting a 904.
-                                    const offered = capValues.get("sasl", "");
-                                    if (!saslMechanismOffered(offered, saslMechanismName(config.sasl)))
-                                        throw new SaslParkedException(parkOnUnsupportedMechanism(offered));
-                                    emitLog("sasl_start",
-                                        "Starting SASL " ~ saslMechanismName(config.sasl) ~ " authentication");
-                                    logJsonMap("info", "auth",
-                                        "SASL starting",
-                                        ["network": config.name, "host": config.host,
-                                         "port": config.port.to!string,
-                                         "mechanism": saslMechanismName(config.sasl),
-                                         "event": "sasl_start"]);
-                                    recordCounter("ircfiber.sasl.start", 1,
-                                        ["network": config.name, "host": config.host,
-                                         "port": config.port.to!string,
-                                         "mechanism": saslMechanismName(config.sasl)]);
-                                    final switch (config.sasl) {
-                                        case SASLMechanism.none: break;
-                                        case SASLMechanism.plain:
-                                            sendRaw("AUTHENTICATE PLAIN");
-                                            break;
-                                        case SASLMechanism.external:
-                                            sendRaw("AUTHENTICATE EXTERNAL");
-                                            break;
-                                        case SASLMechanism.scramSha256:
-                                            sendRaw("AUTHENTICATE SCRAM-SHA-256");
-                                            break;
-                                    }
-                                } else if (saslDone && !capEndSent) {
-                                    sendRaw("CAP END");
-                                    capEndSent = true;
-                                    logJsonMap("info", "connection",
-                                        "CAP negotiation complete",
-                                        ["network": config.name,
-                                         "host": config.host, "port": config.port.to!string,
-                                         "acks": capLine,
-                                         "event": "cap_negotiated"]);
-                                    recordCounter("ircfiber.cap.negotiated", 1,
-                                        ["network": config.name, "host": config.host,
-                                         "port": config.port.to!string]);
-                                } else if (!saslDone && config.sasl != SASLMechanism.none
-                                    && !ackedCaps.get("sasl", false)) {
-                                    // The server granted caps but NOT sasl — it does
-                                    // not support SASL on this connection. Fall back to
-                                    // no-SASL registration instead of deadlocking waiting
-                                    // for an AUTHENTICATE that will never come (the
-                                    // 2026-08-12 BLCKND outage: sasl configured, server
-                                    // never granted it, CAP END never sent, server closed
-                                    // with "Registration Timeout" after ~40s, forever).
-                                    logWarn("SASL not granted by %s (server does not offer sasl) — proceeding without SASL",
-                                        config.host);
-                                    saslDone = true;
-                                    if (!capEndSent) {
-                                        sendRaw("CAP END");
-                                        capEndSent = true;
-                                        logJsonMap("info", "connection",
-                                            "CAP negotiation complete",
-                                            ["network": config.name,
-                                             "host": config.host, "port": config.port.to!string,
-                                             "acks": capLine,
-                                             "sasl": "not-granted",
-                                             "event": "cap_negotiated"]);
-                                        recordCounter("ircfiber.cap.negotiated", 1,
-                                            ["network": config.name, "host": config.host,
-                                             "port": config.port.to!string]);
-                                    }
-                                }
-                            } else if (sub == "NAK") {
-                                // Ignore NAK'd caps; they just won't be used. If the
-                                // server NAK'd the whole request while we configured
-                                // SASL, the server does not offer it — proceed without
-                                // SASL so registration cannot deadlock (BLCKND outage).
-                                if (!saslDone && config.sasl != SASLMechanism.none
-                                    && capLine.canFind("sasl")) {
-                                    logWarn("SASL NAK'd by %s (server does not offer sasl) — proceeding without SASL",
-                                        config.host);
-                                    saslDone = true;
-                                }
-                                if (saslDone && !capEndSent) {
-                                    sendRaw("CAP END");
-                                    capEndSent = true;
-                                    logJsonMap("info", "connection",
-                                        "CAP negotiation complete",
-                                        ["network": config.name,
-                                         "naks": capLine,
-                                         "event": "cap_negotiated"]);
-                                }
-                            } else if (sub == "NEW") {
-                                // Server added new caps (cap-notify); request any we want.
-                                // UnrealIRCd also uses CAP DEL + CAP NEW to *update* a
-                                // value — the multiline max-lines/max-bytes change when
-                                // we move between its known-users and unknown-users
-                                // groups — so the values have to be re-read here.
-                                recordCapValues(capLine);
-                                foreach (cap; capLine.split(" ")) {
-                                    auto capName = capNameOf(cap);
-                                    if (desiredCaps.canFind(capName)) {
-                                        sendRaw("CAP REQ :" ~ capName);
-                                    }
-                                }
-                            } else if (sub == "DEL") {
-                                // Server removed caps
-                                foreach (cap; capLine.split(" ")) {
-                                    auto capName = capNameOf(cap);
-                                    ackedCaps.remove(capName);
-                                    capValues.remove(capName);
-                                }
-                            }
+                            handleCapLine(evt, false);
                             break;
 
                         // ── AUTHENTICATE ──────────────────────────────────────
@@ -6143,10 +6061,7 @@ final class PersistentIRCClient {
                             pacer.adopt(KNOWN_USER_LIMITS);
                             emitLog("sasl_done",
                                 "SASL " ~ saslMechanismName(config.sasl) ~ " authentication succeeded");
-                            if (!capEndSent) {
-                                sendRaw("CAP END");
-                                capEndSent = true;
-                            }
+                            maybeEndCap("sasl-success");
                             logJsonMap("info", "auth",
                                 "SASL success",
                                 ["network": config.name,
@@ -6158,6 +6073,7 @@ final class PersistentIRCClient {
                                  "port": config.port.to!string,
                                  "mechanism": saslMechanismName(config.sasl)]);
                             break;
+                        case "902": // ERR_NICKLOCKED — the account is locked/suspended
                         case "904": // ERR_SASLFAIL
                         case "905": // ERR_SASLTOOLONG
                             // Definitive: services are reachable and refuse the
@@ -6231,6 +6147,10 @@ final class PersistentIRCClient {
                         "311", "312", "313", "315", "317", "318", "319",
                         "330", "332", "333", "354", "366", "376", "401",
                         "422", "761", "766", "770", "771", "772", "774",
+                        "902",
+                        // `BATCH ±ref draft/isupport` around the ISUPPORT
+                        // reply (draft/extended-isupport) — framing only.
+                        "BATCH",
                     ];
                     if (evt.command != "PING" && evt.command != "ERROR"
                         && !noPublishDuringRegistration.canFind(evt.command)) {
@@ -6253,13 +6173,14 @@ final class PersistentIRCClient {
         if (config.operUsername.length > 0 && config.operPassword.length > 0) {
             sendRaw("OPER " ~ config.operUsername ~ " " ~ config.operPassword);
         }
-        // draft/metadata-2: subscribe to `avatar` before the JOINs below so
-        // the server's join-sync batches already carry members' avatars,
-        // then publish our own (account default or per-network override).
-        if (hasCap("draft/metadata-2")) {
-            sendRaw("METADATA * SUB avatar");
-            foreach (l; avatarCommands("", config.effectiveAvatarUrl())) sendRaw(l);
-        }
+        // Our away state outlives the socket; the server forgot it. With
+        // draft/pre-away it already went out before CAP END.
+        if (isAway && awayMessage.length && !hasCap("draft/pre-away"))
+            sendRaw("AWAY :" ~ awayMessage);
+        // draft/metadata-2: subscribe before the JOINs below so the
+        // server's join-sync batches already carry members' keys, then
+        // publish our own (avatar default/override plus profile keys).
+        if (hasCap("draft/metadata-2")) publishOwnMetadata();
 
         // SuperNETs/DangerousIRCd throttles JOIN until the client has been
         // connected for ≥5s (421 "You must be connected for at least 5
@@ -6312,6 +6233,10 @@ final class PersistentIRCClient {
         }
         foreach (batch; joinBatches(autoJoin))
             sendRaw("JOIN " ~ batch);
+
+        // MONITOR is per connection: re-arm the persisted list.
+        if (monitorSupported() && config.monitoredNicks.length)
+            foreach (l; monitorLines("+", config.monitoredNicks, monitorLimit())) sendRaw(l);
 
         // ── Post-registration commands ─────────────────────────────────────
         // NickServ IDENTIFY (if configured) — sent BEFORE user-supplied
@@ -6574,7 +6499,7 @@ private void processEvents() {
                     if (!channelNeedsRealnameWho(users, realnames, realnameProbed, attempts))
                         continue;
                     if (chan in lastWhoTime && now - lastWhoTime[chan] < 2) continue;
-                    sendRaw("WHO " ~ chan);
+                    sendRaw(whoLine(chan));
                     lastWhoTime[chan] = now;
                     whoEnrichAttempts[chan] = attempts + 1;
                     // info, not debug: bounded now (at most
@@ -6804,27 +6729,34 @@ private void processEvents() {
         logWarn("Server ERROR for %s: %s", config.name, text);
     }
 
-    /// draft/metadata-2 avatar bookkeeping plus RPL_LOGGEDIN/OUT tracking.
-    /// Returns true when the line is internal noise the caller must not
-    /// publish (GET/SUB replies, rate-limit retries, KEY_NOT_SET).
+    /// draft/metadata-2 bookkeeping (user and channel keys) plus
+    /// RPL_LOGGEDIN/OUT tracking. Returns true when the line is internal
+    /// noise the caller must not publish (our own GET/SUB replies,
+    /// rate-limit retries, KEY_NOT_SET).
     private bool handleMetadataLine(ref IRCRawEvent event) {
         auto p = event.getParams();
+        static bool isChanTarget(string t) { return t.length && (t[0] == '#' || t[0] == '&'); }
         switch (event.command) {
             case "METADATA":
                 // [target, key, visibility, value?]
                 if (p.length < 3 || p[0].length == 0) return false;
-                if (p[0][0] == '#' || p[0][0] == '&') return false;
-                if (p[1] == "avatar")
-                    applyAvatar(p[0], p.length > 3 ? p[3] : "");
-                // Server log, not a channel (same routing as ACCOUNT).
-                event.channel = "";
+                applyMetadata(p[0], p[1], p.length > 3 ? p[3] : "");
+                // User keys go to the server log, not a channel (same
+                // routing as ACCOUNT); channel keys stay in the channel.
+                if (!isChanTarget(p[0])) event.channel = "";
                 return false;
             case "761":
+            case "766": {
                 // RPL_KEYVALUE [me, target, key, visibility, value]
-                if (p.length >= 5 && p[2] == "avatar")
-                    applyAvatar(p[1] == "*" ? sessionNick : p[1], p[4]);
-                return true;
-            case "766": // RPL_KEYNOTSET
+                // RPL_KEYNOTSET [me, target, key, text]
+                if (p.length < 3) return true;
+                const target = p[1] == "*" ? sessionNick : p[1];
+                applyMetadata(target, p[2], event.command == "761" && p.length >= 5 ? p[4] : "");
+                // A channel reply answers a channel SET (ours or a bouncer
+                // client's), so it is published; user-target replies are
+                // our own bookkeeping.
+                return !isChanTarget(target);
+            }
             case "770": // RPL_METADATASUBOK
             case "771": // RPL_METADATAUNSUBOK
             case "772": // RPL_METADATASUBS
@@ -6873,12 +6805,99 @@ private void processEvents() {
         }
     }
 
-    /// Stores `url` as `nick`'s avatar when it is a usable http(s) URL,
-    /// otherwise (cleared, unsafe scheme, oversized) forgets it.
-    private void applyAvatar(string nick, string url) {
-        if (nick.length == 0) return;
-        if (isAcceptableAvatarUrl(url)) avatars[nick] = url;
-        else avatars.remove(nick);
+    /// Stores `value` under `target`'s metadata `key` when the key is one
+    /// we render for that target type (USER_ / CHANNEL_METADATA_KEYS) and
+    /// the value passes `isValidMetadataValue`; otherwise (cleared,
+    /// unknown key, unsafe value) forgets it. Channel targets key
+    /// `channelMetadata` lowercase.
+    private void applyMetadata(string target, string key, string value) {
+        if (target.length == 0 || key.length == 0) return;
+        const isChan = target[0] == '#' || target[0] == '&';
+        const owner = isChan ? target.toLower : target;
+        auto m = isChan ? &channelMetadata : &userMetadata;
+        const known = isChan ? CHANNEL_METADATA_KEYS.canFind(key) : USER_METADATA_KEYS.canFind(key);
+        if (known && value.length && isValidMetadataValue(key, value)) {
+            if (auto row = owner in *m) (*row)[key] = value;
+            else (*m)[owner] = [key: value];
+        } else if (auto row = owner in *m) {
+            (*row).remove(key);
+            if ((*row).length == 0) (*m).remove(owner);
+        }
+    }
+
+    /// draft/read-marker → `irc:lastseen` bridge. `sel` is
+    /// `timestamp=<iso>` or `*` (no marker on the server). A newer server
+    /// marker advances the shared field (and every web tab / bouncer
+    /// client through the heartbeat echo); a newer stored one is pushed
+    /// back so the server converges too. No-op without Redis.
+    private void applyMarkRead(string target, string sel) {
+        import ircfiber.irc.chathistory : isoTimestampMs, parseIsoTimestampMs;
+        if (redis is null || target.length == 0) return;
+        try {
+            const field = config.id.toString() ~ ":" ~ lastSeenBufferKey(target);
+            auto repo = new LastSeenRepository(redis);
+            long ms = 0;
+            if (sel.startsWith("timestamp=")) ms = parseIsoTimestampMs(sel["timestamp=".length .. $]);
+            if (ms > 0) {
+                auto changed = repo.merge(ownerId, [field: ms]);
+                if (changed.length)
+                    redis.publish(RedisKeys.events(ownerId.toString()), heartbeatEchoJson(changed).toString());
+            }
+            if (ms <= 0 && sel != "*") return;
+            const stored = repo.get(ownerId, field);
+            if (stored > ms) sendRaw("MARKREAD " ~ target ~ " timestamp=" ~ isoTimestampMs(stored));
+        } catch (Exception e) {
+            logWarn("MARKREAD bridge failed for %s %s: %s", config.name, target, e.msg);
+        }
+    }
+
+    /// draft/channel-rename: moves every per-channel fact from `oldChan`
+    /// to `newChan`, honouring each map's key form (normalized, raw,
+    /// lowercase, `chan\0nick`), and follows the rename in the persisted
+    /// autojoin / parted lists.
+    private void renameChannelState(string oldChan, string newChan) {
+        import std.uni : toLower, sicmp;
+        const oldN = normalizeChannelName(oldChan), newN = normalizeChannelName(newChan);
+        const oldL = oldChan.toLower, newL = newChan.toLower;
+        // normalized
+        moveKey(channelState, oldN, newN);
+        moveKey(channelTopics, oldN, newN);
+        moveKey(channelUsers, oldN, newN);
+        moveKey(namesBurst, oldN, newN);
+        moveKey(namesBurstAt, oldN, newN);
+        foreach (ref c; joinsAwaitingConfirm) if (c == oldN) c = newN;
+        // raw (366 params) and normalized (sweep) spellings both occur
+        foreach (from; [oldChan, oldN]) {
+            moveKey(lastWhoTime, from, newN);
+            moveKey(whoEnrichAttempts, from, newN);
+        }
+        // lowercase
+        moveKey(chanFloodLimit, oldL, newL);
+        moveKey(chanFloodWindow, oldL, newL);
+        moveKey(chanFloodExempt, oldL, newL);
+        moveKey(chanFloodProbed, oldL, newL);
+        moveKey(channelLatestMsgid, oldL, newL);
+        moveKey(channelEarliestMsgid, oldL, newL);
+        moveKey(channelLatestTs, oldL, newL);
+        moveKey(channelEarliestTs, oldL, newL);
+        moveKey(chathistoryInFlight, oldL, newL);
+        moveKey(channelMetadata, oldL, newL);
+        if (sicmp(lastFloodNoticeChannel, oldChan) == 0) lastFloodNoticeChannel = newChan;
+        // chan\0nick
+        const prefix = oldN ~ "\0";
+        string[] flapKeys;
+        foreach (key, _; memberFlaps) if (key.startsWith(prefix)) flapKeys ~= key;
+        foreach (key; flapKeys) {
+            auto f = memberFlaps[key];
+            if (f.pending.channel.length && sicmp(f.pending.channel, oldChan) == 0)
+                f.pending.channel = newChan;
+            memberFlaps.remove(key);
+            memberFlaps[newN ~ "\0" ~ key[prefix.length .. $]] = f;
+        }
+        // persisted lists
+        foreach (ref c; config.autoJoinChannels) if (sicmp(c, oldN) == 0) c = newN;
+        foreach (ref c; config.partedChannels) if (sicmp(c, oldN) == 0) c = newN;
+        metaDirty = true;
     }
 
     /// Records our effective avatar in the public-avatar registry under our
@@ -6909,11 +6928,104 @@ private void processEvents() {
         }
     }
 
+    /// `WHO <chan>`, asking for the WHOX field set (`%tcuhnfar` with our
+    /// query type 152 — channel, user, host, nick, flags, account,
+    /// realname) when the server advertises WHOX.
+    private string whoLine(string chan) {
+        if (("WHOX" in isupportMap) !is null) return "WHO " ~ chan ~ " %tcuhnfar,152";
+        return "WHO " ~ chan;
+    }
+
+    /// One WHO (352) or WHOX (354, query type 152) row. Records the
+    /// realname, ident, away (`G`/`H`), bot flag and — WHOX only —
+    /// services account (`"0"` = logged out, `""` = not reported), and
+    /// promotes a BARE roster entry to the prefixed form. Explicit MODE
+    /// changes like +v are never overwritten by a WHO answer that may
+    /// arrive after the MODE.
+    private void applyWhoReply(string chan, string user, string host, string nick,
+                               string flags, string realname, string account) {
+        if (nick.length == 0) return;
+        realnameProbed[nick] = true;
+        if (realname.length > 0 && realname != nick) {
+            realnames[nick] = realname;
+            logJsonMap("debug", "protocol",
+                "WHO realname captured",
+                ["network": config.name, "nick": nick, "realname": realname, "event": "who_realname"]);
+        }
+        if (user.length > 0) idents[nick] = user;
+        if (flags.length > 0) {
+            if (flags[0] == 'G') away[nick] = away.get(nick, "");
+            else if (flags[0] == 'H') away.remove(nick);
+            const botFlag = isupportMap.get("BOT", "B");
+            if (botFlag.length > 0 && flags[1 .. $].indexOf(botFlag) >= 0) bots[nick] = "1";
+            else bots.remove(nick);
+        }
+        if (account == "0") accounts.remove(nick);
+        else if (account.length > 0) accounts[nick] = account;
+
+        char[5] order = ['~', '&', '@', '%', '+'];
+        char chosen = '\0';
+        foreach (c; order) {
+            if (flags.indexOf(c) >= 0) { chosen = c; break; }
+        }
+        if (chosen == '\0' || (chan in channelUsers) is null) return;
+        bool foundBare = false;
+        size_t j = 0;
+        while (j < channelUsers[chan].length) {
+            auto existing = channelUsers[chan][j];
+            if (sameNick(existing, nick)) {
+                // A run of prefix chars — including the
+                // operprefix `*` a multi-prefix NAMES puts
+                // first — means the entry already carries
+                // the server's own, richer answer. Only a
+                // genuinely bare entry gets the single char
+                // WHO's flags field can express.
+                if (nickPrefixRun(existing) == 0) {
+                    // Bare entry — promote it to the
+                    // prefixed form from the WHO response.
+                    if (!foundBare) {
+                        channelUsers[chan][j] = chosen ~ nick;
+                        foundBare = true;
+                        j++;
+                    } else {
+                        // Already promoted an entry for this
+                        // nick; remove the stale duplicate.
+                        channelUsers[chan] = channelUsers[chan][0 .. j]
+                            ~ channelUsers[chan][j + 1 .. $];
+                    }
+                } else if (!foundBare) {
+                    // Already has a prefix (set by 353 or
+                    // MODE). Keep it, but mark as found so
+                    // subsequent bare duplicates get removed.
+                    foundBare = true;
+                    j++;
+                } else {
+                    // Duplicate prefixed entry — remove.
+                    channelUsers[chan] = channelUsers[chan][0 .. j]
+                        ~ channelUsers[chan][j + 1 .. $];
+                }
+            } else {
+                j++;
+            }
+        }
+        // If no entry existed at all (race with JOIN handler),
+        // add the user with the discovered prefix.
+        if (!foundBare) {
+            channelUsers[chan] ~= chosen ~ nick;
+        }
+    }
+
     private void processLine(string line) {
         linesIn++;
         auto event      = parseIRCLine(line);
         event.network   = config.name;
         event.timestampMs = resolveTimestamp(event);
+        processEvent(event);
+    }
+
+    /// Everything `processLine` does after parsing. Also re-entered with
+    /// the one message a closed `draft/multiline` batch reassembles.
+    private void processEvent(IRCRawEvent event) {
 
         // Fix DM echo channel: parser sets channel=nick for all non-channel
         // PRIVMSG/NOTICE (correct for incoming, wrong for our own echo).
@@ -6981,6 +7093,19 @@ private void processEvents() {
 
         if (handleMetadataLine(event)) return;
 
+        // draft/multiline: member lines are one message, published whole
+        // when `BATCH -ref` closes the batch (see `case "BATCH"`).
+        if (event.command == "PRIVMSG" || event.command == "NOTICE") {
+            if (auto ob = event.getTag("batch") in openBatches) {
+                if (ob.type == "draft/multiline") {
+                    if (ob.lines.length == 0) { ob.first = event; ob.cmd = event.command; }
+                    ob.lines ~= event.text;
+                    ob.concat ~= event.hasTag("draft/multiline-concat");
+                    return;
+                }
+            }
+        }
+
         string[] quitChannels;
         string[] nickChannels;
         string[] chghostChannels;
@@ -7026,6 +7151,9 @@ private void processEvents() {
                         // slot the BATCH close releases — the hand-rolled
                         // `sendRaw` here did neither.
                         requestChathistory(chan, "LATEST", "", 100);
+                        // no-implicit-names: the server sends no 353/366
+                        // burst for our JOIN unless asked.
+                        if (hasCap("no-implicit-names")) sendRaw("NAMES " ~ chan);
                         // Log our own JOINs at info so the web join at
                         // /irc/Supernets/channel/superbowl is visible in SigNoz.
                         // Fixed: was checking autoJoinChannels *after* appending, so the
@@ -7052,8 +7180,8 @@ private void processEvents() {
                         // ("*" means not logged in; empty string means not provided).
                         if (params.length >= 3) {
                           const acct = params[1];
-                          if (acct.length > 0)
-                            accounts[event.nick] = acct;
+                          if (acct == "*") accounts.remove(event.nick);
+                          else if (acct.length > 0) accounts[event.nick] = acct;
                           const rn = params[2];
                           // The realname param was supplied, so the question
                           // is answered even when it equals the nick.
@@ -7114,6 +7242,7 @@ private void processEvents() {
                         metaDirty = true;
                         channelUsers.remove(chan);
                         channelTopics.remove(chan);
+                        channelMetadata.remove(chan.toLower);
                         auto i = config.autoJoinChannels.countUntil(chan);
                         if (i >= 0) config.autoJoinChannels = config.autoJoinChannels.remove(i);
                         if (!config.partedChannels.canFind(chan))
@@ -7147,6 +7276,7 @@ private void processEvents() {
                         metaDirty = true;
                         channelUsers.remove(chan);
                         channelTopics.remove(chan);
+                        channelMetadata.remove(chan.toLower);
                         auto i = config.autoJoinChannels.countUntil(chan);
                         if (i >= 0) config.autoJoinChannels = config.autoJoinChannels.remove(i);
                         if (!config.partedChannels.canFind(chan))
@@ -7197,7 +7327,9 @@ private void processEvents() {
                     }
                 }
                 accounts.remove(event.nick);
-                avatars.remove(event.nick);
+                away.remove(event.nick);
+                bots.remove(event.nick);
+                userMetadata.remove(event.nick);
                 // Skip logging our own QUITs when we're about to reconnect
                 // (it just adds noise during reconnect storms).
                 if (event.nick != sessionNick) {
@@ -7232,10 +7364,18 @@ private void processEvents() {
                 break;
 
             case "306": // RPL_NOWAWAY — marked as away
+                // Keep our own text: the server's "You have been marked as
+                // being away" is not the message, and the reconnect re-send
+                // (pre-away / post-registration) needs the real one.
                 isAway = true;
-                awayMessage = event.text;
                 metaDirty = true;
                 break;
+
+            case "335": { // RPL_WHOISBOT — `335 <me> <nick> :is a bot`
+                auto bp = event.getParams();
+                if (bp.length >= 2 && bp[1].length > 0) bots[bp[1]] = "1";
+                break; // still part of the WHOIS output
+            }
 
             case "421": { // ERR_UNKNOWNCOMMAND — or a JOIN throttle wearing its clothes
                 auto ps = event.getParams();
@@ -7346,11 +7486,9 @@ private void processEvents() {
                         accounts[newNick] = *p;
                         accounts.remove(event.nick);
                     }
-                    if (auto p = event.nick in avatars) {
-                        const url = *p;
-                        avatars.remove(event.nick);
-                        avatars[newNick] = url;
-                    }
+                    moveKey(away, event.nick, newNick);
+                    moveKey(bots, event.nick, newNick);
+                    moveKey(userMetadata, event.nick, newNick);
                     // Two paths for detecting this is OUR nick change:
                     // 1. Server-initiated — event.nick (old nick) matches
                     //    current sessionNick and we never asked for it: a
@@ -7469,9 +7607,20 @@ private void processEvents() {
                         }
                     }
                 }
-                // A DM counterparty with a new user@host is still them.
+                // Every roster copy of the nick takes the new user@host, and
+                // so does our own hostmask (it drives the payload budget).
                 {
                     auto hp = event.getParams();
+                    if (hp.length >= 2 && event.nick.length > 0) {
+                        foreach (chan, ref users; channelUsers)
+                            foreach (i, ref u; users)
+                                if (sameNick(stripNickPrefix(u), event.nick))
+                                    u = nickPrefix(u) ~ event.nick ~ "!" ~ hp[0] ~ "@" ~ hp[1];
+                        idents[event.nick] = hp[0];
+                        if (sameNick(event.nick, sessionNick))
+                            ownHostmask = event.nick ~ "!" ~ hp[0] ~ "@" ~ hp[1];
+                    }
+                    // A DM counterparty with a new user@host is still them.
                     const key = foldNick(event.nick);
                     if (hp.length >= 2 && (key in queryHosts) !is null)
                         queryHosts[key] = hp[0] ~ "@" ~ hp[1];
@@ -7610,7 +7759,7 @@ private void processEvents() {
                         if (needsWho && namesBurst[chan].length > 5
                             && (chan !in lastWhoTime || whoNow - lastWhoTime[chan] >= 2)
                             && !pacer.isArmed()) {
-                            sendRaw("WHO " ~ chan);
+                            sendRaw(whoLine(chan));
                             lastWhoTime[chan] = whoNow;
                             whoEnrichAttempts[chan] = attempts + 1;
                             logJsonMap("info", "protocol",
@@ -7676,7 +7825,7 @@ private void processEvents() {
                                 "event": "rpl_endofnames_check"]);
                         if (needsWho && (chan !in lastWhoTime || whoNow - lastWhoTime[chan] >= 2)
                             && !pacer.isArmed()) {
-                            sendRaw("WHO " ~ chan);
+                            sendRaw(whoLine(chan));
                             lastWhoTime[chan] = whoNow;
                             whoEnrichAttempts[chan] = attempts + 1;
                             logJsonMap("info", "protocol",
@@ -7704,84 +7853,22 @@ private void processEvents() {
                         "params": event.getParams().join(" "), "text": event.text,
                         "event": "rpl_whoreply"]);
                 if (mp.length >= 7) {
-                    auto chan = mp[1];
-                    auto nick = mp[5];
-                    if (nick.length > 0) realnameProbed[nick] = true;
-                    auto flags = mp[6];
-                    char[5] order = ['~', '&', '@', '%', '+'];
-                    char chosen = '\0';
-                    foreach (c; order) {
-                        if (flags.indexOf(c) >= 0) { chosen = c; break; }
-                    }
-                    // Extract realname from trailing text: ":<hopcount> <realname>"
-                    // event.text holds the trailing part stripped of leading ':'.
+                    // Realname from the trailing ":<hopcount> <realname>".
                     // Hopcount is digits; the real name follows the first space.
-                    {
-                        auto txt = event.text;
-                        if (txt.length > 0) {
-                            string rn;
-                            auto sp = txt.indexOf(' ');
-                            if (sp >= 0) rn = txt[sp+1 .. $].strip();
-                            else {
-                                size_t i = 0;
-                                while (i < txt.length && txt[i] >= '0' && txt[i] <= '9') i++;
-                                if (i < txt.length && txt[i] == ' ') rn = txt[i+1 .. $].strip();
-                                else if (i == 0) rn = txt.strip();
-                            }
-                            if (rn.length > 0 && rn != nick) {
-                                realnames[nick] = rn;
-                                logJsonMap("debug", "protocol",
-                                    "WHO realname captured (352)",
-                                    ["network": config.name, "nick": nick, "realname": rn, "event": "who_realname"]);
-                            }
+                    string rn;
+                    auto txt = event.text;
+                    if (txt.length > 0) {
+                        auto sp = txt.indexOf(' ');
+                        if (sp >= 0) rn = txt[sp+1 .. $].strip();
+                        else {
+                            size_t i = 0;
+                            while (i < txt.length && txt[i] >= '0' && txt[i] <= '9') i++;
+                            if (i < txt.length && txt[i] == ' ') rn = txt[i+1 .. $].strip();
+                            else if (i == 0) rn = txt.strip();
                         }
                     }
-                    if (chosen != '\0' && chan in channelUsers) {
-                        bool foundBare = false;
-                        size_t j = 0;
-                        while (j < channelUsers[chan].length) {
-                            auto existing = channelUsers[chan][j];
-                            if (sameNick(existing, nick)) {
-                                // A run of prefix chars — including the
-                                // operprefix `*` a multi-prefix NAMES puts
-                                // first — means the entry already carries
-                                // the server's own, richer answer. Only a
-                                // genuinely bare entry gets the single char
-                                // WHO's flags field can express.
-                                if (nickPrefixRun(existing) == 0) {
-                                    // Bare entry — promote it to the
-                                    // prefixed form from the WHO response.
-                                    if (!foundBare) {
-                                        channelUsers[chan][j] = chosen ~ nick;
-                                        foundBare = true;
-                                        j++;
-                                    } else {
-                                        // Already promoted an entry for this
-                                        // nick; remove the stale duplicate.
-                                        channelUsers[chan] = channelUsers[chan][0 .. j]
-                                            ~ channelUsers[chan][j + 1 .. $];
-                                    }
-                                } else if (!foundBare) {
-                                    // Already has a prefix (set by 353 or
-                                    // MODE). Keep it, but mark as found so
-                                    // subsequent bare duplicates get removed.
-                                    foundBare = true;
-                                    j++;
-                                } else {
-                                    // Duplicate prefixed entry — remove.
-                                    channelUsers[chan] = channelUsers[chan][0 .. j]
-                                        ~ channelUsers[chan][j + 1 .. $];
-                                }
-                            } else {
-                                j++;
-                            }
-                        }
-                        // If no entry existed at all (race with JOIN handler),
-                        // add the user with the discovered prefix.
-                        if (!foundBare) {
-                            channelUsers[chan] ~= chosen ~ nick;
-                        }
-                    }
+                    // [me, chan, user, host, server, nick, flags, trailing]
+                    applyWhoReply(mp[1], mp[2], mp[3], mp[5], mp[6], rn, "");
                 }
                 return;
             }
@@ -7833,21 +7920,18 @@ private void processEvents() {
                 return;
             }
 
-            // ── WHOX reply (RPL_WHOX, 354) — engine consumes nothing ──────
-            // The engine issues `WHO %tn` from the JOIN handler to populate
-            // channelUsers with each user's mode prefix; the WHO reply (352)
-            // does that work. The WHOX (354) variant is only sent when the
-            // server has the `WHOX` capability enabled AND we asked for the
-            // extended token set — on SuperNets / UnrealIRCd this is a 2000+
-            // line flood per channel join. The engine does not use any WHOX
-            // fields, and the frontend has no consumer for them either (the
-            // `classifyServerLog` filter in the Svelte side just drops them
-            // as `skip`). Returning here keeps them off the eventChannel
-            // entirely — saves WS bandwidth and prevents them from being
-            // persisted to Redis scrollback where they'd burn storage and
-            // re-flood the timeline on every reconnect / page load.
-            case "354":
+            // ── WHOX reply (RPL_WHOX, 354) ─────────────────────────────────
+            // Only our own `%tcuhnfar,152` query (see `whoLine`) is read —
+            // [me, 152, chan, user, host, nick, flags, account, realname] —
+            // and fed through the same path as 352. Every 354 stays off
+            // the eventChannel: on SuperNets / UnrealIRCd a channel's WHOX
+            // is a 2000+ line flood the frontend has no consumer for.
+            case "354": {
+                auto p = event.getParams();
+                if (p.length >= 8 && p[1] == "152")
+                    applyWhoReply(p[2], p[3], p[4], p[5], p[6], event.text, p[7]);
                 return;
+            }
 
             // ── Away notify (away-notify cap) ─────────────────────────────────
             // ONE event per shared channel, not one per matching roster
@@ -7860,6 +7944,10 @@ private void processEvents() {
             // events with distinct ids — two identical rows in the client.
             case "AWAY":
                 // event.text is the away message (empty = returned from away).
+                if (event.nick.length > 0) {
+                    if (event.text.length > 0) away[event.nick] = event.text;
+                    else away.remove(event.nick);
+                }
                 foreach (chan, users; channelUsers) {
                     foreach (u; users) {
                         if (sameNick(u, event.nick)) {
@@ -7884,7 +7972,8 @@ private void processEvents() {
                 {
                     auto ap = event.getParams();
                     if (ap.length >= 1 && ap[0].length > 0 && event.nick.length > 0) {
-                        accounts[event.nick] = ap[0];
+                        if (ap[0] == "*") accounts.remove(event.nick);
+                        else accounts[event.nick] = ap[0];
                         // A DM counterparty logging in or out ("*") stays
                         // comparable for `dmFollowsNick`.
                         const key = foldNick(event.nick);
@@ -7943,6 +8032,19 @@ private void processEvents() {
                 auto fp = event.getParams();
                 if (fp.length >= 3 && fp[0] == "REDACT" && event.channel.length == 0)
                     event.channel = fp[2]; // FAIL REDACT <code> <target> … → the target buffer
+                // A refused CHATHISTORY never opens a batch, so its in-flight
+                // flag would lock that channel's history until reconnect.
+                if (event.command == "FAIL" && fp.length >= 1 && fp[0] == "CHATHISTORY") {
+                    bool cleared = false;
+                    foreach (param; fp[1 .. $]) {
+                        if (param.toLower in chathistoryInFlight) {
+                            clearChathistoryInFlight(param);
+                            cleared = true;
+                            break;
+                        }
+                    }
+                    if (!cleared) chathistoryInFlight.clear();
+                }
                 break;
 
             // ── Message redaction (draft/message-redaction cap) ────────────
@@ -8051,37 +8153,98 @@ private void processEvents() {
                 }
                 break;
 
-            // ── BATCH (chathistory / chanhistory replay) ──────────────────────
+            // ── BATCH (chathistory / labeled-response / multiline) ─────────────
             // The close form carries a SINGLE parameter and arrives as a
             // trailing on InspIRCd 4 (`:irc.example.org BATCH :-1`). The old
             // `params.length >= 2` guard skipped it, so the batch never
-            // closed: `activeBatchType` stayed "chathistory" for the life of
-            // the connection and every later event was tagged
-            // `batch=chathistory` (see the tag block below). The frontend
-            // routes tagged events down the backfill/prepend path, which
-            // suppresses notifications and unread counts for all live
-            // traffic. parseBatchOpen/parseBatchClose own both shapes.
+            // closed and every later event was tagged `batch=chathistory`.
+            // parseBatchOpen/parseBatchClose own both shapes. Batches are
+            // tracked per reference tag, so nested batches (labeled-response
+            // around chathistory) no longer overwrite each other.
             case "BATCH": {
                 import ircfiber.irc.parser : parseBatchOpen, parseBatchClose;
+                import std.algorithm : map;
+                import std.array : array;
                 auto params = event.getParams();
                 string batchRef, batchType, batchTarget;
                 if (parseBatchOpen(params, batchRef, batchType, batchTarget)) {
-                    activeBatchRef = batchRef;
-                    activeBatchType = batchType;
-                    activeBatchTarget = batchTarget;
+                    OpenBatch ob;
+                    ob.type = batchType;
+                    ob.target = batchTarget;
+                    ob.label = event.getTag("label");
+                    ob.parent = event.getTag("batch");
+                    openBatches[batchRef] = ob;
                 } else if (parseBatchClose(params, batchRef)) {
-                    // Clear in-flight flag for the channel so the next
-                    // CHATHISTORY request can go through. A ref mismatch
-                    // means our tracking drifted — clear anyway, because
-                    // staying open is the failure mode above.
-                    if (activeBatchType == "chathistory" && activeBatchTarget.length > 0) {
-                        clearChathistoryInFlight(activeBatchTarget);
+                    auto found = batchRef in openBatches;
+                    if (found is null) return;
+                    auto ob = *found;
+                    openBatches.remove(batchRef);
+                    switch (ob.type) {
+                        case "chathistory":
+                            // Clear in-flight flag so the next CHATHISTORY
+                            // request for the channel can go through.
+                            if (ob.target.length > 0) clearChathistoryInFlight(ob.target);
+                            break;
+                        case "labeled-response":
+                            if (ob.label.length > 0) clearPendingLabel(ob.label);
+                            break;
+                        case "draft/multiline":
+                            if (ob.lines.length == 0) break;
+                            // One message: lines joined by "\n", except where
+                            // a line continues the previous one (concat).
+                            string joined = ob.lines[0];
+                            foreach (i; 1 .. ob.lines.length)
+                                joined ~= (ob.concat[i] ? "" : "\n") ~ ob.lines[i];
+                            auto merged = ob.first;
+                            auto mp = merged.getParams();
+                            if (mp.length > 0) mp[$ - 1] = joined;
+                            merged.paramsJson = Json(mp.map!(s => Json(s)).array).toString();
+                            merged.text = joined;
+                            // The message belongs to whatever batch held the
+                            // multiline batch (a chathistory replay), if any.
+                            merged.addTag("batch", ob.parent);
+                            // labeled-response puts the label on the BATCH line
+                            // when the whole reply is this one batch.
+                            if (ob.label.length && merged.getTag("label").length == 0)
+                                merged.addTag("label", ob.label);
+                            processEvent(merged);
+                            break;
+                        default:
+                            break;
                     }
-                    activeBatchRef = "";
-                    activeBatchType = "";
-                    activeBatchTarget = "";
                 }
                 return; // Don't publish BATCH events to the UI
+            }
+
+            // ── labeled-response ACK: a labeled command with no other reply.
+            case "ACK":
+                clearPendingLabel(event.getTag("label"));
+                return;
+
+            // ── CAP after registration (cap-notify NEW/DEL, late ACKs) ─────
+            // State follows the server; the line is still published so the
+            // frontend's capability set updates live.
+            case "CAP":
+                handleCapLine(event, true);
+                event.channel = "";
+                break;
+
+            // ── draft/channel-rename: `RENAME <old> <new> [:reason]` ────────
+            case "RENAME": {
+                auto rp = event.getParams();
+                if (rp.length >= 2 && rp[0].length > 0 && rp[1].length > 0) {
+                    renameChannelState(rp[0], rp[1]);
+                    event.channel = rp[1];
+                }
+                break;
+            }
+
+            // ── draft/read-marker: `MARKREAD <target> timestamp=<iso>|*` ────
+            // Bridged into `irc:lastseen`; never published as a row.
+            case "MARKREAD": {
+                auto rp = event.getParams();
+                if (rp.length >= 2) applyMarkRead(rp[0], rp[1]);
+                return;
             }
 
             // ── Channel mode (ban/quiet/op/voice/etc.) ───────────────────────
@@ -8371,9 +8534,21 @@ private void processEvents() {
             }
         }
 
-        // If this event is inside a chathistory batch, tag it
-        if (activeBatchType == "chathistory" && activeBatchRef.length > 0) {
-            event.addTag("batch", "chathistory");
+        // Batch membership comes from the line's OWN `batch` tag: only a
+        // line inside a chathistory batch is history (a live line that
+        // arrives while a backfill batch is open stays live), and an
+        // unknown ref means unbatched.
+        {
+            const ownBatch = openBatches.get(event.getTag("batch"), OpenBatch.init);
+            if (ownBatch.type == "chathistory") {
+                event.addTag("batch", "chathistory");
+            } else if (ownBatch.type == "labeled-response" && ownBatch.label.length
+                       && event.getTag("label").length == 0) {
+                // labeled-response: the label rides on the BATCH line only;
+                // give it to each reply so correlation below (and the
+                // frontend's labeled FAIL handling) sees it.
+                event.addTag("label", ownBatch.label);
+            }
         }
 
         // Correlate labeled echoes (labeled-response cap) and record msgids
@@ -8433,7 +8608,7 @@ private void processEvents() {
                     // event is being routed to.
                     string bufName = event.channel.length > 0 ? event.channel
                         : (event.nick.length > 0 ? event.nick : "");
-                    if (bufName.length > 0) recordChannelMsgid(bufName, msgid);
+                    if (bufName.length > 0) recordChannelMsgid(bufName, msgid, event.timestampMs);
                 } else if (event.command == "TAGMSG" && event.channel.length > 0) {
                     // +react, +typing, etc. carry msgid referring to the
                     // target message. We don't update cursors for these.
@@ -8569,6 +8744,225 @@ private void processEvents() {
             const eq = t.indexOf("=");
             if (eq >= 0) capValues[t[0 .. eq]] = t[eq + 1 .. $];
             else if ((t in capValues) is null) capValues[t] = "";
+        }
+    }
+
+    /// Every `CAP` line, during registration (`registered == false`, where
+    /// it drives REQ / SASL / `CAP END`) and after it (cap-notify NEW/DEL
+    /// and the ACKs that answer our own late REQs). The caller still
+    /// publishes the line so the frontend's cap set follows it live.
+    private void handleCapLine(ref IRCRawEvent event, bool registered) {
+        auto params = event.getParams();
+        if (params.length < 2) return;
+        // params[0] = our nick (or *), params[1] = subcommand
+        const sub = toUpper(params[1]);
+        auto capLine = params.length >= 3 ? params[$ - 1] : "";
+
+        if (sub == "LS") {
+            // Accumulate caps (multi-line uses trailing '*')
+            const bool isMultiline = (params.length >= 3 && params[2] == "*");
+            recordCapValues(capLine);
+            foreach (cap; capLine.split(" ")) {
+                auto capName = capNameOf(cap);
+                if (capName.length > 0) serverCaps ~= capName;
+            }
+            if (registered || isMultiline) return;
+            // Request only caps we want AND the server offers, in two REQs:
+            // CAP REQ is all-or-nothing, so a server that refuses one draft
+            // cap must not cost us the stable ones.
+            string[] stable, drafts;
+            foreach (desired; desiredCapList()) {
+                if (!serverCaps.canFind(desired)) continue;
+                if (desired.startsWith("draft/") || desired == "chathistory") drafts ~= desired;
+                else stable ~= desired;
+            }
+            // ── ngIRCd workaround ───────────────────────────────
+            // ngIRCd 27 only offers `multi-prefix` and stalls if
+            // the client sends `CAP REQ :multi-prefix` AFTER it
+            // has already sent NICK/USER (which the engine does
+            // immediately after CAP LS). Manual test:
+            //   CAP LS + NICK+USER, LS=multi-prefix, REQ -> ACK but no 001
+            //   CAP LS + NICK+USER, LS=multi-prefix, END -> immediate 001 + MOTD
+            // So when the server's entire cap list is a single
+            // `multi-prefix` entry, skip the REQ and go straight
+            // to CAP END. The cap is non-essential for local
+            // testing and this avoids a 30s registration timeout
+            // that wedges the LocalIRCD network.
+            const bool singleMultiPrefixOnly = serverCaps.length == 1
+                && serverCaps[0] == "multi-prefix"
+                && stable.length == 1 && stable[0] == "multi-prefix"
+                && drafts.length == 0;
+            if (singleMultiPrefixOnly) {
+                logJsonMap("info", "connection",
+                    "Skipping CAP REQ for single multi-prefix (ngIRCd workaround)",
+                    ["network": config.name,
+                     "host": config.host, "port": config.port.to!string,
+                     "event": "cap_skipped_ngircd"]);
+                stable = [];
+            }
+            foreach (req; [stable, drafts]) {
+                if (req.length == 0) continue;
+                sendRaw("CAP REQ :" ~ req.join(" "));
+                ++capReqOutstanding;
+                logJsonMap("debug", "connection",
+                    "CAP REQ sent",
+                    ["network": config.name,
+                     "host": config.host, "port": config.port.to!string,
+                     "caps": req.join(" "),
+                     "event": "cap_negotiating"]);
+                recordCounter("ircfiber.cap.negotiating", 1,
+                    ["network": config.name, "host": config.host,
+                     "port": config.port.to!string]);
+            }
+            if (capReqOutstanding == 0) maybeEndCap("0");
+        } else if (sub == "ACK") {
+            string[] newly;
+            foreach (cap; capLine.split(" ")) {
+                auto c = cap.strip();
+                if (c.length == 0) continue;
+                if (c[0] == '-') { ackedCaps.remove(c[1 .. $]); continue; }
+                if (!hasCap(c)) newly ~= c;
+                ackedCaps[c] = true;
+            }
+            if (registered) {
+                if (newly.canFind("draft/metadata-2")) publishOwnMetadata();
+                if (newly.canFind("draft/read-marker")) reseedReadMarkers();
+                return;
+            }
+            if (capReqOutstanding > 0) --capReqOutstanding;
+            // draft/extended-isupport: the full 005 before CAP END, so the
+            // tokens are known before the first post-registration line.
+            if (newly.canFind("draft/extended-isupport")) sendRaw("ISUPPORT");
+            // If SASL was acked, start authentication
+            if (newly.canFind("sasl") && !saslDone && config.sasl != SASLMechanism.none) {
+                // CAP 302 servers list their mechanisms in
+                // `sasl=`; one we cannot use fails every
+                // attempt the same way, so park with the list
+                // instead of collecting a 904.
+                const offered = capValues.get("sasl", "");
+                if (!saslMechanismOffered(offered, saslMechanismName(config.sasl)))
+                    throw new SaslParkedException(parkOnUnsupportedMechanism(offered));
+                emitLog("sasl_start",
+                    "Starting SASL " ~ saslMechanismName(config.sasl) ~ " authentication");
+                logJsonMap("info", "auth",
+                    "SASL starting",
+                    ["network": config.name, "host": config.host,
+                     "port": config.port.to!string,
+                     "mechanism": saslMechanismName(config.sasl),
+                     "event": "sasl_start"]);
+                recordCounter("ircfiber.sasl.start", 1,
+                    ["network": config.name, "host": config.host,
+                     "port": config.port.to!string,
+                     "mechanism": saslMechanismName(config.sasl)]);
+                final switch (config.sasl) {
+                    case SASLMechanism.none: break;
+                    case SASLMechanism.plain:
+                        sendRaw("AUTHENTICATE PLAIN");
+                        break;
+                    case SASLMechanism.external:
+                        sendRaw("AUTHENTICATE EXTERNAL");
+                        break;
+                    case SASLMechanism.scramSha256:
+                        sendRaw("AUTHENTICATE SCRAM-SHA-256");
+                        break;
+                }
+            } else if (!saslDone && config.sasl != SASLMechanism.none
+                && !hasCap("sasl") && capReqOutstanding == 0) {
+                // The server granted caps but NOT sasl — it does
+                // not support SASL on this connection. Fall back to
+                // no-SASL registration instead of deadlocking waiting
+                // for an AUTHENTICATE that will never come (the
+                // 2026-08-12 BLCKND outage: sasl configured, server
+                // never granted it, CAP END never sent, server closed
+                // with "Registration Timeout" after ~40s, forever).
+                logWarn("SASL not granted by %s (server does not offer sasl) — proceeding without SASL",
+                    config.host);
+                saslDone = true;
+            }
+            maybeEndCap(capLine);
+        } else if (sub == "NAK") {
+            if (registered) return;
+            if (capReqOutstanding > 0) --capReqOutstanding;
+            // Ignore NAK'd caps; they just won't be used. If the
+            // server NAK'd the request carrying sasl, the server does
+            // not offer it — proceed without SASL so registration
+            // cannot deadlock (BLCKND outage).
+            if (!saslDone && config.sasl != SASLMechanism.none
+                && capLine.split(" ").canFind("sasl")) {
+                logWarn("SASL NAK'd by %s (server does not offer sasl) — proceeding without SASL",
+                    config.host);
+                saslDone = true;
+            }
+            maybeEndCap("nak: " ~ capLine);
+        } else if (sub == "NEW") {
+            // Server added new caps (cap-notify); request any we want.
+            // UnrealIRCd also uses CAP DEL + CAP NEW to *update* a
+            // value — the multiline max-lines/max-bytes change when
+            // we move between its known-users and unknown-users
+            // groups — so the values have to be re-read here.
+            recordCapValues(capLine);
+            const desired = desiredCapList();
+            foreach (cap; capLine.split(" ")) {
+                auto capName = capNameOf(cap);
+                if (capName.length == 0 || hasCap(capName) || !desired.canFind(capName)) continue;
+                // SASL is a registration-time exchange only.
+                if (registered && capName == "sasl") continue;
+                sendRaw("CAP REQ :" ~ capName);
+                if (!registered && !capEndSent) ++capReqOutstanding;
+            }
+        } else if (sub == "DEL") {
+            // Server removed caps
+            foreach (cap; capLine.split(" ")) {
+                auto capName = capNameOf(cap);
+                ackedCaps.remove(capName);
+                capValues.remove(capName);
+            }
+        }
+    }
+
+    /// Sends `CAP END` once SASL is settled and every registration REQ has
+    /// been answered. With draft/pre-away our away state goes first, so we
+    /// are never seen present after a reconnect.
+    private void maybeEndCap(string acks) {
+        if (capEndSent || !saslDone || capReqOutstanding > 0) return;
+        if (hasCap("draft/pre-away") && isAway && awayMessage.length)
+            sendRaw("AWAY :" ~ awayMessage);
+        sendRaw("CAP END");
+        capEndSent = true;
+        logJsonMap("info", "connection",
+            "CAP negotiation complete",
+            ["network": config.name,
+             "host": config.host, "port": config.port.to!string,
+             "acks": acks,
+             "event": "cap_negotiated"]);
+        recordCounter("ircfiber.cap.negotiated", 1,
+            ["network": config.name, "host": config.host,
+             "port": config.port.to!string]);
+    }
+
+    /// draft/metadata-2: subscribe to every user key we render and publish
+    /// our own (avatar default/override plus the owner's profile keys).
+    private void publishOwnMetadata() {
+        sendRaw("METADATA * SUB " ~ USER_METADATA_KEYS.join(" "));
+        foreach (l; metadataCommands("avatar", "", config.effectiveAvatarUrl())) sendRaw(l);
+        foreach (k; PROFILE_KEYS)
+            foreach (l; metadataCommands(k, "", config.profileMetadata.get(k, ""))) sendRaw(l);
+    }
+
+    /// draft/read-marker just became available: push the stored
+    /// `irc:lastseen` marker of every joined channel. The server keeps a
+    /// marker only when it is newer, so this never moves one backwards.
+    private void reseedReadMarkers() {
+        import ircfiber.irc.chathistory : isoTimestampMs;
+        if (redis is null || ownerId == UUID.init) return;
+        try {
+            auto repo = new LastSeenRepository(redis);
+            foreach (chan; channelState.byKey) {
+                const stored = repo.get(ownerId, config.id.toString() ~ ":" ~ lastSeenBufferKey(chan));
+                if (stored > 0) sendRaw("MARKREAD " ~ chan ~ " timestamp=" ~ isoTimestampMs(stored));
+            }
+        } catch (Exception e) {
+            logWarn("Read-marker re-seed failed for %s: %s", config.name, e.msg);
         }
     }
 
@@ -9710,6 +10104,18 @@ private void processEvents() {
         return ("MONITOR" in isupportMap) !is null;
     }
 
+    /// ISUPPORT `MONITOR=<n>` — the most targets one list may hold; 0 when
+    /// the server gives no number.
+    private size_t monitorLimit() {
+        if (auto v = "MONITOR" in isupportMap) {
+            try {
+                const n = (*v).to!long;
+                if (n > 0) return cast(size_t) n;
+            } catch (Exception) {}
+        }
+        return 0;
+    }
+
     /// Sends a MONITOR command (IRCv3 monitor: + add, - remove,
     /// C clear, L list, S status query). Silent no-op when the server
     /// did not advertise MONITOR or the verb is invalid.
@@ -9720,12 +10126,14 @@ private void processEvents() {
         sendRaw(line);
     }
 
-    /// Sends a realname change (`SETNAME :<realname>`). The spec requires
-    /// servers to accept this even when the setname cap was not
-    /// negotiated, so this sends unconditionally.
-    void sendSetName(string realname) {
-        if (realname.length == 0) return;
-        sendRaw("SETNAME :" ~ realname);
+    /// Pushes a read marker upstream (`MARKREAD <target> timestamp=<iso>`)
+    /// when draft/read-marker is negotiated on a live connection; the
+    /// server keeps it only if it is newer than what it has.
+    void sendMarkRead(string target, long timestampMs) {
+        import ircfiber.irc.chathistory : isoTimestampMs;
+        if (target.length == 0 || timestampMs <= 0) return;
+        if (state != ConnectionState.connected || !hasCap("draft/read-marker")) return;
+        sendRaw("MARKREAD " ~ target ~ " timestamp=" ~ isoTimestampMs(timestampMs));
     }
 
     /// Sends a labeled NOTICE when labeled-response cap is active.
@@ -9783,15 +10191,40 @@ private void processEvents() {
     /// Records the latest/earliest msgid we've observed for a channel
     /// so CHATHISTORY pagination knows where to fetch next. Channel key
     /// is lowercased to match the rest of the codebase's conventions.
-    void recordChannelMsgid(string channel, string msgid) {
+    void recordChannelMsgid(string channel, string msgid, long tsMs) {
         if (channel.length == 0 || msgid.length == 0) return;
         import std.uni : toLower;
         auto key = toLower(channel);
-        if (key !in channelLatestMsgid) channelLatestMsgid[key] = msgid;
-        if (key !in channelEarliestMsgid) channelEarliestMsgid[key] = msgid;
-        // Msgids are RFC-style monotonic: lexicographic > means newer.
-        if (msgid > channelLatestMsgid[key]) channelLatestMsgid[key] = msgid;
-        if (msgid < channelEarliestMsgid[key]) channelEarliestMsgid[key] = msgid;
+        // Msgids are opaque (no ordering); the server-time decides, and a
+        // cursor moves only when the timestamp strictly does.
+        if (key !in channelLatestMsgid || tsMs > channelLatestTs.get(key, long.min)) {
+            channelLatestMsgid[key] = msgid;
+            channelLatestTs[key] = tsMs;
+        }
+        if (key !in channelEarliestMsgid || tsMs < channelEarliestTs.get(key, long.max)) {
+            channelEarliestMsgid[key] = msgid;
+            channelEarliestTs[key] = tsMs;
+        }
+    }
+
+    /// `msgid=<id>` / bare `<id>` (or a comma pair of them) rewritten as
+    /// `timestamp=<iso>` when `<id>` is a cursor we recorded for `key`;
+    /// anything else passes through untouched.
+    private string msgidRefAsTimestamp(string key, string refMsgid) {
+        import ircfiber.irc.chathistory : isoTimestampMs;
+        alias iso = isoTimestampMs;
+        string one(string r) {
+            if (r.length == 0 || r == "*" || r.startsWith("timestamp=")) return r;
+            const id = r.startsWith("msgid=") ? r["msgid=".length .. $] : r;
+            if (channelLatestMsgid.get(key, "") == id)
+                if (auto t = key in channelLatestTs) return "timestamp=" ~ iso(*t);
+            if (channelEarliestMsgid.get(key, "") == id)
+                if (auto t = key in channelEarliestTs) return "timestamp=" ~ iso(*t);
+            return r;
+        }
+        const comma = refMsgid.indexOf(",");
+        if (comma >= 0) return one(refMsgid[0 .. comma]) ~ "," ~ one(refMsgid[comma + 1 .. $]);
+        return one(refMsgid);
     }
 
     /// Returns the latest msgid we've seen for the channel, or "" if none.
@@ -9818,14 +10251,26 @@ private void processEvents() {
     void requestChathistory(string channel, string command, string refMsgid, int limit) {
         if (!hasChathistoryCap()) return;
         import ircfiber.irc.chathistory : buildChathistoryLine;
+        import std.uni : toLower;
+        auto key = toLower(channel);
+        // ISUPPORT CHATHISTORY=<n> is the server's per-request maximum.
+        if (auto mx = "CHATHISTORY" in isupportMap) {
+            int cap;
+            try cap = (*mx).to!int; catch (Exception) {}
+            if (cap > 0 && (limit <= 0 || limit > cap)) limit = cap;
+        }
+        // MSGREFTYPES without `msgid`: the server only takes timestamp
+        // selectors, so a cursor we recorded is sent as its server-time.
+        if (auto rt = "MSGREFTYPES" in isupportMap) {
+            if (!(*rt).split(",").canFind("msgid"))
+                refMsgid = msgidRefAsTimestamp(key, refMsgid);
+        }
         auto line = buildChathistoryLine(command, channel, refMsgid, limit);
         if (line is null) {
             logWarn("Invalid CHATHISTORY request: cmd=%s channel=%s refMsgid=%s",
                 command, channel, refMsgid);
             return;
         }
-        import std.uni : toLower;
-        auto key = toLower(channel);
         // Throttle: at most one in-flight request per channel.
         if (key in chathistoryInFlight) {
             logInfo("CHATHISTORY %s %s already in flight, skipping", command, channel);
@@ -10103,7 +10548,7 @@ unittest {
     assert(lastJoin < firstNick);
 }
 
-@("draft/metadata-2: avatars follow METADATA, NICK and QUIT; replies stay internal")
+@("draft/metadata-2: user/channel keys follow METADATA, NICK and QUIT; replies stay internal")
 unittest {
     import std.typecons : tuple;
     import vibe.core.channel : createChannel;
@@ -10122,6 +10567,10 @@ unittest {
         while (ch.tryConsumeOne(e)) got ~= e;
         return tuple(c, got);
     }
+    static string meta(PersistentIRCClient c, string nick, string key) {
+        if (auto row = nick in c.getUserMetadata()) return (*row).get(key, "");
+        return "";
+    }
 
     // The handler itself: a live update is published, routed to the server log.
     {
@@ -10129,38 +10578,60 @@ unittest {
         auto direct = c.parseIRCLine(":srv METADATA alice avatar * :https://x/a.webp");
         assert(!c.handleMetadataLine(direct));
         assert(direct.channel == "");
-        assert(c.getAvatars()["alice"] == "https://x/a.webp");
+        assert(meta(c, "alice", "avatar") == "https://x/a.webp");
         auto reply = c.parseIRCLine(":srv 761 me me avatar * :https://x/me.webp");
         assert(c.handleMetadataLine(reply), "761 is bookkeeping, not a live push");
     }
 
     // Through processLine: exactly one published event, on the server log.
     auto set = run([":srv METADATA alice avatar * :https://x/a.webp"]);
-    assert(set[0].getAvatars()["alice"] == "https://x/a.webp");
+    assert(meta(set[0], "alice", "avatar") == "https://x/a.webp");
     assert(set[1].length == 1 && set[1][0].command == "METADATA" && set[1][0].channel == "");
 
-    // NICK moves the entry, QUIT drops it.
-    auto renamed = run([":srv METADATA alice avatar * :https://x/a.webp", ":alice!a@h NICK bob"]);
-    assert(("alice" in renamed[0].getAvatars()) is null);
-    assert(renamed[0].getAvatars()["bob"] == "https://x/a.webp");
+    // Every user key we render is kept; NICK moves the entry, QUIT drops it.
+    auto renamed = run([":srv METADATA alice avatar * :https://x/a.webp",
+                        ":srv METADATA alice pronouns * :they/them",
+                        ":alice!a@h NICK bob"]);
+    assert(("alice" in renamed[0].getUserMetadata()) is null);
+    assert(meta(renamed[0], "bob", "avatar") == "https://x/a.webp");
+    assert(meta(renamed[0], "bob", "pronouns") == "they/them");
     auto quit = run([":srv METADATA alice avatar * :https://x/a.webp", ":alice!a@h NICK bob",
                      ":bob!a@h QUIT :bye"]);
-    assert(("bob" in quit[0].getAvatars()) is null);
+    assert(("bob" in quit[0].getUserMetadata()) is null);
 
-    // Unsafe schemes are never stored; a valueless METADATA clears the key.
+    // Invalid values and unknown keys are never stored; a valueless
+    // METADATA clears the key.
     auto bad = run([":srv METADATA carol avatar * :javascript:alert(1)"]);
-    assert(("carol" in bad[0].getAvatars()) is null, "non-http(s) avatar must be rejected");
+    assert(("carol" in bad[0].getUserMetadata()) is null, "non-http(s) avatar must be rejected");
+    auto badColor = run([":s METADATA a color * :red"]);
+    assert(("a" in badColor[0].getUserMetadata()) is null, "color must be #rrggbb");
+    auto unknown = run([":s METADATA a x-secret * :v"]);
+    assert(("a" in unknown[0].getUserMetadata()) is null, "keys outside USER_METADATA_KEYS are dropped");
     auto cleared = run([":srv METADATA carol avatar * :https://x/c.webp",
                         ":srv METADATA carol avatar *"]);
-    assert(("carol" in cleared[0].getAvatars()) is null, "a valueless METADATA clears the key");
+    assert(("carol" in cleared[0].getUserMetadata()) is null, "a valueless METADATA clears the key");
+
+    // Channel keys: stored lowercase, published into the channel.
+    auto chan = run([":s METADATA #C display-name * :Lobby"]);
+    assert(chan[0].getChannelMetadata()["#c"]["display-name"] == "Lobby");
+    assert(chan[1].length == 1 && chan[1][0].channel == "#C");
+    auto chanBad = run([":s METADATA #c pronouns * :they/them"]);
+    assert(("#c" in chanBad[0].getChannelMetadata()) is null, "user-only key on a channel is dropped");
+    // A channel 761 answers a channel SET (possibly a bouncer client's): published.
+    auto chanReply = run([":s 761 me #c display-name * :Lobby"]);
+    assert(chanReply[0].getChannelMetadata()["#c"]["display-name"] == "Lobby");
+    assert(chanReply[1].length == 1 && chanReply[1][0].command == "761");
+    // Our own PART drops the channel's keys.
+    auto parted = run([":me!u@h JOIN #c", ":s METADATA #c display-name * :Lobby", ":me!u@h PART #c"]);
+    assert(("#c" in parted[0].getChannelMetadata()) is null);
 
     // 761/770/KEY_NOT_SET are bookkeeping only, never published.
     auto quiet = run([":srv 761 me me avatar * :https://x/me.webp", ":srv 770 me avatar",
                       ":srv FAIL METADATA KEY_NOT_SET me avatar :key not set"]);
-    assert(quiet[0].getAvatars()["me"] == "https://x/me.webp");
+    assert(meta(quiet[0], "me", "avatar") == "https://x/me.webp");
     assert(quiet[1].length == 0, "761/770/KEY_NOT_SET must not reach the frontend");
     auto self = run([":srv 761 me * avatar * :https://x/self.webp"]);
-    assert(self[0].getAvatars()["me"] == "https://x/self.webp", "`*` target means our own nick");
+    assert(meta(self[0], "me", "avatar") == "https://x/self.webp", "`*` target means our own nick");
 
     // 900/901 track the services account the public registry is keyed by.
     auto login = run([":srv 900 me me!u@h acct :You are now logged in as acct"]);
@@ -10168,4 +10639,235 @@ unittest {
     auto logout = run([":srv 900 me me!u@h acct :You are now logged in as acct",
                        ":srv 901 me me!u@h :You are now logged out"]);
     assert(logout[0].servicesAccount == "");
+}
+
+@("IRCv3 registry: away, WHOX, CHGHOST, ACCOUNT *, batches, ACK, RENAME, FAIL CHATHISTORY, CAP")
+unittest {
+    import std.algorithm : count, filter;
+    import std.array : array;
+    import std.typecons : tuple;
+    import vibe.core.channel : createChannel;
+
+    static auto make() {
+        NetworkConfig cfg;
+        cfg.nick = "me";
+        auto ch = createChannel!IRCRawEvent();
+        return tuple(new PersistentIRCClient(cfg, ch), ch);
+    }
+    static IRCRawEvent[] drain(typeof(make()) t) {
+        t[1].close(); // an open, empty channel blocks tryConsumeOne
+        IRCRawEvent[] got;
+        IRCRawEvent e;
+        while (t[1].tryConsumeOne(e)) got ~= e;
+        return got;
+    }
+    static auto run(string[] lines) {
+        auto t = make();
+        foreach (l; lines) t[0].processLine(l);
+        return tuple(t[0], drain(t));
+    }
+
+    // AWAY: text → stored; no text → present again.
+    auto aw = run([":a!u@h AWAY :lunch"]);
+    assert(aw[0].getAway()["a"] == "lunch");
+    auto back = run([":a!u@h AWAY :lunch", ":a!u@h AWAY"]);
+    assert(("a" in back[0].getAway()) is null);
+    // QUIT and NICK keep the map in step.
+    auto awNick = run([":a!u@h AWAY :lunch", ":a!u@h NICK b"]);
+    assert(("a" in awNick[0].getAway()) is null && awNick[0].getAway()["b"] == "lunch");
+    auto awQuit = run([":a!u@h AWAY :lunch", ":a!u@h QUIT :x"]);
+    assert(("a" in awQuit[0].getAway()) is null);
+
+    // Our own 306 keeps the message we set, not the server's text.
+    {
+        auto t = make();
+        t[0].sendRaw("AWAY :brb");
+        t[0].processLine(":s 306 me :You have been marked as being away");
+        assert(t[0].isAway && t[0].awayMessage == "brb");
+        drain(t);
+    }
+
+    // WHOX 152: away, bot, account, ident from one row.
+    auto whox = run([":s 005 me WHOX BOT=b :are supported",
+                     ":s 354 me 152 #c ident host bob Gb acct :Real Name"]);
+    assert(("bob" in whox[0].getAway()) !is null);
+    assert(("bob" in whox[0].getBots()) !is null);
+    assert(whox[0].getAccounts()["bob"] == "acct");
+    assert(whox[0].getIdents()["bob"] == "ident");
+    assert(whox[0].getRealnames()["bob"] == "Real Name");
+    assert(whox[1].count!(e => e.command == "354") == 0, "354 is never published");
+    // A later row without the flags: present, not a bot, logged out.
+    auto whox2 = run([":s 005 me WHOX BOT=b :are supported",
+                      ":s 354 me 152 #c ident host bob Gb acct :Real Name",
+                      ":s 354 me 152 #c ident host bob H 0 :Real Name"]);
+    assert(("bob" in whox2[0].getAway()) is null);
+    assert(("bob" in whox2[0].getBots()) is null);
+    assert(("bob" in whox2[0].getAccounts()) is null);
+    // whoLine asks for WHOX only when the server has it.
+    assert(whox[0].whoLine("#c") == "WHO #c %tcuhnfar,152");
+    assert(run([])[0].whoLine("#c") == "WHO #c");
+
+    // CHGHOST rewrites every roster entry for the nick.
+    auto chg = run([":me!u@h JOIN #c", ":me!u@h JOIN #d", ":a!u@h JOIN #c", ":a!u@h JOIN #d",
+                    ":a!u@h CHGHOST nu nh"]);
+    foreach (chan; ["#c", "#d"])
+        assert(chg[0].getChannelUsers()[chan].canFind("a!nu@nh"), chan);
+    assert(chg[0].getIdents()["a"] == "nu");
+
+    // ACCOUNT * logs out.
+    auto acct = run([":a!u@h ACCOUNT acct", ":a!u@h ACCOUNT *"]);
+    assert(("a" in acct[0].getAccounts()) is null);
+
+    // A live line whose batch is unknown is not history, even while a
+    // chathistory batch is open.
+    auto hist = run(["BATCH +x chathistory #c", "@batch=y :s PRIVMSG #c :live",
+                     "@batch=x :s PRIVMSG #c :old", "BATCH -x"]);
+    auto msgs = hist[1].filter!(e => e.command == "PRIVMSG").array;
+    assert(msgs.length == 2);
+    assert(msgs[0].text == "live" && msgs[0].getTag("batch") != "chathistory");
+    assert(msgs[1].text == "old" && msgs[1].getTag("batch") == "chathistory");
+
+    // draft/multiline: one message per batch, concat honoured.
+    auto ml = run(["BATCH +m draft/multiline #c", "@batch=m :a!u@h PRIVMSG #c :one",
+                   "@batch=m;draft/multiline-concat :a!u@h PRIVMSG #c :two", "BATCH -m"]);
+    auto mlMsgs = ml[1].filter!(e => e.command == "PRIVMSG").array;
+    assert(mlMsgs.length == 1 && mlMsgs[0].text == "onetwo", mlMsgs.length ? mlMsgs[0].text : "none");
+    auto ml2 = run(["BATCH +m draft/multiline #c", "@batch=m :a!u@h PRIVMSG #c :one",
+                    "@batch=m :a!u@h PRIVMSG #c :two", "BATCH -m"]);
+    auto ml2Msgs = ml2[1].filter!(e => e.command == "PRIVMSG").array;
+    assert(ml2Msgs.length == 1 && ml2Msgs[0].text == "one\ntwo");
+    assert(ml2Msgs[0].channel == "#c");
+
+    // labeled-response: ACK clears the label and is never published; a
+    // label on a labeled-response batch reaches the inner lines.
+    {
+        auto t = make();
+        t[0].pendingLabels["L1"] = 1;
+        t[0].processLine("@label=L1 :s ACK");
+        assert(!t[0].isPendingLabel("L1"));
+        assert(drain(t).length == 0);
+    }
+    {
+        auto t = make();
+        t[0].pendingLabels["L2"] = 1;
+        t[0].processLine("@label=L2 BATCH +b labeled-response");
+        t[0].processLine("@batch=b :s FAIL PRIVMSG CANNOT_SEND #c :nope");
+        t[0].processLine("BATCH -b");
+        auto got = drain(t);
+        assert(!t[0].isPendingLabel("L2"));
+        assert(got.length == 1 && got[0].getTag("label") == "L2");
+    }
+
+    // RENAME moves every per-channel fact and is published under the new name.
+    {
+        auto t = make();
+        t[0].processLine(":me!u@h JOIN #old");
+        t[0].processLine(":a!u@h JOIN #old");
+        t[0].processLine(":s METADATA #old display-name * :Lobby");
+        t[0].processLine(":me!u@h RENAME #old #new :r");
+        auto c = t[0];
+        assert(("#old" in c.channelState) is null && ("#new" in c.channelState) !is null);
+        assert(("#old" in c.channelUsers) is null && c.channelUsers["#new"].length == 2);
+        assert(!c.config.autoJoinChannels.canFind("#old") && c.config.autoJoinChannels.canFind("#new"));
+        assert(c.getChannelMetadata()["#new"]["display-name"] == "Lobby");
+        auto got = drain(t);
+        auto ren = got.filter!(e => e.command == "RENAME").array;
+        assert(ren.length == 1 && ren[0].channel == "#new");
+    }
+
+    // FAIL CHATHISTORY releases the in-flight slot.
+    {
+        auto t = make();
+        t[0].ackedCaps["draft/chathistory"] = true;
+        t[0].requestChathistory("#c", "LATEST", "", 50);
+        assert(t[0].isChathistoryInFlight("#c"));
+        t[0].processLine(":s FAIL CHATHISTORY INVALID_TARGET LATEST #c :x");
+        assert(!t[0].isChathistoryInFlight("#c"));
+        drain(t);
+    }
+    // CHATHISTORY= clamps the limit; MSGREFTYPES without msgid uses timestamps.
+    {
+        auto t = make();
+        t[0].ackedCaps["draft/chathistory"] = true;
+        t[0].processLine(":s 005 me CHATHISTORY=20 MSGREFTYPES=timestamp :are supported");
+        t[0].recordChannelMsgid("#c", "abc", 1_788_750_000_000);
+        t[0].requestChathistory("#c", "BEFORE", "abc", 100);
+        assert(t[0].outboundQueue[$ - 1] == "CHATHISTORY BEFORE #c timestamp=2026-09-07T03:00:00.000Z 20",
+               t[0].outboundQueue[$ - 1]);
+        drain(t);
+    }
+    // Msgid cursors move by server-time, not by string order.
+    {
+        auto t = make();
+        t[0].recordChannelMsgid("#c", "zzz", 100);
+        t[0].recordChannelMsgid("#c", "aaa", 200);
+        t[0].recordChannelMsgid("#c", "mmm", 50);
+        assert(t[0].getLatestMsgid("#c") == "aaa" && t[0].getEarliestMsgid("#c") == "mmm");
+        drain(t);
+    }
+
+    // CAP after registration: NEW requests, ACK/DEL track the cap set.
+    {
+        auto t = make();
+        t[0].processLine(":s CAP me NEW :draft/read-marker");
+        assert(t[0].outboundQueue.canFind("CAP REQ :draft/read-marker"));
+        t[0].processLine(":s CAP me ACK :draft/read-marker");
+        assert(t[0].hasCap("draft/read-marker"));
+        t[0].processLine(":s CAP me DEL :draft/read-marker");
+        assert(!t[0].hasCap("draft/read-marker"));
+        auto got = drain(t);
+        assert(got.count!(e => e.command == "CAP") == 3, "post-registration CAP lines are published");
+    }
+    // A post-registration NEW never re-opens SASL.
+    {
+        NetworkConfig cfg;
+        cfg.nick = "me";
+        cfg.sasl = SASLMechanism.plain;
+        auto ch = createChannel!IRCRawEvent();
+        auto c = new PersistentIRCClient(cfg, ch);
+        c.processLine(":s CAP me NEW :sasl");
+        assert(!c.outboundQueue.canFind("CAP REQ :sasl"));
+        ch.close();
+    }
+
+    // Registration-time split REQ: stable and draft caps go out separately
+    // and CAP END waits for both answers.
+    {
+        auto t = make();
+        auto c = t[0];
+        c.saslDone = true;
+        auto ls = c.parseIRCLine(":s CAP * LS :multi-prefix server-time draft/multiline chathistory draft/pre-away");
+        c.handleCapLine(ls, false);
+        assert(c.outboundQueue.canFind("CAP REQ :multi-prefix server-time"));
+        assert(c.outboundQueue.canFind("CAP REQ :chathistory draft/multiline draft/pre-away"));
+        assert(c.capReqOutstanding == 2);
+        auto ack1 = c.parseIRCLine(":s CAP * ACK :multi-prefix server-time");
+        c.handleCapLine(ack1, false);
+        assert(!c.outboundQueue.canFind("CAP END"));
+        c.isAway = true;
+        c.awayMessage = "gone";
+        auto nak2 = c.parseIRCLine(":s CAP * NAK :chathistory draft/multiline draft/pre-away");
+        c.handleCapLine(nak2, false);
+        assert(c.outboundQueue[$ - 1] == "CAP END");
+        assert(!c.outboundQueue.canFind("AWAY :gone"), "no pre-away without the cap");
+        drain(t);
+    }
+    {
+        auto t = make();
+        auto c = t[0];
+        c.saslDone = true;
+        c.isAway = true;
+        c.awayMessage = "gone";
+        auto ls = c.parseIRCLine(":s CAP * LS :draft/pre-away draft/extended-isupport");
+        c.handleCapLine(ls, false);
+        auto ack = c.parseIRCLine(":s CAP * ACK :draft/pre-away draft/extended-isupport");
+        c.handleCapLine(ack, false);
+        const n = c.outboundQueue.length;
+        assert(c.outboundQueue[n - 3 .. n] == ["ISUPPORT", "AWAY :gone", "CAP END"], c.outboundQueue.join(" | "));
+        drain(t);
+    }
+
+    // ISUPPORT removal tokens drop the key.
+    auto isup = run([":s 005 me MONITOR=100 WHOX :are supported", ":s 005 me -WHOX :are supported"]);
+    assert(("WHOX" in isup[0].getIsupport()) is null && isup[0].getIsupport()["MONITOR"] == "100");
 }
