@@ -4,11 +4,11 @@
 module ircfiber.metadata;
 
 /// Registry user keys we store and surface (https://ircv3.net/registry#metadata-keys).
-immutable string[] USER_METADATA_KEYS = ["avatar", "bot", "color", "display-name", "homepage", "pronouns", "status"];
+immutable string[] USER_METADATA_KEYS = ["avatar", "bot", "display-name", "homepage", "status"];
 /// Registry channel keys we store and surface.
 immutable string[] CHANNEL_METADATA_KEYS = ["avatar", "display-name"];
 /// Keys a user may set on themselves via the web UI or the bouncer.
-immutable string[] PROFILE_KEYS = ["display-name", "pronouns", "status", "homepage", "color"]; // user-settable via web/bouncer
+immutable string[] PROFILE_KEYS = ["display-name", "status", "homepage"]; // user-settable via web/bouncer
 /// Matches the ircd's advertised `draft/metadata-2=max-value-bytes=512`.
 enum MAX_METADATA_VALUE_BYTES = 512;
 

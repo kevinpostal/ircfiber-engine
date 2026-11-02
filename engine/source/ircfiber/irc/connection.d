@@ -4425,6 +4425,75 @@ final class PersistentIRCClient {
         }
     }
 
+    /// SuperNets' and similar servers' channel-targeted flood complaint
+    /// rides numeric 405 (isFloodNotice(event.text) matched, not a genuine
+    /// ERR_TOOMANYCHANNELS — see the case "405" handler). Unlike the 421
+    /// throttle window (an explicit "wait N seconds from connect" the
+    /// server states), a flood complaint gives no explicit window, so the
+    /// wait is computed from the pacer's own documented fake-lag/recvq
+    /// model (pacer.d) via its real `waitMs()` — not guessed — using the
+    /// exact bytes the re-sent JOIN batch will cost. `onFloodComplaint`
+    /// (called just before this) already ran `tighten()`, which primes
+    /// `minIntervalMs` (doubled per complaint, capped at 4s) and
+    /// `lastSendMs`, so `waitMs()` here returns that modelled floor
+    /// immediately — the same quantity the paced PRIVMSG/NOTICE queue
+    /// already waits on in `drainPacedQueue`, applied to JOIN for once.
+    /// Reuses the same bounded-rounds safety net as
+    /// scheduleJoinThrottleRetry (shared joinThrottleRounds counter: a
+    /// server that will not stop complaining must never turn into a JOIN
+    /// loop either way) and the same one-batched-JOIN re-send.
+    ///
+    /// Prod incident 2026-11-02: 9 SuperNets auto-join channels batched
+    /// into one JOIN; the server's flood complaint named #superbowl in a
+    /// 405 and the old handler dropped it from joinsAwaitingConfirm with
+    /// no retry — 8 of 9 channels landed, #superbowl never did.
+    private void scheduleFloodJoinRetry() nothrow {
+        if (joinThrottleRetryInFlight) return;
+        if (joinThrottleRounds >= MAX_JOIN_THROTTLE_ROUNDS) return;
+        if (joinsAwaitingConfirm.length == 0) return;
+        joinThrottleRounds++;
+        joinThrottleRetryInFlight = true;
+        long waitMs = 2000;
+        try {
+            auto batches = joinBatches(joinsAwaitingConfirm);
+            if (batches.length > 0) {
+                // "JOIN " + batch + CRLF — the exact bytes writeRaw charges.
+                const cmdBytes = ("JOIN " ~ batches[0]).length + 2;
+                const modeled = pacer.waitMs(cmdBytes, nowMsSafe());
+                waitMs = modeled > 0 ? modeled : pacer.limits().penaltyMs;
+            }
+        } catch (Exception) {}
+        if (waitMs < 500) waitMs = 500;
+        try {
+            logJsonMap("warn", "connection",
+                "JOIN flood-complained — retrying after the pacer's backoff",
+                ["network": config.name,
+                 "channels": joinsAwaitingConfirm.join(","),
+                 "round": joinThrottleRounds.to!string,
+                 "waitMs": waitMs.to!string,
+                 "event": "join_flood_retry"]);
+            runTask({
+                try {
+                    sleep(waitMs.msecs);
+                    scope(exit) joinThrottleRetryInFlight = false;
+                    if (state != ConnectionState.connected) return;
+                    // Anything confirmed or refused while we waited is gone
+                    // from the pending set — never re-ask for it.
+                    auto batches = joinBatches(joinsAwaitingConfirm);
+                    if (batches.length == 0) return;
+                    logInfo("Re-sending flood-complained JOIN(s) for %s as one command: %s",
+                        config.name, batches[0]);
+                    sendRaw("JOIN " ~ batches[0]);
+                } catch (Exception e) {
+                    joinThrottleRetryInFlight = false;
+                    logWarn("Flood JOIN retry failed for %s: %s", config.name, e.msg);
+                }
+            });
+        } catch (Exception) {
+            joinThrottleRetryInFlight = false;
+        }
+    }
+
     /// Drops this client's slot refcount if it holds one. Idempotent by
     /// construction — `egressSlotHeld` is cleared before the release.
     private void releaseEgressSlot() nothrow {
@@ -7420,17 +7489,28 @@ private void processEvents() {
             // SuperNets' channel-targeted flood warning rides numeric 405
             // (ERR_TOOMANYCHANNELS is its RFC meaning, but this ircd reuses
             // it for ":<server> 405 <nick> <channel> :<flood text>", e.g.
-            // the colourised "slow down nerd" — see the unittest below).
-            // Still clears a pending join the same as any other channel
-            // refusal above; additionally arms the pacer when
-            // isFloodNotice(event.text) matches, narrow enough that a real
-            // ERR_TOOMANYCHANNELS ("You have joined too many channels") on
-            // another network is never mistaken for a flood signal.
+            // the colourised "slow down nerd" — see the unittests below).
+            // isFloodNotice(event.text) tells the two cases apart, narrow
+            // enough that a real ERR_TOOMANYCHANNELS ("You have joined too
+            // many channels") on another network is never mistaken for a
+            // flood signal:
+            //   - flood match: NOT a real refusal — the channel stays in
+            //     joinsAwaitingConfirm and gets the same bounded
+            //     throttle-retry as 421, instead of being abandoned.
+            //     Prod incident 2026-11-02: the previous unconditional
+            //     clearPendingJoin lost 1 of 9 SuperNets auto-join
+            //     channels (#superbowl) to exactly this with no retry.
+            //   - no match: a genuine refusal, cleared like 403/471/.../489
+            //     above — waiting will not fix it.
             case "405": {
                 auto ps = event.getParams();
-                if (ps.length > 1) clearPendingJoin(ps[1]);
-                if (isFloodNotice(event.text))
+                const channelName = ps.length > 1 ? ps[1] : "";
+                if (isFloodNotice(event.text)) {
                     onFloodComplaint("405", event.text);
+                    scheduleFloodJoinRetry();
+                } else if (channelName.length > 0) {
+                    clearPendingJoin(channelName);
+                }
                 break;
             }
             case "433": // ERR_NICKNAMEINUSE
@@ -10443,7 +10523,7 @@ unittest {
            "this is exactly the notice the pacer must arm on — regression for the nick==hostname bug");
 }
 
-@("SuperNets' flood-complaint numeric 405 (\"slow down nerd\") arms the pacer like a flood NOTICE")
+@("SuperNets' flood-complaint numeric 405 (\"slow down nerd\") arms the pacer and keeps #superbowl pending for retry")
 unittest {
     import vibe.core.channel : createChannel;
     NetworkConfig cfg;
@@ -10451,10 +10531,67 @@ unittest {
     auto ch = createChannel!IRCRawEvent();
     auto c = new PersistentIRCClient(cfg, ch);
     assert(!c.pacer.isArmed(), "fresh client starts unarmed");
+    // The autojoin burst recorded #superbowl as awaiting confirmation —
+    // sendRaw is safe to call pre-connect, it just queues the line.
+    c.sendRaw("JOIN #superbowl");
+    assert(c.joinsAwaitingConfirm == ["#superbowl"], "JOIN must record the pending channel");
     c.processLine(":contra.supernets.org 405 Zodiac #superbowl :\x1F\x0304slow down nerd\x0F");
     assert(c.pacer.isArmed(),
            "a channel-targeted 405 carrying a flood phrase must tighten the pacer");
+    // UNKNOWN_USER_LIMITS.penaltyMs=1000 doubled once by tighten() — the
+    // retry's wait comes from pacer.waitMs(), which is driven by this
+    // exact UnrealIRCd-documented formula, not a hardcoded guess.
+    assert(c.pacer.limits().penaltyMs == 2000,
+           "one complaint must double the modelled per-command penalty exactly as pacer.d documents");
+    // Prod incident 2026-11-02: the old handler unconditionally called
+    // clearPendingJoin here, so #superbowl was silently abandoned — 8 of
+    // 9 SuperNets auto-join channels landed, this one never did and
+    // nothing ever retried it.
+    assert(c.joinsAwaitingConfirm == ["#superbowl"],
+           "a flood complaint is not a real refusal — #superbowl must stay pending for the retry, not be abandoned");
+    assert(c.joinThrottleRetryInFlight,
+           "the flood complaint must schedule a bounded retry, mirroring the 421 throttle path");
     ch.close();
+}
+
+@("a genuine (non-flood) 405 ERR_TOOMANYCHANNELS still clears the pending join")
+unittest {
+    import vibe.core.channel : createChannel;
+    NetworkConfig cfg;
+    cfg.nick = "Zodiac";
+    auto ch = createChannel!IRCRawEvent();
+    auto c = new PersistentIRCClient(cfg, ch);
+    c.sendRaw("JOIN #toomany");
+    assert(c.joinsAwaitingConfirm == ["#toomany"]);
+    c.processLine(":irc.example.net 405 Zodiac #toomany :You have joined too many channels");
+    assert(!c.pacer.isArmed(), "a genuine ERR_TOOMANYCHANNELS is not a flood signal");
+    assert(c.joinsAwaitingConfirm.length == 0,
+           "a real refusal must still be cleared — waiting will not fix it");
+    assert(!c.joinThrottleRetryInFlight, "no retry for a channel that was genuinely refused");
+    ch.close();
+}
+
+@("flood retry wait comes from the pacer's modelled minIntervalMs, not a naive penaltyMs read")
+unittest {
+    import vibe.core.channel : createChannel;
+    NetworkConfig cfg;
+    cfg.nick = "Zodiac";
+    auto ch = createChannel!IRCRawEvent();
+    auto c = new PersistentIRCClient(cfg, ch);
+    // Three complaints: penaltyMs doubles to its own 8s ceiling while
+    // minIntervalMs doubles to its OWN, separate 4s ceiling — pacer.d's
+    // two independently-capped formulas. A naive "wait penaltyMs" read
+    // (the pre-fix code) would wait 8s here; the real modelled wait
+    // (what pacer.waitMs() returns, and what scheduleFloodJoinRetry now
+    // asks for) is 4s, because minIntervalMs — not penaltyMs — is the
+    // quantity that actually gates the next send.
+    const now = 1_000_000L;
+    c.pacer.tighten(now);
+    c.pacer.tighten(now);
+    c.pacer.tighten(now);
+    assert(c.pacer.limits().penaltyMs == 8000, "penaltyMs doubles to its 8s ceiling after 3 complaints");
+    assert(c.pacer.waitMs(100, now) == 4000,
+           "the real gate is minIntervalMs's separate 4s ceiling — a naive penaltyMs read would wait twice as long as the server actually requires");
 }
 
 @("firstPartyDirectOnly keeps first-party off shared exits")
@@ -10683,11 +10820,11 @@ unittest {
 
     // Every user key we render is kept; NICK moves the entry, QUIT drops it.
     auto renamed = run([":srv METADATA alice avatar * :https://x/a.webp",
-                        ":srv METADATA alice pronouns * :they/them",
+                        ":srv METADATA alice status * :on holiday",
                         ":alice!a@h NICK bob"]);
     assert(("alice" in renamed[0].getUserMetadata()) is null);
     assert(meta(renamed[0], "bob", "avatar") == "https://x/a.webp");
-    assert(meta(renamed[0], "bob", "pronouns") == "they/them");
+    assert(meta(renamed[0], "bob", "status") == "on holiday");
     auto quit = run([":srv METADATA alice avatar * :https://x/a.webp", ":alice!a@h NICK bob",
                      ":bob!a@h QUIT :bye"]);
     assert(("bob" in quit[0].getUserMetadata()) is null);
@@ -10696,8 +10833,6 @@ unittest {
     // METADATA clears the key.
     auto bad = run([":srv METADATA carol avatar * :javascript:alert(1)"]);
     assert(("carol" in bad[0].getUserMetadata()) is null, "non-http(s) avatar must be rejected");
-    auto badColor = run([":s METADATA a color * :red"]);
-    assert(("a" in badColor[0].getUserMetadata()) is null, "color must be #rrggbb");
     auto unknown = run([":s METADATA a x-secret * :v"]);
     assert(("a" in unknown[0].getUserMetadata()) is null, "keys outside USER_METADATA_KEYS are dropped");
     auto cleared = run([":srv METADATA carol avatar * :https://x/c.webp",
