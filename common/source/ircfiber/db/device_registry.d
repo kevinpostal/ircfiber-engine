@@ -6,10 +6,11 @@ import vibe.data.bson;
 import vibe.core.log;
 import ircfiber.db.mongo : AppMongoConnection;
 
-/// Latest known state of one mobile install, across every account — the
-/// admin fleet directory. `UserPreferences.devices` (Redis, per-user) is
-/// the source of truth for sync/settings; this is a denormalized read model
-/// for cross-user admin queries, upserted on every check-in alongside it.
+/// Latest known state of one client install (iOS app or web browser), across
+/// every account — the admin fleet directory. `UserPreferences.devices`
+/// (Redis, per-user) is the source of truth for sync/settings; this is a
+/// denormalized read model for cross-user admin queries, upserted on every
+/// check-in alongside it.
 struct DeviceRegistryEntry {
     string deviceId;      // _id
     string userId;
@@ -20,12 +21,17 @@ struct DeviceRegistryEntry {
     string lastIp;
     long createdAt;
     long lastSeenAt;
+    /// `"web"` or `"app"` (`DeviceProfile.kind`); documents written before it read as `"app"`.
+    string kind = "app";
+    /// Display name: the user's label, else the client's automatic one; "" when neither.
+    string name;
 
     Bson toBson() const @trusted {
         return Bson([
             "_id": Bson(deviceId), "userId": Bson(userId), "username": Bson(username),
             "model": Bson(model), "osVersion": Bson(osVersion), "appVersion": Bson(appVersion),
             "lastIp": Bson(lastIp), "createdAt": Bson(createdAt), "lastSeenAt": Bson(lastSeenAt),
+            "kind": Bson(kind), "name": Bson(name),
         ]);
     }
 
@@ -40,6 +46,10 @@ struct DeviceRegistryEntry {
         e.lastIp = b["lastIp"].get!string;
         e.createdAt = b["createdAt"].get!long;
         e.lastSeenAt = b["lastSeenAt"].get!long;
+        const kind = b.tryIndex("kind");
+        if (!kind.isNull && kind.get.type == Bson.Type.string) e.kind = kind.get.get!string;
+        const name = b.tryIndex("name");
+        if (!name.isNull && name.get.type == Bson.Type.string) e.name = name.get.get!string;
         return e;
     }
 }
@@ -74,6 +84,8 @@ final class DeviceRegistryRepository {
         setDoc["appVersion"] = Bson(e.appVersion);
         setDoc["lastIp"] = Bson(e.lastIp);
         setDoc["lastSeenAt"] = Bson(e.lastSeenAt);
+        setDoc["kind"] = Bson(e.kind);
+        setDoc["name"] = Bson(e.name);
         auto selector = Bson(["_id": Bson(e.deviceId)]);
         if (collection.updateOne(selector, Bson(["$set": setDoc])).matchedCount > 0) return;
         auto fresh = e;

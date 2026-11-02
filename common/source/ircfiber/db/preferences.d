@@ -103,14 +103,25 @@ immutable string[] DISPLAY_MODE_INDICATORS = ["dots", "symbols", "hidden"];
 immutable string[] DISPLAY_TIMESTAMP_FORMATS = ["auto", "12h", "24h"];
 /// The boolean account display prefs, in wire order.
 immutable string[] DISPLAY_BOOL_PREFS = ["showUserIcons", "monospaceFont", "enlargeEmoji", "coloriseMentions", "formatColors", "showTimestamps"];
-/// Mobile device profiles kept per account; creating one past this drops the one seen least recently.
-enum MAX_DEVICE_PROFILES = 20;
-/// The iOS app's install id header; selects the device's own settings profile.
+/// Device profiles kept per account (web browsers and app installs); creating one past this
+/// drops the least recently seen web profile, or the least recently seen of any kind when none is web.
+enum MAX_DEVICE_PROFILES = 40;
+/// A client install's id header (iOS app install or web browser); selects the device's own settings profile.
 enum DEVICE_HEADER = "X-IRCFiber-Device";
-/// The iOS app's hardware model header (`iPhone17,1`), shown in Settings → Sessions → Mobile devices.
+/// The iOS app's hardware model header (`iPhone17,1`), shown in Settings → Sessions → Devices.
 enum DEVICE_MODEL_HEADER = "X-IRCFiber-Device-Model";
 enum DEVICE_OS_VERSION_HEADER = "X-IRCFiber-Device-OS";
 enum DEVICE_APP_VERSION_HEADER = "X-IRCFiber-Device-App-Version";
+/// `web` or `app`; absent or any other value means `app` (the iOS app predates the header).
+enum DEVICE_KIND_HEADER = "X-IRCFiber-Device-Kind";
+/// The client's automatic label (`Chrome on macOS`), stored as `DeviceProfile.autoName`.
+enum DEVICE_NAME_HEADER = "X-IRCFiber-Device-Name";
+/// `DeviceProfile.kind` values.
+enum DEVICE_KIND_WEB = "web";
+/// ditto
+enum DEVICE_KIND_APP = "app";
+/// Longest device name (user-chosen or automatic) in bytes.
+enum MAX_DEVICE_NAME_BYTES = 64;
 /// `lastSeenAt` is rewritten at most this often by reads, so GET /api/me stays read-only in steady state.
 enum long DEVICE_SEEN_GRANULARITY_MS = 3_600_000;
 /// Bool fields a device profile shares with the account's flat fields, in wire order.
@@ -123,7 +134,45 @@ immutable string[] NOTIFICATION_PREFS = ["desktopNotifications", "notificationSo
 enum MAX_HIGHLIGHT_WORDS = 100;
 enum MAX_HIGHLIGHT_WORD_BYTES = 64;
 
-/// One iOS install's own display, member-list and notification settings (`UserPreferences.devices`).
+/// How a `clientPrefs` value is validated.
+enum ClientPrefKind { bool_, enum_, int_, intEnum, string_ }
+
+/// One `clientPrefs` key: its kind and allowed values (`options` for enum_,
+/// `min`..`max` for int_ (inclusive) and the byte cap for string_ (`max`), `ints` for intEnum).
+struct ClientPrefSpec {
+    string key;
+    ClientPrefKind kind;
+    immutable(string)[] options;
+    long min;
+    long max;
+    immutable(long)[] ints;
+}
+
+/// Per-device web client prefs, in wire order (the frontend keeps the identical list).
+immutable ClientPrefSpec[] CLIENT_PREFS = [
+    ClientPrefSpec("theme", ClientPrefKind.enum_, ["dark", "midnight", "dusk", "tropic", "emerald", "sand", "orchid"]),
+    ClientPrefSpec("fontSize", ClientPrefKind.int_, null, 10, 18),
+    ClientPrefSpec("compactMode", ClientPrefKind.bool_),
+    ClientPrefSpec("sidebarLeft", ClientPrefKind.bool_),
+    ClientPrefSpec("messageLayout", ClientPrefKind.enum_, ["compact", "comfortable", "separate"]),
+    ClientPrefSpec("customCSS", ClientPrefKind.string_, null, 0, 32_768),
+    ClientPrefSpec("defaultScrollPreset", ClientPrefKind.int_, null, 0, 4),
+    ClientPrefSpec("inlineImages", ClientPrefKind.bool_),
+    ClientPrefSpec("inlineVideos", ClientPrefKind.bool_),
+    ClientPrefSpec("inlinePastes", ClientPrefKind.bool_),
+    ClientPrefSpec("autoplayMedia", ClientPrefKind.bool_),
+    ClientPrefSpec("linkPreviewSize", ClientPrefKind.enum_, ["small", "medium", "large"]),
+    ClientPrefSpec("groupConsecutiveMessages", ClientPrefKind.bool_),
+    ClientPrefSpec("typingIndicator", ClientPrefKind.bool_),
+    ClientPrefSpec("showOthersTyping", ClientPrefKind.bool_),
+    ClientPrefSpec("markAwayWhenInactive", ClientPrefKind.bool_),
+    ClientPrefSpec("awayAfterMinutes", ClientPrefKind.intEnum, null, 0, 0, [5, 15, 30, 60]),
+    ClientPrefSpec("removeTrackers", ClientPrefKind.bool_),
+    ClientPrefSpec("blurUnrecognizedLinks", ClientPrefKind.bool_),
+];
+
+/// One client install's own display, member-list, notification and web client settings
+/// (`UserPreferences.devices`): an iOS app install or a web browser.
 /// The settings fields have the names, types and defaults of the account's flat fields, so
 /// `displayPrefsJson`, `applyDisplayPrefsPatch` and `applyNotificationPatch` take either.
 struct DeviceProfile {
@@ -163,6 +212,18 @@ struct DeviceProfile {
     string appVersion;
     /// Client IP at the device's last request (`getClientIp`); "" until known.
     string lastIp;
+    /// `DEVICE_KIND_WEB` or `DEVICE_KIND_APP`; fixed when the profile is created.
+    string kind = DEVICE_KIND_APP;
+    /// The user's label from Settings → Sessions → Devices; "" = none (show `autoName`/`model`).
+    string name;
+    /// The client's automatic label from `DEVICE_NAME_HEADER` (`Chrome on macOS`); "" until sent.
+    string autoName;
+    /// This device's web client prefs (`CLIENT_PREFS` keys only; a missing key is the client default).
+    /// Replaced, never mutated in place: struct copies share the object.
+    Json clientPrefs = Json.emptyObject;
+    /// False until this device first writes `clientPrefs` (or a reset/defaults copy sets them), so
+    /// a browser that already had local prefs pushes them instead of taking the account's.
+    bool clientPrefsSet = false;
 
     /// Serializes every field under its own name.
     Json toJson() const {
@@ -180,6 +241,11 @@ struct DeviceProfile {
         j["osVersion"] = Json(osVersion);
         j["appVersion"] = Json(appVersion);
         j["lastIp"] = Json(lastIp);
+        j["kind"] = Json(kind);
+        j["name"] = Json(name);
+        j["autoName"] = Json(autoName);
+        j["clientPrefs"] = clientPrefs.clone;
+        j["clientPrefsSet"] = Json(clientPrefsSet);
         return j;
     }
 
@@ -250,6 +316,32 @@ struct DeviceProfile {
         if (auto v = "lastIp" in j) {
             if (v.type == Json.Type.string)
                 d.lastIp = v.get!string;
+            else
+                bad = true;
+        }
+        if (auto v = "kind" in j) {
+            if (v.type == Json.Type.string && (v.get!string == DEVICE_KIND_WEB || v.get!string == DEVICE_KIND_APP))
+                d.kind = v.get!string;
+            else
+                bad = true;
+        }
+        static foreach (key; ["name", "autoName"]) {
+            if (auto v = key in j) {
+                // "" is a stored "no name", not damage.
+                if (v.type == Json.Type.string && (v.get!string.length == 0 || isDeviceName(v.get!string)))
+                    __traits(getMember, d, key) = v.get!string;
+                else
+                    bad = true;
+            }
+        }
+        if (auto v = "clientPrefs" in j) {
+            bool cpBad;
+            d.clientPrefs = sanitizeClientPrefs(*v, cpBad);
+            if (cpBad) bad = true;
+        }
+        if (auto v = "clientPrefsSet" in j) {
+            if (v.type == Json.Type.bool_)
+                d.clientPrefsSet = v.get!bool;
             else
                 bad = true;
         }
@@ -344,9 +436,13 @@ struct UserPreferences {
     /// Account UI language: "" follows the browser/device, else a SUPPORTED_LANGUAGES code.
     /// Account-wide (web and every iOS install); not part of DeviceProfile.
     string language = "";
-    /// Each iOS install's own settings, keyed by its lower-case install id (`X-IRCFiber-Device`);
-    /// the flat fields above are the web's.
+    /// Each client install's own settings (iOS app installs and web browsers), keyed by its
+    /// lower-case install id (`X-IRCFiber-Device`); the flat fields above are the account's,
+    /// the defaults a new device starts from (and what header-less clients read and write).
     DeviceProfile[string] devices;
+    /// The account's web client prefs: the defaults a new device's `clientPrefs` start from
+    /// (`CLIENT_PREFS` keys only). Replaced, never mutated in place.
+    Json clientPrefs = Json.emptyObject;
     /// Words highlighted like the own nick (whole word, case-insensitive); web and app share them.
     string[] highlightWords;
 
@@ -420,6 +516,7 @@ struct UserPreferences {
         j["modeIndicator"] = Json(modeIndicator);
         j["timestampFormat"] = Json(timestampFormat);
         j["language"] = Json(language);
+        j["clientPrefs"] = clientPrefs.clone;
         auto devs = Json.emptyObject;
         foreach (id, ref d; devices)
             devs[id] = d.toJson();
@@ -622,6 +719,14 @@ struct UserPreferences {
                 needsRepair = true;
             }
         }
+        if (auto v = "clientPrefs" in json) {
+            bool bad;
+            p.clientPrefs = sanitizeClientPrefs(*v, bad);
+            if (bad) {
+                logFieldInvalid(userId, "clientPrefs", v.type, "object of valid client prefs");
+                needsRepair = true;
+            }
+        }
         if (auto v = "devices" in json) {
             if (v.type != Json.Type.object) {
                 logFieldInvalid(userId, "devices", v.type, "object");
@@ -782,6 +887,158 @@ bool applyNotificationPatch(P)(ref P p, Json patch) {
     return any;
 }
 
+/// The four notification prefs of the account or a device profile as one object.
+Json notificationPrefsJson(P)(const ref P p) {
+    auto j = Json.emptyObject;
+    static foreach (key; NOTIFICATION_PREFS)
+        j[key] = Json(__traits(getMember, p, key));
+    return j;
+}
+
+/// "" when `v` is a valid value for `spec`, else the 400 error text (`<key> must be …`).
+private string clientPrefError(const ref ClientPrefSpec spec, Json v) {
+    import std.algorithm.iteration : map;
+    import std.array : join;
+    import std.conv : to;
+
+    final switch (spec.kind) {
+        case ClientPrefKind.bool_:
+            return v.type == Json.Type.bool_ ? "" : spec.key ~ " must be boolean";
+        case ClientPrefKind.enum_:
+            return v.type == Json.Type.string && spec.options.canFind(v.get!string) ? ""
+                : spec.key ~ " must be one of " ~ spec.options.join(", ");
+        case ClientPrefKind.int_:
+            return v.type == Json.Type.int_ && v.get!long >= spec.min && v.get!long <= spec.max ? ""
+                : spec.key ~ " must be an integer from " ~ spec.min.to!string ~ " to " ~ spec.max.to!string;
+        case ClientPrefKind.intEnum:
+            return v.type == Json.Type.int_ && spec.ints.canFind(v.get!long) ? ""
+                : spec.key ~ " must be one of " ~ spec.ints.map!(i => i.to!string).join(", ");
+        case ClientPrefKind.string_:
+            return v.type == Json.Type.string && v.get!string.length <= spec.max ? ""
+                : spec.key ~ " must be a string of at most " ~ spec.max.to!string ~ " bytes";
+    }
+}
+
+/// Validates a POST /api/me/client-prefs body without applying it. Returns ""
+/// when valid, else the 400 error text with the offending key in `field`.
+/// JSON null is valid for every key (it deletes it); unknown keys are ignored;
+/// `any` is true when a recognised key is present.
+string checkClientPrefsPatch(Json patch, out bool any, out string field) {
+    if (patch.type != Json.Type.object)
+        return "body must be object";
+    foreach (ref spec; CLIENT_PREFS) {
+        if (auto v = spec.key in patch) {
+            any = true;
+            if (v.type == Json.Type.null_)
+                continue;
+            const err = clientPrefError(spec, *v);
+            if (err.length) {
+                field = spec.key;
+                return err;
+            }
+        }
+    }
+    return "";
+}
+
+/// Replaces `prefs` with a new object holding its keys with `patch` applied:
+/// each recognised key is set, or deleted when JSON null. The caller must have
+/// passed `patch` through `checkClientPrefsPatch` first. Never mutates the old
+/// object, so struct copies that share it are unaffected.
+void applyClientPrefsPatch(ref Json prefs, Json patch) {
+    auto next = Json.emptyObject;
+    foreach (ref spec; CLIENT_PREFS) {
+        if (auto v = spec.key in patch) {
+            if (v.type != Json.Type.null_)
+                next[spec.key] = v.clone;
+        } else if (prefs.type == Json.Type.object) {
+            if (auto old = spec.key in prefs)
+                next[spec.key] = old.clone;
+        }
+    }
+    prefs = next;
+}
+
+/// A stored `clientPrefs` value as a fresh object of its valid keys. A
+/// non-object, an invalid value or an unknown key is dropped and sets `bad`.
+Json sanitizeClientPrefs(Json stored, out bool bad) {
+    auto clean = Json.emptyObject;
+    if (stored.type != Json.Type.object) {
+        bad = true;
+        return clean;
+    }
+    size_t kept;
+    foreach (ref spec; CLIENT_PREFS) {
+        if (auto v = spec.key in stored) {
+            if (clientPrefError(spec, *v).length) {
+                bad = true;
+            } else {
+                clean[spec.key] = v.clone;
+                ++kept;
+            }
+        }
+    }
+    if (kept != stored.length) bad = true;
+    return clean;
+}
+
+/// Whether `s` is a stored device name (`DEVICE_NAME_HEADER` or a rename):
+/// 1–`MAX_DEVICE_NAME_BYTES` bytes of valid UTF-8, no control characters
+/// (< 0x20, 0x7f) and no surrounding whitespace.
+bool isDeviceName(string s) @safe {
+    import std.utf : validate;
+
+    if (s.length == 0 || s.length > MAX_DEVICE_NAME_BYTES || s.strip.length != s.length) return false;
+    foreach (char c; s)
+        if (c < 0x20 || c == 0x7f) return false;
+    try {
+        validate(s);
+        return true;
+    } catch (Exception) {
+        return false;
+    }
+}
+
+/// `raw` trimmed when that is a valid device name, else "".
+string normalizeDeviceName(string raw) @safe {
+    const s = raw.strip;
+    return isDeviceName(s) ? s : "";
+}
+
+/// `DEVICE_KIND_WEB` for exactly "web", else `DEVICE_KIND_APP` (absent or unknown).
+string normalizeDeviceKind(string raw) @safe pure nothrow @nogc {
+    return raw == DEVICE_KIND_WEB ? DEVICE_KIND_WEB : DEVICE_KIND_APP;
+}
+
+/// The `device` object of GET /api/me and `stat_user`: who this device is. `ref_` is its
+/// `sessionRef(id)` (the install id never leaves the server).
+Json deviceIdentityJson(string ref_, const ref DeviceProfile d) {
+    auto j = Json.emptyObject;
+    j["ref"] = Json(ref_);
+    j["kind"] = Json(d.kind);
+    j["name"] = Json(d.name);
+    j["autoName"] = Json(d.autoName);
+    j["model"] = Json(d.model);
+    j["createdAt"] = Json(d.createdAt);
+    return j;
+}
+
+/// The value of the `deviceSettings` pref_update: one device's identity and every per-device setting.
+Json deviceSettingsJson(string ref_, const ref DeviceProfile d) {
+    auto j = Json.emptyObject;
+    j["ref"] = Json(ref_);
+    j["kind"] = Json(d.kind);
+    j["name"] = Json(d.name);
+    j["autoName"] = Json(d.autoName);
+    j["displayPrefs"] = displayPrefsJson(d);
+    j["notificationPrefs"] = notificationPrefsJson(d);
+    j["showMemberPrefixes"] = Json(d.showMemberPrefixes);
+    j["clientPrefs"] = d.clientPrefs.clone;
+    j["clientPrefsSet"] = Json(d.clientPrefsSet);
+    j["updatedAt"] = Json(d.updatedAt);
+    return j;
+}
+
 /// Whether `s` is an install id as the app sends it: a canonical 36-character UUID, in any case.
 bool isDeviceId(string s) @safe {
     if (s.length != 36) return false;
@@ -819,31 +1076,54 @@ bool isDeviceAppVersion(string s) @safe pure {
     return true;
 }
 
-/// The web's settings as a device profile, metadata zero: what a new device
-/// starts from and what "Reset to web settings" copies back.
+/// The account's settings as a device profile, metadata zero (`clientPrefsSet` false):
+/// what a new device starts from and what "Reset to defaults" copies back.
 DeviceProfile accountProfile(const ref UserPreferences p) {
     DeviceProfile d;
     static foreach (key; DEVICE_SETTINGS)
         __traits(getMember, d, key) = __traits(getMember, p, key);
+    d.clientPrefs = p.clientPrefs.clone;
     return d;
 }
 
-/// Copies the settings of `from` into `to`, keeping `to`'s model and timestamps.
+/// Copies the settings of `from` into `to` (`clientPrefs` included), keeping `to`'s
+/// identity, `clientPrefsSet` and timestamps.
 void copySettings(ref DeviceProfile to, const ref DeviceProfile from) {
     static foreach (key; DEVICE_SETTINGS)
         __traits(getMember, to, key) = __traits(getMember, from, key);
+    to.clientPrefs = from.clientPrefs.clone;
 }
 
-/// This device's profile, created on first contact as a copy of the web's
-/// settings. Also keeps the device's model and, at `DEVICE_SEEN_GRANULARITY_MS`
-/// granularity, when it was last seen. `changed` means the blob must be saved.
-/// Creating a profile past `MAX_DEVICE_PROFILES` drops the one seen least
-/// recently (ties: the smallest id).
+/// "Reset to defaults": the account's settings over device `d`'s own, which then
+/// counts as having client prefs (the browser takes them instead of pushing its own).
+void resetDeviceToAccount(ref DeviceProfile d, const ref UserPreferences p) {
+    const defaults = accountProfile(p);
+    copySettings(d, defaults);
+    d.clientPrefsSet = true;
+}
+
+/// "Make these the defaults for new devices": device `d`'s settings over the
+/// account's flat fields (marking its display prefs set) and its client prefs.
+void makeAccountDefaults(ref UserPreferences p, const ref DeviceProfile d) {
+    static foreach (key; DEVICE_SETTINGS)
+        __traits(getMember, p, key) = __traits(getMember, d, key);
+    p.displayPrefsSet = true;
+    p.clientPrefs = d.clientPrefs.clone;
+}
+
+/// This device's profile, created on first contact as a copy of the account's
+/// settings (`clientPrefsSet` false). Also keeps the device's model, automatic
+/// name and, at `DEVICE_SEEN_GRANULARITY_MS` granularity, when it was last seen.
+/// `changed` means the blob must be saved. `kind` is stored on creation only.
+/// Creating a profile past `MAX_DEVICE_PROFILES` drops the web profile seen least
+/// recently, or when none is web the profile of any kind seen least recently
+/// (ties: the smallest id).
 ///
-/// `deviceId` must already be valid and lower-case; `model` is "" when absent
-/// or invalid. The pointer is into `p.devices`, valid until it next changes.
+/// `deviceId` must already be valid and lower-case; `model` and `autoName` are ""
+/// when absent or invalid. The pointer is into `p.devices`, valid until it next changes.
 DeviceProfile* ensureDeviceProfile(ref UserPreferences p, string deviceId, string model, long nowMs,
-        out bool changed, string osVersion = "", string appVersion = "", string clientIp = "") {
+        out bool changed, string osVersion = "", string appVersion = "", string clientIp = "",
+        string kind = DEVICE_KIND_APP, string autoName = "") {
     if (auto prof = deviceId in p.devices) {
         if (model.length && model != prof.model) {
             prof.model = model;
@@ -861,6 +1141,10 @@ DeviceProfile* ensureDeviceProfile(ref UserPreferences p, string deviceId, strin
             prof.lastIp = clientIp;
             changed = true;
         }
+        if (autoName.length && autoName != prof.autoName) {
+            prof.autoName = autoName;
+            changed = true;
+        }
         if (nowMs - prof.lastSeenAt >= DEVICE_SEEN_GRANULARITY_MS) {
             prof.lastSeenAt = nowMs;
             changed = true;
@@ -870,10 +1154,14 @@ DeviceProfile* ensureDeviceProfile(ref UserPreferences p, string deviceId, strin
     while (p.devices.length >= MAX_DEVICE_PROFILES) {
         string oldest;
         long oldestSeen;
+        bool oldestWeb;
         foreach (id, ref d; p.devices) {
-            if (!oldest.length || d.lastSeenAt < oldestSeen || (d.lastSeenAt == oldestSeen && id < oldest)) {
+            const web = d.kind == DEVICE_KIND_WEB;
+            if (!oldest.length || (web && !oldestWeb)
+                    || (web == oldestWeb && (d.lastSeenAt < oldestSeen || (d.lastSeenAt == oldestSeen && id < oldest)))) {
                 oldest = id;
                 oldestSeen = d.lastSeenAt;
+                oldestWeb = web;
             }
         }
         p.devices.remove(oldest);
@@ -883,6 +1171,8 @@ DeviceProfile* ensureDeviceProfile(ref UserPreferences p, string deviceId, strin
     fresh.osVersion = osVersion;
     fresh.appVersion = appVersion;
     fresh.lastIp = clientIp;
+    fresh.kind = normalizeDeviceKind(kind);
+    fresh.autoName = autoName;
     fresh.createdAt = fresh.updatedAt = fresh.lastSeenAt = nowMs;
     p.devices[deviceId] = fresh;
     changed = true;
@@ -1844,6 +2134,244 @@ unittest {
     assert(prof.showUserIcons && !prof.muteAll && !prof.showMemberPrefixes);
     assert(prof.model == "iPad16,3" && prof.createdAt == 1000, "a reset keeps the device's identity");
     assert(!applyNotificationPatch(p, Json.emptyObject));
+}
+
+@("checkClientPrefsPatch: per-kind validation, null deletes, unknown keys ignored, any flag")
+unittest {
+    import std.array : replicate;
+
+    bool any;
+    string field;
+    assert(checkClientPrefsPatch(Json.emptyArray, any, field) == "body must be object");
+    assert(checkClientPrefsPatch(Json("x"), any, field) == "body must be object");
+
+    Json one(string key, Json v) {
+        auto j = Json.emptyObject;
+        j[key] = v;
+        return j;
+    }
+    string err(string key, Json v) {
+        bool a;
+        string f;
+        const e = checkClientPrefsPatch(one(key, v), a, f);
+        assert(a, "a recognised key sets any");
+        assert(e.length == 0 || f == key, "the error names its field");
+        return e;
+    }
+    // bool
+    assert(err("compactMode", Json(true)) == "");
+    assert(err("compactMode", Json(1)) == "compactMode must be boolean");
+    // enum
+    assert(err("theme", Json("orchid")) == "");
+    assert(err("theme", Json("light")) == "theme must be one of dark, midnight, dusk, tropic, emerald, sand, orchid");
+    assert(err("theme", Json(true)).length);
+    assert(err("linkPreviewSize", Json("large")) == "");
+    // int range, inclusive bounds
+    assert(err("fontSize", Json(10)) == "" && err("fontSize", Json(18)) == "");
+    assert(err("fontSize", Json(9)) == "fontSize must be an integer from 10 to 18");
+    assert(err("fontSize", Json(19)).length);
+    assert(err("fontSize", Json(14.5)).length, "a float is not an integer");
+    assert(err("fontSize", Json("14")).length);
+    assert(err("defaultScrollPreset", Json(0)) == "" && err("defaultScrollPreset", Json(4)) == "");
+    assert(err("defaultScrollPreset", Json(-1)).length && err("defaultScrollPreset", Json(5)).length);
+    // intEnum
+    assert(err("awayAfterMinutes", Json(30)) == "");
+    assert(err("awayAfterMinutes", Json(10)) == "awayAfterMinutes must be one of 5, 15, 30, 60");
+    assert(err("awayAfterMinutes", Json("15")).length);
+    // string length cap in bytes
+    assert(err("customCSS", Json("")) == "");
+    assert(err("customCSS", Json(replicate("a", 32_768))) == "");
+    assert(err("customCSS", Json(replicate("a", 32_769))) == "customCSS must be a string of at most 32768 bytes");
+    assert(err("customCSS", Json(3)).length);
+    // null is valid for any key (it deletes it)
+    assert(err("theme", Json(null)) == "");
+
+    auto unknown = Json.emptyObject;
+    unknown["inlineTweets"] = Json(true);
+    assert(checkClientPrefsPatch(unknown, any, field) == "" && !any, "unknown keys alone are not a client pref");
+    unknown["inlineImages"] = Json(false);
+    assert(checkClientPrefsPatch(unknown, any, field) == "" && any);
+}
+
+@("applyClientPrefsPatch sets and deletes keys into a new object, ignoring unknown keys")
+unittest {
+    auto base = Json.emptyObject;
+    base["theme"] = Json("dusk");
+    base["fontSize"] = Json(12);
+    Json prefs = base;
+    auto patch = Json.emptyObject;
+    patch["fontSize"] = Json(null);
+    patch["compactMode"] = Json(true);
+    patch["inlineTweets"] = Json(true);
+    applyClientPrefsPatch(prefs, patch);
+    assert(prefs["theme"].get!string == "dusk");
+    assert("fontSize" !in prefs, "null deletes the key");
+    assert(prefs["compactMode"].get!bool);
+    assert("inlineTweets" !in prefs);
+    assert(base["fontSize"].get!long == 12 && "compactMode" !in base, "the old object is untouched");
+}
+
+@("clientPrefs round-trip on the account and a device; bad stored keys are dropped and flag a repair")
+unittest {
+    enum id = "11111111-2222-4333-8444-555555555555";
+    UserPreferences p;
+    auto cp = Json.emptyObject;
+    cp["theme"] = Json("sand");
+    cp["awayAfterMinutes"] = Json(60);
+    p.clientPrefs = cp;
+    DeviceProfile d;
+    d.kind = DEVICE_KIND_WEB;
+    d.name = "Work laptop";
+    d.autoName = "Chrome on macOS";
+    auto dcp = Json.emptyObject;
+    dcp["customCSS"] = Json(".x{}");
+    d.clientPrefs = dcp;
+    d.clientPrefsSet = true;
+    p.devices[id] = d;
+    const r = UserPreferences.fromJson(p.toJson());
+    assert(!r.needsRepair);
+    assert(r.prefs.clientPrefs == cp);
+    assert(r.prefs.devices[id] == d);
+    // Legacy blobs: no clientPrefs anywhere, devices are apps without client prefs.
+    auto legacyDev = d.toJson();
+    foreach (k; ["kind", "name", "autoName", "clientPrefs", "clientPrefsSet"]) legacyDev.remove(k);
+    auto legacyDevs = Json.emptyObject;
+    legacyDevs[id] = legacyDev;
+    auto legacy = Json.emptyObject;
+    legacy["devices"] = legacyDevs;
+    const l = UserPreferences.fromJson(legacy);
+    assert(!l.needsRepair && l.prefs.clientPrefs.length == 0);
+    assert(l.prefs.devices[id].kind == DEVICE_KIND_APP && !l.prefs.devices[id].clientPrefsSet);
+    assert(l.prefs.devices[id].clientPrefs.type == Json.Type.object && l.prefs.devices[id].clientPrefs.length == 0);
+
+    auto badCp = Json.emptyObject;
+    badCp["theme"] = Json("light");
+    badCp["fontSize"] = Json(16);
+    badCp["inlineTweets"] = Json(true);
+    auto j = Json.emptyObject;
+    j["clientPrefs"] = badCp;
+    const s = UserPreferences.fromJson(j);
+    assert(s.needsRepair);
+    assert(s.prefs.clientPrefs.length == 1 && s.prefs.clientPrefs["fontSize"].get!long == 16);
+    j["clientPrefs"] = Json.emptyArray;
+    const t = UserPreferences.fromJson(j);
+    assert(t.needsRepair && t.prefs.clientPrefs.type == Json.Type.object && t.prefs.clientPrefs.length == 0);
+
+    auto devJ = d.toJson();
+    devJ["clientPrefs"] = badCp;
+    devJ["kind"] = Json("tablet");
+    devJ["name"] = Json("bad\x01name");
+    devJ["clientPrefsSet"] = Json("yes");
+    bool bad;
+    const dd = DeviceProfile.fromJson(devJ, bad);
+    assert(bad);
+    assert(dd.clientPrefs.length == 1 && dd.clientPrefs["fontSize"].get!long == 16);
+    assert(dd.kind == DEVICE_KIND_APP && dd.name == "" && !dd.clientPrefsSet);
+    assert(dd.autoName == "Chrome on macOS");
+}
+
+@("ensureDeviceProfile seeds clientPrefs from the account, stores kind/autoName, refreshes autoName only")
+unittest {
+    enum id = "33333333-4444-4555-8666-777777777777";
+    enum long now = 1_800_000_000_000;
+    UserPreferences p;
+    auto cp = Json.emptyObject;
+    cp["theme"] = Json("emerald");
+    p.clientPrefs = cp;
+    bool changed;
+    auto prof = ensureDeviceProfile(p, id, "", now, changed, "", "", "", DEVICE_KIND_WEB, "Firefox on Linux");
+    assert(changed);
+    assert(prof.kind == DEVICE_KIND_WEB && prof.autoName == "Firefox on Linux");
+    assert(prof.clientPrefs == cp && !prof.clientPrefsSet);
+    auto patch = Json.emptyObject;
+    patch["theme"] = Json("dusk");
+    applyClientPrefsPatch(prof.clientPrefs, patch);
+    assert(p.clientPrefs["theme"].get!string == "emerald", "the seed is a copy, not shared");
+
+    prof = ensureDeviceProfile(p, id, "", now + 60_000, changed, "", "", "", DEVICE_KIND_WEB, "Firefox on Linux");
+    assert(!changed, "the same autoName writes nothing");
+    prof = ensureDeviceProfile(p, id, "", now + 60_000, changed, "", "", "", DEVICE_KIND_APP, "");
+    assert(!changed && prof.autoName == "Firefox on Linux" && prof.kind == DEVICE_KIND_WEB,
+        "an absent name keeps the stored one and kind never changes");
+    prof = ensureDeviceProfile(p, id, "", now + 60_000, changed, "", "", "", DEVICE_KIND_WEB, "Firefox on Windows");
+    assert(changed && prof.autoName == "Firefox on Windows");
+
+    prof = ensureDeviceProfile(p, "44444444-4444-4555-8666-777777777777", "", now, changed);
+    assert(prof.kind == DEVICE_KIND_APP, "a header-less kind is an app");
+    prof = ensureDeviceProfile(p, "55555555-4444-4555-8666-777777777777", "", now, changed, "", "", "", "tablet");
+    assert(prof.kind == DEVICE_KIND_APP, "an unknown kind is an app");
+}
+
+@("ensureDeviceProfile evicts the least recently seen web profile before an older app profile")
+unittest {
+    import std.format : format;
+
+    UserPreferences p;
+    foreach (i; 1 .. MAX_DEVICE_PROFILES + 1) {
+        DeviceProfile d;
+        d.lastSeenAt = i;
+        d.kind = i == 1 ? DEVICE_KIND_APP : DEVICE_KIND_WEB;
+        p.devices[format("%08x-0000-4000-8000-000000000000", i)] = d;
+    }
+    bool changed;
+    ensureDeviceProfile(p, "ffffffff-0000-4000-8000-000000000000", "", 100, changed, "", "", "", DEVICE_KIND_WEB);
+    assert(changed && p.devices.length == MAX_DEVICE_PROFILES);
+    assert("00000001-0000-4000-8000-000000000000" in p.devices, "the oldest app profile survives");
+    assert("00000002-0000-4000-8000-000000000000" !in p.devices, "the oldest web profile goes");
+    assert("ffffffff-0000-4000-8000-000000000000" in p.devices);
+}
+
+@("reset and make-defaults copy clientPrefs and the device settings both ways")
+unittest {
+    enum id = "11111111-2222-4333-8444-555555555555";
+    UserPreferences p;
+    auto acct = Json.emptyObject;
+    acct["theme"] = Json("midnight");
+    p.clientPrefs = acct;
+    bool changed;
+    auto prof = ensureDeviceProfile(p, id, "", 1000, changed, "", "", "", DEVICE_KIND_WEB, "Safari on macOS");
+    auto devPrefs = Json.emptyObject;
+    devPrefs["fontSize"] = Json(16);
+    prof.clientPrefs = devPrefs;
+    prof.muteAll = true;
+    prof.monospaceFont = false;
+    prof.name = "Desk";
+
+    makeAccountDefaults(p, *prof);
+    assert(p.clientPrefs == devPrefs && p.muteAll && !p.monospaceFont && p.displayPrefsSet);
+    auto patch = Json.emptyObject;
+    patch["fontSize"] = Json(17);
+    applyClientPrefsPatch(prof.clientPrefs, patch);
+    assert(p.clientPrefs["fontSize"].get!long == 16, "the defaults are a copy");
+
+    p.muteAll = false;
+    resetDeviceToAccount(*prof, p);
+    assert(prof.clientPrefs == devPrefs && !prof.muteAll && !prof.monospaceFont);
+    assert(prof.clientPrefsSet, "a reset device takes the server's client prefs");
+    assert(prof.name == "Desk" && prof.kind == DEVICE_KIND_WEB && prof.createdAt == 1000,
+        "a reset keeps the device's identity");
+}
+
+@("isDeviceName/normalizeDeviceName: 1–64 trimmed bytes of UTF-8 without control characters")
+unittest {
+    import std.array : replicate;
+
+    assert(isDeviceName("Chrome on macOS"));
+    assert(isDeviceName("Café iPad ☕"));
+    assert(isDeviceName(replicate("a", 64)));
+    assert(!isDeviceName(replicate("a", 65)));
+    assert(!isDeviceName(""));
+    assert(!isDeviceName("   "));
+    assert(!isDeviceName("tab\there"));
+    assert(!isDeviceName("del\x7f"));
+    assert(!isDeviceName("\xff\xfe"), "invalid UTF-8");
+    assert(normalizeDeviceName("  Chrome on macOS ") == "Chrome on macOS");
+    assert(normalizeDeviceName(" \t ") == "");
+    assert(normalizeDeviceName("a\nb") == "");
+    assert(normalizeDeviceName(replicate("a", 65)) == "");
+    assert(normalizeDeviceKind("web") == DEVICE_KIND_WEB);
+    assert(normalizeDeviceKind("app") == DEVICE_KIND_APP && normalizeDeviceKind("") == DEVICE_KIND_APP
+        && normalizeDeviceKind("WEB") == DEVICE_KIND_APP);
 }
 
 @("pushNotifyFor: a device's own mute and sound, else the account's")
