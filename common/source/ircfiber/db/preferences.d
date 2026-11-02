@@ -9,6 +9,7 @@ import vibe.core.log;
 import vibe.core.sync : TaskMutex;
 import ircfiber.logging : logJsonMap;
 import ircfiber.storage.redis : RedisStorage;
+import ircfiber.i18n : isSupportedLanguage;
 import ircfiber.db.prefs_cache : PrefsCache;
 import ircfiber.db.prefs_mongo : loadPrefsDoc, savePrefsDoc, deletePrefsDoc;
 import ircfiber.redis.protocol : RedisKeys;
@@ -340,6 +341,9 @@ struct UserPreferences {
     bool formatColors = true;
     bool showTimestamps = true;
     string timestampFormat = "auto";
+    /// Account UI language: "" follows the browser/device, else a SUPPORTED_LANGUAGES code.
+    /// Account-wide (web and every iOS install); not part of DeviceProfile.
+    string language = "";
     /// Each iOS install's own settings, keyed by its lower-case install id (`X-IRCFiber-Device`);
     /// the flat fields above are the web's.
     DeviceProfile[string] devices;
@@ -408,6 +412,7 @@ struct UserPreferences {
             j[key] = Json(__traits(getMember, this, key));
         j["modeIndicator"] = Json(modeIndicator);
         j["timestampFormat"] = Json(timestampFormat);
+        j["language"] = Json(language);
         auto devs = Json.emptyObject;
         foreach (id, ref d; devices)
             devs[id] = d.toJson();
@@ -598,6 +603,14 @@ struct UserPreferences {
                 p.timestampFormat = v.get!string;
             else {
                 logFieldInvalid(userId, "timestampFormat", v.type, "one of auto, 12h, 24h");
+                needsRepair = true;
+            }
+        }
+        if (auto v = "language" in json) {
+            if (v.type == Json.Type.string && (v.get!string.length == 0 || isSupportedLanguage(v.get!string)))
+                p.language = v.get!string;
+            else {
+                logFieldInvalid(userId, "language", v.type, "\"\" or a supported language code");
                 needsRepair = true;
             }
         }
@@ -1592,6 +1605,24 @@ unittest {
     assert(s.needsRepair);
     assert(s.prefs.modeIndicator == "dots" && s.prefs.showUserIcons);
     assert(s.prefs.highlightWords.length == 0);
+}
+
+@("language round-trips; legacy blobs follow the browser; unknown codes repair to automatic")
+unittest {
+    UserPreferences p;
+    p.language = "de";
+    const r = UserPreferences.fromJson(p.toJson());
+    assert(!r.needsRepair && r.prefs.language == "de");
+
+    auto legacy = Json.emptyObject;
+    legacy["pinnedChannels"] = serializeToJson(["net1:#a"]);
+    const l = UserPreferences.fromJson(legacy);
+    assert(!l.needsRepair && l.prefs.language == "");
+
+    auto bad = Json.emptyObject;
+    bad["language"] = Json("xx");
+    const b = UserPreferences.fromJson(bad);
+    assert(b.needsRepair && b.prefs.language == "");
 }
 
 @("checkDisplayPrefsPatch: type and enum errors, unknown keys ignored, any flag")

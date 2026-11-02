@@ -239,6 +239,7 @@ private void handleControlMessage(ref EngineContext ctx, ControlMessage msg) {
         case "removeNetwork":
             if (msg.networkId.length) {
                 const key = msg.networkId;
+                ctx.connManager.forgetPublicAvatar(parseUUID(msg.networkId));
                 ctx.connManager.removeNetwork(parseUUID(msg.networkId));
                 // Tearing the client down emits its own farewell events —
                 // the QUIT echo and the `ERROR :Quit:` line — and those get
@@ -499,6 +500,8 @@ private NetworkConfig parseNetworkConfig(Json j) {
         if (v > 0) cfg.autoJoinDelaySeconds = cast(uint) v;
     }
     if (j["egressNodeId"].type == Json.Type.string) cfg.egressNodeId = j["egressNodeId"].get!string;
+    if (j["avatarUrl"].type == Json.Type.string) cfg.avatarUrl = j["avatarUrl"].get!string;
+    if (j["defaultAvatarUrl"].type == Json.Type.string) cfg.defaultAvatarUrl = j["defaultAvatarUrl"].get!string;
     if (j["systemManaged"].type == Json.Type.bool_) cfg.systemManaged = j["systemManaged"].get!bool;
     return cfg;
 }

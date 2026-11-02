@@ -338,6 +338,19 @@ final class ConnectionManager {
         return null;
     }
 
+    string[string] getAvatars(UUID networkId) {
+        if (auto client = getClient(networkId)) {
+            return client.getAvatars;
+        }
+        return null;
+    }
+
+    /// Drops the network's entry from the public-avatar registry. Only for
+    /// an explicit removal: a reconnect re-adds it on the next 900.
+    void forgetPublicAvatar(UUID networkId) {
+        if (auto client = getClient(networkId)) client.forgetPublicAvatar();
+    }
+
     string[string] getIdents(UUID networkId) {
         if (auto client = getClient(networkId)) {
             return client.getIdents;

@@ -45,6 +45,9 @@ struct User {
     /// subscribed; set via the List-Unsubscribe flow (no migration needed —
     /// missing key reads as false).
     bool emailUnsubscribed = false;
+    /// true = the user set their own NickServ password in Settings; website
+    /// password changes and logins no longer sync it. Missing key reads as false.
+    bool nickservPasswordCustom = false;
     /// Linked social-login identities. Default [] keeps every existing row
     /// unlinked with no migration; missing key reads as [].
     OAuthIdentity[] oauthIdentities;
@@ -92,6 +95,7 @@ struct User {
             "createdAt": Json(createdAt.toUnixTime()),
             "loginIps": serializeToJson(loginIps),
             "emailUnsubscribed": Json(emailUnsubscribed),
+            "nickservPasswordCustom": Json(nickservPasswordCustom),
             "oauthIdentities": Json(ids)
         ]);
     }
@@ -124,6 +128,8 @@ struct User {
         // Missing key (pre-campaign rows) reads as false: still subscribed.
         if (auto pr = "emailUnsubscribed" in json)
             u.emailUnsubscribed = (*pr).get!bool;
+        if (auto pr = "nickservPasswordCustom" in json)
+            u.nickservPasswordCustom = (*pr).get!bool;
         // Missing key (pre-OAuth rows) reads as []: unlinked.
         if (auto pr = "oauthIdentities" in json) {
             try {

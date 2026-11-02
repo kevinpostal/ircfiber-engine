@@ -110,6 +110,7 @@ private immutable string[] DESIRED_CAPS_BASE = [
     "draft/edit-message",
     "draft/message-redaction",
     "draft/multiline",
+    "draft/metadata-2",
 ];
 
 private immutable string[] DESIRED_CAPS_SASL = ["sasl"];
@@ -2403,6 +2404,51 @@ unittest {
     assert(buildMonitorLine("X", "alice") is null);
 }
 
+// ── draft/metadata-2 avatars ─────────────────────────────────────────────────
+
+/// Longest avatar URL we keep from a `METADATA <nick> avatar` value.
+private enum MAX_AVATAR_URL_LENGTH = 2048;
+
+/// Whether a metadata `avatar` value is a URL the client may render:
+/// http(s) only (no `javascript:` / `data:`), bounded length.
+bool isAcceptableAvatarUrl(string value) @safe pure nothrow {
+    import std.uni : sicmp;
+    if (value.length == 0 || value.length > MAX_AVATAR_URL_LENGTH) return false;
+    return (value.length >= 7 && sicmp(value[0 .. 7], "http://") == 0)
+        || (value.length >= 8 && sicmp(value[0 .. 8], "https://") == 0);
+}
+
+/// Lines that move our published `avatar` key from `oldUrl` to `newUrl`:
+/// nothing when unchanged, a SET with value, or a valueless SET to clear.
+string[] avatarCommands(string oldUrl, string newUrl) @safe pure {
+    if (oldUrl == newUrl) return [];
+    if (newUrl.length) return ["METADATA * SET avatar :" ~ newUrl];
+    return ["METADATA * SET avatar"];
+}
+
+@("isAcceptableAvatarUrl takes bounded http(s) URLs only")
+unittest {
+    assert(isAcceptableAvatarUrl("https://x/a.webp"));
+    assert(isAcceptableAvatarUrl("HTTP://x/a.webp"));
+    assert(!isAcceptableAvatarUrl(""));
+    assert(!isAcceptableAvatarUrl("javascript:alert(1)"));
+    assert(!isAcceptableAvatarUrl("data:image/png;base64,AAAA"));
+    assert(!isAcceptableAvatarUrl("https://"[0 .. 7]));
+    char[] big = new char[MAX_AVATAR_URL_LENGTH];
+    big[] = 'a';
+    big[0 .. 8] = "https://";
+    assert(isAcceptableAvatarUrl(big.idup));
+    assert(!isAcceptableAvatarUrl(big.idup ~ "a"));
+}
+
+@("avatarCommands publishes, clears, or stays quiet")
+unittest {
+    assert(avatarCommands("", "https://u") == ["METADATA * SET avatar :https://u"]);
+    assert(avatarCommands("https://u", "") == ["METADATA * SET avatar"]);
+    assert(avatarCommands("https://u", "https://u") == []);
+    assert(avatarCommands("", "") == []);
+}
+
 // ── Lag probe + TLS detail helpers ───────────────────────────────────────────
 
 /// Current wall-clock time in unix milliseconds.
@@ -3134,6 +3180,12 @@ final class PersistentIRCClient {
         bool[string]        realnameProbed;
         // IRCv3 extended-join / account-notify: nick → account name (or "*" for none)
         string[string]      accounts;
+        // draft/metadata-2: nick → avatar URL (`METADATA <nick> avatar`).
+        // Same lifecycle as `accounts`: moves on NICK, dropped on QUIT.
+        string[string]      avatars;
+        // Our services account from 900 RPL_LOGGEDIN; keys our entry in the
+        // public-avatar registry (`RedisKeys.publicAvatars`).
+        string              servicesAccount;
         // Ident (username) extracted from nick!user@host in JOIN/353
         string[string]      idents;
         string[]            queryBuffers;
@@ -3655,6 +3707,7 @@ final class PersistentIRCClient {
         foreach (k, v; channelUsers) s.channelUsers[k] = v.dup;
         s.realnames = realnames.dup;
         s.accounts = accounts.dup;
+        s.avatars = avatars.dup;
         s.idents = idents.dup;
         s.pendingLabels = pendingLabels.dup;
         s.channelLatestMsgid = channelLatestMsgid.dup;
@@ -3744,6 +3797,7 @@ final class PersistentIRCClient {
         foreach (k, v; s.channelUsers) channelUsers[k] = v.dup;
         realnames = s.realnames.dup;
         accounts = s.accounts.dup;
+        avatars = s.avatars.dup;
         idents = s.idents.dup;
         pendingLabels = s.pendingLabels.dup;
         channelLatestMsgid = s.channelLatestMsgid.dup;
@@ -3932,6 +3986,7 @@ final class PersistentIRCClient {
     @property string[][string] getChannelUsers()       { return channelUsers; }
     @property string[string]  getRealnames()          { return realnames; }
     @property string[string]  getAccounts()           { return accounts; }
+    @property string[string]  getAvatars()            { return avatars; }
     @property string[string]  getIdents()             { return idents; }
     @property string[]        getQueryBuffers()         { return queryBuffers.dup; }
     @property ServerFeatures  getServerFeatures()      { return serverFeatures; }
@@ -4324,7 +4379,17 @@ final class PersistentIRCClient {
     }
 
     /// Updates the network configuration.
-    void updateConfig(NetworkConfig cfg) { config = cfg; ipv6BindResolved = false; ipv6BindCache = ""; }
+    void updateConfig(NetworkConfig cfg) {
+        const oldAvatar = config.effectiveAvatarUrl();
+        config = cfg; ipv6BindResolved = false; ipv6BindCache = "";
+        const newAvatar = config.effectiveAvatarUrl();
+        if (oldAvatar == newAvatar) return;
+        // While disconnected nothing goes out: the next registration
+        // publishes whatever URL is current then.
+        if (state == ConnectionState.connected && hasCap("draft/metadata-2"))
+            foreach (l; avatarCommands(oldAvatar, newAvatar)) sendRaw(l);
+        syncPublicAvatar();
+    }
 
     /// Owner UUID (for per-user IPv6). Exposed for the manager / session snapshot.
     @property UUID getOwnerId() const { return ownerId; }
@@ -5627,6 +5692,7 @@ final class PersistentIRCClient {
                             // nothing renamed the old entry and `Zodiac`
                             // sat in #tclmafia beside `Zodiac_` for hours.
                             channelUsers = null;
+                            avatars = null;
                             namesBurst = null;
                             namesBurstAt = null;
                             // Registration completed. Reset the fallback
@@ -6136,6 +6202,16 @@ final class PersistentIRCClient {
                             applyRegistrationRefusal(evt.text);
                             throw new Exception("Server closed connection during registration: " ~ evt.text);
 
+                        // draft/metadata-2 replies and RPL_LOGGEDIN/OUT:
+                        // same bookkeeping as after registration.
+                        case "METADATA":
+                        case "FAIL":
+                        case "761": case "766": case "770": case "771":
+                        case "772": case "774":
+                        case "900": case "901":
+                            if (handleMetadataLine(evt)) continue;
+                            break;
+
                         default:
                             break;
                     }
@@ -6154,7 +6230,7 @@ final class PersistentIRCClient {
                     const noPublishDuringRegistration = [
                         "311", "312", "313", "315", "317", "318", "319",
                         "330", "332", "333", "354", "366", "376", "401",
-                        "422",
+                        "422", "761", "766", "770", "771", "772", "774",
                     ];
                     if (evt.command != "PING" && evt.command != "ERROR"
                         && !noPublishDuringRegistration.canFind(evt.command)) {
@@ -6176,6 +6252,13 @@ final class PersistentIRCClient {
         // performRegistration() runs on every (re)connect, so this re-opers too.
         if (config.operUsername.length > 0 && config.operPassword.length > 0) {
             sendRaw("OPER " ~ config.operUsername ~ " " ~ config.operPassword);
+        }
+        // draft/metadata-2: subscribe to `avatar` before the JOINs below so
+        // the server's join-sync batches already carry members' avatars,
+        // then publish our own (account default or per-network override).
+        if (hasCap("draft/metadata-2")) {
+            sendRaw("METADATA * SUB avatar");
+            foreach (l; avatarCommands("", config.effectiveAvatarUrl())) sendRaw(l);
         }
 
         // SuperNETs/DangerousIRCd throttles JOIN until the client has been
@@ -6721,6 +6804,111 @@ private void processEvents() {
         logWarn("Server ERROR for %s: %s", config.name, text);
     }
 
+    /// draft/metadata-2 avatar bookkeeping plus RPL_LOGGEDIN/OUT tracking.
+    /// Returns true when the line is internal noise the caller must not
+    /// publish (GET/SUB replies, rate-limit retries, KEY_NOT_SET).
+    private bool handleMetadataLine(ref IRCRawEvent event) {
+        auto p = event.getParams();
+        switch (event.command) {
+            case "METADATA":
+                // [target, key, visibility, value?]
+                if (p.length < 3 || p[0].length == 0) return false;
+                if (p[0][0] == '#' || p[0][0] == '&') return false;
+                if (p[1] == "avatar")
+                    applyAvatar(p[0], p.length > 3 ? p[3] : "");
+                // Server log, not a channel (same routing as ACCOUNT).
+                event.channel = "";
+                return false;
+            case "761":
+                // RPL_KEYVALUE [me, target, key, visibility, value]
+                if (p.length >= 5 && p[2] == "avatar")
+                    applyAvatar(p[1] == "*" ? sessionNick : p[1], p[4]);
+                return true;
+            case "766": // RPL_KEYNOTSET
+            case "770": // RPL_METADATASUBOK
+            case "771": // RPL_METADATAUNSUBOK
+            case "772": // RPL_METADATASUBS
+                return true;
+            case "774": {
+                // RPL_METADATASYNCLATER [me, target, retryAfter?]
+                if (p.length < 2) return true;
+                const target = p[1];
+                int secs = 5;
+                if (p.length > 2) {
+                    try secs = p[2].to!int; catch (Exception) {}
+                }
+                if (secs < 1) secs = 1;
+                if (secs > 60) secs = 60;
+                try {
+                    runTask({
+                        try {
+                            sleep(secs.seconds);
+                            if (state == ConnectionState.connected)
+                                sendRaw("METADATA " ~ target ~ " SYNC");
+                        } catch (Exception e) {
+                            logWarn("METADATA SYNC retry failed for %s: %s", config.name, e.msg);
+                        }
+                    });
+                } catch (Exception e) {
+                    logWarn("METADATA SYNC retry not scheduled for %s: %s", config.name, e.msg);
+                }
+                return true;
+            }
+            case "FAIL":
+                return p.length >= 2 && p[0] == "METADATA" && p[1] == "KEY_NOT_SET";
+            case "900":
+                // RPL_LOGGEDIN [me, mask, account, text]
+                if (p.length >= 3) {
+                    servicesAccount = p[2];
+                    syncPublicAvatar();
+                }
+                return false;
+            case "901":
+                // RPL_LOGGEDOUT
+                forgetPublicAvatar();
+                servicesAccount = "";
+                return false;
+            default:
+                return false;
+        }
+    }
+
+    /// Stores `url` as `nick`'s avatar when it is a usable http(s) URL,
+    /// otherwise (cleared, unsafe scheme, oversized) forgets it.
+    private void applyAvatar(string nick, string url) {
+        if (nick.length == 0) return;
+        if (isAcceptableAvatarUrl(url)) avatars[nick] = url;
+        else avatars.remove(nick);
+    }
+
+    /// Records our effective avatar in the public-avatar registry under our
+    /// services account, so IRC Fiber users on networks without
+    /// draft/metadata-2 still see it. Never throws.
+    void syncPublicAvatar() nothrow {
+        if (redis is null || servicesAccount.length == 0) return;
+        try {
+            const key = RedisKeys.publicAvatars(config.host);
+            const field = servicesAccount.toLower;
+            const url = config.effectiveAvatarUrl();
+            if (url.length) redis.hset(key, field, url);
+            else redis.getDb().hdel(key, field);
+        } catch (Exception e) {
+            try logWarn("Public avatar sync failed for %s: %s", config.name, e.msg);
+            catch (Exception) {}
+        }
+    }
+
+    /// Drops our entry from the public-avatar registry. Never throws.
+    void forgetPublicAvatar() nothrow {
+        if (redis is null || servicesAccount.length == 0) return;
+        try {
+            redis.getDb().hdel(RedisKeys.publicAvatars(config.host), servicesAccount.toLower);
+        } catch (Exception e) {
+            try logWarn("Public avatar removal failed for %s: %s", config.name, e.msg);
+            catch (Exception) {}
+        }
+    }
+
     private void processLine(string line) {
         linesIn++;
         auto event      = parseIRCLine(line);
@@ -6790,6 +6978,8 @@ private void processEvents() {
             // so existing handlers (MIB/366) still get visibility into
             // the channel/topic state.
         }
+
+        if (handleMetadataLine(event)) return;
 
         string[] quitChannels;
         string[] nickChannels;
@@ -7007,6 +7197,7 @@ private void processEvents() {
                     }
                 }
                 accounts.remove(event.nick);
+                avatars.remove(event.nick);
                 // Skip logging our own QUITs when we're about to reconnect
                 // (it just adds noise during reconnect storms).
                 if (event.nick != sessionNick) {
@@ -7154,6 +7345,11 @@ private void processEvents() {
                     if (auto p = event.nick in accounts) {
                         accounts[newNick] = *p;
                         accounts.remove(event.nick);
+                    }
+                    if (auto p = event.nick in avatars) {
+                        const url = *p;
+                        avatars.remove(event.nick);
+                        avatars[newNick] = url;
                     }
                     // Two paths for detecting this is OUR nick change:
                     // 1. Server-initiated — event.nick (old nick) matches
@@ -9905,4 +10101,71 @@ unittest {
         if (e.command == "NICK" && firstNick == size_t.max) firstNick = i;
     }
     assert(lastJoin < firstNick);
+}
+
+@("draft/metadata-2: avatars follow METADATA, NICK and QUIT; replies stay internal")
+unittest {
+    import std.typecons : tuple;
+    import vibe.core.channel : createChannel;
+
+    // Feeds raw lines to a fresh client nicked `me`; returns it with every
+    // event it published, in order.
+    static auto run(string[] lines) {
+        NetworkConfig cfg;
+        cfg.nick = "me";
+        auto ch = createChannel!IRCRawEvent();
+        auto c = new PersistentIRCClient(cfg, ch);
+        foreach (l; lines) c.processLine(l);
+        ch.close(); // an open, empty channel blocks tryConsumeOne
+        IRCRawEvent[] got;
+        IRCRawEvent e;
+        while (ch.tryConsumeOne(e)) got ~= e;
+        return tuple(c, got);
+    }
+
+    // The handler itself: a live update is published, routed to the server log.
+    {
+        auto c = run([])[0];
+        auto direct = c.parseIRCLine(":srv METADATA alice avatar * :https://x/a.webp");
+        assert(!c.handleMetadataLine(direct));
+        assert(direct.channel == "");
+        assert(c.getAvatars()["alice"] == "https://x/a.webp");
+        auto reply = c.parseIRCLine(":srv 761 me me avatar * :https://x/me.webp");
+        assert(c.handleMetadataLine(reply), "761 is bookkeeping, not a live push");
+    }
+
+    // Through processLine: exactly one published event, on the server log.
+    auto set = run([":srv METADATA alice avatar * :https://x/a.webp"]);
+    assert(set[0].getAvatars()["alice"] == "https://x/a.webp");
+    assert(set[1].length == 1 && set[1][0].command == "METADATA" && set[1][0].channel == "");
+
+    // NICK moves the entry, QUIT drops it.
+    auto renamed = run([":srv METADATA alice avatar * :https://x/a.webp", ":alice!a@h NICK bob"]);
+    assert(("alice" in renamed[0].getAvatars()) is null);
+    assert(renamed[0].getAvatars()["bob"] == "https://x/a.webp");
+    auto quit = run([":srv METADATA alice avatar * :https://x/a.webp", ":alice!a@h NICK bob",
+                     ":bob!a@h QUIT :bye"]);
+    assert(("bob" in quit[0].getAvatars()) is null);
+
+    // Unsafe schemes are never stored; a valueless METADATA clears the key.
+    auto bad = run([":srv METADATA carol avatar * :javascript:alert(1)"]);
+    assert(("carol" in bad[0].getAvatars()) is null, "non-http(s) avatar must be rejected");
+    auto cleared = run([":srv METADATA carol avatar * :https://x/c.webp",
+                        ":srv METADATA carol avatar *"]);
+    assert(("carol" in cleared[0].getAvatars()) is null, "a valueless METADATA clears the key");
+
+    // 761/770/KEY_NOT_SET are bookkeeping only, never published.
+    auto quiet = run([":srv 761 me me avatar * :https://x/me.webp", ":srv 770 me avatar",
+                      ":srv FAIL METADATA KEY_NOT_SET me avatar :key not set"]);
+    assert(quiet[0].getAvatars()["me"] == "https://x/me.webp");
+    assert(quiet[1].length == 0, "761/770/KEY_NOT_SET must not reach the frontend");
+    auto self = run([":srv 761 me * avatar * :https://x/self.webp"]);
+    assert(self[0].getAvatars()["me"] == "https://x/self.webp", "`*` target means our own nick");
+
+    // 900/901 track the services account the public registry is keyed by.
+    auto login = run([":srv 900 me me!u@h acct :You are now logged in as acct"]);
+    assert(login[0].servicesAccount == "acct");
+    auto logout = run([":srv 900 me me!u@h acct :You are now logged in as acct",
+                       ":srv 901 me me!u@h :You are now logged out"]);
+    assert(logout[0].servicesAccount == "");
 }

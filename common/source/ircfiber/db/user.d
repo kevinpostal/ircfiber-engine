@@ -191,6 +191,25 @@ final class UserRepository {
         collection.updateOne(selector, update);
     }
 
+    /// Returns the user's default avatar URL, or `""` when none is set.
+    /// Kept off `User`/`toJson` for the same reason the bouncer token is:
+    /// session caches must not go stale when it changes.
+    string getAvatarUrl(UUID id) {
+        auto doc = collection.findOne(["id": id.toString()]);
+        if (doc.isNull) return "";
+        try return doc["avatarUrl"].get!string;
+        catch (Exception) return "";
+    }
+
+    /// Sets (or, with an empty URL, clears) the user's default avatar URL.
+    void setAvatarUrl(UUID id, string url) {
+        auto selector = Bson(["id": Bson(id.toString())]);
+        auto update = url.length
+            ? Bson(["$set": Bson(["avatarUrl": Bson(url)])])
+            : Bson(["$unset": Bson(["avatarUrl": Bson("")])]);
+        collection.updateOne(selector, update);
+    }
+
     /// Every user that currently has a bouncer password. Admin-only (the
     /// bouncer page); the token itself is never returned.
     User[] listWithBncToken() {
@@ -345,6 +364,7 @@ final class UserRepository {
         fields["createdAt"] = Bson(cast(double) u.createdAt.toUnixTime);
         fields["loginIps"] = Bson(u.loginIps.map!(r => Bson(r)).array);
         fields["emailUnsubscribed"] = Bson(u.emailUnsubscribed);
+        fields["nickservPasswordCustom"] = Bson(u.nickservPasswordCustom);
         Bson[] ids;
         foreach (o; u.oauthIdentities)
             ids ~= Bson([
@@ -400,6 +420,7 @@ final class UserRepository {
         // Missing key (pre-campaign rows) reads as false: still subscribed.
         // Tolerant: a wrongly typed value keeps false rather than throwing.
         try { if (doc["emailUnsubscribed"].type == Bson.Type.bool_) u.emailUnsubscribed = doc["emailUnsubscribed"].get!bool; } catch (Exception) {}
+        try { if (doc["nickservPasswordCustom"].type == Bson.Type.bool_) u.nickservPasswordCustom = doc["nickservPasswordCustom"].get!bool; } catch (Exception) {}
         // Missing key (pre-OAuth rows) reads as []: unlinked.
         try {
             if (doc["oauthIdentities"].type == Bson.Type.array)

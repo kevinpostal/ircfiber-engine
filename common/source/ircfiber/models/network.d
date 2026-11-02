@@ -181,6 +181,16 @@ struct NetworkConfig {
     /// by its IRCFIBER_MULLVAD_POOL label instead. Only such slots answer to
     /// a label, so a retargetable pool never has two names for one exit.
     string egressNodeId = "";
+    /// Per-network avatar override; empty defers to `defaultAvatarUrl`.
+    string avatarUrl = "";
+    /// Denormalized copy of the owner's account default avatar, kept in
+    /// sync so the engine can resolve the effective avatar without a
+    /// round trip to Mongo.
+    string defaultAvatarUrl = "";
+    /// Avatar actually published: the override if set, else the default.
+    string effectiveAvatarUrl() const @safe pure nothrow {
+        return avatarUrl.length ? avatarUrl : defaultAvatarUrl;
+    }
     /// Serialize to JSON
     Json toJson() const {
         return Json([
@@ -205,7 +215,9 @@ struct NetworkConfig {
             "serverPass": Json(serverPass),
             "systemManaged": Json(systemManaged),
             "autoJoinDelaySeconds": Json(autoJoinDelaySeconds),
-            "egressNodeId": Json(egressNodeId)
+            "egressNodeId": Json(egressNodeId),
+            "avatarUrl": Json(avatarUrl),
+            "defaultAvatarUrl": Json(defaultAvatarUrl)
         ]);
     }
 }

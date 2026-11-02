@@ -251,6 +251,14 @@ void writeStateSnapshotForNetwork(ref EngineContext ctx, Network net, string ser
     }
     snap.accounts = accountsJson;
 
+    // Avatars from draft/metadata-2 (`METADATA <nick> avatar`)
+    auto netAvatars = ctx.connManager.getAvatars(net.config.id);
+    auto avatarsJson = Json.emptyObject;
+    if (netAvatars !is null) {
+        foreach (k, v; netAvatars) avatarsJson[k] = Json(v);
+    }
+    snap.avatars = avatarsJson;
+
     // Idents from userhost-in-names / extended-join
     auto netIdents = ctx.connManager.getIdents(net.config.id);
     auto identsJson = Json.emptyObject;

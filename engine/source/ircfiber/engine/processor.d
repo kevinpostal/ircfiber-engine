@@ -197,6 +197,9 @@ void startEventProcessor(ref EngineContext ctx) {
                     // `accounts` map so member-list badges don't wait for
                     // the next JOIN/heartbeat.
                     || event.command == "ACCOUNT"
+                    // draft/metadata-2: an avatar change republishes the
+                    // `avatars` map so a reloading client sees it at once.
+                    || event.command == "METADATA"
                     // W1-T01: CONNECTION_RETRY_STATUS + CONNECTION_FAIL
                     // are the synthetic events that carry structured
                     // retry/fail payloads to the frontend. Writing a

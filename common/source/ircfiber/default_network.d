@@ -30,6 +30,7 @@ import vibe.core.log;
 import ircfiber.models.network : NetworkConfig, TLSMode, SASLMechanism;
 import ircfiber.models.user : User;
 import ircfiber.db.network : NetworkRepository;
+import ircfiber.db.user : UserRepository;
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.redis.protocol : RedisKeys, ControlMessage;
 import ircfiber.irc.registry : ServerRegistry;
@@ -186,6 +187,7 @@ NetworkConfig ensureDefaultFiberNetwork(
     }
 
     auto cfg = buildDefaultFiberNetwork(user);
+    cfg.defaultAvatarUrl = new UserRepository().getAvatarUrl(user.id);
     networkRepo.save(cfg, user.id);
 
     // Race guard: concurrent logins can both pass the `existing` check

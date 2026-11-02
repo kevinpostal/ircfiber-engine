@@ -2,7 +2,7 @@ module ircfiber.redis.protocol;
 
 import vibe.data.json;
 import std.uuid : UUID;
-import std.string : toUpper;
+import std.string : toUpper, toLower;
 
 /**
  * Redis Key Namespace for Decentralized Architecture
@@ -285,6 +285,15 @@ struct RedisKeys {
     /// frozen contract.
     static string protocolVersion() { return "irc:protocol:version"; }
 
+    /// Public avatar registry fallback for networks without IRCv3
+    /// draft/metadata-2: hash `<lowercased services account>` → avatar URL,
+    /// keyed per network host. Written by the engine on services login
+    /// (900/901), read by GET /api/avatars for users on bare IRC servers.
+    static string publicAvatars(string host) { return "irc:avatar:pub:" ~ host.toLower; }
+
+    /// Avatar upload rate limit: INCR + 1h EXPIRE, per user.
+    static string avatarUploadRate(string userId) { return "irc:avatar:ratelimit:" ~ userId; }
+
     /// SCAN pattern that matches every Redis key namespaced by a given
     /// serverId. Used by the janitor when reaping an orphan engine and
     /// by the bootstrap-time namespace purge.
@@ -550,6 +559,8 @@ struct NetworkStateSnapshot {
     Json realnames;
     /// extended-join account cache: nick → account name
     Json accounts;
+    /// IRCv3 draft/metadata-2 avatar cache: nick → avatar URL
+    Json avatars;
     /// Ident cache from userhost-in-names: nick → ident
     Json idents;
     /// The owner user identifier
@@ -645,6 +656,7 @@ struct NetworkStateSnapshot {
         if (users.type != Json.Type.undefined) j["users"] = users;
         if (realnames.type != Json.Type.undefined) j["realnames"] = realnames;
         if (accounts.type != Json.Type.undefined) j["accounts"] = accounts;
+        if (avatars.type != Json.Type.undefined) j["avatars"] = avatars;
         if (idents.type != Json.Type.undefined) j["idents"] = idents;
         if (ownerId.length) j["ownerId"] = Json(ownerId);
         if (serverId.length) j["serverId"] = Json(serverId);
@@ -716,6 +728,7 @@ struct NetworkStateSnapshot {
         if (j["users"].type != Json.Type.undefined) s.users = j["users"];
         if (j["realnames"].type != Json.Type.undefined) s.realnames = j["realnames"];
         if (j["accounts"].type != Json.Type.undefined) s.accounts = j["accounts"];
+        if (j["avatars"].type != Json.Type.undefined) s.avatars = j["avatars"];
         if (j["idents"].type != Json.Type.undefined) s.idents = j["idents"];
         if (j["ownerId"].type != Json.Type.undefined) s.ownerId = j["ownerId"].get!string;
         if (j["serverId"].type != Json.Type.undefined) s.serverId = j["serverId"].get!string;

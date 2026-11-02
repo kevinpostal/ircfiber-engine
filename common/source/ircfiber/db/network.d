@@ -199,7 +199,9 @@ final class NetworkRepository {
                 "disabled": Bson(config.disabled),
                 "systemManaged": Bson(config.systemManaged),
                 "autoJoinDelaySeconds": Bson(config.autoJoinDelaySeconds),
-                "egressNodeId": Bson(config.egressNodeId)
+                "egressNodeId": Bson(config.egressNodeId),
+                "avatarUrl": Bson(config.avatarUrl),
+                "defaultAvatarUrl": Bson(config.defaultAvatarUrl)
             ])
         ]);
         UpdateOptions options;
@@ -279,6 +281,8 @@ final class NetworkRepository {
                 if (v > 0) cfg.autoJoinDelaySeconds = cast(uint) v;
             } catch (Exception) {}
             try { cfg.egressNodeId = elem["egressNodeId"].get!string; } catch (Exception) {}
+            try { cfg.avatarUrl = elem["avatarUrl"].get!string; } catch (Exception) {}
+            try { cfg.defaultAvatarUrl = elem["defaultAvatarUrl"].get!string; } catch (Exception) {}
             result ~= cfg;
         }
         return result;
@@ -307,6 +311,8 @@ final class NetworkRepository {
             if (v > 0) cfg.autoJoinDelaySeconds = cast(uint) v;
         } catch (Exception) {}
         try { cfg.egressNodeId = doc["egressNodeId"].get!string; } catch (Exception) {}
+        try { cfg.avatarUrl = doc["avatarUrl"].get!string; } catch (Exception) {}
+        try { cfg.defaultAvatarUrl = doc["defaultAvatarUrl"].get!string; } catch (Exception) {}
         try { cfg.nspass = doc["nspass"].get!string; } catch (Exception) {}
         try { cfg.commands = doc["commands"].get!string; } catch (Exception) {}
         try { cfg.serverPass = doc["serverPass"].get!string; } catch (Exception) {}

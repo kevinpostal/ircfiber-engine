@@ -94,6 +94,8 @@ struct SessionSnapshot {
     string[string] realnames;
     /// Nick → account name (extended-join / account-notify).
     string[string] accounts;
+    /// Nick → avatar URL (draft/metadata-2 `avatar` key).
+    string[string] avatars;
     /// Nick → ident.
     string[string] idents;
     /// Label → sent-at unix ms (labeled-response).
@@ -180,6 +182,7 @@ Json toJSON(ref SessionSnapshot s) {
     j["channelUsers"] = stringListMapToJSON(s.channelUsers);
     j["realnames"] = stringMapToJSON(s.realnames);
     j["accounts"] = stringMapToJSON(s.accounts);
+    j["avatars"] = stringMapToJSON(s.avatars);
     j["idents"] = stringMapToJSON(s.idents);
     j["pendingLabels"] = longMapToJSON(s.pendingLabels);
     j["channelLatestMsgid"] = stringMapToJSON(s.channelLatestMsgid);
@@ -312,6 +315,7 @@ SessionSnapshot fromJSON(Json j) {
     }
     if (isObj(j["realnames"])) foreach (string k, v; j["realnames"]) s.realnames[k] = str(v);
     if (isObj(j["accounts"])) foreach (string k, v; j["accounts"]) s.accounts[k] = str(v);
+    if (isObj(j["avatars"])) foreach (string k, v; j["avatars"]) s.avatars[k] = str(v);
     if (isObj(j["idents"])) foreach (string k, v; j["idents"]) s.idents[k] = str(v);
     if (isObj(j["pendingLabels"])) foreach (string k, v; j["pendingLabels"]) s.pendingLabels[k] = integer(v);
     if (isObj(j["channelLatestMsgid"])) foreach (string k, v; j["channelLatestMsgid"]) s.channelLatestMsgid[k] = str(v);
