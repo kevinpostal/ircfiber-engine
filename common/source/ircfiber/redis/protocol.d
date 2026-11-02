@@ -294,6 +294,74 @@ struct RedisKeys {
     /// Avatar upload rate limit: INCR + 1h EXPIRE, per user.
     static string avatarUploadRate(string userId) { return "irc:avatar:ratelimit:" ~ userId; }
 
+    // ── Notifications (Notification Policy v2, `ircfiber.notify.*`) ──
+
+    /// Claims one message for one user across gateway replicas: string, `SET NX EX 86400`.
+    /// Replaces `irc:push:sent:<uid>:<m>`.
+    static string notifyClaim(string userId, string msgid) { return "irc:notify:claim:" ~ userId ~ ":" ~ msgid; }
+
+    /// Per-user app badge counter (reset by the app); 30-day expiry.
+    static string pushBadge(string userId) { return "irc:push:badge:" ~ userId; }
+
+    /// "Why was I notified?" index: ZSET msgid → event t, last 200, 24 h.
+    static string notifyTraceIndex(string userId) { return "irc:notify:traces:" ~ userId; }
+
+    /// Evaluation traces: HASH msgid → trace JSON, trimmed with `notifyTraceIndex`.
+    static string notifyTrace(string userId) { return "irc:notify:trace:" ~ userId; }
+
+    /// Delivery outcomes: HASH msgid → JSON array of outcomes, trimmed with `notifyTraceIndex`.
+    static string notifyOutcome(string userId) { return "irc:notify:outcome:" ~ userId; }
+
+    /// Items held by quiet hours: ZSET score t, member `<m>|<nid>|<buffer>|<cls>`; 8 days.
+    static string notifyHeld(string userId) { return "irc:notify:held:" ~ userId; }
+
+    /// Quiet-hours summary schedule: ZSET uid → window end (unix ms).
+    static string notifySummaryDue() { return "irc:notify:summary:due"; }
+
+    /// Repeated-DM tracking per sender: ZSET msgid → t; 1 h. `senderLower` is the lower-cased nick.
+    static string notifyDmTimes(string userId, string networkId, string senderLower) {
+        return "irc:notify:dm:" ~ userId ~ ":" ~ networkId ~ ":" ~ senderLower;
+    }
+
+    /// Burst grouping window for one thread: string holding the window start (ms), PX = window.
+    static string notifyCoalesce(string userId, string threadHash) { return "irc:notify:co:" ~ userId ~ ":" ~ threadHash; }
+
+    /// Messages coalesced into the current `notifyCoalesce` window (INCR).
+    static string notifyCoalesceCount(string userId, string threadHash) {
+        return "irc:notify:co:" ~ userId ~ ":" ~ threadHash ~ ":n";
+    }
+
+    /// Notification email schedule: ZSET uid → due (unix ms).
+    static string notifyEmailDue() { return "irc:notify:email:due"; }
+
+    /// Queued notification email items: LIST of JSON, at most 200, 3 days.
+    static string notifyEmailItems(string userId) { return "irc:notify:email:items:" ~ userId; }
+
+    /// When the last notification email went out (unix ms).
+    static string notifyEmailLast(string userId) { return "irc:notify:email:last:" ~ userId; }
+
+    /// Notification email unsubscribe token → uid; 30 days.
+    static string notifyUnsub(string token) { return "notify:unsub:" ~ token; }
+
+    /// SET of uids the server must evaluate without a push registration
+    /// (an email cell on, or quiet hours with the summary on).
+    static string notifyServerUsers() { return "irc:notify:server-users"; }
+
+    /// Browser presence for Web Push: HASH sessionRef → expiry ms; key EXPIRE 120 s.
+    static string notifyLive(string userId) { return "irc:notify:live:" ~ userId; }
+
+    /// Delivery health: HASH `<target>:lastOkAt` / `<target>:lastErrAt` / `<target>:lastErr`.
+    static string notifyHealth(string userId) { return "irc:notify:health:" ~ userId; }
+
+    /// Notification endpoint rate limit (`kind` = `patch`, `test`, …): INCR + EXPIRE.
+    static string notifyRate(string kind, string userId) { return "irc:notify:rl:" ~ kind ~ ":" ~ userId; }
+
+    /// Kill switch for notification email: missing = enabled, `"0"` disables.
+    static string notifyEmailSwitch() { return "irc:config:notifyEmail"; }
+
+    /// Kill switch for Web Push: missing = enabled, `"0"` disables.
+    static string notifyWebPushSwitch() { return "irc:config:notifyWebPush"; }
+
     /// SCAN pattern that matches every Redis key namespaced by a given
     /// serverId. Used by the janitor when reaping an orphan engine and
     /// by the bootstrap-time namespace purge.
@@ -893,4 +961,28 @@ unittest {
     auto legacyBack = NetworkStateSnapshot.fromJson(legacy);
     assert(legacyBack.dataAgeSecs == 0);
     assert(legacyBack.pongAgeSecs == 0);
+}
+
+@("RedisKeys notification helpers build the contract key names")
+unittest {
+    assert(RedisKeys.notifyClaim("u1", "m1") == "irc:notify:claim:u1:m1");
+    assert(RedisKeys.pushBadge("u1") == "irc:push:badge:u1");
+    assert(RedisKeys.notifyTraceIndex("u1") == "irc:notify:traces:u1");
+    assert(RedisKeys.notifyTrace("u1") == "irc:notify:trace:u1");
+    assert(RedisKeys.notifyOutcome("u1") == "irc:notify:outcome:u1");
+    assert(RedisKeys.notifyHeld("u1") == "irc:notify:held:u1");
+    assert(RedisKeys.notifySummaryDue() == "irc:notify:summary:due");
+    assert(RedisKeys.notifyDmTimes("u1", "n1", "bob") == "irc:notify:dm:u1:n1:bob");
+    assert(RedisKeys.notifyCoalesce("u1", "h") == "irc:notify:co:u1:h");
+    assert(RedisKeys.notifyCoalesceCount("u1", "h") == "irc:notify:co:u1:h:n");
+    assert(RedisKeys.notifyEmailDue() == "irc:notify:email:due");
+    assert(RedisKeys.notifyEmailItems("u1") == "irc:notify:email:items:u1");
+    assert(RedisKeys.notifyEmailLast("u1") == "irc:notify:email:last:u1");
+    assert(RedisKeys.notifyUnsub("tok") == "notify:unsub:tok");
+    assert(RedisKeys.notifyServerUsers() == "irc:notify:server-users");
+    assert(RedisKeys.notifyLive("u1") == "irc:notify:live:u1");
+    assert(RedisKeys.notifyHealth("u1") == "irc:notify:health:u1");
+    assert(RedisKeys.notifyRate("patch", "u1") == "irc:notify:rl:patch:u1");
+    assert(RedisKeys.notifyEmailSwitch() == "irc:config:notifyEmail");
+    assert(RedisKeys.notifyWebPushSwitch() == "irc:config:notifyWebPush");
 }

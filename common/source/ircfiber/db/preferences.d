@@ -13,6 +13,8 @@ import ircfiber.i18n : isSupportedLanguage;
 import ircfiber.db.prefs_cache : PrefsCache;
 import ircfiber.db.prefs_mongo : loadPrefsDoc, savePrefsDoc, deletePrefsDoc;
 import ircfiber.redis.protocol : RedisKeys;
+import ircfiber.db.notification_policy : NotificationPolicy, defaultPolicy, migrateFromV1, isTzName,
+    projDesktop, projSound, projAutoDismiss, projMuteAll, projHighlightWords, removeClient, CLIENT_WEB;
 
 /// Maps a `vibe.data.json.Json.Type` enum value to its string name so it can
 /// be emitted as a Loki label / log field. Kept private — only the pref
@@ -66,6 +68,15 @@ private void logLoadFail(UUID userId, string errMsg) {
 private void logLoadRepaired(UUID userId) {
     logJsonMap("warn", "prefs", "Repaired corrupt preferences blob by deleting key",
         ["event": "prefs_load_fail_repaired", "user_id": userId.toString()]);
+}
+
+/// Wall-clock unix ms (the v1 migration stamp and the `muteAll` projection).
+private long unixNowMs() @safe {
+    import std.datetime.systime : Clock, SysTime;
+    import std.datetime.timezone : UTC;
+    import std.datetime.date : DateTime;
+
+    return (Clock.currTime(UTC()) - SysTime(DateTime(1970, 1, 1), UTC())).total!"msecs";
 }
 
 /// Default bouncer playback size (lines per buffer on attach).
@@ -129,11 +140,11 @@ enum MAX_DEVICE_NAME_BYTES = 64;
 /// `lastSeenAt` is rewritten at most this often by reads, so GET /api/me stays read-only in steady state.
 enum long DEVICE_SEEN_GRANULARITY_MS = 3_600_000;
 /// Bool fields a device profile shares with the account's flat fields, in wire order.
-immutable string[] DEVICE_BOOL_PREFS = ["showMemberPrefixes", "desktopNotifications", "notificationSound", "autoDismissNotifs", "muteAll", "displayPrefsSet", "showUserIcons", "monospaceFont", "enlargeEmoji", "coloriseMentions", "formatColors", "showTimestamps"];
+immutable string[] DEVICE_BOOL_PREFS = ["showMemberPrefixes", "displayPrefsSet", "showUserIcons", "monospaceFont", "enlargeEmoji", "coloriseMentions", "formatColors", "showTimestamps"];
 /// The settings a device profile keeps apart from the web's: everything in it but `displayPrefsSet` and the metadata.
-private immutable string[] DEVICE_SETTINGS = ["showMemberPrefixes", "desktopNotifications", "notificationSound", "autoDismissNotifs", "muteAll", "showUserIcons", "monospaceFont", "modeIndicator", "enlargeEmoji", "coloriseMentions", "formatColors", "showTimestamps", "timestampFormat", "chatScalePct"];
-/// The notification prefs (POST /api/me/notification-prefs), in wire order.
-immutable string[] NOTIFICATION_PREFS = ["desktopNotifications", "notificationSound", "autoDismissNotifs", "muteAll"];
+private immutable string[] DEVICE_SETTINGS = ["showMemberPrefixes", "showUserIcons", "monospaceFont", "modeIndicator", "enlargeEmoji", "coloriseMentions", "formatColors", "showTimestamps", "timestampFormat", "chatScalePct"];
+/// An app install's IANA timezone (`Europe/Berlin`), stored as `DeviceProfile.tz`.
+enum DEVICE_TZ_HEADER = "X-IRCFiber-Device-TZ";
 /// Highlight words per account, and the longest word in bytes.
 enum MAX_HIGHLIGHT_WORDS = 100;
 enum MAX_HIGHLIGHT_WORD_BYTES = 64;
@@ -175,16 +186,13 @@ immutable ClientPrefSpec[] CLIENT_PREFS = [
     ClientPrefSpec("blurUnrecognizedLinks", ClientPrefKind.bool_),
 ];
 
-/// One client install's own display, member-list, notification and web client settings
-/// (`UserPreferences.devices`): an iOS app install or a web browser.
-/// The settings fields have the names, types and defaults of the account's flat fields, so
-/// `displayPrefsJson`, `applyDisplayPrefsPatch` and `applyNotificationPatch` take either.
+/// One client install's own display, member-list and web client settings
+/// (`UserPreferences.devices`): an iOS app install or a web browser. Its
+/// notification overrides live in `UserPreferences.notificationPolicy.clients`.
+/// The settings fields have the names, types and defaults of the account's flat
+/// fields, so `displayPrefsJson` and `applyDisplayPrefsPatch` take either.
 struct DeviceProfile {
     bool showMemberPrefixes = false;
-    bool desktopNotifications = true;
-    bool notificationSound = true;
-    bool autoDismissNotifs = true;
-    bool muteAll = false;
     /// Always true: a profile starts as a copy of settings the account already has, so the app
     /// never runs a first-time seed from its own storage.
     bool displayPrefsSet = true;
@@ -230,6 +238,9 @@ struct DeviceProfile {
     /// False until this device first writes `clientPrefs` (or a reset/defaults copy sets them), so
     /// a browser that already had local prefs pushes them instead of taking the account's.
     bool clientPrefsSet = false;
+    /// This install's IANA timezone from `DEVICE_TZ_HEADER` (metadata; quiet hours with
+    /// `tzMode == "device"` use it); "" until the app sends a valid one.
+    string tz;
 
     /// Serializes every field under its own name.
     Json toJson() const {
@@ -253,6 +264,7 @@ struct DeviceProfile {
         j["autoName"] = Json(autoName);
         j["clientPrefs"] = clientPrefs.clone;
         j["clientPrefsSet"] = Json(clientPrefsSet);
+        j["tz"] = Json(tz);
         return j;
     }
 
@@ -358,6 +370,13 @@ struct DeviceProfile {
             else
                 bad = true;
         }
+        if (auto v = "tz" in j) {
+            // "" is a stored "no timezone yet", not damage.
+            if (v.type == Json.Type.string && (v.get!string.length == 0 || isDeviceTz(v.get!string)))
+                d.tz = v.get!string;
+            else
+                bad = true;
+        }
         return d;
     }
 }
@@ -424,16 +443,16 @@ struct UserPreferences {
     /// `/api/me/show-member-prefixes` which then fans out via WS.
     bool showMemberPrefixes = false;
 
-    /// Global notification preferences — flat bools keep `prefVersion` fan-out
-    /// uniform (one counter for all prefs) and avoid a nested `notificationPrefs`
-    /// object migration. Cross-device via `pref_update` key `notificationPrefs`
-    /// + `stat_user` boot seed. Mirrors `showMemberPrefixes` handling.
-    bool desktopNotifications = true;
-    bool notificationSound = true;
-    bool autoDismissNotifs = true;
-    bool muteAll = false;
+    /// Notification Policy v2 (`ircfiber.db.notification_policy`): the account's
+    /// classes × transports matrix, snooze, quiet hours, highlight words and the
+    /// per-client overrides. A stored blob without it is migrated from the v1 flat
+    /// fields on load (`migrateFromV1`). `toJson` also writes the v1 projections
+    /// (`desktopNotifications`, `notificationSound`, `autoDismissNotifs`, `muteAll`,
+    /// `highlightWords`, device `muteAll`/`notificationSound`), never read back.
+    /// Every change goes through `bumpPolicyRev`.
+    NotificationPolicy notificationPolicy = defaultPolicy();
     /// The web's chat display prefs (web Settings → Interface/Messages; each iOS install keeps its own in `devices`).
-    /// Flat like the notification prefs; fanned out as one `displayPrefs` object
+    /// Flat fields; fanned out as one `displayPrefs` object
     /// (`displayPrefsJson`). Defaults equal the web's DEFAULT_PREFS. `displayPrefsSet` stays false
     /// until the first POST /api/me/display-prefs; the first web client after the upgrade then
     /// seeds the account from its localStorage values.
@@ -458,8 +477,6 @@ struct UserPreferences {
     /// The account's web client prefs: the defaults a new device's `clientPrefs` start from
     /// (`CLIENT_PREFS` keys only). Replaced, never mutated in place.
     Json clientPrefs = Json.emptyObject;
-    /// Words highlighted like the own nick (whole word, case-insensitive); web and app share them.
-    string[] highlightWords;
 
     /// Lines per buffer the bouncer replays when a client without
     /// `draft/chathistory` attaches (ZNC "playback buffer"). 0 disables.
@@ -521,10 +538,13 @@ struct UserPreferences {
         j["bufferPrefs"] = bp;
         j["prefVersion"] = Json(prefVersion);
         j["showMemberPrefixes"] = Json(showMemberPrefixes);
-        j["desktopNotifications"] = Json(desktopNotifications);
-        j["notificationSound"] = Json(notificationSound);
-        j["autoDismissNotifs"] = Json(autoDismissNotifs);
-        j["muteAll"] = Json(muteAll);
+        // v1 projections of `notificationPolicy` (account view): an older
+        // gateway reading this blob keeps v1 behaviour. Never read back.
+        const nowMs = unixNowMs();
+        j["desktopNotifications"] = Json(projDesktop(notificationPolicy));
+        j["notificationSound"] = Json(projSound(notificationPolicy, ""));
+        j["autoDismissNotifs"] = Json(projAutoDismiss(notificationPolicy));
+        j["muteAll"] = Json(projMuteAll(notificationPolicy, "", nowMs));
         j["displayPrefsSet"] = Json(displayPrefsSet);
         static foreach (key; DISPLAY_BOOL_PREFS)
             j[key] = Json(__traits(getMember, this, key));
@@ -534,10 +554,15 @@ struct UserPreferences {
         j["language"] = Json(language);
         j["clientPrefs"] = clientPrefs.clone;
         auto devs = Json.emptyObject;
-        foreach (id, ref d; devices)
-            devs[id] = d.toJson();
+        foreach (id, ref d; devices) {
+            auto dj = d.toJson();
+            dj["muteAll"] = Json(projMuteAll(notificationPolicy, id, nowMs));
+            dj["notificationSound"] = Json(projSound(notificationPolicy, id));
+            devs[id] = dj;
+        }
         j["devices"] = devs;
-        j["highlightWords"] = highlightWords is null ? Json.emptyArray : serializeToJson(highlightWords);
+        j["highlightWords"] = stringArrayJson(projHighlightWords(notificationPolicy));
+        j["notificationPolicy"] = notificationPolicy.toJson();
         j["bncPlaybackLines"] = Json(bncPlaybackLines);
         j["bncRequireTls"] = Json(bncRequireTls);
         j["bncAllowedCidrs"] = bncAllowedCidrs is null ? Json.emptyArray : serializeToJson(bncAllowedCidrs);
@@ -661,38 +686,6 @@ struct UserPreferences {
                 needsRepair = true;
             }
         }
-        if (auto v = "desktopNotifications" in json) {
-            if (v.type == Json.Type.bool_)
-                p.desktopNotifications = v.get!bool;
-            else {
-                logFieldInvalid(userId, "desktopNotifications", v.type, "bool");
-                needsRepair = true;
-            }
-        }
-        if (auto v = "notificationSound" in json) {
-            if (v.type == Json.Type.bool_)
-                p.notificationSound = v.get!bool;
-            else {
-                logFieldInvalid(userId, "notificationSound", v.type, "bool");
-                needsRepair = true;
-            }
-        }
-        if (auto v = "autoDismissNotifs" in json) {
-            if (v.type == Json.Type.bool_)
-                p.autoDismissNotifs = v.get!bool;
-            else {
-                logFieldInvalid(userId, "autoDismissNotifs", v.type, "bool");
-                needsRepair = true;
-            }
-        }
-        if (auto v = "muteAll" in json) {
-            if (v.type == Json.Type.bool_)
-                p.muteAll = v.get!bool;
-            else {
-                logFieldInvalid(userId, "muteAll", v.type, "bool");
-                needsRepair = true;
-            }
-        }
         if (auto v = "displayPrefsSet" in json) {
             if (v.type == Json.Type.bool_)
                 p.displayPrefsSet = v.get!bool;
@@ -767,15 +760,6 @@ struct UserPreferences {
                 }
             }
         }
-        if (auto v = "highlightWords" in json) {
-            if (v.type == Json.Type.array)
-                p.highlightWords = normalizeHighlightWords(*v);
-            else {
-                logFieldInvalid(userId, "highlightWords", v.type, "array");
-                p.highlightWords = [];
-                needsRepair = true;
-            }
-        }
         if (auto v = "bncPlaybackLines" in json) {
             if (v.type == Json.Type.int_)
                 p.bncPlaybackLines = clampBncPlaybackLines(cast(int) v.get!long);
@@ -829,6 +813,39 @@ struct UserPreferences {
                 logFieldInvalid(userId, "bncAllowPasswordAuth", v.type, "bool");
                 needsRepair = true;
             }
+        }
+        // Last: the v1 migration reads the raw `devices` and moves the
+        // `"<nid>:_server"` levels out of the already parsed `bufferPrefs`.
+        if (auto v = "notificationPolicy" in json) {
+            if (v.type == Json.Type.object) {
+                bool bad;
+                p.notificationPolicy = NotificationPolicy.fromJson(*v, bad);
+                if (bad) {
+                    logFieldInvalid(userId, "notificationPolicy", v.type, "valid notification policy");
+                    needsRepair = true;
+                }
+            } else {
+                logFieldInvalid(userId, "notificationPolicy", v.type, "object");
+                p.notificationPolicy = migrateFromV1(json, unixNowMs(), p.bufferPrefs);
+                needsRepair = true;
+            }
+        } else {
+            // A v1 blob: migrate, and let load() save the result once.
+            import ircfiber.observability : recordCounter;
+
+            p.notificationPolicy = migrateFromV1(json, unixNowMs(), p.bufferPrefs);
+            needsRepair = true;
+            recordCounter("notify_policy_migrations_total", 1);
+            logJsonMap("info", "prefs", "Migrated notification preferences to policy v2",
+                ["event": "notify_policy_migrated", "user_id": userId.toString()]);
+        }
+        // Overrides of devices that no longer have a profile.
+        string[] orphans;
+        foreach (key, _; p.notificationPolicy.clients)
+            if (key != CLIENT_WEB && key !in p.devices) orphans ~= key;
+        foreach (key; orphans) {
+            removeClient(p.notificationPolicy, key);
+            needsRepair = true;
         }
         return LoadResult(p, needsRepair);
     }
@@ -922,27 +939,22 @@ void applyDisplayPrefsPatch(P)(ref P p, Json patch) {
     p.displayPrefsSet = true;
 }
 
-/// Writes each notification pref `patch` holds as a bool into the account or a
-/// device profile; true when any was there. The caller answers a non-bool with 400.
-bool applyNotificationPatch(P)(ref P p, Json patch) {
-    bool any;
-    static foreach (key; NOTIFICATION_PREFS) {
-        if (auto v = key in patch) {
-            if (v.type == Json.Type.bool_) {
-                __traits(getMember, p, key) = v.get!bool;
-                any = true;
-            }
-        }
-    }
-    return any;
+/// The v1 notification prefs (`desktopNotifications`, `notificationSound`,
+/// `autoDismissNotifs`, `muteAll`) projected from the policy: the account view
+/// when `deviceId` is "", else that install's view (sound and mute as its pushes follow them).
+Json notificationPrefsJson(const ref UserPreferences p, string deviceId, long nowMs) {
+    auto j = Json.emptyObject;
+    j["desktopNotifications"] = Json(projDesktop(p.notificationPolicy));
+    j["notificationSound"] = Json(projSound(p.notificationPolicy, deviceId));
+    j["autoDismissNotifs"] = Json(projAutoDismiss(p.notificationPolicy));
+    j["muteAll"] = Json(projMuteAll(p.notificationPolicy, deviceId, nowMs));
+    return j;
 }
 
-/// The four notification prefs of the account or a device profile as one object.
-Json notificationPrefsJson(P)(const ref P p) {
-    auto j = Json.emptyObject;
-    static foreach (key; NOTIFICATION_PREFS)
-        j[key] = Json(__traits(getMember, p, key));
-    return j;
+/// Marks a change of `p.notificationPolicy`: bumps its `rev` (the If-Match token).
+/// Every mutation of the policy calls this once.
+void bumpPolicyRev(ref UserPreferences p) @safe pure nothrow @nogc {
+    ++p.notificationPolicy.rev;
 }
 
 /// "" when `v` is a valid value for `spec`, else the 400 error text (`<key> must be …`).
@@ -1083,14 +1095,16 @@ Json deviceIdentityJson(string ref_, const ref DeviceProfile d) {
 }
 
 /// The value of the `deviceSettings` pref_update: one device's identity and every per-device setting.
-Json deviceSettingsJson(string ref_, const ref DeviceProfile d) {
+/// `deviceId` must name a profile in `p.devices`.
+Json deviceSettingsJson(string ref_, const ref UserPreferences p, string deviceId, long nowMs) {
+    const d = &p.devices[deviceId];
     auto j = Json.emptyObject;
     j["ref"] = Json(ref_);
     j["kind"] = Json(d.kind);
     j["name"] = Json(d.name);
     j["autoName"] = Json(d.autoName);
-    j["displayPrefs"] = displayPrefsJson(d);
-    j["notificationPrefs"] = notificationPrefsJson(d);
+    j["displayPrefs"] = displayPrefsJson(*d);
+    j["notificationPrefs"] = notificationPrefsJson(p, deviceId, nowMs);
     j["showMemberPrefixes"] = Json(d.showMemberPrefixes);
     j["clientPrefs"] = d.clientPrefs.clone;
     j["clientPrefsSet"] = Json(d.clientPrefsSet);
@@ -1133,6 +1147,12 @@ bool isDeviceAppVersion(string s) @safe pure {
     if (s.length == 0 || s.length > 32) return false;
     foreach (c; s) if (!isAlphaNum(c) && c != '.' && c != '(' && c != ')' && c != ' ' && c != '-') return false;
     return true;
+}
+
+/// Whether `s` is a timezone as the app sends it (`DEVICE_TZ_HEADER`): an IANA name,
+/// 1–64 of `[A-Za-z0-9_+\-/]`. Whether it resolves is the gateway's check.
+bool isDeviceTz(string s) @safe pure nothrow @nogc {
+    return isTzName(s);
 }
 
 /// The account's settings as a device profile, metadata zero (`clientPrefsSet` false):
@@ -1178,11 +1198,12 @@ void makeAccountDefaults(ref UserPreferences p, const ref DeviceProfile d) {
 /// recently, or when none is web the profile of any kind seen least recently
 /// (ties: the smallest id).
 ///
-/// `deviceId` must already be valid and lower-case; `model` and `autoName` are ""
+/// `deviceId` must already be valid and lower-case; `model`, `autoName` and `tz` are ""
 /// when absent or invalid. The pointer is into `p.devices`, valid until it next changes.
+/// A dropped profile's notification overrides go with it.
 DeviceProfile* ensureDeviceProfile(ref UserPreferences p, string deviceId, string model, long nowMs,
         out bool changed, string osVersion = "", string appVersion = "", string clientIp = "",
-        string kind = DEVICE_KIND_APP, string autoName = "") {
+        string kind = DEVICE_KIND_APP, string autoName = "", string tz = "") {
     if (auto prof = deviceId in p.devices) {
         if (model.length && model != prof.model) {
             prof.model = model;
@@ -1202,6 +1223,10 @@ DeviceProfile* ensureDeviceProfile(ref UserPreferences p, string deviceId, strin
         }
         if (autoName.length && autoName != prof.autoName) {
             prof.autoName = autoName;
+            changed = true;
+        }
+        if (tz.length && tz != prof.tz) {
+            prof.tz = tz;
             changed = true;
         }
         if (nowMs - prof.lastSeenAt >= DEVICE_SEEN_GRANULARITY_MS) {
@@ -1224,6 +1249,7 @@ DeviceProfile* ensureDeviceProfile(ref UserPreferences p, string deviceId, strin
             }
         }
         p.devices.remove(oldest);
+        if (removeClient(p.notificationPolicy, oldest)) bumpPolicyRev(p);
     }
     auto fresh = accountProfile(p);
     fresh.model = model;
@@ -1232,25 +1258,11 @@ DeviceProfile* ensureDeviceProfile(ref UserPreferences p, string deviceId, strin
     fresh.lastIp = clientIp;
     fresh.kind = normalizeDeviceKind(kind);
     fresh.autoName = autoName;
+    fresh.tz = tz;
     fresh.createdAt = fresh.updatedAt = fresh.lastSeenAt = nowMs;
     p.devices[deviceId] = fresh;
     changed = true;
     return deviceId in p.devices;
-}
-
-/// The mute and sound a push to one APNs registration follows.
-struct PushNotify {
-    bool muteAll;
-    bool sound;
-}
-
-/// The device profile's mute and sound when `deviceId` names a stored one,
-/// else the account's (a registration made without an install id).
-PushNotify pushNotifyFor(const ref UserPreferences p, string deviceId) {
-    if (deviceId.length)
-        if (auto d = deviceId in p.devices)
-            return PushNotify(d.muteAll, d.notificationSound);
-    return PushNotify(p.muteAll, p.notificationSound);
 }
 
 /// Cleans a highlight-word list: keeps strings only, trims them, drops empty
@@ -1605,11 +1617,19 @@ return newPrefVersion`;
         cache_.remove(userId);
         deletePrefsDoc(userId.toString());
     }
+
+    /// Drops this process's cached copy of a user's preferences, so the next
+    /// `load()` reads Redis (another replica or thread changed them).
+    void forget(UUID userId) {
+        cache_.remove(userId);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
 // Unit tests
 // ─────────────────────────────────────────────────────────────────────────
+
+version (unittest) import ircfiber.db.notification_policy;
 
 @("UserPreferences prefVersion round-trips through JSON")
 unittest {
@@ -1657,9 +1677,12 @@ unittest {
     assert(r1.needsRepair, "needsRepair must be true when array fields are wrong type");
     assert(r1.prefs.pinnedChannels.length == 0,
         "wrong-type array field must drop without crashing");
-    // Sanity: object fields (correct type) don't trigger the flag.
+    // Sanity: object fields (correct type) don't trigger the flag. (Each blob
+    // carries a v2 notification policy: without one it is a v1 blob and migrating
+    // it is a repair of its own.)
     auto j2 = Json.emptyObject;
     j2["lastActiveBuffers"] = Json.emptyObject;
+    j2["notificationPolicy"] = defaultPolicy().toJson();
     const r2 = UserPreferences.fromJson(j2, UUID.init);
     assert(!r2.needsRepair, "needsRepair must be false when only object fields are present (correct type)");
     // All-correct JSON must not need repair.
@@ -1667,6 +1690,7 @@ unittest {
     j3["pinnedChannels"] = serializeToJson(["net1:#a"]);
     j3["networkOrder"]   = serializeToJson(["net1"]);
     j3["ignores"]        = serializeToJson(["spammer!*@*"]);
+    j3["notificationPolicy"] = defaultPolicy().toJson();
     const r3 = UserPreferences.fromJson(j3, UUID.init);
     assert(!r3.needsRepair, "needsRepair must be false when all fields are correct type");
 }
@@ -1927,26 +1951,27 @@ unittest {
     p.formatColors = false;
     p.showTimestamps = false;
     p.timestampFormat = "24h";
-    p.highlightWords = ["deploy", "prod"];
+    p.notificationPolicy.highlight.words = [HighlightWord("deploy", false), HighlightWord("prod", true)];
     const r = UserPreferences.fromJson(p.toJson());
     assert(!r.needsRepair);
     assert(r.prefs.displayPrefsSet && !r.prefs.showUserIcons && !r.prefs.monospaceFont);
     assert(!r.prefs.enlargeEmoji && !r.prefs.coloriseMentions && !r.prefs.formatColors && !r.prefs.showTimestamps);
     assert(r.prefs.modeIndicator == "symbols" && r.prefs.timestampFormat == "24h");
-    assert(r.prefs.highlightWords == ["deploy", "prod"]);
+    assert(r.prefs.notificationPolicy.highlight.words == [HighlightWord("deploy", false), HighlightWord("prod", true)]);
     const dp = displayPrefsJson(r.prefs);
     assert(dp["displayPrefsSet"].get!bool && !dp["showUserIcons"].get!bool && !dp["showTimestamps"].get!bool);
     assert(dp["modeIndicator"].get!string == "symbols" && dp["timestampFormat"].get!string == "24h");
 
-    // A blob saved before these fields existed decodes to the defaults.
+    // A blob saved before these fields existed decodes to the defaults (its
+    // notification policy is migrated from v1, which asks for one save).
     auto legacy = Json.emptyObject;
     legacy["pinnedChannels"] = serializeToJson(["net1:#a"]);
     const l = UserPreferences.fromJson(legacy);
-    assert(!l.needsRepair);
+    assert(l.needsRepair);
     assert(!l.prefs.displayPrefsSet && l.prefs.showUserIcons && l.prefs.monospaceFont);
     assert(l.prefs.enlargeEmoji && l.prefs.coloriseMentions && l.prefs.formatColors && l.prefs.showTimestamps);
     assert(l.prefs.modeIndicator == "dots" && l.prefs.timestampFormat == "auto");
-    assert(l.prefs.highlightWords.length == 0);
+    assert(l.prefs.notificationPolicy.highlight.words.length == 0);
     // An empty list is stored and sent as [], never null.
     assert(UserPreferences.init.toJson()["highlightWords"].type == Json.Type.array);
     assert(stringArrayJson(null).type == Json.Type.array);
@@ -1969,7 +1994,34 @@ unittest {
     const s = UserPreferences.fromJson(k);
     assert(s.needsRepair);
     assert(s.prefs.modeIndicator == "dots" && s.prefs.showUserIcons);
-    assert(s.prefs.highlightWords.length == 0);
+    assert(s.prefs.notificationPolicy.highlight.words.length == 0);
+}
+
+@("chatScalePct round-trips on the account and a device; an invalid value repairs to the default")
+unittest {
+    UserPreferences p;
+    p.chatScalePct = 125;
+    const r = UserPreferences.fromJson(p.toJson());
+    assert(!r.needsRepair);
+    assert(r.prefs.chatScalePct == 125);
+
+    DeviceProfile d;
+    d.chatScalePct = 125;
+    bool dBad;
+    const rd = DeviceProfile.fromJson(d.toJson(), dBad);
+    assert(!dBad);
+    assert(rd.chatScalePct == 125);
+
+    auto j = Json.emptyObject;
+    j["chatScalePct"] = Json(7);
+    const s = UserPreferences.fromJson(j);
+    assert(s.needsRepair);
+    assert(s.prefs.chatScalePct == 100);
+
+    bool bad;
+    const sd = DeviceProfile.fromJson(j, bad);
+    assert(bad);
+    assert(sd.chatScalePct == 100);
 }
 
 @("language round-trips; legacy blobs follow the browser; unknown codes repair to automatic")
@@ -1982,7 +2034,8 @@ unittest {
     auto legacy = Json.emptyObject;
     legacy["pinnedChannels"] = serializeToJson(["net1:#a"]);
     const l = UserPreferences.fromJson(legacy);
-    assert(!l.needsRepair && l.prefs.language == "");
+    assert(l.needsRepair, "a v1 blob migrates its notification policy");
+    assert(l.prefs.language == "");
 
     auto bad = Json.emptyObject;
     bad["language"] = Json("xx");
@@ -2053,33 +2106,6 @@ unittest {
     assert(p.chatScalePct == 130);
 }
 
-@("chatScalePct round-trips on the account and a device; an invalid value repairs to the default")
-unittest {
-    UserPreferences p;
-    p.chatScalePct = 125;
-    const r = UserPreferences.fromJson(p.toJson());
-    assert(!r.needsRepair);
-    assert(r.prefs.chatScalePct == 125);
-
-    DeviceProfile d;
-    d.chatScalePct = 125;
-    bool dBad;
-    const rd = DeviceProfile.fromJson(d.toJson(), dBad);
-    assert(!dBad);
-    assert(rd.chatScalePct == 125);
-
-    auto j = Json.emptyObject;
-    j["chatScalePct"] = Json(7);
-    const s = UserPreferences.fromJson(j);
-    assert(s.needsRepair);
-    assert(s.prefs.chatScalePct == 100);
-
-    bool bad;
-    const sd = DeviceProfile.fromJson(j, bad);
-    assert(bad);
-    assert(sd.chatScalePct == 100);
-}
-
 @("sanitizeClientPrefs migrates a legacy fontSize to textSize and flags repair")
 unittest {
     auto stored = Json.emptyObject;
@@ -2146,7 +2172,7 @@ unittest {
     UserPreferences p;
     DeviceProfile d1;
     d1.showUserIcons = false;
-    d1.muteAll = true;
+    d1.tz = "Europe/Berlin";
     d1.modeIndicator = "symbols";
     d1.timestampFormat = "24h";
     d1.model = "iPhone17,1";
@@ -2155,7 +2181,7 @@ unittest {
     d1.lastSeenAt = 3;
     DeviceProfile d2;
     d2.showMemberPrefixes = true;
-    d2.notificationSound = false;
+    d2.tz = "America/Los_Angeles";
     p.devices[a] = d1;
     p.devices[b] = d2;
     const r = UserPreferences.fromJson(p.toJson());
@@ -2191,12 +2217,11 @@ unittest {
     enum long now = 1_800_000_000_000;
     UserPreferences p;
     p.showUserIcons = false;
-    p.muteAll = true;
     p.timestampFormat = "12h";
     bool changed;
     auto prof = ensureDeviceProfile(p, id, "iPhone17,1", now, changed);
     assert(changed);
-    assert(!prof.showUserIcons && prof.muteAll && prof.timestampFormat == "12h");
+    assert(!prof.showUserIcons && prof.timestampFormat == "12h");
     assert(prof.displayPrefsSet, "a device answers displayPrefsSet even before the web set its prefs");
     assert(prof.model == "iPhone17,1");
     assert(prof.createdAt == now && prof.updatedAt == now && prof.lastSeenAt == now);
@@ -2210,6 +2235,15 @@ unittest {
     prof = ensureDeviceProfile(p, id, "iPhone18,2", now + 2 * 3_600_000, changed);
     assert(changed && prof.model == "iPhone18,2");
     assert(prof.createdAt == now && p.devices.length == 1);
+    assert(prof.tz == "", "no timezone until the app sends one");
+    prof = ensureDeviceProfile(p, id, "", now + 2 * 3_600_000, changed, "", "", "", DEVICE_KIND_APP, "", "Europe/Berlin");
+    assert(changed && prof.tz == "Europe/Berlin");
+    prof = ensureDeviceProfile(p, id, "", now + 2 * 3_600_000, changed, "", "", "", DEVICE_KIND_APP, "", "");
+    assert(!changed && prof.tz == "Europe/Berlin", "a request without a timezone keeps the stored one");
+    bool changedNew;
+    auto other = ensureDeviceProfile(p, "99999999-2222-4333-8444-555555555555", "", now, changedNew,
+        "", "", "", DEVICE_KIND_APP, "", "Asia/Tokyo");
+    assert(changedNew && other.tz == "Asia/Tokyo", "a new profile stores the timezone it was created with");
 }
 
 @("ensureDeviceProfile updates osVersion, appVersion and lastIp independently of model")
@@ -2253,12 +2287,19 @@ unittest {
         d.lastSeenAt = i;
         p.devices[format("%08x-0000-4000-8000-000000000000", i)] = d;
     }
+    auto cp = Json.emptyObject;
+    cp["snoozeUntil"] = Json(-1);
+    applyClientPatch(p.notificationPolicy, "00000001-0000-4000-8000-000000000000", cp);
+    const rev = p.notificationPolicy.rev;
     bool changed;
     ensureDeviceProfile(p, "ffffffff-0000-4000-8000-000000000000", "", 100, changed);
     assert(changed && p.devices.length == MAX_DEVICE_PROFILES);
     assert("00000001-0000-4000-8000-000000000000" !in p.devices);
     assert("00000002-0000-4000-8000-000000000000" in p.devices);
     assert("ffffffff-0000-4000-8000-000000000000" in p.devices);
+    assert("00000001-0000-4000-8000-000000000000" !in p.notificationPolicy.clients,
+        "the dropped profile's notification overrides go with it");
+    assert(p.notificationPolicy.rev == rev + 1);
 }
 
 @("a device's patches leave the web's settings alone; copySettings restores the web's")
@@ -2270,20 +2311,26 @@ unittest {
     auto patch = Json.emptyObject;
     patch["showUserIcons"] = Json(false);
     applyDisplayPrefsPatch(*prof, patch);
-    auto notif = Json.emptyObject;
-    notif["muteAll"] = Json(true);
-    notif["notificationSound"] = Json("loud");
-    assert(applyNotificationPatch(*prof, notif));
     prof.showMemberPrefixes = true;
-    assert(!prof.showUserIcons && prof.muteAll && prof.notificationSound, "a non-bool is not applied");
-    assert(p.showUserIcons && !p.muteAll && !p.showMemberPrefixes, "the web's settings are untouched");
+    // The v1 per-device mute and sound are now client overrides in the policy.
+    auto notif = parseJsonString(`{"cells":{"dm.sound":false},"snoozeUntil":-1}`);
+    string field;
+    assert(validateClientPatch(id, notif, field) == "");
+    applyClientPatch(p.notificationPolicy, id, notif);
+    assert(!prof.showUserIcons);
+    assert(p.showUserIcons && !p.showMemberPrefixes, "the web's settings are untouched");
+    assert(projMuteAll(p.notificationPolicy, id, 1000) && !projMuteAll(p.notificationPolicy, "", 1000));
+    assert(resolveCell(p.notificationPolicy, id, NotifyClass.dm, Transport.sound) == false);
+    assert(resolveCell(p.notificationPolicy, CLIENT_WEB, NotifyClass.dm, Transport.sound) == true);
     assert(!displayPrefsJson(*prof)["showUserIcons"].get!bool && displayPrefsJson(p)["showUserIcons"].get!bool);
+    const np = notificationPrefsJson(p, id, 1000);
+    assert(np["muteAll"].get!bool && np["notificationSound"].get!bool, "other classes still push with sound");
+    assert(!notificationPrefsJson(p, "", 1000)["muteAll"].get!bool);
 
     const web = accountProfile(p);
     copySettings(*prof, web);
-    assert(prof.showUserIcons && !prof.muteAll && !prof.showMemberPrefixes);
+    assert(prof.showUserIcons && !prof.showMemberPrefixes);
     assert(prof.model == "iPad16,3" && prof.createdAt == 1000, "a reset keeps the device's identity");
-    assert(!applyNotificationPatch(p, Json.emptyObject));
 }
 
 @("checkClientPrefsPatch: per-kind validation, null deletes, unknown keys ignored, any flag")
@@ -2387,6 +2434,7 @@ unittest {
     legacyDevs[id] = legacyDev;
     auto legacy = Json.emptyObject;
     legacy["devices"] = legacyDevs;
+    legacy["notificationPolicy"] = defaultPolicy().toJson();   // not a v1 notification blob
     const l = UserPreferences.fromJson(legacy);
     assert(!l.needsRepair && l.prefs.clientPrefs.length == 0);
     assert(l.prefs.devices[id].kind == DEVICE_KIND_APP && !l.prefs.devices[id].clientPrefsSet);
@@ -2482,21 +2530,21 @@ unittest {
     devPrefs["textSize"] = Json("l");
     prof.chatScalePct = 130;
     prof.clientPrefs = devPrefs;
-    prof.muteAll = true;
+    prof.showUserIcons = false;
     prof.monospaceFont = false;
     prof.name = "Desk";
 
     makeAccountDefaults(p, *prof);
-    assert(p.clientPrefs == devPrefs && p.muteAll && !p.monospaceFont && p.displayPrefsSet);
+    assert(p.clientPrefs == devPrefs && !p.showUserIcons && !p.monospaceFont && p.displayPrefsSet);
     assert(p.chatScalePct == 130, "makeAccountDefaults copies chatScalePct via DEVICE_SETTINGS");
     auto patch = Json.emptyObject;
     patch["textSize"] = Json("xl");
     applyClientPrefsPatch(prof.clientPrefs, patch);
     assert(p.clientPrefs["textSize"].get!string == "l", "the defaults are a copy");
 
-    p.muteAll = false;
+    p.showUserIcons = true;
     resetDeviceToAccount(*prof, p);
-    assert(prof.clientPrefs == devPrefs && !prof.muteAll && !prof.monospaceFont);
+    assert(prof.clientPrefs == devPrefs && prof.showUserIcons && !prof.monospaceFont);
     assert(prof.clientPrefsSet, "a reset device takes the server's client prefs");
     assert(prof.name == "Desk" && prof.kind == DEVICE_KIND_WEB && prof.createdAt == 1000,
         "a reset keeps the device's identity");
@@ -2524,24 +2572,27 @@ unittest {
         && normalizeDeviceKind("WEB") == DEVICE_KIND_APP);
 }
 
-@("pushNotifyFor: a device's own mute and sound, else the account's")
+@("a device's push mute and sound: its own client override, else the account's")
 unittest {
     enum muted = "11111111-2222-4333-8444-555555555555";
     enum silent = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    enum long now = 1_800_000_000_000;
     UserPreferences p;
-    DeviceProfile m;
-    m.muteAll = true;
-    p.devices[muted] = m;
-    DeviceProfile s;
-    s.notificationSound = false;
-    p.devices[silent] = s;
-    assert(pushNotifyFor(p, muted) == PushNotify(true, true));
-    assert(pushNotifyFor(p, silent) == PushNotify(false, false));
-    assert(pushNotifyFor(p, "") == PushNotify(false, true));
-    assert(pushNotifyFor(p, "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee") == PushNotify(false, true));
-    p.muteAll = true;
-    assert(pushNotifyFor(p, silent) == PushNotify(false, false), "the account's mute does not reach a device");
-    assert(pushNotifyFor(p, "") == PushNotify(true, true));
+    p.devices[muted] = DeviceProfile.init;
+    p.devices[silent] = DeviceProfile.init;
+    applyClientPatch(p.notificationPolicy, muted, parseJsonString(`{"snoozeUntil":-1}`));
+    applyClientPatch(p.notificationPolicy, silent, parseJsonString(`{"cells":{"dm.sound":false}}`));
+    const pol = &p.notificationPolicy;
+    bool muteOf(string id) { return snoozeActive(snoozeOf(*pol, id), now); }
+    bool soundOf(string id) { return resolveCell(*pol, id, NotifyClass.dm, Transport.sound); }
+    assert(muteOf(muted) && soundOf(muted));
+    assert(!muteOf(silent) && !soundOf(silent));
+    assert(!muteOf("bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee") && soundOf("bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee"),
+        "an install without overrides follows the account");
+    p.notificationPolicy.snoozeUntil = -1;
+    assert(muteOf(silent), "the account's snooze reaches a device without its own");
+    applyClientPatch(p.notificationPolicy, silent, parseJsonString(`{"snoozeUntil":0}`));
+    assert(!muteOf(silent), "a device snooze of 0 beats the account's");
 }
 
 @("isDeviceId takes canonical UUIDs in either case; isDeviceModel takes model identifiers")
@@ -2559,4 +2610,87 @@ unittest {
     assert(!isDeviceModel(""));
     assert(!isDeviceModel(replicate("a", 33)));
     assert(!isDeviceModel("a b"));
+}
+
+@("a v1 blob migrates its notification prefs to the policy and asks for one save")
+unittest {
+    enum dev = "11111111-2222-4333-8444-555555555555";
+    auto v1 = parseJsonString(`{"desktopNotifications":false,"notificationSound":true,"autoDismissNotifs":true,
+        "muteAll":true,"highlightWords":["deploy"],
+        "bufferPrefs":{"n1:_server":{"mute":true},"n1:#chan":{"notifyAll":true}},
+        "devices":{"` ~ dev ~ `":{"muteAll":true,"notificationSound":false,"model":"iPhone17,1"}}}`);
+    const r = UserPreferences.fromJson(v1);
+    assert(r.needsRepair, "the migrated blob is saved on the same load");
+    const pol = &r.prefs.notificationPolicy;
+    assert(pol.matrix[NotifyClass.notice] == Cells(false, true, false, false));
+    assert(pol.matrix[NotifyClass.dm] == Cells(false, true, true, false));
+    assert(pol.snoozeUntil == -1);
+    assert(pol.clients[dev].hasSnooze && pol.clients[dev].snoozeUntil == -1);
+    assert(pol.clients[dev].cells["dm.sound"] == false);
+    assert(pol.networks["n1"] == "muted");
+    assert("n1:_server" !in r.prefs.bufferPrefs && "n1:#chan" in r.prefs.bufferPrefs);
+    assert(pol.highlight.words == [HighlightWord("deploy", false)]);
+    assert(pol.presentation.coalesceSec == 0 && pol.migratedAt > 0);
+    assert(r.prefs.devices[dev].model == "iPhone17,1");
+
+    // The saved blob is v2: it loads without another migration, and keeps the
+    // v1 projections for an older gateway.
+    const j = r.prefs.toJson();
+    assert(!j["desktopNotifications"].get!bool && j["notificationSound"].get!bool && j["muteAll"].get!bool);
+    assert(j["devices"][dev]["muteAll"].get!bool && j["devices"][dev]["notificationSound"].get!bool == false);
+    assert(j["highlightWords"] == parseJsonString(`["deploy"]`));
+    const again = UserPreferences.fromJson(j);
+    assert(!again.needsRepair && again.prefs.notificationPolicy.migratedAt == pol.migratedAt);
+}
+
+@("a v2 blob round-trips byte-identical through toJson")
+unittest {
+    enum dev = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    UserPreferences p;
+    DeviceProfile d;
+    d.model = "Pixel9";
+    d.tz = "America/Los_Angeles";
+    p.devices[dev] = d;
+    p.bufferPrefs["n1:#chan"] = parseJsonString(`{"notifyAll":true,"nAt":5}`);
+    p.notificationPolicy.snoozeUntil = -1;
+    p.notificationPolicy.networks["n1"] = "all";
+    p.notificationPolicy.highlight.words = [HighlightWord("outage", true)];
+    applyClientPatch(p.notificationPolicy, dev, parseJsonString(`{"cells":{"all.mobile":true},"snoozeUntil":0}`));
+    applyClientPatch(p.notificationPolicy, CLIENT_WEB, parseJsonString(`{"cells":{"mention.sound":false}}`));
+    bumpPolicyRev(p);
+    assert(p.notificationPolicy.rev == 2);
+    const first = p.toJson().toString();
+    const r = UserPreferences.fromJson(parseJsonString(first));
+    assert(!r.needsRepair);
+    assert(r.prefs.toJson().toString() == first);
+    assert(r.prefs.devices[dev].tz == "America/Los_Angeles");
+}
+
+@("fromJson prunes notification overrides of devices without a profile")
+unittest {
+    enum kept = "11111111-2222-4333-8444-555555555555";
+    enum gone = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    UserPreferences p;
+    p.devices[kept] = DeviceProfile.init;
+    applyClientPatch(p.notificationPolicy, kept, parseJsonString(`{"snoozeUntil":-1}`));
+    applyClientPatch(p.notificationPolicy, gone, parseJsonString(`{"snoozeUntil":-1}`));
+    applyClientPatch(p.notificationPolicy, CLIENT_WEB, parseJsonString(`{"snoozeUntil":-1}`));
+    const r = UserPreferences.fromJson(p.toJson());
+    assert(r.needsRepair);
+    assert(kept in r.prefs.notificationPolicy.clients && CLIENT_WEB in r.prefs.notificationPolicy.clients);
+    assert(gone !in r.prefs.notificationPolicy.clients);
+    assert(!UserPreferences.fromJson(r.prefs.toJson()).needsRepair);
+}
+
+@("device timezones: isDeviceTz and the stored DeviceProfile.tz")
+unittest {
+    assert(isDeviceTz("Europe/Berlin") && isDeviceTz("Etc/GMT-3") && !isDeviceTz("") && !isDeviceTz("Europe/Berlin\n"));
+    auto j = DeviceProfile.init.toJson();
+    j["tz"] = Json("not a zone");
+    bool bad;
+    const d = DeviceProfile.fromJson(j, bad);
+    assert(bad && d.tz == "");
+    j["tz"] = Json("Asia/Tokyo");
+    bool bad2;
+    assert(DeviceProfile.fromJson(j, bad2).tz == "Asia/Tokyo" && !bad2);
 }

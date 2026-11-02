@@ -6,9 +6,11 @@ import vibe.data.bson;
 import vibe.core.log;
 import ircfiber.db.mongo : AppMongoConnection;
 
-/// One push device registration of a mobile app (APNs for iOS, FCM for Android).
+/// One push registration: an app install (APNs for iOS, FCM for Android) or a
+/// browser's Web Push subscription (`platform == "web"`).
 struct PushDevice {
-    /// APNs device token (lower-case hex) or FCM registration token (`_id`).
+    /// APNs device token (lower-case hex), FCM registration token, or the Web
+    /// Push endpoint URL (`_id`).
     string token;
     /// Owning user id.
     string userId;
@@ -18,14 +20,21 @@ struct PushDevice {
     string bundleId;
     /// Device model as reported by the app (`iPhone16,1`).
     string model;
-    /// Delivery platform: `"ios"` (APNs) or `"android"` (FCM).
+    /// Delivery platform: `"ios"` (APNs), `"android"` (FCM) or `"web"` (Web Push).
     string platform = "ios";
-    /// The app's install id (`X-IRCFiber-Device`); empty for registrations made without it.
+    /// The app's install id (`X-IRCFiber-Device`); empty for registrations made
+    /// without it; `"web"` for Web Push subscriptions.
     string deviceId;
     /// First registration (unix ms).
     long createdAt;
     /// Latest registration (unix ms).
     long lastSeenAt;
+    /// Web Push only: the subscription's P-256 public key (`keys.p256dh`, base64url).
+    string webP256dh;
+    /// Web Push only: the subscription's auth secret (`keys.auth`, base64url).
+    string webAuth;
+    /// Web Push only: `sessionRef` of the login session that subscribed (presence check).
+    string webSessionRef;
 
     /// Serializes to Bson.
     Bson toBson() const @trusted {
@@ -33,6 +42,7 @@ struct PushDevice {
             "_id": Bson(token), "userId": Bson(userId), "environment": Bson(environment),
             "bundleId": Bson(bundleId), "model": Bson(model), "platform": Bson(platform),
             "deviceId": Bson(deviceId), "createdAt": Bson(createdAt), "lastSeenAt": Bson(lastSeenAt),
+            "webP256dh": Bson(webP256dh), "webAuth": Bson(webAuth), "webSessionRef": Bson(webSessionRef),
         ]);
     }
 
@@ -51,6 +61,11 @@ struct PushDevice {
         d.deviceId = id.type == Bson.Type.string ? id.get!string : "";
         d.createdAt = b["createdAt"].get!long;
         d.lastSeenAt = b["lastSeenAt"].get!long;
+        // Rows from before Web Push have none of the web fields.
+        static foreach (key; ["webP256dh", "webAuth", "webSessionRef"]) {{
+            auto v = b[key];
+            __traits(getMember, d, key) = v.type == Bson.Type.string ? v.get!string : "";
+        }}
         return d;
     }
 }
@@ -88,6 +103,9 @@ final class PushDeviceRepository {
         setDoc["platform"] = Bson(d.platform);
         setDoc["deviceId"] = Bson(d.deviceId);
         setDoc["lastSeenAt"] = Bson(d.lastSeenAt);
+        setDoc["webP256dh"] = Bson(d.webP256dh);
+        setDoc["webAuth"] = Bson(d.webAuth);
+        setDoc["webSessionRef"] = Bson(d.webSessionRef);
         auto selector = Bson(["_id": Bson(d.token)]);
         if (collection.updateOne(selector, Bson(["$set": setDoc])).matchedCount > 0) return;
         auto fresh = d;
@@ -169,6 +187,23 @@ unittest {
     assert(PushDevice.fromBson(d.toBson()).platform == "android");
 }
 
+@("PushDevice Web Push subscription round-trips its keys and session ref through Bson")
+unittest {
+    PushDevice d;
+    d.token = "https://fcm.googleapis.com/fcm/send/abc";
+    d.userId = "u1";
+    d.platform = "web";
+    d.deviceId = "web";
+    d.webP256dh = "BNcRdreALRFXTkOOUHK1EtK2wtaz5Ry4YfYCA_0QTpQtUbVlUls0VJXg7A8u-Ts1XbjhazAkj7I99e8QcYP7DkM";
+    d.webAuth = "tBHItJI5svbpez7KI4CCXg";
+    d.webSessionRef = "a1b2c3d4e5f6";
+    d.createdAt = 1;
+    d.lastSeenAt = 2;
+    const back = PushDevice.fromBson(d.toBson());
+    assert(back == d);
+    assert(back.platform == "web" && back.webAuth == "tBHItJI5svbpez7KI4CCXg");
+}
+
 @("PushDevice registered before install ids decodes with an empty deviceId")
 unittest {
     auto b = Bson([
@@ -179,6 +214,7 @@ unittest {
     const d = PushDevice.fromBson(b);
     assert(d.deviceId == "" && d.token == "ab12" && d.lastSeenAt == 2);
     assert(d.platform == "ios");
+    assert(d.webP256dh == "" && d.webAuth == "" && d.webSessionRef == "", "an app row has no Web Push keys");
 }
 
 @("PushDevice registered before Android support decodes as platform ios")
