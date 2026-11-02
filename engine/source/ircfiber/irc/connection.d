@@ -2466,7 +2466,7 @@ void moveKey(V)(ref V[string] m, string from, string to) {
 
 /// Deep copy of an `outer → key → value` metadata map (`.dup` alone would
 /// share the inner maps).
-string[string][string] dupNested(const string[string][string] m) @safe pure nothrow {
+string[string][string] dupNested(const string[string][string] m) @safe pure {
     string[string][string] r;
     foreach (k, inner; m) {
         string[string] row;
