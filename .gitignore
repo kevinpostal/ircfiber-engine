@@ -19,3 +19,7 @@ dub.userprefs
 # Ansible vault password — local secret, never committed.
 deploy/.vault_pass.txt
 common/irc-fiber-common-test-unittest
+
+# Python bytecode cache from scripts/e2e/* — never source, never reproducible.
+__pycache__/
+*.pyc

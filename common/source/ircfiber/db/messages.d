@@ -80,6 +80,10 @@ final class MessageRepository {
     /// tombstone state (clients without draft/message-redaction get nothing:
     /// formatEvent drops REDACT for them).
     private static immutable string CHAT_PAYLOAD_RE = `"c"\s*:\s*"(PRIVMSG|NOTICE|REDACT)"`;
+    /// CHAT_PAYLOAD_RE widened for IRCv3 `draft/event-playback` clients:
+    /// channel events replay alongside the chat rows.
+    private static immutable string EVENT_PAYLOAD_RE =
+        `"c"\s*:\s*"(PRIVMSG|NOTICE|REDACT|TAGMSG|JOIN|PART|QUIT|KICK|MODE|NICK|TOPIC)"`;
 
     private static void applyNoiseExclusion(ref Bson filter, string channel) {
         if (channel == "_server")
@@ -508,11 +512,13 @@ final class MessageRepository {
      * Returns up to `count` chat rows with `afterTs < t < beforeTs`
      * (either bound 0 = unbounded), taken from the newest end of the
      * window (`fromNewest`, for LATEST/BEFORE) or the oldest end (AFTER).
-     * Always oldest-first. Only PRIVMSG/NOTICE rows count towards `count`
-     * (the `phase` filter is still the caller's job).
+     * Always oldest-first. Only PRIVMSG/NOTICE/REDACT rows count towards
+     * `count`, plus TAGMSG/JOIN/PART/QUIT/KICK/MODE/NICK/TOPIC when
+     * `events` (draft/event-playback) is set (the `phase` filter is still
+     * the caller's job).
      */
     Json[] getWindow(string serverId, string networkId, string channel,
-                     long afterTs, long beforeTs, int count, bool fromNewest) @trusted {
+                     long afterTs, long beforeTs, int count, bool fromNewest, bool events = false) @trusted {
         channel = normalizeChannel(channel);
         if (count <= 0) count = 50;
         if (count > 1000) count = 1000;
@@ -528,7 +534,7 @@ final class MessageRepository {
         }
         // `$regex` operator form: a bare BsonRegex value in a top-level
         // filter field matched nothing through vibe.d 0.10.3 in practice.
-        filter["payload"] = Bson(["$regex": Bson(CHAT_PAYLOAD_RE)]);
+        filter["payload"] = Bson(["$regex": Bson(events ? EVENT_PAYLOAD_RE : CHAT_PAYLOAD_RE)]);
         if (fromNewest) return readPayloads(filter, count);
 
         FindOptions options;

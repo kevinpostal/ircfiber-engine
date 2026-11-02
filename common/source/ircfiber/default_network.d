@@ -6,6 +6,12 @@
  * The network is marked `systemManaged=true` so users can edit fields but
  * cannot delete it; only platform migrations can remove it.
  *
+ * `DEFAULT_FIBER_HOST`/`_PORT`/`_TLS` are overridable via
+ * `IRCFIBER_DEFAULT_NETWORK_HOST`/`_PORT`/`_TLS` so a non-prod deployment
+ * (local compose, CI) can point every auto-provisioned default network at
+ * its own ircd instead of silently dialing live irc.ircfiber.com. Every
+ * prod deploy leaves these unset, so production behavior is unchanged.
+ *
  * Two entry points are used at runtime:
  *   - `buildDefaultFiberNetwork(user)` — pure constructor for the config
  *     (no I/O). Useful for tests and for callers that want to inspect the
@@ -24,6 +30,8 @@ import std.array : array;
 import std.range : enumerate;
 import std.ascii : isHexDigit;
 import std.datetime : Clock;
+import std.process : environment;
+import std.string : strip;
 
 import vibe.core.log;
 
@@ -35,8 +43,9 @@ import ircfiber.storage.redis : RedisStorage;
 import ircfiber.redis.protocol : RedisKeys, ControlMessage;
 import ircfiber.irc.registry : ServerRegistry;
 
-/// Hostname of the platform-provided IRC server.
-immutable string DEFAULT_FIBER_HOST = "irc.ircfiber.com";
+/// Hostname of the platform-provided IRC server. Overridable via
+/// `IRCFIBER_DEFAULT_NETWORK_HOST` — see the module doc.
+immutable string DEFAULT_FIBER_HOST;
 
 /// Redis key for the admin toggle that controls auto-provisioning of the
 /// default Fiber network and its visibility in the sidebar. When "0"/"false"
@@ -64,8 +73,47 @@ void setFiberEnabled(RedisStorage redis, bool enabled) @trusted {
     }
 }
 
-/// TLS port for the platform-provided IRC server.
-immutable ushort DEFAULT_FIBER_PORT = 6697;
+/// TLS port for the platform-provided IRC server. Overridable via
+/// `IRCFIBER_DEFAULT_NETWORK_PORT` alongside `DEFAULT_FIBER_HOST`.
+immutable ushort DEFAULT_FIBER_PORT;
+/// TLS mode for the platform-provided IRC server. Overridable via
+/// `IRCFIBER_DEFAULT_NETWORK_TLS` (`disabled`/`enabled`/`required`/`starttls`)
+/// — a local ircd without certificates needs this at `disabled`.
+immutable TLSMode DEFAULT_FIBER_TLS;
+
+shared static this() {
+    const h = environment.get("IRCFIBER_DEFAULT_NETWORK_HOST", "").strip();
+    DEFAULT_FIBER_HOST = h.length ? h : "irc.ircfiber.com";
+    DEFAULT_FIBER_PORT = parseDefaultFiberPort(environment.get("IRCFIBER_DEFAULT_NETWORK_PORT", ""));
+    DEFAULT_FIBER_TLS = parseDefaultFiberTls(environment.get("IRCFIBER_DEFAULT_NETWORK_TLS", ""));
+}
+
+/// Parses `IRCFIBER_DEFAULT_NETWORK_PORT`; "" or anything out of a
+/// `ushort`'s range falls back to the platform's real TLS port so a typo
+/// in the env cannot silently zero out the port.
+ushort parseDefaultFiberPort(string raw) @safe pure {
+    import std.conv : to;
+    const s = raw.strip();
+    if (!s.length) return 6697;
+    try {
+        const v = s.to!int;
+        if (v > 0 && v <= ushort.max) return cast(ushort) v;
+    } catch (Exception) {}
+    return 6697;
+}
+
+/// Parses `IRCFIBER_DEFAULT_NETWORK_TLS`; unset or unrecognized falls back
+/// to `required`, the platform's real TLS posture.
+TLSMode parseDefaultFiberTls(string raw) @safe pure {
+    import std.uni : toLower;
+    switch (raw.strip().toLower()) {
+        case "disabled": return TLSMode.disabled;
+        case "enabled":  return TLSMode.enabled;
+        case "starttls": return TLSMode.starttls;
+        default:          return TLSMode.required;
+    }
+}
+
 /// Human-readable name for the default network as it appears in the sidebar.
 immutable string DEFAULT_FIBER_NAME = "IRC Fiber";
 
@@ -93,7 +141,7 @@ NetworkConfig buildDefaultFiberNetwork(User user) @safe {
     cfg.name = DEFAULT_FIBER_NAME;
     cfg.host = DEFAULT_FIBER_HOST;
     cfg.port = DEFAULT_FIBER_PORT;
-    cfg.tls = TLSMode.required;
+    cfg.tls = DEFAULT_FIBER_TLS;
     cfg.sasl = SASLMechanism.none;
     cfg.nick = user.username;
     cfg.realName = user.username;
@@ -303,4 +351,26 @@ unittest {
     // User does NOT raise or insert — the gate is at the top of the fn.
     assert(u.id == UUID.init);
     assert(u.username.length == 0);
+}
+
+@("parseDefaultFiberPort accepts a valid override and falls back otherwise")
+unittest {
+    assert(parseDefaultFiberPort("") == 6697);
+    assert(parseDefaultFiberPort("6667") == 6667);
+    assert(parseDefaultFiberPort("  16667  ") == 16667);
+    assert(parseDefaultFiberPort("0") == 6697, "0 is out of range, must fall back");
+    assert(parseDefaultFiberPort("-1") == 6697);
+    assert(parseDefaultFiberPort("not-a-port") == 6697);
+    assert(parseDefaultFiberPort("99999999") == 6697, "must not overflow ushort");
+}
+
+@("parseDefaultFiberTls maps every mode and falls back to required")
+unittest {
+    assert(parseDefaultFiberTls("disabled") == TLSMode.disabled);
+    assert(parseDefaultFiberTls("Disabled") == TLSMode.disabled, "case-insensitive");
+    assert(parseDefaultFiberTls("enabled") == TLSMode.enabled);
+    assert(parseDefaultFiberTls("starttls") == TLSMode.starttls);
+    assert(parseDefaultFiberTls("required") == TLSMode.required);
+    assert(parseDefaultFiberTls("") == TLSMode.required, "unset must keep the platform's real TLS posture");
+    assert(parseDefaultFiberTls("bogus") == TLSMode.required, "unrecognized must not silently disable TLS");
 }

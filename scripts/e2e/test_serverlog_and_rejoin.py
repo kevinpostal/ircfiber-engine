@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """E2E: verify MOTD, server-log grouping, and auto-rejoin on IRC Fiber."""
+import os
 import asyncio
 import json
 import re
@@ -16,7 +17,7 @@ for line in ENV_FILE.read_text().splitlines():
         k, v = line.split('=', 1)
         creds[k.strip()] = v.strip()
 
-BASE = 'https://ircfiber.com'
+BASE = os.environ.get('IRCFIBER_WEB_BASE_URL', 'https://ircfiber.com')
 NETWORK_NAME = 'IRC Fiber'
 CHANNEL = 'ircfiber'
 
