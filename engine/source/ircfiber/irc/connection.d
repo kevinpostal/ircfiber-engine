@@ -2045,6 +2045,26 @@ private TCPConnection happyEyeballsConnect(HolderClient holder, DialTag tag, str
             if (proxy !is null && e.msg.canFind("TLS handshake timed out")) {
                 banEgressForHost(host, slotBanKey(proxy));
             }
+            // OpenSSL "wrong version number" (0A00010B) right after tcp_open
+            // means the bytes we got back were not a TLS record at all — a
+            // G/K/Z-lined address answered in plaintext (ERROR :Closing
+            // Link: ... (Z-Lined): ...) and our TLS client never got far
+            // enough to read it as text, just far enough to fail the
+            // record-type parse. Confirmed live against this exact failure
+            // (irc.supernets.org Z-lines Mullvad's IPv6 ranges with "ENTER
+            // THE VOID"): every one of us/de/ch read back the plaintext 465
+            // + NOTICE + ERROR, which OpenSSL reports only as this error
+            // code. The reconnect-loop's "tunnel closed" inference
+            // (consecutiveTlsClosed, 15 min) never sees it — different
+            // wording — so without this the engine retried all 3 banned
+            // exits on every single (re)connect before falling through to
+            // NordVPN. Treat it as confirmed as a spelled-out Z-line
+            // (applyBanPolicy's full HOST_EGRESS_BAN_MS), not the shorter
+            // inferred ban: we are reading the same server-side rejection,
+            // just through a different code path.
+            if (proxy !is null && e.msg.canFind("wrong version number")) {
+                banEgressForHost(host, slotBanKey(proxy));
+            }
             continue;
         }
     }
