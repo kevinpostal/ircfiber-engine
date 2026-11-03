@@ -6967,11 +6967,13 @@ private void processEvents() {
                 if (p.length >= 3) {
                     servicesAccount = p[2];
                     syncPublicAvatar();
+                    syncMlsAccountOwner();
                 }
                 return false;
             case "901":
                 // RPL_LOGGEDOUT
                 forgetPublicAvatar();
+                forgetMlsAccountOwner();
                 servicesAccount = "";
                 return false;
             default:
@@ -7098,6 +7100,31 @@ private void processEvents() {
             redis.getDb().hdel(RedisKeys.publicAvatars(config.host), servicesAccount.toLower);
         } catch (Exception e) {
             try logWarn("Public avatar removal failed for %s: %s", config.name, e.msg);
+            catch (Exception) {}
+        }
+    }
+
+    /// Mirrors `syncPublicAvatar`, but for E2EE identity resolution: lets
+    /// the MLS backend bind a services account seen on ANY network (not
+    /// just irc.ircfiber.com) to the ircfiber account that owns this
+    /// connection, via `irc:mls:acct:<host>` → owner UUID. Never throws.
+    void syncMlsAccountOwner() nothrow {
+        if (redis is null || servicesAccount.length == 0 || ownerId == UUID.init) return;
+        try {
+            redis.hset(RedisKeys.mlsAccountOwners(config.host), servicesAccount.toLower, ownerId.toString());
+        } catch (Exception e) {
+            try logWarn("MLS account-owner sync failed for %s: %s", config.name, e.msg);
+            catch (Exception) {}
+        }
+    }
+
+    /// Drops our entry from the MLS account-owner registry. Never throws.
+    void forgetMlsAccountOwner() nothrow {
+        if (redis is null || servicesAccount.length == 0) return;
+        try {
+            redis.getDb().hdel(RedisKeys.mlsAccountOwners(config.host), servicesAccount.toLower);
+        } catch (Exception e) {
+            try logWarn("MLS account-owner removal failed for %s: %s", config.name, e.msg);
             catch (Exception) {}
         }
     }

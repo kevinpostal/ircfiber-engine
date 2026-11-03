@@ -291,6 +291,15 @@ struct RedisKeys {
     /// (900/901), read by GET /api/avatars for users on bare IRC servers.
     static string publicAvatars(string host) { return "irc:avatar:pub:" ~ host.toLower; }
 
+    /// MLS account-owner registry: hash `<lowercased services account>` →
+    /// ircfiber site user UUID, keyed per network host. Generalizes
+    /// `publicAvatars` to identity resolution so the MLS backend's
+    /// `resolveAccount` can bind a NickServ account on ANY network (not
+    /// just irc.ircfiber.com) to the ircfiber account whose connection
+    /// observed that login. Written by the engine on services login
+    /// (900/901), read by `resolveAccount`.
+    static string mlsAccountOwners(string host) { return "irc:mls:acct:" ~ host.toLower; }
+
     /// Avatar upload rate limit: INCR + 1h EXPIRE, per user.
     static string avatarUploadRate(string userId) { return "irc:avatar:ratelimit:" ~ userId; }
 
