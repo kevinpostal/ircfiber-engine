@@ -10,6 +10,9 @@
 
 .DELETE_ON_ERROR:
 .DEFAULT_GOAL := help
+# bash -e + pipefail: a failing stage anywhere in a recipe pipe fails the
+# target. Single-line SHELL form, since GNU Make 3.81 ignores .SHELLFLAGS.
+SHELL := /bin/bash -eo pipefail
 
 # ----------------------------------------------------------------------------
 # Variables
@@ -107,7 +110,7 @@ AR := →
 .PHONY: all help
 .PHONY: build build-gateway build-engine build-release build-debug build-ldc2 janitor-migrate frontend frontend-build frontend-dev frontend-install
 
-.PHONY: dev dev-docker dev-live dev-live-tunnel debug debug-live debug-host debug-all stop
+.PHONY: dev dev-live dev-live-tunnel debug debug-live debug-host debug-all stop
 .PHONY: engine engine-rebuild engine-restart engine-test
 .PHONY: engine-start engine-stop engine-restart-docker holder-logs holder-status
 .PHONY: gateway gateway-rebuild gateway-restart gateway-start
@@ -289,19 +292,6 @@ dev-live-tunnel: ## Component > ssh -L tunnel OVH gateway (172.30.0.2:8090) → 
 	printf '\033[2m  ssh -L $$port:$$gw_ip:8090 deploy@$(_target_ssh) (via -F /dev/null -i ~/.ssh/id_ed25519_ircfiber)\033[0m\n'; \
 	printf '\033[33m⚠ Keep this terminal open — ctrl-c closes the tunnel. In another terminal: make dev-live\033[0m\n'; \
 	ssh -F /dev/null -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519_ircfiber -L $$port:$$gw_ip:8090 -N deploy@$(_target_ssh)
-# then launches the Vite dev server with HMR. Fastest full-stack dev cycle:
-#   - Docker runs backend
-#   - Vite serves frontend with live reload on save
-#   - For D code changes: `make docker-restart-code` in another terminal
-dev-docker: ensure-colima ## Dev > Docker backend + Vite frontend dev (fastest full-stack cycle)
-	@if ! docker compose ps redis mongo ircd ircfiber-gateway ircfiber-engine 2>/dev/null | grep -q "healthy"; then \
-		docker compose up -d redis mongo ircd ircfiber-gateway ircfiber-engine; \
-		printf "%b\n" "$(BG)$(OK) Docker backend started$(R)"; \
-	else \
-		printf "%b\n" "$(BG)$(OK) Docker backend already running$(R)"; \
-	fi
-	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting Vite dev server  $(R)"
-	@cd frontend && VITE_BACKEND_URL=http://127.0.0.1:8090 npm run dev
 
 # Gateway only — leaves engine/IRC untouched. Fast iteration for vibe.d/REST work.
 #   - builds gateway image only when backend/source, common/source, views, config changed
@@ -326,7 +316,7 @@ debug: ensure-colima ## Component > Gateway only (REST API) — leaves engine/IR
 	@stamp_gw=.docker-build-stamp-gateway; build_gw=0; \
 		if [ ! -f "$$stamp_gw" ] || [ Containerfile -nt "$$stamp_gw" ] || [ backend/dub.sdl -nt "$$stamp_gw" ] || [ backend/dub.selections.json -nt "$$stamp_gw" ] || [ common/dub.sdl -nt "$$stamp_gw" ] || [ common/dub.selections.json -nt "$$stamp_gw" ] || [ frontend/package.json -nt "$$stamp_gw" ]; then \
 			build_gw=1; \
-		elif find backend/source backend/views common/source config public deploy/roles/gateway -type f -newer "$$stamp_gw" 2>/dev/null | grep -q .; then \
+		elif [ -n "$$(find backend/source backend/views common/source config public deploy/roles/gateway -type f -newer "$$stamp_gw" 2>/dev/null | head -n1)" ]; then \
 			build_gw=1; \
 		fi; \
 		if [ "$$build_gw" = "1" ]; then \
@@ -367,9 +357,9 @@ debug-all: ensure-colima ## Component > Full stack: gateway + engine (both) — 
 		stamp_eng=.docker-build-stamp-engine; \
 		build_gw=0; build_eng=0; \
 		if [ ! -f "$$stamp_eng" ] || [ Containerfile -nt "$$stamp_eng" ] || [ engine/dub.sdl -nt "$$stamp_eng" ] || [ engine/dub.selections.json -nt "$$stamp_eng" ] || [ common/dub.sdl -nt "$$stamp_eng" ] || [ common/dub.selections.json -nt "$$stamp_eng" ]; then build_eng=1; \
-		elif find engine/source common/source deploy/roles/engine/files -type f -newer "$$stamp_eng" 2>/dev/null | grep -q .; then build_eng=1; fi; \
+		elif [ -n "$$(find engine/source common/source deploy/roles/engine/files -type f -newer "$$stamp_eng" 2>/dev/null | head -n1)" ]; then build_eng=1; fi; \
 		if [ ! -f "$$stamp_gw" ] || [ Containerfile -nt "$$stamp_gw" ] || [ backend/dub.sdl -nt "$$stamp_gw" ] || [ backend/dub.selections.json -nt "$$stamp_gw" ] || [ common/dub.sdl -nt "$$stamp_gw" ] || [ common/dub.selections.json -nt "$$stamp_gw" ] || [ frontend/package.json -nt "$$stamp_gw" ]; then build_gw=1; \
-		elif find backend/source backend/views common/source config public deploy/roles/gateway -type f -newer "$$stamp_gw" 2>/dev/null | grep -q .; then build_gw=1; fi; \
+		elif [ -n "$$(find backend/source backend/views common/source config public deploy/roles/gateway -type f -newer "$$stamp_gw" 2>/dev/null | head -n1)" ]; then build_gw=1; fi; \
 		svcs=""; [ "$$build_gw" = "1" ] && svcs="$$svcs ircfiber-gateway"; [ "$$build_eng" = "1" ] && svcs="$$svcs ircfiber-holder ircfiber-engine"; \
 		if [ -n "$$svcs" ]; then printf "\n%b\n" "$(_BCn)$(K)$(B)  Building changed image(s):$$svcs  $(R)"; DOCKER_BUILDKIT=1 docker compose build $$svcs; [ "$$build_gw" = "1" ] && touch "$$stamp_gw"; [ "$$build_eng" = "1" ] && touch "$$stamp_eng"; \
 		else printf "\n%b\n" "$(BG)$(OK) Images up-to-date — skipping docker build (cached) $(R) $(D)(touch Containerfile or the relevant source tree to force)$(R)"; fi; \
@@ -488,7 +478,7 @@ stop: ## Component > Stop debug/debug-live + local docker stacks (tailnet + loca
 	sid=$${IRCFIBER_SERVER_ID:-$(IRCFIBER_DEFAULT_SERVER_ID)}; \
 	if command -v redis-cli >/dev/null 2>&1; then \
 		redis_url=$${IRCFIBER_REDIS_URL:-$(LOCAL_REDIS_URL)}; \
-		del_keys=$$(redis-cli -u "$$redis_url" --scan --pattern "*:$${sid}:*" 2>/dev/null | head -10000); \
+		del_keys=$$(redis-cli -u "$$redis_url" --scan --pattern "*:$${sid}:*" 2>/dev/null | head -10000 || true); \
 		if [ -n "$$del_keys" ]; then \
 			n=$$(printf '%s\n' "$$del_keys" | wc -l | tr -d ' '); \
 			printf '%s\n' "$$del_keys" | xargs redis-cli -u "$$redis_url" DEL >/dev/null 2>&1 || true; \
@@ -939,7 +929,7 @@ endef
 test: ## Test > D backend unit tests (fast)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Running D backend tests  $(R)"
 	@$(DUB) build --config=unittest -b unittest 2>&1 | tail -5
-	@timeout 30 ./engine/irc-fiber-test 2>&1 | tail -20; code=$${PIPESTATUS[0]}; if [ $$code -eq 124 ]; then printf '\n%b\n' "$(Y)$(WR) test binary hung (timeout 30s) — vibe eventcore leak?$(R)"; exit 1; fi; exit $$code
+	@timeout 30 ./engine/irc-fiber-test 2>&1 | tail -20 || { code=$$?; [ $$code -ne 124 ] || printf '\n%b\n' "$(Y)$(WR) test binary hung (timeout 30s) — vibe eventcore leak?$(R)"; exit $$code; }
 
 prefs-test: ## Test > User-preferences defensive-parse suite (skips if Redis missing)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Prefs defensive-parse tests  $(R)"
@@ -1078,17 +1068,21 @@ lint-frontend: ## Quality > Frontend type-check (svelte-check)
 
 # --- Format -------------------------------------------------------------------
 
+D_FMT_SRCS := $(shell find engine/source common/source common/tests -name '*.d' 2>/dev/null)
+
 fmt: ## Quality > Format D sources in-place
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Formatting D sources  $(R)"
-	@find engine/source -name "*.d" -exec dfmt -i {} \; 2>/dev/null || \
-		printf '%b\n' "$(Y)$(WR) dfmt not found. Install: dub fetch dfmt$(R)"
+	@command -v dfmt >/dev/null || { printf '%b\n' "$(Y)$(WR) dfmt not found. Install: dub fetch dfmt$(R)"; exit 1; }
+	@dfmt -i $(D_FMT_SRCS)
 	@printf '%b\n' "$(BG)$(OK) D sources formatted$(R)"
 
 fmt-check: ## Quality > Verify all D sources are formatted (CI gate, no writes)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Checking D source formatting  $(R)"
-	@UNFORMATTED=$$(find engine/source -name "*.d" -exec dfmt -c {} \; 2>&1 | grep -v "^$" || true); \
+	@command -v dfmt >/dev/null || { printf '%b\n' "$(Y)$(WR) dfmt not found. Install: dub fetch dfmt$(R)"; exit 1; }
+	@bad=""; for f in $(D_FMT_SRCS); do dfmt "$$f" | cmp -s - "$$f" || bad="$$bad $$f"; done; \
+	if [ -n "$$bad" ]; then \
 		printf '%b\n' "$(Y)$(WR) Unformatted sources detected:$(R)"; \
-		echo "$$UNFORMATTED"; \
+		for f in $$bad; do echo "  $$f"; done; \
 		printf '%b\n' "$(D)Fix with: make fmt$(R)"; \
 		exit 1; \
 	else \
@@ -1132,13 +1126,15 @@ dscanner-$(1): ## Quality > $(2)
 	@$(DSCANNER) --config dscanner.ini $(3) $(SRCS) 2>/dev/null $(4)
 endef
 
-$(eval $(call _ds_rule,syntax,syntax check,--syntaxCheck,|| true))
-dscanner-syntax: ## Quality > Syntax check
+# Syntax errors gate; every other dscanner check below stays advisory.
+dscanner-syntax: ## Quality > Syntax check (gating)
+	@printf '\n%b\n' "$(D)--- D-Scanner syntax check ---$(R)"
+	@$(DSCANNER) --syntaxCheck $(SRCS)
 $(eval $(call _ds_rule,lint,lint,--styleCheck,|| true))
 dscanner-lint: ## Quality > Style lint
-$(eval $(call _ds_rule,unused,unused check,--styleCheck,| grep -E "unused_(variable|parameter|import)" || printf '%b\n' "$(G)$(OK) No unused symbols found$(R)"))
+$(eval $(call _ds_rule,unused,unused check,--styleCheck,| { grep -E "unused_(variable|parameter|import)" || printf '%b\n' "$(G)$(OK) No unused symbols found$(R)"; } || true))
 dscanner-unused: ## Quality > Find unused imports/symbols
-$(eval $(call _ds_rule,complexity,complexity check,--styleCheck,| grep "cyclomatic_complexity" || printf '%b\n' "$(G)$(OK) No high-complexity functions found$(R)"))
+$(eval $(call _ds_rule,complexity,complexity check,--styleCheck,| { grep "cyclomatic_complexity" || printf '%b\n' "$(G)$(OK) No high-complexity functions found$(R)"; } || true))
 dscanner-complexity: ## Quality > Cyclomatic complexity check
 $(eval $(call _ds_rule,imports,import analysis,--imports,|| true))
 dscanner-imports: ## Quality > Import analysis
@@ -1225,37 +1221,37 @@ docker-up: ensure-colima ## Docker > Start all services with Docker Compose
 	@docker compose up -d
 docker-down: ensure-colima ## Docker > Stop ALL IRC Fiber containers (3 compose stacks + loose containers)
 	@printf '%b\n' "$(D)→ Stopping test stack (docker-compose.yml)...$(R)"
-	@docker compose down --remove-orphans --timeout 10 2>/dev/null; true
+	@docker compose down --remove-orphans --timeout 10 2>/dev/null || true
 	@printf '%b\n' "$(BG)$(OK) Test stack stopped$(R)"
 	@printf '%b\n' "$(D)→ Stopping test stack (docker-compose.test.yml)...$(R)"
-	@docker compose -f docker-compose.test.yml down --timeout 10 2>/dev/null; true
+	@docker compose -f docker-compose.test.yml down --timeout 10 2>/dev/null || true
 	@printf '%b\n' "$(BG)$(OK) Test stack stopped$(R)"
 	@printf '%b\n' "$(D)→ Stopping local dev stack (deploy/local/docker-compose.yml)...$(R)"
 	@if [ -f deploy/local/docker-compose.yml ]; then \
-		docker compose -f deploy/local/docker-compose.yml down --remove-orphans --timeout 15 2>/dev/null; true; \
+		docker compose -f deploy/local/docker-compose.yml down --remove-orphans --timeout 15 2>/dev/null || true; \
 	else \
 		printf '%b\n' "$(D)  (skipped — deploy/local/docker-compose.yml not present)$(R)"; \
 	fi
 	@if docker network inspect irc_fiber_irc_network >/dev/null 2>&1; then \
 		printf '%b\n' "$(D)→ Detaching any external containers from irc_fiber_irc_network...$(R)"; \
-		attached=$$(docker network inspect irc_fiber_irc_network --format '{{range .Containers}}{{.Name}} {{end}}' | tr ' ' '\n' | grep -v '^$$' | sort -u); \
+		attached=$$(docker network inspect irc_fiber_irc_network --format '{{range .Containers}}{{.Name}} {{end}}' | tr ' ' '\n' | { grep -v '^$$' || true; } | sort -u); \
 		if [ -n "$$attached" ]; then \
 			printf '%b\n' "$$attached" | while IFS= read -r name; do \
-				docker network disconnect -f irc_fiber_irc_network "$$name" 2>/dev/null; true; \
+				docker network disconnect -f irc_fiber_irc_network "$$name" 2>/dev/null || true; \
 			done; \
 		fi; \
-		docker network rm irc_fiber_irc_network 2>/dev/null; true; \
+		docker network rm irc_fiber_irc_network 2>/dev/null || true; \
 	fi
 	@if docker network inspect irc_fiber_local ircfiber_local ircfiber_dev_irc_network >/dev/null 2>&1; then \
 		for net in irc_fiber_local ircfiber_local ircfiber_dev_irc_network; do \
 			if docker network inspect $$net >/dev/null 2>&1; then \
-				attached=$$(docker network inspect $$net --format '{{range .Containers}}{{.Name}} {{end}}' | tr ' ' '\n' | grep -v '^$$' | sort -u); \
+				attached=$$(docker network inspect $$net --format '{{range .Containers}}{{.Name}} {{end}}' | tr ' ' '\n' | { grep -v '^$$' || true; } | sort -u); \
 				if [ -n "$$attached" ]; then \
 					printf '%b\n' "$$attached" | while IFS= read -r name; do \
-						docker network disconnect -f $$net "$$name" 2>/dev/null; true; \
+						docker network disconnect -f $$net "$$name" 2>/dev/null || true; \
 					done; \
 				fi; \
-				docker network rm $$net 2>/dev/null; true; \
+				docker network rm $$net 2>/dev/null || true; \
 			fi; \
 		done; \
 	fi
@@ -1264,13 +1260,13 @@ docker-down: ensure-colima ## Docker > Stop ALL IRC Fiber containers (3 compose 
 		| xargs -r docker inspect --format '{{.Name}} {{.Id}} {{index .Config.Labels "com.docker.compose.project"}} {{index .Config.Labels "com.docker.compose.config-hash"}}' 2>/dev/null \
 		| grep -E '(irc[_-]fiber|ircd_test|irc_engine|ircd[_-]|irc_redis|irc_mongo|anope|unreal_sasl|mock-irc-op|sweet_|builder-img|ircfiber[_-])' \
 		| awk '{print $$2}' \
-		| xargs -r docker stop --timeout 10 2>/dev/null; true
+		| xargs -r docker stop --timeout 10 2>/dev/null || true
 	@printf '%b\n' "$(D)→ Removing stopped containers with IRC Fiber compose labels...$(R)"
-	@docker container prune --force --filter "label=com.docker.compose.project=irc_fiber" 2>/dev/null; true
-	@docker container prune --force --filter "label=com.docker.compose.project=ircfiber_prod" 2>/dev/null; true
-	@docker container prune --force --filter "label=com.docker.compose.project=local" 2>/dev/null; true
-	@docker container prune --force --filter "label=com.docker.compose.project=ircfiber_local" 2>/dev/null; true
-	@docker container prune --force --filter "label=com.docker.compose.project=ircfiber_dev" 2>/dev/null; true
+	@docker container prune --force --filter "label=com.docker.compose.project=irc_fiber" 2>/dev/null || true
+	@docker container prune --force --filter "label=com.docker.compose.project=ircfiber_prod" 2>/dev/null || true
+	@docker container prune --force --filter "label=com.docker.compose.project=local" 2>/dev/null || true
+	@docker container prune --force --filter "label=com.docker.compose.project=ircfiber_local" 2>/dev/null || true
+	@docker container prune --force --filter "label=com.docker.compose.project=ircfiber_dev" 2>/dev/null || true
 	@printf '%b\n' "$(BG)$(OK) All IRC Fiber containers stopped$(R)"
 
 docker-down-test: ensure-colima ## Docker > Stop test services (ircd + mongo + redis)
@@ -1357,7 +1353,7 @@ docker-up-backend: ensure-colima ## Docker > Start backend services only
 	@printf '\n%b\n' "$(D)→ Pruning stale Docker layers...$(R)"
 	@docker system prune -af --volumes=false 2>&1 | tail -2
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Starting Backend Services  $(R)"
-	@docker compose up -d ircfiber-engine redis mongo ircd
+	@docker compose up -d ircfiber-holder ircfiber-engine redis mongo
 	@printf '%b\n' "$(BG)$(OK) Backend services started$(R)"
 
 docker-down-backend: ensure-colima ## Docker > Stop backend services only
@@ -1396,7 +1392,7 @@ engine-start: ensure-colima ## Docker > Start Holder + Engine in background (det
 	fi
 	@stamp_eng=.docker-build-stamp-engine; build_eng=0; \
 		if [ ! -f "$$stamp_eng" ] || [ Containerfile -nt "$$stamp_eng" ] || [ engine/dub.sdl -nt "$$stamp_eng" ] || [ engine/dub.selections.json -nt "$$stamp_eng" ] || [ common/dub.sdl -nt "$$stamp_eng" ] || [ common/dub.selections.json -nt "$$stamp_eng" ]; then build_eng=1; \
-		elif find engine/source common/source deploy/roles/engine/files -type f -newer "$$stamp_eng" 2>/dev/null | grep -q .; then build_eng=1; fi; \
+		elif [ -n "$$(find engine/source common/source deploy/roles/engine/files -type f -newer "$$stamp_eng" 2>/dev/null | head -n1)" ]; then build_eng=1; fi; \
 		if [ "$$build_eng" = "1" ]; then printf "\n%b\n" "$(_BCn)$(K)$(B)  Building holder + engine images  $(R)"; DOCKER_BUILDKIT=1 docker compose build ircfiber-holder ircfiber-engine; touch "$$stamp_eng"; \
 		else printf "%b\n" "$(BG)$(OK) Holder + engine images up-to-date — skipping build (cached)$(R)"; fi; \
 		if [ "$$build_eng" = "1" ]; then docker rm -f ircfiber-engine 2>/dev/null || true; fi
