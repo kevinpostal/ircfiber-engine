@@ -136,6 +136,12 @@ private enum PROCESS_READ_TIMEOUT_MS      = 50;
 private enum STREAM_BUFFER_SIZE           = 4096;
 private enum QUIT_GRACE_PERIOD_MS         = 2_000;  // wait this long for server to close after QUIT
 private enum STARTTLS_REPLY_TIMEOUT_MS      = 15_000; // wait this long for 670 after STARTTLS
+/// A session that stays registered this long resets the reconnect backoff.
+private enum long STABLE_SESSION_RESET_MS = 60_000;
+/// Shortest retry delay after a ghost ("Overridden") disconnect.
+private enum Duration GHOST_RETRY_FLOOR = dur!"seconds"(10);
+/// Minimum spacing between CTCP auto-replies, across all requesters.
+private enum long CTCP_REPLY_MIN_INTERVAL_MS = 1_000;
 
 // ── Flood trust (the one ircd whose limits we know) ──────────────────────────
 // The engine paces nothing until a server complains, because IRC never
@@ -2695,6 +2701,17 @@ private string ctcpReply(string command, string param) {
     return "\x01" ~ command ~ "\x01";
 }
 
+/// Pops the next CRLF-terminated line off `partial`, sanitized as one unit so a
+/// UTF-8 sequence split across two socket reads decodes whole. False when no
+/// complete line is buffered; an empty line yields "".
+package(ircfiber) bool popInboundLine(ref char[] partial, out string line) {
+    const idx = partial.indexOf("\r\n");
+    if (idx < 0) return false;
+    line = idx > 0 ? sanitizeUtf8(cast(string) partial[0 .. idx]) : "";
+    partial = partial[idx + 2 .. $];
+    return true;
+}
+
 // ── ISUPPORT (005) ────────────────────────────────────────────────────────────
 
 /// Key server features extracted from 005 ISUPPORT messages. Legacy
@@ -3193,6 +3210,8 @@ final class PersistentIRCClient {
         /// keeps answering "wait" cannot become a JOIN loop.
         int                 joinThrottleRounds;
         bool                joinThrottleRetryInFlight;
+        /// Bumped per socket so a JOIN retry task of the old one stands down.
+        uint                joinRetryEpoch;
         /// Membership flap guard (see `MemberFlap`), keyed by `memberKey`.
         /// Bounded by MEMBER_FLAP_MAX_TRACKED; reset per socket. The epoch
         /// is bumped per socket so a sweep task of the old one stands down.
@@ -3290,6 +3309,12 @@ final class PersistentIRCClient {
         string[string]      channelState;
         string[string]      channelTopics;
         string[][string]    channelUsers;
+        /// Raw inbound bytes not yet framed into a CRLF line. Shared by the
+        /// registration read loop and processEvents so a fragment straddling
+        /// the hand-off is completed by the next read; reset per socket.
+        char[]              inboundPartial;
+        /// Earliest unix ms at which another CTCP auto-reply may go out.
+        long                ctcpReplyNotBeforeMs;
         // RPL_NAMREPLY accumulation, per channel. 353 lines land here and
         // the 366 that closes the burst swaps the result into
         // `channelUsers` (applyNamesBurst), which is what makes a NAMES
@@ -3975,7 +4000,8 @@ final class PersistentIRCClient {
         failureReasons = s.failureReasons.dup;
         outboundQueue = s.outboundQueue.dup;
         channelState = s.channelState.dup;
-        channelTopics = s.channelTopics.dup;
+        channelTopics = null;
+        foreach (k, v; s.channelTopics) channelTopics[normalizeChannelName(k)] = v;
         foreach (k, v; s.channelUsers) channelUsers[k] = v.dup;
         realnames = s.realnames.dup;
         accounts = s.accounts.dup;
@@ -4254,7 +4280,7 @@ final class PersistentIRCClient {
     /// Unix ms of RPL_WELCOME for the live connection; 0 when not connected.
     @property long getConnectedAtMs() const nothrow { return connectedAtMs; }
     /// Seconds since the last inbound byte; 0 when never. Surfaced via the
-    /// state snapshot so the UI can hint staleness before the reaper fires.
+    /// state snapshot so the UI can hint staleness before the PONG watchdog fires.
     @property long getDataAgeSecs() const { return lastDataReceivedSecs > 0 ? Clock.currTime.toUnixTime!long - lastDataReceivedSecs : 0; }
     /// Seconds since the last PONG; 0 when never.
     @property long getPongAgeSecs() const { return lastPongReceivedSecs > 0 ? Clock.currTime.toUnixTime!long - lastPongReceivedSecs : 0; }
@@ -4288,10 +4314,12 @@ final class PersistentIRCClient {
         joinsAwaitingConfirm = [];
         joinThrottleRounds = 0;
         joinThrottleRetryInFlight = false;
+        joinRetryEpoch++;
         // A fresh socket gets a fresh NAMES; nothing held is owed any more.
         memberFlaps = null;
         memberFlapEpoch++;
         memberFlapSweepArmed = false;
+        inboundPartial = null;
     }
 
     /// Members tracked by the flap guard at once. Past it the guard fails
@@ -4493,9 +4521,12 @@ final class PersistentIRCClient {
                  "windowSecs": windowSecs.to!string,
                  "waitMs": waitMs.to!string,
                  "event": "join_throttled"]);
+            const epoch = joinRetryEpoch;
             runTask({
                 try {
                     sleep(waitMs.msecs);
+                    // A newer socket owns the retry state now.
+                    if (joinRetryEpoch != epoch) return;
                     scope(exit) joinThrottleRetryInFlight = false;
                     if (state != ConnectionState.connected) return;
                     // Anything confirmed or refused while we waited is gone
@@ -4507,7 +4538,7 @@ final class PersistentIRCClient {
                         config.name, batches[0]);
                     sendRaw("JOIN " ~ batches[0]);
                 } catch (Exception e) {
-                    joinThrottleRetryInFlight = false;
+                    if (joinRetryEpoch == epoch) joinThrottleRetryInFlight = false;
                     logWarn("JOIN throttle retry failed for %s: %s", config.name, e.msg);
                 }
             });
@@ -4563,9 +4594,12 @@ final class PersistentIRCClient {
                  "round": joinThrottleRounds.to!string,
                  "waitMs": waitMs.to!string,
                  "event": "join_flood_retry"]);
+            const epoch = joinRetryEpoch;
             runTask({
                 try {
                     sleep(waitMs.msecs);
+                    // A newer socket owns the retry state now.
+                    if (joinRetryEpoch != epoch) return;
                     scope(exit) joinThrottleRetryInFlight = false;
                     if (state != ConnectionState.connected) return;
                     // Anything confirmed or refused while we waited is gone
@@ -4576,7 +4610,7 @@ final class PersistentIRCClient {
                         config.name, batches[0]);
                     sendRaw("JOIN " ~ batches[0]);
                 } catch (Exception e) {
-                    joinThrottleRetryInFlight = false;
+                    if (joinRetryEpoch == epoch) joinThrottleRetryInFlight = false;
                     logWarn("Flood JOIN retry failed for %s: %s", config.name, e.msg);
                 }
             });
@@ -4727,6 +4761,9 @@ final class PersistentIRCClient {
         }
 
         while (!isShutdownRequested) {
+            // How long the session that just ended stayed registered; -1
+            // until measured. Only a stable session resets the backoff.
+            long sessionUptimeMs = -1;
             try {
                 if (!getConnected) {
                     attemptConnection();
@@ -4756,6 +4793,7 @@ final class PersistentIRCClient {
                 // session and the process is exiting.
                 if (detachedForHotSwap) return;
             } catch (Throwable e) {
+                sessionUptimeMs = connectedAtMs > 0 ? unixMsNow() - connectedAtMs : 0;
                 // Enterprise: catch Throwable (not just Exception) — SyncError@(0) from
                 // unsynchronized __gshared access previously killed the TaskFiber
                 // (observed 2026-08-17 cnTb-fin FATAL) and the TLS wedge left the
@@ -4875,8 +4913,8 @@ final class PersistentIRCClient {
                 // connection open without ever surfacing a TCP/TLS-level
                 // error — the same failure signature as a wedged TLS
                 // handshake, just discovered later (by the 120s PONG
-                // watchdog, the idle-half-open reaper, or a direct
-                // `transportAlive` check in processEvents()/writeRaw()).
+                // watchdog or a direct `transportAlive` check in
+                // processEvents()/writeRaw()).
                 // Feed it into the same egress-health machinery the
                 // TLS-timeout path above uses so the next attempt — for
                 // this network *and* every other tenant sharing this
@@ -4886,7 +4924,7 @@ final class PersistentIRCClient {
                 // and `!transportAlive` share one message there —
                 // "Server closed the connection…" — so it can't tell a
                 // dead egress from a real server refusal.)
-                if (reason.canFind("PONG timeout") || reason.canFind("Idle half-open detected")
+                if (reason.canFind("PONG timeout")
                     || reason.canFind("transport not alive") || reason.canFind("transport dead")) {
                     recordCounter("ircfiber.keepalive.timeout_disconnect", 1, ["host": config.host, "egress": activeEgressLabel]);
                     if (activeEgressLocationId.length > 0) banEgressForHost(config.host, activeEgressLocationId);
@@ -4917,6 +4955,11 @@ final class PersistentIRCClient {
                     }
                 }
             }
+            if (sessionUptimeMs < 0) sessionUptimeMs = connectedAtMs > 0 ? unixMsNow() - connectedAtMs : 0;
+            // A session that held for a while proves the route works: start
+            // the next reconnect from the shortest delay. One that dropped
+            // right after registering keeps growing the backoff.
+            if (sessionUptimeMs >= STABLE_SESSION_RESET_MS) backoff.reset();
             if (isShutdownRequested) break;
             if (!shouldReconnect) break;
 
@@ -4980,39 +5023,19 @@ final class PersistentIRCClient {
                 throttledUntil = 0;
             }
 
-            // Ghost / Overridden backoff: when the server closes the
-            // connection because a previous session for our nick is
-            // still active (e.g. supernets.org with UnrealIRCd's
-            // "Overridden" ghost protection), normal 15-30s reconnect
-            // intervals hit the same wall. The ghost timeout on
-            // UnrealIRCd is ~30-60s, so we apply a 10s floor and reset
-            // the exponential backoff so the next attempt starts fresh.
-            //
-            // This addresses the "supernets requires a second
-            // connection with a delay between" pattern that produced
-            // an indefinite 15s-18s reconnect cycle on the OVH
-            // deployment on 2026-07-02.
-            if (lastEmittedReason.canFind("Overridden")
-                || lastEmittedReason.canFind("ERR_NICKNAMEINUSE")
-                || lastEmittedReason.canFind("welcome_timeout")
-                || lastEmittedReason.canFind("tls_read_error_post_001")) {
-                logWarn("Ghost failure detected for %s — retrying in 10s (previous session still active)",
-                    config.name);
-                emitLog("warn",
-                    "Previous session still active (ghost) — retrying in 10s.");
-                sleep(10.seconds);
-                backoff.reset();
-                // W1-T01-rev1: every backoff.reset() site now emits a
-                // zero-valued CONNECTION_RETRY_STATUS so the frontend's
-                // applyRetryStatus(networkId, null) clears the stale
-                // banner. This is the 4th such site (was missed in the
-                // original wave 1 commit — review-wave1 MEDIUM
-                // finding). The retry status the next attempt emits
-                // will repopulate the banner with the fresh schedule.
-                emitZeroRetryStatus();
-            }
-
+            // Ghost / Overridden floor: when the server closes the connection
+            // because a previous session for our nick is still active
+            // (UnrealIRCd's "Overridden" ghost protection, ~30-60s), a retry
+            // sooner than 10s hits the same wall. Floor the delay without
+            // resetting the backoff, so repeated ghosts still grow it.
             auto delay = backoff.nextDelay();
+            if (lastEmittedReason.canFind("Overridden") && delay != Duration.max
+                && delay < GHOST_RETRY_FLOOR) {
+                logWarn("Ghost failure detected for %s — retrying in %s (previous session still active)",
+                    config.name, GHOST_RETRY_FLOOR);
+                emitLog("warn", "Previous session still active (ghost) — retrying in 10s.");
+                delay = GHOST_RETRY_FLOOR;
+            }
 
             // Give up after a week of uninterrupted failure (see
             // ExponentialBackoff): the host is not coming back on its own.
@@ -5186,8 +5209,9 @@ final class PersistentIRCClient {
 
     /// W1-T01 (plan B3): emit a zero-valued CONNECTION_RETRY_STATUS
     /// event AND clear the in-memory retry state. Called at every
-    /// `backoff.reset()` site (registration success, holder attach,
-    /// fail-cycle success). The frontend's
+    /// `backoff.reset()` site (holder attach, holder outage) and after a
+    /// successful registration, which clears the banner without touching the
+    /// backoff. The frontend's
     /// `applyRetryStatus(networkId, null)` on receipt of this event
     /// clears BOTH `net.retryStatus` AND `net.failInfo` so the banner
     /// doesn't keep showing "Reconnecting..." / "Disconnected: ...".
@@ -5598,7 +5622,9 @@ final class PersistentIRCClient {
              "event": "register_complete"]);
 
         state = ConnectionState.connected;
-        backoff.reset();
+        // The backoff is not reset here: runConnectionLoop resets it only
+        // after the session stays up STABLE_SESSION_RESET_MS, so a server
+        // that accepts then drops us keeps backing off.
         consecutiveTlsClosed = 0;
         throttledUntil = 0;
         droppedNoConnWarned = false;
@@ -5799,7 +5825,7 @@ final class PersistentIRCClient {
         sendRaw("USER " ~ (config.ident.length ? config.ident : sessionNick) ~ " 0 * :" ~ config.realName);
 
         ubyte[STREAM_BUFFER_SIZE] buf;
-        string partial;
+        inboundPartial = null;
         bool welcomed    = false; // 001 received (for timeout warning)
         bool motdDone    = false; // 376/422 received (end of MOTD)
         // CAP handshake state lives on the client so `handleCapLine` (also
@@ -5929,13 +5955,9 @@ final class PersistentIRCClient {
                 // a minimal yield prevents tight-looping the event loop.
                 yield();
             } else {
-                partial ~= sanitizeUtf8(cast(string) buf[0 .. received]);
-                enforceLineBound(partial);
-
-                ptrdiff_t idx;
-                while ((idx = partial.indexOf("\r\n")) >= 0) {
-                    auto line = partial[0 .. idx];
-                    partial   = partial[idx + 2 .. $];
+                inboundPartial ~= cast(const(char)[]) buf[0 .. received];
+                string line;
+                while (popInboundLine(inboundPartial, line)) {
                     if (line.length == 0) continue;
                     linesIn++;
 
@@ -6020,7 +6042,7 @@ final class PersistentIRCClient {
                             // still holding it: our previous connection
                             // died in a way that skipped a clean QUIT
                             // (transport loss, egress rotation — see the
-                            // "Ghost failure detected" backoff above), and
+                            // ghost retry floor in runConnectionLoop), and
                             // ghost protection keeps the server-side socket
                             // alive for up to ~30-60s. Minting a `_`-suffix
                             // sibling nick here used to register a brand
@@ -6117,7 +6139,7 @@ final class PersistentIRCClient {
                             auto params = evt.getParams();
                             // params[0] = our nick; params[1..n-1] = tokens; params[n-1] = "are supported..."
                             bool mapChanged = false;
-                            foreach (token; params[1 .. $ > 1 ? $ - 1 : $]) {
+                            foreach (token; params.length > 1 ? params[1 .. $ - 1] : params[0 .. 0]) {
                                 if (token.length == 0) continue;
                                 immutable auto before = isupportMap.length;
                                 applyIsupport(serverFeatures, isupportMap, token);
@@ -6330,6 +6352,7 @@ final class PersistentIRCClient {
                         eventChannel.put(evt);
                     }
                 }
+                enforceLineBound(inboundPartial);
             }
             if (motdDone && saslDone) break;
             yield();
@@ -6509,7 +6532,6 @@ private void processEvents() {
         import core.atomic : atomicLoad;
 
         ubyte[] buffer = new ubyte[4096];
-        string partial;
         auto lastKeepalive = Clock.currTime.toUnixTime!long;
         auto lastLabelSweep = lastKeepalive;
         auto lastWhoEnrichCheck = lastKeepalive;
@@ -6558,15 +6580,11 @@ private void processEvents() {
                 // PING/PONG exchange completes.
                 lastPongReceivedSecs = now;
                 idleEmitted = false;
-                partial ~= sanitizeUtf8(cast(string) buffer[0 .. received]);
-                enforceLineBound(partial);
-
-                ptrdiff_t idx;
-                while ((idx = partial.indexOf("\r\n")) >= 0) {
-                    auto line = partial[0 .. idx];
-                    partial   = partial[idx + 2 .. $];
+                inboundPartial ~= cast(const(char)[]) buffer[0 .. received];
+                string line;
+                while (popInboundLine(inboundPartial, line))
                     if (line.length > 0) processLine(line);
-                }
+                enforceLineBound(inboundPartial);
                 // Own NICK/JOIN/PART/KICK/AWAY/005 changed the session state:
                 // refresh the holder META once per read batch (an auto-join
                 // burst is one write, not ten).
@@ -6629,29 +6647,6 @@ private void processEvents() {
                 throw new Exception(
                     "PONG timeout — no response for 120s (network: " ~
                     config.name ~ ")");
-            }
-            // Defense-in-depth A (idle-reaper): some IRC servers stop
-            // sending PINGs entirely but also stop sending any data (e.g.
-            // a NAT middlebox silently dropped the connection while the
-            // local TCP socket still reports `connected`). The PONG
-            // timeout above can't fire because lastPongReceivedSecs was
-            // last reset on a previous byte; the d207a4d writeRaw
-            // reaper only triggers on a client send. This guard closes
-            // the gap: if we've had at least one byte of activity,
-            // sent ≥2 keepalives since then, and still seen ZERO bytes
-            // for 300 s (5 min), the half-open is unambiguous. Throw
-            // so the runConnectionLoop() catch block runs
-            // handleDisconnection() and schedules a fresh reconnect.
-            // The threshold is well above the 120 s W1-T08 idle event
-            // (which the UI uses as a status hint, not a reaper), so a
-            // merely-quiet channel will not falsely trip.
-            if (lastDataReceivedSecs > 0
-                && now - lastDataReceivedSecs >= 300
-                && now - lastKeepalive >= 120) {
-                throw new Exception(
-                    "Idle half-open detected — no data for "
-                    ~ (now - lastDataReceivedSecs).to!string
-                    ~ "s after keepalive (network: " ~ config.name ~ ")");
             }
             // Periodically (every ~30s) drop labels we never got an echo for
             // so a chatty client with a flaky echo path doesn't leak memory.
@@ -7507,7 +7502,7 @@ private void processEvents() {
                 if (params.length >= 2) {
                     auto chan       = normalizeChannelName(params[0]);
                     auto targetNick = params[1];
-                    if (targetNick == sessionNick) {
+                    if (sameNick(targetNick, sessionNick)) {
                         forgetMemberFlaps(chan);
                         channelState.remove(chan);
                         metaDirty = true;
@@ -7882,13 +7877,17 @@ private void processEvents() {
             // ── Topics ────────────────────────────────────────────────────────
             case "TOPIC":
                 auto params = event.getParams();
-                if (params.length >= 2) {
-                    channelTopics[params[0]] = params[$ - 1];
+                if (params.length >= 1) {
+                    // An empty trailing ("TOPIC #c :") clears the topic; the
+                    // parser drops it, leaving only the channel param.
+                    auto chan  = normalizeChannelName(params[0]);
+                    auto topic = params.length >= 2 ? params[$ - 1] : "";
+                    channelTopics[chan] = topic;
                     logJsonMap("info", "protocol",
                         "TOPIC",
                         ["network": config.name,
-                         "channel": params[0],
-                         "topic": params[$ - 1],
+                         "channel": chan,
+                         "topic": topic,
                          "by": event.nick,
                          "event": "topic_change"]);
                 }
@@ -7898,7 +7897,7 @@ private void processEvents() {
                 // RPL_TOPIC: ":server 332 <nick> <channel> :<topic>" → params = [nick, channel, topic]
                 auto params = event.getParams();
                 if (params.length >= 3) {
-                    channelTopics[params[1]] = params[$ - 1];
+                    channelTopics[normalizeChannelName(params[1])] = params[$ - 1];
                     logJsonMap("debug", "protocol",
                         "TOPIC (332)",
                         ["network": config.name,
@@ -8345,7 +8344,7 @@ private void processEvents() {
             case "005":
                 auto params = event.getParams();
                 bool mapChanged = false;
-                foreach (token; params[1 .. $ > 1 ? $ - 1 : $]) {
+                foreach (token; params.length > 1 ? params[1 .. $ - 1] : params[0 .. 0]) {
                     if (token.length == 0) continue;
                     immutable auto before = isupportMap.length;
                     applyIsupport(serverFeatures, isupportMap, token);
@@ -8941,6 +8940,16 @@ private void processEvents() {
 
     // ── CTCP dispatch ─────────────────────────────────────────────────────────
 
+    /// Claims the global CTCP auto-reply slot: at most one reply per
+    /// CTCP_REPLY_MIN_INTERVAL_MS, so a CTCP flood cannot turn us into a
+    /// NOTICE flood (and an Excess Flood kill).
+    private bool takeCtcpReplySlot() {
+        const now = unixMsNow();
+        if (now < ctcpReplyNotBeforeMs) return false;
+        ctcpReplyNotBeforeMs = now + CTCP_REPLY_MIN_INTERVAL_MS;
+        return true;
+    }
+
     /// Returns true if the CTCP was handled AND should not be published to the event bus.
     private bool handlePrivmsg(ref IRCRawEvent event) {
         if (!isCtcp(event.text)) return false;
@@ -8955,30 +8964,25 @@ private void processEvents() {
              "type": cmd,
              "event": "ctcp"]);
 
+        // Auto-reply only to a live request from someone else: never to a
+        // replayed (chathistory) one, nor to our own echo or another of our
+        // clients, and rate-limited.
+        const batchRef = event.getTag("batch");
+        const replayed = batchRef == "chathistory"
+            || (batchRef.length > 0 && openBatches.get(batchRef, OpenBatch.init).type == "chathistory");
+        const requester = event.nick;
+        const mayReply = requester.length > 0 && !replayed && !sameNick(requester, sessionNick);
+        void reply(string type, string value) {
+            if (!mayReply || !takeCtcpReplySlot()) return;
+            sendRaw("NOTICE " ~ requester ~ " :" ~ ctcpReply(type, value));
+        }
         switch (cmd) {
-            case "ACTION":
-                // Leave event intact; JS renders \x01ACTION...\x01 as /me.
-                return false; // still publish to UI
-
-            case "VERSION":
-                sendRaw("NOTICE " ~ event.nick ~ " :" ~ ctcpReply("VERSION", "IRC Fiber 1.0 (vibe.d)"));
-                return true; // don't show in UI
-
-            case "PING":
-                sendRaw("NOTICE " ~ event.nick ~ " :" ~ ctcpReply("PING", param));
-                return true;
-
-            case "TIME":
-                import std.datetime : Clock;
-                sendRaw("NOTICE " ~ event.nick ~ " :" ~ ctcpReply("TIME", Clock.currTime.toString()));
-                return true;
-
-            case "CLIENTINFO":
-                sendRaw("NOTICE " ~ event.nick ~ " :" ~ ctcpReply("CLIENTINFO", "ACTION VERSION PING TIME CLIENTINFO"));
-                return true;
-
-            default:
-                return false; // unknown CTCP — let it pass through
+            case "ACTION":     return false; // JS renders \x01ACTION...\x01 as /me
+            case "VERSION":    reply("VERSION", "IRC Fiber 1.0 (vibe.d)"); return true;
+            case "PING":       reply("PING", param); return true;
+            case "TIME":       reply("TIME", Clock.currTime.toString()); return true;
+            case "CLIENTINFO": reply("CLIENTINFO", "ACTION VERSION PING TIME CLIENTINFO"); return true;
+            default:           return false; // unknown CTCP — let it pass through
         }
     }
 
@@ -10481,7 +10485,10 @@ private void processEvents() {
     /// server keeps it only if it is newer than what it has.
     void sendMarkRead(string target, long timestampMs) {
         import ircfiber.irc.chathistory : isoTimestampMs;
+        import std.algorithm.searching : any;
         if (target.length == 0 || timestampMs <= 0) return;
+        // One IRC param: a space, CR, LF or NUL would inject a second command.
+        if (target.any!(c => c == ' ' || c == '\r' || c == '\n' || c == '\0')) return;
         if (state != ConnectionState.connected || !hasCap("draft/read-marker")) return;
         sendRaw("MARKREAD " ~ target ~ " timestamp=" ~ isoTimestampMs(timestampMs));
     }
@@ -11353,4 +11360,74 @@ unittest {
     // ISUPPORT removal tokens drop the key.
     auto isup = run([":s 005 me MONITOR=100 WHOX :are supported", ":s 005 me -WHOX :are supported"]);
     assert(("WHOX" in isup[0].getIsupport()) is null && isup[0].getIsupport()["MONITOR"] == "100");
+}
+
+@("inbound framing sanitizes whole lines, so a UTF-8 char split across reads survives")
+unittest {
+    immutable wire = ":a!u@h PRIVMSG #c :caf\u00e9 \u2500\r\n";
+    char[] partial;
+    string line;
+    // The cut lands inside the 3-byte U+2500: sanitizing that read on its
+    // own would turn the dangling lead byte into CP437 mojibake.
+    partial ~= wire[0 .. $ - 4];
+    assert(!popInboundLine(partial, line));
+    partial ~= wire[$ - 4 .. $];
+    assert(popInboundLine(partial, line));
+    assert(line == wire[0 .. $ - 2], line);
+    assert(partial.length == 0);
+    assert(!popInboundLine(partial, line));
+
+    // CR and LF in separate reads still frame one line.
+    partial ~= "PING :x\r";
+    assert(!popInboundLine(partial, line));
+    partial ~= "\n";
+    assert(popInboundLine(partial, line) && line == "PING :x");
+
+    // An empty line pops as "", and the next line is kept.
+    partial ~= "\r\nA\r\n";
+    assert(popInboundLine(partial, line) && line == "");
+    assert(popInboundLine(partial, line) && line == "A");
+    assert(partial.length == 0);
+}
+
+@("TOPIC keys are normalized, an empty TOPIC clears, PART drops the topic")
+unittest {
+    import vibe.core.channel : createChannel;
+
+    NetworkConfig cfg;
+    cfg.nick = "me";
+    auto ch = createChannel!IRCRawEvent();
+    auto c = new PersistentIRCClient(cfg, ch);
+    c.channelState["#chan"] = "";
+
+    c.processLine(":srv 332 me #Chan :old topic");
+    assert(c.getChannelTopics() == ["#chan": "old topic"]);
+    c.processLine(":op!o@h TOPIC #Chan :");
+    assert(c.getChannelTopics() == ["#chan": ""]);
+    c.processLine(":me!u@h PART #Chan");
+    assert(("#chan" in c.getChannelTopics()) is null);
+
+    ch.close();
+    IRCRawEvent e;
+    while (ch.tryConsumeOne(e)) {}
+}
+
+@("KICK of our own nick in another case still leaves the channel")
+unittest {
+    import vibe.core.channel : createChannel;
+
+    NetworkConfig cfg;
+    cfg.nick = "me";
+    auto ch = createChannel!IRCRawEvent();
+    auto c = new PersistentIRCClient(cfg, ch);
+    c.channelState["#c"] = "";
+    c.channelUsers["#c"] = ["me", "op"];
+
+    c.processLine(":op!o@h KICK #c ME :bye");
+    assert(!c.getJoinedChannels().canFind("#c"));
+    assert(c.config.partedChannels.canFind("#c"));
+
+    ch.close();
+    IRCRawEvent e;
+    while (ch.tryConsumeOne(e)) {}
 }
