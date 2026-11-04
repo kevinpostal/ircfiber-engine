@@ -3212,6 +3212,10 @@ final class PersistentIRCClient {
         bool                joinThrottleRetryInFlight;
         /// Bumped per socket so a JOIN retry task of the old one stands down.
         uint                joinRetryEpoch;
+        /// One-shot guard for `scheduleJoinConfirmSweep` — armed right after
+        /// the auto-join burst, cleared when that sweep runs (or a newer
+        /// socket takes over). Prevents stacking a sweep per JOIN batch.
+        bool                joinConfirmSweepArmed;
         /// Membership flap guard (see `MemberFlap`), keyed by `memberKey`.
         /// Bounded by MEMBER_FLAP_MAX_TRACKED; reset per socket. The epoch
         /// is bumped per socket so a sweep task of the old one stands down.
@@ -4616,6 +4620,68 @@ final class PersistentIRCClient {
             });
         } catch (Exception) {
             joinThrottleRetryInFlight = false;
+        }
+    }
+
+    /// Seconds after the auto-join burst to check whether every channel
+    /// confirmed (JOIN echo) or was refused (a numeric). Longer than
+    /// SuperNETs' observed 5s throttle window and any normal round trip.
+    private enum JOIN_CONFIRM_SWEEP_MS = 8_000;
+
+    /// Safety net for a channel whose JOIN the server neither echoed nor
+    /// answered with any numeric at all — not a 421 throttle, not a 405
+    /// flood complaint, nothing. `scheduleJoinThrottleRetry` and
+    /// `scheduleFloodJoinRetry` only fire in response to one of those
+    /// numerics, so a server that just swallows one channel's JOIN out of
+    /// a batch (observed on SuperNETs/#superbowl, 2026-11-03: 8 of 9
+    /// auto-join channels confirmed within milliseconds, #superbowl got no
+    /// reply of any kind on two separate reconnects) left that channel
+    /// stuck in `joinsAwaitingConfirm` forever — `isJoined` stayed true
+    /// from the pre-disconnect snapshot, the roster never refreshed, and
+    /// nothing short of a manual /part + /join noticed. Armed once per
+    /// auto-join burst; shares `joinThrottleRounds`/`MAX_JOIN_THROTTLE_ROUNDS`
+    /// with the other two retries so this can't itself become a JOIN loop.
+    private void scheduleJoinConfirmSweep() nothrow {
+        if (joinConfirmSweepArmed) return;
+        joinConfirmSweepArmed = true;
+        const epoch = joinRetryEpoch;
+        try {
+            runTask({
+                try {
+                    sleep(JOIN_CONFIRM_SWEEP_MS.msecs);
+                    // A newer socket owns the retry state now.
+                    if (joinRetryEpoch != epoch) return;
+                    joinConfirmSweepArmed = false;
+                    if (joinsAwaitingConfirm.length == 0) return;
+                    // A throttle/flood retry already in flight covers these
+                    // same channels — don't send a second JOIN for them.
+                    if (joinThrottleRetryInFlight) return;
+                    if (joinThrottleRounds >= MAX_JOIN_THROTTLE_ROUNDS) {
+                        logJsonMap("warn", "connection",
+                            "JOIN never confirmed or refused — giving up (round cap)",
+                            ["network": config.name,
+                             "channels": joinsAwaitingConfirm.join(","),
+                             "event": "join_confirm_timeout_exhausted"]);
+                        return;
+                    }
+                    if (state != ConnectionState.connected) return;
+                    joinThrottleRounds++;
+                    auto batches = joinBatches(joinsAwaitingConfirm);
+                    if (batches.length == 0) return;
+                    logJsonMap("warn", "connection",
+                        "JOIN never confirmed or refused — retrying once",
+                        ["network": config.name,
+                         "channels": joinsAwaitingConfirm.join(","),
+                         "round": joinThrottleRounds.to!string,
+                         "event": "join_confirm_timeout"]);
+                    sendRaw("JOIN " ~ batches[0]);
+                } catch (Exception e) {
+                    if (joinRetryEpoch == epoch) joinConfirmSweepArmed = false;
+                    logWarn("JOIN confirm sweep failed for %s: %s", config.name, e.msg);
+                }
+            });
+        } catch (Exception) {
+            joinConfirmSweepArmed = false;
         }
     }
 
@@ -6427,6 +6493,7 @@ final class PersistentIRCClient {
         }
         foreach (batch; joinBatches(autoJoin))
             sendRaw("JOIN " ~ batch);
+        if (autoJoin.length > 0) scheduleJoinConfirmSweep();
 
         // MONITOR is per connection: re-arm the persisted list.
         if (monitorSupported() && config.monitoredNicks.length)
@@ -10752,6 +10819,31 @@ unittest {
     assert(c.joinsAwaitingConfirm.length == 0,
            "a real refusal must still be cleared — waiting will not fix it");
     assert(!c.joinThrottleRetryInFlight, "no retry for a channel that was genuinely refused");
+    ch.close();
+}
+
+@("scheduleJoinConfirmSweep arms once per auto-join burst and does not double-arm")
+unittest {
+    import vibe.core.channel : createChannel;
+    NetworkConfig cfg;
+    cfg.nick = "Zodiac";
+    auto ch = createChannel!IRCRawEvent();
+    auto c = new PersistentIRCClient(cfg, ch);
+    // Prod incident 2026-11-03: #superbowl got no JOIN echo and no
+    // numeric at all on two separate SuperNets reconnects — neither the
+    // 421 throttle retry nor the 405 flood retry ever fires without one
+    // of those replies, so the channel sat in joinsAwaitingConfirm
+    // forever with isJoined still true and a frozen roster. The sweep is
+    // the only thing that notices a reply that never arrives.
+    c.sendRaw("JOIN #superbowl");
+    assert(c.joinsAwaitingConfirm == ["#superbowl"]);
+    assert(!c.joinConfirmSweepArmed, "fresh client starts unarmed");
+    c.scheduleJoinConfirmSweep();
+    assert(c.joinConfirmSweepArmed, "the sweep must arm for the pending channel");
+    // A second auto-join burst in the same registration (batched JOINs
+    // span more than one line) must not stack a second sweep task.
+    c.scheduleJoinConfirmSweep();
+    assert(c.joinConfirmSweepArmed, "double-arm is a no-op, not a crash");
     ch.close();
 }
 
