@@ -6387,7 +6387,10 @@ final class PersistentIRCClient {
                             if (handleMetadataLine(evt)) continue;
                             break;
 
-                        default:
+                        case "JOIN": case "PART": case "KICK": case "QUIT":
+                        case "NICK": case "MODE": case "TOPIC":
+                        case "353": case "366": case "332": case "333":
+                        case "352": case "354":
                             // Server-side autojoins can arrive before MOTD
                             // ends or share its final read. Publishing alone
                             // loses JOIN/NAMES state; our later JOIN is then a
@@ -6396,6 +6399,9 @@ final class PersistentIRCClient {
                             evt.timestampMs = resolveTimestamp(evt);
                             processEvent(evt);
                             continue; // normal dispatch already publishes
+
+                        default:
+                            break;
                     }
 
                     // Skip WHOIS / WHOX / NAMES / WHO replies during
