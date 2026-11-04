@@ -6388,7 +6388,14 @@ final class PersistentIRCClient {
                             break;
 
                         default:
-                            break;
+                            // Server-side autojoins can arrive before MOTD
+                            // ends or share its final read. Publishing alone
+                            // loses JOIN/NAMES state; our later JOIN is then a
+                            // no-op because the server already joined us.
+                            evt.network = config.name;
+                            evt.timestampMs = resolveTimestamp(evt);
+                            processEvent(evt);
+                            continue; // normal dispatch already publishes
                     }
 
                     // Skip WHOIS / WHOX / NAMES / WHO replies during
@@ -10735,6 +10742,42 @@ private void processEvents() {
     void partChannel(string channel, string reason = "") {
         if (reason.length > 0) sendRaw("PART " ~ channel ~ " :" ~ reason);
         else                    sendRaw("PART " ~ channel);
+    }
+}
+
+@("server autojoin during registration retains its complete roster")
+unittest {
+    import vibe.core.channel : createChannel;
+    import vibe.core.net : listenTCP;
+
+    // An IRCd can force-join its default channel before MOTD ends, or
+    // append that JOIN/NAMES burst to the same read as 376. Joining the
+    // channel again later produces no echo or NAMES: we are already in it.
+    foreach (motdFirst; [false, true]) {
+        const motd = ":s 376 me :End of MOTD\r\n";
+        const names = ":me!u@h JOIN #autojoin\r\n"
+            ~ ":s 353 me = #autojoin :@me alice\r\n"
+            ~ ":s 353 me = #autojoin :+bob\r\n"
+            ~ ":s 366 me #autojoin :End of NAMES\r\n";
+        const wire = ":s 001 me :Welcome\r\n"
+            ~ (motdFirst ? motd ~ names : names ~ motd);
+        auto listener = listenTCP(0, (TCPConnection peer) {
+            peer.write(wire);
+            peer.flush();
+        }, "127.0.0.1");
+        scope(exit) listener.stopListening();
+        auto ch = createChannel!IRCRawEvent();
+        scope(exit) ch.close();
+        NetworkConfig cfg;
+        cfg.nick = "me";
+        auto c = new PersistentIRCClient(cfg, ch);
+        c.connection = connectTCP("127.0.0.1", listener.bindAddress.port);
+        scope(exit) c.connection.close();
+        c.performRegistration();
+        const roster = c.getChannelUsers().get("#autojoin", null);
+        assert(roster.length == 3, "registration must consume the whole NAMES burst");
+        assert(roster.canFind("@me") && roster.canFind("alice") && roster.canFind("+bob"),
+            "self, ordinary and voiced members survive registration");
     }
 }
 
