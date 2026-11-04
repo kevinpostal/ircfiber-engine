@@ -320,7 +320,7 @@ void loadNetworks(ref EngineContext ctx) {
     auto serverId = ctx.localServer.serverId;
 
     foreach (nw; allNetworks) {
-        if (nw.config.disabled) {
+        if (nw.config.disabled || nw.config.servicesProvisioningPending) {
             skippedCount++;
             continue;
         }
@@ -457,7 +457,7 @@ void loadNetworks(ref EngineContext ctx) {
         logWarn("Network loading: skipped %d orphaned network(s) with no valid owner " ~
             "(disabled in MongoDB)", orphanCount);
     }
-    logInfo("Network loading: loaded %d networks (attached=%d to held sessions, skipped=%d disabled)",
+    logInfo("Network loading: loaded %d networks (attached=%d to held sessions, skipped=%d disabled/pending)",
         loadedCount, attachedCount, skippedCount);
 
     ctx.connManager.startDeferredClients();

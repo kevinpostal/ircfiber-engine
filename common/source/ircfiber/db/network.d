@@ -207,6 +207,9 @@ final class NetworkRepository {
                 "defaultAvatarUrl": Bson(config.defaultAvatarUrl),
                 "profileMetadata": serializeToBson(config.profileMetadata),
                 "monitoredNicks": Bson(config.monitoredNicks.map!(n => Bson(n)).array)
+            ]),
+            "$setOnInsert": Bson([
+                "servicesProvisioningPending": Bson(config.servicesProvisioningPending)
             ])
         ]);
         UpdateOptions options;
@@ -218,6 +221,32 @@ final class NetworkRepository {
             try g_redis.del(RedisKeys.userNetworks(userId.toString()));
             catch (Exception) {}
         }
+    }
+
+    /// Complete an initial signup exactly once; never create or re-arm a row.
+    /// A verified credential is committed in the same atomic transition.
+    bool completeSignupProvisioning(UUID id, UUID ownerId, string account = "", string password = "") {
+        auto fields = Bson(["servicesProvisioningPending": Bson(false)]);
+        if (account.length) {
+            fields["sasl"] = Bson(SASLMechanism.plain.to!string);
+            fields["saslUsername"] = Bson(account);
+            fields["saslPassword"] = Bson(password);
+            fields["nick"] = Bson(account);
+            fields["realName"] = Bson(account);
+        }
+        auto result = collection.updateOne(
+            Bson([
+                "id": Bson(id.toString()),
+                "userId": Bson(ownerId.toString()),
+                "servicesProvisioningPending": Bson(true)
+            ]),
+            Bson(["$set": fields]));
+        if (result.modifiedCount != 1) return false;
+        if (g_redis !is null) {
+            try g_redis.del(RedisKeys.userNetworks(ownerId.toString()));
+            catch (Exception) {}
+        }
+        return true;
     }
 
     /// Sets the egress selection on a network without rewriting the full record.
@@ -273,6 +302,7 @@ final class NetworkRepository {
             cfg.realName = elem["realName"].get!string;
             try { cfg.ident = elem["ident"].get!string; } catch (Exception) {}
             try { cfg.disabled = elem["disabled"].get!bool; } catch (Exception) {}
+            try { cfg.servicesProvisioningPending = elem["servicesProvisioningPending"].get!bool; } catch (Exception) {}
             try { cfg.nspass = elem["nspass"].get!string; } catch (Exception) {}
             try { cfg.commands = elem["commands"].get!string; } catch (Exception) {}
             try { cfg.serverPass = elem["serverPass"].get!string; } catch (Exception) {}
@@ -312,6 +342,7 @@ final class NetworkRepository {
         try { cfg.realName = doc["realName"].get!string; } catch (Exception) {}
         try { cfg.ident = doc["ident"].get!string; } catch (Exception) {}
         try { cfg.disabled = doc["disabled"].get!bool; } catch (Exception) {}
+        try { cfg.servicesProvisioningPending = doc["servicesProvisioningPending"].get!bool; } catch (Exception) {}
         try { cfg.systemManaged = doc["systemManaged"].get!bool; } catch (Exception) {}
         try {
             const v = doc["autoJoinDelaySeconds"].get!int;

@@ -16,11 +16,9 @@
  *   - `buildDefaultFiberNetwork(user)` — pure constructor for the config
  *     (no I/O). Useful for tests and for callers that want to inspect the
  *     config before persisting.
- *   - `ensureDefaultFiberNetwork(user, networkRepo, redis, serverRegistry)` —
- *     idempotent provisioning helper. Skips if the user already has a
- *     network with host=irc.ircfiber.com; otherwise inserts the config into
- *     Mongo, assigns a connection server, and pushes the addNetwork control
- *     message onto the engine's Redis queue.
+ *   - `ensureDefaultFiberNetwork` — idempotent Mongo provisioning. Normal
+ *     signup/login callers defer engine activation until NickServ completes;
+ *     the explicit migration tool may still connect immediately.
  */
 module ircfiber.default_network;
 
@@ -178,20 +176,20 @@ string buildDefaultNick(User user) @safe {
  * - Returns the existing NetworkConfig if the user already has a network
  *   with host=DEFAULT_FIBER_HOST (the network may pre-date this feature
  *   and have systemManaged=false; we don't touch it).
- * - Otherwise builds, persists, assigns to a server, and pushes the
- *   addNetwork control message via Redis.
+ * - Otherwise builds and persists the network. `deferConnect=true` leaves
+ *   it held for NickServ provisioning; the legacy default assigns an engine
+ *   and queues its first addNetwork message.
  *
- * Returns the (existing or new) config. On infrastructure errors after
- * persistence the message may not reach the engine — that's recoverable
- * via engine bootstrap (it reads all configs from Mongo on boot), so we
- * log and return rather than throwing. Throws only for hard failures
- * (Mongo unreachable before insert).
+ * Returns the (existing or new) config. If initial dispatch fails after
+ * persistence, bootstrap can recover the enabled row; hard insert failures
+ * still throw.
  */
 NetworkConfig ensureDefaultFiberNetwork(
     User user,
     NetworkRepository networkRepo,
     RedisStorage redis,
-    ServerRegistry serverRegistry
+    ServerRegistry serverRegistry,
+    bool deferConnect = false
 ) {
     if (user.id == UUID.init || user.username.length == 0)
         return NetworkConfig.init;
@@ -235,6 +233,7 @@ NetworkConfig ensureDefaultFiberNetwork(
     }
 
     auto cfg = buildDefaultFiberNetwork(user);
+    cfg.servicesProvisioningPending = deferConnect;
     auto userRepo = new UserRepository();
     cfg.defaultAvatarUrl = userRepo.getAvatarUrl(user.id);
     cfg.profileMetadata = userRepo.getProfile(user.id);
@@ -271,24 +270,39 @@ NetworkConfig ensureDefaultFiberNetwork(
         }
     } catch (Exception) {} // dedup best-effort
 
-    auto serverId = serverRegistry.assignNetwork(cfg.id.toString());
-    if (serverId.length == 0) {
-        logWarn("ensureDefaultFiberNetwork: no healthy server for user=%s, network=%s — " ~
-                "engine will pick it up on next bootstrap",
-                user.username, cfg.id.toString());
-        return cfg;
-    }
+    if (!cfg.servicesProvisioningPending)
+        activateDefaultFiberNetwork(cfg, user.id, redis, serverRegistry);
+    return cfg;
+}
 
+/// Dispatch the initial connection for an owned, enabled, completed network.
+/// Bootstrap recovers persisted rows when no engine or queue is available.
+void activateDefaultFiberNetwork(NetworkConfig cfg, UUID ownerId, RedisStorage redis,
+                                 ServerRegistry serverRegistry) {
+    if (cfg.id == UUID.init || ownerId == UUID.init || cfg.disabled
+            || cfg.servicesProvisioningPending) return;
+    string serverId;
     try {
-        auto msg = ControlMessage("addNetwork", cfg.id.toString(), user.id.toString(), cfg.toJson());
+        serverId = serverRegistry.getServerForNetwork(cfg.id.toString());
+        if (!serverId.length) serverId = serverRegistry.assignNetwork(cfg.id.toString());
+    } catch (Exception e) {
+        logWarn("activateDefaultFiberNetwork: assignment failed for network=%s: %s",
+                cfg.id.toString(), e.msg);
+        return;
+    }
+    if (!serverId.length) {
+        logWarn("activateDefaultFiberNetwork: no healthy server for network=%s — " ~
+                "engine will pick it up on next bootstrap", cfg.id.toString());
+        return;
+    }
+    try {
+        auto msg = ControlMessage("addNetwork", cfg.id.toString(), ownerId.toString(), cfg.toJson());
         msg.timestampMs = Clock.currTime.toUnixTime!long * 1000;
         redis.lpush(RedisKeys.control(serverId), msg.toJson().toString());
     } catch (Exception e) {
-        logWarn("ensureDefaultFiberNetwork: failed to push addNetwork control msg " ~
-                "for user=%s network=%s: %s — engine will pick it up on next bootstrap",
-                user.username, cfg.id.toString(), e.msg);
+        logWarn("activateDefaultFiberNetwork: failed to push addNetwork for network=%s: %s — " ~
+                "engine will pick it up on next bootstrap", cfg.id.toString(), e.msg);
     }
-    return cfg;
 }
 
 @("buildDefaultFiberNetwork sets all required fields")

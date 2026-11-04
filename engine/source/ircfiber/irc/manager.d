@@ -84,6 +84,7 @@ final class ConnectionManager {
 
     /// Adds a network for a user and starts its IRC client.
     void addNetwork(NetworkConfig config, UUID userId) {
+        if (config.servicesProvisioningPending) return;
         auto key = config.id.toString();
         if (key in clients) {
             logWarn("Network %s already managed", config.name);
@@ -103,6 +104,7 @@ final class ConnectionManager {
     /// Used when a single network needs to start outside the bootstrap loop
     /// (e.g. reconnectNetwork control message).
     void addAndStartNetwork(NetworkConfig config, UUID userId) {
+        if (config.servicesProvisioningPending) return;
         auto key = config.id.toString();
         if (key in clients) {
             logWarn("Network %s already managed", config.name);
@@ -612,6 +614,7 @@ final class ConnectionManager {
         import ircfiber.engine.holder_client : HolderErrorException, HolderUnavailableException;
         import vibe.core.core : runTask, sleep;
         import core.time : seconds;
+        if (config.servicesProvisioningPending) return;
         auto key = config.id.toString();
         if (key in clients) {
             logWarn("Network %s already managed", config.name);

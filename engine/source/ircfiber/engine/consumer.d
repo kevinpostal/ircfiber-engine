@@ -217,21 +217,19 @@ private void handleControlMessage(ref EngineContext ctx, ControlMessage msg) {
             if (msg.config.type != Json.Type.undefined) {
                 auto cfg = parseNetworkConfig(msg.config);
                 auto uid = parseUUID(msg.userId);
-                // A queued addNetwork for a network that has since been
-                // parked (SASL rejection) or admin-disabled must not
-                // resurrect it: fresh rows are never disabled, so this only
-                // fires on stale control traffic.
-                if (cfg.disabled) {
-                    logWarn("addNetwork[%s]: network is parked/disabled — ignoring stale control message", cfg.id.toString());
+                // Stale control traffic must not start a held or disabled row,
+                // nor replace an already-running initial connection.
+                if (cfg.disabled || cfg.servicesProvisioningPending) {
+                    logWarn("addNetwork[%s]: network is disabled or awaiting services — ignoring",
+                            cfg.id.toString());
                     break;
                 }
+                if (ctx.connManager.hasNetwork(cfg.id)) break;
+                const assigned = ctx.serverRegistry.getServerForNetwork(cfg.id.toString());
+                if (assigned.length && assigned != ctx.localServer.serverId) break;
+                if (!assigned.length)
+                    ctx.serverRegistry.selfAssignNetwork(cfg.id.toString(), ctx.localServer.serverId);
 
-                // Claim ownership in registry
-                const sid = ctx.serverRegistry.assignNetwork(cfg.id.toString());
-                if (sid.length == 0) {
-                    logWarn("Cannot add network %s — no healthy connection server available, will retry", cfg.name);
-                }
-                
                 ctx.connManager.addAndStartNetwork(cfg, uid);
                 spawnNetworkCommandConsumer(ctx, cfg.id.toString());
             }
@@ -288,6 +286,12 @@ private void handleControlMessage(ref EngineContext ctx, ControlMessage msg) {
             break;
         case "reconnectNetwork":
             if (msg.networkId.length && msg.config.type != Json.Type.undefined) {
+                auto cfg = parseNetworkConfig(msg.config);
+                if (cfg.disabled || cfg.servicesProvisioningPending) {
+                    logWarn("reconnectNetwork[%s]: network is disabled or awaiting services — ignoring",
+                            cfg.id.toString());
+                    break;
+                }
                 auto id = parseUUID(msg.networkId);
                 // Idempotency: a double-click in the frontend (or a
                 // bounce/retry from the gateway's WebSocket) can publish
@@ -310,7 +314,6 @@ private void handleControlMessage(ref EngineContext ctx, ControlMessage msg) {
                 }
                 markReconnectInFlight(msg.networkId, configKey);
 
-                auto cfg = parseNetworkConfig(msg.config);
                 // Emit a "queued" notice *immediately* so the frontend
                 // sees user-visible feedback the instant the control
                 // message is consumed — the connection fiber can't run
@@ -514,5 +517,8 @@ private NetworkConfig parseNetworkConfig(Json j) {
         foreach (v; j["monitoredNicks"])
             if (v.type == Json.Type.string) cfg.monitoredNicks ~= v.get!string;
     if (j["systemManaged"].type == Json.Type.bool_) cfg.systemManaged = j["systemManaged"].get!bool;
+    if (j["disabled"].type == Json.Type.bool_) cfg.disabled = j["disabled"].get!bool;
+    if (j["servicesProvisioningPending"].type == Json.Type.bool_)
+        cfg.servicesProvisioningPending = j["servicesProvisioningPending"].get!bool;
     return cfg;
 }

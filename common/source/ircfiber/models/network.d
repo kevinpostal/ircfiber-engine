@@ -145,6 +145,9 @@ struct NetworkConfig {
     /// persists across redeploys). Disabled networks are not loaded
     /// during engine bootstrap and must be manually re-enabled.
     bool disabled = false;
+    /// Initial signup only: held until a completed NickServ provisioning attempt.
+    /// Independent of admin disable; absent on legacy networks means false.
+    bool servicesProvisioningPending = false;
     /// NickServ password — sent as PRIVMSG NickServ :IDENTIFY <nspass> after connect
     string nspass;
     /// Commands to execute on connect (one per line, WAIT N supported for delays)
@@ -216,6 +219,7 @@ struct NetworkConfig {
             "realName": Json(realName),
             "ident": Json(ident),
             "disabled": Json(disabled),
+            "servicesProvisioningPending": Json(servicesProvisioningPending),
             "nspass": Json(nspass),
             "commands": Json(commands),
             "serverPass": Json(serverPass),
