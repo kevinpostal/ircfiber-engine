@@ -87,18 +87,42 @@ python3 -m pytest tests/irc_parity -v  # against mock ircd
 The `nordvpn` network pin uses **static SOCKS exits only**; if none can dial,
 the engine retries with backoff rather than connecting directly or via Mullvad.
 After a registered session survives 60 seconds, an upstream socket loss makes
-that client prefer another exit for five minutes. Losses on two distinct IRC
-hostnames within 90 seconds quarantine their shared static exit for five
-minutes, without closing other live sockets. Avoided/quarantined exits remain
-last-resort VPN candidates. All exits sharing one NordVPN account remain a
-provider-wide failure domain.
+that client prefer another exit for five minutes. Correlated losses on two
+distinct IRC hostnames within 90 seconds exclude their shared static exit
+from new connections. This is a precautionary correlation, not proof that
+the VPN provider caused the losses. Existing sockets stay open.
 
-Run `bash scripts/e2e/egress_failover.sh` against the local Docker stack to
-prove correlated failover and the no-direct fallback; run
-`bash scripts/e2e/hot_swap.sh` to prove holder sockets survive engine restarts.
+Admission lives in Redis at `irc:egress:admission:<label>`, bound to the
+configured proxy endpoint. Quarantine survives engine hot swaps and applies
+to every engine; neither an exact-label pin nor route memory bypasses it.
+After the minimum five-minute cooldown, one atomically claimed recovery
+session may try the exit, after healthy permitted alternatives. It must stay
+registered for at least 60 seconds and answer a matching keepalive sent
+after that window before the exit admits ordinary connections again.
+Failed or expired trials double the cooldown up to one hour. Fresh
+correlated loss during a trial invalidates its claim; stale callbacks cannot
+undo a drain or reopen the circuit. A hot-swapped trial needs a fresh
+keepalive from the new engine, not an inferred success from reattachment.
+
+Admin's Mullvad and NordVPN tables distinguish the SOCKS probe from
+`healthy`, `quarantined`, `recovering`, `draining`, or `unavailable` admission.
+Drain/resume affects new connections only and never queues reconnects.
+Resume does not clear quarantine. Malformed, changed-endpoint, or unreadable
+records fail closed; an acknowledged replacement endpoint must recover.
+A refused quarantine write leaves the exit locally excluded while the
+engine retries persistence. All exits sharing one NordVPN account remain a
+provider-wide failure domain; this does not buy independent provider capacity.
+
+Run `bash scripts/e2e/egress_failover.sh` only against a disposable local
+Docker stack to exercise failover, drain, recovery, silent blackholing, and
+no-direct fallback; `bash scripts/e2e/hot_swap.sh` checks holder continuity.
+The shared package's `egress-admission-redis-test` configuration exercises
+atomic claims and fencing. It requires a dedicated disposable Redis and
+`EGRESS_ADMISSION_ALLOW_CONFIG_TEST=1`: its write-failure case temporarily
+changes server-wide `min-replicas-to-write`, then restores it.
 On a quarantine transition the engine queues one `notice` in
-`irc:logs:outbox`; FiberEye delivers it to `#staff`. Redis delivery is
-best-effort and does not block reconnect decisions if unavailable.
+`irc:logs:outbox`; FiberEye delivers it to `#staff`. Notice delivery is
+best-effort; it is not the source of the admission decision.
 
 ### Automatic route selection and IPv6
 
