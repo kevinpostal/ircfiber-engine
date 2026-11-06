@@ -6954,6 +6954,9 @@ private void processEvents() {
                 }
             }
 
+            // FIBERMLS probes leave on their own 1 s pacing.
+            drainFiberProbes();
+
             yield();
             // Detach pause: while a hot-swap detach is being prepared, spin
             // here so the snapshot the engine publishes is exact. We check
@@ -9402,6 +9405,324 @@ private void processEvents() {
         }
     }
 
+    // ── FIBERMLS peer discovery ───────────────────────────────────────────────
+    // Wire protocol and pure checks live in ircfiber.irc.mls_peer. Nothing
+    // here logs a control line, nonce or ticket: they are bearer material.
+
+    /// Status symbols of ISUPPORT PREFIX; RFC `@+` when none was sent.
+    private string prefixSymbols() {
+        if (auto p = "PREFIX" in isupportMap) return prefixSymbolsFromIsupport(*p);
+        return DEFAULT_PREFIX_SYMBOLS;
+    }
+
+    /// ISUPPORT CHANTYPES; RFC `#&` when none was sent.
+    private string channelTypes() {
+        if (auto p = "CHANTYPES" in isupportMap) return *p;
+        return "#&";
+    }
+
+    /// The source as a roster entry may record it: `nick!user@host` when
+    /// the server stated it whole, else the bare nick.
+    private static string rosterIdentityOf(ref IRCRawEvent event) {
+        IrcPrefix p;
+        return parseFullPrefix(event.prefix, p) ? event.prefix : event.nick;
+    }
+
+    /// Sets the verified own prefix (and the payload-budget hostmask);
+    /// a change refreshes the holder META and the state snapshot.
+    private void setOwnPrefix(string prefix) {
+        if (prefix == ownPrefix) return;
+        ownPrefix = prefix;
+        ownHostmask = prefix;
+        metaDirty = true;
+        announceOwnPrefix();
+    }
+
+    /// Drops the proof until the server restates it.
+    private void clearOwnPrefix() {
+        if (ownPrefix.length == 0) return;
+        ownPrefix = "";
+        metaDirty = true;
+        announceOwnPrefix();
+    }
+
+    /// Engine-private `own_prefix` event: the processor writes the state
+    /// snapshot at once and never publishes or stores it. A WHO-only
+    /// refresh has no other published event to ride on (the engine's own
+    /// 315 stays off the event channel).
+    private void announceOwnPrefix() {
+        auto ev = IRCRawEvent(config.name, "own_prefix");
+        ev.networkId = config.id.toString();
+        eventChannel.put(ev);
+    }
+
+    /// WHO on our own nick so the server restates who we are; at most every
+    /// FIBERMLS_SELF_WHO_MS, and never while a /nick awaits its echo (the
+    /// row would name a nick we may not hold).
+    private void requestSelfWho() {
+        if (state != ConnectionState.connected || optimisticNickOld.length || sessionNick.length == 0)
+            return;
+        const now = unixMsNow();
+        if (fiberSelfWhoMs > 0 && now - fiberSelfWhoMs < FIBERMLS_SELF_WHO_MS) return;
+        fiberSelfWhoMs = now;
+        sendRaw("WHO " ~ sessionNick);
+    }
+
+    /// WHO on a channel whose roster cannot prove an identity yet (a bare or
+    /// contradicting entry), at most every FIBERMLS_ROSTER_WHO_MS per channel.
+    private void requestRosterWho(string chanKey) {
+        if (state != ConnectionState.connected) return;
+        const now = unixMsNow();
+        if (auto last = chanKey in fiberRosterWhoMs)
+            if (now - *last < FIBERMLS_ROSTER_WHO_MS) return;
+        fiberRosterWhoMs[chanKey] = now;
+        sendRaw(whoLine(chanKey));
+    }
+
+    /// `nick` is this connection: the session nick, a /nick still awaiting
+    /// its echo, or the verified prefix's nick.
+    private bool isOwnNick(string nick) {
+        if (nick.length == 0) return false;
+        if (sameNick(nick, sessionNick)) return true;
+        if (optimisticNickOld.length && sameNick(nick, optimisticNickOld)) return true;
+        IrcPrefix held;
+        return parseFullPrefix(ownPrefix, held) && nicksEqualMapped(nick, held.nick, casemapping());
+    }
+
+    /// The line is history, never a live request: any batch (chathistory,
+    /// netjoin, labeled), a reassembled multiline message, the holder's
+    /// attach backlog, or a server-time more than FIBERMLS_FRESH_MS off.
+    private bool fiberHistorical(ref IRCRawEvent event) {
+        if (lineFromBacklog || inMultilineMerge || event.getTag("batch").length) return true;
+        if (event.getTag("time").length) {
+            const age = unixMsNow() - event.timestampMs;
+            if (age > FIBERMLS_FRESH_MS || age < -FIBERMLS_FRESH_MS) return true;
+        }
+        return false;
+    }
+
+    /// GCRA bucket for ID replies, separate from `takeCtcpReplySlot`.
+    private bool takeFiberReplySlot() {
+        const now = unixMsNow();
+        const tat = fiberReplyTatMs > now ? fiberReplyTatMs : now;
+        if (tat - now > (FIBERMLS_REPLY_BURST - 1) * FIBERMLS_REPLY_INTERVAL_MS) return false;
+        fiberReplyTatMs = tat + FIBERMLS_REPLY_INTERVAL_MS;
+        return true;
+    }
+
+    /// This engine may issue for this socket right now: registered with a
+    /// generation and a verified prefix, still owning the session (not
+    /// detached for a swap, not shutting down, on its holder connection),
+    /// with Redis, an owner and a server id to fence the assignment on.
+    private bool fiberIssuerLive() {
+        return state == ConnectionState.connected && !detachedForHotSwap && !isShutdownRequested
+            && connectedAtMs > 0 && ownPrefix.length > 0
+            && (holder is null || holderConnId.length > 0)
+            && ownerId != UUID.init && redis !is null && serverId.length > 0;
+    }
+
+    /// Consumes every reserved FIBERMLS PRIVMSG/NOTICE before chat, query,
+    /// multiline or history handling. Answers only a live private QUERY to
+    /// our verified nick and relays only the ID reply to a probe this
+    /// connection sent; everything else (malformed, other versions,
+    /// oversized, channel/STATUSMSG targets, own echoes, history) is
+    /// dropped silently. NOTICE never elicits a reply.
+    private bool interceptFiberMls(ref IRCRawEvent event) {
+        if (event.command != "PRIVMSG" && event.command != "NOTICE") return false;
+        if (!isReservedFiberMls(event.text)) return false;
+        auto params = event.getParams();
+        const target = params.length > 0 ? params[0] : "";
+        int linelen = 512;
+        if (auto v = "LINELEN" in isupportMap) {
+            try linelen = (*v).to!int; catch (Exception) linelen = 512;
+        }
+        auto pkt = parseFiberMls(event.text,
+            payloadBudget(linelen, event.prefix, event.command, target, 0), channelTypes());
+        if (isOwnNick(event.nick) || fiberHistorical(event)) return true;
+        IrcPrefix source;
+        if (!parseFullPrefix(event.prefix, source)) return true;
+        IrcPrefix self;
+        if (!parseFullPrefix(ownPrefix, self)) {
+            // Cannot prove the line was addressed to us; get verified so
+            // the peer's retry can be answered.
+            if (target.length && sameNick(target, sessionNick)) requestSelfWho();
+            return true;
+        }
+        if (target.length == 0 || !nicksEqualMapped(target, self.nick, casemapping())) return true;
+        if (event.command == "PRIVMSG" && pkt.kind == FiberMlsKind.query)
+            answerFiberQuery(source, event.prefix, pkt);
+        else if (event.command == "NOTICE" && pkt.kind == FiberMlsKind.id)
+            relayFiberId(source, event.prefix, target, pkt);
+        return true;
+    }
+
+    /// Issues a ticket for a QUERY whose source and our own identity are
+    /// both stated in full on the named channel's roster, stores it
+    /// (SET NX EX 30, fenced on the assignment before and after) and only
+    /// then answers with the ID NOTICE.
+    private void answerFiberQuery(IrcPrefix source, string sourcePrefix, FiberMlsPacket pkt) {
+        if (!fiberIssuerLive()) return;
+        const mapping = casemapping();
+        string chanKey;
+        foreach (k; channelState.byKey)
+            if (nicksEqualMapped(k, pkt.channel, mapping)) { chanKey = k; break; }
+        auto roster = chanKey.length ? chanKey in channelUsers : null;
+        if (roster is null) return;
+        IrcPrefix self;
+        if (!parseFullPrefix(ownPrefix, self)) return;
+        const symbols = prefixSymbols();
+        const peer = matchRosterIdentity(*roster, source, symbols, mapping);
+        const mine = matchRosterIdentity(*roster, self, symbols, mapping);
+        if (peer != RosterMatch.match || mine != RosterMatch.match) {
+            // A bare or stale entry is no proof; refresh it so the peer's
+            // retry can be answered. A peer simply not on the channel is not.
+            if (peer != RosterMatch.absent || mine != RosterMatch.match) requestRosterWho(chanKey);
+            return;
+        }
+        if (!takeFiberReplySlot()) return;
+        string ticket;
+        bool minted;
+        try minted = generateTicketHex(ticket); catch (Exception) minted = false;
+        if (!minted) return;
+        const body = buildFiberMlsId(pkt.nonce, ticket, linePayloadBudget(source.nick, "NOTICE"));
+        if (body is null) return;
+        PeerTicket t;
+        t.networkId = config.id.toString();
+        t.ownerId = ownerId.toString();
+        t.serverId = serverId;
+        t.connectedAtMs = connectedAtMs;
+        t.issuerPrefix = ownPrefix;
+        t.requesterPrefix = sourcePrefix;
+        t.networkKey = canonicalNetworkKey(config.host, config.port);
+        t.channel = normalizeFiberChannel(pkt.channel, mapping);
+        t.nonce = pkt.nonce;
+        t.issuedAt = unixMsNow();
+        const generation = connectedAtMs;
+        const issuer = ownPrefix;
+        const holderId = holderConnId;
+        if (!storeFiberTicket(ticket, t.toJson())) return;
+        // Redis yielded this fiber: re-fence the session before answering.
+        if (!fiberIssuerLive() || connectedAtMs != generation || ownPrefix != issuer
+            || holderConnId != holderId) {
+            dropFiberTicket(ticket);
+            return;
+        }
+        writeRaw("NOTICE " ~ source.nick ~ " :" ~ body);
+    }
+
+    /// SET NX EX 30 of the ticket, only while `irc:assignments` names this
+    /// engine before and after the write. False (and no ID reply) on any
+    /// failure.
+    private bool storeFiberTicket(string ticket, string value) {
+        const nid = config.id.toString();
+        const key = RedisKeys.mlsPeerTicket(ticket);
+        try {
+            auto db = redis.getDb();
+            if (db.hget(RedisKeys.networkAssignments(), nid) != serverId) return false;
+            if (!db.setNX(key, value, FIBERMLS_TICKET_TTL_SECS.seconds)) return false;
+            if (db.hget(RedisKeys.networkAssignments(), nid) == serverId) return true;
+            db.del(key);
+            return false;
+        } catch (Exception) {
+            logJsonMap("warn", "connection", "FIBERMLS ticket not stored; no reply sent",
+                ["network": config.name, "event": "fibermls_ticket_store_failed"]);
+            return false;
+        }
+    }
+
+    private void dropFiberTicket(string ticket) {
+        try redis.getDb().del(RedisKeys.mlsPeerTicket(ticket));
+        catch (Exception) {}
+    }
+
+    /// Publishes a matching ID reply to the owner's live event channel only
+    /// (no scrollback, history, query tab or notification). The nonce must
+    /// belong to a probe this connection wrote to that same nick within
+    /// FIBERMLS_FRESH_MS; it is single-use. A reply from anyone else leaves
+    /// the genuine probe redeemable.
+    private void relayFiberId(IrcPrefix source, string sourcePrefix, string destination,
+                              FiberMlsPacket pkt) {
+        pruneFiberProbes(unixMsNow());
+        auto sent = pkt.nonce in fiberProbesSent;
+        if (sent is null || !nicksEqualMapped(sent.target, source.nick, casemapping())) return;
+        fiberProbesSent.remove(pkt.nonce);
+        if (redis is null || ownerId == UUID.init) return;
+        auto msg = Json.emptyObject;
+        msg["type"] = "mls_peer_response";
+        msg["networkId"] = config.id.toString();
+        msg["prefix"] = sourcePrefix;
+        msg["destination"] = destination;
+        msg["nonce"] = pkt.nonce;
+        msg["ticket"] = pkt.ticket;
+        redis.publish(RedisKeys.events(ownerId.toString()), msg.toString());
+    }
+
+    private void pruneFiberProbes(long now) {
+        string[] stale;
+        foreach (nonce, p; fiberProbesSent)
+            if (now - p.sentAtMs > FIBERMLS_FRESH_MS) stale ~= nonce;
+        foreach (nonce; stale) fiberProbesSent.remove(nonce);
+    }
+
+    /// A raw line carrying the reserved CTCP command anywhere.
+    private static bool carriesFiberMls(string line) @safe pure nothrow {
+        foreach (i, c; line)
+            if (c == CTCP_DELIM && isReservedFiberMls(line[i .. $])) return true;
+        return false;
+    }
+
+    /// Queues a client's exact `PRIVMSG <nick> :<FIBERMLS 1 QUERY …>` for
+    /// paced sending; a nonce already queued or sent coalesces. Every other
+    /// line carrying the reserved command — an ID reply (only this engine
+    /// answers), tags, a channel/STATUSMSG/self/multi target, a malformed or
+    /// oversized packet (never split) — and a 65th pending probe is
+    /// dropped. False when dropped.
+    private bool queueFiberProbe(string line) {
+        import std.uni : icmp;
+        if (line.length < 8 || icmp(line[0 .. 8], "PRIVMSG ") != 0) return false;
+        const rest = line[8 .. $];
+        const sep = rest.indexOf(" :");
+        if (sep <= 0) return false;
+        const target = rest[0 .. sep];
+        const text = rest[sep + 2 .. $];
+        if (target.indexOf(' ') >= 0 || target.indexOf(',') >= 0) return false;
+        const types = channelTypes();
+        if (types.indexOf(target[0]) >= 0 || stripNickPrefix(target) != target || isOwnNick(target))
+            return false;
+        auto pkt = parseFiberMls(text, linePayloadBudget(target, "PRIVMSG"), types);
+        if (pkt.kind != FiberMlsKind.query) return false;
+        if ((pkt.nonce in fiberProbesSent) !is null) return true;
+        foreach (q; fiberProbeQueue) if (q.nonce == pkt.nonce) return true;
+        if (fiberProbeQueue.length >= FIBERMLS_MAX_PENDING) return false;
+        fiberProbeQueue ~= FiberProbe(target, pkt.nonce, "PRIVMSG " ~ target ~ " :" ~ text);
+        return true;
+    }
+
+    /// Writes the next queued probe once its 1 s slot opens, our prefix is
+    /// verified and fewer than FIBERMLS_MAX_PENDING sent probes await
+    /// replies, then publishes `mls_peer_sent` so the browser's deadline
+    /// starts at the real write rather than while queued.
+    private void drainFiberProbes() {
+        if (fiberProbeQueue.length == 0) return;
+        if (state != ConnectionState.connected || detachedForHotSwap || isShutdownRequested) return;
+        if (ownPrefix.length == 0) { requestSelfWho(); return; }
+        const now = unixMsNow();
+        if (now < fiberProbeNotBeforeMs) return;
+        pruneFiberProbes(now);
+        if (fiberProbesSent.length >= FIBERMLS_MAX_PENDING) return;
+        const probe = fiberProbeQueue[0];
+        fiberProbeQueue = fiberProbeQueue[1 .. $];
+        fiberProbeNotBeforeMs = now + FIBERMLS_PROBE_INTERVAL_MS;
+        writeRaw(probe.line);
+        fiberProbesSent[probe.nonce] = SentFiberProbe(probe.target, now);
+        if (redis is null || ownerId == UUID.init) return;
+        auto msg = Json.emptyObject;
+        msg["type"] = "mls_peer_sent";
+        msg["networkId"] = config.id.toString();
+        msg["nonce"] = probe.nonce;
+        redis.publish(RedisKeys.events(ownerId.toString()), msg.toString());
+    }
+
     // ── CTCP dispatch ─────────────────────────────────────────────────────────
 
     /// Claims the global CTCP auto-reply slot: at most one reply per
@@ -10732,6 +11053,13 @@ private void processEvents() {
     /// Sends a raw IRC line. `fromClient` marks a line a client typed or
     /// sent (the `raw` command), whose WHO replies are published to it.
     void sendRaw(string line, bool fromClient = false) {
+        // Reserved FIBERMLS control never takes the generic paths below
+        // (outbound queue across reconnects, optimistic bookkeeping): only a
+        // well-formed private QUERY leaves, through its own paced queue.
+        if (carriesFiberMls(line)) {
+            if (queueFiberProbe(line)) drainFiberProbes();
+            return;
+        }
         // Track own away status
         if (line == "AWAY" || line == "away") {
             isAway = false;
