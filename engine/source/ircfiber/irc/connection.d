@@ -11499,7 +11499,10 @@ unittest {
         c.performRegistration();
         const roster = c.getChannelUsers().get("#autojoin", null);
         assert(roster.length == 3, "registration must consume the whole NAMES burst");
-        assert(roster.canFind("@me") && roster.canFind("alice") && roster.canFind("+bob"),
+        // Our own entry may carry the JOIN echo's `!u@h` (kept across the
+        // bare NAMES burst for peer identity checks); status still `@`.
+        assert(roster.canFind!(e => nickPrefix(e) == "@" && stripNickPrefix(e) == "me")
+            && roster.canFind("alice") && roster.canFind("+bob"),
             "self, ordinary and voiced members survive registration");
     }
 }
