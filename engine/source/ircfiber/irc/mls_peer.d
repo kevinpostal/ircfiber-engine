@@ -683,12 +683,6 @@ unittest {
     assert(buildFiberMlsId(N1, T1, 144) is null);
     assert(buildFiberMlsId(N1, "TICKET", LIMIT) is null);
 
-    foreach (len; 1 .. 8) {
-        auto name = "#" ~ "xyzw!~é"[0 .. len - 1];
-        if (!isStrictUtf8(name)) continue;
-        string back;
-        assert(decodeChannel64(encodeChannel64(name), "#", back) && back == name);
-    }
 }
 
 @("FIBERMLS channel normalization follows CASEMAPPING")

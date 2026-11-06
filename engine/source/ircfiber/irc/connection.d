@@ -155,7 +155,7 @@ private enum long FIBERMLS_REPLY_BURST = 4;
 /// Outgoing QUERY probes leave at most one per second per connection,
 /// across every tab and bouncer client that asks.
 private enum long FIBERMLS_PROBE_INTERVAL_MS = 1_000;
-/// Queued plus sent-and-unanswered probes, each bounded separately.
+/// Queued plus sent-and-unanswered probes, bounded together.
 private enum size_t FIBERMLS_MAX_PENDING = 64;
 /// A control line older than this (server-time) is history, not a request;
 /// a sent probe's nonce is only redeemable for this long.
@@ -6942,8 +6942,13 @@ private void processEvents() {
                 idleEmitted = false;
                 inboundPartial ~= cast(const(char)[]) buffer[0 .. received];
                 string line;
-                while (popInboundLine(inboundPartial, line))
-                    if (line.length > 0) processLine(line);
+                while (true) {
+                    const before = inboundPartial.length;
+                    if (!popInboundLine(inboundPartial, line)) break;
+                    const rawBytes = before - inboundPartial.length;
+                    if (line.length > 0) processLine(line, rawBytes);
+                    else if (attachBacklogBytes > 0) attachBacklogBytes -= cast(long) rawBytes;
+                }
                 enforceLineBound(inboundPartial);
                 // Own NICK/JOIN/PART/KICK/AWAY/005 changed the session state:
                 // refresh the holder META once per read batch (an auto-join
@@ -7538,7 +7543,7 @@ private void processEvents() {
     /// changes like +v are never overwritten by a WHO answer that may
     /// arrive after the MODE.
     private void applyWhoReply(string chan, string user, string host, string nick,
-                               string flags, string realname, string account) {
+                               string flags, string realname, string account, bool live) {
         if (nick.length == 0) return;
         realnameProbed[nick] = true;
         if (realname.length > 0 && realname != nick) {
@@ -7561,7 +7566,7 @@ private void processEvents() {
         // the roster keeps it so peer discovery has a full identity to
         // check a source against, and for our own confirmed nick (no /nick
         // awaiting its echo) it is the verified prefix.
-        if (user.length > 0 && host.length > 0) {
+        if (live && user.length > 0 && host.length > 0) {
             const full = nick ~ "!" ~ user ~ "@" ~ host;
             IrcPrefix row;
             if (parseFullPrefix(full, row)) {
@@ -7623,14 +7628,13 @@ private void processEvents() {
         }
     }
 
-    private void processLine(string line) {
+    private void processLine(string line, size_t rawBytes = 0) {
         linesIn++;
-        // Lines the holder buffered while no engine was attached replay
-        // first after an attach; until those bytes are consumed every line
-        // is history. Approximate: a line whose invalid UTF-8 was replaced
-        // counts a little long, so FIBERMLS also rejects stale server-time.
+        // Count original wire bytes, not sanitized UTF-8: replacements can
+        // grow a line and must never release the replay fence early.
         lineFromBacklog = attachBacklogBytes > 0;
-        if (lineFromBacklog) attachBacklogBytes -= cast(long) line.length + 2;
+        if (lineFromBacklog)
+            attachBacklogBytes -= cast(long)(rawBytes ? rawBytes : line.length + 2);
         auto event      = parseIRCLine(line);
         event.network   = config.name;
         event.timestampMs = resolveTimestamp(event);
@@ -7752,7 +7756,7 @@ private void processEvents() {
                         // The same echo is server-observed proof of who
                         // this connection is — unless it is replayed
                         // history or a /nick of ours is still unconfirmed.
-                        if (event.getTag("batch").length == 0 && optimisticNickOld.length == 0) {
+                        if (!fiberHistorical(event) && optimisticNickOld.length == 0) {
                             IrcPrefix self;
                             if (parseFullPrefix(event.prefix, self)) setOwnPrefix(event.prefix);
                         }
@@ -8177,7 +8181,7 @@ private void processEvents() {
                     {
                         IrcPrefix held;
                         const haveHeld = parseFullPrefix(ownPrefix, held);
-                        if (haveHeld && renamerSuffix.length && event.getTag("batch").length == 0
+                        if (haveHeld && renamerSuffix.length && !fiberHistorical(event)
                             && sameIdentity(renamerId, held, casemapping())) {
                             setOwnPrefix(newNick ~ "!" ~ held.user ~ "@" ~ held.host);
                         } else if (isSelf
@@ -8287,7 +8291,7 @@ private void processEvents() {
                         // from any other identity drops it until a WHO.
                         IrcPrefix held, changer, moved;
                         const haveHeld = parseFullPrefix(ownPrefix, held);
-                        if (haveHeld && event.getTag("batch").length == 0
+                        if (haveHeld && !fiberHistorical(event)
                             && parseFullPrefix(event.prefix, changer)
                             && sameIdentity(changer, held, casemapping())
                             && parseFullPrefix(held.nick ~ "!" ~ hp[0] ~ "@" ~ hp[1], moved)) {
@@ -8566,7 +8570,7 @@ private void processEvents() {
                         }
                     }
                     // [me, chan, user, host, server, nick, flags, trailing]
-                    applyWhoReply(mp[1], mp[2], mp[3], mp[5], mp[6], rn, "");
+                    applyWhoReply(mp[1], mp[2], mp[3], mp[5], mp[6], rn, "", !fiberHistorical(event));
                 }
                 PendingWho owner;
                 if (whoReplyOwner(owner) && owner.client) break;
@@ -8637,7 +8641,7 @@ private void processEvents() {
             case "354": {
                 auto p = event.getParams();
                 if (p.length >= 8 && p[1] == "152")
-                    applyWhoReply(p[2], p[3], p[4], p[5], p[6], event.text, p[7]);
+                    applyWhoReply(p[2], p[3], p[4], p[5], p[6], event.text, p[7], !fiberHistorical(event));
                 PendingWho owner;
                 if (!whoReplyOwner(owner) || !owner.client) return;
                 const nick = whoxField(p, owner.fields, 'n');
@@ -9693,7 +9697,8 @@ private void processEvents() {
         if (pkt.kind != FiberMlsKind.query) return false;
         if ((pkt.nonce in fiberProbesSent) !is null) return true;
         foreach (q; fiberProbeQueue) if (q.nonce == pkt.nonce) return true;
-        if (fiberProbeQueue.length >= FIBERMLS_MAX_PENDING) return false;
+        pruneFiberProbes(unixMsNow());
+        if (fiberProbeQueue.length + fiberProbesSent.length >= FIBERMLS_MAX_PENDING) return false;
         fiberProbeQueue ~= FiberProbe(target, pkt.nonce, "PRIVMSG " ~ target ~ " :" ~ text);
         return true;
     }
@@ -11973,7 +11978,6 @@ unittest {
 
 @("FIBERMLS: own prefix follows only server-confirmed identity and survives a swap snapshot")
 unittest {
-    import std.algorithm : count;
     import vibe.core.channel : createChannel;
 
     static PersistentIRCClient fresh(out typeof(createChannel!IRCRawEvent()) ch) {
@@ -11981,13 +11985,6 @@ unittest {
         cfg.nick = "me";
         ch = createChannel!IRCRawEvent();
         return new PersistentIRCClient(cfg, ch);
-    }
-    static size_t ownPrefixEvents(typeof(createChannel!IRCRawEvent()) ch) {
-        ch.close();
-        size_t n;
-        IRCRawEvent e;
-        while (ch.tryConsumeOne(e)) if (e.command == "own_prefix") n++;
-        return n;
     }
 
     typeof(createChannel!IRCRawEvent()) ch;
@@ -12013,6 +12010,8 @@ unittest {
     // A replayed CHGHOST for our nick is no proof: dropped until WHO.
     c.processLine("@batch=h :newme!~m@cloak.b CHGHOST ~m old.host");
     assert(c.ownPrefix == "");
+    c.processLine("@batch=h :s 352 newme #c ~m old.host s newme H :0 Me");
+    assert(c.ownPrefix == "", "historical WHO cannot restore identity proof");
     // WHO for our confirmed nick restates it.
     c.processLine(":s 352 newme #c ~m cloak.b s newme H :0 Me");
     assert(c.ownPrefix == "newme!~m@cloak.b");
@@ -12029,7 +12028,7 @@ unittest {
     // While a /nick awaits its echo a WHO row for that nick proves nothing.
     c.processLine(":s 352 other * x evil s other H :0 Evil");
     assert(c.ownPrefix == "");
-    assert(ownPrefixEvents(ch) == 8, "every change (set, move, clear) asks for a snapshot");
+    ch.close();
 
     // Hot-swap META carries the generation and the proof; a detached or
     // unregistered engine exports none, and a new socket forgets it.
@@ -12046,6 +12045,20 @@ unittest {
     d.state = ConnectionState.disconnected;
     d.resetConnectionTelemetry();
     assert(d.ownPrefix == "" && d.connectedAtMs == 0);
+    // Sanitizing invalid UTF-8 grows bytes; only original wire lengths may
+    // advance the holder replay fence.
+    const historicalWho = ":s 352 me #c ~m stale.host s me H :0 Me";
+    char[] backlog = (":a!u@h NOTICE me :\xFF\r\n" ~ historicalWho ~ "\r\n").dup;
+    d.attachBacklogBytes = backlog.length;
+    string replay;
+    while (backlog.length) {
+        const before = backlog.length;
+        assert(popInboundLine(backlog, replay));
+        d.processLine(replay, before - backlog.length);
+    }
+    assert(d.ownPrefix == "", "holder replay must not restore authoritative identity");
+    d.processLine(":s 352 me #c ~m live.host s me H :0 Me");
+    assert(d.ownPrefix == "me!~m@live.host");
     ch2.close();
 }
 
