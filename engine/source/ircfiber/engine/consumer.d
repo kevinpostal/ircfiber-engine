@@ -10,6 +10,9 @@ import vibe.data.json : parseJsonString, Json, deserializeJson;
 import ircfiber.engine.bootstrap : EngineContext;
 import ircfiber.redis.protocol : RedisKeys, ControlMessage, IRCCommand;
 import ircfiber.models.network : NetworkConfig, TLSMode, SASLMechanism, sanitizeIdent;
+import ircfiber.services.config : decodeStoredServicesConfig;
+import ircfiber.services.protocol : ServicesResult;
+import ircfiber.storage.redis : RedisStorage;
 import ircfiber.models.irc_event : IRCRawEvent;
 import ircfiber.logging : logJsonMap;
 import ircfiber.storage.buffer : BufferManager;
@@ -478,8 +481,285 @@ private void handleNetworkCommand(ref EngineContext ctx, string networkId, IRCCo
             // push it upstream (no-op without the cap).
             ctx.connManager.sendMarkRead(nid, cmd.target, cmd.timestampMs);
             break;
+        case "services":
+            handleServicesCommand(ctx, networkId, cmd, false);
+            break;
+        case "services_manual":
+            handleServicesCommand(ctx, networkId, cmd, true);
+            break;
         default:
             logWarn("Unknown network command: %s", cmd.cmd);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Actual-user services requests
+// ─────────────────────────────────────────────────────────────────────────
+//
+// The command list carries routing metadata only: `label` = request id,
+// `userId` = the gateway's authenticated owner, `timestampMs` = issue time,
+// `text` = a `ServicesPayloadReference`. The request itself (credentials,
+// memo text, broadcast text) waits in an owner/network-scoped single-use key
+// (EX 15) that is fetched and deleted atomically here, so an absent, stale
+// or already-consumed payload can never execute. Results go to a scoped
+// reply list (one entry, EX 60) that only the originating gateway fiber
+// reads; nothing is published on the owner's event stream. Nothing here
+// logs payloads or results.
+
+/// GET+DEL in one step; '' (never a valid payload) when absent.
+private enum SERVICES_PAYLOAD_TAKE_LUA =
+    "local v = redis.call('GET', KEYS[1]) "
+    ~ "if v then redis.call('DEL', KEYS[1]) return v end "
+    ~ "return ''";
+
+/// Writes the reply only while this engine still holds the network
+/// (KEYS[1] assignments hash, ARGV[1] network, ARGV[2] server), keeps the
+/// first result only, and expires the list.
+private enum SERVICES_REPLY_LUA =
+    "if redis.call('HGET', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end "
+    ~ "redis.call('RPUSH', KEYS[2], ARGV[3]) "
+    ~ "redis.call('LTRIM', KEYS[2], 0, 0) "
+    ~ "redis.call('EXPIRE', KEYS[2], tonumber(ARGV[4])) "
+    ~ "return 1";
+
+/// Clock skew tolerated for a gateway timestamp from the future.
+private enum long SERVICES_FUTURE_SKEW_MS = 5_000;
+
+/// Why a routed services command must not run, or "" to proceed. `owner`
+/// is the engine's own record of the network owner — never the command's.
+string servicesCommandRejection(string owner, string cmdUserId, long issuedMs, long nowMs) @safe pure nothrow {
+    import ircfiber.services.protocol : ServicesKeys;
+    if (!owner.length) return "network_unowned";
+    if (cmdUserId != owner) return "owner_mismatch";
+    if (issuedMs <= 0 || nowMs - issuedMs > ServicesKeys.payloadTTLSeconds * 1000L
+            || issuedMs - nowMs > SERVICES_FUTURE_SKEW_MS)
+        return "request_expired";
+    return "";
+}
+
+/// Bound private replies. Optional raw details yield to the canonical view;
+/// dropping required data/capabilities makes a confirmed result uncertain.
+string boundedServicesReply(ServicesResult r) {
+    import ircfiber.services.protocol : ServicesKeys, ServiceStatus;
+    auto text = r.toJson().toString();
+    if (text.length <= ServicesKeys.maxReplyBytes) return text;
+    r.details = null;
+    text = r.toJson().toString();
+    if (text.length <= ServicesKeys.maxReplyBytes) return text;
+    r.data = Json.undefined;
+    r.capabilities = Json.undefined;
+    if (r.status == ServiceStatus.confirmed) r.status = ServiceStatus.unconfirmed;
+    r.reasonCode = "result_too_large";
+    return r.toJson().toString();
+}
+
+@("services reply bounds preserve canonical state before optional details") unittest {
+    import std.array : replicate;
+    import ircfiber.services.protocol : ServiceAction, ServiceStatus, ServicesKeys;
+    ServicesResult result;
+    result.action = ServiceAction.channelAccessList;
+    result.status = ServiceStatus.confirmed;
+    result.data = Json(["kind": Json("channelAccess"), "channel": Json("#c")]);
+    result.details = ["x".replicate(ServicesKeys.maxReplyBytes)];
+    auto bounded = parseJsonString(boundedServicesReply(result));
+    assert(bounded["status"].get!string == "confirmed");
+    assert(bounded["data"]["channel"].get!string == "#c");
+    assert(bounded["details"].type == Json.Type.undefined);
+    result.data["oversized"] = Json("x".replicate(ServicesKeys.maxReplyBytes));
+    bounded = parseJsonString(boundedServicesReply(result));
+    assert(bounded["status"].get!string == "unconfirmed");
+    assert(bounded["reasonCode"].get!string == "result_too_large");
+    assert(bounded["data"].type == Json.Type.undefined);
+}
+
+private bool canonicalUuid(string s) nothrow {
+    import ircfiber.services.protocol : requireUUID;
+    try {
+        requireUUID(s);
+        return true;
+    } catch (Exception) {
+        return false;
+    }
+}
+
+private void handleServicesCommand(ref EngineContext ctx, string networkId, IRCCommand cmd, bool manual) {
+    import ircfiber.services.protocol : ServicesKeys, ServicesPayloadReference, ServicesRequest,
+        ServicesManualPayload, ServiceAction, ServiceStatus;
+
+    const nid = parseUUID(networkId);
+    const requestId = cmd.label;
+    const serverId = ctx.localServer.serverId;
+    auto redis = ctx.redis;
+    void note(string level, string message, string reason) {
+        logJsonMap(level, "services", message,
+            ["networkId": networkId, "requestId": canonicalUuid(requestId) ? requestId : "",
+             "manual": manual ? "true" : "false", "reason": reason, "event": "services_request"]);
+    }
+    if (!canonicalUuid(requestId) || !canonicalUuid(networkId)) {
+        note("warn", "Services command without a canonical request id dropped", "invalid_identifier");
+        return;
+    }
+
+    // The action named by a payload this handler consumed, so a rejection
+    // still answers with the action the gateway is waiting for.
+    auto action = ServiceAction.discover;
+    void learnAction(string raw) {
+        try {
+            auto j = parseJsonString(raw);
+            if (j["action"].type == Json.Type.string) action = j["action"].get!string.to!ServiceAction;
+        } catch (Exception) {}
+    }
+    // Answers a typed request under the given owner scope (the gateway
+    // fiber waiting there); manual lines have no reply channel.
+    void answer(string scopeOwner, ServiceStatus status, string reason) {
+        if (manual || !canonicalUuid(scopeOwner)) return;
+        ServicesResult r;
+        r.network = networkId;
+        r.requestId = requestId;
+        r.action = action;
+        r.status = status;
+        r.reasonCode = reason;
+        writeServicesReply(redis, serverId, scopeOwner, networkId, r);
+    }
+    // A rejected request's payload is consumed too: it must never run later.
+    void burnPayload(string scopeOwner) {
+        if (!canonicalUuid(scopeOwner)) return;
+        try {
+            auto reply = redis.getDb().eval!string(SERVICES_PAYLOAD_TAKE_LUA,
+                [ServicesKeys.payload(scopeOwner, networkId, requestId)]);
+            if (!reply.empty) learnAction(reply.front);
+        } catch (Exception) {}
+    }
+
+    const owner = ctx.connManager.getOwnerId(nid);
+    const now = (Clock.currStdTime - 621_355_968_000_000_000L) / 10_000;
+    const rejection = servicesCommandRejection(owner, cmd.userId, cmd.timestampMs, now);
+    if (rejection.length) {
+        note("warn", "Services command rejected", rejection);
+        burnPayload(cmd.userId);
+        answer(cmd.userId, rejection == "request_expired" ? ServiceStatus.stale : ServiceStatus.unavailable,
+            rejection);
+        return;
+    }
+
+    ServicesPayloadReference reference;
+    try reference = ServicesPayloadReference.fromJson(parseJsonString(cmd.text), owner, networkId);
+    catch (Exception) {
+        note("warn", "Services command with an invalid payload reference", "invalid_reference");
+        burnPayload(owner);
+        answer(owner, ServiceStatus.unavailable, "invalid_reference");
+        return;
+    }
+    if (reference.requestId != requestId) {
+        note("warn", "Services reference names another request", "invalid_reference");
+        burnPayload(owner);
+        answer(owner, ServiceStatus.unavailable, "invalid_reference");
+        return;
+    }
+    // Only the engine the network is assigned to may consume or answer.
+    try {
+        if (redis.getDb().hget!string(RedisKeys.networkAssignments(), networkId) != serverId) {
+            note("info", "Services command for a network assigned elsewhere ignored", "not_assigned");
+            return;
+        }
+    } catch (Exception) {
+        note("warn", "Services assignment check failed", "redis_error");
+        answer(owner, ServiceStatus.unavailable, "engine_unavailable");
+        return;
+    }
+
+    string raw;
+    try {
+        auto reply = redis.getDb().eval!string(SERVICES_PAYLOAD_TAKE_LUA, [reference.payloadKey]);
+        raw = reply.empty ? "" : reply.front;
+    }
+    catch (Exception) {
+        note("warn", "Services payload fetch failed", "redis_error");
+        answer(owner, ServiceStatus.unavailable, "engine_unavailable");
+        return;
+    }
+    if (!raw.length) {
+        note("info", "Services payload absent, expired or already consumed", "payload_unavailable");
+        answer(owner, ServiceStatus.stale, "payload_unavailable");
+        return;
+    }
+    if (raw.length > ServicesKeys.maxPayloadBytes) {
+        note("warn", "Services payload over the size bound", "payload_invalid");
+        answer(owner, ServiceStatus.unavailable, "payload_invalid");
+        return;
+    }
+    learnAction(raw);
+
+    auto client = ctx.connManager.getClient(nid);
+    if (manual) {
+        ServicesManualPayload p;
+        try p = ServicesManualPayload.fromJson(parseJsonString(raw));
+        catch (Exception) {
+            note("warn", "Manual services payload invalid", "payload_invalid");
+            return;
+        }
+        if (p.requestId != requestId) {
+            note("warn", "Manual services payload names another request", "payload_invalid");
+            return;
+        }
+        if (client is null) {
+            note("info", "Manual services line for a network without a client dropped", "offline");
+            return;
+        }
+        client.sendManualService(p);
+        return;
+    }
+
+    ServicesRequest request;
+    try request = ServicesRequest.fromJson(parseJsonString(raw));
+    catch (Exception) {
+        note("warn", "Services request payload invalid", "invalid_request");
+        answer(owner, ServiceStatus.unavailable, "invalid_request");
+        return;
+    }
+    if (request.requestId != requestId) {
+        note("warn", "Services payload names another request", "invalid_request");
+        answer(owner, ServiceStatus.unavailable, "invalid_request");
+        return;
+    }
+    if (client is null) {
+        ServicesResult r;
+        r.network = networkId;
+        r.requestId = requestId;
+        r.action = request.action;
+        r.status = ServiceStatus.unavailable;
+        r.reasonCode = "offline";
+        writeServicesReply(redis, serverId, owner, networkId, r);
+        return;
+    }
+    const ownerScope = owner;
+    client.executeServices(request, (ServicesResult r) {
+        r.network = networkId;
+        // The connection may call back from its read fiber: never block it
+        // on Redis.
+        runTask(() nothrow {
+            try writeServicesReply(redis, serverId, ownerScope, networkId, r);
+            catch (Exception) {}
+        });
+    }, cmd.timestampMs); // every bound counts from the gateway's issue time
+}
+
+/// Fenced, bounded, expiring reply write. Never throws.
+private void writeServicesReply(RedisStorage redis, string serverId, string owner, string networkId,
+        ServicesResult r) nothrow {
+    import ircfiber.services.protocol : ServicesKeys;
+    try {
+        const key = ServicesKeys.reply(owner, networkId, r.requestId);
+        auto reply = redis.getDb().eval!long(SERVICES_REPLY_LUA, [RedisKeys.networkAssignments(), key],
+            networkId, serverId, boundedServicesReply(r), ServicesKeys.replyTTLSeconds.to!string);
+        const written = reply.empty ? 0 : reply.front;
+        if (written != 1)
+            logJsonMap("info", "services", "Services reply not written: network no longer assigned here",
+                ["networkId": networkId, "requestId": r.requestId, "event": "services_reply_unassigned"]);
+    } catch (Exception e) {
+        try logJsonMap("warn", "services", "Services reply write failed",
+            ["networkId": networkId, "requestId": r.requestId, "event": "services_reply_fail"]);
+        catch (Exception) {}
     }
 }
 
@@ -532,5 +812,8 @@ private NetworkConfig parseNetworkConfig(Json j) {
     if (j["disabled"].type == Json.Type.bool_) cfg.disabled = j["disabled"].get!bool;
     if (j["servicesProvisioningPending"].type == Json.Type.bool_)
         cfg.servicesProvisioningPending = j["servicesProvisioningPending"].get!bool;
+    string servicesError;
+    cfg.services = decodeStoredServicesConfig(j["services"], servicesError);
+    if (servicesError.length) logWarn("Invalid services config in engine control; trust cleared");
     return cfg;
 }

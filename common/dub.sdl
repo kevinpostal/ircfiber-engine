@@ -53,3 +53,14 @@ configuration "egress-admission-redis-test" {
     mainSourceFile "tests/egress_admission_redis_test.d"
     versions "VibeUseFibers" "EgressAdmissionRedisTest"
 }
+
+configuration "services-protocol-test" {
+    targetType "executable"
+    targetName "services-protocol-test"
+    sourcePaths "source/ircfiber/services"
+    sourceFiles "source/ircfiber/models/network.d" "source/ircfiber/redis/protocol.d"
+    importPaths "source" "tests"
+    mainSourceFile "tests/services_protocol_test.d"
+    versions "VibeUseFibers" "ServicesProtocolTest"
+    buildOptions "unittests"
+}

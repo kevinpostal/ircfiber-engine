@@ -93,6 +93,8 @@ COPY backend/dub.sdl backend/dub.selections.json ./backend/
 COPY engine/dub.sdl engine/dub.selections.json ./engine/
 COPY engine/source/ ./engine/source/
 COPY engine/holder/ ./engine/holder/
+# String-imported Anope message catalogs (services_grammar.d) + attribution.
+COPY engine/catalogs/ ./engine/catalogs/
 
 RUN --mount=type=cache,target=/build/.dub,sharing=locked \
     --mount=type=cache,target=/root/.dub,sharing=locked \
@@ -139,6 +141,13 @@ COPY --from=tailscale/tailscale:stable /usr/local/bin/tailscale /usr/local/bin/t
 
 COPY --from=builder-engine /build/irc-fiber-engine      /app/irc-fiber-engine
 COPY --from=builder-engine /build/janitor-migrate       /app/janitor-migrate
+# Keep the independently licensed catalog sources and notices with the
+# binary that embeds their compiled translations.
+COPY --from=builder-engine /build/engine/catalogs/anope/SOURCE.txt /usr/share/ircfiber/anope-catalogs/SOURCE.txt
+COPY --from=builder-engine /build/engine/catalogs/anope/2.1/source/ /usr/share/ircfiber/anope-catalogs/2.1/source/
+COPY --from=builder-engine /build/engine/catalogs/anope/2.1/LICENSE.txt /usr/share/ircfiber/anope-catalogs/2.1/LICENSE.txt
+COPY --from=builder-engine /build/engine/catalogs/anope/2.0.20/source/ /usr/share/ircfiber/anope-catalogs/2.0.20/source/
+COPY --from=builder-engine /build/engine/catalogs/anope/2.0.20/COPYING /usr/share/ircfiber/anope-catalogs/2.0.20/COPYING
 COPY config/ ./config/
 
 # Data dirs (engine needs no public/views).

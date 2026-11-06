@@ -141,6 +141,20 @@ struct SessionSnapshot {
     /// confirmed NICK, CHGHOST); "" when unverified. Restored only together
     /// with a matching `connectedAtMs` on a graceful attach.
     string ownPrefix;
+    /// Server-stated own services login (`unknown`/`none`/`account`) and
+    /// account name; "" / unknown in a META from an older engine. Restored
+    /// under the same graceful same-generation rule as `ownPrefix`. The
+    /// connection epoch is deliberately absent: every attach mints a new one.
+    string servicesAccountState;
+    /// Observed account; "" unless `servicesAccountState == "account"`.
+    string servicesAccount;
+    /// Non-secret services marker: `nick!user@host` of each pseudoclient an
+    /// in-flight services transaction was talking to, and the unix-ms
+    /// deadline until which an attaching engine treats backlog lines from
+    /// them as that transaction's private replies (never persisted). No
+    /// fence tokens, commands, credentials or reply text.
+    string[] servicesQuietPrefixes;
+    long servicesQuietUntilMs;
 
     // ── Egress bookkeeping (Mullvad slot the session rides) ──────────
     /// Slot label ("" = direct).
@@ -185,6 +199,10 @@ Json toJSON(ref SessionSnapshot s) {
     j["usersDropped"] = s.usersDropped;
     j["connectedAtMs"] = s.connectedAtMs;
     j["ownPrefix"] = s.ownPrefix;
+    j["servicesAccountState"] = s.servicesAccountState;
+    j["servicesAccount"] = s.servicesAccount;
+    j["servicesQuietPrefixes"] = jsonArrayOf(s.servicesQuietPrefixes);
+    j["servicesQuietUntilMs"] = s.servicesQuietUntilMs;
 
     auto cfg = Json.emptyObject;
     cfg["id"] = s.config.id.toString();
@@ -329,6 +347,11 @@ SessionSnapshot fromJSON(Json j) {
     s.usersDropped = boolean(j["usersDropped"]);
     s.connectedAtMs = integer(j["connectedAtMs"]);
     s.ownPrefix = str(j["ownPrefix"]);
+    s.servicesAccountState = str(j["servicesAccountState"]);
+    s.servicesAccount = str(j["servicesAccount"]);
+    if (isArr(j["servicesQuietPrefixes"]))
+        foreach (v; j["servicesQuietPrefixes"]) s.servicesQuietPrefixes ~= str(v);
+    s.servicesQuietUntilMs = integer(j["servicesQuietUntilMs"]);
 
     auto cfg = j["config"];
     if (isObj(cfg)) {
@@ -440,12 +463,29 @@ unittest {
     auto proof = fromJSON(toJSON(s));
     assert(proof.connectedAtMs == 1_700_000_000_123);
     assert(proof.ownPrefix == "Zodiac!~z@fiber.example");
+    // The observed services login rides along; no epoch is carried.
+    s.servicesAccountState = "account";
+    s.servicesAccount = "zodiac";
+    auto login = fromJSON(toJSON(s));
+    assert(login.servicesAccountState == "account" && login.servicesAccount == "zodiac");
+    auto loginJson = toJSON(s);
+    assert(loginJson["connectionEpoch"].type == Json.Type.undefined);
     // A META from an older engine has neither: unknown, never invented.
     auto legacy = toJSON(s);
     legacy.remove("connectedAtMs");
     legacy.remove("ownPrefix");
+    legacy.remove("servicesAccountState");
+    legacy.remove("servicesAccount");
     auto old = fromJSON(legacy);
     assert(old.connectedAtMs == 0 && old.ownPrefix == "");
+    assert(old.servicesAccountState == "" && old.servicesAccount == "");
+    assert(old.servicesQuietPrefixes.length == 0 && old.servicesQuietUntilMs == 0);
+    // The services marker carries prefixes and a deadline, nothing else.
+    s.servicesQuietPrefixes = ["NickServ!services@services.example"];
+    s.servicesQuietUntilMs = 1_700_000_030_000;
+    auto quiet = fromJSON(toJSON(s));
+    assert(quiet.servicesQuietPrefixes == ["NickServ!services@services.example"]
+        && quiet.servicesQuietUntilMs == 1_700_000_030_000);
 
     auto bad = Json.emptyObject;
     bad["schemaTag"] = "IRCFv0";

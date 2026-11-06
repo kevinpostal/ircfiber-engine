@@ -38,6 +38,10 @@ import ircfiber.irc.pacer;
 import ircfiber.irc.reconnect;
 import ircfiber.irc.route_memory;
 import ircfiber.engine.session_snapshot;
+import ircfiber.irc.services;
+import ircfiber.irc.services_identity;
+import ircfiber.irc.services_channel;
+import ircfiber.engine.consumer;
 
 private uint g_passed;
 private uint g_failed;
@@ -73,7 +77,11 @@ int main() {
         ircfiber.irc.reconnect,
         ircfiber.irc.route_memory,
         ircfiber.irc.chathistory,
-        ircfiber.engine.session_snapshot
+        ircfiber.engine.session_snapshot,
+        ircfiber.irc.services,
+        ircfiber.irc.services_identity,
+        ircfiber.irc.services_channel,
+        ircfiber.engine.consumer
     )();
     writefln("\n%d passed, %d failed", g_passed, g_failed);
     exit(g_failed == 0 ? 0 : 1);

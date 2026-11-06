@@ -112,9 +112,15 @@ void startEventProcessor(ref EngineContext ctx) {
                 // `_server`) is a live server-log diagnostic. Its raw
                 // parameters can carry PING tokens or DCC addresses, so it
                 // is deliberately never persisted anywhere.
+                //
+                // Safe identity/epoch and capability invalidations for the
+                // owner's browsers: live only, never scrollback, Mongo or
+                // the user stream.
                 const bool publishOnly = event.command == "CHANNEL_LIST"
                     || event.command == "352" || event.command == "354"
                     || event.command == "315"
+                    || event.command == "SERVICES_STATE"
+                    || event.command == "SERVICES_INVALIDATED"
                     || event.getTag("ctcp").length > 0;
 
                 // draft/channel-rename: move the channel's Redis scrollback
@@ -264,7 +270,9 @@ void startEventProcessor(ref EngineContext ctx) {
                     // this the user-facing banner can lag the engine
                     // state by up to 10s on a fast-fail network.
                     || event.command == "CONNECTION_RETRY_STATUS"
-                    || event.command == "CONNECTION_FAIL")) {
+                    || event.command == "CONNECTION_FAIL"
+                    // Observed services login / connection epoch changed.
+                    || event.command == "SERVICES_STATE")) {
                     try {
                         writeStateSnapshotForNetwork(ctx, matchedNet, serverId);
                     } catch (Exception e) {

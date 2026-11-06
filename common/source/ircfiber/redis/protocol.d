@@ -729,6 +729,26 @@ struct NetworkStateSnapshot {
     /// Server-observed nick!user@host for this registered transport generation.
     /// Empty until verified; optimistic nick changes are not identity evidence.
     string ownPrefix;
+    /// Engine-minted opaque random UUID of the live transport as interpreted
+    /// by the engine that wrote this snapshot: new at every RPL_WELCOME and
+    /// every hot-swap/crash attach of a held socket. "" when not connected.
+    /// Distinct from `connectedAtMs`, which a retained socket keeps.
+    string connectionEpoch;
+    /// Services login the IRC server stated for this connection (900/901,
+    /// live self ACCOUNT/WHOX): "unknown" | "none" | "account". Never derived
+    /// from the configured SASL username or the website account.
+    string servicesAccountState = "unknown";
+    /// Observed services account; "" unless `servicesAccountState == "account"`.
+    string servicesAccount;
+    /// Non-sensitive services availability: "unknown" (not discovered),
+    /// "unavailable", "available" or "disabled". Legacy snapshots read
+    /// "unknown"; no capability is ever implied by default.
+    string servicesAvailability = "unknown";
+
+    /// Whether the services identity fields describe a live generation.
+    bool hasLiveServicesIdentity() const @safe pure nothrow {
+        return connected && connectedAtMs > 0 && connectionEpoch.length > 0;
+    }
     /// Seconds since the last inbound byte on the live connection. 0 =
     /// unknown / not connected. Shipped on every snapshot so the UI can
     /// show a stale hint before the PONG-timeout reaper fires.
@@ -793,6 +813,17 @@ struct NetworkStateSnapshot {
         j["connectedAtMs"] = Json(connectedAtMs);
         if (connected && connectedAtMs > 0 && ownPrefix.length)
             j["ownPrefix"] = Json(ownPrefix);
+        // Services identity: epoch and account only for a live generation;
+        // otherwise the state reads unknown. Availability is always shipped.
+        if (hasLiveServicesIdentity()) {
+            j["connectionEpoch"] = Json(connectionEpoch);
+            const st = normalizedServicesAccountState(servicesAccountState, servicesAccount);
+            j["servicesAccountState"] = Json(st);
+            if (st == "account") j["servicesAccount"] = Json(servicesAccount);
+        } else {
+            j["servicesAccountState"] = Json("unknown");
+        }
+        j["servicesAvailability"] = Json(normalizedServicesAvailability(servicesAvailability));
         j["dataAgeSecs"] = Json(dataAgeSecs);
         j["pongAgeSecs"] = Json(pongAgeSecs);
         if (hasTlsInfo) j["tlsInfo"] = tlsInfo.toJson();
@@ -870,6 +901,19 @@ struct NetworkStateSnapshot {
         if (j["connectedAtMs"].type == Json.Type.int_) s.connectedAtMs = j["connectedAtMs"].get!long;
         if (s.connected && s.connectedAtMs > 0 && j["ownPrefix"].type == Json.Type.string)
             s.ownPrefix = j["ownPrefix"].get!string;
+        if (j["connectionEpoch"].type == Json.Type.string)
+            s.connectionEpoch = j["connectionEpoch"].get!string;
+        if (s.hasLiveServicesIdentity()) {
+            const acct = j["servicesAccount"].type == Json.Type.string ? j["servicesAccount"].get!string : "";
+            const st = j["servicesAccountState"].type == Json.Type.string
+                ? normalizedServicesAccountState(j["servicesAccountState"].get!string, acct) : "unknown";
+            s.servicesAccountState = st;
+            if (st == "account") s.servicesAccount = acct;
+        } else {
+            s.connectionEpoch = "";
+        }
+        if (j["servicesAvailability"].type == Json.Type.string)
+            s.servicesAvailability = normalizedServicesAvailability(j["servicesAvailability"].get!string);
         if (j["dataAgeSecs"].type == Json.Type.int_) s.dataAgeSecs = j["dataAgeSecs"].get!long;
         if (j["pongAgeSecs"].type == Json.Type.int_) s.pongAgeSecs = j["pongAgeSecs"].get!long;
         if (j["tlsInfo"].type == Json.Type.object) {
@@ -931,6 +975,82 @@ struct NetworkStateSnapshot {
         }
         return s;
     }
+}
+
+/// `state` when it is a known services account state consistent with
+/// `account` ("account" needs a name); otherwise "unknown".
+string normalizedServicesAccountState(string state, string account) @safe pure nothrow {
+    switch (state) {
+        case "none":    return "none";
+        case "account": return account.length ? "account" : "unknown";
+        default:        return "unknown";
+    }
+}
+
+/// `value` when it is a known availability; otherwise "unknown".
+string normalizedServicesAvailability(string value) @safe pure nothrow {
+    switch (value) {
+        case "unavailable": return "unavailable";
+        case "available":   return "available";
+        case "disabled":    return "disabled";
+        default:            return "unknown";
+    }
+}
+
+@("NetworkStateSnapshot services identity round-trips only for a live generation")
+unittest {
+    NetworkStateSnapshot s;
+    s.connected = true;
+    s.connectedAtMs = 1_700_000_000_000;
+    s.connectionEpoch = "0b9f6d0e-4c41-4c8e-9b8f-6d5d2b1f7a10";
+    s.servicesAccountState = "account";
+    s.servicesAccount = "zodiac";
+    s.servicesAvailability = "unavailable";
+    auto j = s.toJson();
+    assert(j["connectionEpoch"].get!string == s.connectionEpoch);
+    assert(j["servicesAccountState"].get!string == "account");
+    assert(j["servicesAccount"].get!string == "zodiac");
+    auto back = NetworkStateSnapshot.fromJson(j);
+    assert(back.connectionEpoch == s.connectionEpoch && back.servicesAccount == "zodiac"
+        && back.servicesAccountState == "account" && back.servicesAvailability == "unavailable");
+
+    // "none" carries no account name.
+    s.servicesAccountState = "none";
+    auto none = NetworkStateSnapshot.fromJson(s.toJson());
+    assert(none.servicesAccountState == "none" && none.servicesAccount == "");
+
+    // An "account" state without a name is not proof.
+    s.servicesAccountState = "account";
+    s.servicesAccount = "";
+    assert(s.toJson()["servicesAccountState"].get!string == "unknown");
+
+    // Disconnected: no epoch, no account, state unknown — whatever was set.
+    s.servicesAccount = "zodiac";
+    s.connected = false;
+    auto down = s.toJson();
+    assert(down["connectionEpoch"].type == Json.Type.undefined);
+    assert(down["servicesAccount"].type == Json.Type.undefined);
+    assert(down["servicesAccountState"].get!string == "unknown");
+    auto downBack = NetworkStateSnapshot.fromJson(down);
+    assert(downBack.connectionEpoch == "" && downBack.servicesAccount == ""
+        && downBack.servicesAccountState == "unknown");
+
+    // Legacy snapshot without the fields: unknown everywhere, no epoch.
+    auto legacy = Json.emptyObject;
+    legacy["connected"] = Json(true);
+    legacy["connectedAtMs"] = Json(1_700_000_000_000L);
+    auto old = NetworkStateSnapshot.fromJson(legacy);
+    assert(old.connectionEpoch == "" && old.servicesAccount == ""
+        && old.servicesAccountState == "unknown" && old.servicesAvailability == "unknown");
+
+    // Unrecognised values never become a state or capability.
+    auto odd = s.toJson();
+    odd["connected"] = Json(true);
+    odd["connectionEpoch"] = Json("e");
+    odd["servicesAccountState"] = Json("operator");
+    odd["servicesAvailability"] = Json("all");
+    auto oddBack = NetworkStateSnapshot.fromJson(odd);
+    assert(oddBack.servicesAccountState == "unknown" && oddBack.servicesAvailability == "unknown");
 }
 
 @("NetworkStateSnapshot lag/connectedAt/tlsInfo round-trip through JSON")

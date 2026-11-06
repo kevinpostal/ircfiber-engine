@@ -21,6 +21,7 @@ import ircfiber.engine.consumer : startControlConsumer, startCommandConsumers;
 import ircfiber.engine.processor : startEventProcessor;
 import ircfiber.engine.state : startStateSnapshotter, writeStateSnapshots;
 import ircfiber.irc.connection : startDailyReachabilityRefresh;
+import ircfiber.irc.services_registry : initializeServicesOperations;
 import ircfiber.redis.protocol : RedisKeys;
 import ircfiber.logging : logJsonMap;
 import ircfiber.term_signal : installTermSignalFlag, termSignal;
@@ -105,6 +106,7 @@ private bool setupBugsink(string svcName) {
 }
 
 void main() {
+    initializeServicesOperations();
     // Global crash handler: ensure buffered OTLP logs are shipped even if
     // the process terminates via an uncaught Throwable. vibe.d's event loop
     // normally swallows fiber exceptions, but a top-level Error (e.g.

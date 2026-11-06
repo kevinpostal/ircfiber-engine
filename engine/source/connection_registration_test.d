@@ -29,7 +29,7 @@ import ircfiber.irc.server : ConnectionServer;
 import ircfiber.irc.connection : parseJoinThrottleSeconds, remainingJoinDelayMs, joinBatches,
     memberNeedsRealname, channelNeedsRealnameWho, MAX_WHO_ENRICH_ATTEMPTS,
     upsertRosterEntry, applyNamesBurst, isSaslRequiredRefusal, extractServerReason,
-    saslMechanismOffered, fiberMlsBackstopChecks, fiberMlsWireChecks;
+    saslMechanismOffered, fiberMlsBackstopChecks, fiberMlsWireChecks, servicesIdentityWireChecks;
 import std.string : indexOf;
 
 /// Tracks the number of passing checks.
@@ -317,6 +317,14 @@ void main() {
     foreach (check; fiberMlsWireChecks(wire)) ok(check.name, check.passed);
     import std.array : replace;
     foreach (line; wire) stderr.writeln("    wire> ", line.replace("\x01", "^A"));
+
+    // ── Engine-observed services identity (Anope UI step 1) ──────────────
+    // A localhost fake ircd: the observed account comes only from server
+    // statements, every socket and every attach gets a fresh epoch.
+    stderr.writeln("\n[connection.services] observed account and connection epoch");
+    string[] servicesWire;
+    foreach (check; servicesIdentityWireChecks(servicesWire)) ok(check.name, check.passed);
+    foreach (line; servicesWire) stderr.writeln("    wire> ", line);
     stderr.writeln("\n[", passed, " passed, ", failed, " failed]");
     if (failed > 0) core.stdc.stdlib.exit(1);
 }

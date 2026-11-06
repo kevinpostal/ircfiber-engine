@@ -9,6 +9,7 @@ import vibe.data.bson;
 import vibe.data.json;
 import vibe.core.log;
 import ircfiber.models.network;
+import ircfiber.services.config : decodeStoredServicesConfig, ServicesConfig;
 import ircfiber.db.mongo;
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.redis.protocol : RedisKeys;
@@ -179,35 +180,7 @@ final class NetworkRepository {
     void save(NetworkConfig config, UUID userId) {
         auto selector = Bson(["id": Bson(config.id.toString())]);
         auto update = Bson([
-            "$set": Bson([
-                "id": Bson(config.id.toString()),
-                "userId": Bson(userId.toString()),
-                "name": Bson(config.name),
-                "host": Bson(config.host),
-                "port": Bson(config.port),
-                "tls": Bson(config.tls.to!string),
-                "sasl": Bson(config.sasl.to!string),
-                "saslUsername": Bson(config.saslUsername),
-                "saslPassword": Bson(config.saslPassword),
-                "operUsername": Bson(config.operUsername),
-                "operPassword": Bson(config.operPassword),
-                "nspass": Bson(config.nspass),
-                "serverPass": Bson(config.serverPass),
-                "commands": Bson(config.commands),
-                "autoJoinChannels": Bson(config.autoJoinChannels.map!(c => Bson(c)).array),
-                "partedChannels": Bson(config.partedChannels.map!(c => Bson(c)).array),
-                "nick": Bson(config.nick),
-                "realName": Bson(config.realName),
-                "ident": Bson(config.ident),
-                "disabled": Bson(config.disabled),
-                "systemManaged": Bson(config.systemManaged),
-                "autoJoinDelaySeconds": Bson(config.autoJoinDelaySeconds),
-                "egressNodeId": Bson(config.egressNodeId),
-                "avatarUrl": Bson(config.avatarUrl),
-                "defaultAvatarUrl": Bson(config.defaultAvatarUrl),
-                "profileMetadata": serializeToBson(config.profileMetadata),
-                "monitoredNicks": Bson(config.monitoredNicks.map!(n => Bson(n)).array)
-            ]),
+            "$set": persistedFields(config, userId),
             "$setOnInsert": Bson([
                 "servicesProvisioningPending": Bson(config.servicesProvisioningPending)
             ])
@@ -221,6 +194,52 @@ final class NetworkRepository {
             try g_redis.del(RedisKeys.userNetworks(userId.toString()));
             catch (Exception) {}
         }
+    }
+
+    /// The `$set` document `save` writes: every user/admin-editable field.
+    /// `servicesProvisioningPending` is insert-only (see `save`).
+    private static Bson persistedFields(ref NetworkConfig config, UUID userId) {
+        return Bson([
+            "id": Bson(config.id.toString()),
+            "userId": Bson(userId.toString()),
+            "name": Bson(config.name),
+            "host": Bson(config.host),
+            "port": Bson(config.port),
+            "tls": Bson(config.tls.to!string),
+            "sasl": Bson(config.sasl.to!string),
+            "saslUsername": Bson(config.saslUsername),
+            "saslPassword": Bson(config.saslPassword),
+            "operUsername": Bson(config.operUsername),
+            "operPassword": Bson(config.operPassword),
+            "nspass": Bson(config.nspass),
+            "serverPass": Bson(config.serverPass),
+            "commands": Bson(config.commands),
+            "autoJoinChannels": Bson(config.autoJoinChannels.map!(c => Bson(c)).array),
+            "partedChannels": Bson(config.partedChannels.map!(c => Bson(c)).array),
+            "nick": Bson(config.nick),
+            "realName": Bson(config.realName),
+            "ident": Bson(config.ident),
+            "disabled": Bson(config.disabled),
+            "systemManaged": Bson(config.systemManaged),
+            "autoJoinDelaySeconds": Bson(config.autoJoinDelaySeconds),
+            "egressNodeId": Bson(config.egressNodeId),
+            "avatarUrl": Bson(config.avatarUrl),
+            "defaultAvatarUrl": Bson(config.defaultAvatarUrl),
+            "profileMetadata": serializeToBson(config.profileMetadata),
+            "monitoredNicks": Bson(config.monitoredNicks.map!(n => Bson(n)).array),
+            "services": Bson.fromJson(config.services.toJson())
+        ]);
+    }
+
+    /// Decodes a stored `services` value; absent (legacy) or malformed
+    /// values give the no-trust default, malformed ones are logged.
+    private static ServicesConfig storedServices(Json j, string networkId) {
+        string error;
+        auto services = decodeStoredServicesConfig(j, error);
+        if (error.length)
+            logWarn("NetworkRepository: network %s has an invalid services config (%s); using defaults",
+                networkId, error);
+        return services;
     }
 
     /// Complete an initial signup exactly once; never create or re-arm a row.
@@ -320,12 +339,13 @@ final class NetworkRepository {
             try { cfg.defaultAvatarUrl = elem["defaultAvatarUrl"].get!string; } catch (Exception) {}
             try { cfg.profileMetadata = deserializeJson!(string[string])(elem["profileMetadata"]); } catch (Exception) {}
             try { cfg.monitoredNicks = deserializeJson!(string[])(elem["monitoredNicks"]); } catch (Exception) {}
+            cfg.services = storedServices(elem["services"], cfg.id.toString());
             result ~= cfg;
         }
         return result;
     }
 
-    private NetworkConfig docToConfig(const(Bson) doc) {
+    private static NetworkConfig docToConfig(const(Bson) doc) {
         NetworkConfig cfg;
         try { cfg.id = parseUUID(doc["id"].get!string); } catch (Exception) {}
         try { cfg.name = doc["name"].get!string; } catch (Exception) {}
@@ -358,6 +378,7 @@ final class NetworkRepository {
         try { cfg.serverPass = doc["serverPass"].get!string; } catch (Exception) {}
         try { cfg.operUsername = doc["operUsername"].get!string; } catch (Exception) {}
         try { cfg.operPassword = doc["operPassword"].get!string; } catch (Exception) {}
+        cfg.services = storedServices(doc["services"].toJson(), cfg.id.toString());
         return cfg;
     }
 }
@@ -378,4 +399,48 @@ unittest {
     NetworkRepository.NetworkWithUser missing;
     assert(!missing.isOwnedBy(owner));
     assert(!missing.isOwnedBy(UUID.init));
+}
+
+@("NetworkConfig services pins survive the Mongo document and Redis cache paths")
+unittest {
+    import ircfiber.services.config : ServiceId, ServicePin, ServicesProvider;
+    NetworkConfig cfg;
+    cfg.id = parseUUID("44444444-4444-4444-4444-444444444444");
+    cfg.name = "External";
+    cfg.host = "irc.example.net";
+    cfg.nick = "me";
+    cfg.realName = "me";
+    cfg.services.provider = ServicesProvider.anope;
+    cfg.services.server = "services.example.net";
+    cfg.services.pins[ServiceId.nickServ] = ServicePin("NS", "services", "services.example.net");
+    cfg.services.pins[ServiceId.operServ] = ServicePin("OS", "", "");
+    const owner = parseUUID("55555555-5555-5555-5555-555555555555");
+
+    // Mongo: the `$set` document read back through docToConfig.
+    auto doc = NetworkRepository.persistedFields(cfg, owner);
+    auto fromDoc = NetworkRepository.docToConfig(doc);
+    assert(fromDoc.services == cfg.services);
+    assert(fromDoc.host == cfg.host);
+
+    // Redis cache: serialize/deserialize the per-user array.
+    auto cached = NetworkRepository.deserializeNetworkConfigs(
+        parseJsonString(NetworkRepository.serializeNetworkConfigs([cfg]).toString()));
+    assert(cached.length == 1 && cached[0].services == cfg.services);
+
+    // Legacy rows/cache entries without `services`: default, nothing trusted.
+    auto legacyDoc = Bson.emptyObject;
+    legacyDoc["id"] = Bson(cfg.id.toString());
+    legacyDoc["host"] = Bson(cfg.host);
+    assert(NetworkRepository.docToConfig(legacyDoc).services.isDefault);
+    auto legacyCache = NetworkConfig.init;
+    legacyCache.id = cfg.id;
+    auto legacyJson = legacyCache.toJson();
+    legacyJson.remove("services");
+    auto arr = Json.emptyArray;
+    arr ~= legacyJson;
+    assert(NetworkRepository.deserializeNetworkConfigs(arr)[0].services.isDefault);
+
+    // A corrupted stored value fails closed to the default.
+    doc["services"] = Bson.fromJson(parseJsonString(`{"provider":"anope","managed":true}`));
+    assert(NetworkRepository.docToConfig(doc).services.isDefault);
 }

@@ -10,6 +10,9 @@ targetType "executable"
 targetName "irc-fiber-engine"
 sourcePaths "source"
 importPaths "source"
+// Anope message catalogs (GPL-2 data, see catalogs/anope/SOURCE.txt),
+// embedded by ircfiber.irc.services_grammar via string imports.
+stringImportPaths "catalogs"
 
 dependency "irc-fiber-common" path="../common" version="~>0.4.1"
 dependency "vibe-d" version="~>0.10.0"
@@ -119,8 +122,18 @@ configuration "connection-registration-test" {
     targetName "connection-registration-test"
     mainSourceFile "source/connection_registration_test.d"
     // FiberMlsWireHarness exposes connection.d's FIBERMLS outbound-discovery
-    // checks (in-memory clock + localhost fake-ircd wire capture) to main().
+    // checks (in-memory clock + localhost fake-ircd wire capture) and the
+    // services-identity checks (observed account, connection epoch) to main().
     versions "VibeUseFibers" "FiberMlsWireHarness"
+}
+
+configuration "services-test" {
+    targetType "executable"
+    targetName "services-test"
+    mainSourceFile "source/services_test.d"
+    // ServicesWireHarness exposes connection.d's localhost fake-Anope
+    // transport checks (servicesTransportWireChecks) to main().
+    versions "VibeUseFibers" "ServicesWireHarness"
 }
 
 configuration "observability-test" {

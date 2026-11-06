@@ -7,6 +7,7 @@ import std.uuid;
 import std.uni : toLower;
 import vibe.data.json;
 import std.conv;
+import ircfiber.services.config : ServicesConfig;
 /// TLS mode options
 enum TLSMode {
     /// TLS disabled
@@ -196,6 +197,12 @@ struct NetworkConfig {
     string[string] profileMetadata;
     /// Persisted MONITOR list; replayed by the engine after every reconnect.
     string[] monitoredNicks;
+    /// Services trust configuration (provider, approved services server,
+    /// per-service pins). Never holds credentials. Legacy networks decode to
+    /// the default — automatic discovery, nothing trusted. The platform
+    /// network's effective value is derived server-side
+    /// (`ircfiber.services.config.effectiveServicesConfig`), never stored.
+    ServicesConfig services;
     /// Avatar actually published: the override if set, else the default.
     string effectiveAvatarUrl() const @safe pure nothrow {
         return avatarUrl.length ? avatarUrl : defaultAvatarUrl;
@@ -229,7 +236,8 @@ struct NetworkConfig {
             "avatarUrl": Json(avatarUrl),
             "defaultAvatarUrl": Json(defaultAvatarUrl),
             "profileMetadata": serializeToJson(profileMetadata),
-            "monitoredNicks": serializeToJson(monitoredNicks)
+            "monitoredNicks": serializeToJson(monitoredNicks),
+            "services": services.toJson()
         ]);
     }
 }
@@ -315,6 +323,10 @@ unittest {
     assert(json["autoJoinDelaySeconds"].get!int == 6);
     assert(json["profileMetadata"].type == Json.Type.object);
     assert(json["monitoredNicks"].type == Json.Type.array);
+    // Legacy/new networks: automatic discovery, nothing pinned.
+    assert(json["services"]["provider"].get!string == "auto");
+    assert(json["services"]["server"].get!string == "");
+    assert(json["services"]["pins"].length == 0);
 }
 
 @("sanitizeIdent keeps ident-safe bytes and caps length")

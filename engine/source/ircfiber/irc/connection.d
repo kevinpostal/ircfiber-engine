@@ -62,6 +62,11 @@ import ircfiber.irc.mls_peer : FiberMlsKind, FiberMlsPacket, IrcPrefix, PeerTick
     DEFAULT_PREFIX_SYMBOLS, FIBERMLS_TICKET_TTL_SECS, buildFiberMlsId, canonicalNetworkKey,
     generateTicketHex, ircNamesEqual, isReservedFiberMls, matchRosterIdentity, normalizeFiberChannel,
     parseFiberMls, parseFullPrefix, parseRosterEntry, prefixSymbolsFromIsupport, sameIdentity;
+import ircfiber.irc.services : ServicesTransport, ServicesHost, ServicesActor, ServicesActorState,
+    ServicesQuietMarker;
+import ircfiber.services.config : ServicesConfig, effectiveServicesConfig;
+import ircfiber.services.privacy : sensitiveServiceLine, sensitiveServiceMessage;
+import ircfiber.services.protocol : ServicesRequest, ServicesResult, ServicesManualPayload;
 
 /// IRC connection state.
 ///
@@ -3826,6 +3831,109 @@ unittest {
                    == nicksEqualMapped(pair[0], pair[1], m));
 }
 
+/// What the server has stated about this connection's own services login.
+/// Only server statements count — 900/901 RPL_LOGGEDIN/OUT, a live self
+/// `ACCOUNT`, a live self WHOX account field — never the configured SASL
+/// username, user modes or the website account.
+enum ServicesAccountState : ubyte {
+    /// Not established for the live generation (not registered, or an
+    /// attached engine that could not prove the account it inherited).
+    unknown,
+    /// Registered with no login observed on this connection.
+    none,
+    /// Logged in as the observed account.
+    account,
+}
+
+/// Wire names of `ServicesAccountState` (NetworkStateSnapshot,
+/// SERVICES_STATE event, frontend `Network.servicesAccountState`).
+string servicesAccountStateName(ServicesAccountState s) @safe pure nothrow {
+    final switch (s) {
+        case ServicesAccountState.unknown: return "unknown";
+        case ServicesAccountState.none:    return "none";
+        case ServicesAccountState.account: return "account";
+    }
+}
+
+/// Inverse of `servicesAccountStateName`; anything else (legacy META) is unknown.
+ServicesAccountState parseServicesAccountState(string s) @safe pure nothrow {
+    switch (s) {
+        case "none":    return ServicesAccountState.none;
+        case "account": return ServicesAccountState.account;
+        default:        return ServicesAccountState.unknown;
+    }
+}
+
+@("ServicesAccountState wire names round-trip; unknown text stays unknown")
+unittest {
+    foreach (s; [ServicesAccountState.unknown, ServicesAccountState.none, ServicesAccountState.account])
+        assert(parseServicesAccountState(servicesAccountStateName(s)) == s);
+    assert(parseServicesAccountState("") == ServicesAccountState.unknown);
+    assert(parseServicesAccountState("Account") == ServicesAccountState.unknown);
+}
+
+/// The live connection as the services transport sees it. Same module as
+/// `PersistentIRCClient`, so it reads the client's state directly.
+private final class ConnectionServicesHost : ServicesHost {
+    private PersistentIRCClient c;
+
+    this(PersistentIRCClient client) { c = client; }
+
+    long nowMs() { return unixMsNow(); }
+    string liveEpoch() { return c.getConnectionEpoch(); }
+    string ownNick() { return c.sessionNick; }
+    bool isOwnNick(string nick) { return c.isOwnNick(nick); }
+    bool sameNick(string a, string b) { return c.sameNick(a, b); }
+    ServicesActor actor() { return c.servicesActor(); }
+    ServicesConfig servicesConfig() { return c.effectiveServices(); }
+    string isupport(string key) { return c.isupportMap.get(key, ""); }
+
+    size_t lineLimit() {
+        if (auto v = "LINELEN" in c.isupportMap) {
+            try {
+                const n = (*v).to!long;
+                if (n >= 64 && n <= 65_536) return cast(size_t) n;
+            } catch (Exception) {}
+        }
+        return 512;
+    }
+
+    /// `:` + `nick!user@host` + space; the IRCv3 worst case (105) when our
+    /// own prefix is not known yet.
+    size_t ownPrefixBytes() {
+        return 2 + (c.ownHostmask.length ? c.ownHostmask.length : 105);
+    }
+
+    bool manualLinePending(string serviceNick) {
+        bool addressed(string line) {
+            auto t = PersistentIRCClient.messageTargetOf(line);
+            const at = t.indexOf('@');
+            if (at >= 0) t = t[0 .. at];
+            return t.length && c.sameNick(t, serviceNick);
+        }
+        foreach (l; c.pacedQueue) if (addressed(l)) return true;
+        foreach (l; c.outboundQueue) if (addressed(l)) return true;
+        return false;
+    }
+
+    void wake() {
+        if (!c.servicesWakeDeferred) c.drainServicesQueue();
+    }
+
+    void markerChanged() {
+        c.metaDirty = true;
+        c.servicesMarkerDirty = true;
+    }
+
+    void adoptOwnAccount(string account) {
+        if (account.length) c.observeOwnAccount(account);
+    }
+
+    bool ownChannelStatus(string channel, out string prefixes) {
+        return c.ownChannelStatus(channel, prefixes);
+    }
+}
+
 /// Whether the user renaming away from a tracked DM nick is the person that
 /// conversation was held with, so the DM may follow the rename. A nick is
 /// not an identity: anyone can take one the moment its holder drops it, and
@@ -4792,9 +4900,27 @@ final class PersistentIRCClient {
         // draft/metadata-2: lowercase channel → key → value for
         // CHANNEL_METADATA_KEYS. Dropped with the channel, moved on RENAME.
         string[string][string] channelMetadata;
-        // Our services account from 900 RPL_LOGGEDIN; keys our entry in the
-        // public-avatar registry (`RedisKeys.publicAvatars`).
+        // Our services account as the server last stated it (900, a live
+        // self ACCOUNT or WHOX row); keys our entry in the public-avatar
+        // registry (`RedisKeys.publicAvatars`). Never seeded from config.
         string              servicesAccount;
+        /// Whether `servicesAccount` is established for this generation.
+        ServicesAccountState servicesAccountState;
+        /// Opaque id this engine minted for the live transport: new at every
+        /// RPL_WELCOME and every attach of a held socket (hot swap / crash),
+        /// "" once the socket is gone. Service operations are bound to it.
+        string              connectionEpoch;
+        /// The SERVICES_STATE tuple last published, so only changes are.
+        string[4]           announcedServicesState = ["unknown", "", "", "unavailable"];
+        ulong               announcedServicesGeneration;
+        /// Actual-user services transport (fences, pins, service locks,
+        /// private-reply interception). Never in a snapshot.
+        ServicesTransport   services;
+        /// `executeServices` is admitting a request: its first writes wait
+        /// until the holder marker is published.
+        bool                servicesWakeDeferred;
+        /// A transaction started or ended since the last META write.
+        bool                servicesMarkerDirty;
         // Ident (username) extracted from nick!user@host in JOIN/353
         string[string]      idents;
         string[]            queryBuffers;
@@ -5124,6 +5250,7 @@ final class PersistentIRCClient {
         this.registrationFallbackAttempts = 0;
         this.randomNickPersisted = false;
         this.ghostReclaimAttempted = false;
+        this.services = new ServicesTransport(new ConnectionServicesHost(this));
     }
 
     /// Starts the connection loop in a background task. No-op for a
@@ -5193,6 +5320,10 @@ final class PersistentIRCClient {
     /// socket is closed too (see `transportClose`).
     void stop(string quitReason = "") {
         isShutdownRequested = true;
+        // In-flight services requests are answered now (stale, or unconfirmed
+        // once a command left), not left to the gateway's timeout.
+        try services.onDisconnect();
+        catch (Exception) {}
 
         if (state == ConnectionState.connected && connection.connected) {
             try {
@@ -5349,8 +5480,11 @@ final class PersistentIRCClient {
         s.queryAccounts = queryAccounts.dup;
         s.queryHosts = queryHosts.dup;
         s.failureReasons = failureReasons.dup;
-        s.outboundQueue = outboundQueue.dup;
-        if (graceful && pacedQueue.length > 0) s.outboundQueue ~= pacedQueue.dup;
+        // A services credential or private memo line never rides in META:
+        // the next engine would replay it, and META is not a secret store.
+        foreach (l; outboundQueue) if (!isSensitiveServiceLine(l)) s.outboundQueue ~= l;
+        if (graceful)
+            foreach (l; pacedQueue) if (!isSensitiveServiceLine(l)) s.outboundQueue ~= l;
         s.channelState = channelState.dup;
         s.channelTopics = channelTopics.dup;
         // Duplicate the associative array of user lists.
@@ -5400,6 +5534,16 @@ final class PersistentIRCClient {
         // re-deriving them.
         s.connectedAtMs = connectedAtMs;
         s.ownPrefix = getOwnPrefix();
+        // The services login rides along under the same rule as the prefix;
+        // the epoch never does — the attaching engine mints its own.
+        s.servicesAccountState = servicesAccountStateName(getServicesAccountState());
+        s.servicesAccount = getServicesAccount();
+        // Non-secret marker: which pseudoclients an in-flight transaction is
+        // talking to and until when, so the next engine keeps their backlog
+        // replies out of history. Never tokens, commands or reply text.
+        const quiet = services.marker();
+        s.servicesQuietPrefixes = quiet.prefixes.dup;
+        s.servicesQuietUntilMs = quiet.untilMs;
         return s;
     }
 
@@ -5454,7 +5598,8 @@ final class PersistentIRCClient {
         queryAccounts = s.queryAccounts.dup;
         queryHosts = s.queryHosts.dup;
         failureReasons = s.failureReasons.dup;
-        outboundQueue = s.outboundQueue.dup;
+        outboundQueue = null;
+        foreach (l; s.outboundQueue) if (!isSensitiveServiceLine(l)) outboundQueue ~= l;
         channelState = s.channelState.dup;
         channelTopics = null;
         foreach (k, v; s.channelTopics) channelTopics[normalizeChannelName(k)] = v;
@@ -5504,6 +5649,13 @@ final class PersistentIRCClient {
                 ownPrefix = s.ownPrefix;
         }
         if (ownPrefix.length) ownHostmask = ownPrefix;
+        // Same rule for the services login; otherwise unknown until the
+        // server restates it (self WHOX below, 900/901, live self ACCOUNT).
+        restoreServicesAccount(s, graceful);
+        // This engine interprets the socket from here on: a fresh epoch, so
+        // nothing bound to the previous engine's reading of it carries over.
+        mintConnectionEpoch();
+        services.restoreQuiet(s.servicesQuietPrefixes, s.servicesQuietUntilMs);
         // What the holder buffered while detached replays first: history.
         attachBacklogBytes = r.entry.bufferedBytes > 0 ? r.entry.bufferedBytes : 0;
         // Egress bookkeeping: the session still rides its Mullvad slot, so
@@ -5573,7 +5725,9 @@ final class PersistentIRCClient {
         // re-adding the ones still here, which is what a resync was always
         // meant to do. Paced by writeRaw like any other line.
         foreach (chan; channelState.byKey) sendRaw("NAMES " ~ chan);
-        if (ownPrefix.length == 0) requestSelfWho();
+        if (ownPrefix.length == 0 || servicesAccountState == ServicesAccountState.unknown)
+            requestSelfWho();
+        announceServicesState();
         // Fresh META from the attached engine: the previous one was the
         // detach snapshot (`graceful == true`), and a crash before the next
         // upkeep write must not be mistaken for a planned swap.
@@ -5593,6 +5747,10 @@ final class PersistentIRCClient {
     void detachForHotSwap() {
         const live = state == ConnectionState.connected && holderConnId.length > 0;
         if (live) publishMeta(true);
+        // In-flight services requests end here (stale, or unconfirmed when a
+        // command already left); the META above carries only their marker.
+        try services.onDetach();
+        catch (Exception e) { logWarn("detachForHotSwap: services cancel for %s: %s", config.name, e.msg); }
         isShutdownRequested = true;
         detachedForHotSwap = true;
         try { if (connection.connected) connection.close(); }
@@ -5773,6 +5931,28 @@ final class PersistentIRCClient {
         return state == ConnectionState.connected && connectedAtMs > 0 && !detachedForHotSwap
             ? ownPrefix : "";
     }
+    /// Opaque random UUID this engine minted for the live transport; a new
+    /// one at every RPL_WELCOME and every attach of a held socket. "" when
+    /// not registered, without a connection generation, or detached.
+    @property string getConnectionEpoch() const nothrow {
+        return state == ConnectionState.connected && connectedAtMs > 0 && !detachedForHotSwap
+            ? connectionEpoch : "";
+    }
+    /// Server-stated own services login for the live epoch; unknown
+    /// whenever there is no live epoch.
+    @property ServicesAccountState getServicesAccountState() const nothrow {
+        return getConnectionEpoch().length ? servicesAccountState : ServicesAccountState.unknown;
+    }
+    /// The observed services account; "" unless the state is `account`.
+    /// Never the configured SASL username or the website account.
+    @property string getServicesAccount() const nothrow {
+        return getServicesAccountState() == ServicesAccountState.account ? servicesAccount : "";
+    }
+    /// Non-sensitive services availability: `unavailable` without a live
+    /// epoch, else `unknown` — nothing here has discovered services yet.
+    @property string getServicesAvailability() const nothrow {
+        return getConnectionEpoch().length ? "unknown" : "unavailable";
+    }
     /// Seconds since the last inbound byte; 0 when never. Surfaced via the
     /// state snapshot so the UI can hint staleness before the PONG watchdog fires.
     @property long getDataAgeSecs() const { return lastDataReceivedSecs > 0 ? Clock.currTime.toUnixTime!long - lastDataReceivedSecs : 0; }
@@ -5797,6 +5977,15 @@ final class PersistentIRCClient {
         // Identity proof and discovery are per socket: a reconnect starts
         // unverified and forgets every probe the old socket carried.
         ownPrefix = "";
+        // So are the epoch and the observed services login.
+        connectionEpoch = "";
+        servicesAccount = "";
+        servicesAccountState = ServicesAccountState.unknown;
+        announceServicesState();
+        // Transactions, fences, probes and the service write queue belonged
+        // to that socket.
+        try services.onDisconnect();
+        catch (Exception) {}
         fiberReplyTatMs = 0;
         fiberRequesterNotBeforeMs = null;
         fiberProbeQueue = null;
@@ -6324,7 +6513,12 @@ final class PersistentIRCClient {
         const oldAvatar = config.effectiveAvatarUrl();
         auto oldProfile = config.profileMetadata.dup;
         auto oldMonitor = config.monitoredNicks.dup;
+        const oldServices = effectiveServices();
         config = cfg; ipv6BindResolved = false; ipv6BindCache = "";
+        if (effectiveServices() != oldServices) {
+            services.onConfigChanged();
+            announceServicesInvalidated();
+        }
         const newAvatar = config.effectiveAvatarUrl();
         const live = state == ConnectionState.connected;
         if (live && hasCap("draft/metadata-2")) {
@@ -7171,6 +7365,13 @@ final class PersistentIRCClient {
         // the reconnect it caused. Queued user lines survive too — they
         // were never delivered.
         saslSucceeded = false;
+        // A login and an epoch belong to the socket that observed them.
+        servicesAccount = "";
+        servicesAccountState = ServicesAccountState.unknown;
+        connectionEpoch = "";
+        announceServicesState();
+        try services.onDisconnect();
+        catch (Exception) {}
         saslMechsReply = "";
         pacer.resetAccrual();
         pacer.adopt(assumedFloodLimits());
@@ -7286,6 +7487,7 @@ final class PersistentIRCClient {
              "event": "register_complete"]);
 
         state = ConnectionState.connected;
+        beginServicesGeneration();
         // The backoff is not reset here: runConnectionLoop resets it only
         // after the session stays up STABLE_SESSION_RESET_MS, so a server
         // that accepts then drops us keeps backing off.
@@ -8284,6 +8486,9 @@ private void processEvents() {
 
             // FIBERMLS probes leave on their own 1 s pacing.
             drainFiberProbes();
+            // Services: deadlines, then the dedicated paced write queue.
+            services.tick();
+            drainServicesQueue();
 
             yield();
             // Detach pause: while a hot-swap detach is being prepared, spin
@@ -8651,10 +8856,11 @@ private void processEvents() {
                 return p.length >= 2 && p[0] == "METADATA" && p[1] == "KEY_NOT_SET";
             case "900":
                 // RPL_LOGGEDIN [me, mask, account, text]
-                if (p.length >= 3) {
+                if (p.length >= 3 && p[2].length) {
                     servicesAccount = p[2];
                     syncPublicAvatar();
                     syncMlsAccountOwner();
+                    noteServicesAccount(ServicesAccountState.account);
                 }
                 return false;
             case "901":
@@ -8662,6 +8868,7 @@ private void processEvents() {
                 forgetPublicAvatar();
                 forgetMlsAccountOwner();
                 servicesAccount = "";
+                noteServicesAccount(ServicesAccountState.none);
                 return false;
             default:
                 return false;
@@ -8894,7 +9101,11 @@ private void processEvents() {
             const full = nick ~ "!" ~ user ~ "@" ~ host;
             IrcPrefix row;
             if (parseFullPrefix(full, row)) {
-                if (optimisticNickOld.length == 0 && sameNick(nick, sessionNick)) setOwnPrefix(full);
+                if (optimisticNickOld.length == 0 && sameNick(nick, sessionNick)) {
+                    setOwnPrefix(full);
+                    // A WHOX row states our account too ("0" = none).
+                    if (account.length) observeOwnAccount(account == "0" ? "" : account);
+                }
                 if (auto members = normalizeChannelName(chan) in channelUsers)
                     *members = upsertRosterEntry(*members, full, casemapping());
             }
@@ -8968,10 +9179,16 @@ private void processEvents() {
     /// Everything `processLine` does after parsing. Also re-entered with
     /// the one message a closed `draft/multiline` batch reassembles.
     private void processEvent(IRCRawEvent event) {
+        scope (exit) announceServicesInvalidated();
 
         // Reserved FIBERMLS control packets never reach multiline
         // accumulation, query tracking, buffers, history or logs.
         if (interceptFiberMls(event)) return;
+
+        // Services fences, correlated private replies, engine WHOIS/VERSION
+        // probes and private own echoes never reach CTCP handling, buffers,
+        // history, persistence or bouncers.
+        if (services.intercept(event, fiberHistorical(event))) return;
 
         // Fix DM echo channel: parser sets channel=nick for all non-channel
         // PRIVMSG/NOTICE (correct for incoming, wrong for our own echo).
@@ -10028,6 +10245,11 @@ private void processEvents() {
                         // the timeline renders msg.text, so normalize it.
                         if (event.text.length == 0)
                             event.text = ap[0];
+                        // A self ACCOUNT on the live socket restates our own
+                        // login; a chathistory/multiline replay does not.
+                        if (optimisticNickOld.length == 0 && sameNick(event.nick, sessionNick)
+                                && event.getTag("batch").length == 0 && !inMultilineMerge)
+                            observeOwnAccount(ap[0] == "*" ? "" : ap[0]);
                     }
                 }
                 event.channel = "";
@@ -10785,6 +11007,242 @@ private void processEvents() {
         eventChannel.put(ev);
     }
 
+    // ── Observed services identity (no transport here) ───────────────────
+
+    /// A fresh opaque epoch for the transport this engine now interprets.
+    /// Random, not derived from anything, never reused across generations.
+    private void mintConnectionEpoch() {
+        connectionEpoch = randomUUID().toString();
+        if (services !is null) services.onEpoch();
+    }
+
+    /// RPL_WELCOME preserves any login already stated during registration.
+    /// Silence is not an authoritative logout; WHOX/WHOIS or 901 may resolve
+    /// an unknown account after the transport gets its own epoch.
+    private void beginServicesGeneration() {
+        mintConnectionEpoch();
+        announceServicesState();
+    }
+
+    /// Attach: the inherited login is kept only from a planned swap's META
+    /// written for this very generation (the `ownPrefix` rule); otherwise
+    /// it stays unknown until the server restates it.
+    private void restoreServicesAccount(ref const SessionSnapshot s, bool graceful) {
+        servicesAccount = "";
+        servicesAccountState = ServicesAccountState.unknown;
+        if (!(graceful && s.graceful && s.wasConnected && s.connectedAtMs > 0
+                && s.connectedAtMs == connectedAtMs))
+            return;
+        const st = parseServicesAccountState(s.servicesAccountState);
+        if (st == ServicesAccountState.account && s.servicesAccount.length) {
+            servicesAccount = s.servicesAccount;
+            servicesAccountState = st;
+        } else if (st == ServicesAccountState.none) {
+            servicesAccountState = st;
+        }
+    }
+
+    /// Records the state after `servicesAccount` was set from a server
+    /// statement; an `account` state without a name is not proof.
+    private void noteServicesAccount(ServicesAccountState st) nothrow {
+        if (st == ServicesAccountState.account && servicesAccount.length == 0)
+            st = ServicesAccountState.unknown;
+        servicesAccountState = st;
+        metaDirty = true;
+        announceServicesState();
+        try services.onOwnAccount(servicesActor());
+        catch (Exception) {}
+        announceServicesInvalidated();
+    }
+
+    /// A live self ACCOUNT or WHOX row: our login is `account` ("" = none).
+    /// Registry upkeep matches 900/901, but only when the statement changes
+    /// what we hold (a WHOX refresh is not a fresh login).
+    private void observeOwnAccount(string account) {
+        const next = account.length ? ServicesAccountState.account : ServicesAccountState.none;
+        if (next == servicesAccountState && account == servicesAccount) return;
+        if (account.length) {
+            servicesAccount = account;
+            syncPublicAvatar();
+            syncMlsAccountOwner();
+        } else {
+            forgetPublicAvatar();
+            forgetMlsAccountOwner();
+            servicesAccount = "";
+        }
+        noteServicesAccount(next);
+    }
+
+    /// Publishes `SERVICES_STATE` [accountState, account, epoch,
+    /// availability] when the exported tuple changed. Carries no service
+    /// reply text or credentials; the processor publishes it live only
+    /// (never scrollback, Mongo or the user stream) and refreshes the
+    /// state snapshot. A detached engine stays silent: the attaching one
+    /// announces its own epoch.
+    private void announceServicesState() nothrow {
+        if (detachedForHotSwap) return;
+        string[4] now = [servicesAccountStateName(getServicesAccountState()),
+            getServicesAccount(), getConnectionEpoch(), getServicesAvailability()];
+        if (now == announcedServicesState) return;
+        announcedServicesState = now;
+        try {
+            auto ev = IRCRawEvent(config.name, "SERVICES_STATE");
+            ev.networkId = config.id.toString();
+            ev.setParams(now[].dup);
+            eventChannel.put(ev);
+        } catch (Exception e) {
+            try logWarn("SERVICES_STATE publish failed for %s: %s", config.name, e.msg);
+            catch (Exception) {}
+        }
+    }
+
+    /// Live, non-sensitive invalidation only. No permission cache survives
+    /// an account, mode, target-identity, channel-state or pin change.
+    private void announceServicesInvalidated() nothrow {
+        if (detachedForHotSwap || services is null || !getConnectionEpoch().length) return;
+        const generation = services.invalidationGeneration;
+        if (generation == announcedServicesGeneration) return;
+        announcedServicesGeneration = generation;
+        try {
+            auto ev = IRCRawEvent(config.name, "SERVICES_INVALIDATED");
+            ev.networkId = config.id.toString();
+            ev.setParams([getConnectionEpoch(), generation.to!string,
+                services.lastInvalidationChannel, services.lastInvalidationTarget]);
+            eventChannel.put(ev);
+        } catch (Exception) {
+            // Invalidations contain no private text; disconnect/sync is the
+            // authoritative fallback when the event channel is closing.
+        }
+    }
+
+    // ── Actual-user services transport (ircfiber.irc.services) ───────────
+
+    /// Trust configuration this connection enforces: the managed network's
+    /// is derived from the deployment, never from stored/browser data.
+    private ServicesConfig effectiveServices() const {
+        return effectiveServicesConfig(config.services, isFiberNetwork());
+    }
+
+    /// The shared classifier, against this network's services.
+    private bool isSensitiveServiceLine(string line) const {
+        return sensitiveServiceLine(line, effectiveServices());
+    }
+
+    /// Observed login in the transport's terms.
+    private ServicesActor servicesActor() const nothrow {
+        final switch (getServicesAccountState()) {
+            case ServicesAccountState.unknown: return ServicesActor(ServicesActorState.unknown, "");
+            case ServicesAccountState.none:    return ServicesActor(ServicesActorState.none, "");
+            case ServicesAccountState.account:
+                return ServicesActor(ServicesActorState.account, getServicesAccount());
+        }
+    }
+
+    /// Gate for every manual, alias, bouncer and automatic line: a line to a
+    /// service whose transaction is in flight is refused (never queued or
+    /// interleaved), and a sensitive service line is never parked in the
+    /// reconnect queue — it would be replayed later and written into META.
+    private bool admitServiceLine(string line) {
+        return admitService(services.lockedServiceFor(line), () => isSensitiveServiceLine(line));
+    }
+
+    /// `admitServiceLine` for a chat message: only its targets decide the
+    /// lock, and the body is judged as messages to them (a multi-line body
+    /// to a person is ordinary chat).
+    private bool admitServiceMessage(string target, string text) {
+        return admitService(services.lockedServiceForTargets(target),
+            () => sensitiveServiceMessage(target, text, effectiveServices()));
+    }
+
+    private bool admitService(string busy, scope bool delegate() sensitive) {
+        if (busy.length) {
+            emitLog("warn", busy ~ " is busy with a request from IRC Fiber; your line to it was not sent."
+                ~ " Try again in a moment.");
+            return false;
+        }
+        const live = state == ConnectionState.connected
+            || (state == ConnectionState.connecting && transportAlive);
+        if (!live && sensitive()) {
+            emitLog("warn", "A services login or private command was not sent: the network is not connected."
+                ~ " It is never queued for later.");
+            return false;
+        }
+        return true;
+    }
+
+    /// Writes queued service lines (fences, bodies, probes) as fast as the
+    /// real pacer allows. Never through `outboundQueue`/`pacedQueue`, so
+    /// none of it can be replayed or snapshotted.
+    private void drainServicesQueue() {
+        if (state != ConnectionState.connected || detachedForHotSwap) return;
+        const now = unixMsNow();
+        while (true) {
+            const line = services.nextWrite();
+            if (!line.length) return;
+            if (floodTrusted && cmdBucket.waitMs(now, trustedRate) > 0) return;
+            if (pacer.waitMs(line.length + 2, now) > 0) return;
+            services.popWrite();
+            try writeRaw(line);
+            catch (Exception e) {
+                // The transport is gone; the loop's liveness check reconnects
+                // and the disconnect cancels the transaction (unconfirmed).
+                logInfo("Services write failed for %s: %s", config.name, e.msg);
+                return;
+            }
+        }
+    }
+
+    /// Runs one validated services request as this connection's live user.
+    /// `complete` is called exactly once with the request's result (the
+    /// caller adds `network`). The holder marker is published before the
+    /// transaction's first line leaves.
+    void executeServices(ServicesRequest request, void delegate(ServicesResult) complete, long issuedMs = 0) {
+        servicesWakeDeferred = true;
+        try services.execute(request, complete, issuedMs);
+        finally servicesWakeDeferred = false;
+        if (servicesMarkerDirty) {
+            servicesMarkerDirty = false;
+            publishMeta(false);
+        }
+        drainServicesQueue();
+    }
+
+    /// A sensitive manual `msg`/`raw` the gateway kept out of the ordinary
+    /// command list. Legacy manual behaviour on the epoch it was typed for;
+    /// another (or no) live epoch drops it — it is never replayed.
+    bool sendManualService(ServicesManualPayload p) {
+        if (!p.expectedConnectionEpoch.length || p.expectedConnectionEpoch != getConnectionEpoch()) {
+            emitLog("warn", "A services login or private command was not sent: the connection changed"
+                ~ " before it could be delivered.");
+            return false;
+        }
+        if (p.command == "msg") {
+            if (p.label.length) sendLabeledMessage(p.target, p.text, p.label);
+            else sendMessage(p.target, p.text);
+        } else {
+            sendRaw(p.text, true);
+        }
+        return true;
+    }
+
+    /// Our live status prefixes on `channel` from the roster.
+    private bool ownChannelStatus(string channel, out string prefixes) {
+        string[]* members = channel in channelUsers;
+        if (members is null) members = normalizeChannelName(channel).toLower() in channelUsers;
+        if (members is null) return false;
+        bool found;
+        foreach (entry; *members) {
+            auto bare = stripNickPrefix(entry);
+            const bang = bare.indexOf("!");
+            if (bang > 0) bare = bare[0 .. bang];
+            if (!sameNick(bare, sessionNick)) continue;
+            found = true;
+            foreach (c; nickPrefix(entry))
+                if (!prefixes.canFind(c)) prefixes ~= c;
+        }
+        return found;
+    }
+
     /// WHO on our own nick so the server restates who we are; at most every
     /// FIBERMLS_SELF_WHO_MS, and never while a /nick awaits its echo (the
     /// row would name a nick we may not hold).
@@ -10794,7 +11252,8 @@ private void processEvents() {
         const now = unixMsNow();
         if (fiberSelfWhoMs > 0 && now - fiberSelfWhoMs < FIBERMLS_SELF_WHO_MS) return;
         fiberSelfWhoMs = now;
-        sendRaw("WHO " ~ sessionNick);
+        // WHOX (when offered) also restates our services account.
+        sendRaw(whoLine(sessionNick));
     }
 
     /// WHO on a channel whose roster cannot prove an identity yet (a bare or
@@ -11847,6 +12306,7 @@ private void processEvents() {
     private void setOperState(bool oper, string signal) {
         if (isOper == oper) return;
         isOper = oper;
+        if (services !is null) services.onOwnAuthorityChanged();
         pacer.setImmune(oper);
         logJsonMap("info", "connection",
             oper ? "IRCOp status detected — fake-lag pacing disabled"
@@ -12644,6 +13104,12 @@ private void processEvents() {
             submitFiberProbe(line);
             return;
         }
+        if (!admitServiceLine(line)) return;
+        if (fromClient && line.length > 6 && line[0 .. 6].toUpper() == "WHOIS ") {
+            auto args = line[6 .. $].strip();
+            const sp = args.lastIndexOf(' ');
+            services.noteClientWhois(sp < 0 ? args : args[sp + 1 .. $]);
+        }
         // Track own away status
         if (line == "AWAY" || line == "away") {
             isAway = false;
@@ -12745,6 +13211,10 @@ private void processEvents() {
                 submitFiberProbe("PRIVMSG " ~ target ~ " :" ~ text);
             return;
         }
+        if (!admitServiceMessage(target, text)) return;
+        // A services credential or private memo is never echoed into chat
+        // history by us; the server's own echo is intercepted on arrival.
+        const sensitive = sensitiveServiceMessage(target, text, effectiveServices());
         const budget = linePayloadBudget(target, command);
         bool[] concat;
         auto lines = splitMessage(text, budget, concat);
@@ -12770,7 +13240,7 @@ private void processEvents() {
             }
         }
 
-        if (!hasCap("echo-message")) {
+        if (!hasCap("echo-message") && !sensitive) {
             foreach (i, line; lines) {
                 if (line.length == 0) continue;
                 emitSyntheticSelfMessage(target, line, command,
@@ -13650,6 +14120,114 @@ unittest {
     ch2.close();
 }
 
+@("Services identity: server-observed account, fresh epoch per generation and attach")
+unittest {
+    import vibe.core.channel : createChannel;
+
+    NetworkConfig cfg;
+    cfg.nick = "me";
+    // Configured SASL credentials are never identity evidence.
+    cfg.sasl = SASLMechanism.plain;
+    cfg.saslUsername = "configured";
+    cfg.saslPassword = "pw";
+    auto ch = createChannel!IRCRawEvent();
+    auto c = new PersistentIRCClient(cfg, ch);
+    string[][] announced;
+    void drain() {
+        IRCRawEvent ev;
+        while (ch.tryConsumeOne(ev, 0.msecs))
+            if (ev.command == "SERVICES_STATE") announced ~= ev.getParams();
+    }
+    void live(long gen) {
+        c.state = ConnectionState.connected;
+        c.connectedAtMs = gen;
+        c.beginServicesGeneration();
+    }
+
+    // Nothing is exported before registration, even with a SASL 900.
+    c.processLine(":srv 900 me me!u@h acct :You are now logged in as acct");
+    assert(c.servicesAccount == "acct" && c.getServicesAccount() == "");
+    assert(c.getServicesAccountState() == ServicesAccountState.unknown && c.getConnectionEpoch() == "");
+    drain();
+    assert(announced.length == 0, "no live generation, nothing to announce");
+
+    live(1_000);
+    const epoch1 = c.getConnectionEpoch();
+    assert(epoch1.length == 36 && epoch1 != "00000000-0000-0000-0000-000000000000");
+    assert(c.getServicesAccountState() == ServicesAccountState.account && c.getServicesAccount() == "acct");
+    drain();
+    assert(announced.length == 1 && announced[0] == ["account", "acct", epoch1, "unknown"]);
+
+    // 901 logs out; a live self ACCOUNT logs in; replays and others do not.
+    c.processLine(":srv 901 me me!u@h :You are now logged out");
+    assert(c.getServicesAccountState() == ServicesAccountState.none && c.getServicesAccount() == "");
+    c.processLine(":me!u@h ACCOUNT acct2");
+    assert(c.getServicesAccount() == "acct2");
+    c.processLine("@batch=h :me!u@h ACCOUNT replayed");
+    c.processLine(":bob!b@h ACCOUNT bobacct");
+    assert(c.getServicesAccount() == "acct2", "only a live self ACCOUNT moves our login");
+    c.processLine(":me!u@h ACCOUNT *");
+    assert(c.getServicesAccountState() == ServicesAccountState.none);
+    // A live self WHOX row restates it ("0" = none); a plain WHO cannot.
+    c.processLine(":s 354 me 152 * ~u host me H acct3 :Me");
+    assert(c.getServicesAccount() == "acct3");
+    c.processLine(":s 352 me * ~u host s me H :0 Me");
+    assert(c.getServicesAccount() == "acct3");
+    c.processLine(":s 354 me 152 * ~u host me H 0 :Me");
+    assert(c.getServicesAccountState() == ServicesAccountState.none);
+    c.processLine(":s 354 me 152 * ~u host me H acct3 :Me");
+    drain();
+    assert(announced[$ - 1] == ["account", "acct3", epoch1, "unknown"]);
+    assert(c.getServicesAccount() != cfg.saslUsername);
+
+    // META carries the login, never the epoch; a detached engine exports
+    // and announces nothing.
+    auto snap = c.snapshotSession(true);
+    assert(snap.servicesAccountState == "account" && snap.servicesAccount == "acct3");
+    c.detachedForHotSwap = true;
+    assert(c.getConnectionEpoch() == "" && c.getServicesAccount() == "");
+    const before = announced.length;
+    c.processLine(":srv 901 me me!u@h :You are now logged out");
+    drain();
+    assert(announced.length == before, "a detached engine stays silent");
+    c.detachedForHotSwap = false;
+
+    // Attach: the login survives only a graceful META of this generation,
+    // and the attaching engine always mints its own epoch.
+    auto d = new PersistentIRCClient(cfg, ch);
+    d.connectedAtMs = snap.connectedAtMs;
+    d.restoreServicesAccount(snap, true);
+    assert(d.servicesAccountState == ServicesAccountState.account && d.servicesAccount == "acct3");
+    d.restoreServicesAccount(snap, false);
+    assert(d.servicesAccountState == ServicesAccountState.unknown && d.servicesAccount == "");
+    d.connectedAtMs = snap.connectedAtMs + 1;
+    d.restoreServicesAccount(snap, true);
+    assert(d.servicesAccountState == ServicesAccountState.unknown, "another generation's META proves nothing");
+    auto legacy = snap;
+    legacy.servicesAccountState = "";
+    d.connectedAtMs = snap.connectedAtMs;
+    d.restoreServicesAccount(legacy, true);
+    assert(d.servicesAccountState == ServicesAccountState.unknown, "an older engine's META is unknown");
+    d.state = ConnectionState.connected;
+    d.mintConnectionEpoch();
+    assert(d.getConnectionEpoch().length == 36 && d.getConnectionEpoch() != epoch1,
+        "a retained socket under a new engine gets a new epoch");
+    drain();
+
+    // A dropped socket clears everything and says so; the next one differs.
+    c.state = ConnectionState.disconnected;
+    c.resetConnectionTelemetry();
+    assert(c.connectionEpoch == "" && c.servicesAccount == ""
+        && c.servicesAccountState == ServicesAccountState.unknown);
+    drain();
+    assert(announced[$ - 1] == ["unknown", "", "", "unavailable"]);
+    live(2_000);
+    assert(c.getConnectionEpoch().length == 36 && c.getConnectionEpoch() != epoch1);
+    assert(c.getServicesAccountState() == ServicesAccountState.unknown, "a new socket has no observed login state yet");
+    drain();
+    ch.close();
+}
+
 @("FIBERMLS: roster keeps user@host through JOIN, WHO, NICK and a bare NAMES resync")
 unittest {
     import vibe.core.channel : createChannel;
@@ -14111,6 +14689,191 @@ FiberMlsCheck[] fiberMlsWireChecks(out string[] wire) {
 
 } // version (FiberMlsChecks)
 
+version (unittest) version = ServicesIdentityChecks;
+version (FiberMlsWireHarness) version = ServicesIdentityChecks;
+
+version (ServicesIdentityChecks) {
+
+/// One named services-identity check, printed and counted by the
+/// `connection-registration-test` harness.
+struct ServicesIdentityCheck {
+    string name;
+    bool passed;
+}
+
+/// Engine-observed services identity over a real localhost socket: a fake
+/// ircd runs two registrations (the first with a SASL 900, the second
+/// without) and records every line the client writes (returned in `wire`).
+/// Proves the account comes only from server statements, every registered
+/// socket and every engine attach of a retained socket gets a fresh
+/// canonical UUID epoch, logout/relogin and disconnect are announced, and
+/// a detached engine exports and announces nothing.
+ServicesIdentityCheck[] servicesIdentityWireChecks(out string[] wire) {
+    import std.algorithm : canFind;
+    import std.uuid : parseUUID, UUID;
+    import core.time : msecs;
+    import vibe.core.channel : createChannel;
+    import vibe.core.core : sleep;
+    import vibe.core.net : listenTCP;
+    import vibe.stream.operations : readLine;
+
+    ServicesIdentityCheck[] results;
+    void check(string name, bool passed) { results ~= ServicesIdentityCheck(name, passed); }
+    static bool canonicalUuid(string s) {
+        if (s.length != 36) return false;
+        try {
+            const u = UUID(s);
+            return u != UUID.init && u.toString() == s;
+        } catch (Exception) {
+            return false;
+        }
+    }
+
+    const loggedIn = ":s 900 me me!~m@host.a acct :You are now logged in as acct\r\n"
+        ~ ":s 001 me :Welcome\r\n"
+        ~ ":s 005 me WHOX CASEMAPPING=rfc1459 :are supported by this server\r\n"
+        ~ ":s 376 me :End of MOTD\r\n";
+    const anonymous = ":s 001 me :Welcome\r\n:s 376 me :End of MOTD\r\n";
+    string[] got;
+    int accepted;
+    int closedPeers;
+    auto listener = listenTCP(0, (TCPConnection peer) {
+        const n = accepted++;
+        try {
+            peer.write(n == 0 ? loggedIn : anonymous);
+            peer.flush();
+            while (!peer.empty) got ~= (cast(const(char)[]) peer.readLine()).idup;
+        } catch (Exception) {}
+        try peer.close(); catch (Exception) {}
+        ++closedPeers;
+    }, "127.0.0.1");
+    auto ch = createChannel!IRCRawEvent();
+    NetworkConfig cfg;
+    cfg.nick = "me";
+    // Configuration only: never evidence of who we are logged in as.
+    cfg.saslUsername = "configured-sasl";
+    auto c = new PersistentIRCClient(cfg, ch);
+    string[][] announced;
+    void drain() {
+        IRCRawEvent ev;
+        while (ch.tryConsumeOne(ev, 0.msecs))
+            if (ev.command == "SERVICES_STATE") announced ~= ev.getParams();
+    }
+    void closeSocket(int peersBefore) {
+        try c.connection.close(); catch (Exception) {}
+        foreach (_; 0 .. 200) {
+            if (closedPeers > peersBefore) break;
+            try sleep(10.msecs); catch (Exception) {}
+        }
+    }
+    void cleanup() {
+        closeSocket(accepted - 1);
+        try {
+            listener.stopListening();
+            sleep(10.msecs);
+        } catch (Exception) {}
+        ch.close();
+    }
+    scope (exit) cleanup();
+    /// The real registration read loop, then attemptConnectionImpl's
+    /// RPL_WELCOME tail for the services generation.
+    void register() {
+        c.connection = connectTCP("127.0.0.1", listener.bindAddress.port);
+        c.performRegistration();
+        c.connectedAtMs = unixMsNow();
+        c.state = ConnectionState.connected;
+        c.beginServicesGeneration();
+        drain();
+    }
+
+    register();
+    const epoch1 = c.getConnectionEpoch();
+    check("a SASL 900 read off the wire during registration is the observed account",
+        c.getServicesAccountState() == ServicesAccountState.account && c.getServicesAccount() == "acct");
+    check("the configured SASL username is never the observed account",
+        c.getServicesAccount() != cfg.saslUsername);
+    check("registration mints a canonical random UUID epoch", canonicalUuid(epoch1));
+    check("one SERVICES_STATE announces the new generation",
+        announced == [["account", "acct", epoch1, "unknown"]]);
+
+    c.requestSelfWho();
+    sleep(300.msecs);
+    check("a self WHO asks WHOX to restate our account", got.canFind("WHO me %tcuhnfar,152"));
+    c.processLine(":s 354 me 152 * ~m host.a me H acct :Me");
+    drain();
+    check("a WHOX row restating the same account announces nothing", announced.length == 1);
+    c.processLine(":s 901 me me!~m@host.a :You are now logged out");
+    drain();
+    check("901 is a logout on the same epoch",
+        c.getServicesAccountState() == ServicesAccountState.none && c.getServicesAccount() == ""
+        && c.getConnectionEpoch() == epoch1 && announced[$ - 1] == ["none", "", epoch1, "unknown"]);
+    c.processLine("@batch=hist :me!~m@host.a ACCOUNT replayed");
+    c.processLine(":bob!~b@hb ACCOUNT acct");
+    check("replayed and other users' ACCOUNT lines are not our login",
+        c.getServicesAccountState() == ServicesAccountState.none);
+    c.processLine(":me!~m@host.a ACCOUNT acct2");
+    drain();
+    check("a live self ACCOUNT is a relogin",
+        c.getServicesAccount() == "acct2" && announced[$ - 1] == ["account", "acct2", epoch1, "unknown"]);
+
+    // Drop and redial: everything belonged to the old socket.
+    closeSocket(0);
+    c.state = ConnectionState.disconnected;
+    c.resetConnectionTelemetry();
+    drain();
+    check("a dropped socket clears the epoch and login and says so",
+        c.getConnectionEpoch() == "" && c.servicesAccount == ""
+        && announced[$ - 1] == ["unknown", "", "", "unavailable"]);
+    register();
+    const epoch2 = c.getConnectionEpoch();
+    check("the next registered socket gets a different epoch", canonicalUuid(epoch2) && epoch2 != epoch1);
+    check("no 900 leaves identity unknown, whatever SASL config says",
+        c.getServicesAccountState() == ServicesAccountState.unknown && c.getServicesAccount() == ""
+        && announced[$ - 1] == ["unknown", "", epoch2, "unknown"]);
+    c.processLine(":me!~m@host.a ACCOUNT acct2");
+    drain();
+
+    // Hot swap of the retained socket: META carries the login, never the
+    // epoch; the detached engine goes quiet; the attaching one mints anew.
+    auto meta = c.snapshotSession(true);
+    c.detachedForHotSwap = true;
+    const before = announced.length;
+    c.processLine(":s 901 me me!~m@host.a :You are now logged out");
+    drain();
+    check("a detached engine exports and announces nothing",
+        c.getConnectionEpoch() == "" && c.getServicesAccount() == "" && announced.length == before);
+    auto next = new PersistentIRCClient(cfg, ch);
+    next.connectedAtMs = meta.connectedAtMs;
+    next.state = ConnectionState.connected;
+    next.restoreServicesAccount(meta, true);
+    next.mintConnectionEpoch();
+    const epoch3 = next.getConnectionEpoch();
+    check("an attached retained socket keeps its generation but gets a new epoch",
+        canonicalUuid(epoch3) && epoch3 != epoch2 && next.getConnectedAtMs() == c.connectedAtMs);
+    check("a graceful same-generation META restores the observed login",
+        next.getServicesAccountState() == ServicesAccountState.account && next.getServicesAccount() == "acct2");
+    auto crashed = new PersistentIRCClient(cfg, ch);
+    crashed.connectedAtMs = meta.connectedAtMs;
+    crashed.state = ConnectionState.connected;
+    crashed.restoreServicesAccount(meta, false);
+    crashed.mintConnectionEpoch();
+    check("a crash attach cannot prove the login: unknown until the server restates it",
+        crashed.getServicesAccountState() == ServicesAccountState.unknown && crashed.getServicesAccount() == ""
+        && crashed.getConnectionEpoch() != epoch3);
+    c.detachedForHotSwap = false;
+    drain();
+    wire = got.dup;
+    return results;
+}
+
+} // version (ServicesIdentityChecks)
+
+@("Services identity over a localhost socket: observed account, per-generation epochs, attach")
+unittest {
+    string[] wire;
+    foreach (check; servicesIdentityWireChecks(wire)) assert(check.passed, check.name);
+}
+
 @("FIBERMLS outbound discovery: one validated probe per recipient, cooldowns, no msg/raw bypass")
 unittest {
     foreach (check; fiberMlsBackstopChecks()) assert(check.passed, check.name);
@@ -14496,3 +15259,292 @@ unittest {
     IRCRawEvent e;
     while (ch.tryConsumeOne(e)) {}
 }
+
+version (ServicesWireHarness) {
+
+import ircfiber.irc.services : ServicesOperation, ServicesTransaction, ServicesEndpoint, ServiceFrame,
+    ServiceFrameSpec, ServiceFrameOutcome, registerServicesOperation, clearServicesOperations;
+
+/// One named services-transport check over a localhost socket, printed by
+/// the `services-test` runner.
+struct ServicesWireCheck {
+    string name;
+    bool passed;
+}
+
+/// Test-only adapter: one INFO frame, "confirmed" only when the frame
+/// completed AND carried a reply. It proves transport attribution, not any
+/// real Anope grammar (unit 3 owns those).
+private final class WireInfoOperation : ServicesOperation {
+    ServiceFrame last;
+    bool supports(const ref ServicesEndpoint ep) { return ep.version_.length > 0; }
+    void run(ServicesTransaction txn) {
+        import ircfiber.services.protocol : ServiceStatus;
+        auto body_ = "INFO " ~ txn.request.params["account"].get!string;
+        txn.frame(ServiceFrameSpec([body_]), (ServiceFrame f) {
+            last = f;
+            if (f.outcome != ServiceFrameOutcome.completed)
+                return txn.complete(ServiceStatus.unconfirmed, f.reason);
+            if (f.lines.length == 0) return txn.complete(ServiceStatus.unconfirmed, "no_reply");
+            txn.complete(ServiceStatus.confirmed, "", Json.undefined, "", Json.undefined, txn.details(f.lines));
+        });
+    }
+}
+
+/// Real frame transport over a localhost fake ircd that answers like an
+/// Anope pseudoclient on `services.test`: typed request → self-WHOIS
+/// account → pin WHOIS + VERSION → start fence → command → end fence →
+/// private result, with nothing service-private reaching the event channel.
+ServicesWireCheck[] servicesTransportWireChecks(out string[] wire) {
+    import std.algorithm : any, countUntil;
+    import std.uuid : randomUUID;
+    import core.time : msecs;
+    import vibe.core.channel : createChannel;
+    import vibe.core.core : sleep;
+    import vibe.core.net : listenTCP;
+    import vibe.data.json : parseJsonString;
+    import vibe.stream.operations : readLine;
+    import ircfiber.services.config : ServicePin, ServiceId, ServicesProvider;
+    import ircfiber.services.protocol : ServiceAction, ServiceStatus;
+
+    ServicesWireCheck[] results;
+    void check(string name, bool passed) {
+        results ~= ServicesWireCheck(name, passed);
+    }
+
+    enum svc = ":NickServ!services@services.test ";
+    enum to = "PRIVMSG NickServ@services.test :";
+    string[] got;
+    int pings;
+    string respond(string line) {
+        if (line.startsWith("WHOIS ")) {
+            const nick = line[6 .. $];
+            if (nick == "NickServ")
+                return ":s 311 me NickServ services services.test * :Nickname Services\r\n"
+                    ~ ":s 312 me NickServ services.test :Anope\r\n:s 318 me NickServ :End of /WHOIS list.\r\n";
+            if (nick == "me")
+                return ":s 311 me me ~m host.a * :Me\r\n:s 330 me me acct :is logged in as\r\n"
+                    ~ ":s 318 me me :End of /WHOIS list.\r\n";
+            return ":s 401 me " ~ nick ~ " :No such nick\r\n:s 318 me " ~ nick ~ " :End of /WHOIS list.\r\n";
+        }
+        if (!line.startsWith(to)) return "";
+        const body_ = line[to.length .. $];
+        if (body_ == "\x01VERSION\x01")
+            return svc ~ "NOTICE me :\x01VERSION Anope-2.1.test services.test -- inspircd4\x01\r\n";
+        if (body_.startsWith("\x01PING ")) {
+            // Every second fence closes a frame; services then say something
+            // unsolicited, which must stay ordinary traffic.
+            const closing = ++pings % 2 == 0;
+            return svc ~ "NOTICE me :" ~ body_ ~ "\r\n"
+                ~ (closing ? svc ~ "NOTICE me :Unsolicited reminder\r\n" : "");
+        }
+        if (body_ == "INFO acct")
+            return svc ~ "NOTICE me :\x02acct\x02 is me\r\n" ~ svc ~ "PRIVMSG me :Registered: today\r\n";
+        return ""; // "INFO quiet": fences answered, command silently dropped
+    }
+
+    int accepted;
+    auto listener = listenTCP(0, (TCPConnection peer) {
+        ++accepted;
+        try {
+            peer.write(":s 001 me :Welcome\r\n:s 005 me CASEMAPPING=rfc1459 :are supported\r\n"
+                ~ ":s 376 me :End of MOTD\r\n");
+            peer.flush();
+            while (!peer.empty) {
+                const line = (cast(const(char)[]) peer.readLine()).idup;
+                got ~= line;
+                const reply = respond(line);
+                if (reply.length) {
+                    peer.write(reply);
+                    peer.flush();
+                }
+            }
+        } catch (Exception) {}
+        try peer.close(); catch (Exception) {}
+    }, "127.0.0.1");
+
+    auto ch = createChannel!IRCRawEvent();
+    NetworkConfig cfg;
+    cfg.nick = "me";
+    cfg.host = "127.0.0.1";
+    cfg.saslUsername = "configured-sasl";
+    cfg.services.provider = ServicesProvider.anope;
+    cfg.services.server = "services.test";
+    cfg.services.pins[ServiceId.nickServ] = ServicePin("NickServ", "services", "services.test");
+    auto c = new PersistentIRCClient(cfg, ch);
+    auto op = new WireInfoOperation;
+    registerServicesOperation(ServiceAction.accountInfo, op);
+    IRCRawEvent[] events;
+    void cleanup() {
+        try clearServicesOperations(); catch (Exception) {}
+        try c.connection.close(); catch (Exception) {}
+        try { listener.stopListening(); sleep(10.msecs); } catch (Exception) {}
+        try ch.close(); catch (Exception) {}
+    }
+    scope (exit) cleanup();
+    void drainEvents() {
+        IRCRawEvent ev;
+        // This harness is the only reader. Avoid the channel's zero-time
+        // wait: its condition can wait indefinitely at the exact deadline.
+        while (ch.bufferFill > 0 && ch.tryConsumeOne(ev)) {
+            events ~= ev;
+        }
+    }
+    void pump(long ms) {
+        const until = unixMsNow() + ms;
+        ubyte[4096] buf;
+        while (unixMsNow() < until) {
+            const n = c.readFromStream(buf[], 20.msecs);
+            if (n) {
+                c.inboundPartial ~= cast(const(char)[]) buf[0 .. n];
+                string line;
+                while (popInboundLine(c.inboundPartial, line))
+                    if (line.length) c.processLine(line);
+            }
+            c.services.tick();
+            c.drainServicesQueue();
+        }
+        drainEvents();
+    }
+    ServicesResult[] results_;
+    void delegate(ServicesResult) collect() { return (ServicesResult r) { results_ ~= r; }; }
+    ServicesRequest request(ServiceAction action, string params, string actor) {
+        auto j = parseJsonString(`{"params":` ~ params ~ `}`);
+        j["requestId"] = randomUUID().toString();
+        j["action"] = action.to!string;
+        // Offline: a well-formed review from a connection that is gone.
+        j["expectedConnectionEpoch"] = c.getConnectionEpoch().length ? c.getConnectionEpoch()
+            : randomUUID().toString();
+        j["expectedActorAccount"] = actor;
+        return ServicesRequest.fromJson(j);
+    }
+
+    c.connection = connectTCP("127.0.0.1", listener.bindAddress.port);
+    c.state = ConnectionState.connecting;
+    c.performRegistration();
+    c.connectedAtMs = unixMsNow();
+    c.state = ConnectionState.connected;
+    c.beginServicesGeneration();
+    pump(100);
+    check("registration without 900 leaves the actor unknown",
+        c.getServicesAccountState() == ServicesAccountState.unknown);
+
+    // ── discover: self-WHOIS 330, then WHOIS + VERSION for the seven ───
+    auto discover = request(ServiceAction.discover, `{}`, "");
+    c.executeServices(discover, collect());
+    pump(600);
+    check("an unknown actor is resolved by a suppressed self-WHOIS 330, never by SASL config",
+        c.getServicesAccount() == "acct" && c.getServicesAccount() != cfg.saslUsername);
+    check("discover answers confirmed with observed WHOIS data",
+        results_.length == 1 && results_[0].status == ServiceStatus.confirmed
+        && results_[0].requestId == discover.requestId);
+    Json data = results_.length ? results_[0].data : Json.undefined;
+    check("the pinned NickServ is verified with its CTCP VERSION; absent services say so",
+        data.type == Json.Type.object
+        && data["services"]["nickserv"]["pin"].get!string == "verified"
+        && data["services"]["nickserv"]["version"].get!string.startsWith("Anope-2.1.test")
+        && data["services"]["chanserv"]["pin"].get!string == "absent"
+        && data["approvedServer"].get!string == "services.test");
+    check("discovery WHOIS/VERSION replies never reach the event channel",
+        !events.any!(e => ["311", "312", "318", "330", "401"].canFind(e.command)
+            || e.getTag("ctcp").length));
+
+    // ── typed request through a real frame ────────────────────────────
+    events = null;
+    const before = got.length;
+    auto info = request(ServiceAction.accountInfo, `{"account":"acct"}`, "acct");
+    c.executeServices(info, collect());
+    // A manual line to the busy service is refused, never interleaved.
+    c.sendRaw("PRIVMSG NickServ :IDENTIFY hunter2", true);
+    pump(600);
+    auto frameWire = got[before .. $];
+    const startAt = frameWire.countUntil!(l => l.startsWith(to ~ "\x01PING ifsvc"));
+    const bodyAt = frameWire.countUntil(to ~ "INFO acct");
+    ptrdiff_t endAt = -1;
+    foreach (i, l; frameWire)
+        if (cast(ptrdiff_t) i > bodyAt && l.startsWith(to ~ "\x01PING ifsvc")) { endAt = i; break; }
+    check("start fence, command and end fence leave in order to Nick@server",
+        startAt >= 0 && bodyAt > startAt && endAt > bodyAt);
+    check("the typed request is answered confirmed only with an attributed reply",
+        results_.length == 2 && results_[1].status == ServiceStatus.confirmed
+        && op.last.startFenced && op.last.endFenced && op.last.lines.length == 2);
+    check("NOTICE and PRIVMSG replies are both attributed, formatting kept raw",
+        op.last.lines.length == 2 && op.last.lines[0].command == "NOTICE"
+        && op.last.lines[1].command == "PRIVMSG" && op.last.lines[0].text == "\x02acct\x02 is me"
+        && op.last.lines[0].plain == "acct is me");
+    check("details are sanitized lines for the initiating session only",
+        results_.length == 2 && results_[1].details == ["acct is me", "Registered: today"]);
+    check("correlated private replies and fences never reach the event channel",
+        !events.any!(e => (e.command == "NOTICE" || e.command == "PRIVMSG")
+            && e.nick == "NickServ" && e.text != "Unsolicited reminder"));
+    check("an unsolicited service notice after the frame stays ordinary traffic",
+        events.any!(e => e.command == "NOTICE" && e.nick == "NickServ" && e.text == "Unsolicited reminder"));
+    check("a manual line to the service during the transaction is refused, not queued",
+        !got.any!(l => l.canFind("hunter2")) && !c.outboundQueue.any!(l => l.canFind("hunter2"))
+        && !c.pacedQueue.any!(l => l.canFind("hunter2")));
+    check("nothing services-related went through the reconnect or paced queues",
+        c.outboundQueue.length == 0 && c.pacedQueue.length == 0);
+
+    // ── fences answered, command silently dropped ─────────────────────
+    auto quiet = request(ServiceAction.accountInfo, `{"account":"quiet"}`, "acct");
+    c.executeServices(quiet, collect());
+    pump(600);
+    check("a fenced frame with no command reply is never success",
+        results_.length == 3 && results_[2].status == ServiceStatus.unconfirmed
+        && results_[2].reasonCode == "no_reply");
+
+    // ── dedup, stale epoch ────────────────────────────────────────────
+    const sentBefore = got.length;
+    c.executeServices(info, collect());
+    pump(200);
+    check("a duplicate request id is answered from the dedup record without re-executing",
+        results_.length == 4 && results_[3].reasonCode == "duplicate_request"
+        && results_[3].status == ServiceStatus.confirmed && results_[3].details.length == 0
+        && got.length == sentBefore);
+    auto stale = request(ServiceAction.accountInfo, `{"account":"acct"}`, "acct");
+    stale.expectedConnectionEpoch = randomUUID().toString();
+    c.executeServices(stale, collect());
+    check("a review from another connection epoch is stale",
+        results_.length == 5 && results_[4].status == ServiceStatus.stale
+        && results_[4].reasonCode == "epoch_stale");
+    auto other = request(ServiceAction.accountInfo, `{"account":"acct"}`, "someoneelse");
+    c.executeServices(other, collect());
+    check("a review for another actor account is stale",
+        results_.length == 6 && results_[5].reasonCode == "actor_changed");
+
+    // ── pacing: the dedicated queue waits for the real pacer ──────────
+    auto saved = c.pacer;
+    c.pacer.tighten(unixMsNow());
+    const pacedBefore = got.length;
+    auto paced = request(ServiceAction.accountInfo, `{"account":"acct"}`, "acct");
+    c.executeServices(paced, collect());
+    sleep(100.msecs);
+    check("service lines wait in their own queue while the pacer says wait",
+        c.services.queued > 0 && got.length == pacedBefore);
+    c.pacer = saved;
+    pump(600);
+    check("and leave through the same socket once it admits them",
+        results_.length == 7 && results_[6].status == ServiceStatus.confirmed);
+
+    // ── disconnect mid-transaction ────────────────────────────────────
+    auto lost = request(ServiceAction.accountInfo, `{"account":"acct"}`, "acct");
+    c.executeServices(lost, collect());
+    c.resetConnectionTelemetry();
+    c.state = ConnectionState.disconnected;
+    check("a transaction lost to a disconnect is stale or unconfirmed, never confirmed",
+        results_.length == 8 && results_[7].status != ServiceStatus.confirmed
+        && results_[7].reasonCode == "cancelled_disconnect");
+    c.sendRaw("PRIVMSG NickServ :IDENTIFY hunter2");
+    check("a sensitive line while disconnected is dropped, never queued for replay",
+        !c.outboundQueue.any!(l => l.canFind("hunter2"))
+        && !c.snapshotSession(true).outboundQueue.any!(l => l.canFind("hunter2")));
+    auto offline = request(ServiceAction.accountInfo, `{"account":"acct"}`, "acct");
+    c.executeServices(offline, collect());
+    check("an offline connection answers unavailable",
+        results_.length == 9 && results_[8].reasonCode == "offline");
+
+    wire = got.dup;
+    return results;
+}
+
+} // version (ServicesWireHarness)

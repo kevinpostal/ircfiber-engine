@@ -13,7 +13,7 @@ import ircfiber.models.network : Network;
 import ircfiber.redis.protocol : RedisKeys, NetworkStateSnapshot,
     RetryStatus, FailInfoSnapshot, TlsInfo, PROTOCOL_VERSION;
 import ircfiber.irc.connection : EgressSlotView, egressLocations, egressSlotViews,
-    refreshEgressState;
+    refreshEgressState, servicesAccountStateName;
 import ircfiber.irc.egress_catalog : ExitLocation;
 import std.conv : to;
 private void runSafeTask(void delegate() dg) {
@@ -306,7 +306,13 @@ void writeStateSnapshotForNetwork(ref EngineContext ctx, Network net, string ser
             snap.peerIp = clientForEgress.getActivePeerIp();
             snap.localIp = clientForEgress.getActiveLocalIp();
             snap.ownPrefix = clientForEgress.getOwnPrefix();
+            // Engine-observed services identity of this epoch (getters
+            // export nothing without a live, attached generation).
+            snap.connectionEpoch = clientForEgress.getConnectionEpoch();
+            snap.servicesAccountState = servicesAccountStateName(clientForEgress.getServicesAccountState());
+            snap.servicesAccount = clientForEgress.getServicesAccount();
         }
+        snap.servicesAvailability = snap.connected ? clientForEgress.getServicesAvailability() : "unavailable";
         // Live-connection telemetry for the server-log header: lag
         // probe RTT, RPL_WELCOME instant and negotiated TLS details.
         snap.lagMs = clientForEgress.getLagMs();
@@ -315,6 +321,9 @@ void writeStateSnapshotForNetwork(ref EngineContext ctx, Network net, string ser
         snap.pongAgeSecs = clientForEgress.getPongAgeSecs();
         snap.hasTlsInfo = clientForEgress.hasTlsInfo();
         snap.tlsInfo = clientForEgress.hasTlsInfo() ? clientForEgress.getTlsInfo() : TlsInfo.init;
+    } else {
+        // No engine client: nothing can reach this network's services.
+        snap.servicesAvailability = "unavailable";
     }
 
     // W1-T01-rev1: structured retry + fail info from the engine's

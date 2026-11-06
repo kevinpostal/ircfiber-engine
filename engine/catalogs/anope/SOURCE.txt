@@ -1,0 +1,74 @@
+Anope IRC Services message catalogs (data only)
+===============================================
+
+This directory holds unmodified translation catalogs from Anope IRC Services
+and their compiled form. They are data that the IRC Fiber engine reads to
+recognise service replies in every shipped language
+(engine/source/ircfiber/irc/services_grammar.d embeds the .mo files and the
+English source template <version>/source/anope.en_US.po with D string
+imports). No Anope program code is copied into IRC Fiber.
+
+Copyright and licence
+---------------------
+Anope IRC Services <https://www.anope.org/>
+Copyright (C) 2003-2026 Anope Contributors, and the individual translators
+named in each catalog header. Based on the original code of Epona by Lara
+and of Services by Andy Church.
+
+The catalogs are distributed under the terms of version 2 of the GNU General
+Public License, exactly as published upstream: 2.1/LICENSE.txt is upstream
+docs/LICENSE.txt and 2.0.20/COPYING is upstream docs/COPYING. That licence
+applies to the files in this directory only; it does not change the licence
+of the rest of IRC Fiber.
+
+Provenance
+----------
+2.1/source/*.po     language/anope.*.po of the managed fork
+                    https://github.com/kevinpostal/anope.git
+                    commit f6e46425b6747e1b34ff939ca5e8d6028cd4dae3
+                    (the commit pinned in site/deploy/roles/ircd/files/Containerfile.anope;
+                    VERSION reports Anope-2.1.27-git)
+2.0.20/source/*.po  language/anope.*.po of upstream Anope
+                    https://github.com/anope/anope.git
+                    tag 2.0.20, commit 12f1ebee1c03c1a71ecb7f6c3a1d853f97625bea
+
+The .po files are byte-for-byte copies (corresponding source). Every .mo file
+was produced from the .po beside it with the same command Anope's own build
+uses (language/CMakeLists.txt), which drops fuzzy and untranslated entries and
+keeps every plural form:
+
+    msgfmt -c <version>/source/anope.<locale>.po -o <version>/anope.<locale>.mo
+
+Compiled with GNU gettext-tools msgfmt 1.0. To update, replace the .po files
+from the exact upstream commit, re-run the command for every locale, and
+update the checksums below and the locale lists in services_grammar.d.
+
+SHA-256 of the source catalogs
+------------------------------
+2.1:
+c3275ac4054bbd10f2252277c3c730c03e6224fd77733b63d407c61f6fcb0883  anope.de_DE.po
+17114ed1a40d823ba15ec0c46b5d946e44dfcff19c26192a9ba58c9f571832cc  anope.el_GR.po
+71cdb50bffd25e04d6e5ec94862d90ee407f211af286f5759032c3a33038b678  anope.en_US.po
+2c42c7bbf90b8a99457d93f874700a458e0ff53ae716da51af77807f501b7f94  anope.es_ES.po
+ac1305bd1967f05fb846d3b7bf251994b8a74aa2f5ff25754ed4f5b504f428ae  anope.fr_FR.po
+a8c38d9074c0d892bb7cb37cb20b57b0d97b9bb3f739dc32e6830b17642e81d5  anope.it_IT.po
+3bce082498ee738a9c959a93e1ac1d8ecea87d52eef2adffdffb07f8ff292937  anope.nl_NL.po
+2c3d02cf74d2298ad896c6d767852a0de8d639562ec4fa878d4f0c5705aa6f58  anope.pl_PL.po
+fb51c2cdbc5df2c58c1598b946f8b249c18d0671be35086d1b90f2f492550b72  anope.pt_PT.po
+b7157d83fe5f166acb404271a5bc3d79061ebc428de1a9afce5cfd0fcfdf5bf0  anope.ro_RO.po
+647b8aff060d9127e842f7b14e5b708d80be4bfcf53ee257cd75a97f8762cc28  anope.tr_TR.po
+
+2.0.20:
+9b48375e98f3832ed4743a28a74ce81392dea350f5aac0a1bdf8d583903f8418  anope.ca_ES.po
+4c55c66f75825b915162f29b836dfb728927928f26313ee187d7e5d4b978b1f7  anope.de_DE.po
+955a0eccdbeece53664503ecb8a6b2638026e6ce8594a186ecd643faf8eb0093  anope.el_GR.po
+fe68ed073786db8b2ed9b5a1c5e744ac81d38fff27e9959362616003458fd7d6  anope.en_US.po
+dd260df067e96c2f9d7433b85d4d9a460a6d56eb670cb3c11eae44c36066bc36  anope.es_ES.po
+f5cbb220576e5275d5a8156f6491599d1e4476e3551dd3e99d33ac1ca61fd9cc  anope.fr_FR.po
+e6fe634b1cdf3ee1cd360633b550352bcd382fcd1d3e471127051606d2ded367  anope.hu_HU.po
+d6d693c133ae80bc67aa2345f85dc8e8dcc82af59f934625045ea23900b294bc  anope.it_IT.po
+ea3cb2640f284b911ed6d200ab3fe28ac4bf9acd58b865829a29a129c74a4ec2  anope.nl_NL.po
+30869dd72b82fa2d6184eb9125765603a41992fd7fde7bd88db171fc92c9d632  anope.pl_PL.po
+f3762ba73e61526ed6e7d5ab8e86246903c9e5ef2200830e5d57748beec6d15c  anope.pt_PT.po
+3a496820648143eacdc8bf355fd7029f9702918e4392dd1116fcc1503cdb3ceb  anope.ru_RU.po
+f509ef4c51b50d039e861e5f7392ac7f03377a64de8ced3739ebfd6c0842e112  anope.tr_TR.po
