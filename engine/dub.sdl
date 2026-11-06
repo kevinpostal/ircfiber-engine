@@ -253,4 +253,17 @@ subPackage {
     versions "VibeUseFibers"
     dependency "irc-fiber-common" path="../common"
     dependency "vibe-d:tls" version="~>0.10.0"
+    // First configuration = default: the holder daemon, unchanged.
+    configuration "application" {
+    }
+    // Real-socket TLS regression for dialUpstream's direct per-address
+    // fallback (::1 + 127.0.0.1 loopback upstreams, fresh openssl-minted
+    // certificates). `dub run :holder --config=dial-fallback-test`; exits
+    // non-zero, never skips, when IPv6 loopback or openssl is missing.
+    configuration "dial-fallback-test" {
+        targetName "holder-dial-fallback-test"
+        mainSourceFile "holder/source/holder/dial_fallback_test.d"
+        excludedSourceFiles "holder/source/holder/app.d"
+        versions "HolderDialHarness"
+    }
 }

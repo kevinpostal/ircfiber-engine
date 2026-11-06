@@ -36,6 +36,7 @@ import ircfiber.irc.parser;
 import ircfiber.irc.sasl;
 import ircfiber.irc.pacer;
 import ircfiber.irc.reconnect;
+import ircfiber.irc.route_memory;
 import ircfiber.engine.session_snapshot;
 
 private uint g_passed;
@@ -70,6 +71,7 @@ int main() {
         ircfiber.irc.sasl,
         ircfiber.irc.pacer,
         ircfiber.irc.reconnect,
+        ircfiber.irc.route_memory,
         ircfiber.irc.chathistory,
         ircfiber.engine.session_snapshot
     )();

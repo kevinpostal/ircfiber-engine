@@ -1,0 +1,53 @@
+---
+# The provider-assigned /128 is shared direct egress, not a per-user prefix.
+# Merge into the existing netplan interface; never restart networking here.
+- name: Configure provider-assigned public IPv6
+  when: ircfiber_public_ipv6_address | default('') | length > 0
+  block:
+    - name: Persist the assigned IPv6 address and gateway
+      ansible.builtin.copy:
+        dest: /etc/netplan/60-ircfiber-public-ipv6.yaml
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          network:
+            version: 2
+            ethernets:
+              {{ ircfiber_public_ipv6_interface }}:
+                dhcp6: false
+                addresses:
+                  - {{ ircfiber_public_ipv6_address }}/128
+                routes:
+                  - to: {{ ircfiber_public_ipv6_gateway }}/128
+                    scope: link
+                  - to: default
+                    via: {{ ircfiber_public_ipv6_gateway }}
+                    on-link: true
+      register: _public_ipv6_netplan
+
+    - name: Validate and generate persistent networking without reconfiguring links
+      ansible.builtin.command: netplan generate
+      when: _public_ipv6_netplan.changed
+      changed_when: false
+
+    - name: Add the assigned IPv6 address without disturbing existing addresses
+      ansible.builtin.command:
+        argv: [ip, -6, address, add, "{{ ircfiber_public_ipv6_address }}/128", dev, "{{ ircfiber_public_ipv6_interface }}"]
+      register: _public_ipv6_add
+      changed_when: _public_ipv6_add.rc == 0
+      failed_when: _public_ipv6_add.rc != 0 and 'File exists' not in _public_ipv6_add.stderr and 'address already assigned' not in _public_ipv6_add.stderr
+
+    - name: Make the provider IPv6 gateway reachable on link
+      ansible.builtin.command:
+        argv: [ip, -6, route, add, "{{ ircfiber_public_ipv6_gateway }}/128", dev, "{{ ircfiber_public_ipv6_interface }}"]
+      register: _public_ipv6_gateway_add
+      changed_when: _public_ipv6_gateway_add.rc == 0
+      failed_when: _public_ipv6_gateway_add.rc != 0 and 'File exists' not in _public_ipv6_gateway_add.stderr
+
+    - name: Add the public IPv6 default route without restarting networking
+      ansible.builtin.command:
+        argv: [ip, -6, route, add, default, via, "{{ ircfiber_public_ipv6_gateway }}", dev, "{{ ircfiber_public_ipv6_interface }}"]
+      register: _public_ipv6_default_add
+      changed_when: _public_ipv6_default_add.rc == 0
+      failed_when: _public_ipv6_default_add.rc != 0 and 'File exists' not in _public_ipv6_default_add.stderr

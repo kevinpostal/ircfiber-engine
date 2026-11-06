@@ -13,6 +13,9 @@
 # engine connectTCP(..., bind=<prefix>:<uid-iid>) without a per-user
 # `ip addr add`; replies arrive because the provider routes the whole
 # prefix here and the local route delivers any IID to the socket.
+- name: Configure the provider-assigned shared public IPv6
+  ansible.builtin.include_tasks: public_ipv6.yml
+
 - name: Configure per-user IPv6 (host-level, idempotent)
   when: ircfiber_ipv6_prefix is defined and ircfiber_ipv6_prefix | length > 0
   block:

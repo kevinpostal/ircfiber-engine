@@ -48,7 +48,7 @@
     group: root
     mode: "0750"
 
-- name: Per-user IPv6 host prep (no-op unless ircfiber_ipv6_prefix is set)
+- name: IPv6 host prep (shared assigned address and optional per-user prefix)
   ansible.builtin.include_tasks: ipv6.yml
 
 - name: Render engine env file

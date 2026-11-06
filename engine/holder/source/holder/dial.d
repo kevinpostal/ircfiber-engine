@@ -484,12 +484,11 @@ private void finishHappyEyeballs(TCPConnection[] conns, Task[] tasks, int winner
     }
 }
 
-/// Direct dial: DNS + Happy Eyeballs race across every resolved address
-/// (250 ms stagger, `ipv6BindAddr` as the IPv6 local bind). Throws
-/// `DialFailed("dns"|"tcp", …)`.
-private TCPConnection happyEyeballsDirect(string host, ushort port, string ipv6BindAddr,
-                                          Duration connectTimeout, EventSink emit) {
-    const egressLabel = ipv6BindAddr.length > 0 ? "ipv6:" ~ ipv6BindAddr : "direct";
+/// Vetted direct-dial candidates for `host` in Happy Eyeballs order: DNS
+/// (worker thread + cache), then the destination policy — unless `host` is
+/// allowlisted for internal addresses, only resolved public IPs are kept.
+/// Emits the `dns` line. Throws `DialFailed("dns"|"blocked", …)`.
+private ResolvedAddr[] directCandidates(string host, ushort port, string egressLabel, EventSink emit) {
     auto addrs = resolveAllAddresses(host, port);
     if (addrs.length == 0) {
         report(emit, "attempt_fail", "DNS lookup for " ~ host ~ " returned no addresses.");
@@ -519,70 +518,75 @@ private TCPConnection happyEyeballsDirect(string host, ushort port, string ipv6B
     }
 
     auto interleaved = interleaveAddressFamilies(addrs);
-    {
-        string list;
-        foreach (i, a; interleaved) {
-            if (i >= 4) { list ~= ", …"; break; }
-            if (i) list ~= ", ";
-            list ~= a.ip;
-        }
-        report(emit, "dns", "Resolved " ~ host ~ " → " ~ interleaved.length.to!string
-            ~ (interleaved.length == 1 ? " address" : " addresses") ~ " (" ~ list ~ "), connecting via " ~ egressLabel ~ ".");
+    string list;
+    foreach (i, a; interleaved) {
+        if (i >= 4) { list ~= ", …"; break; }
+        if (i) list ~= ", ";
+        list ~= a.ip;
     }
+    report(emit, "dns", "Resolved " ~ host ~ " → " ~ interleaved.length.to!string
+        ~ (interleaved.length == 1 ? " address" : " addresses") ~ " (" ~ list ~ "), connecting via " ~ egressLabel ~ ".");
+    return interleaved;
+}
+
+/// Winner of one direct TCP race: `ok` with the socket and its index into
+/// the candidate list, or `!ok` when no remaining address connected.
+private struct TcpWinner {
+    bool ok;
+    TCPConnection conn;
+    size_t index;
+}
+
+/// One Happy Eyeballs TCP race over the `candidates` not yet `spent`
+/// (250 ms stagger; `ipv6BindAddr` binds IPv6 attempts only — an IPv4
+/// attempt bound to an IPv6 source fails with EINVAL). Every address
+/// whose connect failed is marked spent; attempts cancelled because
+/// another address won stay unspent. Losing sockets are closed.
+private TcpWinner raceDirectTcp(string host, ushort port, const ResolvedAddr[] candidates, bool[] spent,
+                                string ipv6BindAddr, string egressLabel, Duration connectTimeout,
+                                EventSink emit) {
     const connectTimeoutSecs = connectTimeout.total!"seconds";
-    logDebug("Happy Eyeballs: racing %d addresses for %s (connect timeout %ds, race timeout %ds)",
-        interleaved.length, host, connectTimeoutSecs, HAPPY_EYEBALLS_RACE_TIMEOUT_SECONDS);
-    immutable raceStartMs = Clock.currTime.toUnixTime!long * 1000;
-
     auto winnerCh = createChannel!int();
-    auto conns = new TCPConnection[interleaved.length];
-    auto tasks = new Task[interleaved.length];
+    auto conns = new TCPConnection[candidates.length];
+    auto tasks = new Task[candidates.length];
     bool done = false;
-    size_t failed = 0;
+    size_t pending = 0, failed = 0;
+    foreach (s; spent) if (!s) pending++;
+    logDebug("Happy Eyeballs: racing %d addresses for %s (connect timeout %ds, race timeout %ds)",
+        pending, host, connectTimeoutSecs, HAPPY_EYEBALLS_RACE_TIMEOUT_SECONDS);
 
-    foreach (idx, addr; interleaved) {
-        // Before launching the next attempt, see if an earlier one already won.
-        if (idx > 0) {
-            int winIdx;
-            if (winnerCh.tryConsumeOne(winIdx, HAPPY_EYEBALLS_DELAY_MS.msecs)) {
-                if (winIdx < 0) {
-                    failed++;
-                } else if (conns[winIdx] && conns[winIdx].connected) {
-                    done = true;
-                    finishHappyEyeballs(conns, tasks, winIdx);
-                    logDebug("Happy Eyeballs: winner %s for %s", interleaved[winIdx].ip, host);
-                    return conns[winIdx];
-                }
-            }
-        }
+    TcpWinner claim(int idx) {
+        done = true;
+        finishHappyEyeballs(conns, tasks, idx);
+        logDebug("Happy Eyeballs: winner %s for %s", candidates[idx].ip, host);
+        return TcpWinner(true, conns[idx], cast(size_t) idx);
+    }
 
-        auto connIdx = idx;
-        auto addrIp  = addr.ip;
-        auto addrFam = addr.family;
-        // With per-user IPv6, bind the source to the user's deterministic
-        // /128 — IPv6→IPv6 only, to avoid EINVAL when racing an IPv4 A record.
-        auto bindForThisAddr = (ipv6BindAddr.length > 0 && addrFam == AddressFamily.INET6) ? ipv6BindAddr : null;
+    // A nested function gives every attempt its own closure frame.
+    void launch(size_t ci) {
+        const addrIp = candidates[ci].ip;
+        const bind = (ipv6BindAddr.length > 0 && candidates[ci].family == AddressFamily.INET6)
+            ? ipv6BindAddr : null;
         report(emit, "attempt", "Trying " ~ addrIp ~ ":" ~ port.to!string ~ " via " ~ egressLabel
-            ~ (bindForThisAddr ? " bind=" ~ bindForThisAddr : "")
+            ~ (bind ? " bind=" ~ bind : "")
             ~ " (up to " ~ connectTimeoutSecs.to!string ~ "s)…");
-        tasks[connIdx] = safeFiberRun("happy_eyeballs_attempt", host, {
+        tasks[ci] = safeFiberRun("happy_eyeballs_attempt", host, {
             immutable attemptStartMs = Clock.currTime.toUnixTime!long * 1000;
             try {
                 // vibe.d connectTCP third param is string localAddr (bind IP)
-                TCPConnection conn = bindForThisAddr.length > 0
-                    ? connectTCP(addrIp, port, bindForThisAddr, 0, connectTimeout)
-                    : connectTCP(addrIp, port, null, 0, connectTimeout);
+                TCPConnection conn = connectTCP(addrIp, port, bind.length > 0 ? bind : null, 0, connectTimeout);
                 if (done) {
                     try { conn.close(); } catch (Exception) {}
                     return;
                 }
-                conns[connIdx] = conn;
-                try { winnerCh.put(cast(int) connIdx); } catch (Exception) {
+                conns[ci] = conn;
+                try { winnerCh.put(cast(int) ci); } catch (Exception) {
                     try { conn.close(); } catch (Exception) {}
                 }
             } catch (Exception e) {
                 logDebug("Happy Eyeballs: %s failed: %s", addrIp, e.msg);
                 if (!done) {
+                    spent[ci] = true;
                     const tookMs = Clock.currTime.toUnixTime!long * 1000 - attemptStartMs;
                     report(emit, "attempt_fail", addrIp ~ " via " ~ egressLabel ~ ": "
                         ~ shortConnectError(e.msg) ~ " (" ~ (tookMs / 1000).to!string ~ "s).");
@@ -597,27 +601,34 @@ private TCPConnection happyEyeballsDirect(string host, ushort port, string ipv6B
         });
     }
 
+    bool first = true;
+    foreach (ci; 0 .. candidates.length) {
+        if (spent[ci]) continue;
+        // Before launching the next attempt, see if an earlier one already won.
+        if (!first) {
+            int winIdx;
+            if (winnerCh.tryConsumeOne(winIdx, HAPPY_EYEBALLS_DELAY_MS.msecs)) {
+                if (winIdx < 0) failed++;
+                else if (conns[winIdx] && conns[winIdx].connected) return claim(winIdx);
+            }
+        }
+        first = false;
+        launch(ci);
+    }
+
     // Wait for a winner. Each attempt reports either its index (success) or
     // -1 (failure); the race ends on the first success, once every attempt
     // has failed, or when the per-address race timeout expires.
-    while (failed < interleaved.length) {
+    while (failed < pending) {
         int winIdx;
         if (!winnerCh.tryConsumeOne(winIdx, HAPPY_EYEBALLS_RACE_TIMEOUT_SECONDS.seconds)) break;
         if (winIdx < 0) { failed++; continue; }
-        if (conns[winIdx] && conns[winIdx].connected) {
-            done = true;
-            finishHappyEyeballs(conns, tasks, winIdx);
-            logDebug("Happy Eyeballs: winner %s for %s", interleaved[winIdx].ip, host);
-            return conns[winIdx];
-        }
+        if (conns[winIdx] && conns[winIdx].connected) return claim(winIdx);
     }
 
     done = true;
     finishHappyEyeballs(conns, tasks, -1);
-    const tookMs = Clock.currTime.toUnixTime!long * 1000 - raceStartMs;
-    report(emit, "attempt_fail", "No address for " ~ host ~ " answered via " ~ egressLabel
-        ~ " (" ~ (tookMs / 1000).to!string ~ "s).");
-    throw new DialFailed("tcp", "All connection attempts failed for " ~ host ~ ":" ~ port.to!string);
+    return TcpWinner.init;
 }
 
 // ── TLS ─────────────────────────────────────────────────────────────────────
@@ -888,45 +899,32 @@ private TLSContext clientTlsContext() {
     return ctx;
 }
 
-/// Performs one dial exactly as requested. Emits `EVENT`s through `emit`
-/// as each phase happens; throws `DialFailed` (phase + verbatim reason)
-/// on any failure, after closing whatever it opened.
-DialOutcome dialUpstream(ref DialRequest req, EventSink emit) {
-    DialOutcome o;
-    const target = stripHostBrackets(req.host);
-    const connectTimeout = req.connectTimeoutMs.msecs;
+/// Closes whatever a dial opened (TLS stream first, then the socket).
+private void closeOutcome(ref DialOutcome o) nothrow {
+    try { if (o.tls !is null) o.tls.finalize(); } catch (Exception) {}
+    try { o.conn.close(); } catch (Exception) {}
+}
 
-    if (req.hasProxy) {
-        // One CONNECT with the hostname: the exit resolves it (see
-        // socks5ConnectViaProxy). The engine already emitted the `attempt`
-        // line for proxied dials; on failure it composes `attempt_fail`.
-        {
-            string[] resolved;
-            if (!isIpLiteral(target) && !isPrivateAllowedHost(target, privateAllowHosts()))
-                foreach (a; resolveAllAddresses(target, req.port))
-                    if (isIpLiteral(a.ip)) resolved ~= a.ip;
-            const why = proxiedDialBlockReason(target, resolved, privateAllowHosts());
-            if (why.length) throw new DialFailed("blocked", "blocked: " ~ why);
-        }
-        try {
-            o.conn = socks5ConnectViaProxy(req.proxy.host, req.proxy.port, req.proxy.username, req.proxy.password, target, req.port, connectTimeout);
-        } catch (Exception e) {
-            const l = e.msg.toLower();
-            throw new DialFailed(l.canFind("socks") ? "socks5" : "tcp", e.msg);
-        }
-    } else {
-        o.conn = happyEyeballsDirect(req.host, req.port, req.bindIp6, connectTimeout, emit);
-    }
-    scope (failure) {
-        try { if (o.tls !is null) o.tls.finalize(); } catch (Exception) {}
-        try { o.conn.close(); } catch (Exception) {}
-    }
+/// Runs the requested protocol on the freshly connected `o.conn`:
+/// `tcp_open`, then STARTTLS and/or the TLS handshake (SNI `req.sni`).
+/// On failure closes everything and throws `DialFailed("starttls"|"tls", …)`;
+/// the failed TLS session is never retried.
+private void negotiate(ref DialRequest req, ref DialOutcome o, EventSink emit) {
+    scope (failure) closeOutcome(o);
     recordAddrs(o, o.conn);
     if (emit !is null) emit(EventLine("tcp_open", "", o.peerIp, o.localIp, o.peerPort, o.localPort));
 
     if (req.tls == "starttls") {
         report(emit, "starttls", "");
-        awaitStarttlsGoAhead(o.conn, req.starttlsTimeoutMs.msecs, o.preTlsLines);
+        try {
+            awaitStarttlsGoAhead(o.conn, req.starttlsTimeoutMs.msecs, o.preTlsLines);
+        } catch (DialFailed e) {
+            throw e;
+        } catch (Exception e) {
+            // A reset or write error mid-STARTTLS is a STARTTLS failure of
+            // this address, not a failed TCP connect.
+            throw new DialFailed("starttls", e.msg);
+        }
     }
     if (req.tls == "implicit" || req.tls == "starttls") {
         if (req.tls == "implicit") report(emit, "tls", "");
@@ -938,7 +936,100 @@ DialOutcome dialUpstream(ref DialRequest req, EventSink emit) {
         }
         o.tlsInfo = captureTlsInfo(o.tls, req.tag.name);
     }
+}
+
+/// How far a failed protocol attempt got; the furthest is the one reported.
+private int failureDepth(string phase) @safe pure nothrow @nogc {
+    return phase == "tls" ? 2 : phase == "starttls" ? 1 : 0;
+}
+
+/// Direct dial: race TCP over the vetted addresses, then run the requested
+/// protocol on the winner. A winner that fails STARTTLS/TLS is closed and
+/// the race reruns over the addresses not yet tried, so a TLS-ready
+/// address of the other family (or a second A/AAAA record) still connects
+/// when the first one accepts TCP but drops the handshake. Each address is
+/// tried to completion at most once per dial, each step within the existing
+/// connect/TLS/STARTTLS timeouts; plain TCP ends at the first connect.
+private DialOutcome dialDirect(ref DialRequest req, Duration connectTimeout, EventSink emit) {
+    const egressLabel = req.bindIp6.length > 0 ? "ipv6:" ~ req.bindIp6 : "direct";
+    const candidates = directCandidates(req.host, req.port, egressLabel, emit);
+    auto spent = new bool[candidates.length];
+    immutable raceStartMs = Clock.currTime.toUnixTime!long * 1000;
+    DialFailed furthest;
+    size_t protocolFailures = 0;
+    while (true) {
+        auto won = raceDirectTcp(req.host, req.port, candidates, spent, req.bindIp6, egressLabel,
+            connectTimeout, emit);
+        if (!won.ok) break;
+        spent[won.index] = true;
+        DialOutcome o;
+        o.conn = won.conn;
+        try {
+            negotiate(req, o, emit);
+            return o;
+        } catch (DialFailed e) {
+            protocolFailures++;
+            if (furthest is null || failureDepth(e.phase) > failureDepth(furthest.phase)) furthest = e;
+            size_t left = 0;
+            foreach (s; spent) if (!s) left++;
+            report(emit, "attempt_fail", candidates[won.index].ip ~ " via " ~ egressLabel ~ ": "
+                ~ (e.phase == "starttls" ? "STARTTLS" : "TLS") ~ " failed: " ~ e.msg
+                ~ (left ? " — trying the next address." : "."));
+            if (left == 0) break;
+        }
+    }
+    if (furthest !is null) {
+        if (protocolFailures == 1) throw furthest;
+        throw new DialFailed(furthest.phase, furthest.msg ~ " (" ~ protocolFailures.to!string
+            ~ " addresses failed " ~ (furthest.phase == "starttls" ? "STARTTLS" : "TLS") ~ ")");
+    }
+    const tookMs = Clock.currTime.toUnixTime!long * 1000 - raceStartMs;
+    report(emit, "attempt_fail", "No address for " ~ req.host ~ " answered via " ~ egressLabel
+        ~ " (" ~ (tookMs / 1000).to!string ~ "s).");
+    throw new DialFailed("tcp", "All connection attempts failed for " ~ req.host ~ ":" ~ req.port.to!string);
+}
+
+/// Performs one dial exactly as requested. Emits `EVENT`s through `emit`
+/// as each phase happens; throws `DialFailed` (phase + verbatim reason)
+/// on any failure, after closing whatever it opened.
+DialOutcome dialUpstream(ref DialRequest req, EventSink emit) {
+    const target = stripHostBrackets(req.host);
+    const connectTimeout = req.connectTimeoutMs.msecs;
+    if (!req.hasProxy) return dialDirect(req, connectTimeout, emit);
+
+    // One CONNECT with the hostname: the exit resolves it (see
+    // socks5ConnectViaProxy). The engine already emitted the `attempt`
+    // line for proxied dials; on failure it composes `attempt_fail`.
+    {
+        string[] resolved;
+        if (!isIpLiteral(target) && !isPrivateAllowedHost(target, privateAllowHosts()))
+            foreach (a; resolveAllAddresses(target, req.port))
+                if (isIpLiteral(a.ip)) resolved ~= a.ip;
+        const why = proxiedDialBlockReason(target, resolved, privateAllowHosts());
+        if (why.length) throw new DialFailed("blocked", "blocked: " ~ why);
+    }
+    DialOutcome o;
+    try {
+        o.conn = socks5ConnectViaProxy(req.proxy.host, req.proxy.port, req.proxy.username, req.proxy.password, target, req.port, connectTimeout);
+    } catch (Exception e) {
+        const l = e.msg.toLower();
+        throw new DialFailed(l.canFind("socks") ? "socks5" : "tcp", e.msg);
+    }
+    negotiate(req, o, emit);
     return o;
+}
+
+version (HolderDialHarness) {
+    /// Harness-only: makes `host` resolve to `addrs` (in this order) through
+    /// the real resolver cache for `DNS_CACHE_TTL_MS`, so a test dial can
+    /// reach several loopback addresses under one TLS hostname.
+    void seedResolvedAddresses(string host, ResolvedAddr[] addrs) {
+        const now = Clock.currTime.toUnixTime!long * 1000;
+        synchronized (gDnsLock) {
+            dnsCache[host] = addrs.dup;
+            dnsCacheTime[host] = now;
+        }
+    }
 }
 
 @("stripHostBrackets handles URLs and bracketed literals")

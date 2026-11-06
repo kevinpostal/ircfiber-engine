@@ -100,6 +100,43 @@ On a quarantine transition the engine queues one `notice` in
 `irc:logs:outbox`; FiberEye delivers it to `#staff`. Redis delivery is
 best-effort and does not block reconnect decisions if unavailable.
 
+### Automatic route selection and IPv6
+
+Automatic routing remembers completed TCP+TLS/STARTTLS dials per host, port,
+and TLS mode: successful routes lead for 30 minutes, failed routes go last
+for five minutes but remain last resorts. Memory is process-local and bounded
+to 512 endpoints with 32 concrete routes each; retargeting an exit starts fresh.
+Host-specific TLS failures do not trip an exit's global circuit breaker.
+Host bans, SASL gates, and client avoidance still take precedence. Direct pins
+stay direct; NordVPN pins stay on NordVPN; location pins may use another VPN
+exit but never fall back to direct.
+
+Direct TLS/STARTTLS tries the remaining vetted DNS addresses if the first
+TCP winner fails negotiation. Each address gets at most one protocol attempt,
+with the existing timeouts, original SNI, and no plaintext downgrade.
+The timeline can therefore contain multiple TCP-open and TLS-attempt events
+within one direct dial.
+
+For a provider-assigned **shared /128**, set `ircfiber_public_ipv6_address`,
+`ircfiber_public_ipv6_gateway`, and `ircfiber_public_ipv6_interface` in host
+inventory. The engine role persists a netplan overlay and adds the address
+and routes without restarting networking or containers. This is separate from
+`ircfiber_ipv6_prefix`, which requires an actually routed per-user prefix.
+An assigned IPv6 route does not override a remote server's access policy.
+
+```bash
+cd engine
+dub test --compiler=ldc2
+dub run :holder --config=dial-fallback-test --compiler=ldc2
+```
+
+The real-socket harness requires IPv6 loopback and `openssl`; it checks TLS
+fallback, bounded silent-peer timeouts with scheduler progress, cleanup,
+STARTTLS, unchanged plaintext behavior, original SNI, and destination policy.
+Deploying the holder (`make ship-holder`) disconnects **every IRC session**;
+an engine hot swap alone cannot install holder-side address fallback.
+
+
 ## Links
 
 * Superproject: [kevinpostal/irc-fiber](https://github.com/kevinpostal/irc-fiber)
