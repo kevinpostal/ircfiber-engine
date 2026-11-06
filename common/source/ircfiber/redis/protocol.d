@@ -87,6 +87,14 @@ struct RedisKeys {
     /// lying forever. Not per-server: the pool itself is gateway-global.
     static string egressProbe(string label) { return "irc:egress:probe:" ~ label; }
 
+    /// Durable admission record for one egress exit label (operator drain,
+    /// quarantine circuit, single recovery trial), bound to the exit's
+    /// canonical `host:port`. JSON owned exclusively by the Lua scripts in
+    /// ircfiber.irc.egress_admission; read it only through that module.
+    /// No TTL — a drain or open circuit must survive restarts and hot swaps.
+    /// Not per-server: every engine and the gateway share one verdict.
+    static string egressAdmission(string label) { return "irc:egress:admission:" ~ label; }
+
     /// Latest reachability result for one proxy label against every host the
     /// daily sweep (ircfiber.web.admin.egress_reachability) has tested it
     /// against: hash field `<host>:<port>` (host lowercased) -> JSON

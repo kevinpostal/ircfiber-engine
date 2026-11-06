@@ -19,6 +19,7 @@ import vibe.core.log;
 import vibe.core.net : connectTCP, TCPConnection;
 import vibe.core.task : Task;
 import vibe.data.json : Json;
+import vibe.db.redis.redis : RedisDatabase;
 import vibe.stream.operations : IOMode;
 import core.time : Duration, dur, msecs, seconds, minutes;
 
@@ -54,6 +55,9 @@ import ircfiber.irc.egress_catalog : ExitLocation, ExitRelay, locationMatches,
     pickRelayForPin;
 import ircfiber.irc.route_memory : RouteMemory, RouteStanding, rankByRouteMemory, routeEndpointKey,
     ROUTE_FAILURE_COOLDOWN_MS;
+import ircfiber.irc.egress_admission : EgressAdmission, EgressEndpointRef, EgressDialAdmit, EgressQuarantine,
+    EgressTrialOutcome, EGRESS_TRIAL_SUSTAIN_MS, readEgressAdmissions, admitEgressDial, renewEgressTrial,
+    settleEgressTrial, quarantineEgress, unavailableAdmission;
 import ircfiber.irc.mls_peer : FiberMlsKind, FiberMlsPacket, IrcPrefix, PeerTicket, RosterMatch,
     DEFAULT_PREFIX_SYMBOLS, FIBERMLS_TICKET_TTL_SECS, buildFiberMlsId, canonicalNetworkKey,
     generateTicketHex, ircNamesEqual, isReservedFiberMls, matchRosterIdentity, normalizeFiberChannel,
@@ -631,8 +635,9 @@ private struct MullvadProxy {
     /// happyEyeballsConnect's tiering comment.
     long lastSuccessMs;
     /// Correlated established-session losses, keyed by full IRC hostname.
+    /// Detection evidence only: the resulting quarantine is durable admission
+    /// state (ircfiber.irc.egress_admission), never a field of this slot.
     long[string] recentLossAtMsByHost;
-    long quarantinedUntilMs;
 }
 private __gshared MullvadProxy[] mullvadPool;
 private __gshared size_t mullvadRR;
@@ -644,7 +649,280 @@ private __gshared Object gMullvadLock;
 /// RedisKeys.nordvpnCreds() without threading redis through getHealthyProxies.
 private __gshared RedisStorage gEgressRedis;
 
-void setEgressRedis(RedisStorage redis) { gEgressRedis = redis; }
+void setEgressRedis(RedisStorage redis) {
+    gEgressRedis = redis;
+    gAdmissionStore = redis is null ? null : new RedisAdmissionStore(redis);
+}
+
+// ── Durable egress admission ─────────────────────────────────────────────────
+// Operator drain, correlated-loss quarantine and the single recovery trial
+// live in Redis (ircfiber.irc.egress_admission), shared by every engine and
+// the gateway and surviving hot swaps. They are read and written only
+// outside gMullvadLock (Redis I/O yields the fiber). Without a store every
+// VPN exit reads `unavailable`: new VPN dials fail closed.
+
+/// Lock for a claimed trial before its session registers: dial, TLS or
+/// STARTTLS and the whole registration budget, with margin.
+private enum long EGRESS_TRIAL_CLAIM_MS = 180_000L;
+/// Lock extension past registration: the sustain window, the keepalive
+/// tick that sends the verifying PING (<= 30 s) and its PONG, with margin.
+private enum long EGRESS_TRIAL_SETTLE_SLACK_MS = 90_000L;
+
+/// Admission backend seam. Production is `RedisAdmissionStore`; unit tests
+/// install a scripted store. Every method may throw; callers fail closed.
+private interface EgressAdmissionStore {
+    EgressAdmission[] read(const(EgressEndpointRef)[] exits, long nowMs);
+    EgressDialAdmit admit(EgressEndpointRef exit, bool allowTrial, long claimMs, long nowMs);
+    bool renewTrial(EgressEndpointRef exit, string token, long untilMs, long nowMs);
+    string settleTrial(EgressEndpointRef exit, string token, EgressTrialOutcome outcome,
+                       string reason, long nowMs);
+    EgressQuarantine quarantine(EgressEndpointRef exit, string reason, long nowMs);
+}
+
+private final class RedisAdmissionStore : EgressAdmissionStore {
+    private RedisStorage redis;
+    this(RedisStorage redis) { this.redis = redis; }
+    private RedisDatabase db() { return redis.getDb(); }
+    EgressAdmission[] read(const(EgressEndpointRef)[] exits, long nowMs) {
+        return readEgressAdmissions(db(), exits, nowMs);
+    }
+    EgressDialAdmit admit(EgressEndpointRef e, bool allowTrial, long claimMs, long nowMs) {
+        return admitEgressDial(db(), e.label, e.host, e.port, allowTrial, claimMs, nowMs);
+    }
+    bool renewTrial(EgressEndpointRef e, string token, long untilMs, long nowMs) {
+        return renewEgressTrial(db(), e.label, e.host, e.port, token, untilMs, nowMs);
+    }
+    string settleTrial(EgressEndpointRef e, string token, EgressTrialOutcome outcome, string reason, long nowMs) {
+        return settleEgressTrial(db(), e.label, e.host, e.port, token, outcome, reason, nowMs);
+    }
+    EgressQuarantine quarantine(EgressEndpointRef e, string reason, long nowMs) {
+        return quarantineEgress(db(), e.label, e.host, e.port, reason, nowMs);
+    }
+}
+
+private __gshared EgressAdmissionStore gAdmissionStore;
+
+version (unittest) {
+    /// Scripted admission backend: read verdicts and pre-dial replies are
+    /// set by each test; it keeps only a ledger of trial claims and settled
+    /// exit verdicts so tests can assert their effect. The real state
+    /// machine runs in Redis (egress-admission-redis-test).
+    private final class ScriptedAdmissionStore : EgressAdmissionStore {
+        /// label → read() verdict; absent = healthy.
+        EgressAdmission[string] states;
+        /// label → admit() reply; absent = allowed without a trial. A reply
+        /// carrying a trial token is refused (`recovering`) unless the dial
+        /// is a recovery-tier candidate, as the store contract requires.
+        EgressDialAdmit[string] admitReplies;
+        /// read()/admit() throw (store outage).
+        bool failing;
+        /// The store's own clock refuses a success (`early`).
+        bool refuseSuccessAsEarly;
+        /// Every trial was cancelled or expired store-side (`stale`).
+        bool trialsCancelled;
+        /// quarantine() writes are refused (read-only replica / ACL) while
+        /// reads keep working.
+        bool refuseQuarantineWrites;
+        EgressQuarantine quarantineReply = EgressQuarantine(true, false, false, 0);
+        /// Claimed and not yet settled: token → exit label.
+        string[string] openTrials;
+        /// Trial tokens whose session the store saw register.
+        bool[string] registeredTrials;
+        /// Accepted outcomes in order, "<label>:<outcome>".
+        string[] verdicts;
+        EgressEndpointRef[] quarantined;
+        string[] quarantineReasons;
+
+        void set(string label, string state) {
+            EgressAdmission a;
+            a.state = state;
+            a.draining = state == "draining";
+            states[label] = a;
+        }
+
+        EgressAdmission[] read(const(EgressEndpointRef)[] exits, long nowMs) {
+            if (failing) throw new Exception("redis down");
+            EgressAdmission[] r;
+            foreach (e; exits) r ~= (e.label in states) ? states[e.label] : EgressAdmission.init;
+            return r;
+        }
+        EgressDialAdmit admit(EgressEndpointRef e, bool allowTrial, long claimMs, long nowMs) {
+            if (failing) throw new Exception("redis down");
+            EgressDialAdmit r;
+            r.allowed = true;
+            if (auto scripted = e.label in admitReplies) r = *scripted;
+            if (r.trialToken.length && !allowTrial) return EgressDialAdmit(false, "", "recovering");
+            if (r.trialToken.length) openTrials[r.trialToken] = e.label;
+            return r;
+        }
+        bool renewTrial(EgressEndpointRef e, string token, long untilMs, long nowMs) {
+            if (trialsCancelled || token !in openTrials) return false;
+            registeredTrials[token] = true;
+            return true;
+        }
+        string settleTrial(EgressEndpointRef e, string token, EgressTrialOutcome outcome,
+                           string reason, long nowMs) {
+            if (trialsCancelled || token !in openTrials) return "stale";
+            if (outcome == EgressTrialOutcome.success && refuseSuccessAsEarly) return "early";
+            openTrials.remove(token);
+            verdicts ~= e.label ~ ":" ~ outcome.to!string;
+            return "ok";
+        }
+        EgressQuarantine quarantine(EgressEndpointRef e, string reason, long nowMs) {
+            if (refuseQuarantineWrites) throw new Exception("READONLY You can't write against a read only replica.");
+            quarantined ~= e;
+            quarantineReasons ~= reason;
+            return quarantineReply;
+        }
+    }
+}
+
+private EgressEndpointRef exitRef(const(MullvadProxy)* p) nothrow {
+    return EgressEndpointRef(p.label, p.host, p.port);
+}
+
+/// A correlated-loss quarantine the store has not accepted yet (outage,
+/// read-only replica, ACL refusal). Until it is persisted the exit is
+/// `unavailable` to this engine: a write failure never leaves it healthy.
+private struct PendingQuarantine {
+    EgressEndpointRef exit;
+    string reason;
+    size_t distinctHosts;
+}
+/// label → unpersisted quarantine. Guarded by gMullvadLock (no I/O under it).
+private __gshared PendingQuarantine[string] gPendingQuarantines;
+
+private bool quarantinePending(string label) nothrow {
+    bool pending;
+    withPoolLock({ pending = (label in gPendingQuarantines) !is null; });
+    return pending;
+}
+
+/// Persists every pending quarantine it can (Redis I/O outside the lock).
+/// A persisted transition is logged and announced exactly once; a record
+/// the store reports as malformed/rebound blocks dials by itself.
+private void flushPendingQuarantines() nothrow {
+    PendingQuarantine[] todo;
+    withPoolLock({ foreach (_, p; gPendingQuarantines) todo ~= p; });
+    auto store = gAdmissionStore;
+    if (todo.length == 0 || store is null) return;
+    foreach (p; todo) {
+        const now = nowMsSafe();
+        EgressQuarantine q;
+        try {
+            q = store.quarantine(p.exit, p.reason, now);
+        } catch (Exception e) {
+            try logWarn("VPN exit %s: correlated-loss quarantine still not persisted (new dials blocked): %s",
+                p.exit.label, e.msg);
+            catch (Exception) {}
+            continue;
+        }
+        withPoolLock({ gPendingQuarantines.remove(p.exit.label); });
+        if (!q.opened) continue;
+        try {
+            logJsonMap("warn", "connection", "Correlated VPN exit loss",
+                ["event": "egress_quarantined", "label": p.exit.label,
+                 "distinctHosts": p.distinctHosts.to!string, "retryAtMs": q.retryAtMs.to!string]);
+            announceEgressQuarantine(p.exit.label, p.distinctHosts, q.retryAtMs - now, now);
+        } catch (Exception) {}
+    }
+}
+
+/// Admission for `exits`, aligned with them. Never throws: no store or a
+/// failed read makes every entry `unavailable`, and so does a quarantine
+/// this engine detected but could not persist yet.
+private EgressAdmission[] readAdmissions(const(EgressEndpointRef)[] exits) nothrow {
+    flushPendingQuarantines();
+    auto store = gAdmissionStore;
+    string failure = "no admission store configured";
+    EgressAdmission[] r;
+    if (store !is null) {
+        try {
+            r = store.read(exits, nowMsSafe());
+            if (r.length != exits.length) {
+                r = null;
+                failure = "admission reply misaligned";
+            }
+        } catch (Exception e) {
+            r = null;
+            failure = e.msg;
+        }
+    }
+    if (r is null) {
+        r = new EgressAdmission[exits.length];
+        foreach (ref a; r) a = unavailableAdmission(failure);
+    }
+    withPoolLock({
+        foreach (i, e; exits) if (e.label in gPendingQuarantines) {
+            r[i] = unavailableAdmission("");
+            r[i].reason = "correlated-loss quarantine not yet persisted; new dials blocked";
+        }
+    });
+    return r;
+}
+
+/// Admission of every pool exit by label, read outside the pool lock.
+private EgressAdmission[string] poolAdmissions() {
+    EgressEndpointRef[] refs;
+    withPoolLock({ foreach (ref p; mullvadPool) refs ~= exitRef(&p); });
+    auto verdicts = readAdmissions(refs);
+    EgressAdmission[string] byLabel;
+    foreach (i, r; refs) byLabel[r.label] = verdicts[i];
+    return byLabel;
+}
+
+/// Atomic pre-dial check (and, for the recovery tier, trial claim). Any
+/// failure refuses the dial as `unavailable`.
+private EgressDialAdmit admitDial(EgressEndpointRef exit, bool allowTrial) nothrow {
+    EgressDialAdmit refused;
+    refused.blockedState = "unavailable";
+    auto store = gAdmissionStore;
+    if (store is null || quarantinePending(exit.label)) return refused;
+    try {
+        return store.admit(exit, allowTrial, EGRESS_TRIAL_CLAIM_MS, nowMsSafe());
+    } catch (Exception e) {
+        try logWarn("Egress admission check for %s failed — dial refused: %s", exit.label, e.msg);
+        catch (Exception) {}
+        return refused;
+    }
+}
+
+/// Marks a trial session registered and extends its lock. "ok" | "stale" |
+/// "error" (store unreachable: the claim lock still bounds the trial).
+private string renewTrial(EgressEndpointRef exit, string token) nothrow {
+    auto store = gAdmissionStore;
+    if (store is null || token.length == 0) return token.length ? "error" : "stale";
+    try {
+        const now = nowMsSafe();
+        return store.renewTrial(exit, token, now + EGRESS_TRIAL_SUSTAIN_MS + EGRESS_TRIAL_SETTLE_SLACK_MS, now)
+            ? "ok" : "stale";
+    } catch (Exception e) {
+        try logWarn("Egress recovery trial renew for %s failed: %s", exit.label, e.msg);
+        catch (Exception) {}
+        return "error";
+    }
+}
+
+/// Settles a trial: "ok" | "stale" | "early" | "error" (store unreachable:
+/// the lock expiry later settles it as a failure — fail closed).
+private string settleTrial(EgressEndpointRef exit, string token, EgressTrialOutcome outcome,
+                           string reason) nothrow {
+    if (token.length == 0) return "stale";
+    auto store = gAdmissionStore;
+    if (store is null) return "error";
+    try {
+        const r = store.settleTrial(exit, token, outcome, reason, nowMsSafe());
+        logJsonMap("info", "connection", "Egress recovery trial settled",
+            ["event": "egress_trial_settled", "label": exit.label, "outcome": outcome.to!string,
+             "result": r]);
+        return r;
+    } catch (Exception e) {
+        try logWarn("Egress recovery trial settle (%s) for %s failed: %s", outcome.to!string, exit.label, e.msg);
+        catch (Exception) {}
+        return "error";
+    }
+}
+
 /// Mullvad relay catalog as the slots' own tailscaled reports it, plus the
 /// unix-ms it was last rebuilt. Guarded by gMullvadLock.
 private __gshared ExitRelay[] gExitRelays;
@@ -842,6 +1120,9 @@ private string tailscaleBin() nothrow {
 private void loadMullvadPoolUnlocked() {
     import core.stdc.stdlib : getenv;
     import core.stdc.string : strlen;
+    // Providers are independent: a static-only deployment must still
+    // load its NordVPN exits when no Mullvad sidecars are configured.
+    scope(exit) loadNordvpnPoolUnlocked();
     auto envp = getenv(toStringz("IRCFIBER_MULLVAD_POOL"));
     if (envp is null) {
         logWarn("Mullvad pool: IRCFIBER_MULLVAD_POOL not set (getenv null)");
@@ -880,7 +1161,6 @@ private void loadMullvadPoolUnlocked() {
             sock.length ? "true" : "false", sock.length ? sock : "-");
     }
     logInfo("Mullvad pool loaded: %d slots", cast(int) mullvadPool.length);
-    loadNordvpnPoolUnlocked();
 }
 
 // Reads IRCFIBER_NORDVPN_POOL directly via getenv. Grammar:
@@ -1053,14 +1333,18 @@ private bool isEstablishedEgressLoss(bool registered, long uptimeMs, bool stoppi
 
 /// Publish only on a quarantine transition, outside the pool lock. FiberEye
 /// drains this existing outbox into #staff; a Redis failure must not stop IRC.
-private void announceEgressQuarantine(string label, size_t distinct, long nowMs) {
+private void announceEgressQuarantine(string label, size_t distinct, long cooldownMs, long nowMs) {
     if (gEgressRedis is null) return;
     try {
         auto db = gEgressRedis.getDb();
+        const minutes = cooldownMs <= 0 ? 0 : (cooldownMs + 59_999) / 60_000;
         auto event = Json([
             "type": Json("notice"), "ts": Json(nowMs), "actor": Json("engine"),
-            "text": Json("VPN exit " ~ label ~ " quarantined for 5 minutes after established sessions on "
-                ~ distinct.to!string ~ " distinct IRC hosts lost their sockets within 90 seconds"),
+            "text": Json("VPN exit " ~ label ~ " quarantined: excluded from new connections after established"
+                ~ " sessions on " ~ distinct.to!string ~ " distinct IRC hosts lost their sockets within 90 seconds"
+                ~ " (a correlation signal, not proof of an exit fault). " ~ minutes.to!string
+                ~ "-minute minimum cooldown, then one verified recovery session must stay registered for"
+                ~ " 60 seconds before it takes new connections again. Existing sessions are left running."),
         ]);
         db.rpush("irc:logs:outbox", event.toString());
         db.ltrim("irc:logs:outbox", -1000, -1);
@@ -1069,10 +1353,18 @@ private void announceEgressQuarantine(string label, size_t distinct, long nowMs)
     }
 }
 
+/// Correlates established-session losses per static exit (process-local
+/// detection evidence) and, at two distinct IRC hosts inside the window,
+/// opens the exit's durable circuit. The quarantine is queued in-process
+/// first, so until the store accepts it the exit is `unavailable` here —
+/// a refused or failed write never leaves it admitting dials. The store
+/// keeps an already open circuit and its cooldown unchanged, so only a real
+/// transition is logged and announced. Never closes the exit's live sockets.
 private void recordEstablishedEgressLoss(string label, string hostLower, long closedAtMs, long nowMs) {
     if (label.length == 0 || hostLower.length == 0 || closedAtMs <= 0
         || closedAtMs > nowMs || nowMs - closedAtMs > EGRESS_LOSS_MAX_AGE_MS) return;
-    size_t announcedHosts;
+    size_t distinctHosts;
+    EgressEndpointRef exit;
     void update() {
         foreach (ref p; mullvadPool) if (p.label == label && p.controlSocket.length == 0) {
             string[] expired;
@@ -1086,19 +1378,21 @@ private void recordEstablishedEgressLoss(string label, string hostLower, long cl
             foreach (_, at; p.recentLossAtMsByHost)
                 if (at <= closedAtMs && closedAtMs - at <= EGRESS_LOSS_WINDOW_MS
                     || at > closedAtMs && at - closedAtMs <= EGRESS_LOSS_WINDOW_MS) distinct++;
-            if (distinct >= 2 && nowMs >= p.quarantinedUntilMs) {
-                p.quarantinedUntilMs = nowMs + EGRESS_QUARANTINE_MS;
-                announcedHosts = distinct;
-                logJsonMap("warn", "connection", "Correlated VPN exit loss",
-                    ["event": "egress_quarantined", "label": label,
-                     "distinctHosts": distinct.to!string]);
+            if (distinct >= 2) {
+                distinctHosts = distinct;
+                exit = exitRef(&p);
             }
             break;
         }
     }
     if (gMullvadLock !is null) synchronized (gMullvadLock) update();
     else update();
-    if (announcedHosts) announceEgressQuarantine(label, announcedHosts, nowMs);
+    if (distinctHosts < 2) return;
+    const reason = "correlated loss: established sessions on " ~ distinctHosts.to!string
+        ~ " distinct IRC hosts lost their sockets within 90 seconds";
+    withPoolLock({ gPendingQuarantines[label] = PendingQuarantine(exit, reason, distinctHosts); });
+    // Redis I/O: strictly after the pool lock is released.
+    flushPendingQuarantines();
 }
 
 @("Established static losses require independent IRC hosts and a live holder close")
@@ -1113,30 +1407,39 @@ unittest {
     assert(!isEstablishedEgressLoss(true, 60_000, false, false, "", "write failed"));
 
     auto saved = mullvadPool;
-    scope(exit) mullvadPool = saved;
+    auto savedStore = gAdmissionStore;
+    auto savedPending = gPendingQuarantines;
+    scope(exit) { mullvadPool = saved; gAdmissionStore = savedStore; gPendingQuarantines = savedPending; }
+    gPendingQuarantines = null;
+    auto store = new ScriptedAdmissionStore;
+    gAdmissionStore = store;
     MullvadProxy staticExit, mullvad;
-    staticExit.label = "north";
+    staticExit.label = "north"; staticExit.host = "socks-north.example"; staticExit.port = 1080;
     mullvad.label = "de"; mullvad.controlSocket = "/ctl/de";
     mullvadPool = [staticExit, mullvad];
     const now = 1_000_000L;
     recordEstablishedEgressLoss("north", "alpha.example.org", now, now);
     recordEstablishedEgressLoss("north", "alpha.example.org", now + 1_000, now + 1_000);
-    assert(mullvadPool[0].quarantinedUntilMs == 0);
+    assert(store.quarantined.length == 0, "one IRC host is a per-client signal, not exit evidence");
     recordEstablishedEgressLoss("de", "beta.example.net", now + 2_000, now + 2_000);
-    assert(mullvadPool[1].recentLossAtMsByHost.length == 0);
+    assert(mullvadPool[1].recentLossAtMsByHost.length == 0 && store.quarantined.length == 0);
     recordEstablishedEgressLoss("north", "beta.example.net", now + 3_000, now + 3_000);
-    assert(mullvadPool[0].quarantinedUntilMs == now + 3_000 + EGRESS_QUARANTINE_MS);
+    assert(store.quarantined.length == 1);
+    assert(store.quarantined[0] == EgressEndpointRef("north", "socks-north.example", 1080));
+    assert(store.quarantineReasons[0].canFind("2 distinct IRC hosts"));
+    // Live sockets succeeding on the exit never touch its circuit.
     recordMullvadSuccess("north");
-    assert(mullvadPool[0].quarantinedUntilMs == now + 3_000 + EGRESS_QUARANTINE_MS);
+    assert(store.quarantined.length == 1 && store.verdicts.length == 0);
+    // A third host asks again; the store keeps the open circuit as is.
+    store.quarantineReply = EgressQuarantine(false, true, false, now + 3_000 + 300_000);
     recordEstablishedEgressLoss("north", "gamma.example", now + 4_000, now + 4_000);
-    assert(mullvadPool[0].quarantinedUntilMs == now + 3_000 + EGRESS_QUARANTINE_MS);
+    assert(store.quarantined.length == 2);
     mullvadPool[0].recentLossAtMsByHost = null;
-    mullvadPool[0].quarantinedUntilMs = 0;
     recordEstablishedEgressLoss("north", "alpha.example.org", now, now);
     recordEstablishedEgressLoss("north", "beta.example.net", now + 91_000, now + 91_000);
-    assert(mullvadPool[0].quarantinedUntilMs == 0);
+    assert(store.quarantined.length == 2, "losses 91 s apart are not correlated");
     recordEstablishedEgressLoss("north", "gamma.example", now + 92_000, now + 212_001);
-    assert(mullvadPool[0].quarantinedUntilMs == 0);
+    assert(store.quarantined.length == 2, "stale losses are ignored");
 }
 private void recordMullvadFailure(string label) {
     if (gMullvadLock !is null) synchronized (gMullvadLock) {
@@ -1331,22 +1634,31 @@ enum NORDVPN_TIER_EGRESS_LABEL = "nordvpn";
 private bool hasAlternativeEgressForHost(string hostLower, string bannedKey, bool unauthenticated = false,
                                          string egressPin = "") {
     loadMullvadPool();
+    // Read once outside the pool lock: an excluded exit is not an
+    // alternative that can justify immediately retrying a ban/SASL gate.
+    const admissions = poolAdmissions();
+    const now = nowMsSafe();
+    bool admissible(string label) {
+        auto a = label in admissions;
+        return a !is null && (a.state == "healthy"
+            || (a.state == "recovering" && a.trialUntilMs <= now));
+    }
     bool check() {
         if (egressPin == DIRECT_EGRESS_LABEL) return false;
         const nordOnly = egressPin == NORDVPN_TIER_EGRESS_LABEL;
         const skipGated = unauthenticated && hostHasSaslGatesLocked(hostLower);
         foreach (p; getHealthyProxiesForHostLocked(hostLower)) {
             if (nordOnly && p.controlSocket.length > 0) continue;
+            if (!admissible(p.label)) continue;
             const key = slotBanKey(p);
             if (key != bannedKey && !(skipGated && isEgressSaslGatedLocked(hostLower, key))) return true;
         }
         // A free controllable slot is an alternative in itself: it can be
         // retargeted to any city in the catalog that is not host-banned.
-        const now = Clock.currTime.toUnixTime!long * 1000;
         if (!nordOnly && !skipGated && gExitRelays.length > 0) {
             foreach (ref pr; mullvadPool)
                 if (pr.controlSocket.length > 0 && pr.activeConns == 0
-                    && now >= pr.heldUntilMs && pr.state != "retargeting")
+                    && now >= pr.heldUntilMs && pr.state != "retargeting" && admissible(pr.label))
                     return true;
         }
         return egressPin.length == 0 && bannedKey != DIRECT_EGRESS_LABEL && !isEgressBannedForHost(hostLower, DIRECT_EGRESS_LABEL)
@@ -1617,6 +1929,9 @@ struct EgressSlotView {
     bool controllable;
     int activeConns;
     long heldUntilMs;
+    /// Durable admission verdict (drain / quarantine / recovery), read
+    /// after the pool lock is released. Separate from the transport `state`.
+    EgressAdmission admission;
 }
 
 /// Every slot's current state, for `irc:egress:slots:<serverId>`.
@@ -1644,6 +1959,11 @@ EgressSlotView[] egressSlotViews() nothrow {
             views ~= v;
         }
     });
+    // Redis I/O: outside the pool lock. A failed read publishes `unavailable`.
+    EgressEndpointRef[] refs;
+    foreach (ref v; views) refs ~= EgressEndpointRef(v.label, v.host, v.port);
+    auto verdicts = readAdmissions(refs);
+    foreach (i, ref v; views) v.admission = verdicts[i];
     return views;
 }
 
@@ -1726,7 +2046,12 @@ string retargetSlotByLabel(string label, string pin, bool force = false) nothrow
 /// a genuinely idle slot is ever retargeted, and it is reserved (state
 /// "retargeting" + a `RETARGET_RESERVE_MS` hold) before the lock is released
 /// so two concurrent connects cannot fight over the same slot.
-private MullvadProxy* acquireSlotForPin(string hostLower, string pin, out string reason) nothrow {
+///
+/// `notAdmitted` names exits whose durable admission refuses ordinary new
+/// dials (drained, quarantined, recovering, unavailable): they are neither
+/// matched nor retargeted here, so a pin can never reach them this way.
+private MullvadProxy* acquireSlotForPin(string hostLower, string pin, out string reason,
+                                        const bool[string] notAdmitted = null) nothrow {
     reason = "";
     if (pin.length == 0) {
         reason = "no-pin";
@@ -1744,14 +2069,14 @@ private MullvadProxy* acquireSlotForPin(string hostLower, string pin, out string
         // non-controllable slots answer to a label, so a retargetable pool
         // never has two ways to name the same exit.
         foreach (i, ref p; mullvadPool) {
-            if (p.controlSocket.length > 0 || p.label != pin) continue;
+            if (p.controlSocket.length > 0 || p.label != pin || p.label in notAdmitted) continue;
             if (p.deadUntilMs != 0 && now < p.deadUntilMs) continue;
             if (isEgressBannedForHost(hostLower, slotBanKey(&mullvadPool[i]))) continue;
             match = &mullvadPool[i];
             return;
         }
         foreach (i, ref p; mullvadPool) {
-            if (!locationMatches(p.locationId, pin)) continue;
+            if (!locationMatches(p.locationId, pin) || p.label in notAdmitted) continue;
             if (p.deadUntilMs != 0 && now < p.deadUntilMs) continue;
             if (isEgressBannedForHost(hostLower, slotBanKey(&mullvadPool[i]))) continue;
             match = &mullvadPool[i];
@@ -1759,7 +2084,7 @@ private MullvadProxy* acquireSlotForPin(string hostLower, string pin, out string
         }
         long lru = long.max;
         foreach (i, ref p; mullvadPool) {
-            if (p.controlSocket.length == 0) continue;
+            if (p.controlSocket.length == 0 || p.label in notAdmitted) continue;
             controllable++;
             if (p.activeConns != 0 || now < p.heldUntilMs || p.state == "retargeting") continue;
             if (p.heldUntilMs <= lru) {
@@ -2059,6 +2384,10 @@ struct EgressUsed {
     string locationId;
     /// Human text for the UI, e.g. "Berlin, Germany"; "" when unknown.
     string locationText;
+    /// Owner token when this connection is the exit's single recovery trial
+    /// ("" otherwise); the caller must renew/settle it for `trialExit`.
+    string trialToken;
+    EgressEndpointRef trialExit;
 }
 
 /// User-facing copy for a Mullvad location pin that could not be honoured.
@@ -2134,9 +2463,11 @@ private ulong staticTieHash(string networkId, string label) {
     return hash;
 }
 
+/// Admission (drain/quarantine/recovery) is applied before ranking, so only
+/// admitted exits reach this order.
 private struct StaticRank {
     MullvadProxy* proxy;
-    bool avoided, quarantined, unproven;
+    bool avoided, unproven;
     int activeConns;
     long lastSuccessMs;
     ulong tieHash;
@@ -2147,14 +2478,13 @@ private MullvadProxy*[] orderStaticProxies(MullvadProxy*[] candidates,
     StaticRank[] ranked;
     foreach (p; candidates) {
         if (p.controlSocket.length > 0) continue;
-        ranked ~= StaticRank(p, p.label == avoidLabel, nowMs < p.quarantinedUntilMs,
+        ranked ~= StaticRank(p, p.label == avoidLabel,
             p.activeConns == 0 && (p.lastSuccessMs == 0 || p.lastSuccessMs > nowMs
                 || nowMs - p.lastSuccessMs > 30 * 60_000L),
             p.activeConns, p.lastSuccessMs, staticTieHash(networkId, p.label));
     }
     ranked.sort!((a, b) =>
         a.avoided != b.avoided ? !a.avoided :
-        a.quarantined != b.quarantined ? !a.quarantined :
         a.unproven != b.unproven ? !a.unproven :
         a.activeConns != b.activeConns ? a.activeConns < b.activeConns :
         a.lastSuccessMs != b.lastSuccessMs ? a.lastSuccessMs > b.lastSuccessMs :
@@ -2224,7 +2554,7 @@ private MullvadProxy*[] staticTierOnly(MullvadProxy*[] healthy, string networkId
     return orderStaticProxies(healthy, networkId, nowMs, avoidLabel);
 }
 
-@("staticTierOnly: proof, load, quarantine, avoidance and last resort")
+@("staticTierOnly: proof, load, avoidance and last resort")
 unittest {
     MullvadProxy de, a, b, never;
     de.label = "de"; de.controlSocket = "/ctl/de.sock";
@@ -2246,9 +2576,8 @@ unittest {
         if (first is &b) sawB = true;
     }
     assert(sawA && sawB);
-    a.quarantinedUntilMs = 1_300;
-    assert(staticTierOnly(healthy, "network-a", 1_000, "")[0] is &b);
-    assert(staticTierOnly([&a], "network-a", 1_000, "")[0] is &a);
+    // The client's own avoided exit goes last but stays a candidate.
+    b.lastSuccessMs = 800;
     assert(staticTierOnly(healthy, "network-a", 1_300, "north")[0] is &b);
     assert(staticTierOnly([&a], "network-a", 1_300, "north")[0] is &a);
     assert(staticTierOnly(healthy, "network-a", 1_300, "")[2] is &never);
@@ -2330,6 +2659,27 @@ private TCPConnection connectThroughEgressPlan(scope EgressDial dial, string net
     //   host never blocks it for another.
     auto healthyForHost = getHealthyProxiesForHost(hostLower);
     const orderNowMs = unixMsNow();
+    // Durable admission (drain, quarantine, recovery; Redis, read outside
+    // the pool lock) is applied to the final candidates before any ordering,
+    // pin or route memory sees them. Only `healthy` exits stay regular
+    // candidates; `recovering` exits become the single-trial last resort at
+    // the very end; drained, quarantined and unavailable exits are never
+    // dialed. Each dial re-checks atomically right before it starts.
+    auto admissions = poolAdmissions();
+    bool[string] notAdmitted;
+    foreach (label, a; admissions) if (!a.admitsDials) notAdmitted[label] = true;
+    MullvadProxy*[] admitted, recovering;
+    string[] admissionNotes;
+    foreach (p; healthyForHost) {
+        auto a = p.label in admissions;
+        if (a !is null && a.admitsDials) { admitted ~= p; continue; }
+        const st = a is null ? "unavailable" : a.state;
+        if (st == "recovering") recovering ~= p;
+        admissionNotes ~= p.label ~ " " ~ (st == "quarantined" && a.retryAtMs > orderNowMs
+            ? "quarantined (retry in " ~ ((a.retryAtMs - orderNowMs + 59_999) / 60_000).to!string ~ " min)"
+            : st == "recovering" ? "awaiting a recovery trial" : st);
+    }
+    healthyForHost = admitted;
     if (egressNodeId.length == 0 && healthyForHost.length > 1) {
         if (gMullvadLock !is null) synchronized (gMullvadLock) {
             healthyForHost = tierAndOrderProxies(healthyForHost, mullvadRR, networkId, orderNowMs, avoidLabel);
@@ -2337,6 +2687,8 @@ private TCPConnection connectThroughEgressPlan(scope EgressDial dial, string net
             healthyForHost = tierAndOrderProxies(healthyForHost, mullvadRR, networkId, orderNowMs, avoidLabel);
         }
     }
+    const admissionSummary = admissionNotes.length
+        ? " (VPN exits not admitting new connections: " ~ admissionNotes.join(", ") ~ ")" : "";
     MullvadProxy*[] toTry;
     // Pinned "direct": the user asked for the bare host IP — never route
     // through an exit. If the host has banned it, the ban policy already
@@ -2356,14 +2708,25 @@ private TCPConnection connectThroughEgressPlan(scope EgressDial dial, string net
         if (gMullvadLock !is null) synchronized (gMullvadLock)
             toTry = staticTierOnly(healthyForHost, networkId, orderNowMs, avoidLabel);
         else toTry = staticTierOnly(healthyForHost, networkId, orderNowMs, avoidLabel);
-        if (toTry.length == 0)
-            throw new Exception("No healthy NordVPN exit available for " ~ host);
+        bool staticRecovery = false;
+        foreach (p; recovering) if (p.controlSocket.length == 0) staticRecovery = true;
+        if (toTry.length == 0 && !staticRecovery)
+            throw new Exception("No healthy NordVPN exit available for " ~ host ~ admissionSummary);
+    } else if (pinLocation && egressNodeId.toLower() in notAdmitted && isStaticProxy(egressNodeId.toLower())) {
+        // An exact static-exit pin never bypasses drain or quarantine: the
+        // existing "another VPN exit" fallback applies, never direct. A
+        // recovering pinned exit stays in the recovery tier below.
+        const st = admissions[egressNodeId.toLower()].state;
+        logJsonMap("warn", "connection", "Pinned egress not admitted",
+            ["host": hostLower, "pin": egressNodeId, "admission": st, "event": "egress_pin_not_admitted"]);
+        egressBusyNote = "Your pinned exit is not accepting new connections right now (" ~ st
+            ~ ") — connecting via another VPN exit; this network does not fall back to direct.";
     } else if (pinLocation) {
         // Country/city pin: reuse a slot already on that location, else
         // retarget an idle one. A slot carrying live connections is never
         // touched, so honouring this pin cannot drop another network.
         string reason;
-        pinnedSlot = acquireSlotForPin(hostLower, egressNodeId.toLower(), reason);
+        pinnedSlot = acquireSlotForPin(hostLower, egressNodeId.toLower(), reason, notAdmitted);
         if (pinnedSlot !is null) {
             toTry ~= pinnedSlot;
         } else {
@@ -2382,7 +2745,7 @@ private TCPConnection connectThroughEgressPlan(scope EgressDial dial, string net
         auto target = bestUnbannedLocationFor(hostLower);
         if (target.length > 0) {
             string reason;
-            auto slot = acquireSlotForPin(hostLower, target, reason);
+            auto slot = acquireSlotForPin(hostLower, target, reason, notAdmitted);
             if (slot !is null) {
                 logInfo("Automatic egress: slot %s retargeted to %s for %s (no healthy exit left)",
                     slot.label, target, hostLower);
@@ -2425,13 +2788,36 @@ private TCPConnection connectThroughEgressPlan(scope EgressDial dial, string net
     const rankEnd = toTry.length;
     toTry ~= gated;
     if (!vpnOnly && directGated && !directBanned) toTry ~= null;
-    if (pinLocation && toTry.length == 0)
-        throw new Exception("No VPN exit available for pinned location '" ~ egressNodeId ~ "' to " ~ host
-            ~ " — not falling back to direct");
-    if (egressBusyNote.length > 0) report(progress, "info", egressBusyNote);
     if (!vpnOnly && !directBanned && toTry.length == 0) toTry ~= null;
     else if (directBanned && !vpnOnly)
         logWarn("Direct egress is host-banned for %s — trying %d exit(s) only", hostLower, cast(int) toTry.length);
+    // Recovery tier: exits whose quarantine cooldown elapsed, after every
+    // admitted route (direct included where policy allows it) and outside
+    // the route-memory prefix. Dialing one atomically claims the exit's
+    // single global trial; while another trial runs, the claim is refused.
+    // Same provider/pin scope as the regular candidates; SASL-gated exits
+    // are skipped for an unauthenticated network (the trial would be wasted).
+    const recoveryStart = toTry.length;
+    if (!pinDirect) {
+        MullvadProxy*[] tier;
+        foreach (p; recovering) {
+            if (pinNordvpnTier && p.controlSocket.length > 0) continue;
+            if (unauthenticated && isEgressSaslGatedForHost(hostLower, slotBanKey(p))) continue;
+            tier ~= p;
+        }
+        MullvadProxy*[] mullvadRecovery;
+        foreach (p; tier) if (p.controlSocket.length > 0) mullvadRecovery ~= p;
+        if (gMullvadLock !is null) synchronized (gMullvadLock)
+            toTry ~= mullvadRecovery ~ orderStaticProxies(tier, networkId, orderNowMs, avoidLabel);
+        else toTry ~= mullvadRecovery ~ orderStaticProxies(tier, networkId, orderNowMs, avoidLabel);
+    }
+    if (pinLocation && toTry.length == 0)
+        throw new Exception("No VPN exit available for pinned location '" ~ egressNodeId ~ "' to " ~ host
+            ~ " — not falling back to direct" ~ admissionSummary);
+    if (egressBusyNote.length > 0) report(progress, "info", egressBusyNote);
+    if (toTry.length > recoveryStart && recoveryStart == 0)
+        report(progress, "info", "No admitted route is left" ~ admissionSummary
+            ~ " — trying a VPN exit whose quarantine cooldown ended as its single recovery trial.");
     // Identities are read once, under the lock, and stay aligned with toTry.
     // Only Automatic is reordered: a pin is the user's route choice. Every
     // candidate is still dialed exactly once per call — a cooling route is
@@ -2450,6 +2836,31 @@ private TCPConnection connectThroughEgressPlan(scope EgressDial dial, string net
     // One "route [phase]: reason" per failed dial, for the diagnosis below.
     string[] failures;
     foreach (i, proxy; toTry) {
+        // Atomic re-check right before the dial: a drain or quarantine that
+        // landed after planning still stops it, and only a recovery-tier
+        // candidate may claim the exit's single trial.
+        string trialToken;
+        if (proxy !is null) {
+            const adm = admitDial(exitRef(proxy), i >= recoveryStart);
+            if (!adm.allowed) {
+                failures ~= proxy.label ~ " [admission]: " ~ adm.blockedState;
+                if (lastErr is null)
+                    lastErr = new Exception("VPN exit " ~ proxy.label ~ " is not admitting new connections ("
+                        ~ adm.blockedState ~ ")" ~ (vpnOnly ? " — not falling back to direct" : ""));
+                logJsonMap("info", "connection", "Egress dial refused by admission",
+                    ["host": hostLower, "label": proxy.label, "admission": adm.blockedState,
+                     "event": "egress_admission_refused"]);
+                continue;
+            }
+            trialToken = adm.trialToken;
+            if (trialToken.length) {
+                logJsonMap("info", "connection", "Egress recovery trial claimed",
+                    ["host": hostLower, "label": proxy.label, "event": "egress_trial_claimed"]);
+                report(progress, "info", "VPN exit " ~ proxy.label ~ " finished its quarantine cooldown; this "
+                    ~ "connection is its single recovery trial and must stay registered for 60s before the "
+                    ~ "exit takes new connections again.");
+            }
+        }
         try {
             auto conn = dial(proxy, dr);
             // Positive evidence: the holder answers CONNECTED only after TCP
@@ -2467,15 +2878,29 @@ private TCPConnection connectThroughEgressPlan(scope EgressDial dial, string net
                 // while this connection lives. Released by the client's
                 // releaseEgressSlot() on every disconnect / reconnect.
                 holdSlot(proxy.label);
+                used.trialToken = trialToken;
+                if (trialToken.length) used.trialExit = exitRef(proxy);
             }
             return conn;
         } catch (HolderUnavailableException e) {
             // The exit was never tried: no ban, no counters — just retry
-            // later from the connection loop.
+            // later from the connection loop. A claimed trial is released
+            // without penalty.
+            if (trialToken.length)
+                settleTrial(exitRef(proxy), trialToken, EgressTrialOutcome.abort, "");
             throw e;
         } catch (Exception e) {
             lastErr = e;
             logWarn("happyEyeballsConnect via %s failed for %s:%d: %s, trying next egress", proxy ? proxy.label : "direct", host, port, e.msg);
+            // A trial dial that reached the exit and failed reopens the
+            // circuit with the next cooldown; a holder-side refusal never
+            // exercised the exit and only releases the claim.
+            if (trialToken.length) {
+                const holderSide = cast(HolderErrorException) e !is null || dialFailurePhase(e) == "holder";
+                settleTrial(exitRef(proxy), trialToken,
+                    holderSide ? EgressTrialOutcome.abort : EgressTrialOutcome.failure,
+                    "recovery trial dial failed [" ~ dialFailurePhase(e) ~ "]");
+            }
             // Recorded before the ban checks below: a ban forgets the
             // route's memos, so no stale cooling entry outlives it.
             if (isRouteDialFailure(e))
@@ -2550,6 +2975,10 @@ version (unittest) {
         long[string][string] savedBans, savedGates;
         bool[string][string] savedDaily;
         ExitRelay[] savedRelays;
+        EgressAdmissionStore savedStore;
+        /// Admission backend for this harness: every exit healthy until a
+        /// test scripts otherwise.
+        ScriptedAdmissionStore admission;
         /// route ("direct" or slot label) → outcome: a holder FAILED phase,
         /// or "holder-down" / "holder-err" / "untyped". Absent = CONNECTED.
         string[string] failWith;
@@ -2558,21 +2987,27 @@ version (unittest) {
         string[] dialed;
         EgressUsed used;
         Exception failed;
+        PendingQuarantine[string] savedPending;
 
         static EgressPlanHarness open(MullvadProxy[] pool) {
             EgressPlanHarness h;
             h.savedPool = mullvadPool; h.savedLoaded = mullvadPoolLoaded; h.savedRR = mullvadRR;
             h.savedMemory = gRouteMemory; h.savedBans = hostEgressBanUntil; h.savedGates = hostSaslGateUntil;
-            h.savedDaily = dailyReachabilityBanned; h.savedRelays = gExitRelays;
+            h.savedDaily = dailyReachabilityBanned; h.savedRelays = gExitRelays; h.savedStore = gAdmissionStore;
+            h.savedPending = gPendingQuarantines;
             mullvadPool = pool; mullvadPoolLoaded = true; gRouteMemory = RouteMemory.init;
             hostEgressBanUntil = null; hostSaslGateUntil = null; dailyReachabilityBanned = null; gExitRelays = null;
+            gPendingQuarantines = null;
+            h.admission = new ScriptedAdmissionStore;
+            gAdmissionStore = h.admission;
             return h;
         }
 
         void close() {
             mullvadPool = savedPool; mullvadPoolLoaded = savedLoaded; mullvadRR = savedRR;
             gRouteMemory = savedMemory; hostEgressBanUntil = savedBans; hostSaslGateUntil = savedGates;
-            dailyReachabilityBanned = savedDaily; gExitRelays = savedRelays;
+            dailyReachabilityBanned = savedDaily; gExitRelays = savedRelays; gAdmissionStore = savedStore;
+            gPendingQuarantines = savedPending;
         }
 
         /// Two Mullvad slots (Mullvad tier) and one static NordVPN-style exit.
@@ -2785,6 +3220,228 @@ unittest {
     banEgressForHost(host, "slot:nord-se");
     assert(hasAlternativeEgressForHost(host, "slot:nord-se", false, "de-ber"));
     assert(!hasAlternativeEgressForHost(host, "slot:nord-se", false, "nordvpn"));
+    // A drained or quarantined route must not clear the host's backoff
+    // simply because the pool still contains its configuration entry.
+    vpn.admission.set("de", "draining");
+    vpn.admission.set("ch", "quarantined");
+    assert(!hasAlternativeEgressForHost(host, "slot:nord-se", false, "de-ber"));
+    vpn.admission.set("ch", "recovering");
+    assert(hasAlternativeEgressForHost(host, "slot:nord-se", false, "de-ber"));
+    vpn.admission.states["ch"].trialUntilMs = nowMsSafe() + 60_000;
+    assert(!hasAlternativeEgressForHost(host, "slot:nord-se", false, "de-ber"));
+}
+
+@("egress plan: drained, quarantined and unavailable exits are never dialed, by any route")
+unittest {
+    auto h = EgressPlanHarness.open(EgressPlanHarness.standardPool());
+    scope(exit) h.close();
+    enum host = "irc.example.org";
+    h.admission.set("de", "draining");
+    h.admission.set("ch", "quarantined");
+    assert(h.connect(host) == ["nord-se"] && h.failed is null && h.used.label == "nord-se");
+    assert(h.used.trialToken.length == 0, "a healthy exit is never a trial");
+    // A remembered success cannot promote an exit admission refuses.
+    h.remember(host, "de", true);
+    assert(h.connect(host) == ["nord-se"]);
+    // No trial was ever claimed for anything.
+    assert(h.admission.openTrials.length == 0 && h.admission.verdicts.length == 0);
+    // Every VPN exit refused: Automatic keeps its own direct policy; the
+    // Nord tier, an exact exit pin and a location pin fail closed undialed.
+    h.admission.set("nord-se", "unavailable");
+    assert(h.connect(host) == ["direct"] && h.used.label == "");
+    assert(h.connect(host, "nordvpn").length == 0 && h.failed !is null);
+    assert(h.failed.msg.canFind("No healthy NordVPN exit") && h.failed.msg.canFind("nord-se unavailable"));
+    assert(h.connect(host, "nord-se").length == 0 && h.failed.msg.canFind("not falling back to direct"));
+    assert(h.connect(host, "de-ber").length == 0 && h.failed.msg.canFind("not falling back to direct"));
+}
+
+@("egress plan: an exact static pin cannot bypass a drain and falls back VPN-only")
+unittest {
+    auto h = EgressPlanHarness.open(EgressPlanHarness.standardPool());
+    scope(exit) h.close();
+    enum host = "irc.example.org";
+    h.admission.set("nord-se", "draining");
+    h.failWith = ["de": "tls"];
+    assert(h.connect(host, "nord-se") == ["de", "ch"] && h.failed is null && h.used.label == "ch");
+    h.failWith["ch"] = "tcp";
+    assert(h.connect(host, "nord-se") == ["de", "ch"] && h.failed !is null, "never direct");
+    // Resumed (admitted again): the pin is honoured first, as before.
+    h.admission.states.remove("nord-se");
+    h.failWith = null;
+    assert(h.connect(host, "nord-se") == ["nord-se"]);
+}
+
+@("egress plan: a recovering exit is the single-trial last resort and route memory cannot lift it")
+unittest {
+    auto h = EgressPlanHarness.open(EgressPlanHarness.standardPool());
+    scope(exit) h.close();
+    enum host = "irc.example.org";
+    h.admission.set("nord-se", "recovering");
+    h.remember(host, "nord-se", true);
+    h.failWith = ["de": "tls", "ch": "tls"];
+    // Automatic: every admitted route, direct included, precedes the trial.
+    assert(h.connect(host) == ["de", "ch", "direct"] && h.used.label == "");
+    assert(h.used.trialToken.length == 0 && h.admission.openTrials.length == 0,
+        "an admitted route won: the recovering exit's trial was never claimed");
+    h.failWith["direct"] = "tcp";
+    h.admission.admitReplies["nord-se"] = EgressDialAdmit(true, "nonce:3", "");
+    // Direct's success leads, the cooling exits follow, the trial is last.
+    assert(h.connect(host) == ["direct", "de", "ch", "nord-se"]);
+    assert(h.used.label == "nord-se" && h.used.trialToken == "nonce:3");
+    assert(h.used.trialExit == EgressEndpointRef("nord-se", "10.64.0.3", 1080));
+    assert(h.admission.openTrials == ["nonce:3": "nord-se"], "the trial stays owned by this connection");
+    // Nord pin with only a recovering exit: that exit, as the trial.
+    h.admission.openTrials = null;
+    assert(h.connect(host, "nordvpn") == ["nord-se"] && h.used.trialToken == "nonce:3");
+    // A failed trial dial reopens the circuit; a holder-side failure never
+    // exercised the exit and only releases the claim.
+    h.failWith["nord-se"] = "socks5";
+    h.admission.openTrials = null;
+    assert(h.connect(host, "nordvpn") == ["nord-se"] && h.failed !is null);
+    assert(h.admission.openTrials.length == 0 && h.admission.verdicts == ["nord-se:failure"],
+        "an exit failure ends the trial as failed, never leaves it claimed");
+    h.failWith["nord-se"] = "holder-err";
+    h.admission.verdicts = null;
+    h.connect(host, "nordvpn");
+    assert(h.admission.openTrials.length == 0 && h.admission.verdicts == ["nord-se:abort"],
+        "a holder refusal releases the claim without penalty");
+    h.failWith["nord-se"] = "holder-down";
+    h.admission.verdicts = null;
+    h.connect(host, "nordvpn");
+    assert(cast(HolderUnavailableException) h.failed !is null);
+    assert(h.admission.openTrials.length == 0 && h.admission.verdicts == ["nord-se:abort"]);
+    // Another engine holds the trial: nothing is dialed, nothing leaks.
+    h.failWith.remove("nord-se");
+    h.admission.admitReplies["nord-se"] = EgressDialAdmit(false, "", "trial");
+    assert(h.connect(host, "nordvpn").length == 0 && h.failed !is null);
+    assert(h.failed.msg.canFind("not admitting") && h.failed.msg.canFind("not falling back to direct"));
+}
+
+@("egress plan: a verdict that changes after planning refuses the dial; no store fails VPN closed")
+unittest {
+    auto h = EgressPlanHarness.open(EgressPlanHarness.standardPool());
+    scope(exit) h.close();
+    enum host = "irc.example.org";
+    // Drained between the plan read and the dial: skipped at the atomic check.
+    h.admission.admitReplies["de"] = EgressDialAdmit(false, "", "draining");
+    assert(h.connect(host) == ["ch"] && h.used.label == "ch");
+    // Store outage: every VPN exit is `unavailable`.
+    h.admission.failing = true;
+    assert(h.connect(host) == ["direct"]);
+    assert(h.connect(host, "nordvpn").length == 0 && h.failed !is null);
+    assert(h.connect(host, "nord-se").length == 0 && h.failed !is null);
+    assert(h.connect(host, "ch-zrh").length == 0 && h.failed !is null);
+    // No store configured at all (no Redis): the same, never permissive.
+    gAdmissionStore = null;
+    assert(h.connect(host, "nordvpn").length == 0 && h.failed !is null);
+    assert(h.connect(host) == ["direct"]);
+    assert(readAdmissions([EgressEndpointRef("nord-se", "10.64.0.3", 1080)])[0].state == "unavailable");
+}
+
+@("egress plan: a quarantine the store refuses to persist still blocks the exit until it is written")
+unittest {
+    auto h = EgressPlanHarness.open(EgressPlanHarness.standardPool());
+    scope(exit) h.close();
+    enum host = "irc.example.org";
+    // Reads work, writes are refused (read-only replica): the store still
+    // reports nord-se healthy, yet this engine must not admit it.
+    h.admission.refuseQuarantineWrites = true;
+    const now = unixMsNow();
+    recordEstablishedEgressLoss("nord-se", "alpha.example.org", now - 2_000, now);
+    recordEstablishedEgressLoss("nord-se", "beta.example.net", now - 1_000, now);
+    assert(h.admission.quarantined.length == 0);
+    assert(h.connect(host, "nordvpn").length == 0 && h.failed !is null);
+    assert(h.failed.msg.canFind("nord-se unavailable"));
+    assert(h.connect(host, "nord-se") == ["de"] && h.used.label == "de", "an exact pin falls back VPN-only");
+    auto published = readAdmissions([EgressEndpointRef("nord-se", "10.64.0.3", 1080)])[0];
+    assert(published.state == "unavailable" && published.reason.canFind("not yet persisted"));
+    // Once the store accepts the write its own verdict rules again.
+    h.admission.refuseQuarantineWrites = false;
+    h.admission.set("nord-se", "quarantined");
+    assert(h.connect(host, "nordvpn").length == 0 && h.admission.quarantined.length == 1);
+    assert(readAdmissions([EgressEndpointRef("nord-se", "10.64.0.3", 1080)])[0].state == "quarantined");
+    h.admission.states.remove("nord-se");
+    assert(h.connect(host, "nordvpn") == ["nord-se"], "healed store-side: dialable again");
+}
+
+@("egress trial: a client settles its trial only through the fenced store, and carries it across a swap")
+unittest {
+    import vibe.core.channel : createChannel;
+    auto savedStore = gAdmissionStore;
+    scope(exit) gAdmissionStore = savedStore;
+    auto store = new ScriptedAdmissionStore;
+    gAdmissionStore = store;
+    NetworkConfig cfg;
+    cfg.nick = "me";
+    auto ch = createChannel!IRCRawEvent();
+    scope(exit) ch.close();
+    auto c = new PersistentIRCClient(cfg, ch);
+    const exit = EgressEndpointRef("north", "socks-north.example", 1080);
+    void claim() {
+        c.egressTrialToken = "nonce:9";
+        c.egressTrialExit = exit;
+        store.openTrials["nonce:9"] = "north";
+        store.verdicts = null;
+    }
+
+    // Registration marks the trial; the hot-swap snapshot carries ownership.
+    claim();
+    c.state = ConnectionState.connected;
+    c.connectedAtMs = nowMsSafe();
+    c.renewEgressTrialOnRegistered();
+    assert("nonce:9" in store.registeredTrials && c.egressTrialToken == "nonce:9");
+    auto snap = c.snapshotSession(true);
+    import ircfiber.engine.session_snapshot : snapshotFromJSON = fromJSON;
+    auto back = snapshotFromJSON(toJSON(snap));
+    assert(back.egressTrialToken == "nonce:9" && back.egressTrialHost == "socks-north.example"
+        && back.egressTrialPort == 1080 && back.egressLabel == c.activeEgressLabel);
+    string pong(long sentMs) { return ":irc.example PONG irc.example :" ~ lagPingToken(sentMs); }
+    // A keepalive answered inside the sustain window proves nothing.
+    const inWindow = nowMsSafe();
+    c.noteEgressTrialProbe(inWindow);
+    c.processLine(pong(inWindow));
+    assert(store.verdicts.length == 0 && c.egressTrialToken == "nonce:9");
+    // Registered past the window: only the PONG to a PING sent after it heals.
+    c.connectedAtMs = nowMsSafe() - EGRESS_TRIAL_SUSTAIN_MS - 1_000;
+    const probe = nowMsSafe();
+    c.noteEgressTrialProbe(probe);
+    c.processLine(pong(probe - 1));
+    assert(store.verdicts.length == 0, "an older or foreign PONG proves nothing");
+    c.processLine(pong(probe));
+    assert(store.verdicts == ["north:success"] && c.egressTrialToken == "" && store.openTrials.length == 0);
+
+    // Registered well past the window but never answered (silent drop):
+    // the session's end fails the trial — uptime alone never heals.
+    claim();
+    c.connectedAtMs = nowMsSafe() - 10 * EGRESS_TRIAL_SUSTAIN_MS;
+    c.noteEgressTrialProbe(nowMsSafe());
+    c.settleEgressTrialOnEnd(10 * EGRESS_TRIAL_SUSTAIN_MS, false);
+    assert(store.verdicts == ["north:failure"] && c.egressTrialToken == "" && store.openTrials.length == 0);
+    // An engine stop releases the claim without penalty.
+    claim();
+    c.settleEgressTrialOnEnd(0, true);
+    assert(store.verdicts == ["north:abort"]);
+    // Answered locally but refused by the store's clock: not healed, the
+    // trial stays owned and needs a later probe.
+    claim();
+    store.refuseSuccessAsEarly = true;
+    c.connectedAtMs = nowMsSafe() - 2 * EGRESS_TRIAL_SUSTAIN_MS;
+    const refused = nowMsSafe();
+    c.noteEgressTrialProbe(refused);
+    c.processLine(pong(refused));
+    assert(store.verdicts.length == 0 && c.egressTrialToken == "nonce:9");
+    store.refuseSuccessAsEarly = false;
+    // A trial cancelled store-side (drain) or expired stops speaking for the
+    // exit: the session continues, but nothing it does settles the exit.
+    claim();
+    store.trialsCancelled = true;
+    c.renewEgressTrialOnRegistered();
+    assert(c.egressTrialToken == "" && c.state == ConnectionState.connected);
+    const late = nowMsSafe();
+    c.noteEgressTrialProbe(late);
+    c.processLine(pong(late));
+    c.settleEgressTrialOnEnd(10 * EGRESS_TRIAL_SUSTAIN_MS, false);
+    assert(store.verdicts.length == 0, "a cancelled trial never heals or fails the exit");
 }
 // ── Nick prefix helpers ───────────────────────────────────────────────────────
 //
@@ -4354,6 +5011,19 @@ final class PersistentIRCClient {
         string              egressSlotLabel;
         /// Whether `egressSlotLabel`'s refcount is currently taken.
         bool                egressSlotHeld;
+        /// Owner token of the exit's single recovery trial this connection
+        /// is running ("" = not a trial) and the exit it was claimed for.
+        /// Renewed at registration; succeeds only through
+        /// `completeEgressTrialOnPong` (a PING sent after the sustain window,
+        /// answered); any other end is `settleEgressTrialOnEnd` (failure, or
+        /// abort on an engine stop). Survives a hot swap via the session
+        /// snapshot. The admission store fences every outcome.
+        string              egressTrialToken;
+        EgressEndpointRef   egressTrialExit;
+        /// Send time of the newest lag PING that left after the sustain
+        /// window while this engine owns the trial; 0 = none yet. Only its
+        /// matching PONG proves the session is alive end to end.
+        long                egressTrialProbeSentMs;
         /// Remote IP the Happy Eyeballs race actually connected to (e.g.
         /// "2001:6b0:e:2a18::120" for an AAAA winner). The family of this
         /// address is the only reliable "did we use IPv6" signal — the
@@ -4720,6 +5390,9 @@ final class PersistentIRCClient {
         s.egressIp = activeEgressIp;
         s.egressLocationId = activeEgressLocationId;
         s.egressLocationText = activeEgressLocation;
+        s.egressTrialToken = egressTrialToken;
+        s.egressTrialHost = egressTrialExit.host;
+        s.egressTrialPort = egressTrialExit.port;
         s.peerIp = activePeerIp;
         s.localIp = activeLocalIp;
         // Peer tickets are bound to the connection generation and the
@@ -4845,6 +5518,16 @@ final class PersistentIRCClient {
         egressSlotLabel = activeEgressLabel;
         egressSlotHeld = activeEgressLabel.length > 0;
         if (egressSlotHeld) holdSlot(activeEgressLabel);
+        // A recovery trial in flight keeps its owner token: this engine
+        // settles it only through the store's fence and only after a fresh
+        // post-window PING it sends itself is answered (the probe resets with
+        // the new engine instance). A snapshot without one leaves an
+        // unsettled claim to expire, which the store counts as a failure.
+        if (s.egressTrialToken.length && activeEgressLabel.length) {
+            egressTrialToken = s.egressTrialToken;
+            egressTrialExit = EgressEndpointRef(activeEgressLabel, s.egressTrialHost, s.egressTrialPort);
+            if (connectedAtMs > 0) renewEgressTrialOnRegistered();
+        }
         // Per-session pacing model: the fake-lag accumulator is unknown
         // after a swap; start it at zero as a registered user and keep the
         // learned limits. Trust is per host and re-derived from config.
@@ -5513,6 +6196,82 @@ final class PersistentIRCClient {
         egressSlotHeld = false;
         releaseSlot(egressSlotLabel);
         egressSlotLabel = "";
+    }
+
+    private void clearEgressTrial() nothrow {
+        egressTrialToken = "";
+        egressTrialExit = EgressEndpointRef.init;
+        egressTrialProbeSentMs = 0;
+    }
+
+    /// The trial session registered: start the store's sustain clock (first
+    /// call only) and extend the claim past it. A stale token means the
+    /// trial was cancelled (drain) or expired; the session itself carries on
+    /// untouched but no longer speaks for the exit.
+    private void renewEgressTrialOnRegistered() nothrow {
+        if (egressTrialToken.length == 0) return;
+        const r = renewTrial(egressTrialExit, egressTrialToken);
+        if (r == "ok") {
+            emitLog("info", "Registered via VPN exit " ~ egressTrialExit.label ~ " during its recovery trial; "
+                ~ "the exit takes new connections again only if this session stays registered for "
+                ~ (EGRESS_TRIAL_SUSTAIN_MS / 1000).to!string ~ "s and then answers a keepalive PING.");
+        } else if (r == "stale") {
+            emitLog("info", "The recovery trial of VPN exit " ~ egressTrialExit.label
+                ~ " was cancelled or expired; this session continues but does not count as a trial.");
+            clearEgressTrial();
+        }
+        // "error": keep the token; the claim lock still bounds the trial.
+    }
+
+    /// Keepalive tick, right after a lag PING left: once the trial session
+    /// has been registered for the sustain window, that PING becomes the
+    /// trial's liveness probe. Nothing is settled here.
+    private void noteEgressTrialProbe(long pingSentMs) nothrow {
+        if (egressTrialToken.length == 0 || connectedAtMs <= 0 || pingSentMs <= 0) return;
+        if (pingSentMs - connectedAtMs < EGRESS_TRIAL_SUSTAIN_MS) return;
+        egressTrialProbeSentMs = pingSentMs;
+    }
+
+    /// A PONG answered lag PING `sentMs`. When that PING is the trial's
+    /// post-window probe, the session has proven a live end-to-end round
+    /// trip after staying registered: ask the store to close the circuit
+    /// (it re-checks the window against its own registration mark).
+    private void completeEgressTrialOnPong(long sentMs) nothrow {
+        if (egressTrialToken.length == 0 || egressTrialProbeSentMs == 0 || sentMs != egressTrialProbeSentMs) return;
+        egressTrialProbeSentMs = 0;
+        const label = egressTrialExit.label;
+        const r = settleTrial(egressTrialExit, egressTrialToken, EgressTrialOutcome.success, "");
+        if (r == "ok") {
+            emitLog("info", "VPN exit " ~ label ~ " passed its recovery trial (registered "
+                ~ (EGRESS_TRIAL_SUSTAIN_MS / 1000).to!string ~ "s, keepalive answered) and takes new connections again.");
+            clearEgressTrial();
+        } else if (r == "stale") {
+            clearEgressTrial();
+        } else if (r == "early") {
+            // The store never saw this session register (renew failed):
+            // mark it now; a later post-window probe must be answered.
+            renewEgressTrialOnRegistered();
+        }
+        // "error": the next post-window probe retries; the lock bounds it.
+    }
+
+    /// Settles a trial that did not complete while its session lived: the
+    /// session ended (or was superseded) without an answered post-window
+    /// probe, so the exit is not proven — uptime alone never heals it. An
+    /// engine stop releases the claim without penalty; anything else is a
+    /// failed trial (next cooldown). Never called for a hot-swap detach.
+    private void settleEgressTrialOnEnd(long uptimeMs, bool stopping) nothrow {
+        if (egressTrialToken.length == 0) return;
+        const token = egressTrialToken;
+        const exit = egressTrialExit;
+        clearEgressTrial();
+        if (stopping) {
+            settleTrial(exit, token, EgressTrialOutcome.abort, "");
+            return;
+        }
+        settleTrial(exit, token, EgressTrialOutcome.failure, "recovery trial session ended after "
+            ~ (uptimeMs / 1000).to!string ~ "s without an answered keepalive after the "
+            ~ (EGRESS_TRIAL_SUSTAIN_MS / 1000).to!string ~ "s window");
     }
 
     /// Whether a given IRCv3 capability was negotiated.
@@ -6335,6 +7094,9 @@ final class PersistentIRCClient {
             // hold on the slot it wins, and releasing afterwards would cancel
             // it out when the same slot is reused.
             releaseEgressSlot();
+            // A trial still owned here belonged to a connection that is
+            // gone without being settled: it did not prove the exit.
+            settleEgressTrialOnEnd(0, isShutdownRequested);
             auto tag = DialTag(config.id.toString(), ownerId.toString(), config.name, "");
             const now = unixMsNow();
             if (now >= avoidUntilMs) { avoidEgressLabel = ""; avoidUntilMs = 0; }
@@ -6349,6 +7111,9 @@ final class PersistentIRCClient {
             activeEgressLocation = used.locationText;
             egressSlotLabel = used.label;
             egressSlotHeld = used.label.length > 0;
+            egressTrialToken = used.trialToken;
+            egressTrialExit = used.trialExit;
+            egressTrialProbeSentMs = 0;
             activePeerIp = dr.peerIp;
             activeLocalIp = dr.localIp;
             tlsInfoValid = dr.tlsOk;
@@ -6511,6 +7276,7 @@ final class PersistentIRCClient {
         // server log timeline ends on a clear success line before any
         // MOTD text begins to stream in.
         connectedAtMs = unixMsNow();
+        renewEgressTrialOnRegistered();
         emitLog("welcome",
             "Connection registered as " ~ sessionNick
             ~ ". Server handshake complete.");
@@ -7544,6 +8310,7 @@ private void processEvents() {
                 // Catch-up META write (member-list drift from other users'
                 // JOIN/PART/NICK, which do not trigger a write of their own).
                 publishMeta(false);
+                noteEgressTrialProbe(lagProbeSentMs);
             }
             // Silent-drop early warning: a LAG probe is outstanding and no
             // PONG (or any data, which also resets the PONG clock) has
@@ -8242,6 +9009,7 @@ private void processEvents() {
                     lagMs = unixMsNow() - sentMs;
                     lagProbeSentMs = 0;
                 }
+                if (sentMs > 0) completeEgressTrialOnPong(sentMs);
             }
             logJsonMap("debug", "connection",
                 "PONG received",
@@ -11513,6 +12281,8 @@ private void processEvents() {
             const linesInAtDrop  = linesIn;
             const linesOutAtDrop = linesOut;
             const whoOutAtDrop   = whoOut;
+            // Settle a recovery trial while the session's uptime is known.
+            settleEgressTrialOnEnd(connectedAtMs > 0 ? unixMsNow() - connectedAtMs : 0, isShutdownRequested);
             state = ConnectionState.disconnected;
             resetConnectionTelemetry();
             // When the relay ended from the holder's side (upstream EOF, TLS

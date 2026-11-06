@@ -1256,11 +1256,18 @@ bool isDeviceId(string s) @safe {
     }
 }
 
-/// Whether `s` is a hardware model identifier (`iPhone17,1`): 1–32 of `[A-Za-z0-9,._-]`.
+/// Whether `s` is a hardware model identifier (`iPhone17,1`): 1–32 bytes of
+/// `[A-Za-z0-9,._-]`, optionally followed by exactly ` (Simulator)` — what the
+/// iOS app sends from the Simulator (`Diagnostics.modelIdentifier`). The
+/// suffix counts toward the 32-byte cap and the base must be nonempty.
 bool isDeviceModel(string s) @safe pure {
+    import std.algorithm.searching : endsWith;
     import std.ascii : isAlphaNum;
 
+    enum simulatorSuffix = " (Simulator)";
     if (s.length == 0 || s.length > 32) return false;
+    if (s.endsWith(simulatorSuffix)) s = s[0 .. $ - simulatorSuffix.length];
+    if (s.length == 0) return false;
     foreach (char c; s)
         if (!isAlphaNum(c) && c != ',' && c != '.' && c != '_' && c != '-') return false;
     return true;
@@ -2845,6 +2852,15 @@ unittest {
     assert(!isDeviceModel(""));
     assert(!isDeviceModel(replicate("a", 33)));
     assert(!isDeviceModel("a b"));
+    // The iOS Simulator's exact suffix only, once, on a valid base.
+    assert(isDeviceModel("iPhone17,1 (Simulator)"));
+    assert(isDeviceModel(replicate("a", 20) ~ " (Simulator)"));
+    assert(!isDeviceModel(replicate("a", 21) ~ " (Simulator)"));
+    assert(!isDeviceModel(" (Simulator)"));
+    assert(!isDeviceModel("iPhone17,1 (simulator)"));
+    assert(!isDeviceModel("iPhone17,1 (Simulator) (Simulator)"));
+    assert(!isDeviceModel("iPhone17,1 (Simulator)\r\n"));
+    assert(!isDeviceModel("iPhone17,1 (Emulator)"));
 }
 
 @("a v1 blob migrates its notification prefs to the policy and asks for one save")

@@ -35,3 +35,21 @@ configuration "buffer-dedup-test" {
     mainSourceFile "tests/buffer_dedup_test.d"
     versions "VibeUseFibers"
 }
+
+configuration "device-registry-test" {
+    targetType "executable"
+    targetName "device-registry-test"
+    sourcePaths "source"
+    importPaths "source" "tests"
+    mainSourceFile "tests/device_registry_test.d"
+    versions "VibeUseFibers" "DeviceRegistryTest"
+}
+
+configuration "egress-admission-redis-test" {
+    targetType "executable"
+    targetName "egress-admission-redis-test"
+    sourcePaths "source"
+    importPaths "source" "tests"
+    mainSourceFile "tests/egress_admission_redis_test.d"
+    versions "VibeUseFibers" "EgressAdmissionRedisTest"
+}

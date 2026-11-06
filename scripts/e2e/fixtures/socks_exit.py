@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Test-only RFC 1928/1929 exit. SIGUSR1 kills live tunnels and rejects CONNECT."""
+"""Test-only RFC 1928/1929 exit. SIGUSR1 kills live tunnels and rejects CONNECT.
+SIGUSR2 toggles blackhole mode: live tunnels stay open and keep reading both
+directions, but forwarded bytes are dropped (a silently dead path)."""
 import select
 import signal
 import socket
@@ -10,6 +12,7 @@ TARGETS = {"alpha.example.org", "beta.example.net"}
 active = set()
 lock = threading.Lock()
 failed = threading.Event()
+blackhole = threading.Event()
 
 
 def recv_exact(sock, length):
@@ -86,6 +89,8 @@ class Handler(socketserver.BaseRequestHandler):
                     chunk = source.recv(65536)
                     if not chunk:
                         return
+                    if blackhole.is_set():
+                        continue
                     (upstream if source is client else client).sendall(chunk)
         except (OSError, ValueError, ConnectionError):
             pass
@@ -103,8 +108,17 @@ class Server(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
+def toggle_blackhole(_signal, _frame):
+    if blackhole.is_set():
+        blackhole.clear()
+    else:
+        blackhole.set()
+    print(f"SIGUSR2 blackhole {'on' if blackhole.is_set() else 'off'}", flush=True)
+
+
 if __name__ == "__main__":
     signal.signal(signal.SIGUSR1, drop_tunnels)
+    signal.signal(signal.SIGUSR2, toggle_blackhole)
     with Server(("0.0.0.0", 1080), Handler) as server:
         print("SOCKS exit listening on 1080", flush=True)
         server.serve_forever()

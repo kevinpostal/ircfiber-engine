@@ -29,7 +29,8 @@ final class UserRepository {
      * the two rules agree exactly. Idempotent: re-creating an identical
      * index is a server-side no-op.
      *
-     * `bncToken_1` backs the admin bouncer page (`listWithBncToken`).
+     * `bncToken_1` backs the admin bouncer page (`listWithBncToken`);
+     * `id_1` backs every by-id lookup and the device fleet's owner join.
      */
     private void ensureIndexes() @trusted {
         try {
@@ -47,6 +48,8 @@ final class UserRepository {
         }
         try collection.createIndex(Bson(["bncToken": Bson(1)]));
         catch (Exception e) logWarn("users bncToken index: %s", e.msg);
+        try collection.createIndex(Bson(["id": Bson(1)]));
+        catch (Exception e) logWarn("users id index: %s", e.msg);
         try {
             IndexOptions o;
             o.unique = true;
@@ -150,15 +153,27 @@ final class UserRepository {
         return docFromBson(doc);
     }
 
-    /// Creates a new user account.
+    /// Creates a new user account, including its initial `isTestAccount`.
     void create(User user) {
-        collection.insertOne(userToBson(user));
+        auto doc = userToBson(user);
+        doc["isTestAccount"] = Bson(user.isTestAccount);
+        collection.insertOne(doc);
     }
 
     /// Updates an existing user account. `$set` rather than a replace so
     /// fields outside `User` (the bouncer token) survive profile edits.
+    /// `isTestAccount` is not written: only `setTestAccount` changes it.
     void update(User user) {
         collection.updateOne(["id": user.id.toString()], Bson(["$set": userToBson(user)]));
+    }
+
+    /// Atomically sets the admin test-account classification on the account
+    /// itself, so every device of the account reflects it on the next fleet
+    /// read. False when no user has `id`; throws on database errors.
+    bool setTestAccount(UUID id, bool value) {
+        return collection.updateOne(
+            Bson(["id": Bson(id.toString())]),
+            Bson(["$set": Bson(["isTestAccount": Bson(value)])])).matchedCount > 0;
     }
 
     /// Returns the user's bouncer password, or `""` when none is set. Kept
@@ -440,6 +455,7 @@ final class UserRepository {
         // Tolerant: a wrongly typed value keeps false rather than throwing.
         try { if (doc["emailUnsubscribed"].type == Bson.Type.bool_) u.emailUnsubscribed = doc["emailUnsubscribed"].get!bool; } catch (Exception) {}
         try { if (doc["nickservPasswordCustom"].type == Bson.Type.bool_) u.nickservPasswordCustom = doc["nickservPasswordCustom"].get!bool; } catch (Exception) {}
+        try { if (doc["isTestAccount"].type == Bson.Type.bool_) u.isTestAccount = doc["isTestAccount"].get!bool; } catch (Exception) {}
         // Missing key (pre-OAuth rows) reads as []: unlinked.
         try {
             if (doc["oauthIdentities"].type == Bson.Type.array)

@@ -51,6 +51,12 @@ struct User {
     /// Linked social-login identities. Default [] keeps every existing row
     /// unlinked with no migration; missing key reads as [].
     OAuthIdentity[] oauthIdentities;
+    /// Admin classification: this account exists for testing, so its devices
+    /// are hidden from the default admin fleet. Missing key reads as false.
+    /// `UserRepository.create` stores the initial value and
+    /// `UserRepository.setTestAccount` changes it; `update` never writes it,
+    /// so a stale copy cannot undo an admin change.
+    bool isTestAccount = false;
     /// The account creation time
     SysTime createdAt;
     /// IP history (de-duplicated list of login IPs)
@@ -96,6 +102,7 @@ struct User {
             "loginIps": serializeToJson(loginIps),
             "emailUnsubscribed": Json(emailUnsubscribed),
             "nickservPasswordCustom": Json(nickservPasswordCustom),
+            "isTestAccount": Json(isTestAccount),
             "oauthIdentities": Json(ids)
         ]);
     }
@@ -130,6 +137,8 @@ struct User {
             u.emailUnsubscribed = (*pr).get!bool;
         if (auto pr = "nickservPasswordCustom" in json)
             u.nickservPasswordCustom = (*pr).get!bool;
+        if (auto pr = "isTestAccount" in json)
+            u.isTestAccount = (*pr).get!bool;
         // Missing key (pre-OAuth rows) reads as []: unlinked.
         if (auto pr = "oauthIdentities" in json) {
             try {

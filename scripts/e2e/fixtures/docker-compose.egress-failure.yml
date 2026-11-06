@@ -2,6 +2,7 @@
 services:
   ircfiber-engine:
     environment:
+      IRCFIBER_MULLVAD_POOL: ""
       IRCFIBER_NORDVPN_POOL: socks5://north:test:test@egress-a:1080,socks5://south:test:test@egress-b:1080
   egress-a:
     image: python:3.12-alpine

@@ -11,7 +11,8 @@
  *
  * Wire form: JSON object with `schemaTag == "IRCFv1"`; every other key is
  * optional on read (absent == empty). Newer optional keys: `graceful`,
- * `metaAtMs`, `usersDropped`, the `egress*`/`peerIp`/`localIp` block.
+ * `metaAtMs`, `usersDropped`, the `egress*` (including `egressTrial*`)/
+ * `peerIp`/`localIp` block.
  */
 module ircfiber.engine.session_snapshot;
 
@@ -156,6 +157,13 @@ struct SessionSnapshot {
     string peerIp;
     /// Local source IP of the upstream socket.
     string localIp;
+    /// Owner token of the exit's single recovery trial this session is
+    /// running ("" = not a trial), plus the endpoint it was claimed for.
+    /// Carried across a hot swap so the next engine can settle it; the
+    /// admission store still decides (fenced token, registered >= 60 s).
+    string egressTrialToken;
+    string egressTrialHost;
+    ushort egressTrialPort;
 }
 
 // ── Serialisation ─────────────────────────────────────────────────────
@@ -220,6 +228,9 @@ Json toJSON(ref SessionSnapshot s) {
     j["egressLocationText"] = s.egressLocationText;
     j["peerIp"] = s.peerIp;
     j["localIp"] = s.localIp;
+    j["egressTrialToken"] = s.egressTrialToken;
+    j["egressTrialHost"] = s.egressTrialHost;
+    j["egressTrialPort"] = cast(long) s.egressTrialPort;
     return j;
 }
 
@@ -380,6 +391,9 @@ SessionSnapshot fromJSON(Json j) {
     s.egressLocationText = str(j["egressLocationText"]);
     s.peerIp = str(j["peerIp"]);
     s.localIp = str(j["localIp"]);
+    s.egressTrialToken = str(j["egressTrialToken"]);
+    s.egressTrialHost = str(j["egressTrialHost"]);
+    s.egressTrialPort = cast(ushort) integer(j["egressTrialPort"]);
     return s;
 }
 
@@ -401,6 +415,9 @@ unittest {
     s.ackedCaps = ["sasl", "multi-prefix"];
     s.pendingLabels["abc"] = 42;
     s.egressLabel = "de";
+    s.egressTrialToken = "nonce:7";
+    s.egressTrialHost = "socks.example";
+    s.egressTrialPort = 1080;
     s.outboundQueue = ["PRIVMSG #staff :hi"];
     s.queryHosts["p34c3"] = "~user@788114F4.IP";
     s.queryAccounts["p34c3"] = "p34c3";
@@ -411,6 +428,8 @@ unittest {
     assert(back.ackedCaps == ["sasl", "multi-prefix"]);
     assert(back.pendingLabels["abc"] == 42);
     assert(back.egressLabel == "de" && back.outboundQueue == ["PRIVMSG #staff :hi"]);
+    assert(back.egressTrialToken == "nonce:7" && back.egressTrialHost == "socks.example"
+        && back.egressTrialPort == 1080);
     // A hot swap must not forget who each DM partner is, or every
     // conversation stops following its partner's renames until they speak.
     assert(back.queryHosts["p34c3"] == "~user@788114F4.IP" && back.queryAccounts["p34c3"] == "p34c3");

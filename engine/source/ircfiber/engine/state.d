@@ -64,7 +64,8 @@ void writeStateSnapshots(ref EngineContext ctx) {
 }
 
 /// One slot's published state. Keys must match the gateway's reader
-/// (site/backend/source/ircfiber/egress.d).
+/// (site/backend/source/ircfiber/egress.d). `admission` is the durable
+/// drain/quarantine/recovery verdict, distinct from the transport `state`.
 private Json slotViewToJson(EgressSlotView v) {
     auto j = Json.emptyObject;
     j["label"] = Json(v.label);
@@ -80,6 +81,7 @@ private Json slotViewToJson(EgressSlotView v) {
     j["activeConns"] = Json(cast(long) v.activeConns);
     j["heldUntilMs"] = Json(v.heldUntilMs);
     j["error"] = Json(v.lastError);
+    j["admission"] = v.admission.toJson();
     return j;
 }
 
