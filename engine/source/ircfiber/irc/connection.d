@@ -6324,6 +6324,11 @@ final class PersistentIRCClient {
                         // ── 001 welcomed ─────────────────────────────────────
                         case "001":
                             welcomed = true;
+                            // Registration NICK has no separate echo: 001 is
+                            // its confirmation, not an outstanding /nick.
+                            const welcomeParams = evt.getParams();
+                            if (welcomeParams.length) sessionNick = welcomeParams[0];
+                            optimisticNickOld = "";
                             // A new registration is a new IRC session:
                             // every membership fact we hold belongs to the
                             // socket that just died, and each rejoin's

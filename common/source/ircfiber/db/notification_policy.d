@@ -112,7 +112,6 @@ struct HighlightSettings {
 struct Presentation {
     string preview = "full";
     int coalesceSec = 30;
-    bool autoDismiss = true;
 }
 
 /// Email cadence.
@@ -214,7 +213,6 @@ struct NotificationPolicy {
         auto pr = Json.emptyObject;
         pr["preview"] = Json(presentation.preview);
         pr["coalesceSec"] = Json(presentation.coalesceSec);
-        pr["autoDismiss"] = Json(presentation.autoDismiss);
         j["presentation"] = pr;
         auto em = Json.emptyObject;
         em["mode"] = Json(email.mode);
@@ -352,7 +350,6 @@ struct NotificationPolicy {
             } else {
                 readEnum(*pr, "preview", PREVIEW_LEVELS, p.presentation.preview, repair);
                 readIntIn(*pr, "coalesceSec", COALESCE_SECONDS, p.presentation.coalesceSec, repair);
-                readBool(*pr, "autoDismiss", p.presentation.autoDismiss, repair);
             }
         }
         if (auto em = "email" in j) {
@@ -578,11 +575,6 @@ bool projSound(const ref NotificationPolicy p, string target) {
     return false;
 }
 
-/// `autoDismissNotifs`.
-bool projAutoDismiss(const ref NotificationPolicy p) @safe pure nothrow @nogc {
-    return p.presentation.autoDismiss;
-}
-
 /// `muteAll`: the account's (or that device's effective) snooze is active.
 bool projMuteAll(const ref NotificationPolicy p, string target, long nowMs) {
     return snoozeActive(target.length ? snoozeOf(p, target) : p.snoozeUntil, nowMs);
@@ -598,8 +590,8 @@ string[] projHighlightWords(const ref NotificationPolicy p) {
 // ── v1 migration ──────────────────────────────────────────────────────────
 
 /// The policy of a stored v1 blob (one without `notificationPolicy`). Reads
-/// the flat `desktopNotifications` (D), `notificationSound` (S),
-/// `autoDismissNotifs` (A), `muteAll` (M), `highlightWords` and the raw
+/// the flat `desktopNotifications` (D), `notificationSound` (S), `muteAll` (M),
+/// `highlightWords` and the raw
 /// `devices` entries; moves `mute`/`notifyAll` of each `"<nid>:_server"` entry
 /// of `bufferPrefs` into `networks` (dropping the entry when nothing else is left).
 ///
@@ -611,14 +603,13 @@ NotificationPolicy migrateFromV1(Json rawBlob, long nowMs, ref Json[string] buff
     auto p = defaultPolicy();
     const D = flag(rawBlob, "desktopNotifications", true);
     const S = flag(rawBlob, "notificationSound", true);
-    const A = flag(rawBlob, "autoDismissNotifs", true);
     const M = flag(rawBlob, "muteAll", false);
     foreach (i; 0 .. 6) {
         const pushes = i != NotifyClass.notice && i != NotifyClass.wallops;
         p.matrix[i] = Cells(D, S, pushes, false);
     }
     p.snoozeUntil = M ? -1 : 0;
-    p.presentation = Presentation("full", 0, A);
+    p.presentation = Presentation("full", 0);
     if (rawBlob.type == Json.Type.object)
         if (auto hw = "highlightWords" in rawBlob) {
             auto words = normalizeHighlightWords(*hw);
@@ -710,8 +701,6 @@ string validatePatch(Json patch, out string field) {
                         if (x.type != Json.Type.string || !PREVIEW_LEVELS.canFind(x.get!string)) return "invalid_value";
                     } else if (k == "coalesceSec") {
                         if (x.type != Json.Type.int_ || !COALESCE_SECONDS.canFind(x.get!long)) return "invalid_value";
-                    } else if (k == "autoDismiss") {
-                        if (x.type != Json.Type.bool_) return "invalid_value";
                     } else {
                         return "unknown_field";
                     }
@@ -818,7 +807,6 @@ void applyPatch(ref NotificationPolicy p, Json patch) {
     if (auto pr = "presentation" in patch) {
         if (auto v = "preview" in *pr) p.presentation.preview = v.get!string;
         if (auto v = "coalesceSec" in *pr) p.presentation.coalesceSec = cast(int) v.get!long;
-        if (auto v = "autoDismiss" in *pr) p.presentation.autoDismiss = v.get!bool;
     }
     if (auto em = "email" in patch) {
         if (auto v = "mode" in *em) p.email.mode = v.get!string;
@@ -1291,7 +1279,7 @@ unittest {
     assert(p.quiet.windows == [QuietWindow([0, 1, 2, 3, 4, 5, 6], 1320, 480)]);
     assert(p.quiet.breakthrough.repeatSec == 180 && p.quiet.breakthrough.urgentWords && !p.quiet.breakthrough.vip.length);
     assert(p.highlight.wholeWord && !p.highlight.caseSensitive && !p.highlight.words.length);
-    assert(p.presentation == Presentation("full", 30, true));
+    assert(p.presentation == Presentation("full", 30));
     assert(p.email == EmailSettings("delay15", 8));
     assert(!p.networks.length && !p.clients.length);
     // defaultPolicy hands out its own windows array.
@@ -1322,7 +1310,7 @@ unittest {
     p.quiet.breakthrough = QuietBreakthrough(["Alice", "bob"], 0, false);
     p.quiet.summary = false;
     p.highlight = HighlightSettings([HighlightWord("outage", true), HighlightWord("deploy", false)], false, true);
-    p.presentation = Presentation("sender", 120, false);
+    p.presentation = Presentation("sender", 120);
     p.email = EmailSettings("daily", 23);
     p.networks["n1"] = "muted";
     p.networks["n2"] = "all";
@@ -1378,6 +1366,16 @@ unittest {
     assert(repair);
 }
 
+@("NotificationPolicy.fromJson: a stored presentation.autoDismiss is ignored and dropped on save")
+unittest {
+    bool repair;
+    auto j = defaultPolicy().toJson();
+    j["presentation"] = parseJsonString(`{"preview":"sender","coalesceSec":120,"autoDismiss":false}`);
+    auto p = NotificationPolicy.fromJson(j, repair);
+    assert(!repair && p.presentation == Presentation("sender", 120));
+    assert("autoDismiss" !in p.toJson()["presentation"]);
+}
+
 @("validatePatch: every error code")
 unittest {
     assert(patchError(`[]`) == "bad_request");
@@ -1420,6 +1418,8 @@ unittest {
     assert(patchError(`{"highlight":{"words":[{"w":"outage","urgent":true}],"wholeWord":false}}`) == "");
     assert(patchError(`{"presentation":{"preview":"blurry"}}`) == "invalid_value");
     assert(patchError(`{"presentation":{"coalesceSec":60}}`) == "invalid_value");
+    assert(patchError(`{"presentation":{"autoDismiss":false}}`) == "unknown_field");
+    assert(patchField(`{"presentation":{"autoDismiss":false}}`) == "presentation.autoDismiss");
     assert(patchError(`{"email":{"mode":"weekly"}}`) == "invalid_value");
     assert(patchError(`{"email":{"dailyHour":24}}`) == "invalid_value");
     assert(patchError(`{"networks":{"n1":"loud"}}`) == "invalid_value");
@@ -1454,7 +1454,7 @@ unittest {
     assert(p.quiet.breakthrough.vip == ["Bob", "alice"] && p.quiet.breakthrough.repeatSec == 180);
     assert(p.highlight.words == [HighlightWord("Outage", true), HighlightWord("deploy", false)]);
     assert(p.highlight.caseSensitive && p.highlight.wholeWord);
-    assert(p.presentation == Presentation("full", 0, true));
+    assert(p.presentation == Presentation("full", 0));
     assert(p.email == EmailSettings("daily", 7) && p.bannerDismissed && p.snoozeUntil == 99);
     assert(p.rev == 1, "applyPatch does not bump rev");
     applyPatch(p, parseJsonString(`{"applyPreset":"quiet"}`));
@@ -1515,7 +1515,7 @@ unittest {
 @("v1 projections: account and device views")
 unittest {
     auto p = defaultPolicy();
-    assert(projDesktop(p) && projSound(p, "") && projAutoDismiss(p) && !projMuteAll(p, "", 10));
+    assert(projDesktop(p) && projSound(p, "") && !projMuteAll(p, "", 10));
     assert(projSound(p, DEV), "dm pushes with sound by default");
     foreach (i; 0 .. 6) p.matrix[i].desktop = false;
     assert(!projDesktop(p));
@@ -1527,8 +1527,6 @@ unittest {
     assert(projMuteAll(p, "", 10) && !projMuteAll(p, "", 20) && projMuteAll(p, DEV, 10));
     applyClientPatch(p, DEV, parseJsonString(`{"snoozeUntil":0}`));
     assert(!projMuteAll(p, DEV, 10) && projMuteAll(p, "", 10));
-    p.presentation.autoDismiss = false;
-    assert(!projAutoDismiss(p));
     p.highlight.words = [HighlightWord("a", true), HighlightWord("b", false)];
     assert(projHighlightWords(p) == ["a", "b"]);
 }
@@ -1548,7 +1546,7 @@ unittest {
         const pushes = i != NotifyClass.notice && i != NotifyClass.wallops;
         assert(p.matrix[i] == Cells(false, true, pushes, false));
     }
-    assert(p.snoozeUntil == -1 && p.presentation == Presentation("full", 0, false) && p.migratedAt == 42);
+    assert(p.snoozeUntil == -1 && p.presentation == Presentation("full", 0) && p.migratedAt == 42);
     assert(p.highlight.words == [HighlightWord("Deploy", false), HighlightWord("prod", false)]);
     assert(p.networks == ["n1": "all", "n2": "muted"]);
     assert(bp.length == 2 && bp["n1:_server"] == parseJsonString(`{"showJoinPart":false}`) && "n2:_server" !in bp);
@@ -1558,11 +1556,11 @@ unittest {
     const other = p.clients["aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"];
     assert(other.hasSnooze && other.snoozeUntil == -1 && !other.cells.length);
 
-    // Absent flat keys: D, S, A default on, M off; a device without overrides gets no entry.
+    // Absent flat keys: D, S default on, M off; a device without overrides gets no entry.
     Json[string] none;
     auto q = migrateFromV1(parseJsonString(`{"devices":{"` ~ DEV ~ `":{"muteAll":false,"notificationSound":true}}}`), 1, none);
     assert(q.matrix[NotifyClass.dm] == Cells(true, true, true, false) && q.snoozeUntil == 0);
-    assert(q.presentation.autoDismiss && !q.clients.length && !q.networks.length);
+    assert(!q.clients.length && !q.networks.length);
 }
 
 @("format helpers: isTzName, parseHhmm/formatHhmm, cell keys, ownership")

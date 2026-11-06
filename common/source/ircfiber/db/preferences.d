@@ -15,7 +15,7 @@ import ircfiber.db.prefs_cache : PrefsCache;
 import ircfiber.db.prefs_mongo : loadPrefsDoc, savePrefsDoc, deletePrefsDoc;
 import ircfiber.redis.protocol : RedisKeys;
 import ircfiber.db.notification_policy : NotificationPolicy, defaultPolicy, migrateFromV1, isTzName,
-    projDesktop, projSound, projAutoDismiss, projMuteAll, projHighlightWords, removeClient, CLIENT_WEB;
+    projDesktop, projSound, projMuteAll, projHighlightWords, removeClient, CLIENT_WEB;
 
 /// Maps a `vibe.data.json.Json.Type` enum value to its string name so it can
 /// be emitted as a Loki label / log field. Kept private — only the pref
@@ -507,7 +507,7 @@ struct UserPreferences {
     /// classes × transports matrix, snooze, quiet hours, highlight words and the
     /// per-client overrides. A stored blob without it is migrated from the v1 flat
     /// fields on load (`migrateFromV1`). `toJson` also writes the v1 projections
-    /// (`desktopNotifications`, `notificationSound`, `autoDismissNotifs`, `muteAll`,
+    /// (`desktopNotifications`, `notificationSound`, `muteAll`,
     /// `highlightWords`, device `muteAll`/`notificationSound`), never read back.
     /// Every change goes through `bumpPolicyRev`.
     NotificationPolicy notificationPolicy = defaultPolicy();
@@ -606,7 +606,6 @@ struct UserPreferences {
         const nowMs = unixNowMs();
         j["desktopNotifications"] = Json(projDesktop(notificationPolicy));
         j["notificationSound"] = Json(projSound(notificationPolicy, ""));
-        j["autoDismissNotifs"] = Json(projAutoDismiss(notificationPolicy));
         j["muteAll"] = Json(projMuteAll(notificationPolicy, "", nowMs));
         j["displayPrefsSet"] = Json(displayPrefsSet);
         static foreach (key; DISPLAY_BOOL_PREFS)
@@ -1075,13 +1074,12 @@ void applyDisplayPrefsPatch(P)(ref P p, Json patch) {
 }
 
 /// The v1 notification prefs (`desktopNotifications`, `notificationSound`,
-/// `autoDismissNotifs`, `muteAll`) projected from the policy: the account view
+/// `muteAll`) projected from the policy: the account view
 /// when `deviceId` is "", else that install's view (sound and mute as its pushes follow them).
 Json notificationPrefsJson(const ref UserPreferences p, string deviceId, long nowMs) {
     auto j = Json.emptyObject;
     j["desktopNotifications"] = Json(projDesktop(p.notificationPolicy));
     j["notificationSound"] = Json(projSound(p.notificationPolicy, deviceId));
-    j["autoDismissNotifs"] = Json(projAutoDismiss(p.notificationPolicy));
     j["muteAll"] = Json(projMuteAll(p.notificationPolicy, deviceId, nowMs));
     return j;
 }
@@ -2876,6 +2874,7 @@ unittest {
     assert(!j["desktopNotifications"].get!bool && j["notificationSound"].get!bool && j["muteAll"].get!bool);
     assert(j["devices"][dev]["muteAll"].get!bool && j["devices"][dev]["notificationSound"].get!bool == false);
     assert(j["highlightWords"] == parseJsonString(`["deploy"]`));
+    assert("autoDismissNotifs" !in j, "the legacy expiry flag is ignored, not projected back");
     const again = UserPreferences.fromJson(j);
     assert(!again.needsRepair && again.prefs.notificationPolicy.migratedAt == pol.migratedAt);
 }
