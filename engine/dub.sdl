@@ -118,7 +118,9 @@ configuration "connection-registration-test" {
     targetType "executable"
     targetName "connection-registration-test"
     mainSourceFile "source/connection_registration_test.d"
-    versions "VibeUseFibers"
+    // FiberMlsWireHarness exposes connection.d's FIBERMLS outbound-discovery
+    // checks (in-memory clock + localhost fake-ircd wire capture) to main().
+    versions "VibeUseFibers" "FiberMlsWireHarness"
 }
 
 configuration "observability-test" {

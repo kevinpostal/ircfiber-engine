@@ -429,7 +429,19 @@ private void handleControlMessage(ref EngineContext ctx, ControlMessage msg) {
 
 private void handleNetworkCommand(ref EngineContext ctx, string networkId, IRCCommand cmd) {
     import std.uuid : UUID;
+    import ircfiber.irc.connection : staleFiberMlsCommand;
     auto nid = parseUUID(networkId);
+
+    // A FIBERMLS probe that waited in the command list (engine restart,
+    // consumer backlog) is no longer a live request: never sent late. The
+    // text is bearer material and is not logged.
+    if ((cmd.cmd == "msg" || cmd.cmd == "raw")
+        && staleFiberMlsCommand(cmd.text, cmd.timestampMs,
+            (Clock.currStdTime - 621_355_968_000_000_000L) / 10_000)) {
+        logJsonMap("debug", "consumer", "Stale FIBERMLS command dropped",
+            ["networkId": networkId, "event": "fibermls_stale_command_dropped"]);
+        return;
+    }
 
     switch (cmd.cmd) {
         case "msg":

@@ -29,7 +29,7 @@ import ircfiber.irc.server : ConnectionServer;
 import ircfiber.irc.connection : parseJoinThrottleSeconds, remainingJoinDelayMs, joinBatches,
     memberNeedsRealname, channelNeedsRealnameWho, MAX_WHO_ENRICH_ATTEMPTS,
     upsertRosterEntry, applyNamesBurst, isSaslRequiredRefusal, extractServerReason,
-    saslMechanismOffered;
+    saslMechanismOffered, fiberMlsBackstopChecks, fiberMlsWireChecks;
 import std.string : indexOf;
 
 /// Tracks the number of passing checks.
@@ -307,6 +307,16 @@ void main() {
     ok("mechanism names compare case-insensitively", saslMechanismOffered("plain,external", "PLAIN"));
     ok("an unstated list means try it", saslMechanismOffered("", "SCRAM-SHA-256"));
 
+    // ── FIBERMLS outbound discovery backstop (CTCP probe spam) ───────────
+    // Old tabs, native clients and the msg path share one validated,
+    // per-recipient queue. The wire half runs a real localhost fake ircd
+    // and prints every line the client wrote to it.
+    stderr.writeln("\n[connection.fibermls] outbound discovery backstop");
+    foreach (check; fiberMlsBackstopChecks()) ok(check.name, check.passed);
+    string[] wire;
+    foreach (check; fiberMlsWireChecks(wire)) ok(check.name, check.passed);
+    import std.array : replace;
+    foreach (line; wire) stderr.writeln("    wire> ", line.replace("\x01", "^A"));
     stderr.writeln("\n[", passed, " passed, ", failed, " failed]");
     if (failed > 0) core.stdc.stdlib.exit(1);
 }

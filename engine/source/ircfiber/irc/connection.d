@@ -54,8 +54,8 @@ import ircfiber.irc.egress_catalog : ExitLocation, ExitRelay, locationMatches,
     pickRelayForPin;
 import ircfiber.irc.mls_peer : FiberMlsKind, FiberMlsPacket, IrcPrefix, PeerTicket, RosterMatch,
     DEFAULT_PREFIX_SYMBOLS, FIBERMLS_TICKET_TTL_SECS, buildFiberMlsId, canonicalNetworkKey,
-    generateTicketHex, isReservedFiberMls, matchRosterIdentity, normalizeFiberChannel,
-    parseFiberMls, parseFullPrefix, prefixSymbolsFromIsupport, sameIdentity;
+    generateTicketHex, ircNamesEqual, isReservedFiberMls, matchRosterIdentity, normalizeFiberChannel,
+    parseFiberMls, parseFullPrefix, parseRosterEntry, prefixSymbolsFromIsupport, sameIdentity;
 
 /// IRC connection state.
 ///
@@ -162,21 +162,123 @@ private enum size_t FIBERMLS_MAX_PENDING = 64;
 /// A control line older than this (server-time) is history, not a request;
 /// a sent probe's nonce is only redeemable for this long.
 private enum long FIBERMLS_FRESH_MS = 30_000;
+/// A probe not written this long after a client asked is no longer a live
+/// request (the browser stops waiting for `mls_peer_sent` at the same
+/// point): dropped, never sent late. Also bounds a client command that
+/// waited in the engine command list.
+enum long FIBERMLS_PROBE_MAX_AGE_MS = 20_000;
+/// Per-recipient backstop, independent of any client or tab. A nick not
+/// proven responsive gets one QUERY, on one channel, then nothing on any
+/// channel for this long unless it answers; a QUERY a proven responder
+/// leaves unanswered revokes the proof and starts the same cooldown.
+private enum long FIBERMLS_UNANSWERED_COOLDOWN_MS = 300_000;
+/// A recipient that answered may be asked again on that same channel this
+/// long after the answered QUERY was written (a peer proof lives 30 s in
+/// the browser, refreshed at ~25 s); its other shared channels are
+/// independent, since tickets are channel-bound. The proof itself lapses
+/// FIBERMLS_UNANSWERED_COOLDOWN_MS after the last answered QUERY.
+private enum long FIBERMLS_RESPONDER_REFRESH_MS = 20_000;
+/// Recipient records held at once; a new recipient past this is refused.
+private enum size_t FIBERMLS_MAX_RECIPIENTS = 512;
 /// Spacing of the WHO that refreshes a bare roster entry or our own prefix.
 private enum long FIBERMLS_ROSTER_WHO_MS = 30_000;
 private enum long FIBERMLS_SELF_WHO_MS = 5_000;
 
-/// One outgoing QUERY waiting for its pacing slot.
+/// One outgoing QUERY waiting for its pacing slot, with what it was
+/// validated against so the drain can check it still holds.
 private struct FiberProbe {
     string target;
+    /// CASEMAPPING-folded target nick: the per-recipient key.
+    string recipient;
+    /// `channelState` key of the channel the QUERY names.
+    string chanKey;
+    /// The target's user@host when the roster stated it at queue time.
+    string targetUser;
+    string targetHost;
     string nonce;
     string line;
+    /// Unix ms the client's request reached this connection.
+    long queuedAtMs;
+    /// `connectedAtMs` of the socket it was accepted on.
+    long generation;
 }
 
 /// A QUERY already on the wire, awaiting its ID reply.
 private struct SentFiberProbe {
     string target;
+    string recipient;
+    string chanKey;
     long sentAtMs;
+}
+
+/// What this client knows about one recipient (folded nick). Kept across
+/// our reconnects; see FIBERMLS_UNANSWERED_COOLDOWN_MS.
+private struct FiberRecipientGuard {
+    /// No QUERY on any channel before this unless proven responsive.
+    long blockedUntilMs;
+    /// Write time of the last answered QUERY; 0 = not proven.
+    long answeredSentAtMs;
+    /// `channelState` key → earliest next QUERY naming that channel.
+    long[string] channelNotBeforeMs;
+}
+
+/// Answered within the last FIBERMLS_UNANSWERED_COOLDOWN_MS and not
+/// revoked since by an unanswered QUERY.
+private bool fiberResponsive(ref const FiberRecipientGuard g, long now) @safe pure nothrow @nogc {
+    return g.answeredSentAtMs > 0 && now - g.answeredSentAtMs <= FIBERMLS_UNANSWERED_COOLDOWN_MS;
+}
+
+/// Nothing in the record can still refuse a QUERY at `now`.
+private bool fiberGuardExpired(ref const FiberRecipientGuard g, long now) {
+    if (g.blockedUntilMs > now || fiberResponsive(g, now)) return false;
+    foreach (until; g.channelNotBeforeMs) if (until > now) return false;
+    return true;
+}
+
+/// Whether a raw line or message body carries the reserved CTCP command
+/// anywhere (a split or multi-line body could put it at a line start).
+bool carriesFiberMls(string line) @safe pure nothrow @nogc {
+    foreach (i, c; line)
+        if (c == '\x01' && isReservedFiberMls(line[i .. $])) return true;
+    return false;
+}
+
+/// A client command carrying FIBERMLS that was issued more than
+/// FIBERMLS_PROBE_MAX_AGE_MS from `nowMs` (either way), or carries no issue
+/// time, is history: the command consumer drops it instead of delivering
+/// a stale probe. Commands without the reserved command are never stale.
+bool staleFiberMlsCommand(string text, long issuedAtMs, long nowMs) @safe pure nothrow @nogc {
+    if (!carriesFiberMls(text)) return false;
+    if (issuedAtMs <= 0) return true;
+    const age = nowMs - issuedAtMs;
+    return age > FIBERMLS_PROBE_MAX_AGE_MS || age < -FIBERMLS_PROBE_MAX_AGE_MS;
+}
+
+/// How `nick` stands on one roster: absent, only bare entries
+/// (unverified), one stated hostmask (match, returned in `found`), or a
+/// malformed/contradicting entry (conflict).
+private RosterMatch rosterNickIdentity(const(string)[] roster, string nick, string symbols,
+                                       string mapping, out IrcPrefix found) @safe pure nothrow {
+    auto result = RosterMatch.absent;
+    foreach (entry; roster) {
+        const id = parseRosterEntry(entry, symbols);
+        if (id.nick.length == 0 || !ircNamesEqual(id.nick, nick, mapping)) continue;
+        if (id.malformed) return RosterMatch.conflict;
+        if (!id.hasHostmask) {
+            if (result == RosterMatch.absent) result = RosterMatch.unverified;
+            continue;
+        }
+        if (result == RosterMatch.match && (id.user != found.user || id.host != found.host))
+            return RosterMatch.conflict;
+        found = IrcPrefix(id.nick, id.user, id.host);
+        result = RosterMatch.match;
+    }
+    return result;
+}
+
+/// CASEMAPPINGs a peer engine answers under (see answerFiberQuery).
+private bool fiberMappingSupported(string mapping) @safe pure nothrow @nogc {
+    return mapping == "ascii" || mapping == "rfc1459" || mapping == "rfc1459-strict";
 }
 
 // ── Flood trust (the one ircd whose limits we know) ──────────────────────────
@@ -3535,6 +3637,12 @@ final class PersistentIRCClient {
         SentFiberProbe[string] fiberProbesSent;
         /// Earliest unix ms the next probe may be written.
         long                fiberProbeNotBeforeMs;
+        /// Folded recipient nick → its discovery backstop record.
+        /// Deliberately NOT per socket: it survives our reconnects on this
+        /// client object (and any browser reload) so nothing can re-probe
+        /// one person by forcing a fresh session. Expired records are
+        /// pruned; at most FIBERMLS_MAX_RECIPIENTS.
+        FiberRecipientGuard[string] fiberRecipients;
         /// Normalized channel → unix ms of the last identity-refresh WHO.
         long[string]        fiberRosterWhoMs;
         /// Unix ms of the last WHO for our own nick.
@@ -4573,6 +4681,9 @@ final class PersistentIRCClient {
         fiberReplyTatMs = 0;
         fiberRequesterNotBeforeMs = null;
         fiberProbeQueue = null;
+        // The per-recipient backstop outlives the socket; a QUERY this
+        // socket left unanswered counts as unanswered.
+        foreach (ref p; fiberProbesSent.byValue) noteFiberUnanswered(p);
         fiberProbesSent = null;
         fiberProbeNotBeforeMs = 0;
         fiberRosterWhoMs = null;
@@ -9587,10 +9698,8 @@ private void processEvents() {
     private void answerFiberQuery(IrcPrefix source, string sourcePrefix, FiberMlsPacket pkt) {
         if (!fiberIssuerLive()) return;
         const mapping = casemapping();
-        if (mapping != "ascii" && mapping != "rfc1459" && mapping != "rfc1459-strict") return;
-        string chanKey;
-        foreach (k; channelState.byKey)
-            if (nicksEqualMapped(k, pkt.channel, mapping)) { chanKey = k; break; }
+        if (!fiberMappingSupported(mapping)) return;
+        const chanKey = fiberChannelKey(pkt.channel, mapping);
         auto roster = chanKey.length ? chanKey in channelUsers : null;
         if (roster is null) return;
         IrcPrefix self;
@@ -9667,13 +9776,18 @@ private void processEvents() {
     /// (no scrollback, history, query tab or notification). The nonce must
     /// belong to a probe this connection wrote to that same nick within
     /// FIBERMLS_FRESH_MS; it is single-use. A reply from anyone else leaves
-    /// the genuine probe redeemable.
+    /// the genuine probe redeemable. The answer proves the recipient runs
+    /// discovery: it may be asked on that channel again
+    /// FIBERMLS_RESPONDER_REFRESH_MS after that probe was written, and on
+    /// its other shared channels independently.
     private void relayFiberId(IrcPrefix source, string sourcePrefix, string destination,
                               FiberMlsPacket pkt) {
         pruneFiberProbes(unixMsNow());
         auto sent = pkt.nonce in fiberProbesSent;
         if (sent is null || !nicksEqualMapped(sent.target, source.nick, casemapping())) return;
+        const answered = *sent;
         fiberProbesSent.remove(pkt.nonce);
+        noteFiberAnswered(answered);
         if (redis is null || ownerId == UUID.init) return;
         auto msg = Json.emptyObject;
         msg["type"] = "mls_peer_response";
@@ -9685,65 +9799,260 @@ private void processEvents() {
         redis.publish(RedisKeys.events(ownerId.toString()), msg.toString());
     }
 
+    /// Forgets sent probes past FIBERMLS_FRESH_MS: each was left unanswered.
     private void pruneFiberProbes(long now) {
         string[] stale;
-        foreach (nonce, p; fiberProbesSent)
+        foreach (nonce, ref p; fiberProbesSent)
             if (now - p.sentAtMs > FIBERMLS_FRESH_MS) stale ~= nonce;
-        foreach (nonce; stale) fiberProbesSent.remove(nonce);
+        foreach (nonce; stale) {
+            noteFiberUnanswered(fiberProbesSent[nonce]);
+            fiberProbesSent.remove(nonce);
+        }
     }
 
-    /// A raw line carrying the reserved CTCP command anywhere.
-    private static bool carriesFiberMls(string line) @safe pure nothrow {
-        foreach (i, c; line)
-            if (c == CTCP_DELIM && isReservedFiberMls(line[i .. $])) return true;
-        return false;
+    /// A written QUERY was answered: the recipient is proven, its global
+    /// cooldown lifts, and that channel may be refreshed 20 s after it.
+    private void noteFiberAnswered(ref const SentFiberProbe p) {
+        auto g = p.recipient in fiberRecipients;
+        if (g is null) {
+            fiberRecipients[p.recipient] = FiberRecipientGuard.init;
+            g = p.recipient in fiberRecipients;
+        }
+        if (p.sentAtMs > g.answeredSentAtMs) g.answeredSentAtMs = p.sentAtMs;
+        g.blockedUntilMs = 0;
+        g.channelNotBeforeMs[p.chanKey] = p.sentAtMs + FIBERMLS_RESPONDER_REFRESH_MS;
+    }
+
+    /// A written QUERY got no answer (expired, or its socket closed). Its
+    /// channel keeps the cooldown set at write time; unless the recipient
+    /// answered a later QUERY, its proof is revoked and every channel waits
+    /// out FIBERMLS_UNANSWERED_COOLDOWN_MS from this write.
+    private void noteFiberUnanswered(ref const SentFiberProbe p) nothrow {
+        auto g = p.recipient in fiberRecipients;
+        if (g is null || g.answeredSentAtMs > p.sentAtMs) return;
+        g.answeredSentAtMs = 0;
+        const until = p.sentAtMs + FIBERMLS_UNANSWERED_COOLDOWN_MS;
+        if (g.blockedUntilMs < until) g.blockedUntilMs = until;
+    }
+
+    /// A QUERY was written at `now`: that channel waits the full cooldown
+    /// (shortened by an answer), and an unproven recipient gets nothing on
+    /// any channel until it answers or the cooldown ends.
+    private void noteFiberWritten(ref const FiberProbe p, long now) {
+        auto g = p.recipient in fiberRecipients;
+        if (g is null) {
+            fiberRecipients[p.recipient] = FiberRecipientGuard.init;
+            g = p.recipient in fiberRecipients;
+        }
+        if (!fiberResponsive(*g, now)) g.blockedUntilMs = now + FIBERMLS_UNANSWERED_COOLDOWN_MS;
+        string[] lapsed;
+        foreach (key, until; g.channelNotBeforeMs) if (until <= now) lapsed ~= key;
+        foreach (key; lapsed) g.channelNotBeforeMs.remove(key);
+        g.channelNotBeforeMs[p.chanKey] = now + FIBERMLS_UNANSWERED_COOLDOWN_MS;
+    }
+
+    /// The `channelState` key naming `channel` under `mapping`; "" when
+    /// this connection is not in it.
+    private string fiberChannelKey(string channel, string mapping) {
+        foreach (k; channelState.byKey)
+            if (nicksEqualMapped(k, channel, mapping)) return k;
+        return "";
+    }
+
+    /// Registered (a generation is set) and still owned by this engine (not
+    /// detached for a swap or shutting down): the only time a probe is
+    /// accepted or written. It does not probe the transport itself; a dead
+    /// relay surfaces in writeRaw like any other write, and the reconnect's
+    /// resetConnectionTelemetry drops everything queued for this socket.
+    private bool fiberDiscoveryLive() const {
+        return state == ConnectionState.connected && connectedAtMs > 0
+            && !detachedForHotSwap && !isShutdownRequested;
+    }
+
+    /// Room for one more recipient record, pruning expired ones when full.
+    private bool fiberRecipientRoom(long now) {
+        if (fiberRecipients.length < FIBERMLS_MAX_RECIPIENTS) return true;
+        string[] expired;
+        foreach (key, ref g; fiberRecipients)
+            if (fiberGuardExpired(g, now)) expired ~= key;
+        foreach (key; expired) fiberRecipients.remove(key);
+        return fiberRecipients.length < FIBERMLS_MAX_RECIPIENTS;
+    }
+
+    /// The per-recipient backstop for a QUERY to `recipient` naming
+    /// `chanKey` at `now` (call after pruneFiberProbes). Drop: that channel
+    /// already has one on the wire or is inside its refresh/cooldown, or an
+    /// unproven recipient is in its unanswered cooldown, or no record fits.
+    /// Wait: an unproven recipient's one QUERY on another channel is still
+    /// awaiting its answer, which would prove it for this channel too.
+    private FiberProbeVerdict fiberRecipientVerdict(string recipient, string chanKey, long now) {
+        bool inFlight = false;
+        foreach (ref p; fiberProbesSent) {
+            if (p.recipient != recipient) continue;
+            if (p.chanKey == chanKey) return FiberProbeVerdict.drop;
+            inFlight = true;
+        }
+        auto g = recipient in fiberRecipients;
+        if (g is null)
+            return inFlight ? FiberProbeVerdict.wait
+                : fiberRecipientRoom(now) ? FiberProbeVerdict.send : FiberProbeVerdict.drop;
+        if (auto until = chanKey in g.channelNotBeforeMs)
+            if (*until > now) return FiberProbeVerdict.drop;
+        if (fiberResponsive(*g, now)) return FiberProbeVerdict.send;
+        if (inFlight) return FiberProbeVerdict.wait;
+        return g.blockedUntilMs > now ? FiberProbeVerdict.drop : FiberProbeVerdict.send;
     }
 
     /// Queues a client's exact `PRIVMSG <nick> :<FIBERMLS 1 QUERY …>` for
-    /// paced sending; a nonce already queued or sent coalesces. Every other
-    /// line carrying the reserved command — an ID reply (only this engine
-    /// answers), tags, a channel/STATUSMSG/self/multi target, a malformed or
-    /// oversized packet (never split) — and a 65th pending probe is
-    /// dropped. False when dropped.
-    private bool queueFiberProbe(string line) {
+    /// paced sending, only while registered, only when the channel it names
+    /// is one we are in with both the target and us on its roster, and
+    /// only when the per-recipient backstop allows it (fiberRecipientVerdict)
+    /// and that recipient has nothing for that channel queued already —
+    /// whatever the nonce, tab or client. A second channel for an unproven
+    /// recipient is held until the first is answered, never sent beside it.
+    /// Everything else carrying the reserved command — an ID reply (only
+    /// this engine answers), tags, a channel/STATUSMSG/self/multi target, a
+    /// malformed or oversized packet (never split), a repeat, a 65th
+    /// pending probe — is dropped. False when dropped.
+    private bool queueFiberProbe(string line, long now) {
         import std.uni : icmp;
+        if (!fiberDiscoveryLive()) return false;
         if (line.length < 8 || icmp(line[0 .. 8], "PRIVMSG ") != 0) return false;
         const rest = line[8 .. $];
         const sep = rest.indexOf(" :");
         if (sep <= 0) return false;
         const target = rest[0 .. sep];
         const text = rest[sep + 2 .. $];
-        if (target.indexOf(' ') >= 0 || target.indexOf(',') >= 0) return false;
+        foreach (char c; target) if (c <= ' ' || c == ',' || c == 0x7F) return false;
         const types = channelTypes();
         if (types.indexOf(target[0]) >= 0 || stripNickPrefix(target) != target || isOwnNick(target))
             return false;
         auto pkt = parseFiberMls(text, linePayloadBudget(target, "PRIVMSG"), types);
         if (pkt.kind != FiberMlsKind.query) return false;
-        if ((pkt.nonce in fiberProbesSent) !is null) return true;
-        foreach (q; fiberProbeQueue) if (q.nonce == pkt.nonce) return true;
-        pruneFiberProbes(unixMsNow());
+        const mapping = casemapping();
+        if (!fiberMappingSupported(mapping)) return false;
+        const chanKey = fiberChannelKey(pkt.channel, mapping);
+        auto roster = chanKey.length ? chanKey in channelUsers : null;
+        if (roster is null) return false;
+        const symbols = prefixSymbols();
+        IrcPrefix peer;
+        const peerState = rosterNickIdentity(*roster, target, symbols, mapping, peer);
+        if (peerState == RosterMatch.absent || peerState == RosterMatch.conflict) return false;
+        IrcPrefix self;
+        if (parseFullPrefix(ownPrefix, self)) {
+            const mine = matchRosterIdentity(*roster, self, symbols, mapping);
+            if (mine == RosterMatch.absent || mine == RosterMatch.conflict) return false;
+        } else if (!rosterHas(chanKey, sessionNick)) {
+            return false;
+        }
+        const recipient = normalizeFiberChannel(target, mapping);
+        if ((pkt.nonce in fiberProbesSent) !is null) return false;
+        foreach (ref q; fiberProbeQueue)
+            if ((q.recipient == recipient && q.chanKey == chanKey) || q.nonce == pkt.nonce) return false;
+        pruneFiberProbes(now);
+        if (fiberRecipientVerdict(recipient, chanKey, now) == FiberProbeVerdict.drop) return false;
         if (fiberProbeQueue.length + fiberProbesSent.length >= FIBERMLS_MAX_PENDING) return false;
-        fiberProbeQueue ~= FiberProbe(target, pkt.nonce, "PRIVMSG " ~ target ~ " :" ~ text);
+        FiberProbe p;
+        p.target = target;
+        p.recipient = recipient;
+        p.chanKey = chanKey;
+        if (peerState == RosterMatch.match) {
+            p.targetUser = peer.user;
+            p.targetHost = peer.host;
+        }
+        p.nonce = pkt.nonce;
+        p.line = "PRIVMSG " ~ target ~ " :" ~ text;
+        p.queuedAtMs = now;
+        p.generation = connectedAtMs;
+        fiberProbeQueue ~= p;
         return true;
     }
 
-    /// Writes the next queued probe once its 1 s slot opens, our prefix is
-    /// verified and fewer than FIBERMLS_MAX_PENDING sent probes await
-    /// replies, then publishes `mls_peer_sent` so the browser's deadline
-    /// starts at the real write rather than while queued.
+    private enum FiberProbeVerdict : ubyte { send, wait, drop }
+
+    /// Re-checks a queued probe against the live session at write time:
+    /// same socket, under FIBERMLS_PROBE_MAX_AGE_MS old, still in the
+    /// channel, the target still there as the identity it was queued for,
+    /// our verified prefix stated on that roster, and the per-recipient
+    /// backstop. `whoChan` names a channel whose roster cannot prove us yet.
+    private FiberProbeVerdict fiberProbeVerdict(ref const FiberProbe q, long now, ref const IrcPrefix self,
+                                                string mapping, string symbols, ref string whoChan) {
+        if (q.generation != connectedAtMs || now - q.queuedAtMs > FIBERMLS_PROBE_MAX_AGE_MS
+            || now < q.queuedAtMs)
+            return FiberProbeVerdict.drop;
+        if ((q.chanKey in channelState) is null) return FiberProbeVerdict.drop;
+        auto roster = q.chanKey in channelUsers;
+        if (roster is null) return FiberProbeVerdict.drop;
+        IrcPrefix peer;
+        const peerState = rosterNickIdentity(*roster, q.target, symbols, mapping, peer);
+        if (peerState == RosterMatch.absent || peerState == RosterMatch.conflict)
+            return FiberProbeVerdict.drop;
+        if (q.targetUser.length && (peerState != RosterMatch.match
+            || peer.user != q.targetUser || peer.host != q.targetHost))
+            return FiberProbeVerdict.drop;
+        const mine = matchRosterIdentity(*roster, self, symbols, mapping);
+        if (mine == RosterMatch.unverified) {
+            if (whoChan.length == 0) whoChan = q.chanKey;
+            return FiberProbeVerdict.wait;
+        }
+        if (mine != RosterMatch.match) return FiberProbeVerdict.drop;
+        return fiberRecipientVerdict(q.recipient, q.chanKey, now);
+    }
+
+    /// Takes the oldest queued probe that may be written at `now`, dropping
+    /// every one that no longer validates, and records it as sent: the
+    /// pacing slot, the redeemable nonce and the recipient's cooldown. False
+    /// when nothing may go out yet; `needSelfWho`/`whoChan` then name the
+    /// WHO that would let a waiting probe prove our identity.
+    private bool takeFiberProbe(long now, out FiberProbe probe, out bool needSelfWho, out string whoChan) {
+        if (fiberProbeQueue.length == 0 || !fiberDiscoveryLive()) return false;
+        IrcPrefix self;
+        if (!parseFullPrefix(ownPrefix, self)) { needSelfWho = true; return false; }
+        if (now < fiberProbeNotBeforeMs) return false;
+        pruneFiberProbes(now);
+        if (fiberProbesSent.length >= FIBERMLS_MAX_PENDING) return false;
+        const mapping = casemapping();
+        const symbols = prefixSymbols();
+        bool taken = false;
+        size_t kept = 0;
+        foreach (i; 0 .. fiberProbeQueue.length) {
+            FiberProbe q = fiberProbeQueue[i];
+            if (!taken) {
+                const verdict = fiberMappingSupported(mapping)
+                    ? fiberProbeVerdict(q, now, self, mapping, symbols, whoChan)
+                    : FiberProbeVerdict.drop;
+                if (verdict == FiberProbeVerdict.drop) continue;
+                if (verdict == FiberProbeVerdict.send) {
+                    probe = q;
+                    taken = true;
+                    continue;
+                }
+            }
+            fiberProbeQueue[kept++] = q;
+        }
+        fiberProbeQueue = fiberProbeQueue[0 .. kept];
+        if (!taken) return false;
+        whoChan = "";
+        fiberProbeNotBeforeMs = now + FIBERMLS_PROBE_INTERVAL_MS;
+        fiberProbesSent[probe.nonce] = SentFiberProbe(probe.target, probe.recipient, probe.chanKey, now);
+        noteFiberWritten(probe, now);
+        return true;
+    }
+
+    /// Writes the next valid queued probe once its 1 s slot opens, then
+    /// publishes `mls_peer_sent` so the browser's deadline starts at the
+    /// real write rather than while queued.
     private void drainFiberProbes() {
         if (fiberProbeQueue.length == 0) return;
-        if (state != ConnectionState.connected || detachedForHotSwap || isShutdownRequested) return;
-        if (ownPrefix.length == 0) { requestSelfWho(); return; }
-        const now = unixMsNow();
-        if (now < fiberProbeNotBeforeMs) return;
-        pruneFiberProbes(now);
-        if (fiberProbesSent.length >= FIBERMLS_MAX_PENDING) return;
-        const probe = fiberProbeQueue[0];
-        fiberProbeQueue = fiberProbeQueue[1 .. $];
-        fiberProbeNotBeforeMs = now + FIBERMLS_PROBE_INTERVAL_MS;
+        FiberProbe probe;
+        bool needSelfWho;
+        string whoChan;
+        if (!takeFiberProbe(unixMsNow(), probe, needSelfWho, whoChan)) {
+            if (needSelfWho) requestSelfWho();
+            else if (whoChan.length) requestRosterWho(whoChan);
+            return;
+        }
         writeRaw(probe.line);
-        fiberProbesSent[probe.nonce] = SentFiberProbe(probe.target, now);
         if (redis is null || ownerId == UUID.init) return;
         auto msg = Json.emptyObject;
         msg["type"] = "mls_peer_sent";
@@ -11086,7 +11395,7 @@ private void processEvents() {
         // (outbound queue across reconnects, optimistic bookkeeping): only a
         // well-formed private QUERY leaves, through its own paced queue.
         if (carriesFiberMls(line)) {
-            if (queueFiberProbe(line)) drainFiberProbes();
+            if (queueFiberProbe(line, unixMsNow())) drainFiberProbes();
             return;
         }
         // Track own away status
@@ -11181,6 +11490,16 @@ private void processEvents() {
     ///  4. Otherwise the lines are queued behind the fake-lag pacer.
     private void sendUserMessage(string command, string target, string text,
                                  string label, string[string] tags = null) {
+        // Reserved FIBERMLS discovery is never chat: no split, batch, label,
+        // pacer queue or synthetic echo. An untagged PRIVMSG goes through the
+        // same validated, per-recipient probe queue as a raw line; anything
+        // else carrying the reserved command anywhere is dropped.
+        if (carriesFiberMls(text)) {
+            if (command == "PRIVMSG" && tags.length == 0
+                && queueFiberProbe("PRIVMSG " ~ target ~ " :" ~ text, unixMsNow()))
+                drainFiberProbes();
+            return;
+        }
         const budget = linePayloadBudget(target, command);
         bool[] concat;
         auto lines = splitMessage(text, budget, concat);
@@ -12194,7 +12513,7 @@ unittest {
     // An ID is redeemable once, only from the nick the probe went to.
     auto r = run(outbound);
     auto c = r[0];
-    c.fiberProbesSent[N1] = SentFiberProbe("alice", unixMsNow());
+    c.fiberProbesSent[N1] = SentFiberProbe("alice", "alice", "#c", unixMsNow());
     c.processLine(":bob!~b@hb NOTICE me :" ~ id);
     assert((N1 in c.fiberProbesSent) !is null, "a forged source leaves the genuine probe pending");
     c.processLine("@batch=x :alice!~a@ha NOTICE me :" ~ id);
@@ -12204,40 +12523,302 @@ unittest {
     assert(c.queryBuffers.length == 0);
 }
 
-@("FIBERMLS outbound probes: only exact private QUERYs, coalesced, bounded, never generic-queued")
-unittest {
-    import std.format : format;
-    import vibe.core.channel : createChannel;
-    import ircfiber.irc.mls_peer : buildFiberMlsQuery;
+version (unittest) version = FiberMlsChecks;
+version (FiberMlsWireHarness) version = FiberMlsChecks;
 
-    enum N1 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+version (FiberMlsChecks) {
+
+/// One named outbound-discovery check. Shared by the module unittest and
+/// the `connection-registration-test` harness (built with the
+/// `FiberMlsWireHarness` version), which prints and counts them.
+struct FiberMlsCheck {
+    string name;
+    bool passed;
+}
+
+private string fiberCheckNonce(size_t i) {
+    import std.format : format;
+    return format("%064x", i);
+}
+
+private string fiberCheckQuery(size_t i, string channel) {
+    import ircfiber.irc.mls_peer : buildFiberMlsQuery;
+    return buildFiberMlsQuery(fiberCheckNonce(i), channel, 400);
+}
+
+/// Feeds the roster the checks use while unregistered (any WHO the JOINs
+/// provoke waits in the outbound queue, nothing is written), then marks
+/// the session registered at `connectedAt`. We are `me!~m@host.a` in #c
+/// and #d; alice is in both, bob, erin and gina only in #c, carol is a
+/// bare #c entry.
+private void fiberCheckSession(PersistentIRCClient c, long connectedAt) {
+    foreach (line; [":me!~m@host.a JOIN #c", ":alice!~a@ha JOIN #c", ":bob!~b@hb JOIN #c",
+                    ":erin!~e@he JOIN #c", ":gina!~g@hg JOIN #c",
+                    ":me!~m@host.a JOIN #d", ":alice!~a@ha JOIN #d"])
+        c.processLine(line);
+    c.channelUsers["#c"] ~= "carol";
+    c.state = ConnectionState.connected;
+    c.connectedAtMs = connectedAt;
+}
+
+/// Outbound discovery state transitions with an injected clock, no socket:
+/// queue admission, per-recipient coalescing, write-time revalidation,
+/// staleness, the msg/raw bypasses, cooldowns across a reconnect and the
+/// responder refresh.
+FiberMlsCheck[] fiberMlsBackstopChecks() {
+    import std.algorithm : endsWith;
+    import vibe.core.channel : createChannel;
+
+    FiberMlsCheck[] results;
+    void check(string name, bool passed) { results ~= FiberMlsCheck(name, passed); }
     NetworkConfig cfg;
     cfg.nick = "me";
     auto ch = createChannel!IRCRawEvent();
     scope (exit) ch.close();
     auto c = new PersistentIRCClient(cfg, ch);
-    string query = buildFiberMlsQuery(N1, "#c", 400);
-    c.sendRaw("PRIVMSG alice :" ~ query);
-    assert(c.fiberProbeQueue.length == 1 && c.fiberProbeQueue[0].nonce == N1);
-    assert(c.outboundQueue.length == 0, "a probe never rides the reconnect queue");
-    c.sendRaw("PRIVMSG alice :" ~ query);
-    assert(c.fiberProbeQueue.length == 1, "a duplicate nonce coalesces");
-    foreach (line; ["NOTICE alice :\x01FIBERMLS 1 ID " ~ N1 ~ " " ~ N1 ~ "\x01",
-                    "PRIVMSG #c :" ~ query, "PRIVMSG @alice :" ~ query, "PRIVMSG me :" ~ query,
-                    "PRIVMSG alice,bob :" ~ query, "@+x=1 PRIVMSG bob :" ~ query,
-                    "PRIVMSG bob :\x01FIBERMLS 1 QUERY nope\x01",
-                    "PRIVMSG bob :hello " ~ query]) {
-        c.sendRaw(line);
-        assert(c.fiberProbeQueue.length == 1 && c.outboundQueue.length == 0, line);
+    const t0 = unixMsNow();
+    fiberCheckSession(c, t0);
+    bool queue(string target, size_t n, string channel, long at) {
+        return c.queueFiberProbe("PRIVMSG " ~ target ~ " :" ~ fiberCheckQuery(n, channel), at);
     }
-    foreach (i; 1 .. 100)
-        c.sendRaw("PRIVMSG alice :" ~ buildFiberMlsQuery(format("%064x", i), "#c", 400));
-    assert(c.fiberProbeQueue.length == FIBERMLS_MAX_PENDING);
-    // Not registered: nothing is written, and a new socket forgets them.
-    c.drainFiberProbes();
-    assert(c.fiberProbesSent.length == 0);
+    FiberProbe probe;
+    bool needWho;
+    string whoChan;
+    bool take(long at) { return c.takeFiberProbe(at, probe, needWho, whoChan); }
+    long blocked(string r) { auto g = r in c.fiberRecipients; return g ? g.blockedUntilMs : 0; }
+    long chanGuard(string r, string chan) {
+        auto g = r in c.fiberRecipients;
+        return g ? g.channelNotBeforeMs.get(chan, 0) : 0;
+    }
+    bool proven(string r, long at) { auto g = r in c.fiberRecipients; return g && fiberResponsive(*g, at); }
+    string idLine(string nick, string host, size_t n) {
+        return ":" ~ nick ~ "!" ~ host ~ " NOTICE me :\x01FIBERMLS 1 ID " ~ fiberCheckNonce(n) ~ " "
+            ~ fiberCheckNonce(999) ~ "\x01";
+    }
+
+    check("a QUERY to a member of a shared joined channel is queued", queue("alice", 1, "#c", t0));
+    check("a fresh nonce for a recipient and channel already queued coalesces", !queue("alice", 2, "#c", t0));
+    check("the same recipient and channel in another letter case coalesces", !queue("ALICE", 4, "#c", t0));
+    check("the same recipient on another shared channel is held, not dropped", queue("alice", 3, "#d", t0));
+    bool burst = false;
+    foreach (n; 100 .. 164) burst |= queue("alice", n, n % 2 ? "#c" : "#d", t0);
+    check("64 fresh nonces to one recipient add nothing", !burst && c.fiberProbeQueue.length == 2);
+    check("a member not on the named channel is never probed", !queue("bob", 5, "#d", t0));
+    check("a channel we are not in is never probed", !queue("bob", 6, "#zz", t0));
+    check("a nick on no roster is never probed", !queue("dave", 7, "#c", t0));
+    check("we never probe ourselves", !queue("me", 8, "#c", t0));
+    check("a different recipient is still queued", queue("bob", 10, "#c", t0));
+    check("a bare roster member may be queued", queue("carol", 11, "#c", t0));
+
+    // Hold the pacer so nothing reaches writeRaw (there is no socket).
+    c.fiberProbeNotBeforeMs = long.max;
+    const queued = c.fiberProbeQueue.length;
+    const paced = c.pacedQueue.length;
+    const outbound = c.outboundQueue.length;
+    c.sendLabeledMessage("erin", fiberCheckQuery(20, "#c"), "lbl-1");
+    check("a msg-path QUERY joins the same validated queue, unlabeled, never as chat",
+        c.fiberProbeQueue.length == queued + 1 && c.fiberProbeQueue[$ - 1].recipient == "erin"
+        && ("lbl-1" in c.pendingLabels) is null && c.pacedQueue.length == paced);
+    c.sendMessage("erin", fiberCheckQuery(21, "#c"));
+    c.sendMessage("alice", fiberCheckQuery(22, "#d"));
+    c.sendMessage("dave", fiberCheckQuery(23, "#c"));
+    c.sendMessage("gina", fiberCheckQuery(24, "#c"), ["+reply": "m1"]);
+    c.sendMessage("gina", "hi " ~ fiberCheckQuery(25, "#c"));
+    c.sendMessage("gina", "line one\n" ~ fiberCheckQuery(26, "#c"));
+    c.sendLabeledNotice("gina", "\x01FIBERMLS 1 ID " ~ fiberCheckNonce(27) ~ " "
+        ~ fiberCheckNonce(28) ~ "\x01", "lbl-2");
+    const q = fiberCheckQuery(29, "#c");
+    foreach (line; ["NOTICE gina :\x01FIBERMLS 1 ID " ~ fiberCheckNonce(29) ~ " " ~ fiberCheckNonce(29) ~ "\x01",
+                    "PRIVMSG #c :" ~ q, "PRIVMSG @gina :" ~ q, "PRIVMSG me :" ~ q,
+                    "PRIVMSG gina,bob :" ~ q, "@+x=1 PRIVMSG gina :" ~ q,
+                    "PRIVMSG gina :\x01FIBERMLS 1 QUERY nope\x01", "PRIVMSG gina :hello " ~ q])
+        c.sendRaw(line, true);
+    check("repeats, absent targets, tags, embedded or malformed control and ID replies are dropped"
+        ~ " on both the msg and raw paths",
+        c.fiberProbeQueue.length == queued + 1 && c.pacedQueue.length == paced
+        && c.outboundQueue.length == outbound && ("lbl-2" in c.pendingLabels) is null);
+    c.fiberProbeNotBeforeMs = 0;
+
+    check("the first queued probe is written at once",
+        take(t0) && probe.target == "alice" && probe.chanKey == "#c" && probe.nonce == fiberCheckNonce(1));
+    check("writing it blocks that unproven recipient on every channel for 5 min",
+        blocked("alice") == t0 + FIBERMLS_UNANSWERED_COOLDOWN_MS
+        && chanGuard("alice", "#c") == t0 + FIBERMLS_UNANSWERED_COOLDOWN_MS
+        && (fiberCheckNonce(1) in c.fiberProbesSent) !is null);
+    check("the next probe waits for its pacing slot", !take(t0 + 500));
+    check("a fresh nonce for the channel already on the wire is refused", !queue("alice", 30, "#c", t0 + 600));
+    // Behind the queue, bob's nick now names someone else and carol left.
+    string[] moved;
+    foreach (e; c.channelUsers["#c"]) {
+        if (e.endsWith("bob!~b@hb")) moved ~= "bob!~x@elsewhere";
+        else if (e != "carol") moved ~= e;
+    }
+    c.channelUsers["#c"] = moved;
+    check("an unproven recipient's second channel waits while its first QUERY is unanswered;"
+        ~ " probes whose target changed identity or left are dropped at write time",
+        take(t0 + 1000) && probe.target == "erin" && c.fiberProbeQueue.length == 1
+        && c.fiberProbeQueue[0].recipient == "alice" && c.fiberProbeQueue[0].chanKey == "#d"
+        && ("bob" in c.fiberRecipients) is null && ("carol" in c.fiberRecipients) is null);
+    c.processLine(idLine("alice", "~a@ha", 1));
+    check("a matching ID reply proves the recipient and sets that channel's 20 s refresh",
+        (fiberCheckNonce(1) in c.fiberProbesSent) is null && blocked("alice") == 0
+        && proven("alice", t0 + 2000) && chanGuard("alice", "#c") == t0 + FIBERMLS_RESPONDER_REFRESH_MS);
+    check("a proven responder's other shared channel then gets its own QUERY",
+        take(t0 + 2000) && probe.target == "alice" && probe.chanKey == "#d" && c.fiberProbeQueue.length == 0);
+    check("a proven responder is not refreshed on a channel sooner than 20 s",
+        !queue("alice", 31, "#c", t0 + FIBERMLS_RESPONDER_REFRESH_MS - 1));
+    check("a proven responder may be refreshed on that channel after 20 s",
+        queue("alice", 32, "#c", t0 + FIBERMLS_RESPONDER_REFRESH_MS)
+        && take(t0 + FIBERMLS_RESPONDER_REFRESH_MS) && probe.nonce == fiberCheckNonce(32));
+
+    const tg = t0 + 21_000;
+    check("a probe can be queued for gina", queue("gina", 40, "#c", tg));
+    check("a probe still unwritten 20 s after the request is dropped, never sent late",
+        !take(tg + FIBERMLS_PROBE_MAX_AGE_MS + 1) && c.fiberProbeQueue.length == 0
+        && ("gina" in c.fiberRecipients) is null);
+    check("a QUERY a proven responder left unanswered revokes the proof and blocks every channel",
+        !proven("alice", tg + FIBERMLS_PROBE_MAX_AGE_MS + 1)
+        && blocked("alice") == t0 + 2000 + FIBERMLS_UNANSWERED_COOLDOWN_MS
+        && blocked("erin") == t0 + 1000 + FIBERMLS_UNANSWERED_COOLDOWN_MS);
+    c.state = ConnectionState.connecting;
+    check("nothing is accepted while registering for later delivery", !queue("gina", 41, "#c", tg + 23_000));
+    c.state = ConnectionState.disconnected;
+    check("nothing is accepted while disconnected for later delivery", !queue("gina", 42, "#c", tg + 23_000));
+
+    // Our reconnect: same client object, new socket generation. The #c
+    // refresh written at t0 + 20 s is still in flight and goes unanswered.
     c.resetConnectionTelemetry();
-    assert(c.fiberProbeQueue.length == 0);
+    check("a reconnect forgets queued and sent probes but keeps per-recipient cooldowns",
+        c.fiberProbeQueue.length == 0 && c.fiberProbesSent.length == 0
+        && blocked("alice") == t0 + FIBERMLS_RESPONDER_REFRESH_MS + FIBERMLS_UNANSWERED_COOLDOWN_MS
+        && blocked("erin") == t0 + 1000 + FIBERMLS_UNANSWERED_COOLDOWN_MS);
+    const t1 = t0 + 50_000;
+    c.state = ConnectionState.connected;
+    c.connectedAtMs = t1;
+    c.ownPrefix = "me!~m@host.a";
+    check("the new socket cannot re-probe an unanswered recipient on any channel inside its cooldown",
+        !queue("alice", 50, "#d", t1) && !queue("alice", 51, "#c", t1) && !queue("erin", 52, "#c", t1));
+    check("a recipient that was dropped, never written, may still be probed",
+        queue("bob", 53, "#c", t1) && take(t1) && probe.target == "bob");
+    c.processLine(idLine("bob", "~x@elsewhere", 53));
+    check("a responding recipient is not refreshed sooner than 20 s",
+        proven("bob", t1) && !queue("bob", 54, "#c", t1 + FIBERMLS_RESPONDER_REFRESH_MS - 1));
+    check("a responding recipient may be refreshed after 20 s",
+        queue("bob", 55, "#c", t1 + FIBERMLS_RESPONDER_REFRESH_MS));
+    const aliceFree = t0 + FIBERMLS_RESPONDER_REFRESH_MS + FIBERMLS_UNANSWERED_COOLDOWN_MS;
+    check("an unanswered recipient may be asked again once its 5 min cooldown ends",
+        !queue("alice", 56, "#c", aliceFree - 1) && queue("alice", 57, "#c", aliceFree));
+
+    const sq = "PRIVMSG a :" ~ fiberCheckQuery(60, "#c");
+    check("a queued client command carrying FIBERMLS is stale past 20 s or undated, chat never",
+        staleFiberMlsCommand(sq, t0 - FIBERMLS_PROBE_MAX_AGE_MS - 1, t0)
+        && staleFiberMlsCommand(sq, 0, t0)
+        && !staleFiberMlsCommand(sq, t0 - 1_000, t0)
+        && !staleFiberMlsCommand("PRIVMSG a :hello", 0, t0));
+    return results;
+}
+
+/// The same paths over a real localhost socket: a fake ircd records every
+/// line the client writes (returned in `wire`). Two tabs and a native
+/// client asking for one person, an absent nick, control smuggled into
+/// chat and an ID NOTICE put exactly one QUERY on the wire; a different
+/// recipient gets its own one pacing slot later; the first recipient's
+/// second shared channel goes only after its first QUERY is answered.
+FiberMlsCheck[] fiberMlsWireChecks(out string[] wire) {
+    import std.algorithm : canFind, filter, startsWith;
+    import std.array : array;
+    import core.time : msecs;
+    import vibe.core.channel : createChannel;
+    import vibe.core.core : sleep;
+    import vibe.core.net : listenTCP;
+    import vibe.stream.operations : readLine;
+
+    FiberMlsCheck[] results;
+    void check(string name, bool passed) { results ~= FiberMlsCheck(name, passed); }
+    string[] got;
+    bool peerClosed = false;
+    auto listener = listenTCP(0, (TCPConnection peer) {
+        try {
+            while (!peer.empty) got ~= (cast(const(char)[]) peer.readLine()).idup;
+        } catch (Exception) {}
+        try peer.close(); catch (Exception) {}
+        peerClosed = true;
+    }, "127.0.0.1");
+    auto ch = createChannel!IRCRawEvent();
+    NetworkConfig cfg;
+    cfg.nick = "me";
+    auto c = new PersistentIRCClient(cfg, ch);
+    c.connection = connectTCP("127.0.0.1", listener.bindAddress.port);
+    // Close our end, let the fake ircd's handler see EOF and close the
+    // accepted socket, then stop listening and run the loop once more so
+    // eventcore releases every handle before the process exits.
+    void cleanup() {
+        try {
+            c.connection.close();
+            foreach (_; 0 .. 200) {
+                if (peerClosed) break;
+                sleep(10.msecs);
+            }
+            listener.stopListening();
+            sleep(10.msecs);
+        } catch (Exception) {}
+        ch.close();
+    }
+    scope (exit) cleanup();
+    fiberCheckSession(c, unixMsNow());
+    static string[] messages(string[] lines) {
+        return lines.filter!(l => l.startsWith("PRIVMSG") || l.startsWith("NOTICE")
+            || l.startsWith("BATCH") || l.startsWith("@") || l.canFind("FIBERMLS")).array;
+    }
+
+    const qa = fiberCheckQuery(1, "#c");
+    c.sendRaw("PRIVMSG alice :" ~ qa, true);                              // tab 1
+    c.sendRaw("PRIVMSG alice :" ~ fiberCheckQuery(2, "#c"), true);       // tab 2, fresh nonce
+    c.sendMessage("alice", fiberCheckQuery(3, "#d"));                    // shared channel, msg path
+    c.sendLabeledMessage("Alice", fiberCheckQuery(4, "#c"), "bnc-1");    // native client
+    c.sendRaw("PRIVMSG dave :" ~ fiberCheckQuery(5, "#c"), true);        // shares nothing
+    c.sendMessage("bob", "hello " ~ fiberCheckQuery(6, "#c"));           // smuggled in chat
+    c.sendLabeledNotice("bob", "\x01FIBERMLS 1 ID " ~ fiberCheckNonce(6) ~ " "
+        ~ fiberCheckNonce(7) ~ "\x01", "bnc-2");
+    const qb = fiberCheckQuery(8, "#c");
+    c.sendMessage("bob", qb);                                            // different recipient
+    sleep(300.msecs);
+    const early = messages(got);
+    check("one QUERY reaches the wire for alice however many tabs, nonces and paths ask",
+        early == ["PRIVMSG alice :" ~ qa]);
+    sleep((FIBERMLS_PROBE_INTERVAL_MS + 200).msecs);
+    c.drainFiberProbes();
+    sleep(300.msecs);
+    check("a different recipient gets its own QUERY one pacing slot later; alice's #d waits unanswered",
+        messages(got) == ["PRIVMSG alice :" ~ qa, "PRIVMSG bob :" ~ qb]
+        && c.fiberProbeQueue.length == 1 && c.fiberProbeQueue[0].chanKey == "#d");
+    // alice answers the #c QUERY: her #d proof may now be asked for.
+    c.processLine(":alice!~a@ha NOTICE me :\x01FIBERMLS 1 ID " ~ fiberCheckNonce(1) ~ " "
+        ~ fiberCheckNonce(999) ~ "\x01");
+    sleep((FIBERMLS_PROBE_INTERVAL_MS + 200).msecs);
+    c.drainFiberProbes();
+    sleep(300.msecs);
+    const qd = fiberCheckQuery(3, "#d");
+    check("a proven responder's second channel gets exactly one QUERY after the answer",
+        messages(got) == ["PRIVMSG alice :" ~ qa, "PRIVMSG bob :" ~ qb, "PRIVMSG alice :" ~ qd]);
+    sleep((FIBERMLS_PROBE_INTERVAL_MS + 200).msecs);
+    c.drainFiberProbes();
+    sleep(300.msecs);
+    wire = got.dup;
+    check("nothing further is written once the queue is spent",
+        messages(got).length == 3 && c.fiberProbeQueue.length == 0);
+    check("no client label is registered for a probe", ("bnc-1" in c.pendingLabels) is null
+        && ("bnc-2" in c.pendingLabels) is null);
+    return results;
+}
+
+} // version (FiberMlsChecks)
+
+@("FIBERMLS outbound discovery: one validated probe per recipient, cooldowns, no msg/raw bypass")
+unittest {
+    foreach (check; fiberMlsBackstopChecks()) assert(check.passed, check.name);
+    string[] wire;
+    foreach (check; fiberMlsWireChecks(wire)) assert(check.passed, check.name);
 }
 
 @("IRCv3 registry: away, WHOX, CHGHOST, ACCOUNT *, batches, ACK, RENAME, FAIL CHATHISTORY, CAP")
