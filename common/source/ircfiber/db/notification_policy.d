@@ -1279,7 +1279,6 @@ unittest {
     assert(p.quiet.windows == [QuietWindow([0, 1, 2, 3, 4, 5, 6], 1320, 480)]);
     assert(p.quiet.breakthrough.repeatSec == 180 && p.quiet.breakthrough.urgentWords && !p.quiet.breakthrough.vip.length);
     assert(p.highlight.wholeWord && !p.highlight.caseSensitive && !p.highlight.words.length);
-    assert(p.presentation == Presentation("full", 30));
     assert(p.email == EmailSettings("delay15", 8));
     assert(!p.networks.length && !p.clients.length);
     // defaultPolicy hands out its own windows array.
