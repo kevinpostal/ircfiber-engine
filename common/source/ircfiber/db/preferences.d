@@ -1,5 +1,6 @@
 module ircfiber.db.preferences;
 
+import std.typecons : Nullable;
 import std.algorithm.searching : canFind;
 import std.string : strip;
 import std.uni : icmp;
@@ -381,6 +382,65 @@ struct DeviceProfile {
     }
 }
 
+/// Content version of the post-signup welcome tour; a reworked tour bumps it.
+enum WELCOME_TOUR_VERSION = 1;
+/// The tour's last step: 0 is the welcome, 1–5 teach, 6 is "ready".
+enum WELCOME_TOUR_LAST_STEP = 6;
+/// `WelcomeTour.status`: shown and resumed at `step`.
+enum WELCOME_TOUR_PENDING = "pending";
+/// `WelcomeTour.status`: finished at "ready". Finished tours never reopen.
+enum WELCOME_TOUR_COMPLETED = "completed";
+/// `WelcomeTour.status`: dismissed before "ready". Finished tours never reopen.
+enum WELCOME_TOUR_SKIPPED = "skipped";
+
+/// Whether `s` is a `WelcomeTour.status` value.
+bool isWelcomeTourStatus(string s) @safe pure nothrow @nogc {
+    return s == WELCOME_TOUR_PENDING || s == WELCOME_TOUR_COMPLETED || s == WELCOME_TOUR_SKIPPED;
+}
+
+/// The post-signup welcome tour's progress: `welcomeTour` in GET /api/me, `stat_user` and its
+/// `pref_update`, as `{version, step, status}`. Only accounts given one at creation
+/// (`enrollWelcomeTour`) have it; every other account answers JSON null and never sees the
+/// tour automatically.
+struct WelcomeTour {
+    /// The tour content version the account was enrolled in.
+    int version_ = WELCOME_TOUR_VERSION;
+    /// 0 .. WELCOME_TOUR_LAST_STEP.
+    int step = 0;
+    /// One of `WELCOME_TOUR_PENDING`, `WELCOME_TOUR_COMPLETED`, `WELCOME_TOUR_SKIPPED`.
+    string status = WELCOME_TOUR_PENDING;
+
+    /// Completed or skipped: a terminal state.
+    bool finished() const @safe pure nothrow @nogc {
+        return status != WELCOME_TOUR_PENDING;
+    }
+
+    /// The wire and stored shape.
+    Json toJson() const {
+        auto j = Json.emptyObject;
+        j["version"] = Json(version_);
+        j["step"] = Json(step);
+        j["status"] = Json(status);
+        return j;
+    }
+
+    /// Parses a stored tour into `t`; false when `j` is not a complete, valid one.
+    static bool fromJson(Json j, out WelcomeTour t) {
+        if (j.type != Json.Type.object) return false;
+        auto v = "version" in j;
+        auto s = "step" in j;
+        auto st = "status" in j;
+        if (v is null || v.type != Json.Type.int_ || v.get!long < 1 || v.get!long > int.max) return false;
+        if (s is null || s.type != Json.Type.int_ || s.get!long < 0 || s.get!long > WELCOME_TOUR_LAST_STEP)
+            return false;
+        if (st is null || st.type != Json.Type.string || !isWelcomeTourStatus(st.get!string)) return false;
+        t.version_ = cast(int) v.get!long;
+        t.step = cast(int) s.get!long;
+        t.status = st.get!string;
+        return true;
+    }
+}
+
 /// User preference settings.
 struct UserPreferences {
     /// Pinned channels in "networkId:#channel" format.
@@ -500,6 +560,9 @@ struct UserPreferences {
     /// (`web/admin/bnc.d` `apiBncRevoke`) clears it; the self-service
     /// dedicated-password Revoke does not.
     bool bncAllowPasswordAuth = true;
+    /// The post-signup welcome tour (`WelcomeTour`). Null for accounts created before it or
+    /// otherwise never enrolled: they never see the tour automatically. Account-wide.
+    Nullable!WelcomeTour welcomeTour;
     /// Serializes to JSON.
     Json toJson() const {
         auto j = Json.emptyObject;
@@ -569,6 +632,7 @@ struct UserPreferences {
         j["bncMaxClients"] = Json(bncMaxClients);
         j["bncAwayMessage"] = Json(bncAwayMessage);
         j["bncAllowPasswordAuth"] = Json(bncAllowPasswordAuth);
+        j["welcomeTour"] = welcomeTourJson(this);
         return j;
     }
     /// Deserializes from JSON. The optional `userId` enables structured
@@ -814,6 +878,18 @@ struct UserPreferences {
                 needsRepair = true;
             }
         }
+        if (auto v = "welcomeTour" in json) {
+            if (v.type != Json.Type.null_) {
+                WelcomeTour t;
+                if (WelcomeTour.fromJson(*v, t))
+                    p.welcomeTour = t;
+                else {
+                    logFieldInvalid(userId, "welcomeTour", v.type,
+                        "null or {version >= 1, step 0–6, status pending|completed|skipped}");
+                    needsRepair = true;
+                }
+            }
+        }
         // Last: the v1 migration reads the raw `devices` and moves the
         // `"<nid>:_server"` levels out of the already parsed `bufferPrefs`.
         if (auto v = "notificationPolicy" in json) {
@@ -849,6 +925,65 @@ struct UserPreferences {
         }
         return LoadResult(p, needsRepair);
     }
+}
+
+/// `p.welcomeTour` on the wire: JSON null for an account without a tour, else its object.
+/// The `welcomeTour` value of GET /api/me, `stat_user` and the pref_update.
+Json welcomeTourJson(const ref UserPreferences p) {
+    return p.welcomeTour.isNull ? Json(null) : p.welcomeTour.get.toJson();
+}
+
+/// Gives a just-created account the welcome tour, pending at the welcome step. Call it only
+/// where an account is created, never on login; an existing tour (any state) is left alone.
+/// Returns whether `p` changed.
+bool enrollWelcomeTour(ref UserPreferences p) {
+    if (!p.welcomeTour.isNull) return false;
+    p.welcomeTour = WelcomeTour.init;
+    return true;
+}
+
+/// Validates a POST /api/me/welcome-tour body `{step, status}` (other keys ignored): "" with
+/// `update` set, else the 400 error text. `step` must be a JSON integer in
+/// 0 .. WELCOME_TOUR_LAST_STEP, `status` one of pending, completed, skipped.
+string parseWelcomeTourUpdate(Json body_, out WelcomeTour update) {
+    if (body_.type != Json.Type.object)
+        return "body must be object";
+    auto s = "step" in body_;
+    if (s is null || s.type != Json.Type.int_ || s.get!long < 0 || s.get!long > WELCOME_TOUR_LAST_STEP)
+        return "step must be an integer from 0 to 6";
+    auto st = "status" in body_;
+    if (st is null || st.type != Json.Type.string || !isWelcomeTourStatus(st.get!string))
+        return "status must be one of pending, completed, skipped";
+    update.step = cast(int) s.get!long;
+    update.status = st.get!string;
+    return "";
+}
+
+/// Applies a client's tour save (`parseWelcomeTourUpdate`) and returns whether `p` changed.
+/// Only a pending tour moves: a completed or skipped one is final, so a late or replayed save
+/// cannot reopen it (replays after finishing stay on the client), and an account without a
+/// tour is never enrolled by a save.
+bool applyWelcomeTourUpdate(ref UserPreferences p, const WelcomeTour update) {
+    if (p.welcomeTour.isNull) return false;
+    auto cur = p.welcomeTour.get;
+    if (cur.finished) return false;
+    if (cur.step == update.step && cur.status == update.status) return false;
+    cur.step = update.step;
+    cur.status = update.status;
+    p.welcomeTour = cur;
+    return true;
+}
+
+/// The save-time rule `PreferencesRepository`'s `INCR_AND_SET_LUA` applies
+/// atomically (and its plain-SET fallback applies here): a full-blob save
+/// carrying `incoming` over a valid `stored` tour keeps `stored` when
+/// `incoming` is null (enrolment is never undone) or when `stored` is finished
+/// and `incoming` is not identical (finished tours are final). Sets `incoming`
+/// to `stored` and returns true when it keeps it.
+bool keepStoredWelcomeTour(ref Nullable!WelcomeTour incoming, const WelcomeTour stored) {
+    if (!incoming.isNull && (!stored.finished || incoming.get == stored)) return false;
+    incoming = WelcomeTour(stored.version_, stored.step, stored.status);
+    return true;
 }
 
 /// A JSON array of `items`; never JSON null, even for a null slice.
@@ -1335,34 +1470,88 @@ final class PreferencesRepository {
     /// array fields, each load "repair" them, and the repair save corrupt
     /// them again — an endless loop bumping prefVersion on every load.
     ///
+    /// `welcomeTour` is the one field decided here rather than by the
+    /// caller: every save writes the whole blob, so a process (or another
+    /// gateway colour) holding an older copy would otherwise put back the
+    /// tour it read. A valid stored tour is kept when the incoming one is
+    /// not an object (null: enrolment is never undone), and a stored
+    /// completed/skipped tour is kept unless the incoming one is identical
+    /// (finished tours are final). Only that one segment of the payload is
+    /// replaced, by the stored tour re-encoded. A kept tour is reported by
+    /// returning the new version negated, so `save` can correct its copy.
+    ///
     /// KEYS[1] = prefs:<userId>
-    /// ARGV[1] = JSON to write; must start with `PAYLOAD_PREFIX`
-    ///           (see `versionedPayload`)
-    /// Returns the new prefVersion.
-    private enum PAYLOAD_PREFIX = `{"prefVersion":0,`;
+    /// ARGV[1] = JSON to write; must start with `PAYLOAD_PREFIX` followed
+    ///           by ARGV[2] and a comma (see `versionedPayload`)
+    /// ARGV[2] = the payload's `welcomeTour` value, exactly as spliced
+    /// Returns the new prefVersion, negated when the stored tour was kept.
+    private enum PAYLOAD_PREFIX = `{"prefVersion":0,"welcomeTour":`;
+    static assert(WELCOME_TOUR_LAST_STEP == 6, "update the step bound in INCR_AND_SET_LUA");
     private enum INCR_AND_SET_LUA = `local current = redis.call('GET', KEYS[1])
 local newPrefVersion = 1
+local stored = nil
 if current then
     local ok, parsed = pcall(cjson.decode, current)
-    if ok and type(parsed) == 'table' and parsed.prefVersion then
-        newPrefVersion = tonumber(parsed.prefVersion) + 1
+    if ok and type(parsed) == 'table' then
+        if parsed.prefVersion then
+            newPrefVersion = tonumber(parsed.prefVersion) + 1
+        end
+        stored = parsed.welcomeTour
     end
 end
 local prefix = '` ~ PAYLOAD_PREFIX ~ `'
 local doc = ARGV[1]
-if string.sub(doc, 1, #prefix) ~= prefix or not pcall(cjson.decode, doc) then
-    return redis.error_reply('preferences.d: ARGV[1] must be JSON starting with ' .. prefix)
+local tour = ARGV[2]
+local okDoc, incoming = pcall(cjson.decode, doc)
+if not okDoc or type(incoming) ~= 'table' or string.sub(doc, 1, #prefix + #tour + 1) ~= prefix .. tour .. ',' then
+    return redis.error_reply('preferences.d: ARGV[1] must be JSON starting with ' .. prefix .. tour .. ',')
 end
-redis.call('SET', KEYS[1], '{"prefVersion":' .. string.format('%d', newPrefVersion) .. ',' .. string.sub(doc, #prefix + 1))
+local rest = string.sub(doc, #prefix + #tour + 2)
+local function validTour(t)
+    return type(t) == 'table'
+        and (t.status == 'pending' or t.status == 'completed' or t.status == 'skipped')
+        and type(t.step) == 'number' and t.step >= 0 and t.step <= 6 and t.step == math.floor(t.step)
+        and type(t.version) == 'number' and t.version >= 1 and t.version <= 2147483647
+        and t.version == math.floor(t.version)
+end
+local kept = false
+if validTour(stored) then
+    local inc = incoming.welcomeTour
+    if type(inc) ~= 'table' or (stored.status ~= 'pending'
+            and not (inc.status == stored.status and inc.step == stored.step and inc.version == stored.version)) then
+        tour = cjson.encode({version = stored.version, step = stored.step, status = stored.status})
+        kept = true
+    end
+end
+redis.call('SET', KEYS[1], '{"prefVersion":' .. string.format('%d', newPrefVersion) .. ',"welcomeTour":' .. tour .. ',' .. rest)
+if kept then
+    return -newPrefVersion
+end
 return newPrefVersion`;
 
-    /// `prefs` as JSON with `"prefVersion":0` first, the shape
-    /// `INCR_AND_SET_LUA` splices the real version into.
-    private static string versionedPayload(const ref UserPreferences prefs) {
+    /// `prefs` as JSON with `"prefVersion":0` then `"welcomeTour"` first, the
+    /// shape `INCR_AND_SET_LUA` splices into; `tour` is the welcomeTour value
+    /// as written there.
+    private static string versionedPayload(const ref UserPreferences prefs, out string tour) {
         auto j = prefs.toJson();
         j.remove("prefVersion");
+        j.remove("welcomeTour");
+        tour = welcomeTourJson(prefs).toString();
         const rest = j.toString();   // "{...}", never empty: toJson always emits every field
-        return PAYLOAD_PREFIX ~ rest[1 .. $];
+        return PAYLOAD_PREFIX ~ tour ~ "," ~ rest[1 .. $];
+    }
+
+    /// The valid `welcomeTour` stored at `key`, read back after `INCR_AND_SET_LUA`
+    /// kept it; false when it cannot be read.
+    private bool readStoredWelcomeTour(string key, out WelcomeTour tour) {
+        try {
+            auto j = parseJsonString(redis.getDb().get(key));
+            if (j.type == Json.Type.object)
+                if (auto v = "welcomeTour" in j)
+                    return WelcomeTour.fromJson(*v, tour);
+        } catch (Exception e)
+            logWarn("prefs: reading the stored welcome tour at %s failed: %s", key, e.msg);
+        return false;
     }
 
     /// Creates a new preferences repository, optionally using a shared
@@ -1524,23 +1713,15 @@ return newPrefVersion`;
         // The Lua is authoritative for prefVersion; zero it so the cached
         // copy below never carries a stale caller-side number.
         prefs.prefVersion = 0;
-        const payload = versionedPayload(prefs);
+        string tour;
+        const payload = versionedPayload(prefs, tour);
 
         long newVersion = 0;
         try {
-            auto reply = redis.getDb().eval!long(INCR_AND_SET_LUA, [key], payload);
+            auto reply = redis.getDb().eval!long(INCR_AND_SET_LUA, [key], payload, tour);
             if (!reply.empty) {
                 newVersion = reply.front;
             }
-            // Update cache AFTER the Redis write succeeds so a concurrent
-            // load() in another fiber sees the fresh data in the cache
-            // instead of reading the stale blob from Redis. This prevents
-            // the repair-path race where multiple requests all miss the
-            // cache, load the broken blob, and each fires a repair cycle.
-            // Restore prefVersion from the Lua-returned counter since
-            // it was zeroed before serialization (line 428).
-            prefs.prefVersion = newVersion;
-            cache_.set(userId, prefs);
         } catch (Exception e) {
             logWarn("prefsRepo.save EVAL failed for %s: %s — falling back to plain SET",
                 userId, e.msg);
@@ -1548,10 +1729,36 @@ return newPrefVersion`;
             // prefVersion counter will be wrong on this save, but the
             // next successful save will repair it. We do NOT swallow
             // the failure silently — callers will see prefVersion=0.
+            // The plain SET skips the Lua's welcome tour rule, so apply
+            // it here (not atomically; this path is already degraded).
+            WelcomeTour stored;
+            if (readStoredWelcomeTour(key, stored))
+                keepStoredWelcomeTour(prefs.welcomeTour, stored);
             redis.setJson(key, prefs.toJson());
             savePrefsDoc(userId.toString(), prefs.toJson(), prefs.prefVersion);
             return 0;
         }
+        if (newVersion < 0) {
+            // The Lua kept the stored welcome tour over this (older) one:
+            // take it so the cache and the durable copy match Redis.
+            newVersion = -newVersion;
+            WelcomeTour stored;
+            if (!readStoredWelcomeTour(key, stored)) {
+                // Redis holds the right tour; the next save writes the durable copy.
+                cache_.remove(userId);
+                return newVersion;
+            }
+            prefs.welcomeTour = stored;
+        }
+        // Update cache AFTER the Redis write succeeds so a concurrent
+        // load() in another fiber sees the fresh data in the cache
+        // instead of reading the stale blob from Redis. This prevents
+        // the repair-path race where multiple requests all miss the
+        // cache, load the broken blob, and each fires a repair cycle.
+        // Restore prefVersion from the Lua-returned counter since
+        // it was zeroed before serialization.
+        prefs.prefVersion = newVersion;
+        cache_.set(userId, prefs);
 
         // Write through to the durable copy. Redis stays authoritative on
         // read; this is what survives a flush or a corrupt-blob repair.
@@ -1604,6 +1811,36 @@ return newPrefVersion`;
     /// Convenience overload for callers that always save.
     long mutate(UUID userId, scope void delegate(ref UserPreferences) apply) {
         return mutate(userId, (ref UserPreferences p) { apply(p); return true; });
+    }
+
+    /// Creates an account so that it can never exist without its welcome tour:
+    /// first stores the preferences of `userId` (a freshly allocated id, never an
+    /// existing user's) — `seed` (may be null) plus a pending tour — and throws
+    /// when that fails, before anything is inserted. Then runs `insert` (the
+    /// user-row insert: true when created, false when a unique index lost a
+    /// race). When `insert` returns false or throws, those just-written
+    /// preferences are erased again, so failed attempts leave nothing behind.
+    bool createWithWelcomeTour(UUID userId, scope void delegate(ref UserPreferences) seed,
+            scope bool delegate() insert) {
+        mutate(userId, (ref UserPreferences p) {
+            if (seed !is null) seed(p);
+            enrollWelcomeTour(p);
+        });
+        bool created;
+        try created = insert();
+        catch (Exception e) {
+            eraseUncreated(userId);
+            throw e;
+        }
+        if (!created) eraseUncreated(userId);
+        return created;
+    }
+
+    /// `deleteForUser` for an account whose insert failed; failures only logged.
+    private void eraseUncreated(UUID userId) {
+        try deleteForUser(userId);
+        catch (Exception e)
+            logWarn("prefs: erasing the preferences of uncreated account %s failed: %s", userId, e.msg);
     }
 
     /// Erases every copy of a user's preferences: Redis, the in-process
@@ -2693,4 +2930,242 @@ unittest {
     j["tz"] = Json("Asia/Tokyo");
     bool bad2;
     assert(DeviceProfile.fromJson(j, bad2).tz == "Asia/Tokyo" && !bad2);
+}
+
+@("welcomeTour: legacy blobs and explicit null stay null without a repair; tours round-trip")
+unittest {
+    // A legacy account's stored blob has no welcomeTour key at all.
+    auto legacy = UserPreferences.init.toJson();
+    assert(legacy["welcomeTour"].type == Json.Type.null_, "an un-enrolled account serializes null");
+    legacy.remove("welcomeTour");
+    const r0 = UserPreferences.fromJson(legacy);
+    assert(r0.prefs.welcomeTour.isNull, "a legacy account must never be enrolled by a load");
+    assert(welcomeTourJson(r0.prefs).type == Json.Type.null_);
+    assert(!UserPreferences.fromJson(UserPreferences.init.toJson()).needsRepair);
+
+    foreach (status; [WELCOME_TOUR_PENDING, WELCOME_TOUR_COMPLETED, WELCOME_TOUR_SKIPPED]) {
+        UserPreferences p;
+        p.welcomeTour = WelcomeTour(WELCOME_TOUR_VERSION, 4, status);
+        const first = p.toJson().toString();
+        const r = UserPreferences.fromJson(parseJsonString(first));
+        assert(!r.needsRepair);
+        assert(!r.prefs.welcomeTour.isNull);
+        assert(r.prefs.welcomeTour.get.step == 4 && r.prefs.welcomeTour.get.status == status);
+        assert(r.prefs.welcomeTour.get.version_ == WELCOME_TOUR_VERSION);
+        assert(r.prefs.toJson().toString() == first, "a tour must survive a reload unchanged");
+        auto wire = welcomeTourJson(r.prefs);
+        assert(wire["version"].get!long == 1 && wire["step"].get!long == 4 && wire["status"].get!string == status);
+    }
+}
+
+@("welcomeTour: a malformed stored tour loads as null and flags a repair")
+unittest {
+    foreach (bad; [`[]`, `"pending"`, `{}`, `{"step":2,"status":"pending"}`,
+            `{"version":0,"step":2,"status":"pending"}`, `{"version":1,"step":7,"status":"pending"}`,
+            `{"version":1,"step":-1,"status":"pending"}`, `{"version":1,"step":"2","status":"pending"}`,
+            `{"version":1,"step":2.5,"status":"pending"}`, `{"version":1,"step":2,"status":"done"}`,
+            `{"version":1,"step":2}`]) {
+        auto j = UserPreferences.init.toJson();
+        j["welcomeTour"] = parseJsonString(bad);
+        const r = UserPreferences.fromJson(j);
+        assert(r.needsRepair, bad);
+        assert(r.prefs.welcomeTour.isNull, bad);
+        assert(!UserPreferences.fromJson(r.prefs.toJson()).needsRepair, "the repaired blob is clean: " ~ bad);
+    }
+}
+
+@("enrollWelcomeTour: a new account starts pending at step 0; an existing tour is never reset")
+unittest {
+    UserPreferences p;
+    assert(enrollWelcomeTour(p));
+    assert(!p.welcomeTour.isNull);
+    assert(p.welcomeTour.get == WelcomeTour(WELCOME_TOUR_VERSION, 0, WELCOME_TOUR_PENDING));
+    assert(!enrollWelcomeTour(p), "enrolling twice changes nothing");
+
+    p.welcomeTour = WelcomeTour(WELCOME_TOUR_VERSION, 6, WELCOME_TOUR_COMPLETED);
+    assert(!enrollWelcomeTour(p));
+    assert(p.welcomeTour.get.status == WELCOME_TOUR_COMPLETED && p.welcomeTour.get.step == 6);
+}
+
+@("parseWelcomeTourUpdate: integer step 0..6 and a known status, else a 400 text")
+unittest {
+    WelcomeTour u;
+    foreach (bad; [`[]`, `null`, `"x"`, `{}`, `{"status":"pending"}`, `{"step":0}`,
+            `{"step":-1,"status":"pending"}`, `{"step":7,"status":"pending"}`, `{"step":2.0,"status":"pending"}`,
+            `{"step":"2","status":"pending"}`, `{"step":true,"status":"pending"}`, `{"step":null,"status":"pending"}`,
+            `{"step":2,"status":"PENDING"}`, `{"step":2,"status":"done"}`, `{"step":2,"status":1}`,
+            `{"step":2,"status":null}`, `{"step":99999999999999999999,"status":"pending"}`]) {
+        assert(parseWelcomeTourUpdate(parseJsonString(bad), u).length, bad);
+    }
+    assert(parseWelcomeTourUpdate(parseJsonString(`{"step":3,"status":"pending","extra":1}`), u) == "");
+    assert(u.step == 3 && u.status == WELCOME_TOUR_PENDING);
+    assert(parseWelcomeTourUpdate(parseJsonString(`{"step":0,"status":"skipped"}`), u) == "");
+    assert(u.step == 0 && u.status == WELCOME_TOUR_SKIPPED);
+    assert(parseWelcomeTourUpdate(parseJsonString(`{"step":6,"status":"completed"}`), u) == "");
+    assert(u.step == 6 && u.status == WELCOME_TOUR_COMPLETED);
+}
+
+@("applyWelcomeTourUpdate: only a pending tour moves; finished tours and legacy accounts never change")
+unittest {
+    // Legacy account: no save enrolls it, finishing or not.
+    UserPreferences legacy;
+    assert(!applyWelcomeTourUpdate(legacy, WelcomeTour(1, 2, WELCOME_TOUR_PENDING)));
+    assert(!applyWelcomeTourUpdate(legacy, WelcomeTour(1, 6, WELCOME_TOUR_COMPLETED)));
+    assert(legacy.welcomeTour.isNull);
+
+    UserPreferences p;
+    enrollWelcomeTour(p);
+    assert(applyWelcomeTourUpdate(p, WelcomeTour(1, 3, WELCOME_TOUR_PENDING)));
+    assert(p.welcomeTour.get.step == 3 && p.welcomeTour.get.status == WELCOME_TOUR_PENDING);
+    assert(!applyWelcomeTourUpdate(p, WelcomeTour(1, 3, WELCOME_TOUR_PENDING)), "a repeat is not a change");
+    assert(applyWelcomeTourUpdate(p, WelcomeTour(1, 1, WELCOME_TOUR_PENDING)), "going back is allowed");
+    assert(applyWelcomeTourUpdate(p, WelcomeTour(1, 6, WELCOME_TOUR_COMPLETED)));
+
+    // Late pending saves (sent before finishing, delivered after) and a replay's saves.
+    assert(!applyWelcomeTourUpdate(p, WelcomeTour(1, 5, WELCOME_TOUR_PENDING)));
+    assert(!applyWelcomeTourUpdate(p, WelcomeTour(1, 0, WELCOME_TOUR_PENDING)));
+    assert(!applyWelcomeTourUpdate(p, WelcomeTour(1, 2, WELCOME_TOUR_SKIPPED)));
+    assert(p.welcomeTour.get == WelcomeTour(WELCOME_TOUR_VERSION, 6, WELCOME_TOUR_COMPLETED));
+
+    UserPreferences s;
+    enrollWelcomeTour(s);
+    assert(applyWelcomeTourUpdate(s, WelcomeTour(1, 2, WELCOME_TOUR_SKIPPED)));
+    assert(!applyWelcomeTourUpdate(s, WelcomeTour(1, 6, WELCOME_TOUR_COMPLETED)));
+    assert(!applyWelcomeTourUpdate(s, WelcomeTour(1, 3, WELCOME_TOUR_PENDING)));
+    assert(s.welcomeTour.get == WelcomeTour(WELCOME_TOUR_VERSION, 2, WELCOME_TOUR_SKIPPED));
+}
+
+@("prefsRepo: stale full saves from independently cached repositories never reopen or erase a tour")
+unittest {
+    // Requires local Redis (same gate as the atomicity test above).
+    RedisStorage redis;
+    try {
+        redis = new RedisStorage();
+        redis.connect();
+        redis.ping();
+    } catch (Exception e) {
+        logWarn("Skipping welcome tour persistence test: Redis unavailable (%s)", e.msg);
+        return;
+    }
+
+    auto userId = randomUUID();
+    auto userId2 = randomUUID();
+    auto legacyId = randomUUID();
+    string key = "prefs:" ~ userId.toString();
+    string key2 = "prefs:" ~ userId2.toString();
+    string legacyKey = "prefs:" ~ legacyId.toString();
+    void cleanup() {
+        foreach (k; [key, key2, legacyKey]) {
+            try redis.getDb().del(k);
+            catch (Exception) {}
+        }
+    }
+    cleanup();
+    scope (exit) cleanup();
+
+    // Two processes (or gateway colours): independent caches over one Redis.
+    auto a = new PreferencesRepository(redis, new PrefsCache());
+    auto b = new PreferencesRepository(redis, new PrefsCache());
+    WelcomeTour stored() {
+        const p = new PreferencesRepository(redis, new PrefsCache()).load(userId, true);
+        assert(!p.welcomeTour.isNull, "a stored tour must never be erased");
+        return p.welcomeTour.get;
+    }
+    const completed = WelcomeTour(WELCOME_TOUR_VERSION, 6, WELCOME_TOUR_COMPLETED);
+
+    assert(a.createWithWelcomeTour(userId, (ref UserPreferences p) { p.language = "de"; }, () => true));
+    assert(stored() == WelcomeTour.init && b.load(userId).language == "de");
+    // b now caches the pending tour, then a finishes it.
+    const staleCopy = b.load(userId);
+    const done = a.mutate(userId, (ref UserPreferences p) {
+        return applyWelcomeTourUpdate(p, completed);
+    });
+    assert(done > 0);
+
+    // b's unrelated save carries its stale pending tour: the field it changed
+    // lands, the finished tour is kept, and b's cache learns it.
+    const pinVersion = b.mutate(userId, (ref UserPreferences p) { p.pinnedChannels ~= "n1:#a"; });
+    assert(pinVersion > done, "the stale save still writes (and reports a positive version)");
+    assert(stored() == completed);
+    assert(new PreferencesRepository(redis, new PrefsCache()).load(userId, true).pinnedChannels == ["n1:#a"]);
+    assert(b.load(userId).welcomeTour.get == completed, "the saving process's cache must match Redis");
+
+    // A late pending tour save, decided on a stale copy, cannot reopen it either.
+    auto stalePending = UserPreferences.fromJson(staleCopy.toJson()).prefs;
+    assert(applyWelcomeTourUpdate(stalePending, WelcomeTour(1, 4, WELCOME_TOUR_PENDING)));
+    assert(b.save(userId, stalePending) > 0);
+    assert(stored() == completed);
+    // Nor can a stale blob without a tour, or one finishing it differently.
+    b.save(userId, UserPreferences.init);
+    assert(stored() == completed);
+    auto skipped = UserPreferences.init;
+    skipped.welcomeTour = WelcomeTour(WELCOME_TOUR_VERSION, 2, WELCOME_TOUR_SKIPPED);
+    b.save(userId, skipped);
+    assert(stored() == completed);
+    assert(b.mutate(userId, (ref UserPreferences p) {
+        return applyWelcomeTourUpdate(p, WelcomeTour(1, 3, WELCOME_TOUR_PENDING));
+    }) == 0);
+    assert(stored() == completed);
+
+    // A pending tour progresses normally, but a blob without one cannot erase it.
+    assert(a.createWithWelcomeTour(userId2, null, () => true));
+    auto progressed = UserPreferences.init;
+    progressed.welcomeTour = WelcomeTour(WELCOME_TOUR_VERSION, 3, WELCOME_TOUR_PENDING);
+    b.save(userId2, progressed);
+    b.save(userId2, UserPreferences.init);
+    const p2 = new PreferencesRepository(redis, new PrefsCache()).load(userId2, true);
+    assert(!p2.welcomeTour.isNull && p2.welcomeTour.get == WelcomeTour(WELCOME_TOUR_VERSION, 3, WELCOME_TOUR_PENDING));
+
+    // A legacy account (blob without the key) stays without a tour.
+    redis.getDb().set(legacyKey, `{"prefVersion":5,"pinnedChannels":[]}`);
+    b.save(legacyId, UserPreferences.init);
+    assert(new PreferencesRepository(redis, new PrefsCache()).load(legacyId, true).welcomeTour.isNull);
+}
+
+@("createWithWelcomeTour: a lost or failed insert leaves no preferences behind")
+unittest {
+    // Requires local Redis (same gate as the atomicity test above).
+    RedisStorage redis;
+    try {
+        redis = new RedisStorage();
+        redis.connect();
+        redis.ping();
+    } catch (Exception e) {
+        logWarn("Skipping createWithWelcomeTour test: Redis unavailable (%s)", e.msg);
+        return;
+    }
+    auto lost = randomUUID();
+    auto failed = randomUUID();
+    auto repo = new PreferencesRepository(redis, new PrefsCache());
+
+    assert(!repo.createWithWelcomeTour(lost, null, () => false));
+    assert(!redis.exists("prefs:" ~ lost.toString()), "a duplicate-key loser must not leave preferences");
+    assert(repo.load(lost).welcomeTour.isNull, "nor a cached copy");
+
+    bool threw;
+    try repo.createWithWelcomeTour(failed, null, delegate bool() {
+        throw new Exception("insert failed");
+    });
+    catch (Exception) threw = true;
+    assert(threw, "an insert failure must reach the caller");
+    assert(!redis.exists("prefs:" ~ failed.toString()));
+}
+
+@("keepStoredWelcomeTour: null never replaces a tour; a finished tour is final")
+unittest {
+    const pending = WelcomeTour(1, 2, WELCOME_TOUR_PENDING);
+    const done = WelcomeTour(1, 6, WELCOME_TOUR_COMPLETED);
+    Nullable!WelcomeTour t;
+    assert(keepStoredWelcomeTour(t, pending) && t.get == pending);
+    t.nullify();
+    assert(keepStoredWelcomeTour(t, done) && t.get == done);
+    t = WelcomeTour(1, 4, WELCOME_TOUR_PENDING);
+    assert(!keepStoredWelcomeTour(t, pending) && t.get.step == 4, "a pending tour progresses");
+    t = WelcomeTour(1, 6, WELCOME_TOUR_COMPLETED);
+    assert(!keepStoredWelcomeTour(t, pending), "a pending tour can finish");
+    assert(!keepStoredWelcomeTour(t, done), "an identical finished tour is no change");
+    t = WelcomeTour(1, 4, WELCOME_TOUR_PENDING);
+    assert(keepStoredWelcomeTour(t, done) && t.get == done);
+    t = WelcomeTour(1, 2, WELCOME_TOUR_SKIPPED);
+    assert(keepStoredWelcomeTour(t, done) && t.get == done, "the first finish wins");
 }

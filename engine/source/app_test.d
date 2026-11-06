@@ -31,6 +31,7 @@ pragma(msg, "[app_test] module loaded");
 // and the backend's own narrow `*-test` configs.
 import ircfiber.irc.chathistory;
 import ircfiber.irc.connection;
+import ircfiber.irc.mls_peer;
 import ircfiber.irc.parser;
 import ircfiber.irc.sasl;
 import ircfiber.irc.pacer;
@@ -64,6 +65,7 @@ int main() {
     writefln("IRC Fiber unittest suite (run with -b unittest)");
     cast(void) runModuleTests!(
         ircfiber.irc.connection,
+        ircfiber.irc.mls_peer,
         ircfiber.irc.parser,
         ircfiber.irc.sasl,
         ircfiber.irc.pacer,

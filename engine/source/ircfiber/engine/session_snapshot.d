@@ -132,6 +132,14 @@ struct SessionSnapshot {
     long metaAtMs;
     /// `channelUsers` was dropped to fit the META size limit.
     bool usersDropped;
+    /// Connection generation: unix ms of RPL_WELCOME for this socket. An
+    /// attaching engine keeps it so a hot swap never invents a new
+    /// transport generation (MLS peer tickets are bound to it). 0 = unknown.
+    long connectedAtMs;
+    /// Server-observed `nick!user@host` of this connection (self JOIN/WHO,
+    /// confirmed NICK, CHGHOST); "" when unverified. Restored only together
+    /// with a matching `connectedAtMs` on a graceful attach.
+    string ownPrefix;
 
     // ── Egress bookkeeping (Mullvad slot the session rides) ──────────
     /// Slot label ("" = direct).
@@ -167,6 +175,8 @@ Json toJSON(ref SessionSnapshot s) {
     j["graceful"] = s.graceful;
     j["metaAtMs"] = s.metaAtMs;
     j["usersDropped"] = s.usersDropped;
+    j["connectedAtMs"] = s.connectedAtMs;
+    j["ownPrefix"] = s.ownPrefix;
 
     auto cfg = Json.emptyObject;
     cfg["id"] = s.config.id.toString();
@@ -306,6 +316,8 @@ SessionSnapshot fromJSON(Json j) {
     s.graceful = boolean(j["graceful"]);
     s.metaAtMs = integer(j["metaAtMs"]);
     s.usersDropped = boolean(j["usersDropped"]);
+    s.connectedAtMs = integer(j["connectedAtMs"]);
+    s.ownPrefix = str(j["ownPrefix"]);
 
     auto cfg = j["config"];
     if (isObj(cfg)) {
@@ -402,6 +414,19 @@ unittest {
     // A hot swap must not forget who each DM partner is, or every
     // conversation stops following its partner's renames until they speak.
     assert(back.queryHosts["p34c3"] == "~user@788114F4.IP" && back.queryAccounts["p34c3"] == "p34c3");
+
+    // Identity proof and connection generation survive the swap intact.
+    s.connectedAtMs = 1_700_000_000_123;
+    s.ownPrefix = "Zodiac!~z@fiber.example";
+    auto proof = fromJSON(toJSON(s));
+    assert(proof.connectedAtMs == 1_700_000_000_123);
+    assert(proof.ownPrefix == "Zodiac!~z@fiber.example");
+    // A META from an older engine has neither: unknown, never invented.
+    auto legacy = toJSON(s);
+    legacy.remove("connectedAtMs");
+    legacy.remove("ownPrefix");
+    auto old = fromJSON(legacy);
+    assert(old.connectedAtMs == 0 && old.ownPrefix == "");
 
     auto bad = Json.emptyObject;
     bad["schemaTag"] = "IRCFv0";

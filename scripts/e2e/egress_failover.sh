@@ -55,6 +55,7 @@ curl -s -c "$JAR" -b "$JAR" -X POST "$GATEWAY/login" \
     -d "username=$USER" -d "password=$PASS" -L -o /dev/null
 curl -fsS -b "$JAR" "$GATEWAY/api/networks" | jq -e 'type == "array"' >/dev/null || fail 'login failed'
 
+START_MS=$(date +%s000)
 START=$(mark)
 create() {
     local response
@@ -83,6 +84,13 @@ wait_for 180 'both networks re-registered through south' '[[ "$(entries | jq -r 
 wait_for 30 'two south registration events' 'registered_both "$DROP"'
 count=$(since "$DROP" | grep '"event":"egress_quarantined"' | grep -c '"label":"north"' || true)
 [[ "$count" == 1 ]] || fail "expected one north quarantine transition, got $count"
+alert_count() {
+    docker exec ircfiber-redis redis-cli --raw lrange irc:logs:outbox 0 -1 |
+        jq -s --argjson start "$START_MS" '[.[] | select(.type == "notice" and .actor == "engine"
+            and .ts >= $start and (.text | contains("VPN exit north quarantined"))
+            and (.text | contains("2 distinct IRC hosts")))] | length'
+}
+wait_for 10 'north #staff outbox notice' '[[ "$(alert_count)" == 1 ]]'
 [[ "$(entries | jq -r 'select(.tag.egressLabel == "") | .id' | wc -l | tr -d ' ')" == 0 ]] || fail 'direct holder socket during failover'
 if since "$DROP" | grep '"event":"tcp_open"' | grep -E '"host":"(alpha.example.org|beta.example.net)"' | grep -q '"egress":"direct"'; then
     fail 'direct TCP dial during failover'

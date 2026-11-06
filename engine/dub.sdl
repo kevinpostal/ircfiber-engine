@@ -177,6 +177,13 @@ configuration "buffer-dedup-test" {
     versions "VibeUseFibers"
 }
 
+configuration "processor-ctcp-test" {
+    targetType "executable"
+    targetName "processor-ctcp-test"
+    mainSourceFile "source/processor_ctcp_test.d"
+    versions "VibeUseFibers"
+}
+
 configuration "janitor-safety-test" {
     targetType "executable"
     targetName "janitor-safety-test"

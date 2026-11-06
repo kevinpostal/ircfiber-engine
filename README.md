@@ -96,8 +96,9 @@ provider-wide failure domain.
 Run `bash scripts/e2e/egress_failover.sh` against the local Docker stack to
 prove correlated failover and the no-direct fallback; run
 `bash scripts/e2e/hot_swap.sh` to prove holder sockets survive engine restarts.
-The SigNoz `IRCFiber VPN exit correlated loss` rule alerts #staff on the
-structured `egress_quarantined` log.
+On a quarantine transition the engine queues one `notice` in
+`irc:logs:outbox`; FiberEye delivers it to `#staff`. Redis delivery is
+best-effort and does not block reconnect decisions if unavailable.
 
 ## Links
 

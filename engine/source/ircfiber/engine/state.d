@@ -303,11 +303,12 @@ void writeStateSnapshotForNetwork(ref EngineContext ctx, Network net, string ser
         if (snap.connected) {
             snap.peerIp = clientForEgress.getActivePeerIp();
             snap.localIp = clientForEgress.getActiveLocalIp();
+            snap.ownPrefix = clientForEgress.getOwnPrefix();
         }
         // Live-connection telemetry for the server-log header: lag
         // probe RTT, RPL_WELCOME instant and negotiated TLS details.
         snap.lagMs = clientForEgress.getLagMs();
-        snap.connectedAtMs = clientForEgress.getConnectedAtMs();
+        snap.connectedAtMs = snap.connected ? clientForEgress.getConnectedAtMs() : 0;
         snap.dataAgeSecs = clientForEgress.getDataAgeSecs();
         snap.pongAgeSecs = clientForEgress.getPongAgeSecs();
         snap.hasTlsInfo = clientForEgress.hasTlsInfo();

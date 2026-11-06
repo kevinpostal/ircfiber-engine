@@ -300,6 +300,9 @@ struct RedisKeys {
     /// (900/901), read by `resolveAccount`.
     static string mlsAccountOwners(string host) { return "irc:mls:acct:" ~ host.toLower; }
 
+    /// Opaque, single-use live-connection identity ticket; SET NX EX 30.
+    static string mlsPeerTicket(string ticket) { return "irc:mls:peer:" ~ ticket; }
+
     /// Avatar upload rate limit: INCR + 1h EXPIRE, per user.
     static string avatarUploadRate(string userId) { return "irc:avatar:ratelimit:" ~ userId; }
 
@@ -715,6 +718,9 @@ struct NetworkStateSnapshot {
     long lagMs = -1;
     /// Unix ms of RPL_WELCOME for the live connection. 0 = not connected.
     long connectedAtMs = 0;
+    /// Server-observed nick!user@host for this registered transport generation.
+    /// Empty until verified; optimistic nick changes are not identity evidence.
+    string ownPrefix;
     /// Seconds since the last inbound byte on the live connection. 0 =
     /// unknown / not connected. Shipped on every snapshot so the UI can
     /// show a stale hint before the PONG-timeout reaper fires.
@@ -777,6 +783,8 @@ struct NetworkStateSnapshot {
         if (localIp.length) j["localIp"] = Json(localIp);
         j["lagMs"] = Json(lagMs);
         j["connectedAtMs"] = Json(connectedAtMs);
+        if (connected && connectedAtMs > 0 && ownPrefix.length)
+            j["ownPrefix"] = Json(ownPrefix);
         j["dataAgeSecs"] = Json(dataAgeSecs);
         j["pongAgeSecs"] = Json(pongAgeSecs);
         if (hasTlsInfo) j["tlsInfo"] = tlsInfo.toJson();
@@ -852,6 +860,8 @@ struct NetworkStateSnapshot {
         if (j["localIp"].type == Json.Type.string) s.localIp = j["localIp"].get!string;
         if (j["lagMs"].type == Json.Type.int_) s.lagMs = j["lagMs"].get!long;
         if (j["connectedAtMs"].type == Json.Type.int_) s.connectedAtMs = j["connectedAtMs"].get!long;
+        if (s.connected && s.connectedAtMs > 0 && j["ownPrefix"].type == Json.Type.string)
+            s.ownPrefix = j["ownPrefix"].get!string;
         if (j["dataAgeSecs"].type == Json.Type.int_) s.dataAgeSecs = j["dataAgeSecs"].get!long;
         if (j["pongAgeSecs"].type == Json.Type.int_) s.pongAgeSecs = j["pongAgeSecs"].get!long;
         if (j["tlsInfo"].type == Json.Type.object) {

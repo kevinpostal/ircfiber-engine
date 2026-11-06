@@ -80,23 +80,42 @@ void startEventProcessor(ref EngineContext ctx) {
                     continue;
                 }
 
+                // Internal identity changes refresh proof immediately, without
+                // exposing a synthetic chat event or spending a history eid.
+                if (event.command == "own_prefix") {
+                    foreach (net; ctx.connManager.getNetworks()) {
+                        if (net.config.id.toString() != event.networkId) continue;
+                        writeStateSnapshotForNetwork(ctx, net, serverId);
+                        break;
+                    }
+                    continue;
+                }
+
                 // IRCCloud-style: assign a global sequential eid to every
                 // event. This is the primary key for pagination, dedup,
                 // and stream resume — always present, never missing.
                 event.eid = ctx.redis.incr(RedisKeys.globalEid());
                 logDebug("Engine event [server=%s]: %s %s (eid=%d)", serverId, event.network, event.command, event.eid);
 
-                // CHANNEL_LIST chunks are publish-only: they are a live
-                // reply to a /LIST request, not scrollback. Never written
-                // to Redis scrollback, Mongo, or the user stream (a 20k
-                // channel network would otherwise fill all three). WHO
-                // replies (352/354/315) are the same: the connection only
-                // publishes the ones answering a client's own WHO, and a
-                // big channel's roster would otherwise land row by row in
-                // the `_server` scrollback.
-                const bool transientList = event.command == "CHANNEL_LIST"
+                // Publish-only events: assigned an eid and published live,
+                // but never written to Redis scrollback, Mongo, or the user
+                // stream.
+                //
+                // CHANNEL_LIST chunks are a live reply to a /LIST request,
+                // not scrollback (a 20k channel network would otherwise fill
+                // all three sinks). WHO replies (352/354/315) are the same:
+                // the connection only publishes the ones answering a
+                // client's own WHO, and a big channel's roster would
+                // otherwise land row by row in the `_server` scrollback.
+                //
+                // Non-ACTION CTCP (connection.d tags it `ctcp`, routed to
+                // `_server`) is a live server-log diagnostic. Its raw
+                // parameters can carry PING tokens or DCC addresses, so it
+                // is deliberately never persisted anywhere.
+                const bool publishOnly = event.command == "CHANNEL_LIST"
                     || event.command == "352" || event.command == "354"
-                    || event.command == "315";
+                    || event.command == "315"
+                    || event.getTag("ctcp").length > 0;
 
                 // draft/channel-rename: move the channel's Redis scrollback
                 // and Mongo rows to the new name BEFORE this event is stored
@@ -129,7 +148,7 @@ void startEventProcessor(ref EngineContext ctx) {
                 // downstream can collapse those — while the scrollback kept
                 // exactly one. That is the "it showed my JOIN twice" class
                 // of bug: duplicated live rows over a clean scrollback.
-                if (!transientList && !ctx.bufferManager.appendIRCEvent(event, serverId)) {
+                if (!publishOnly && !ctx.bufferManager.appendIRCEvent(event, serverId)) {
                     logDebug("Dropping duplicate %s eid=%d for %s/%s (already in scrollback)",
                         event.command, event.eid, event.network,
                         event.channel.length ? event.channel : "_server");
@@ -177,7 +196,7 @@ void startEventProcessor(ref EngineContext ctx) {
                         break;
                     }
                 }
-                if (foundNet && userIdStr.length > 0 && !transientList && !isTransientServerLogPhase(event)) {
+                if (foundNet && userIdStr.length > 0 && !publishOnly && !isTransientServerLogPhase(event)) {
                     runTask(() nothrow {
                         try {
                             ctx.messageRepo.appendIRCEvent(event, serverId);
@@ -202,7 +221,7 @@ void startEventProcessor(ref EngineContext ctx) {
 
                 if (userIdStr.length > 0) {
                     ctx.redis.publish(RedisKeys.events(userIdStr), msg);
-                    if (!transientList) {
+                    if (!publishOnly) {
                         auto streamKey = RedisKeys.userStream(userIdStr);
                         ctx.redis.getDb().lpush(streamKey, msg);
                         ctx.redis.getDb().ltrim(streamKey, 0, 999);
@@ -230,6 +249,8 @@ void startEventProcessor(ref EngineContext ctx) {
                     // Member state the snapshot carries (away, host,
                     // realname, caps, renamed channel, MONITOR status).
                     || event.command == "AWAY" || event.command == "CHGHOST"
+                    || event.command == "NICK" || event.command == "you_nickchange"
+                    || event.command == "396"
                     || event.command == "SETNAME" || event.command == "CAP"
                     || event.command == "RENAME"
                     || event.command == "730" || event.command == "731"

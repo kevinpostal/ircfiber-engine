@@ -966,6 +966,11 @@ buffer-dedup-test: ## Test > BufferManager event dedup (duplicate verdict, reass
 	@$(DUB) build --config=buffer-dedup-test 2>&1 | tail -3
 	@./engine/buffer-dedup-test
 
+processor-ctcp-test: ## Test > Event processor publishes CTCP diagnostics live only (no scrollback/Mongo/stream; needs local Redis + Mongo)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Processor CTCP publish-only tests  $(R)"
+	@$(DUB) build --config=processor-ctcp-test 2>&1 | tail -3
+	@timeout 60 ./engine/processor-ctcp-test
+
 janitor-test: ## Test > EngineJanitor basic reap (orphan → reaped, live → skipped)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  EngineJanitor basic-reap tests  $(R)"
 	@$(DUB) build --config=janitor-test 2>&1 | tail -3

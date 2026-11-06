@@ -52,6 +52,10 @@ import ircfiber.irc.pacer : FakeLagPacer, FloodLimits, ChannelLineLimit, LineRat
 import ircfiber.irc.egress_catalog : ExitLocation, ExitRelay, locationMatches,
     locationsFromRelays, parseExitOnline, parseExitRelays, parseSelectedExit,
     pickRelayForPin;
+import ircfiber.irc.mls_peer : FiberMlsKind, FiberMlsPacket, IrcPrefix, PeerTicket, RosterMatch,
+    DEFAULT_PREFIX_SYMBOLS, FIBERMLS_TICKET_TTL_SECS, buildFiberMlsId, canonicalNetworkKey,
+    generateTicketHex, isReservedFiberMls, matchRosterIdentity, normalizeFiberChannel,
+    parseFiberMls, parseFullPrefix, prefixSymbolsFromIsupport, sameIdentity;
 
 /// IRC connection state.
 ///
@@ -142,6 +146,36 @@ private enum long STABLE_SESSION_RESET_MS = 60_000;
 private enum Duration GHOST_RETRY_FLOOR = dur!"seconds"(10);
 /// Minimum spacing between CTCP auto-replies, across all requesters.
 private enum long CTCP_REPLY_MIN_INTERVAL_MS = 1_000;
+
+// ── FIBERMLS peer discovery (see ircfiber.irc.mls_peer) ──────────────────────
+/// ID replies refill one per second with a burst of four, on a bucket of
+/// their own so VERSION/PING traffic can never starve discovery.
+private enum long FIBERMLS_REPLY_INTERVAL_MS = 1_000;
+private enum long FIBERMLS_REPLY_BURST = 4;
+/// Outgoing QUERY probes leave at most one per second per connection,
+/// across every tab and bouncer client that asks.
+private enum long FIBERMLS_PROBE_INTERVAL_MS = 1_000;
+/// Queued plus sent-and-unanswered probes, each bounded separately.
+private enum size_t FIBERMLS_MAX_PENDING = 64;
+/// A control line older than this (server-time) is history, not a request;
+/// a sent probe's nonce is only redeemable for this long.
+private enum long FIBERMLS_FRESH_MS = 30_000;
+/// Spacing of the WHO that refreshes a bare roster entry or our own prefix.
+private enum long FIBERMLS_ROSTER_WHO_MS = 30_000;
+private enum long FIBERMLS_SELF_WHO_MS = 5_000;
+
+/// One outgoing QUERY waiting for its pacing slot.
+private struct FiberProbe {
+    string target;
+    string nonce;
+    string line;
+}
+
+/// A QUERY already on the wire, awaiting its ID reply.
+private struct SentFiberProbe {
+    string target;
+    long sentAtMs;
+}
 
 // ── Flood trust (the one ircd whose limits we know) ──────────────────────────
 // The engine paces nothing until a server complains, because IRC never
@@ -872,9 +906,28 @@ private bool isEstablishedEgressLoss(bool registered, long uptimeMs, bool stoppi
         || (closeReason.length == 0 && errorText.canFind("PONG timeout"));
 }
 
+/// Publish only on a quarantine transition, outside the pool lock. FiberEye
+/// drains this existing outbox into #staff; a Redis failure must not stop IRC.
+private void announceEgressQuarantine(string label, size_t distinct, long nowMs) {
+    if (gEgressRedis is null) return;
+    try {
+        auto db = gEgressRedis.getDb();
+        auto event = Json([
+            "type": Json("notice"), "ts": Json(nowMs), "actor": Json("engine"),
+            "text": Json("VPN exit " ~ label ~ " quarantined for 5 minutes after established sessions on "
+                ~ distinct.to!string ~ " distinct IRC hosts lost their sockets within 90 seconds"),
+        ]);
+        db.rpush("irc:logs:outbox", event.toString());
+        db.ltrim("irc:logs:outbox", -1000, -1);
+    } catch (Exception e) {
+        logWarn("VPN exit quarantine #staff announcement failed: %s", e.msg);
+    }
+}
+
 private void recordEstablishedEgressLoss(string label, string hostLower, long closedAtMs, long nowMs) {
     if (label.length == 0 || hostLower.length == 0 || closedAtMs <= 0
         || closedAtMs > nowMs || nowMs - closedAtMs > EGRESS_LOSS_MAX_AGE_MS) return;
+    size_t announcedHosts;
     void update() {
         foreach (ref p; mullvadPool) if (p.label == label && p.controlSocket.length == 0) {
             string[] expired;
@@ -890,6 +943,7 @@ private void recordEstablishedEgressLoss(string label, string hostLower, long cl
                     || at > closedAtMs && at - closedAtMs <= EGRESS_LOSS_WINDOW_MS) distinct++;
             if (distinct >= 2 && nowMs >= p.quarantinedUntilMs) {
                 p.quarantinedUntilMs = nowMs + EGRESS_QUARANTINE_MS;
+                announcedHosts = distinct;
                 logJsonMap("warn", "connection", "Correlated VPN exit loss",
                     ["event": "egress_quarantined", "label": label,
                      "distinctHosts": distinct.to!string]);
@@ -899,6 +953,7 @@ private void recordEstablishedEgressLoss(string label, string hostLower, long cl
     }
     if (gMullvadLock !is null) synchronized (gMullvadLock) update();
     else update();
+    if (announcedHosts) announceEgressQuarantine(label, announcedHosts, nowMs);
 }
 
 @("Established static losses require independent IRC hosts and a live holder close")
@@ -2280,8 +2335,32 @@ string[] upsertRosterEntry(string[] roster, string entry, string mapping) {
 ///
 /// An empty burst is never authoritative: a truncated reply must not wipe a
 /// roster (we are in the channel, so the server always names at least us).
-string[] applyNamesBurst(string[] previous, string[] burst) {
-    return burst.length ? burst : previous;
+///
+/// A bare burst entry (no userhost-in-names) keeps the `!user@host` the
+/// roster already held for that nick from JOIN/WHO/CHGHOST: a NAMES resync
+/// must not throw away the identity peer discovery checks a source against.
+string[] applyNamesBurst(string[] previous, string[] burst, string mapping = "rfc1459") {
+    if (!burst.length) return previous;
+    foreach (ref entry; burst) {
+        if (rosterHostSuffix(entry).length) continue;
+        const bare = stripNickPrefix(entry);
+        foreach (old; previous) {
+            const suffix = rosterHostSuffix(old);
+            if (suffix.length && nicksEqualMapped(stripNickPrefix(old), bare, mapping)) {
+                entry = entry ~ suffix;
+                break;
+            }
+        }
+    }
+    return burst;
+}
+
+/// The `!user@host` tail of a roster entry, "" when it carries none. `!` is
+/// itself a prefix char (ojoin), so the tail is looked for past the run.
+string rosterHostSuffix(string entry) @safe pure nothrow {
+    const body = entry[nickPrefixRun(entry) .. $];
+    const bang = body.indexOf('!');
+    return bang > 0 && body.indexOf('@') > bang ? body[bang .. $] : "";
 }
 
 /// The single strongest status char across a member's prefix runs.
@@ -3436,6 +3515,33 @@ final class PersistentIRCClient {
         char[]              inboundPartial;
         /// Earliest unix ms at which another CTCP auto-reply may go out.
         long                ctcpReplyNotBeforeMs;
+        // ── FIBERMLS peer discovery (per TCP session) ─────────────────────
+        /// Server-observed `nick!user@host` of this connection — the only
+        /// identity a peer ticket may name. Set from our own JOIN echo and
+        /// WHO row, moved by a server-confirmed self NICK/CHGHOST, cleared
+        /// by 396, by a self rename that contradicts it and by every new
+        /// socket. An optimistic `/nick` never touches it. "" = unverified.
+        string              ownPrefix;
+        /// GCRA theoretical arrival time of the ID-reply bucket.
+        long                fiberReplyTatMs;
+        /// Outgoing QUERY probes not yet written, oldest first.
+        FiberProbe[]        fiberProbeQueue;
+        /// Probes written to the wire, by nonce: an ID reply is relayed
+        /// only for one of these, from the nick it was sent to.
+        SentFiberProbe[string] fiberProbesSent;
+        /// Earliest unix ms the next probe may be written.
+        long                fiberProbeNotBeforeMs;
+        /// Normalized channel → unix ms of the last identity-refresh WHO.
+        long[string]        fiberRosterWhoMs;
+        /// Unix ms of the last WHO for our own nick.
+        long                fiberSelfWhoMs;
+        /// Bytes the holder buffered while no engine was attached; lines
+        /// read before they are consumed are history, never requests.
+        long                attachBacklogBytes;
+        /// The line being processed came from that attach backlog.
+        bool                lineFromBacklog;
+        /// A reassembled `draft/multiline` message is being processed.
+        bool                inMultilineMerge;
         // RPL_NAMREPLY accumulation, per channel. 353 lines land here and
         // the 366 that closes the burst swaps the result into
         // `channelUsers` (applyNamesBurst), which is what makes a NAMES
@@ -4068,6 +4174,11 @@ final class PersistentIRCClient {
         s.egressLocationText = activeEgressLocation;
         s.peerIp = activePeerIp;
         s.localIp = activeLocalIp;
+        // Peer tickets are bound to the connection generation and the
+        // verified prefix; the next engine keeps both rather than
+        // re-deriving them.
+        s.connectedAtMs = connectedAtMs;
+        s.ownPrefix = getOwnPrefix();
         return s;
     }
 
@@ -4153,8 +4264,27 @@ final class PersistentIRCClient {
         activeLocalIp = r.entry.localIp;
         tlsInfoValid = r.entry.tlsOk;
         tlsInfo = r.entry.tls;
-        // Real signon time: the session never dropped.
-        connectedAtMs = r.entry.connectedAtMs > 0 ? r.entry.connectedAtMs : unixMsNow();
+        // Connection generation: the exact value the previous engine held
+        // (RPL_WELCOME of this very socket). A META from before that field
+        // existed falls back to the holder's own connect time of the same
+        // transport — never to now(), which would mint a new generation.
+        connectedAtMs = s.connectedAtMs > 0 ? s.connectedAtMs
+                      : r.entry.connectedAtMs > 0 ? r.entry.connectedAtMs : 0;
+        // The verified prefix survives only a planned swap whose META was
+        // written at detach for this same generation; anything else waits
+        // for the server to restate it (self WHO below).
+        ownPrefix = "";
+        {
+            IrcPrefix restored;
+            if (graceful && s.graceful && s.wasConnected && s.connectedAtMs > 0
+                && s.connectedAtMs == connectedAtMs
+                && parseFullPrefix(s.ownPrefix, restored)
+                && nicksEqualMapped(restored.nick, sessionNick, casemapping()))
+                ownPrefix = s.ownPrefix;
+        }
+        if (ownPrefix.length) ownHostmask = ownPrefix;
+        // What the holder buffered while detached replays first: history.
+        attachBacklogBytes = r.entry.bufferedBytes > 0 ? r.entry.bufferedBytes : 0;
         // Egress bookkeeping: the session still rides its Mullvad slot, so
         // re-take the hold — `retargetSlotByLabel` must refuse to move it
         // and `bounceNetworksOnEgress(label)` must find it, exactly as
@@ -4187,7 +4317,7 @@ final class PersistentIRCClient {
         // Zero-valued CONNECTION_RETRY_STATUS at every backoff.reset() site
         // so the frontend clears any stale retry/fail banner.
         emitZeroRetryStatus();
-        const upSecs = (unixMsNow() - connectedAtMs) / 1000;
+        const upSecs = connectedAtMs > 0 ? (unixMsNow() - connectedAtMs) / 1000 : 0;
         // No CONNECTED lifecycle event: the session never changed. One
         // server-log line tells the user what happened.
         emitLog("info", "Engine reattached to live connection (hot swap); connected for "
@@ -4212,6 +4342,7 @@ final class PersistentIRCClient {
         // re-adding the ones still here, which is what a resync was always
         // meant to do. Paced by writeRaw like any other line.
         foreach (chan; channelState.byKey) sendRaw("NAMES " ~ chan);
+        if (ownPrefix.length == 0) requestSelfWho();
         // Fresh META from the attached engine: the previous one was the
         // detach snapshot (`graceful == true`), and a crash before the next
         // upkeep write must not be mistaken for a planned swap.
@@ -4403,6 +4534,14 @@ final class PersistentIRCClient {
     @property long getLagMs() const nothrow { return lagMs; }
     /// Unix ms of RPL_WELCOME for the live connection; 0 when not connected.
     @property long getConnectedAtMs() const nothrow { return connectedAtMs; }
+    /// Server-verified `nick!user@host` of the live connection for the
+    /// state snapshot (and MLS peer tickets); "" whenever it is not proof:
+    /// not registered, no connection generation, or this engine has handed
+    /// the socket to the holder for a hot swap.
+    @property string getOwnPrefix() const nothrow {
+        return state == ConnectionState.connected && connectedAtMs > 0 && !detachedForHotSwap
+            ? ownPrefix : "";
+    }
     /// Seconds since the last inbound byte; 0 when never. Surfaced via the
     /// state snapshot so the UI can hint staleness before the PONG watchdog fires.
     @property long getDataAgeSecs() const { return lastDataReceivedSecs > 0 ? Clock.currTime.toUnixTime!long - lastDataReceivedSecs : 0; }
@@ -4424,6 +4563,16 @@ final class PersistentIRCClient {
         lagMs = -1;
         lagProbeSentMs = 0;
         connectedAtMs = 0;
+        // Identity proof and discovery are per socket: a reconnect starts
+        // unverified and forgets every probe the old socket carried.
+        ownPrefix = "";
+        fiberReplyTatMs = 0;
+        fiberProbeQueue = null;
+        fiberProbesSent = null;
+        fiberProbeNotBeforeMs = 0;
+        fiberRosterWhoMs = null;
+        fiberSelfWhoMs = 0;
+        attachBacklogBytes = 0;
         tlsInfoValid = false;
         tlsInfo = TlsInfo.init;
         // Per-connection: a fresh socket may legitimately re-ask once.
@@ -7405,6 +7554,19 @@ private void processEvents() {
         }
         if (account == "0") accounts.remove(nick);
         else if (account.length > 0) accounts[nick] = account;
+        // A WHO row is the server's statement of who `nick` is right now:
+        // the roster keeps it so peer discovery has a full identity to
+        // check a source against, and for our own confirmed nick (no /nick
+        // awaiting its echo) it is the verified prefix.
+        if (user.length > 0 && host.length > 0) {
+            const full = nick ~ "!" ~ user ~ "@" ~ host;
+            IrcPrefix row;
+            if (parseFullPrefix(full, row)) {
+                if (optimisticNickOld.length == 0 && sameNick(nick, sessionNick)) setOwnPrefix(full);
+                if (auto members = normalizeChannelName(chan) in channelUsers)
+                    *members = upsertRosterEntry(*members, full, casemapping());
+            }
+        }
 
         char[5] order = ['~', '&', '@', '%', '+'];
         char chosen = '\0';
@@ -7427,7 +7589,7 @@ private void processEvents() {
                     // Bare entry — promote it to the
                     // prefixed form from the WHO response.
                     if (!foundBare) {
-                        channelUsers[chan][j] = chosen ~ nick;
+                        channelUsers[chan][j] = chosen ~ existing;
                         foundBare = true;
                         j++;
                     } else {
@@ -7460,6 +7622,12 @@ private void processEvents() {
 
     private void processLine(string line) {
         linesIn++;
+        // Lines the holder buffered while no engine was attached replay
+        // first after an attach; until those bytes are consumed every line
+        // is history. Approximate: a line whose invalid UTF-8 was replaced
+        // counts a little long, so FIBERMLS also rejects stale server-time.
+        lineFromBacklog = attachBacklogBytes > 0;
+        if (lineFromBacklog) attachBacklogBytes -= cast(long) line.length + 2;
         auto event      = parseIRCLine(line);
         event.network   = config.name;
         event.timestampMs = resolveTimestamp(event);
@@ -7469,6 +7637,10 @@ private void processEvents() {
     /// Everything `processLine` does after parsing. Also re-entered with
     /// the one message a closed `draft/multiline` batch reassembles.
     private void processEvent(IRCRawEvent event) {
+
+        // Reserved FIBERMLS control packets never reach multiline
+        // accumulation, query tracking, buffers, history or logs.
+        if (interceptFiberMls(event)) return;
 
         // Fix DM echo channel: parser sets channel=nick for all non-channel
         // PRIVMSG/NOTICE (correct for incoming, wrong for our own echo).
@@ -7574,6 +7746,13 @@ private void processEvents() {
                             && event.prefix.indexOf("!") > 0
                             && event.prefix.indexOf("@") > 0)
                             ownHostmask = event.prefix;
+                        // The same echo is server-observed proof of who
+                        // this connection is — unless it is replayed
+                        // history or a /nick of ours is still unconfirmed.
+                        if (event.getTag("batch").length == 0 && optimisticNickOld.length == 0) {
+                            IrcPrefix self;
+                            if (parseFullPrefix(event.prefix, self)) setOwnPrefix(event.prefix);
+                        }
                         // Add our nick to channelUsers immediately so the
                         // current user always appears in the member list,
                         // even if the IRC server omits us from
@@ -7582,7 +7761,7 @@ private void processEvents() {
                         // hostmask form 353 already stored instead of
                         // standing beside it as a second member.
                         channelUsers[chan] = upsertRosterEntry(
-                            channelUsers.get(chan, null), event.nick, casemapping());
+                            channelUsers.get(chan, null), rosterIdentityOf(event), casemapping());
                         bool wasAutoJoin = config.autoJoinChannels.canFind(chan);
                         if (!wasAutoJoin)
                             config.autoJoinChannels ~= chan;
@@ -7618,7 +7797,7 @@ private void processEvents() {
                         // the #tclmafia roster.
                         const wasIn = rosterHas(chan, event.nick);
                         channelUsers[chan] = upsertRosterEntry(
-                            channelUsers.get(chan, null), event.nick, casemapping());
+                            channelUsers.get(chan, null), rosterIdentityOf(event), casemapping());
                         // IRCv3 extended-join: extract account name from params[1]
                         // ("*" means not logged in; empty string means not provided).
                         if (params.length >= 3) {
@@ -7910,6 +8089,11 @@ private void processEvents() {
                 if (params.length > 0) {
                     const newNick = params[$ - 1];
                     flushMemberFlaps(event.nick);
+                    // The renamer's user@host as the server states it now;
+                    // without a full prefix each entry keeps what it held.
+                    IrcPrefix renamerId;
+                    const renamerSuffix = parseFullPrefix(event.prefix, renamerId)
+                        ? "!" ~ renamerId.user ~ "@" ~ renamerId.host : "";
                     foreach (chan, ref users; channelUsers) {
                         // Mutate EVERY entry that matches the old nick. The
                         // same user can appear twice in channelUsers — once
@@ -7922,7 +8106,8 @@ private void processEvents() {
                             if (sameNick(u, event.nick)) {
                                 if (!canFind(nickChannels, chan))
                                     nickChannels ~= chan;
-                                u = nickPrefix(u) ~ newNick;
+                                u = nickPrefix(u) ~ newNick
+                                  ~ (renamerSuffix.length ? renamerSuffix : rosterHostSuffix(u));
                                 // Don't break — keep mutating duplicates.
                             }
                         }
@@ -7980,6 +8165,23 @@ private void processEvents() {
                         optimisticNickOld = "";
                         forcedFromNick = "";
                         persistNick(sessionNick);
+                    }
+                    // Identity proof follows only a live rename the server
+                    // states for the exact identity we hold; any other
+                    // rename touching us drops the proof until a WHO
+                    // restates it. `isSelf` alone is not proof: it keys on
+                    // the possibly optimistic `sessionNick`.
+                    {
+                        IrcPrefix held;
+                        const haveHeld = parseFullPrefix(ownPrefix, held);
+                        if (haveHeld && renamerSuffix.length && event.getTag("batch").length == 0
+                            && sameIdentity(renamerId, held, casemapping())) {
+                            setOwnPrefix(newNick ~ "!" ~ held.user ~ "@" ~ held.host);
+                        } else if (isSelf
+                                   || (haveHeld && nicksEqualMapped(event.nick, held.nick, casemapping()))) {
+                            clearOwnPrefix();
+                            requestSelfWho();
+                        }
                     }
                     // IRCCloud-style you_nickchange: emit a dedicated message
                     // type for self-nick changes so the frontend can update
@@ -8077,6 +8279,21 @@ private void processEvents() {
                         idents[event.nick] = hp[0];
                         if (sameNick(event.nick, sessionNick))
                             ownHostmask = event.nick ~ "!" ~ hp[0] ~ "@" ~ hp[1];
+                        // Proof moves only when the server restates the
+                        // exact identity we hold; a CHGHOST for our nick
+                        // from any other identity drops it until a WHO.
+                        IrcPrefix held, changer, moved;
+                        const haveHeld = parseFullPrefix(ownPrefix, held);
+                        if (haveHeld && event.getTag("batch").length == 0
+                            && parseFullPrefix(event.prefix, changer)
+                            && sameIdentity(changer, held, casemapping())
+                            && parseFullPrefix(held.nick ~ "!" ~ hp[0] ~ "@" ~ hp[1], moved)) {
+                            setOwnPrefix(held.nick ~ "!" ~ hp[0] ~ "@" ~ hp[1]);
+                        } else if (sameNick(event.nick, sessionNick)
+                                   || (haveHeld && nicksEqualMapped(event.nick, held.nick, casemapping()))) {
+                            clearOwnPrefix();
+                            requestSelfWho();
+                        }
                     }
                     // A DM counterparty with a new user@host is still them.
                     const key = foldNick(event.nick);
@@ -8253,7 +8470,7 @@ private void processEvents() {
                     // chain (`Zodiac` beside `Zodiac_`).
                     if (auto burst = chan in namesBurst) {
                         auto held = channelUsers.get(chan, null);
-                        auto rebased = applyNamesBurst(held, *burst);
+                        auto rebased = applyNamesBurst(held, *burst, casemapping());
                         namesBurst.remove(chan);
                         namesBurstAt.remove(chan);
                         if (rebased.length != held.length)
@@ -8300,6 +8517,21 @@ private void processEvents() {
                             ["network": config.name, "channel": chan, "event": "rpl_endofnames_no_users"]);
                     }
                 }
+                break;
+            }
+
+            // ── RPL_VISIBLEHOST (396) ────────────────────────────────────────
+            // Our displayed host changed, but the numeric carries no user, so
+            // it cannot restate the full identity: drop the proof and ask the
+            // server who we are now. The payload budget takes the new host at
+            // once. Still published to the server log as before.
+            case "396": {
+                auto p = event.getParams();
+                const at = ownHostmask.indexOf('@');
+                if (p.length >= 2 && p[1].length > 0 && at > 0)
+                    ownHostmask = ownHostmask[0 .. at + 1] ~ p[1];
+                clearOwnPrefix();
+                requestSelfWho();
                 break;
             }
 
@@ -8691,7 +8923,14 @@ private void processEvents() {
                             // when the whole reply is this one batch.
                             if (ob.label.length && merged.getTag("label").length == 0)
                                 merged.addTag("label", ob.label);
-                            processEvent(merged);
+                            // A control packet split across a multiline
+                            // batch is never a request (no splitting).
+                            {
+                                const outerMerge = inMultilineMerge;
+                                inMultilineMerge = true;
+                                scope (exit) inMultilineMerge = outerMerge;
+                                processEvent(merged);
+                            }
                             break;
                         default:
                             break;

@@ -182,6 +182,13 @@ struct IRCRawEvent {
         // the author held no status, which must read like an empty value.
         auto fromMode = getTag("from_mode");
         if (fromMode.length) j["fm"] = Json(fromMode);
+        // Non-ACTION CTCP diagnostic marker stamped by the engine
+        // (connection.d `handlePrivmsg` / NOTICE switch): the CTCP verb,
+        // or `MALFORMED` for an unframed leading `\x01`. Request vs reply
+        // is derived from `c` (PRIVMSG vs NOTICE); the original command,
+        // params and text are left intact for bouncer wire compatibility.
+        auto ctcp = getTag("ctcp");
+        if (ctcp.length) j["ct"] = Json(ctcp);
         // W1-T08: temp_unavailable event carries countdown_ms + serverTs
         if (command == "temp_unavailable") {
             auto cd = getTag("countdown_ms");
@@ -605,6 +612,35 @@ unittest {
     event.channel = "#ircfiber";
     auto json = event.toCompactJson();
     assert(("fm" in json) is null);
+}
+
+@("IRCRawEvent toCompactJson ships ctcp marker as 'ct' with raw payload intact")
+unittest {
+    auto event = IRCRawEvent("libera", "NOTICE");
+    event.nick = "alice";
+    event.prefix = "alice!u@h";
+    event.text = "\x01PING 123\x01";
+    event.channel = "_server";
+    event.setParams(["me", "\x01PING 123\x01"]);
+    event.addTag("ctcp", "PING");
+    auto json = event.toCompactJson();
+    assert(json["ct"].get!string == "PING");
+    assert(json["c"].get!string == "NOTICE");
+    assert(json["x"].get!string == "\x01PING 123\x01");
+    assert(json["ch"].get!string == "_server");
+    assert(json["p"][0].get!string == "me");
+}
+
+@("IRCRawEvent toCompactJson omits 'ct' without a ctcp marker")
+unittest {
+    auto plain = IRCRawEvent("libera", "PRIVMSG");
+    plain.text = "\x01ACTION waves\x01";
+    plain.setParams(["#d", "\x01ACTION waves\x01"]);
+    assert(("ct" in plain.toCompactJson()) is null);
+
+    auto empty = IRCRawEvent("libera", "PRIVMSG");
+    empty.addTag("ctcp", "");
+    assert(("ct" in empty.toCompactJson()) is null);
 }
 
 @("makeServerLog produces a NOTICE-shaped event with phase tag")
