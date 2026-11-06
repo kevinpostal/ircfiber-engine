@@ -9,6 +9,19 @@ import vibe.core.log;
 import vibe.data.json;
 import vibe.db.redis.redis;
 
+/// Drain the subscription before setting vibe-d's stop flag. Stopping with
+/// DATA already in flight can skip its acknowledgement and terminate the
+/// process in RedisSubscriber's listener helper (vibe-d 0.10.3).
+void stopEventSubscriber(RedisSubscriber subscriber, string channel) @trusted nothrow {
+    try {
+        if (subscriber.isListening) subscriber.unsubscribe(channel);
+    } catch (Exception e) {
+        logDebug("Redis event unsubscribe failed: %s", e.msg);
+    }
+    try subscriber.bstop();
+    catch (Exception e) { logDebug("Redis event stop failed: %s", e.msg); }
+}
+
 /// Redis connection wrapper.
 final class RedisStorage {
     private {

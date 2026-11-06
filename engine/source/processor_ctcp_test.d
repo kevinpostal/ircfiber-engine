@@ -46,7 +46,7 @@ import ircfiber.models.irc_event : IRCRawEvent;
 import ircfiber.models.network : NetworkConfig;
 import ircfiber.redis.protocol : RedisKeys;
 import ircfiber.storage.buffer : BufferManager;
-import ircfiber.storage.redis : RedisStorage;
+import ircfiber.storage.redis : RedisStorage, stopEventSubscriber;
 
 /// Tracks the number of passing checks.
 int passed;
@@ -284,7 +284,7 @@ int run() {
 
     // Stop the listener (UNSUBSCRIBE + wait for its fiber), then remove
     // this run's keys and rows from the real stores.
-    g_sub.bstop();
+    stopEventSubscriber(g_sub, RedisKeys.events(uid));
     check!("live-channel listener stopped")(!g_sub.isListening);
     cleanup(redis, nid, uid);
     check!("Redis scrollback cleaned up")(scrollbackRows(redis, nid).length == 0);

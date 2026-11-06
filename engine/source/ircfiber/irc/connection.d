@@ -148,10 +148,12 @@ private enum Duration GHOST_RETRY_FLOOR = dur!"seconds"(10);
 private enum long CTCP_REPLY_MIN_INTERVAL_MS = 1_000;
 
 // ── FIBERMLS peer discovery (see ircfiber.irc.mls_peer) ──────────────────────
-/// ID replies refill one per second with a burst of four, on a bucket of
-/// their own so VERSION/PING traffic can never starve discovery.
-private enum long FIBERMLS_REPLY_INTERVAL_MS = 1_000;
-private enum long FIBERMLS_REPLY_BURST = 4;
+/// Separate from VERSION/PING. A shared-channel requester gets one reply
+/// per second; the global guard allows normal simultaneous peer discovery.
+private enum long FIBERMLS_REPLY_INTERVAL_MS = 250;
+private enum long FIBERMLS_REPLY_BURST = 16;
+private enum long FIBERMLS_REQUESTER_INTERVAL_MS = 1_000;
+private enum size_t FIBERMLS_MAX_REQUESTERS = 256;
 /// Outgoing QUERY probes leave at most one per second per connection,
 /// across every tab and bouncer client that asks.
 private enum long FIBERMLS_PROBE_INTERVAL_MS = 1_000;
@@ -3524,6 +3526,8 @@ final class PersistentIRCClient {
         string              ownPrefix;
         /// GCRA theoretical arrival time of the ID-reply bucket.
         long                fiberReplyTatMs;
+        /// Full observed requester prefix → next allowed reply time.
+        long[string]        fiberRequesterNotBeforeMs;
         /// Outgoing QUERY probes not yet written, oldest first.
         FiberProbe[]        fiberProbeQueue;
         /// Probes written to the wire, by nonce: an ID reply is relayed
@@ -4567,6 +4571,7 @@ final class PersistentIRCClient {
         // unverified and forgets every probe the old socket carried.
         ownPrefix = "";
         fiberReplyTatMs = 0;
+        fiberRequesterNotBeforeMs = null;
         fiberProbeQueue = null;
         fiberProbesSent = null;
         fiberProbeNotBeforeMs = 0;
@@ -9511,11 +9516,21 @@ private void processEvents() {
     }
 
     /// GCRA bucket for ID replies, separate from `takeCtcpReplySlot`.
-    private bool takeFiberReplySlot() {
+    private bool takeFiberReplySlot(string requester) {
         const now = unixMsNow();
+        auto peer = requester in fiberRequesterNotBeforeMs;
+        if (peer !is null && *peer > now) return false;
+        if (peer is null) {
+            string[] expired;
+            foreach (key, until; fiberRequesterNotBeforeMs)
+                if (until <= now) expired ~= key;
+            foreach (key; expired) fiberRequesterNotBeforeMs.remove(key);
+            if (fiberRequesterNotBeforeMs.length >= FIBERMLS_MAX_REQUESTERS) return false;
+        }
         const tat = fiberReplyTatMs > now ? fiberReplyTatMs : now;
         if (tat - now > (FIBERMLS_REPLY_BURST - 1) * FIBERMLS_REPLY_INTERVAL_MS) return false;
         fiberReplyTatMs = tat + FIBERMLS_REPLY_INTERVAL_MS;
+        fiberRequesterNotBeforeMs[requester] = now + FIBERMLS_REQUESTER_INTERVAL_MS;
         return true;
     }
 
@@ -9572,6 +9587,7 @@ private void processEvents() {
     private void answerFiberQuery(IrcPrefix source, string sourcePrefix, FiberMlsPacket pkt) {
         if (!fiberIssuerLive()) return;
         const mapping = casemapping();
+        if (mapping != "ascii" && mapping != "rfc1459" && mapping != "rfc1459-strict") return;
         string chanKey;
         foreach (k; channelState.byKey)
             if (nicksEqualMapped(k, pkt.channel, mapping)) { chanKey = k; break; }
@@ -9588,7 +9604,10 @@ private void processEvents() {
             if (peer != RosterMatch.absent || mine != RosterMatch.match) requestRosterWho(chanKey);
             return;
         }
-        if (!takeFiberReplySlot()) return;
+        const foldedNick = normalizeFiberChannel(source.nick, mapping);
+        const requesterKey = foldedNick == source.nick ? sourcePrefix
+            : foldedNick ~ sourcePrefix[source.nick.length .. $];
+        if (!takeFiberReplySlot(requesterKey)) return;
         string ticket;
         bool minted;
         try minted = generateTicketHex(ticket); catch (Exception) minted = false;
@@ -12087,6 +12106,21 @@ unittest {
     // WHO fills the bare one in and promotes it without losing the host.
     c.processLine(":s 352 me #c ~c hc s carol H@ :0 Carol");
     assert(c.channelUsers["#c"] == ["@me!~m@host.a", "b!~a@ha", "@carol!~c@hc"]);
+    ch.close();
+}
+
+@("FIBERMLS a repeated requester cannot spend another peer's reply slot")
+unittest {
+    import vibe.core.channel : createChannel;
+    NetworkConfig cfg;
+    auto ch = createChannel!IRCRawEvent();
+    auto c = new PersistentIRCClient(cfg, ch);
+    assert(c.takeFiberReplySlot("alice!a@host"));
+    foreach (_; 0 .. 64) assert(!c.takeFiberReplySlot("alice!a@host"));
+    assert(c.takeFiberReplySlot("bob!b@host"));
+    c.resetConnectionTelemetry();
+    assert(c.fiberRequesterNotBeforeMs.length == 0);
+    assert(c.takeFiberReplySlot("alice!a@host"));
     ch.close();
 }
 
