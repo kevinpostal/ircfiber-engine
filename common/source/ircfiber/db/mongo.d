@@ -94,12 +94,19 @@ final class AppMongoConnection {
         if (client) client.cleanupConnections();
     }
 
-    /// Runs an admin command and returns the result as a Bson document.
-    /// Wraps `runCommandChecked` so callers can use a typed `Bson`.
+    /// Runs a command against the application database and returns its Bson result.
+    /// Admin-only commands use dedicated methods below.
     /// Throws on connection failure.
     static Bson runCommand(Bson cmd) @trusted {
         if (!connected) throw new Exception("MongoDB not connected");
         return db.runCommandChecked(cmd);
+    }
+
+    /// Runs the replica-set status command against the admin database.
+    static Bson replicaSetStatus() @trusted {
+        if (!connected) throw new Exception("MongoDB not connected");
+        static struct Cmd { int replSetGetStatus = 1; }
+        return client.getDatabase("admin").runCommandChecked(Cmd());
     }
 
     /// Returns the subset of `serverStatus` we surface in the admin dashboard.
@@ -109,7 +116,7 @@ final class AppMongoConnection {
     static Bson serverStatusSubset() @trusted {
         if (!connected) throw new Exception("MongoDB not connected");
         static struct Cmd { int serverStatus = 1; }
-        auto result = db.runCommandChecked(Cmd());
+        auto result = client.getDatabase("admin").runCommandChecked(Cmd());
         return projectServerStatus(result);
     }
 
