@@ -235,8 +235,6 @@ private bool fiberGuardExpired(ref const FiberRecipientGuard g, long now) {
     return true;
 }
 
-/// Whether a raw line or message body carries the reserved CTCP command
-/// anywhere (a split or multi-line body could put it at a line start).
 /// A client's QUERY refused only by a proven responder's own pacing, told
 /// to the asking client as `mls_peer_deferred` rather than left silent.
 private struct FiberProbeDeferral {
@@ -271,6 +269,8 @@ private long fiberResponderDeferMs(ref const FiberRecipientGuard g, string chanK
     return wait < 1 ? 1 : wait > cap ? cap : wait;
 }
 
+/// Whether a raw line or message body carries the reserved CTCP command
+/// anywhere (a split or multi-line body could put it at a line start).
 bool carriesFiberMls(string line) @safe pure nothrow @nogc {
     foreach (i, c; line)
         if (c == '\x01' && isReservedFiberMls(line[i .. $])) return true;
@@ -10011,6 +10011,17 @@ private void processEvents() {
         return true;
     }
 
+    /// fiberResponderDeferMs for `recipient` on `chanKey` at `now`, with
+    /// that channel's QUERY on the wire, if any (call after pruneFiberProbes).
+    private long fiberDeferMs(string recipient, string chanKey, bool queued, long now) {
+        auto g = recipient in fiberRecipients;
+        if (g is null) return 0;
+        long sentAtMs = 0;
+        foreach (ref p; fiberProbesSent)
+            if (p.recipient == recipient && p.chanKey == chanKey) sentAtMs = p.sentAtMs;
+        return fiberResponderDeferMs(*g, chanKey, queued, sentAtMs, now);
+    }
+
     private enum FiberProbeVerdict : ubyte { send, wait, drop }
 
     /// Re-checks a queued probe against the live session at write time:
@@ -10080,6 +10091,26 @@ private void processEvents() {
         fiberProbesSent[probe.nonce] = SentFiberProbe(probe.target, probe.recipient, probe.chanKey, now);
         noteFiberWritten(probe, now);
         return true;
+    }
+
+    /// A client's reserved-command line: queued then drained, or — when a
+    /// proven responder's own pacing refused a fully validated fresh nonce —
+    /// answered with owner-scoped `mls_peer_deferred {networkId, nonce,
+    /// retryAfterMs}` so that client retries once the backstop allows it
+    /// instead of waiting out silence. Nothing reaches the wire either way.
+    private void submitFiberProbe(string line) {
+        FiberProbeDeferral deferral;
+        if (queueFiberProbe(line, unixMsNow(), deferral)) {
+            drainFiberProbes();
+            return;
+        }
+        if (deferral.retryAfterMs <= 0 || redis is null || ownerId == UUID.init) return;
+        auto msg = Json.emptyObject;
+        msg["type"] = "mls_peer_deferred";
+        msg["networkId"] = config.id.toString();
+        msg["nonce"] = deferral.nonce;
+        msg["retryAfterMs"] = deferral.retryAfterMs;
+        redis.publish(RedisKeys.events(ownerId.toString()), msg.toString());
     }
 
     /// Writes the next valid queued probe once its 1 s slot opens, then
@@ -10413,17 +10444,6 @@ private void processEvents() {
     /// live, and parking it would disconnect a working connection over a
     /// login it never needed to register. Success takes back the nick
     /// services enforcement renamed us away from.
-    /// fiberResponderDeferMs for `recipient` on `chanKey` at `now`, with
-    /// that channel's QUERY on the wire, if any (call after pruneFiberProbes).
-    private long fiberDeferMs(string recipient, string chanKey, bool queued, long now) {
-        auto g = recipient in fiberRecipients;
-        if (g is null) return 0;
-        long sentAtMs = 0;
-        foreach (ref p; fiberProbesSent)
-            if (p.recipient == recipient && p.chanKey == chanKey) sentAtMs = p.sentAtMs;
-        return fiberResponderDeferMs(*g, chanKey, queued, sentAtMs, now);
-    }
-
     private void finishLateSasl(bool ok, string detail) {
         lateSaslPending = false;
         if (!ok) {
@@ -10495,26 +10515,6 @@ private void processEvents() {
     /// The server's advertised multiline limits, or an unusable value when
     /// the cap was not negotiated. `batch` is a hard dependency of the spec.
     private MultilineLimits multilineLimits() {
-    /// A client's reserved-command line: queued then drained, or — when a
-    /// proven responder's own pacing refused a fully validated fresh nonce —
-    /// answered with owner-scoped `mls_peer_deferred {networkId, nonce,
-    /// retryAfterMs}` so that client retries once the backstop allows it
-    /// instead of waiting out silence. Nothing reaches the wire either way.
-    private void submitFiberProbe(string line) {
-        FiberProbeDeferral deferral;
-        if (queueFiberProbe(line, unixMsNow(), deferral)) {
-            drainFiberProbes();
-            return;
-        }
-        if (deferral.retryAfterMs <= 0 || redis is null || ownerId == UUID.init) return;
-        auto msg = Json.emptyObject;
-        msg["type"] = "mls_peer_deferred";
-        msg["networkId"] = config.id.toString();
-        msg["nonce"] = deferral.nonce;
-        msg["retryAfterMs"] = deferral.retryAfterMs;
-        redis.publish(RedisKeys.events(ownerId.toString()), msg.toString());
-    }
-
         if (!hasCap("draft/multiline") || !hasCap("batch"))
             return MultilineLimits.init;
         if (auto v = "draft/multiline" in capValues)
@@ -12652,6 +12652,7 @@ FiberMlsCheck[] fiberMlsBackstopChecks() {
     auto c = new PersistentIRCClient(cfg, ch);
     const t0 = unixMsNow();
     fiberCheckSession(c, t0);
+    FiberProbeDeferral deferral;
     bool queue(string target, size_t n, string channel, long at) {
         return c.queueFiberProbe("PRIVMSG " ~ target ~ " :" ~ fiberCheckQuery(n, channel), at, deferral);
     }
@@ -12780,6 +12781,10 @@ FiberMlsCheck[] fiberMlsBackstopChecks() {
         !proven("alice", tg + FIBERMLS_PROBE_MAX_AGE_MS + 1)
         && blocked("alice") == t0 + 2000 + FIBERMLS_UNANSWERED_COOLDOWN_MS
         && blocked("erin") == t0 + 1000 + FIBERMLS_UNANSWERED_COOLDOWN_MS);
+    const ts = tg + FIBERMLS_PROBE_MAX_AGE_MS + 1;
+    check("a revoked or never-proven recipient is never deferred: its refusal stays silent",
+        deferred("alice", 39, "#c", ts) == 0 && deferred("alice", 43, "#d", ts) == 0
+        && deferred("erin", 44, "#c", ts) == 0 && c.fiberProbeQueue.length == 0);
     c.state = ConnectionState.connecting;
     check("nothing is accepted while registering for later delivery", !queue("gina", 41, "#c", tg + 23_000));
     c.state = ConnectionState.disconnected;
@@ -12808,6 +12813,21 @@ FiberMlsCheck[] fiberMlsBackstopChecks() {
     const aliceFree = t0 + FIBERMLS_RESPONDER_REFRESH_MS + FIBERMLS_UNANSWERED_COOLDOWN_MS;
     check("an unanswered recipient may be asked again once its 5 min cooldown ends",
         !queue("alice", 56, "#c", aliceFree - 1) && queue("alice", 57, "#c", aliceFree));
+    FiberRecipientGuard responder, unproven;
+    responder.answeredSentAtMs = t1;
+    responder.channelNotBeforeMs["#c"] = t1 - 1000 + FIBERMLS_UNANSWERED_COOLDOWN_MS;
+    responder.channelNotBeforeMs["#d"] = t1 + FIBERMLS_RESPONDER_REFRESH_MS;
+    unproven.channelNotBeforeMs["#d"] = t1 + 1000;
+    check("only a proven responder's own pacing is deferred, never past 20 s plus one pacing slot:"
+        ~ " an unanswered QUERY's channel cooldown and an unproven recipient stay silent",
+        fiberResponderDeferMs(responder, "#c", false, 0, t1) == 0
+        && fiberResponderDeferMs(responder, "#d", false, 0, t1) == FIBERMLS_RESPONDER_REFRESH_MS
+        && fiberResponderDeferMs(responder, "#e", false, 0, t1) == 0
+        && fiberResponderDeferMs(responder, "#c", true, 0, t1)
+            == FIBERMLS_RESPONDER_REFRESH_MS + FIBERMLS_PROBE_INTERVAL_MS
+        && fiberResponderDeferMs(responder, "#e", false, t1 - FIBERMLS_FRESH_MS, t1) == 1
+        && fiberResponderDeferMs(unproven, "#d", true, t1, t1) == 0
+        && fiberResponderDeferMs(unproven, "#d", false, 0, t1) == 0);
 
     const sq = "PRIVMSG a :" ~ fiberCheckQuery(60, "#c");
     check("a queued client command carrying FIBERMLS is stale past 20 s or undated, chat never",
@@ -12901,6 +12921,11 @@ FiberMlsCheck[] fiberMlsWireChecks(out string[] wire) {
     const qd = fiberCheckQuery(3, "#d");
     check("a proven responder's second channel gets exactly one QUERY after the answer",
         messages(got) == ["PRIVMSG alice :" ~ qa, "PRIVMSG bob :" ~ qb, "PRIVMSG alice :" ~ qd]);
+    // A reloaded tab asks the proven responder again with fresh nonces: #c
+    // is inside its 20 s refresh, #d still on the wire. Both are deferred
+    // (published only with an owner), neither is queued or written.
+    c.sendRaw("PRIVMSG alice :" ~ fiberCheckQuery(9, "#c"), true);
+    c.sendMessage("alice", fiberCheckQuery(10, "#d"));
     sleep((FIBERMLS_PROBE_INTERVAL_MS + 200).msecs);
     c.drainFiberProbes();
     sleep(300.msecs);
@@ -13080,7 +13105,6 @@ unittest {
         assert(("#old" in c.channelState) is null && ("#new" in c.channelState) !is null);
         assert(("#old" in c.channelUsers) is null && c.channelUsers["#new"].length == 2);
         assert(!c.config.autoJoinChannels.canFind("#old") && c.config.autoJoinChannels.canFind("#new"));
-    FiberProbeDeferral deferral;
         assert(c.getChannelMetadata()["#new"]["display-name"] == "Lobby");
         auto got = drain(t);
         auto ren = got.filter!(e => e.command == "RENAME").array;
@@ -13183,10 +13207,6 @@ unittest {
         c.processLine(":s CAP Guest123 NEW :sasl");
         c.processLine(":s CAP Guest123 ACK :sasl");
         c.processLine("AUTHENTICATE +");
-    const ts = tg + FIBERMLS_PROBE_MAX_AGE_MS + 1;
-    check("a revoked or never-proven recipient is never deferred: its refusal stays silent",
-        deferred("alice", 39, "#c", ts) == 0 && deferred("alice", 43, "#d", ts) == 0
-        && deferred("erin", 44, "#c", ts) == 0 && c.fiberProbeQueue.length == 0);
         c.processLine(":s 904 Guest123 :SASL authentication failed");
         assert(!c.lateSaslPending);
         assert(!c.outboundQueue.canFind("NICK me"));
@@ -13215,21 +13235,6 @@ unittest {
         assert(!c.outboundQueue.canFind("AWAY :gone"), "no pre-away without the cap");
         drain(t);
     }
-    FiberRecipientGuard responder, unproven;
-    responder.answeredSentAtMs = t1;
-    responder.channelNotBeforeMs["#c"] = t1 - 1000 + FIBERMLS_UNANSWERED_COOLDOWN_MS;
-    responder.channelNotBeforeMs["#d"] = t1 + FIBERMLS_RESPONDER_REFRESH_MS;
-    unproven.channelNotBeforeMs["#d"] = t1 + 1000;
-    check("only a proven responder's own pacing is deferred, never past 20 s plus one pacing slot:"
-        ~ " an unanswered QUERY's channel cooldown and an unproven recipient stay silent",
-        fiberResponderDeferMs(responder, "#c", false, 0, t1) == 0
-        && fiberResponderDeferMs(responder, "#d", false, 0, t1) == FIBERMLS_RESPONDER_REFRESH_MS
-        && fiberResponderDeferMs(responder, "#e", false, 0, t1) == 0
-        && fiberResponderDeferMs(responder, "#c", true, 0, t1)
-            == FIBERMLS_RESPONDER_REFRESH_MS + FIBERMLS_PROBE_INTERVAL_MS
-        && fiberResponderDeferMs(responder, "#e", false, t1 - FIBERMLS_FRESH_MS, t1) == 1
-        && fiberResponderDeferMs(unproven, "#d", true, t1, t1) == 0
-        && fiberResponderDeferMs(unproven, "#d", false, 0, t1) == 0);
     {
         auto t = make();
         auto c = t[0];
@@ -13319,8 +13324,3 @@ unittest {
     IRCRawEvent e;
     while (ch.tryConsumeOne(e)) {}
 }
-    // A reloaded tab asks the proven responder again with fresh nonces: #c
-    // is inside its 20 s refresh, #d still on the wire. Both are deferred
-    // (published only with an owner), neither is queued or written.
-    c.sendRaw("PRIVMSG alice :" ~ fiberCheckQuery(9, "#c"), true);
-    c.sendMessage("alice", fiberCheckQuery(10, "#d"));
