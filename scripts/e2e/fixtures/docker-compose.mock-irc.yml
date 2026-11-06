@@ -4,6 +4,10 @@
 # The proof reads /tmp/mock-irc.lines and /tmp/holder-mock-irc.result and
 # writes /tmp/mock-irc.inject inside this container (docker exec).
 services:
+  ircfiber-holder:
+    environment:
+      # Local mock only; production continues refusing internal IRC targets.
+      IRCFIBER_DIAL_PRIVATE_HOSTS: mock-irc
   mock-irc:
     image: python:3.12-alpine
     container_name: mock-irc
@@ -11,4 +15,4 @@ services:
       - ircfiber_local
     command: ["python3", "-u", "/fixture/holder_mock_irc.py", "16668", "/tmp/holder-mock-irc.result"]
     volumes:
-      - ./holder_mock_irc.py:/fixture/holder_mock_irc.py:ro
+      - ../../../engine/scripts/e2e/fixtures/holder_mock_irc.py:/fixture/holder_mock_irc.py:ro

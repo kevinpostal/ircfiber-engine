@@ -42,14 +42,17 @@ lock = threading.Lock()
 
 
 def write_result():
-    distinct = len(set(accepted))
-    verdict = "PASS" if distinct <= 1 else "FAIL"
-    text = f"{verdict}\naccepted={accepted}\ndistinct={distinct}\n"
-    tmp = RESULT_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        f.write(text)
-    os.replace(tmp, RESULT_FILE)
-    return text
+    # Concurrent connections write the same result file during failover.
+    # Serialize the temp-file rename so one thread cannot steal another's.
+    with lock:
+        distinct = len(set(accepted))
+        verdict = "PASS" if distinct <= 1 else "FAIL"
+        text = f"{verdict}\naccepted={accepted}\ndistinct={distinct}\n"
+        tmp = RESULT_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(text)
+        os.replace(tmp, RESULT_FILE)
+        return text
 
 
 def record_line(text):

@@ -1,0 +1,21 @@
+# Compose overlay for egress_failover.sh; used after docker-compose.mock-irc.yml.
+services:
+  ircfiber-engine:
+    environment:
+      IRCFIBER_NORDVPN_POOL: socks5://north:test:test@egress-a:1080,socks5://south:test:test@egress-b:1080
+  egress-a:
+    image: python:3.12-alpine
+    container_name: egress-a
+    networks:
+      - ircfiber_local
+    command: ["python3", "-u", "/fixture/socks_exit.py"]
+    volumes:
+      - ../../../engine/scripts/e2e/fixtures/socks_exit.py:/fixture/socks_exit.py:ro
+  egress-b:
+    image: python:3.12-alpine
+    container_name: egress-b
+    networks:
+      - ircfiber_local
+    command: ["python3", "-u", "/fixture/socks_exit.py"]
+    volumes:
+      - ../../../engine/scripts/e2e/fixtures/socks_exit.py:/fixture/socks_exit.py:ro

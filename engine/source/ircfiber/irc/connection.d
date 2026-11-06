@@ -456,6 +456,9 @@ private struct MullvadProxy {
     /// most-recently-proven-live instead of blind round robin — see
     /// happyEyeballsConnect's tiering comment.
     long lastSuccessMs;
+    /// Correlated established-session losses, keyed by full IRC hostname.
+    long[string] recentLossAtMsByHost;
+    long quarantinedUntilMs;
 }
 private __gshared MullvadProxy[] mullvadPool;
 private __gshared size_t mullvadRR;
@@ -481,6 +484,9 @@ private enum HOST_EGRESS_BAN_MS = 12 * 60 * 60 * 1000L; // 12 h
 // Shorter host-ban used when a ban is inferred from repeated TLS closes
 // rather than read from an ERROR line (see the reconnect loop).
 private enum TLS_CLOSED_ROTATE_BAN_MS = 15 * 60 * 1000L; // 15 min
+private enum EGRESS_LOSS_MAX_AGE_MS = 120_000L;
+private enum EGRESS_LOSS_WINDOW_MS = 90_000L;
+private enum EGRESS_QUARANTINE_MS = 300_000L;
 private enum TLS_CLOSED_ROTATE_AFTER  = 2;
 /// Sticky hold after the last connection releases a slot, so a reconnect
 /// loop keeps its location instead of losing the slot to another network.
@@ -843,6 +849,95 @@ private void recordMullvadSuccess(string label) {
     }
     foreach (ref pr; mullvadPool) if (pr.label == label) { pr.failCount = 0; pr.deadUntilMs = 0; pr.lastSuccessMs = now; break; }
 }
+
+/// Only a static exit can be quarantined; never attribute an unknown label.
+private bool isStaticProxy(string label) {
+    if (label.length == 0) return false;
+    if (gMullvadLock !is null) synchronized (gMullvadLock) {
+        foreach (ref p; mullvadPool) if (p.label == label) return p.controlSocket.length == 0;
+        return false;
+    }
+    foreach (ref p; mullvadPool) if (p.label == label) return p.controlSocket.length == 0;
+    return false;
+}
+
+/// A stable registered socket ended at the holder, not by an IRC ERROR or
+/// engine shutdown. A missing holder reason is evidence only for a PONG timeout.
+private bool isEstablishedEgressLoss(bool registered, long uptimeMs, bool stopping,
+                                     bool serverError, string closeReason, string errorText) {
+    if (!registered || uptimeMs < STABLE_SESSION_RESET_MS || stopping || serverError)
+        return false;
+    return closeReason == "peer_closed" || closeReason.startsWith("read_error:")
+        || closeReason.startsWith("tls_read_error:") || closeReason.startsWith("write_error:")
+        || (closeReason.length == 0 && errorText.canFind("PONG timeout"));
+}
+
+private void recordEstablishedEgressLoss(string label, string hostLower, long closedAtMs, long nowMs) {
+    if (label.length == 0 || hostLower.length == 0 || closedAtMs <= 0
+        || closedAtMs > nowMs || nowMs - closedAtMs > EGRESS_LOSS_MAX_AGE_MS) return;
+    void update() {
+        foreach (ref p; mullvadPool) if (p.label == label && p.controlSocket.length == 0) {
+            string[] expired;
+            foreach (host, at; p.recentLossAtMsByHost)
+                if (at > nowMs || nowMs - at > EGRESS_LOSS_WINDOW_MS) expired ~= host;
+            foreach (host; expired) p.recentLossAtMsByHost.remove(host);
+            p.recentLossAtMsByHost[hostLower] = closedAtMs;
+            // Compare close times, not arrival times: a delayed INFO response
+            // must not correlate unrelated upstream closes.
+            size_t distinct;
+            foreach (_, at; p.recentLossAtMsByHost)
+                if (at <= closedAtMs && closedAtMs - at <= EGRESS_LOSS_WINDOW_MS
+                    || at > closedAtMs && at - closedAtMs <= EGRESS_LOSS_WINDOW_MS) distinct++;
+            if (distinct >= 2 && nowMs >= p.quarantinedUntilMs) {
+                p.quarantinedUntilMs = nowMs + EGRESS_QUARANTINE_MS;
+                logJsonMap("warn", "connection", "Correlated VPN exit loss",
+                    ["event": "egress_quarantined", "label": label,
+                     "distinctHosts": distinct.to!string]);
+            }
+            break;
+        }
+    }
+    if (gMullvadLock !is null) synchronized (gMullvadLock) update();
+    else update();
+}
+
+@("Established static losses require independent IRC hosts and a live holder close")
+unittest {
+    assert(isEstablishedEgressLoss(true, 60_000, false, false, "peer_closed", ""));
+    assert(isEstablishedEgressLoss(true, 60_000, false, false, "", "PONG timeout"));
+    assert(!isEstablishedEgressLoss(true, 60_000, false, true, "peer_closed", ""));
+    assert(!isEstablishedEgressLoss(true, 60_000, true, false, "peer_closed", ""));
+    assert(!isEstablishedEgressLoss(false, 60_000, false, false, "peer_closed", ""));
+    assert(!isEstablishedEgressLoss(true, 59_999, false, false, "peer_closed", ""));
+    assert(!isEstablishedEgressLoss(true, 60_000, false, false, "holder_shutdown", "transport dead"));
+    assert(!isEstablishedEgressLoss(true, 60_000, false, false, "", "write failed"));
+
+    auto saved = mullvadPool;
+    scope(exit) mullvadPool = saved;
+    MullvadProxy staticExit, mullvad;
+    staticExit.label = "north";
+    mullvad.label = "de"; mullvad.controlSocket = "/ctl/de";
+    mullvadPool = [staticExit, mullvad];
+    const now = 1_000_000L;
+    recordEstablishedEgressLoss("north", "alpha.example.org", now, now);
+    recordEstablishedEgressLoss("north", "alpha.example.org", now + 1_000, now + 1_000);
+    assert(mullvadPool[0].quarantinedUntilMs == 0);
+    recordEstablishedEgressLoss("de", "beta.example.net", now + 2_000, now + 2_000);
+    assert(mullvadPool[1].recentLossAtMsByHost.length == 0);
+    recordEstablishedEgressLoss("north", "beta.example.net", now + 3_000, now + 3_000);
+    assert(mullvadPool[0].quarantinedUntilMs == now + 3_000 + EGRESS_QUARANTINE_MS);
+    recordMullvadSuccess("north");
+    assert(mullvadPool[0].quarantinedUntilMs == now + 3_000 + EGRESS_QUARANTINE_MS);
+    recordEstablishedEgressLoss("north", "gamma.example", now + 4_000, now + 4_000);
+    assert(mullvadPool[0].quarantinedUntilMs == now + 3_000 + EGRESS_QUARANTINE_MS);
+    mullvadPool[0].recentLossAtMsByHost = null;
+    mullvadPool[0].quarantinedUntilMs = 0;
+    recordEstablishedEgressLoss("north", "alpha.example.org", now, now);
+    recordEstablishedEgressLoss("north", "beta.example.net", now + 91_000, now + 91_000);
+    assert(mullvadPool[0].quarantinedUntilMs == 0);
+    recordEstablishedEgressLoss("north", "gamma.example", now + 92_000, now + 212_001);
+    assert(mullvadPool[0].quarantinedUntilMs == 0);
+}
 private void recordMullvadFailure(string label) {
     if (gMullvadLock !is null) synchronized (gMullvadLock) {
         foreach (ref pr; mullvadPool) if (pr.label == label) {
@@ -1010,16 +1105,10 @@ private MullvadProxy*[] getHealthyProxiesForHostLocked(string hostLower) {
 /// can pin it ("direct") the same way it pins a Mullvad label.
 enum DIRECT_EGRESS_LABEL = "direct";
 
-/// Pin value requesting "any healthy exit on the static (NordVPN-like)
-/// tier, automatic selection within it, never Mullvad" — the same
-/// ranking tierAndOrderProxies' static half uses (most-recent-success
-/// descending), but without the Mullvad-first ordering Automatic always
-/// applies. Some networks (e.g. SuperNets) want to stay off Mullvad and
-/// only use the shared NordVPN pool, while still getting automatic
-/// failover among whichever of those exits is currently not banned/dead
-/// for that host — a single static-label pin is a worse fit since
-/// NordVPN's shared-account contention means *which* entry works shifts
-/// over time (see tierAndOrderProxies' own doc comment).
+/// "nordvpn" pins a network to healthy static exits only: no Mullvad or
+/// direct fallback. Established losses from independent IRC hosts temporarily
+/// quarantine a static exit; a single loss is only a per-client preference.
+/// Avoided and quarantined exits remain last-resort VPN candidates.
 enum NORDVPN_TIER_EGRESS_LABEL = "nordvpn";
 
 /// True when, after `bannedKey` was just banned (or SASL-gated) for
@@ -1728,9 +1817,8 @@ struct EgressUsed {
     string locationText;
 }
 
-/// User-facing copy for a pin that could not be honoured. A pin problem
-/// never hard-fails a connect — being offline is worse than being in the
-/// wrong city — so every branch ends "connecting via another exit".
+/// User-facing copy for a Mullvad location pin that could not be honoured.
+/// The Nord tier pin is fail-closed and never uses this fallback.
 private string egressPinFallbackCopy(string reason) nothrow {
     switch (reason) {
         case "all-busy":
@@ -1740,9 +1828,6 @@ private string egressPinFallbackCopy(string reason) nothrow {
             return "Could not switch an exit to that location — connecting via another exit.";
         case "no-catalog":
             return "No exit locations are available on this server — connecting via another exit.";
-        case "no-healthy-static":
-            return "No NordVPN exit is currently healthy for this server — "
-                ~ "connecting directly instead.";
         default:
             return "That location is not available on this server — connecting via another exit.";
     }
@@ -1788,29 +1873,64 @@ private bool firstPartyDirectOnly(string hostLower, string egressNodeId) @safe p
 /// many-network host (e.g. 6x SuperNets) would try the same exit first,
 /// hammering its 32/10m limit into "Too many unknown connections"; with
 /// rotation they spread across exits and stay under per-IP limits.
-/// Session-limit throttling (isThrottleError) already bans a hammered
-/// exit for 12h via banEgressForHost, but rotation prevents the initial
-/// herd. Within the static tier: sorted by most-recent-success
-/// (lastSuccessMs) descending rather than rotated, since with only ~1 of
-/// N typically live, round-robining through the rest wastes real
-/// connection attempts on entries that are currently dead.
-///
-/// Pure aside from `rrIndex` (an explicit ref parameter, not the global
-/// directly) so the tiering invariant is unit-tested without touching
-/// gMullvadLock/mullvadPool. Caller holds gMullvadLock while mutating the
-/// shared rrIndex, same as every other mullvadRR use in this module.
-private MullvadProxy*[] tierAndOrderProxies(MullvadProxy*[] healthy, ref size_t rrIndex) {
-    MullvadProxy*[] mullvadTier, staticTier;
-    foreach (p; healthy) (p.controlSocket.length > 0 ? mullvadTier : staticTier) ~= p;
+/// Session-limit throttling (isThrottleError) still bans a hammered Mullvad
+/// exit per host. Static candidates prefer this client's healthy alternatives,
+/// unquarantined exits, proven exits and lower load. A deterministic
+/// network/label hash breaks equal-load ties without reservation state.
+/// Caller holds gMullvadLock while reading shared slot state.
+private ulong staticTieHash(string networkId, string label) {
+    ulong hash = 14695981039346656037UL;
+    foreach (ubyte b; cast(const(ubyte)[]) networkId) hash = (hash ^ b) * 1099511628211UL;
+    hash = (hash ^ 0) * 1099511628211UL;
+    foreach (ubyte b; cast(const(ubyte)[]) label) hash = (hash ^ b) * 1099511628211UL;
+    return hash;
+}
+
+private struct StaticRank {
+    MullvadProxy* proxy;
+    bool avoided, quarantined, unproven;
+    int activeConns;
+    long lastSuccessMs;
+    ulong tieHash;
+}
+
+private MullvadProxy*[] orderStaticProxies(MullvadProxy*[] candidates,
+                                           string networkId, long nowMs, string avoidLabel) {
+    StaticRank[] ranked;
+    foreach (p; candidates) {
+        if (p.controlSocket.length > 0) continue;
+        ranked ~= StaticRank(p, p.label == avoidLabel, nowMs < p.quarantinedUntilMs,
+            p.activeConns == 0 && (p.lastSuccessMs == 0 || p.lastSuccessMs > nowMs
+                || nowMs - p.lastSuccessMs > 30 * 60_000L),
+            p.activeConns, p.lastSuccessMs, staticTieHash(networkId, p.label));
+    }
+    ranked.sort!((a, b) =>
+        a.avoided != b.avoided ? !a.avoided :
+        a.quarantined != b.quarantined ? !a.quarantined :
+        a.unproven != b.unproven ? !a.unproven :
+        a.activeConns != b.activeConns ? a.activeConns < b.activeConns :
+        a.lastSuccessMs != b.lastSuccessMs ? a.lastSuccessMs > b.lastSuccessMs :
+        a.tieHash != b.tieHash ? a.tieHash < b.tieHash :
+        a.proxy.label < b.proxy.label);
+    MullvadProxy*[] ordered;
+    foreach (r; ranked) ordered ~= r.proxy;
+    return ordered;
+}
+
+/// Mullvad rotation remains unchanged; static ranking is shared with pins.
+/// Caller holds gMullvadLock while reading shared slot state and rrIndex.
+private MullvadProxy*[] tierAndOrderProxies(MullvadProxy*[] healthy, ref size_t rrIndex,
+                                            string networkId, long nowMs, string avoidLabel) {
+    MullvadProxy*[] mullvadTier;
+    foreach (p; healthy) if (p.controlSocket.length > 0) mullvadTier ~= p;
     if (mullvadTier.length > 1) {
         const startIdx = rrIndex++ % mullvadTier.length;
         if (startIdx != 0) mullvadTier = mullvadTier[startIdx .. $] ~ mullvadTier[0 .. startIdx];
     }
-    if (staticTier.length > 1) staticTier.sort!((a, b) => a.lastSuccessMs > b.lastSuccessMs);
-    return mullvadTier ~ staticTier;
+    return mullvadTier ~ orderStaticProxies(healthy, networkId, nowMs, avoidLabel);
 }
 
-@("tierAndOrderProxies: Mullvad tier first, static tier ranked by recent success, rotation only within Mullvad")
+@("tierAndOrderProxies: Mullvad first with static proof, load and deterministic ties")
 unittest {
     MullvadProxy de, ch, us, nordA, nordB, nordC;
     de.label = "de"; de.controlSocket = "/ctl/de.sock";
@@ -1822,7 +1942,7 @@ unittest {
 
     auto healthy = [&de, &nordA, &ch, &nordB, &us, &nordC];
     size_t rr = 0;
-    auto ordered = tierAndOrderProxies(healthy, rr);
+    auto ordered = tierAndOrderProxies(healthy, rr, "network-a", 1_000, "");
 
     assert(ordered.length == 6);
     // Every Mullvad entry sorts before every static entry.
@@ -1840,54 +1960,57 @@ unittest {
     assert(rr == 1, "rrIndex advanced exactly once");
 
     // Next call rotates: startIdx = 1 % 3 = 1 -> ch, us, de.
-    auto ordered2 = tierAndOrderProxies(healthy, rr);
+    auto ordered2 = tierAndOrderProxies(healthy, rr, "network-a", 1_000, "");
     assert(ordered2[0].label == "ch" && ordered2[1].label == "us" && ordered2[2].label == "de");
 
     // A single Mullvad entry never rotates (nothing to rotate among) and
     // rrIndex is left untouched.
     size_t rr2 = 5;
-    auto single = tierAndOrderProxies([&de], rr2);
+    auto single = tierAndOrderProxies([&de], rr2, "network-a", 1_000, "");
     assert(single.length == 1 && single[0].label == "de" && rr2 == 5);
 }
 
-/// Static (NordVPN-like) tier only, ranked by most-recent-success
-/// descending — same ranking as tierAndOrderProxies' static half, for a
-/// "nordvpn" pin that wants automatic failover within that tier without
-/// ever trying Mullvad. `healthy` is expected to already be host-ban and
-/// global-health filtered (getHealthyProxiesForHost's output), same
-/// precondition tierAndOrderProxies has.
-private MullvadProxy*[] staticTierOnly(MullvadProxy*[] healthy) {
-    MullvadProxy*[] staticTier;
-    foreach (p; healthy) if (p.controlSocket.length == 0) staticTier ~= p;
-    if (staticTier.length > 1) staticTier.sort!((a, b) => a.lastSuccessMs > b.lastSuccessMs);
-    return staticTier;
+/// Static-only pin uses the same order as Automatic without its Mullvad tier.
+private MullvadProxy*[] staticTierOnly(MullvadProxy*[] healthy, string networkId,
+                                       long nowMs, string avoidLabel) {
+    return orderStaticProxies(healthy, networkId, nowMs, avoidLabel);
 }
 
-@("staticTierOnly: Mullvad entries excluded, static tier ranked by recent success")
+@("staticTierOnly: proof, load, quarantine, avoidance and last resort")
 unittest {
-    MullvadProxy de, nordA, nordB, nordC;
+    MullvadProxy de, a, b, never;
     de.label = "de"; de.controlSocket = "/ctl/de.sock";
-    nordA.label = "nordA"; nordA.lastSuccessMs = 100;
-    nordB.label = "nordB"; nordB.lastSuccessMs = 300; // most recently successful
-    nordC.label = "nordC"; nordC.lastSuccessMs = 0;   // never succeeded
-
-    auto healthy = [&de, &nordA, &nordB, &nordC];
-    auto ordered = staticTierOnly(healthy);
-
-    assert(ordered.length == 3, "Mullvad entry excluded");
-    assert(ordered[0].label == "nordB");
-    assert(ordered[1].label == "nordA");
-    assert(ordered[2].label == "nordC");
-
-    assert(staticTierOnly([&de]).length == 0, "Mullvad-only input yields nothing");
-    MullvadProxy*[] empty;
-    assert(staticTierOnly(empty).length == 0);
+    a.label = "north"; a.lastSuccessMs = 900;
+    b.label = "south"; b.lastSuccessMs = 800;
+    never.label = "untested";
+    auto healthy = [&de, &a, &b, &never];
+    auto ordered = staticTierOnly(healthy, "network-a", 1_000, "");
+    assert(ordered.length == 3 && ordered[0] is &a && ordered[1] is &b && ordered[2] is &never);
+    a.activeConns = 2; b.activeConns = 1;
+    assert(staticTierOnly(healthy, "network-a", 1_000, "")[0] is &b);
+    a.activeConns = 0; b.activeConns = 0;
+    // Equal recency exposes the deterministic per-network tie breaker.
+    b.lastSuccessMs = a.lastSuccessMs;
+    bool sawA, sawB;
+    foreach (i; 0 .. 100) {
+        auto first = staticTierOnly(healthy, i.to!string, 1_000, "")[0];
+        if (first is &a) sawA = true;
+        if (first is &b) sawB = true;
+    }
+    assert(sawA && sawB);
+    a.quarantinedUntilMs = 1_300;
+    assert(staticTierOnly(healthy, "network-a", 1_000, "")[0] is &b);
+    assert(staticTierOnly([&a], "network-a", 1_000, "")[0] is &a);
+    assert(staticTierOnly(healthy, "network-a", 1_300, "north")[0] is &b);
+    assert(staticTierOnly([&a], "network-a", 1_300, "north")[0] is &a);
+    assert(staticTierOnly(healthy, "network-a", 1_300, "")[2] is &never);
+    assert(staticTierOnly([&de], "network-a", 1_000, "").length == 0);
 }
 
 private TCPConnection happyEyeballsConnect(HolderClient holder, DialTag tag, string host, ushort port,
                                            string tlsMode, string egressNodeId, bool unauthenticated,
                                            string ipv6BindAddr, ConnectProgress progress,
-                                           out EgressUsed used, out DialResult dr) {
+                                           string avoidLabel, out EgressUsed used, out DialResult dr) {
     import std.string : toLower;
     auto hostLower = host.toLower();
     // Fast-path for the first-party InspIRCd instance (irc.ircfiber.com):
@@ -1920,15 +2043,12 @@ private TCPConnection happyEyeballsConnect(HolderClient holder, DialTag tag, str
     //   by getHealthyProxiesForHost(hostLower) so a G-lined exit for one
     //   host never blocks it for another.
     auto healthyForHost = getHealthyProxiesForHost(hostLower);
-    // Reliability tiering + smart routing (Automatic only — a pin/location
-    // request bypasses this entirely): see tierAndOrderProxies' own doc
-    // comment for why Mullvad goes first and the static tier is ranked by
-    // recent success instead of rotated.
+    const orderNowMs = unixMsNow();
     if (egressNodeId.length == 0 && healthyForHost.length > 1) {
         if (gMullvadLock !is null) synchronized (gMullvadLock) {
-            healthyForHost = tierAndOrderProxies(healthyForHost, mullvadRR);
+            healthyForHost = tierAndOrderProxies(healthyForHost, mullvadRR, tag.networkId, orderNowMs, avoidLabel);
         } else {
-            healthyForHost = tierAndOrderProxies(healthyForHost, mullvadRR);
+            healthyForHost = tierAndOrderProxies(healthyForHost, mullvadRR, tag.networkId, orderNowMs, avoidLabel);
         }
     }
     MullvadProxy*[] toTry;
@@ -1940,19 +2060,12 @@ private TCPConnection happyEyeballsConnect(HolderClient holder, DialTag tag, str
     const pinNordvpnTier = egressNodeId.length > 0 && egressNodeId.toLower() == NORDVPN_TIER_EGRESS_LABEL;
     string egressBusyNote;
     if (pinNordvpnTier) {
-        // "nordvpn" pin: automatic selection within the static tier only
-        // (never Mullvad), host-ban and global-health aware since
-        // healthyForHost already filters both — same preconditions
-        // tierAndOrderProxies' Automatic path relies on.
-        toTry ~= staticTierOnly(healthyForHost);
-        if (toTry.length == 0) {
-            logWarn("NordVPN tier pin unavailable for %s — no healthy static exit, falling back to direct",
-                hostLower);
-            logJsonMap("warn", "connection", "Egress pin unavailable",
-                ["host": hostLower, "pin": egressNodeId, "reason": "no-healthy-static",
-                 "event": "egress_busy"]);
-            egressBusyNote = egressPinFallbackCopy("no-healthy-static");
-        }
+        // A Nord pin is VPN-only, including when every exit is unhealthy.
+        if (gMullvadLock !is null) synchronized (gMullvadLock)
+            toTry = staticTierOnly(healthyForHost, tag.networkId, orderNowMs, avoidLabel);
+        else toTry = staticTierOnly(healthyForHost, tag.networkId, orderNowMs, avoidLabel);
+        if (toTry.length == 0)
+            throw new Exception("No healthy NordVPN exit available for " ~ host);
     } else if (egressNodeId.length > 0 && !pinDirect) {
         // Country/city pin: reuse a slot already on that location, else
         // retarget an idle one. A slot carrying live connections is never
@@ -1997,10 +2110,7 @@ private TCPConnection happyEyeballsConnect(HolderClient holder, DialTag tag, str
     MullvadProxy*[] gated;
     if (!pinDirect) {
         foreach (p; healthyForHost) {
-            // A "nordvpn" pin never falls through to Mullvad, not even as
-            // a gated last resort — Direct is the only non-static fallback
-            // it allows (the unconditional direct-fallback block below,
-            // unchanged, already covers that).
+            // The Nord pin excludes Mullvad even as a gated last resort.
             if (pinNordvpnTier && p.controlSocket.length > 0) continue;
             bool already = false;
             foreach (q; toTry) if (q is p) { already = true; break; }
@@ -2009,18 +2119,22 @@ private TCPConnection happyEyeballsConnect(HolderClient holder, DialTag tag, str
             else toTry ~= p;
         }
     }
-    // Direct fallback — the sidecars are egress, not a proxy mesh; the bare
-    // host IP is the last resort. Skipped while the host has it banned and
-    // an exit is still available; kept when it is the only route (or
-    // pinned) so the attempt surfaces the ban instead of failing silently.
+    // Direct is not a last resort for a Nord pin: fail closed when no VPN
+    // candidate can connect, then let the reconnect loop back off.
     const directBanned = !pinDirect && isDirectBannedForHost(hostLower);
     const directGated = !pinDirect && unauthenticated
         && isEgressSaslGatedForHost(hostLower, DIRECT_EGRESS_LABEL);
-    if (pinDirect || (!directBanned && !directGated)) toTry ~= null;
+    if (!pinNordvpnTier && (pinDirect || (!directBanned && !directGated))) toTry ~= null;
+    if (pinNordvpnTier) {
+        if (gMullvadLock !is null) synchronized (gMullvadLock)
+            gated = orderStaticProxies(gated, tag.networkId, orderNowMs, avoidLabel);
+        else gated = orderStaticProxies(gated, tag.networkId, orderNowMs, avoidLabel);
+    }
     toTry ~= gated;
-    if (directGated && !directBanned) toTry ~= null;
-    if (toTry.length == 0) toTry ~= null;
-    else if (directBanned) logWarn("Direct egress is host-banned for %s — trying %d exit(s) only", hostLower, cast(int) toTry.length);
+    if (!pinNordvpnTier && directGated && !directBanned) toTry ~= null;
+    if (!pinNordvpnTier && toTry.length == 0) toTry ~= null;
+    else if (directBanned && !pinNordvpnTier)
+        logWarn("Direct egress is host-banned for %s — trying %d exit(s) only", hostLower, cast(int) toTry.length);
     Exception lastErr;
     foreach (proxy; toTry) {
         try {
@@ -2681,7 +2795,8 @@ string stripMircFormatting(string s) {
 private enum CTCP_DELIM = '\x01';
 
 private bool isCtcp(string text) {
-    return text.length >= 2 && text[0] == CTCP_DELIM && text[$ - 1] == CTCP_DELIM;
+    return text.length >= 3 && text[0] == CTCP_DELIM && text[$ - 1] == CTCP_DELIM
+        && text[1] != ' ' && text[1 .. $ - 1].indexOf(CTCP_DELIM) < 0;
 }
 
 /// Extract CTCP command and optional parameter from a message text.
@@ -3196,6 +3311,8 @@ final class PersistentIRCClient {
         /// Holder id (`c-<n>`) of the live upstream connection; "" when
         /// there is none.
         string             holderConnId;
+        string             lastHolderCloseReason;
+        long               lastHolderClosedAtMs;
 
         /// unix-ms when the current registration handshake began (≈ TCP
         /// connect). The JOIN-throttle window is measured from there, and
@@ -3562,6 +3679,9 @@ final class PersistentIRCClient {
         /// when the server later G/K/Z-lines us — generic, no hostname
         /// hardcode.
         string              activeEgressLabel;
+        /// This client's temporary preference after one established exit loss.
+        string              avoidEgressLabel;
+        long                avoidUntilMs;
         /// Full proxy host that won (e.g. "tailscale-mullvad-de:1055").
         string              activeEgressHost;
         /// Resolved Tailnet IP of the active proxy (e.g. "100.117.47.8").
@@ -4827,6 +4947,8 @@ final class PersistentIRCClient {
         }
 
         while (!isShutdownRequested) {
+            lastHolderCloseReason = "";
+            lastHolderClosedAtMs = 0;
             // How long the session that just ended stayed registered; -1
             // until measured. Only a stable session resets the backoff.
             long sessionUptimeMs = -1;
@@ -4859,6 +4981,8 @@ final class PersistentIRCClient {
                 // session and the process is exiting.
                 if (detachedForHotSwap) return;
             } catch (Throwable e) {
+                const wasRegistered = state == ConnectionState.connected;
+                const hadServerError = lastErrorText.length > 0;
                 sessionUptimeMs = connectedAtMs > 0 ? unixMsNow() - connectedAtMs : 0;
                 // Enterprise: catch Throwable (not just Exception) — SyncError@(0) from
                 // unsynchronized __gshared access previously killed the TaskFiber
@@ -4947,6 +5071,21 @@ final class PersistentIRCClient {
                     try { transportClose(); } catch (Throwable) {}
                     state = ConnectionState.disconnected;
                 }
+                const lossAtMs = unixMsNow();
+                if (isStaticProxy(activeEgressLabel)
+                    && isEstablishedEgressLoss(wasRegistered, sessionUptimeMs,
+                        isShutdownRequested || detachedForHotSwap, hadServerError,
+                        lastHolderCloseReason, errMsg)) {
+                    const closedAtMs = lastHolderCloseReason.length > 0
+                        ? lastHolderClosedAtMs : lossAtMs;
+                    if (closedAtMs > 0 && closedAtMs <= lossAtMs
+                        && lossAtMs - closedAtMs <= EGRESS_LOSS_MAX_AGE_MS) {
+                        recordEstablishedEgressLoss(activeEgressLabel,
+                            config.host.toLower(), closedAtMs, lossAtMs);
+                        avoidEgressLabel = activeEgressLabel;
+                        avoidUntilMs = lossAtMs + EGRESS_QUARANTINE_MS;
+                    }
+                }
 
                 if (isShutdownRequested) break;
 
@@ -4975,26 +5114,15 @@ final class PersistentIRCClient {
                     if (activeEgressLocationId.length > 0) banEgressForHost(config.host, activeEgressLocationId);
                     recordHostFailure(config.host, config.port);
                 }
-                // A silent-drop reconnect means this egress held a dead
-                // connection open without ever surfacing a TCP/TLS-level
-                // error — the same failure signature as a wedged TLS
-                // handshake, just discovered later (by the 120s PONG
-                // watchdog or a direct `transportAlive` check in
-                // processEvents()/writeRaw()).
-                // Feed it into the same egress-health machinery the
-                // TLS-timeout path above uses so the next attempt — for
-                // this network *and* every other tenant sharing this
-                // sidecar — skips the exit that just black-holed us
-                // instead of round-robin handing it right back out.
-                // (Registration-phase closes are excluded: `relayClosed()`
-                // and `!transportAlive` share one message there —
-                // "Server closed the connection…" — so it can't tell a
-                // dead egress from a real server refusal.)
+                // Keep Mullvad's existing accounting for silent drops. Static
+                // exits instead use qualified, cross-host observations above.
                 if (reason.canFind("PONG timeout")
                     || reason.canFind("transport not alive") || reason.canFind("transport dead")) {
                     recordCounter("ircfiber.keepalive.timeout_disconnect", 1, ["host": config.host, "egress": activeEgressLabel]);
-                    if (activeEgressLocationId.length > 0) banEgressForHost(config.host, activeEgressLocationId);
-                    if (activeEgressLabel.length > 0) recordMullvadFailure(activeEgressLabel);
+                    if (!isStaticProxy(activeEgressLabel)) {
+                        if (activeEgressLocationId.length > 0) banEgressForHost(config.host, activeEgressLocationId);
+                        if (activeEgressLabel.length > 0) recordMullvadFailure(activeEgressLabel);
+                    }
                 }
                 // An IP ban on a TLS port never reaches us as text: InspIRCd
                 // answers a Z-lined address with a plaintext ERROR and closes,
@@ -5507,8 +5635,11 @@ final class PersistentIRCClient {
             // it out when the same slot is reused.
             releaseEgressSlot();
             auto tag = DialTag(config.id.toString(), ownerId.toString(), config.name, "");
+            const now = unixMsNow();
+            if (now >= avoidUntilMs) { avoidEgressLabel = ""; avoidUntilMs = 0; }
             connection = happyEyeballsConnect(holder, tag, config.host, config.port, tlsMode,
-                config.egressNodeId, config.sasl == SASLMechanism.none, ipv6Bind, &onDialEvent, used, dr);
+                config.egressNodeId, config.sasl == SASLMechanism.none, ipv6Bind,
+                &onDialEvent, avoidEgressLabel, used, dr);
             holderConnId = dr.id;
             activeEgressLabel = used.label;
             activeEgressHost = used.host;
@@ -8455,6 +8586,11 @@ private void processEvents() {
 
             // ── NOTICE ─────────────────────────────────────────────────────────
             case "NOTICE":
+                if (event.text.length > 0 && event.text[0] == CTCP_DELIM) {
+                    if (sameNick(event.nick, sessionNick)) return;
+                    event.addTag("ctcp", isCtcp(event.text) ? parseCtcp(event.text)[0] : "MALFORMED");
+                    break;
+                }
                 {
                     auto mp = event.getParams();
                     auto to = mp.length > 0 ? mp[0] : "";
@@ -8818,7 +8954,8 @@ private void processEvents() {
         // The old check `channel.length==0` never fired because parser always
         // sets channel for PRIVMSG. Instead detect DM by target not being a
         // channel prefix.
-        if (event.command == "PRIVMSG" || event.command == "NOTICE") {
+        if (event.getTag("ctcp").length == 0
+            && (event.command == "PRIVMSG" || event.command == "NOTICE")) {
             auto p = event.getParams();
             if (p.length > 0 && p[0].length > 0
                 && p[0][0] != '#' && p[0][0] != '&'
@@ -8918,6 +9055,14 @@ private void processEvents() {
                 // frontend's labeled FAIL handling) sees it.
                 event.addTag("label", ownBatch.label);
             }
+        }
+
+        // Diagnostics retain the original IRC wire fields, but never touch a
+        // query's identity, history cursor, or author metadata.
+        if (event.getTag("ctcp").length > 0) {
+            event.channel = "_server";
+            eventChannel.put(event);
+            return;
         }
 
         // Correlate labeled echoes (labeled-response cap) and record msgids
@@ -9030,19 +9175,17 @@ private void processEvents() {
         return true;
     }
 
-    /// Returns true if the CTCP was handled AND should not be published to the event bus.
+    /// Consume only our non-ACTION echoes; publish every other diagnostic.
     private bool handlePrivmsg(ref IRCRawEvent event) {
-        if (!isCtcp(event.text)) return false;
-
-        auto ctcp  = parseCtcp(event.text);
-        auto cmd   = ctcp[0];
+        if (event.text.length == 0 || event.text[0] != CTCP_DELIM) return false;
+        const framed = isCtcp(event.text);
+        auto ctcp = framed ? parseCtcp(event.text) : ["MALFORMED", ""];
+        auto cmd = ctcp[0];
         auto param = ctcp[1];
-        logJsonMap("debug", "protocol",
-            "CTCP",
-            ["network": config.name,
-             "from": event.nick,
-             "type": cmd,
-             "event": "ctcp"]);
+        if (framed && cmd == "ACTION") return false;
+        if (sameNick(event.nick, sessionNick)) return true;
+        event.addTag("ctcp", cmd);
+        if (!framed) return false;
 
         // Auto-reply only to a live request from someone else: never to a
         // replayed (chathistory) one, nor to our own echo or another of our
@@ -9051,19 +9194,22 @@ private void processEvents() {
         const replayed = batchRef == "chathistory"
             || (batchRef.length > 0 && openBatches.get(batchRef, OpenBatch.init).type == "chathistory");
         const requester = event.nick;
-        const mayReply = requester.length > 0 && !replayed && !sameNick(requester, sessionNick);
+        auto params = event.getParams();
+        const mayReply = requester.length > 0 && !replayed && !sameNick(requester, sessionNick)
+            && params.length > 0 && params[0] == stripNickPrefix(params[0])
+            && sameNick(params[0], sessionNick);
         void reply(string type, string value) {
             if (!mayReply || !takeCtcpReplySlot()) return;
             sendRaw("NOTICE " ~ requester ~ " :" ~ ctcpReply(type, value));
         }
         switch (cmd) {
-            case "ACTION":     return false; // JS renders \x01ACTION...\x01 as /me
-            case "VERSION":    reply("VERSION", "IRC Fiber 1.0 (vibe.d)"); return true;
-            case "PING":       reply("PING", param); return true;
-            case "TIME":       reply("TIME", Clock.currTime.toString()); return true;
-            case "CLIENTINFO": reply("CLIENTINFO", "ACTION VERSION PING TIME CLIENTINFO"); return true;
-            default:           return false; // unknown CTCP — let it pass through
+            case "VERSION":    reply("VERSION", "IRC Fiber"); break;
+            case "PING":       reply("PING", param); break;
+            case "TIME":       reply("TIME", Clock.currTime.toString()); break;
+            case "CLIENTINFO": reply("CLIENTINFO", "ACTION VERSION PING TIME CLIENTINFO"); break;
+            default:           break;
         }
+        return false;
     }
 
     // ── IRC line parser ───────────────────────────────────────────────────────
@@ -10001,6 +10147,10 @@ private void processEvents() {
             if (holderConnId.length && holder !is null) {
                 try {
                     auto e = holder.info(holderConnId);
+                    if (e.state == "closed") {
+                        lastHolderCloseReason = e.closeReason;
+                        lastHolderClosedAtMs = e.closedAtMs;
+                    }
                     if (e.state == "closed" && e.closeReason.length) {
                         if (lastDisconnectReason.length == 0
                             || lastDisconnectReason == "Connection closed unexpectedly"
@@ -11192,6 +11342,63 @@ unittest {
     auto logout = run([":srv 900 me me!u@h acct :You are now logged in as acct",
                        ":srv 901 me me!u@h :You are now logged out"]);
     assert(logout[0].servicesAccount == "");
+}
+
+@("CTCP is direct-only, generic, quiet, and preserves ACTION")
+unittest {
+    import std.typecons : tuple;
+    import vibe.core.channel : createChannel;
+
+    static auto run(string[] lines) {
+        NetworkConfig cfg;
+        cfg.nick = "me";
+        auto ch = createChannel!IRCRawEvent();
+        auto c = new PersistentIRCClient(cfg, ch);
+        foreach (line; lines) c.processLine(line);
+        ch.close();
+        IRCRawEvent[] events;
+        IRCRawEvent event;
+        while (ch.tryConsumeOne(event)) events ~= event;
+        return tuple(c, events);
+    }
+    auto direct = run([":alice!u@h PRIVMSG me :\x01VERSION\x01"]);
+    assert(direct[1].length == 1, "a request must publish one diagnostic");
+    assert(direct[1][0].channel == "_server" && direct[1][0].getTag("ctcp") == "VERSION");
+    assert(direct[0].outboundQueue == ["NOTICE alice :\x01VERSION IRC Fiber\x01"]);
+
+    foreach (target; ["#room", "@me", "someone"]) {
+        auto channel = run([":alice!u@h PRIVMSG " ~ target ~ " :\x01VERSION\x01"]);
+        assert(channel[1].length == 1 && channel[1][0].channel == "_server");
+        assert(channel[0].outboundQueue.length == 0, "only our exact nick may elicit a reply");
+        assert(channel[0].queryBuffers.length == 0);
+    }
+    auto replay = run(["BATCH +history chathistory me",
+        "@batch=history :alice!u@h PRIVMSG me :\x01VERSION\x01", "BATCH -history"]);
+    assert(replay[0].outboundQueue.length == 0);
+    assert(replay[1].length == 1 && replay[1][0].getTag("batch") == "chathistory");
+
+    auto diagnostics = run([
+        "@msgid=secret;account=acct :alice!u@h PRIVMSG me :\x01DCC SEND private\x01",
+        ":alice!u@h PRIVMSG me :\x01VERSION",
+        ":alice!u@h NOTICE me :\x01PING private-token\x01",
+        ":me!u@h NOTICE alice :\x01PING own-token\x01",
+        ":me!u@h PRIVMSG alice :\x01PING own-token\x01"]);
+    assert(diagnostics[1].length == 3, "own CTCP echoes must disappear");
+    assert(diagnostics[1][0].getTag("ctcp") == "DCC");
+    assert(diagnostics[1][1].getTag("ctcp") == "MALFORMED");
+    assert(diagnostics[1][2].getTag("ctcp") == "PING");
+    foreach (event; diagnostics[1]) assert(event.channel == "_server");
+    assert(diagnostics[1][2].command == "NOTICE"
+        && diagnostics[1][2].getParams()[0] == "me"
+        && diagnostics[1][2].text == "\x01PING private-token\x01");
+    assert(diagnostics[0].outboundQueue.length == 0);
+    assert(diagnostics[0].queryBuffers.length == 0 && diagnostics[0].queryAccounts.length == 0
+        && diagnostics[0].queryHosts.length == 0 && diagnostics[0].accounts.length == 0);
+    assert(diagnostics[0].getLatestMsgid("alice").length == 0);
+
+    auto action = run([":alice!u@h PRIVMSG #room :\x01ACTION waves\x01"]);
+    assert(action[1].length == 1 && action[1][0].channel == "#room");
+    assert(action[1][0].getTag("ctcp").length == 0 && action[1][0].text == "\x01ACTION waves\x01");
 }
 
 @("IRCv3 registry: away, WHOX, CHGHOST, ACCOUNT *, batches, ACK, RENAME, FAIL CHATHISTORY, CAP")

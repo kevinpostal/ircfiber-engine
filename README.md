@@ -82,6 +82,23 @@ dub --root=engine test && dub --root=common test
 python3 -m pytest tests/irc_parity -v  # against mock ircd
 ```
 
+### VPN egress reliability
+
+The `nordvpn` network pin uses **static SOCKS exits only**; if none can dial,
+the engine retries with backoff rather than connecting directly or via Mullvad.
+After a registered session survives 60 seconds, an upstream socket loss makes
+that client prefer another exit for five minutes. Losses on two distinct IRC
+hostnames within 90 seconds quarantine their shared static exit for five
+minutes, without closing other live sockets. Avoided/quarantined exits remain
+last-resort VPN candidates. All exits sharing one NordVPN account remain a
+provider-wide failure domain.
+
+Run `bash scripts/e2e/egress_failover.sh` against the local Docker stack to
+prove correlated failover and the no-direct fallback; run
+`bash scripts/e2e/hot_swap.sh` to prove holder sockets survive engine restarts.
+The SigNoz `IRCFiber VPN exit correlated loss` rule alerts #staff on the
+structured `egress_quarantined` log.
+
 ## Links
 
 * Superproject: [kevinpostal/irc-fiber](https://github.com/kevinpostal/irc-fiber)

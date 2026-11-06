@@ -18,7 +18,7 @@
 #   * the mock saw exactly one server-side socket (result file distinct=1)
 #   * no QUIT ever reached the mock
 #   * a JOIN issued after the swap is relayed (JOIN #hot / #hot2 at the mock)
-#   * NAMES re-sync happens only on the crash path (b), never on (a)
+#   * NAMES re-baselines the channel roster after either attach
 #   * during (b), while the engine is down, a PING :x injected by the mock is
 #     answered PONG :x by the holder and never reaches the engine log
 #
@@ -104,7 +104,11 @@ say "starting local stack + mock-irc ($COMPOSE_FILE)"
 dc up -d --remove-orphans redis mongo "$MOCK" "$HOLDER" ircfiber-gateway "$ENGINE"
 wait_for 90 "gateway /health" 'curl -fsS "$GATEWAY/health"'
 wait_for 60 "holder --status" 'holder_status'
-wait_for 30 "mock-irc listening" 'docker logs "$MOCK" 2>&1 | grep -q listening'
+wait_for 30 "mock-irc listening" 'docker logs "$MOCK" 2>&1 | grep listening'
+# The mock may already be running from another local scenario. Reset its
+# socket counter and recorded lines before asserting one preserved socket.
+dc restart "$MOCK" >/dev/null
+wait_for 30 "reset mock-irc listening" 'docker logs "$MOCK" 2>&1 | grep listening'
 ok "stack up"
 
 # ── 1. Session + network ─────────────────────────────────────────────────
@@ -117,7 +121,7 @@ api GET /api/networks | jq -e 'type == "array"' >/dev/null || fail "login failed
 
 LOG_MARK=$(engine_log_lines)
 say "creating network $NET_NAME → $MOCK:16668 (plain TCP)"
-RESP=$(api POST /api/networks "{\"name\":\"$NET_NAME\",\"host\":\"$MOCK\",\"port\":16668,\"tls\":\"disabled\",\"nick\":\"hotswap\",\"realName\":\"Hot Swap\",\"autoJoinChannels\":[]}")
+RESP=$(api POST /api/networks "{\"name\":\"$NET_NAME\",\"host\":\"$MOCK\",\"port\":16668,\"tls\":\"disabled\",\"nick\":\"hotswap\",\"realName\":\"Hot Swap\",\"egressNodeId\":\"direct\",\"autoJoinChannels\":[]}")
 NET_ID=$(printf '%s' "$RESP" | jq -r '.id // .networkId // empty')
 [[ -n "$NET_ID" ]] || fail "create network failed: $RESP"
 ok "network $NET_ID"
@@ -127,8 +131,7 @@ wait_for 30 "holder shows $NET_NAME open" 'holder_entry | grep -q " open$"'
 read -r ID0 CONNECTED0 _ < <(holder_entry)
 ok "registered; holder id=$ID0 connectedAtMs=$CONNECTED0"
 
-# A channel joined before the swaps: on the crash path the reattached engine
-# must re-sync it with NAMES; on the graceful path it must not.
+# A channel joined before the swaps must be re-baselined after both attaches.
 MARK=$(mock_lines_count)
 join_channel '#pre'
 wait_for 20 "JOIN #pre at the mock" 'mock_lines_since "$MARK" | grep -q "^JOIN #pre"'
@@ -161,13 +164,9 @@ assert_swapped() {
     if mock_lines | grep -q '^QUIT'; then fail "$phase: a QUIT reached the mock"; fi
     ok "$phase: no QUIT at the mock"
 
-    if [[ "$phase" == graceful ]]; then
-        if mock_lines_since "$mock_mark" | grep -q '^NAMES'; then fail "$phase: NAMES sent on the graceful path"; fi
-        ok "$phase: no NAMES re-sync (META was graceful)"
-    else
-        mock_lines_since "$mock_mark" | grep -q '^NAMES #pre' || fail "$phase: no NAMES #pre re-sync after crash attach"
-        ok "$phase: NAMES #pre re-sync after crash"
-    fi
+    mock_lines_since "$mock_mark" | grep -q '^NAMES #pre' \
+        || fail "$phase: no NAMES #pre re-baseline after attach"
+    ok "$phase: NAMES #pre re-baselined"
 }
 
 # ── (a) graceful: SIGTERM = detach, new engine reattaches ────────────────
