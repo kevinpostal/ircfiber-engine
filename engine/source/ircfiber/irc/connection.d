@@ -11971,6 +11971,223 @@ unittest {
     assert(action[1][0].getTag("ctcp").length == 0 && action[1][0].text == "\x01ACTION waves\x01");
 }
 
+@("FIBERMLS: own prefix follows only server-confirmed identity and survives a swap snapshot")
+unittest {
+    import std.algorithm : count;
+    import vibe.core.channel : createChannel;
+
+    static PersistentIRCClient fresh(out typeof(createChannel!IRCRawEvent()) ch) {
+        NetworkConfig cfg;
+        cfg.nick = "me";
+        ch = createChannel!IRCRawEvent();
+        return new PersistentIRCClient(cfg, ch);
+    }
+    static size_t ownPrefixEvents(typeof(createChannel!IRCRawEvent()) ch) {
+        ch.close();
+        size_t n;
+        IRCRawEvent e;
+        while (ch.tryConsumeOne(e)) if (e.command == "own_prefix") n++;
+        return n;
+    }
+
+    typeof(createChannel!IRCRawEvent()) ch;
+    auto c = fresh(ch);
+    // Self JOIN echo is the proof; it also lands whole on the roster.
+    c.processLine(":me!~m@host.a JOIN #c");
+    assert(c.ownPrefix == "me!~m@host.a");
+    assert(c.getOwnPrefix() == "", "never exported while not registered");
+    assert(c.channelUsers["#c"] == ["me!~m@host.a"]);
+    // An optimistic /nick and its rejection never move the proof.
+    c.sendRaw("NICK newme");
+    assert(c.sessionNick == "newme" && c.ownPrefix == "me!~m@host.a");
+    c.processLine(":s 433 me newme :Nickname is already in use");
+    assert(c.sessionNick == "me" && c.ownPrefix == "me!~m@host.a");
+    // The server's NICK for the identity we hold moves it.
+    c.sendRaw("NICK newme");
+    c.processLine(":me!~m@host.a NICK newme");
+    assert(c.ownPrefix == "newme!~m@host.a");
+    assert(c.channelUsers["#c"] == ["newme!~m@host.a"], "NICK keeps the roster's user@host");
+    // CHGHOST from the identity we hold moves the host.
+    c.processLine(":newme!~m@host.a CHGHOST ~m cloak.b");
+    assert(c.ownPrefix == "newme!~m@cloak.b");
+    // A replayed CHGHOST for our nick is no proof: dropped until WHO.
+    c.processLine("@batch=h :newme!~m@cloak.b CHGHOST ~m old.host");
+    assert(c.ownPrefix == "");
+    // WHO for our confirmed nick restates it.
+    c.processLine(":s 352 newme #c ~m cloak.b s newme H :0 Me");
+    assert(c.ownPrefix == "newme!~m@cloak.b");
+    // 396 carries no user: the proof is dropped, the budget host follows.
+    c.processLine(":s 396 newme cloak.d :is now your displayed host");
+    assert(c.ownPrefix == "" && c.ownHostmask == "newme!~m@cloak.d");
+    c.processLine(":s 352 newme * ~m cloak.d s newme H :0 Me");
+    assert(c.ownPrefix == "newme!~m@cloak.d");
+    // Someone else holding the nick we optimistically asked for renames:
+    // the bookkeeping misreads it as us, the proof must not follow it.
+    c.sendRaw("NICK taken");
+    c.processLine(":taken!x@evil NICK other");
+    assert(c.ownPrefix == "", "a rename of another identity never becomes ours");
+    // While a /nick awaits its echo a WHO row for that nick proves nothing.
+    c.processLine(":s 352 other * x evil s other H :0 Evil");
+    assert(c.ownPrefix == "");
+    assert(ownPrefixEvents(ch) == 8, "every change (set, move, clear) asks for a snapshot");
+
+    // Hot-swap META carries the generation and the proof; a detached or
+    // unregistered engine exports none, and a new socket forgets it.
+    typeof(createChannel!IRCRawEvent()) ch2;
+    auto d = fresh(ch2);
+    d.processLine(":me!~m@host.a JOIN #c");
+    d.state = ConnectionState.connected;
+    d.connectedAtMs = 1_700_000_000_123;
+    auto snap = d.snapshotSession(true);
+    assert(snap.connectedAtMs == 1_700_000_000_123 && snap.ownPrefix == "me!~m@host.a");
+    d.detachedForHotSwap = true;
+    assert(d.getOwnPrefix() == "" && d.snapshotSession(true).ownPrefix == "");
+    d.detachedForHotSwap = false;
+    d.state = ConnectionState.disconnected;
+    d.resetConnectionTelemetry();
+    assert(d.ownPrefix == "" && d.connectedAtMs == 0);
+    ch2.close();
+}
+
+@("FIBERMLS: roster keeps user@host through JOIN, WHO, NICK and a bare NAMES resync")
+unittest {
+    import vibe.core.channel : createChannel;
+
+    NetworkConfig cfg;
+    cfg.nick = "me";
+    auto ch = createChannel!IRCRawEvent();
+    auto c = new PersistentIRCClient(cfg, ch);
+    c.processLine(":me!~m@host.a JOIN #c");
+    c.processLine(":a!~a@ha JOIN #c");
+    assert(c.channelUsers["#c"] == ["me!~m@host.a", "a!~a@ha"]);
+    c.processLine(":a!~a@ha NICK b");
+    assert(c.channelUsers["#c"] == ["me!~m@host.a", "b!~a@ha"]);
+    // A bare NAMES burst (no userhost-in-names) keeps the known hostmasks.
+    c.processLine(":s 353 me = #c :@me b carol");
+    c.processLine(":s 366 me #c :End of NAMES");
+    assert(c.channelUsers["#c"] == ["@me!~m@host.a", "b!~a@ha", "carol"]);
+    // WHO fills the bare one in and promotes it without losing the host.
+    c.processLine(":s 352 me #c ~c hc s carol H@ :0 Carol");
+    assert(c.channelUsers["#c"] == ["@me!~m@host.a", "b!~a@ha", "@carol!~c@hc"]);
+    ch.close();
+}
+
+@("FIBERMLS control lines are consumed silently: no events, query tabs, replies or history")
+unittest {
+    import std.algorithm : filter;
+    import std.array : array, replicate;
+    import std.typecons : tuple;
+    import vibe.core.channel : createChannel;
+    import ircfiber.irc.mls_peer : buildFiberMlsQuery;
+
+    enum N1 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    enum T1 = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+    string query = buildFiberMlsQuery(N1, "#c", 400);
+    assert(query !is null);
+    string id = "\x01FIBERMLS 1 ID " ~ N1 ~ " " ~ T1 ~ "\x01";
+
+    static auto run(string[] lines) {
+        NetworkConfig cfg;
+        cfg.nick = "me";
+        auto ch = createChannel!IRCRawEvent();
+        auto c = new PersistentIRCClient(cfg, ch);
+        foreach (line; lines) c.processLine(line);
+        ch.close();
+        IRCRawEvent[] events;
+        IRCRawEvent event;
+        while (ch.tryConsumeOne(event))
+            if (event.command != "own_prefix") events ~= event;
+        return tuple(c, events);
+    }
+    alias Run = typeof(run(null));
+    static void quiet(Run r, string why) {
+        assert(r[1].filter!(e => e.command == "PRIVMSG" || e.command == "NOTICE").array.length == 0, why);
+        assert(r[0].queryBuffers.length == 0 && r[0].queryHosts.length == 0, why);
+        // JOIN may queue its own WHO/WHOIS; nothing protocol-related may.
+        assert(!r[0].outboundQueue.canFind!(l => l.indexOf("FIBERMLS") >= 0 || l.startsWith("NOTICE")),
+            why);
+        assert(r[0].getLatestMsgid("alice").length == 0, why);
+    }
+    enum join = ":me!~m@host.a JOIN #c";
+    enum peer = ":alice!~a@ha JOIN #c";
+    string[] outbound = [join, peer];
+
+    quiet(run(outbound ~ [":alice!~a@ha PRIVMSG me :" ~ query]), "a live private QUERY");
+    quiet(run(outbound ~ ["@msgid=m1 :alice!~a@ha PRIVMSG #c :" ~ query]), "channel-targeted");
+    quiet(run(outbound ~ [":alice!~a@ha PRIVMSG @me :" ~ query]), "STATUSMSG-targeted");
+    quiet(run(outbound ~ [":alice!~a@ha PRIVMSG someone :" ~ query]), "another nick");
+    quiet(run(outbound ~ [":alice!~a@ha PRIVMSG me :\x01FIBERMLS 1 QUERY bad\x01"]), "malformed");
+    quiet(run(outbound ~ [":alice!~a@ha PRIVMSG me :\x01FIBERMLS 2 QUERY " ~ N1 ~ " Iw\x01"]),
+        "unsupported version");
+    quiet(run(outbound ~ [":alice!~a@ha PRIVMSG me :\x01fibermls 1 QUERY " ~ N1 ~ " Iw\x01"]),
+        "reserved in any case");
+    quiet(run(outbound ~ [":alice!~a@ha PRIVMSG me :\x01FIBERMLS 1 QUERY " ~ N1 ~ " "
+        ~ "A".replicate(600) ~ "\x01"]), "oversized");
+    quiet(run(outbound ~ [":alice!~a@ha PRIVMSG me :\x01FIBERMLS 1 QUERY " ~ N1]), "unterminated");
+    quiet(run(outbound ~ [":me!~m@host.a PRIVMSG alice :" ~ query]), "own echo");
+    quiet(run(outbound ~ ["BATCH +h chathistory me", "@batch=h :alice!~a@ha PRIVMSG me :" ~ query,
+        "BATCH -h"]), "chathistory replay");
+    quiet(run(outbound ~ ["@time=2020-01-01T00:00:00.000Z :alice!~a@ha PRIVMSG me :" ~ query]),
+        "stale server-time");
+    quiet(run(outbound ~ ["BATCH +m draft/multiline me",
+        "@batch=m :alice!~a@ha PRIVMSG me :\x01FIBER",
+        "@batch=m;draft/multiline-concat :alice!~a@ha PRIVMSG me :" ~ query[6 .. $],
+        "BATCH -m"]), "split across a multiline batch");
+    quiet(run(outbound ~ [":alice!~a@ha NOTICE me :" ~ id]), "unsolicited ID");
+    quiet(run([peer, ":alice!~a@ha PRIVMSG me :" ~ query]), "unverified own prefix");
+    // Ordinary CTCP keeps its existing handling.
+    auto version_ = run(outbound ~ [":alice!~a@ha PRIVMSG me :\x01VERSION\x01"]);
+    assert(version_[1].filter!(e => e.getTag("ctcp") == "VERSION").array.length == 1);
+
+    // An ID is redeemable once, only from the nick the probe went to.
+    auto r = run(outbound);
+    auto c = r[0];
+    c.fiberProbesSent[N1] = SentFiberProbe("alice", unixMsNow());
+    c.processLine(":bob!~b@hb NOTICE me :" ~ id);
+    assert((N1 in c.fiberProbesSent) !is null, "a forged source leaves the genuine probe pending");
+    c.processLine("@batch=x :alice!~a@ha NOTICE me :" ~ id);
+    assert((N1 in c.fiberProbesSent) !is null, "a replayed reply is not the answer");
+    c.processLine(":alice!~a@ha NOTICE me :" ~ id);
+    assert((N1 in c.fiberProbesSent) is null, "the matching reply consumes the nonce");
+    assert(c.queryBuffers.length == 0);
+}
+
+@("FIBERMLS outbound probes: only exact private QUERYs, coalesced, bounded, never generic-queued")
+unittest {
+    import std.format : format;
+    import vibe.core.channel : createChannel;
+    import ircfiber.irc.mls_peer : buildFiberMlsQuery;
+
+    enum N1 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    NetworkConfig cfg;
+    cfg.nick = "me";
+    auto ch = createChannel!IRCRawEvent();
+    scope (exit) ch.close();
+    auto c = new PersistentIRCClient(cfg, ch);
+    string query = buildFiberMlsQuery(N1, "#c", 400);
+    c.sendRaw("PRIVMSG alice :" ~ query);
+    assert(c.fiberProbeQueue.length == 1 && c.fiberProbeQueue[0].nonce == N1);
+    assert(c.outboundQueue.length == 0, "a probe never rides the reconnect queue");
+    c.sendRaw("PRIVMSG alice :" ~ query);
+    assert(c.fiberProbeQueue.length == 1, "a duplicate nonce coalesces");
+    foreach (line; ["NOTICE alice :\x01FIBERMLS 1 ID " ~ N1 ~ " " ~ N1 ~ "\x01",
+                    "PRIVMSG #c :" ~ query, "PRIVMSG @alice :" ~ query, "PRIVMSG me :" ~ query,
+                    "PRIVMSG alice,bob :" ~ query, "@+x=1 PRIVMSG bob :" ~ query,
+                    "PRIVMSG bob :\x01FIBERMLS 1 QUERY nope\x01",
+                    "PRIVMSG bob :hello " ~ query]) {
+        c.sendRaw(line);
+        assert(c.fiberProbeQueue.length == 1 && c.outboundQueue.length == 0, line);
+    }
+    foreach (i; 1 .. 100)
+        c.sendRaw("PRIVMSG alice :" ~ buildFiberMlsQuery(format("%064x", i), "#c", 400));
+    assert(c.fiberProbeQueue.length == FIBERMLS_MAX_PENDING);
+    // Not registered: nothing is written, and a new socket forgets them.
+    c.drainFiberProbes();
+    assert(c.fiberProbesSent.length == 0);
+    c.resetConnectionTelemetry();
+    assert(c.fiberProbeQueue.length == 0);
+}
+
 @("IRCv3 registry: away, WHOX, CHGHOST, ACCOUNT *, batches, ACK, RENAME, FAIL CHATHISTORY, CAP")
 unittest {
     import std.algorithm : count, filter;
