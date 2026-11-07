@@ -1,6 +1,6 @@
 module ircfiber.engine.consumer;
 
-import std.uuid : parseUUID;
+import std.uuid : UUID, parseUUID;
 import std.conv : to;
 
 import vibe.core.core : runTask, sleep, yield;
@@ -431,9 +431,8 @@ private void handleControlMessage(ref EngineContext ctx, ControlMessage msg) {
 }
 
 private void handleNetworkCommand(ref EngineContext ctx, string networkId, IRCCommand cmd) {
-    import std.uuid : UUID;
     import ircfiber.irc.connection : staleFiberMlsCommand;
-    auto nid = parseUUID(networkId);
+    const nid = UUID(networkId);
 
     // A FIBERMLS probe that waited in the command list (engine restart,
     // consumer backlog) is no longer a live request: never sent late. The
@@ -586,7 +585,7 @@ private void handleServicesCommand(ref EngineContext ctx, string networkId, IRCC
     import ircfiber.services.protocol : ServicesKeys, ServicesPayloadReference, ServicesRequest,
         ServicesManualPayload, ServiceAction, ServiceStatus;
 
-    const nid = parseUUID(networkId);
+    const nid = UUID(networkId);
     const requestId = cmd.label;
     const serverId = ctx.localServer.serverId;
     auto redis = ctx.redis;

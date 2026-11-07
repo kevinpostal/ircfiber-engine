@@ -612,10 +612,14 @@ private final class Staff {
                     return finish(ServiceStatus.rejected, "already_exists", akillData(before, ""),
                         servicesRevision(txn, akillRevisionView(before, "")));
                 mutate(body_, ServiceFrameKind.ordinary, null, (ServiceFrame f) {
-                    string outcome;
-                    const verdict = akillAddVerdict(f, mask, outcome);
-                    akillReadback(verdict, outcome, f, (const AkillEntry[] after) =>
-                        after.any!(e => asciiEqual(e.mask, mask)));
+                    const outcome = akillAddVerdict(f, mask);
+                    // Every covered entry the service says it removed must be
+                    // gone too: the add may be partially destructive.
+                    const removed = outcome.removed;
+                    akillReadback(outcome.status, outcome.reason, f, (const AkillEntry[] after) =>
+                        after.any!(e => asciiEqual(e.mask, mask))
+                        && !after.any!(e => removed.any!(m => asciiEqual(e.mask, m))),
+                        outcome.removed.dup, before, outcome.refusal);
                 });
             });
         });
@@ -665,7 +669,8 @@ private final class Staff {
     /// An acknowledged change is confirmed only when the read-back shows
     /// `effect`; a refusal keeps its status and still returns fresh data.
     private void akillReadback(ServiceStatus verdict, string outcome, ServiceFrame mutation,
-            bool delegate(const AkillEntry[]) effect) {
+            bool delegate(const AkillEntry[]) effect, string[] removed = null, const AkillEntry[] before = null,
+            string addRefusal = "") {
         // Nothing reached services (stale preflight, queue refusal).
         if (!txn.dispatched && mutation.outcome == ServiceFrameOutcome.unavailable)
             return finish(ServiceStatus.unavailable, mutation.reason.length ? mutation.reason : "not_sent");
@@ -683,46 +688,97 @@ private final class Staff {
                 status = ServiceStatus.unconfirmed;
                 reason = "readback_mismatch";
             }
-            auto details = status == ServiceStatus.confirmed ? null : mutationDetails;
-            if (!readOk) return finish(status, reason, Json.undefined, "", details);
-            finish(status, reason, akillData(after, ""), servicesRevision(txn, akillRevisionView(after, "")),
+            // Removal lines are part of the receipt even on success: a
+            // covered ban disappearing is never a hidden side effect.
+            string[] details = status == ServiceStatus.confirmed && !removed.length ? null : mutationDetails;
+            Json data = readOk ? akillData(after, "") : Json(["kind": Json("akillRemovals")]);
+            if (removed.length) data["removedEntries"] = removedEntries(removed, before);
+            if (addRefusal.length) data["addRefusal"] = Json(addRefusal);
+            if (!readOk && !removed.length) data = Json.undefined;
+            finish(status, reason, data, readOk ? servicesRevision(txn, akillRevisionView(after, "")) : "",
                 details);
         });
     }
 
-    /// `AKILL ADD` reply: the add acknowledgement for exactly our mask,
-    /// optionally preceded by `Removing X because <mask> covers it.` lines
-    /// and followed by the read-only notice (added but not persisted).
-    private ServiceStatus akillAddVerdict(const ref ServiceFrame f, string mask, out string reason) {
-        if (!frameComplete(f)) {
-            reason = f.reason.length ? f.reason : "frame_incomplete";
-            return ServiceStatus.unconfirmed;
+    /// The reviewed entries a covering add removed (the pre-read's data when
+    /// the mask was listed there, otherwise the mask the service named).
+    private static Json removedEntries(const string[] masks, const AkillEntry[] before) {
+        auto list = Json.emptyArray;
+        foreach (m; masks) {
+            bool known;
+            foreach (e; before)
+                if (asciiEqual(e.mask, m)) {
+                    list ~= akillData([e], "")["entries"][0];
+                    known = true;
+                }
+            if (!known) list ~= Json(["mask": Json(m)]);
         }
+        return list;
+    }
+
+    private struct AddOutcome {
+        ServiceStatus status;
+        string reason;
+        /// Masks the service removed because the new mask covers them.
+        string[] removed;
+        /// The service's refusal when it removed entries and then refused.
+        string refusal;
+    }
+
+    /// `AKILL ADD` reply (os_akill.cpp DoAdd, xline.cpp CanAdd). CanAdd
+    /// walks the list: each existing mask the new one covers with an expiry
+    /// no later than the new one is deleted (`Removing X because <mask>
+    /// covers it.`) before a later entry may still refuse the add, and a
+    /// module may veto after the deletions. Then the add acknowledgement for
+    /// exactly our mask, optionally the read-only notice. Recognised removal
+    /// lines are reported in every outcome.
+    private AddOutcome akillAddVerdict(const ref ServiceFrame f, string mask) {
+        AddOutcome o;
         bool lossy;
         auto lines = logical(f, [AKILL_ADDED, XLINE_REMOVING, XLINE_EXISTS, XLINE_COVERED,
             v21 ? READ_ONLY_21 : READ_ONLY_20], false, lossy);
-        if (lossy || !lines.length) {
-            reason = lines.length ? "unrecognized_reply" : "no_reply";
-            return ServiceStatus.unconfirmed;
-        }
-        bool added, readOnly;
-        foreach (l; lines) {
+        bool added, readOnly, unknown;
+        string refused;
+        ServiceStatus refusedStatus;
+        foreach (i, l; lines) {
             string[] c;
-            if (match(AKILL_ADDED, l, c) && c.length == 1 && asciiEqual(c[0], mask) && !added) added = true;
-            else if (!added && match(XLINE_REMOVING, l, c) && c.length == 2 && asciiEqual(c[1], mask)) {}
-            else if (added && match(v21 ? READ_ONLY_21 : READ_ONLY_20, l)) readOnly = true;
-            else {
-                if (lines.length == 1) return akillAddRefusal(l, mask, reason);
-                reason = "unrecognized_reply";
-                return ServiceStatus.unconfirmed;
-            }
+            if (!added && !refused.length && match(XLINE_REMOVING, l, c) && c.length == 2 && asciiEqual(c[1], mask))
+                o.removed ~= c[0];
+            else if (!added && !refused.length && match(AKILL_ADDED, l, c) && c.length == 1 && asciiEqual(c[0], mask))
+                added = true;
+            else if (added && !readOnly && match(v21 ? READ_ONLY_21 : READ_ONLY_20, l)) readOnly = true;
+            else if (!added && !refused.length && i + 1 == lines.length) {
+                refusedStatus = akillAddRefusal(l, mask, refused);
+                if (refusedStatus != ServiceStatus.rejected && refused != "existing_entry_updated") unknown = true;
+            } else unknown = true;
         }
-        if (!added) {
-            reason = "unrecognized_reply";
-            return ServiceStatus.unconfirmed;
+        if (!frameComplete(f)) {
+            o.status = ServiceStatus.unconfirmed;
+            o.reason = f.reason.length ? f.reason : "frame_incomplete";
+        } else if (lossy || unknown) {
+            o.status = ServiceStatus.unconfirmed;
+            o.reason = "unrecognized_reply";
+        } else if (!lines.length) {
+            o.status = ServiceStatus.unconfirmed;
+            o.reason = "no_reply";
+        } else if (added) {
+            o.status = ServiceStatus.confirmed;
+            o.reason = readOnly ? "services_read_only" : "";
+        } else if (refused.length && o.removed.length) {
+            // Covered entries are gone but the add was refused: partial.
+            o.status = ServiceStatus.unconfirmed;
+            o.reason = "covered_entries_removed_add_refused";
+            o.refusal = refused;
+        } else if (refused.length) {
+            o.status = refusedStatus;
+            o.reason = refused;
+        } else {
+            // Removals, then neither acknowledgement nor refusal (a module
+            // vetoed the add after CanAdd deleted the covered entries).
+            o.status = ServiceStatus.unconfirmed;
+            o.reason = "covered_entries_removed_add_unacknowledged";
         }
-        reason = readOnly ? "services_read_only" : "";
-        return ServiceStatus.confirmed;
+        return o;
     }
 
     private ServiceStatus akillAddRefusal(string l, string mask, out string reason) {
@@ -1005,7 +1061,11 @@ private final class Staff {
     /// Review: globalQueue revision (2.1: the queue recognised empty).
     void globalSend() {
         const text = serviceParam(txn, "text");
-        if (!text.strip.length || text.strip != text) return finish(ServiceStatus.rejected, "invalid_message");
+        if (!text.strip.length) return finish(ServiceStatus.rejected, "invalid_message");
+        // Anope tokenises the command line on spaces, so leading, trailing or
+        // repeated spaces would not survive into the broadcast we must match
+        // exactly. Refuse instead of silently rewriting the reviewed text.
+        if (text.strip != text || text.canFind("  ")) return finish(ServiceStatus.rejected, "noncanonical_spacing");
         const body_ = "GLOBAL " ~ text;
         const ep = txn.endpoint;
         const nick = txn.ownNick();
@@ -2021,6 +2081,42 @@ version (ServicesWireHarness) {
             ok("staff: an acknowledged DEL whose entry is still listed is unconfirmed, not success",
                 answered(ghost, ServiceStatus.unconfirmed, "readback_mismatch")
                 && r.anope.bodies.count!(b => b == "AKILL DEL AB12CD34EF") == 1);
+
+            // xline.cpp CanAdd: a covering mask with a later expiry deletes
+            // the covered entry before the add; the receipt must show it.
+            auto afterCover = [
+                ["1", "baduser@*.bad.example", "oper2", "Thu Nov  6 15:30:00 2026", "does not expire", "Z9Y8X7W6V5",
+                    "[oper2] repeated flooding of #help over several hours (see ticket 41)"],
+                ["2", "*@203.0.113.*", "me", "Thu Nov  6 16:10:00 2026", "expires in 29 days, 23 hours", "PO98IU76YT",
+                    "[me] subnet"]];
+            r.anope.reply("AKILL VIEW", akillView21(twoAkills()), akillView21(afterCover));
+            r.anope.reply("AKILL ADD +2592000s *@203.0.113.* subnet", [
+                "Removing *@203.0.113.7 because *@203.0.113.* covers it.",
+                "\x02*@203.0.113.*\x02 added to the AKILL list."]);
+            auto cover = r.run(ServiceAction.akillAdd,
+                `{"mask":"*@203.0.113.*","expirySeconds":2592000,"reason":"subnet","broadMaskConfirmed":false}`,
+                ghost.revision);
+            ok("staff: a covering AKILL ADD reports the removed entry and confirms new mask + removal by read-back",
+                answered(cover, ServiceStatus.confirmed) && cover.data["removedEntries"].length == 1
+                && cover.data["removedEntries"][0]["mask"].get!string == "*@203.0.113.7"
+                && cover.data["removedEntries"][0]["id"].get!string == "AB12CD34EF"
+                && cover.details.any!(d => d.canFind("Removing *@203.0.113.7"))
+                && cover.data["entries"].length == 2);
+
+            auto afterPartial = [["1", "*@203.0.113.*", "me", "Thu Nov  6 16:10:00 2026", "expires in 29 days, 23 hours",
+                "PO98IU76YT", "[me] subnet"]];
+            r.anope.reply("AKILL VIEW", akillView21(afterCover), akillView21(afterPartial));
+            r.anope.reply("AKILL ADD +600s *@*.bad.example wide", [
+                "Removing baduser@*.bad.example because *@*.bad.example covers it.",
+                "*@*.bad.example is already covered by *@*.example."]);
+            auto partial = r.run(ServiceAction.akillAdd,
+                `{"mask":"*@*.bad.example","expirySeconds":600,"reason":"wide","broadMaskConfirmed":false}`,
+                cover.revision);
+            ok("staff: removals followed by a refusal are a visible partial result, not a plain rejection",
+                answered(partial, ServiceStatus.unconfirmed, "covered_entries_removed_add_refused")
+                && partial.data["addRefusal"].get!string == "already_covered"
+                && partial.data["removedEntries"][0]["id"].get!string == "Z9Y8X7W6V5"
+                && r.anope.bodies.count!(b => b == "AKILL ADD +600s *@*.bad.example wide") == 1);
         }
 
         // ── AKILL FLEXIBLE (2.1) and a translated FIXED table ─────────
@@ -2148,6 +2244,10 @@ version (ServicesWireHarness) {
             auto blocked = r.run(ServiceAction.globalSend, `{"text":"Third"}`, q.revision);
             ok("staff: a queue that changed since review is never sent over",
                 answered(blocked, ServiceStatus.stale, "revision_changed") && !r.anope.bodies.canFind("GLOBAL Third"));
+            auto spaced = r.run(ServiceAction.globalSend, `{"text":"Two  spaces"}`, q.revision);
+            ok("staff: GLOBAL text Anope would respace is refused before dispatch",
+                answered(spaced, ServiceStatus.rejected, "noncanonical_spacing")
+                && !r.anope.bodies.any!(b => b.canFind("Two")));
         }
 
         // ── Global on 2.0.20: immediate, no queue ─────────────────────

@@ -90,6 +90,29 @@ enum long SERVICES_LATE_QUARANTINE_MS = 60_000;
 /// Fence tokens are `ifsvc` + 32 hex: alphanumeric, as 2.0's PING handler
 /// (`NormalizeBuffer`) requires, and recognisably ours in any replay.
 enum string SERVICES_FENCE_PREFIX = "ifsvc";
+/// Legacy (manual, automatic, bouncer) NickServ authentication commands
+/// remembered per socket while their verdict is outstanding. More than this
+/// saturates the ledger: structured authentication then waits for a new
+/// socket rather than guess which verdict belonged to which request.
+enum size_t SERVICES_LEGACY_AUTH_MAX = 8;
+/// Unresolved `+reply` lines one frame keeps while its own echo is pending.
+enum size_t SERVICES_FRAME_MAX_UNRESOLVED = 64;
+
+/// Pure classifier for UNTAGGED legacy-auth verdicts (Anope 2.0, no
+/// echo-message, ircd aliases such as `ID <pass>`): given the NickServ
+/// endpoint's CTCP VERSION text ("" unknown) and one formatting-stripped
+/// NickServ→us line, true iff it is the terminal reply (acknowledgement or
+/// any refusal) of IDENTIFY/GROUP/RECOVER/GHOST/RELEASE/REGISTER/CONFIRM in
+/// any shipped locale. Supplied by the identity adapters; without it an
+/// untagged legacy request stays pending until the socket is replaced.
+alias LegacyAuthTerminal = bool function(string versionText, string plainLine);
+
+private LegacyAuthTerminal gLegacyAuthTerminal;
+
+/// Installs (or, with null, removes) the untagged legacy-auth classifier.
+void setLegacyAuthTerminalClassifier(LegacyAuthTerminal fn) {
+    gLegacyAuthTerminal = fn;
+}
 
 // ── Host contract ──────────────────────────────────────────────────────────
 
@@ -209,6 +232,11 @@ struct ServiceFrame {
     bool replyCorrelated;
     /// A line-count or retained-byte bound was reached; never a full read.
     bool truncated;
+    /// A `+reply`-tagged line named a message this frame could not prove
+    /// was its own or someone else's (our echo still pending, or never
+    /// coming): kept private and OUT of `lines`. Such a frame never
+    /// confirms anything (`ServicesTransaction.complete` downgrades).
+    bool ambiguous;
     ServiceReplyLine[] lines;
     /// Own-login changes the server stated while the frame was open.
     ServicesActor[] accountChanges;
@@ -399,8 +427,9 @@ final class ServicesTransaction {
 
     /// Sends one ordinary, non-sensitive (read) frame to a secondary
     /// service whose state the primary operation depends on. Allowed
-    /// edges only: HostServ → NickServ (own vhost via INFO) and BotServ →
-    /// ChanServ (STATUS/LEVELS/ACCESS policy); never the reverse, so two
+    /// edges only (`peerAllowed`): HostServ → NickServ (own vhost via INFO),
+    /// BotServ → ChanServ (STATUS/LEVELS/ACCESS policy) and ChanServ →
+    /// BotServ (assigned bot INFO for TOPIC). Peer locks never wait, so two
     /// transactions cannot deadlock. The peer's lock is taken for the rest
     /// of the transaction (manual lines to it are refused too) and its pin
     /// is revalidated like the primary's. A busy, untrusted, absent or
@@ -480,9 +509,34 @@ private struct PendingFrame {
     string[] ownMsgids;
     /// A command body of this frame reached the socket.
     bool bodySent;
+    /// `+reply` lines naming a msgid not (yet) known as ours or foreign,
+    /// kept private and out of `frame.lines` until our echo decides.
+    ServiceReplyLine[] unresolved;
     ulong capabilityGeneration;
     ulong targetGeneration;
     size_t retainedBytes;
+}
+
+/// One legacy NickServ authentication command awaiting its verdict.
+private struct LegacyAuth {
+    /// Sent as a PRIVMSG, so echo-message returns it with a msgid.
+    bool expectEcho;
+    bool echoed;
+    /// Msgid of our echo ("" when untagged): 2.1 tags the verdict with it.
+    string msgid;
+    long sentAtMs;
+}
+
+/// Opaque copy of the legacy-auth ledger (`legacyAuthState`): no text, no
+/// secret — only what is needed to put a tentative note back.
+struct LegacyAuthLedger {
+    private LegacyAuth[] entries;
+    private bool saturated;
+
+    /// Same count `legacyAuthPending` reports.
+    size_t pending() const @safe pure nothrow @nogc {
+        return saturated ? SERVICES_LEGACY_AUTH_MAX + 1 : entries.length;
+    }
 }
 
 private struct LateQuarantine {
@@ -568,6 +622,16 @@ final class ServicesTransport {
     private ServicesQuietMarker quiet;
     /// Requests waiting for the self-WHOIS before admission.
     private string[] pendingAdmission;
+    /// Legacy NickServ authentication commands on THIS socket whose verdict
+    /// is still outstanding (no text, no secret: only how to recognise the
+    /// verdict). Survives epoch changes on the same socket; ends with it.
+    private LegacyAuth[] legacyAuth;
+    /// More legacy auth commands than SERVICES_LEGACY_AUTH_MAX were sent.
+    private bool legacyAuthSaturated;
+    /// Msgids of our own non-frame lines to services (manual commands), so
+    /// a `+reply` naming one is provably someone else's than a frame's.
+    private bool[string] foreignMsgids;
+    private string[] foreignMsgidOrder;
     private ulong generation = 1;
     private ulong[string] channelGenerations;
     private ulong invalidationSerial = 1;
@@ -758,6 +822,11 @@ final class ServicesTransport {
         if (slot.txn !is null) return answer(ServiceStatus.unavailable, "service_busy");
         if (isAuthentication(req.action) && slot.authAmbiguous)
             return answer(ServiceStatus.unavailable, "auth_pending_ambiguous");
+        // An earlier manual/automatic NickServ authentication on this socket
+        // has no verdict yet: its asynchronous reply and 900 would land in
+        // this frame.
+        if (isAuthentication(req.action) && legacyAuthPending() > 0)
+            return answer(ServiceStatus.unavailable, "legacy_auth_pending");
         if (!isServiceTrusted(cfg, service)) return answer(ServiceStatus.unavailable, "untrusted_endpoint");
         if (slot.pin == PinState.mismatch) return answer(ServiceStatus.unavailable, "pin_mismatch");
         if (slot.pin == PinState.absent) return answer(ServiceStatus.unavailable, "service_absent");
@@ -818,10 +887,213 @@ final class ServicesTransport {
 
     /// Socket gone or a new connection attempt: everything bound to the old
     /// transport ends. Dedup memory survives (request ids are global).
-    void onDisconnect() { cancelAll("cancelled_disconnect"); resetEpochState(""); }
+    void onDisconnect() {
+        cancelAll("cancelled_disconnect");
+        resetEpochState("");
+        resetLegacyAuth();
+    }
 
     /// Hot-swap detach: the next engine sees the marker in META.
-    void onDetach() { cancelAll("cancelled_detach"); resetEpochState(""); }
+    void onDetach() {
+        cancelAll("cancelled_detach");
+        resetEpochState("");
+        resetLegacyAuth();
+    }
+
+    // ── Legacy (manual / automatic / bouncer) NickServ authentication ──
+    //
+    // A structured IDENTIFY/GROUP/RECOVER/REGISTER/CONFIRM must not start
+    // while an earlier NickServ authentication command sent outside the
+    // transport on this socket still awaits its verdict: an asynchronous
+    // (SQL/LDAP) verdict for the old command — and its 900 — would land in
+    // the new frame. Each Anope auth command ends with exactly one
+    // CommandSource reply (sync refusal/ack, or IdentifyRequest
+    // OnSuccess/OnFail), which 2.1 tags `+reply=<msgid of the command>`;
+    // that tagged reply resolves the entry whose echo carried the msgid.
+    // Untagged (2.0, no echo-message, ircd aliases) entries are resolved
+    // only by a verdict the identity grammar recognises. A 900 alone
+    // never resolves anything; nothing expires by quiet time; a new socket
+    // clears the ledger.
+
+    /// A raw line the connection is sending live (manual `/raw`, ircd alias,
+    /// bouncer, automatic IDENTIFY/GHOST). Records each NickServ
+    /// authentication command it carries, physical line by line.
+    void noteManualLine(string line) {
+        import std.string : indexOf, stripLeft;
+        size_t start;
+        foreach (i; 0 .. line.length + 1) {
+            if (i < line.length && line[i] != '\r' && line[i] != '\n') continue;
+            string seg = line[start .. i].stripLeft;
+            start = i + 1;
+            if (seg.length && seg[0] == '@') {
+                const sp = seg.indexOf(' ');
+                seg = sp < 0 ? "" : seg[sp + 1 .. $].stripLeft;
+            }
+            const sp1 = seg.indexOf(' ');
+            const verb = sp1 < 0 ? seg : seg[0 .. sp1];
+            string rest = sp1 < 0 ? "" : seg[sp1 + 1 .. $].stripLeft;
+            const privmsg = icmp(verb, "PRIVMSG") == 0;
+            if (privmsg || icmp(verb, "SQUERY") == 0) {
+                const sp2 = rest.indexOf(' ');
+                if (sp2 < 0 || !targetsNickServ(rest[0 .. sp2], host.servicesConfig())) continue;
+                auto text = rest[sp2 + 1 .. $].stripLeft;
+                if (text.length && text[0] == ':') text = text[1 .. $];
+                // Only a PRIVMSG is echoed back with its msgid.
+                if (isLegacyAuthCommand(text)) addLegacyAuth(privmsg);
+            } else if (icmp(verb, "NS") == 0 || icmp(verb, "NICKSERV") == 0) {
+                if (rest.length && rest[0] == ':') rest = rest[1 .. $];
+                if (isLegacyAuthCommand(rest)) addLegacyAuth(false);
+            } else if (icmp(verb, "IDENTIFY") == 0 || icmp(verb, "ID") == 0 || icmp(verb, "LOGIN") == 0) {
+                addLegacyAuth(false);
+            }
+        }
+    }
+
+    /// A PRIVMSG chat message (body possibly multi-line: one message per
+    /// line) being sent live to `targets`.
+    void noteManualMessage(string targets, string text) {
+        if (!targetsNickServ(targets, host.servicesConfig())) return;
+        size_t start;
+        foreach (i; 0 .. text.length + 1) {
+            if (i < text.length && text[i] != '\r' && text[i] != '\n') continue;
+            if (i > start && isLegacyAuthCommand(text[start .. i])) addLegacyAuth(true);
+            start = i + 1;
+        }
+    }
+
+    /// Outstanding legacy auth commands on this socket (a non-secret count
+    /// for the holder META); saturation reports SERVICES_LEGACY_AUTH_MAX + 1.
+    size_t legacyAuthPending() const {
+        return legacyAuthSaturated ? SERVICES_LEGACY_AUTH_MAX + 1 : legacyAuth.length;
+    }
+
+    /// Attach to a held socket whose previous engine had `count` legacy
+    /// auth commands outstanding: their msgids are unknown here, so only a
+    /// recognised untagged verdict or a new socket resolves them.
+    void restoreLegacyAuth(size_t count) {
+        resetLegacyAuth();
+        foreach (_; 0 .. count) addLegacyAuth(false);
+    }
+
+    /// What the holder META must carry so a next engine on this socket
+    /// blocks structured authentication: the legacy ledger, plus a
+    /// structured authentication in flight or left ambiguous (its verdict
+    /// can still arrive on the retained socket).
+    size_t handoffAuthPending() const {
+        size_t n = legacyAuthPending();
+        const ns = &slots[ServiceId.nickServ];
+        if (ns.authAmbiguous) ++n;
+        if (ns.txn !is null && isAuthentication(ns.txn.req.action)) ++n;
+        return n;
+    }
+
+    /// Current ledger, to undo a tentative note when its META write fails.
+    LegacyAuthLedger legacyAuthState() const {
+        return LegacyAuthLedger(legacyAuth.dup, legacyAuthSaturated);
+    }
+
+    /// Puts back a ledger saved by `legacyAuthState`.
+    void restoreLegacyAuthState(const LegacyAuthLedger saved) {
+        legacyAuth = saved.entries.dup;
+        legacyAuthSaturated = saved.saturated;
+        host.markerChanged();
+    }
+
+    /// The holder META could not be written before a transaction's first
+    /// line: every transaction that has not sent a command ends stale
+    /// (`meta_unavailable`) and its queued lines are dropped. Transactions
+    /// already dispatched had their marker published before their first
+    /// line and continue.
+    void failClosedMeta() {
+        foreach (ref s; slots)
+            if (s.txn !is null && !s.txn.bodiesWritten) cancelTransaction(s.txn, "meta_unavailable");
+    }
+
+    private void resetLegacyAuth() {
+        legacyAuth = null;
+        legacyAuthSaturated = false;
+    }
+
+    private void addLegacyAuth(bool expectEcho) {
+        if (legacyAuth.length >= SERVICES_LEGACY_AUTH_MAX) {
+            legacyAuthSaturated = true;
+            return;
+        }
+        legacyAuth ~= LegacyAuth(expectEcho, false, "", host.nowMs());
+        host.markerChanged(); // the count rides in the holder META
+    }
+
+    private bool targetsNickServ(string targets, const ServicesConfig cfg) {
+        ServiceId id;
+        foreach (t; splitTargets(targets))
+            if (serviceTarget(t, cfg, id) && id == ServiceId.nickServ) return true;
+        return false;
+    }
+
+    /// Our own echo of a non-frame line to NickServ: the oldest legacy auth
+    /// command still waiting for its echo learns its msgid (echoes come back
+    /// in send order).
+    private void legacyAuthEchoed(string text, string msgid) {
+        size_t start;
+        foreach (i; 0 .. text.length + 1) {
+            if (i < text.length && text[i] != '\r' && text[i] != '\n') continue;
+            if (i > start && isLegacyAuthCommand(text[start .. i]))
+                foreach (ref e; legacyAuth)
+                    if (e.expectEcho && !e.echoed) {
+                        e.echoed = true;
+                        e.msgid = msgid;
+                        break;
+                    }
+            start = i + 1;
+        }
+    }
+
+    /// A live NickServ→us line (verified endpoint, or the conventional nick
+    /// before verification). Observation only: never consumes the line.
+    private void observeLegacyAuthReply(ref IRCRawEvent ev, string text, const ServicesEndpoint ep) {
+        if (!legacyAuth.length) return;
+        auto replyTo = ev.getTag("+reply");
+        if (!replyTo.length) replyTo = ev.getTag("+draft/reply");
+        if (replyTo.length) {
+            foreach (i, ref e; legacyAuth)
+                if (e.msgid.length && e.msgid == replyTo) {
+                    legacyAuth = legacyAuth[0 .. i] ~ legacyAuth[i + 1 .. $];
+                    host.markerChanged();
+                    return;
+                }
+            // A further tagged line for a message we already know (a
+            // multi-line verdict, a manual non-auth command, a frame of our
+            // own): never a second verdict.
+            if ((replyTo in foreignMsgids) !is null) return;
+            foreach (ref s; slots)
+                if (s.txn !is null && s.txn.frameState !is null && s.txn.frameState.ownMsgids.canFind(replyTo))
+                    return;
+        }
+        // Untagged, or tagged for a message whose echo we never saw (ircd
+        // alias): only a verdict the grammar recognises closes the oldest
+        // entry that has no msgid.
+        if (gLegacyAuthTerminal is null) return;
+        bool terminal;
+        try terminal = gLegacyAuthTerminal(ep.version_, stripIrcFormatting(text));
+        catch (Exception) terminal = false;
+        if (!terminal) return;
+        foreach (i, ref e; legacyAuth)
+            if (!e.msgid.length) {
+                legacyAuth = legacyAuth[0 .. i] ~ legacyAuth[i + 1 .. $];
+                host.markerChanged();
+                return;
+            }
+    }
+
+    private void rememberForeignMsgid(string msgid) {
+        if (!msgid.length || (msgid in foreignMsgids) !is null) return;
+        if (foreignMsgidOrder.length >= SERVICES_PRIVATE_MSGIDS_MAX) {
+            foreignMsgids.remove(foreignMsgidOrder[0]);
+            foreignMsgidOrder = foreignMsgidOrder[1 .. $];
+        }
+        foreignMsgids[msgid] = true;
+        foreignMsgidOrder ~= msgid;
+    }
 
     /// The live epoch changed (attach, re-registration).
     void onEpoch() { syncEpoch(host.liveEpoch()); }
@@ -1007,6 +1279,12 @@ final class ServicesTransport {
         if (text == "\x01VERSION\x01") return false;
         if (versionReply(ev, text)) return true;
         auto slot = &slots[id];
+        // Legacy auth verdicts are observed (never consumed) before any
+        // frame or quarantine handling sees the line: from the verified
+        // NickServ, or by nick before this epoch verified it.
+        if (id == ServiceId.nickServ && host.isOwnNick(target)
+                && (slot.pin != PinState.verified || matchesEndpoint(ev, slot.endpoint)))
+            observeLegacyAuthReply(ev, text, slot.endpoint);
         // Late private replies of a frame that timed out or was cancelled
         // after its command left, or of a previous engine's in-flight
         // transaction (holder marker): private until bounded expiry.
@@ -1426,11 +1704,30 @@ final class ServicesTransport {
         line.replyTo = ev.getTag("+reply");
         if (!line.replyTo.length) line.replyTo = ev.getTag("+draft/reply");
         line.atMs = host.nowMs();
-        if (line.replyTo.length && f.ownMsgids.length) {
-            // Tagged for some other message (a manual command): not ours.
-            if (!f.ownMsgids.canFind(line.replyTo)) return false;
-            line.attribution = ServiceReplyAttribution.reply;
-            line.claimed = true;
+        if (line.replyTo.length) {
+            if (f.ownMsgids.canFind(line.replyTo)) {
+                line.attribution = ServiceReplyAttribution.reply;
+                line.claimed = true;
+            } else if ((line.replyTo in foreignMsgids) !is null
+                    || (!f.unechoed.length && f.ownMsgids.length >= f.spec.bodies.length)) {
+                // Provably a reply to another message of ours (a manual
+                // command): ordinary traffic, as it always was.
+                return false;
+            } else {
+                // Names a message we cannot place yet (our echo pending, or
+                // never coming): private, never attributed. Our echo may
+                // still claim it (`resolveUnresolved`); otherwise the frame
+                // closes ambiguous and cannot confirm.
+                line.attribution = ServiceReplyAttribution.reply;
+                line.claimed = true;
+                const ubytes = ServiceReplyLine.sizeof + line.command.length + line.text.length
+                    + line.plain.length + line.msgid.length + line.replyTo.length;
+                if (f.unresolved.length < SERVICES_FRAME_MAX_UNRESOLVED && retainFrameBytes(f, ubytes))
+                    f.unresolved ~= line;
+                else f.frame.ambiguous = true;
+                rememberPrivateMsgid(line.msgid);
+                return true;
+            }
         } else {
             line.attribution = f.phase == FramePhase.collecting
                 ? ServiceReplyAttribution.window : ServiceReplyAttribution.late;
@@ -1477,7 +1774,11 @@ final class ServicesTransport {
         f.frame.reason = reason;
         f.frame.closedAtMs = host.nowMs();
         f.unechoed = null;
-        if (outcome == ServiceFrameOutcome.completed && !f.frame.truncated) ++txn.framesCompleted;
+        // Replies we could not place keep the frame from confirming anything.
+        if (f.unresolved.length) f.frame.ambiguous = true;
+        f.unresolved = null;
+        if (outcome == ServiceFrameOutcome.completed && !f.frame.truncated && !f.frame.ambiguous)
+            ++txn.framesCompleted;
         else txn.frameIncomplete = true;
         if (outcome != ServiceFrameOutcome.completed) quarantineLate(f);
         // Drop this frame's unwritten lines (fences, bodies).
@@ -1508,15 +1809,47 @@ final class ServicesTransport {
                             f.ownMsgids ~= msgid;
                             f.frame.replyCorrelated = true;
                         }
+                        resolveUnresolved(f, msgid);
                         return true;
                     }
                 }
             }
+            // Our own line to a service outside any frame (manual, alias,
+            // bouncer, automatic): its msgid is provably not a frame's, and
+            // a NickServ auth command learns the msgid its verdict will name.
+            const echoMsgid = ev.getMsgid();
+            rememberForeignMsgid(echoMsgid);
+            if (id == ServiceId.nickServ) legacyAuthEchoed(text, echoMsgid);
         }
         if (text == "\x01VERSION\x01") return true;
         // Sensitive own service commands (manual or automatic) never become
         // a chat row, live or replayed.
         return sensitiveServiceMessage(target, text, cfg);
+    }
+
+    /// Our echo for one of a frame's bodies arrived: `+reply` lines naming
+    /// its msgid become ours. Once every body has echoed, the remaining
+    /// unresolved lines are provably someone else's — they stay private
+    /// (already hidden) but no longer make the frame ambiguous.
+    private void resolveUnresolved(PendingFrame* f, string msgid) {
+        if (!f.unresolved.length) return;
+        ServiceReplyLine[] still;
+        foreach (l; f.unresolved) {
+            if (msgid.length && l.replyTo == msgid) {
+                auto ours = l;
+                ours.attribution = ServiceReplyAttribution.reply;
+                ours.claimed = true;
+                if (f.frame.lines.length < SERVICES_FRAME_MAX_LINES) f.frame.lines ~= ours;
+                else f.frame.truncated = true;
+            } else {
+                still ~= l;
+            }
+        }
+        // Every body echoed with a msgid: whatever is left named a message
+        // that is provably not ours.
+        const allKnown = !f.unechoed.length && f.ownMsgids.length >= f.spec.bodies.length;
+        f.unresolved = allKnown ? null : still;
+        if (f.phase == FramePhase.lingering) evaluateTerminal(f);
     }
 
     /// Backlog / CHATHISTORY lines from a service. Private replies (to our
@@ -1859,11 +2192,38 @@ bool isFenceReply(string text, out string token) @safe pure nothrow {
     return true;
 }
 
-/// Secondary-service edges a transaction may add (`frameOn`). One
-/// direction only, so two transactions can never wait on each other.
+/// Secondary-service edges a transaction may add (`frameOn`): HostServ →
+/// NickServ (own vhost via INFO), BotServ → ChanServ (channel policy) and
+/// ChanServ → BotServ (the assigned bot that relays TOPIC). A peer lock is
+/// taken without waiting — a busy peer refuses the frame at once — so two
+/// transactions holding each other's primary can never wait on each other.
 bool peerAllowed(ServiceId primary, ServiceId peer) @safe pure nothrow @nogc {
     return (primary == ServiceId.hostServ && peer == ServiceId.nickServ)
-        || (primary == ServiceId.botServ && peer == ServiceId.chanServ);
+        || (primary == ServiceId.botServ && peer == ServiceId.chanServ)
+        || (primary == ServiceId.chanServ && peer == ServiceId.botServ);
+}
+
+/// One line of NickServ text is an authentication command whose verdict
+/// can log this session in or out, or arrive asynchronously (formatting
+/// ignored, as services tokenise the raw body).
+bool isLegacyAuthCommand(string text) @safe pure nothrow {
+    import std.ascii : toUpper;
+    const plain = stripIrcFormatting(text);
+    size_t i;
+    while (i < plain.length && plain[i] == ' ') ++i;
+    if (i < plain.length && plain[i] == '/') ++i;
+    size_t j = i;
+    while (j < plain.length && plain[j] != ' ') ++j;
+    char[16] buf;
+    if (j - i == 0 || j - i > buf.length) return false;
+    foreach (k, c; plain[i .. j]) buf[k] = toUpper(c);
+    switch (buf[0 .. j - i]) {
+        case "IDENTIFY": case "ID": case "LOGIN": case "GROUP": case "RECOVER": case "GHOST":
+        case "RELEASE": case "REGISTER": case "CONFIRM":
+            return true;
+        default:
+            return false;
+    }
 }
 
 private string[] removeValue(string[] list, string value) @safe pure nothrow {
@@ -2055,3 +2415,286 @@ unittest {
     assert(lineServiceTargets("PRIVMSG #chan :hi", cfg).length == 0);
     assert(lineServiceTargets("JOIN #c", cfg).length == 0);
 }
+
+version (ServicesWireHarness) {
+
+import ircfiber.irc.parser : parseIRCLineNamed;
+import ircfiber.services.config : managedServicesConfig;
+
+/// One named legacy-auth / reply-correlation check, printed and counted by
+/// the `services-test` runner (`servicesLegacyAuthChecks`).
+struct ServicesLedgerCheck {
+    string name;
+    bool passed;
+}
+
+private enum LEDGER_NET = "22222222-2222-4222-8222-222222222222";
+private enum LEDGER_NS = ":NickServ!services@services.test ";
+
+private final class LedgerHost : ServicesHost {
+    long now = 1_700_000_000_000;
+    string epoch = "11111111-1111-4111-8111-111111111111";
+    ServicesActor who = ServicesActor(ServicesActorState.none, "");
+    ServicesConfig cfg;
+    string[] written;
+    ServicesTransport t;
+    long nowMs() { return now; }
+    string liveEpoch() { return epoch; }
+    string ownNick() { return "me"; }
+    bool isOwnNick(string n) { return icmp(n, "me") == 0; }
+    bool sameNick(string a, string b) { return icmp(a, b) == 0; }
+    ServicesActor actor() { return who; }
+    ServicesConfig servicesConfig() { return cfg; }
+    string isupport(string) { return ""; }
+    size_t lineLimit() { return 512; }
+    size_t ownPrefixBytes() { return 30; }
+    bool manualLinePending(string) { return false; }
+    void wake() {
+        for (;;) {
+            auto l = t.nextWrite();
+            if (!l.length) break;
+            t.popWrite();
+            written ~= l;
+        }
+    }
+    void markerChanged() {}
+    void adoptOwnAccount(string) {}
+    bool ownChannelStatus(string, out string p) { return false; }
+}
+
+/// A deliberately naive adapter: "confirmed" whenever its frame completed
+/// with any line. The transport must still never let a foreign reply make
+/// that true.
+private final class LedgerOp : ServicesOperation {
+    ServiceFrame got;
+    bool asyncKind;
+    bool supports(const ref ServicesEndpoint) { return true; }
+    void run(ServicesTransaction txn) {
+        ServiceFrameSpec spec;
+        spec.bodies = [asyncKind ? "IDENTIFY acct wrongpw" : "INFO acct"];
+        spec.kind = asyncKind ? ServiceFrameKind.asyncAuth : ServiceFrameKind.ordinary;
+        if (asyncKind)
+            spec.terminal = delegate (const ref ServiceFrame f) => f.lines.length > 0 && f.accountChanges.length > 0;
+        txn.frame(spec, (ServiceFrame f) {
+            got = f;
+            const ok_ = f.outcome == ServiceFrameOutcome.completed && f.lines.length > 0;
+            txn.complete(ok_ ? ServiceStatus.confirmed : ServiceStatus.unconfirmed, ok_ ? "" : f.reason);
+        });
+    }
+}
+
+private final class LedgerRig {
+    LedgerHost host;
+    ServicesTransport t;
+    ServicesResult[] results;
+
+    this() {
+        host = new LedgerHost;
+        host.cfg = managedServicesConfig("services.test");
+        t = new ServicesTransport(host);
+        host.t = t;
+    }
+
+    ServicesRequest request(ServiceAction action, string params, string actor) {
+        import vibe.data.json : parseJsonString;
+        auto j = parseJsonString(`{"params":` ~ params ~ `}`);
+        j["requestId"] = randomUUID().toString();
+        j["action"] = action.to!string;
+        j["expectedConnectionEpoch"] = host.epoch;
+        j["expectedActorAccount"] = actor;
+        return ServicesRequest.fromJson(j);
+    }
+
+    void run(ServicesRequest q) { t.execute(q, (ServicesResult r) { results ~= r; }); }
+
+    bool feed(string line, bool historical = false) {
+        auto ev = parseIRCLineNamed(line, "net", LEDGER_NET);
+        return t.intercept(ev, historical);
+    }
+
+    void verify() {
+        feed(":s 311 me NickServ services services.test * :Services");
+        feed(":s 312 me NickServ services.test :Anope");
+        feed(":s 318 me NickServ :End of /WHOIS list.");
+        feed(LEDGER_NS ~ "NOTICE me :\x01VERSION Anope-2.1.0 services.test\x01");
+    }
+
+    string fence(size_t n) {
+        size_t seen;
+        foreach (l; host.written) {
+            const at = l.countUntil("\x01PING ");
+            if (at < 0) continue;
+            if (seen++ == n) return l[at + 6 .. $ - 1];
+        }
+        return "";
+    }
+
+    void fenceReply(size_t n) { feed(LEDGER_NS ~ "NOTICE me :\x01PING " ~ fence(n) ~ "\x01"); }
+
+    ServicesResult last() { return results.length ? results[$ - 1] : ServicesResult.init; }
+
+    bool wrote(string needle) {
+        foreach (l; host.written) if (l.countUntil(needle) >= 0) return true;
+        return false;
+    }
+}
+
+/// Legacy NickServ auth serialization and `+reply` correlation, scripted.
+ServicesLedgerCheck[] servicesLegacyAuthChecks() {
+    ServicesLedgerCheck[] results;
+    void check(string name, bool passed) { results ~= ServicesLedgerCheck(name, passed); }
+    auto savedOps = gServicesOperations.dup;
+    auto savedClassifier = gLegacyAuthTerminal;
+    scope (exit) {
+        gServicesOperations = savedOps;
+        gLegacyAuthTerminal = savedClassifier;
+    }
+    gServicesOperations = null;
+    auto op = new LedgerOp;
+    registerServicesOperation(ServiceAction.accountIdentify, op);
+    registerServicesOperation(ServiceAction.accountInfo, op);
+    static bool passwordVerdict(string, string plain) @safe pure nothrow {
+        return plain.length >= 8 && plain[0 .. 8] == "Password";
+    }
+    setLegacyAuthTerminalClassifier(&passwordVerdict);
+
+    // ── 2.1 tagged: an old manual IDENTIFY (right password, held by an
+    // async SQL/LDAP backend) still pending when the UI sends a wrong one.
+    {
+        auto r = new LedgerRig;
+        op.asyncKind = true;
+        r.t.noteManualMessage("NickServ", "IDENTIFY acct rightpw");
+        check("our echo of the manual IDENTIFY is swallowed",
+            r.feed("@msgid=m0 :me!~m@h PRIVMSG NickServ :IDENTIFY acct rightpw"));
+        r.run(r.request(ServiceAction.accountIdentify, `{"account":"acct","password":"wrongpw"}`, ""));
+        check("a structured IDENTIFY is refused while a manual IDENTIFY awaits its verdict",
+            r.last.reasonCode == "legacy_auth_pending" && !r.wrote("wrongpw"));
+        r.t.onOwnAccount(ServicesActor(ServicesActorState.account, "acct"));
+        r.host.who = ServicesActor(ServicesActorState.account, "acct");
+        r.run(r.request(ServiceAction.accountIdentify, `{"account":"acct","password":"wrongpw"}`, "acct"));
+        check("a 900 alone does not resolve the manual command",
+            r.last.reasonCode == "legacy_auth_pending" && r.t.legacyAuthPending() == 1);
+        check("the verdict tagged with the manual command's msgid stays ordinary traffic",
+            !r.feed("@+reply=m0;msgid=r0 " ~ LEDGER_NS ~ "NOTICE me :Password accepted - you are now recognized."));
+        check("and resolves it", r.t.legacyAuthPending() == 0);
+        const answered = r.results.length;
+        r.run(r.request(ServiceAction.accountIdentify, `{"account":"acct","password":"wrongpw"}`, "acct"));
+        check("then the structured IDENTIFY is admitted",
+            r.results.length == answered && r.wrote("WHOIS NickServ"));
+        r.t.onDisconnect();
+    }
+
+    // ── a foreign +reply inside our frame, before / without our echo ────
+    {
+        auto r = new LedgerRig;
+        op.asyncKind = false;
+        r.run(r.request(ServiceAction.accountInfo, `{"account":"acct"}`, ""));
+        r.verify();
+        r.fenceReply(0);
+        check("a +reply naming a message we cannot place yet is private",
+            r.feed("@+reply=m1;msgid=x1 " ~ LEDGER_NS ~ "NOTICE me :acct is me"));
+        r.feed("@msgid=m1 :me!~m@h PRIVMSG NickServ@services.test :INFO acct");
+        r.fenceReply(1);
+        check("our later echo claims it as ours",
+            op.got.lines.length == 1 && op.got.lines[0].replyTo == "m1" && !op.got.ambiguous
+            && r.last.status == ServiceStatus.confirmed);
+    }
+    {
+        auto r = new LedgerRig;
+        op.asyncKind = false;
+        r.run(r.request(ServiceAction.accountInfo, `{"account":"acct"}`, ""));
+        r.verify();
+        r.fenceReply(0);
+        check("a manual command's tagged verdict arriving before our echo is private, not attributed",
+            r.feed("@+reply=mX;msgid=x2 " ~ LEDGER_NS ~ "NOTICE me :Password accepted - you are now recognized."));
+        r.feed("@msgid=m1 :me!~m@h PRIVMSG NickServ@services.test :INFO acct");
+        r.feed("@+reply=m1;msgid=x3 " ~ LEDGER_NS ~ "NOTICE me :acct is me");
+        r.fenceReply(1);
+        check("once every echo is known it is provably foreign: never in the frame",
+            op.got.lines.length == 1 && op.got.lines[0].text == "acct is me" && !op.got.ambiguous);
+        check("a CHATHISTORY replay of that private line is suppressed",
+            r.feed("@batch=h;msgid=x2 " ~ LEDGER_NS ~ "NOTICE me :Password accepted - you are now recognized.", true));
+    }
+    {
+        auto r = new LedgerRig;
+        op.asyncKind = false;
+        r.run(r.request(ServiceAction.accountInfo, `{"account":"acct"}`, ""));
+        r.verify();
+        r.fenceReply(0);
+        r.feed("@+reply=mX;msgid=x4 " ~ LEDGER_NS ~ "NOTICE me :Password accepted - you are now recognized.");
+        r.feed(LEDGER_NS ~ "NOTICE me :acct is me");
+        r.fenceReply(1);
+        check("with no echo ever, an unplaceable tagged reply makes the frame ambiguous",
+            op.got.ambiguous && op.got.lines.length == 1);
+        check("and an adapter's confirmed is reported unconfirmed",
+            r.last.status == ServiceStatus.unconfirmed && r.last.reasonCode == "frame_incomplete");
+    }
+
+    // ── 2.0 / alias: untagged verdicts need the grammar classifier ───────
+    {
+        auto r = new LedgerRig;
+        r.t.noteManualLine("ID rightpw");
+        r.run(r.request(ServiceAction.accountIdentify, `{"account":"acct","password":"wrongpw"}`, ""));
+        check("an ircd-alias IDENTIFY blocks structured authentication",
+            r.last.reasonCode == "legacy_auth_pending");
+        check("an unrelated untagged notice does not resolve it",
+            !r.feed(LEDGER_NS ~ "NOTICE me :This nickname is registered and protected.")
+            && r.t.legacyAuthPending() == 1);
+        check("a recognised untagged verdict does (and stays ordinary traffic)",
+            !r.feed(LEDGER_NS ~ "NOTICE me :Password incorrect.") && r.t.legacyAuthPending() == 0);
+    }
+    {
+        auto r = new LedgerRig;
+        setLegacyAuthTerminalClassifier(null);
+        r.t.noteManualLine("PRIVMSG NickServ :IDENTIFY rightpw");
+        r.feed(LEDGER_NS ~ "NOTICE me :Password incorrect.");
+        check("without a classifier an untagged verdict cannot be placed: still pending",
+            r.t.legacyAuthPending() == 1);
+        r.t.onDisconnect();
+        check("a new socket clears the ledger", r.t.legacyAuthPending() == 0);
+        setLegacyAuthTerminalClassifier(&passwordVerdict);
+    }
+    {
+        auto r = new LedgerRig;
+        r.t.noteManualLine("PRIVMSG NickServ :IDENTIFY rightpw");
+        r.t.noteManualLine("ID otherpw");
+        r.feed("@msgid=m5 :me!~m@h PRIVMSG NickServ :IDENTIFY rightpw");
+        r.feed("@+reply=m5 " ~ LEDGER_NS ~ "NOTICE me :Password incorrect.");
+        r.feed("@+reply=m5 " ~ LEDGER_NS ~ "NOTICE me :Password incorrect (continued).");
+        check("a second tagged line of one verdict never closes another command",
+            r.t.legacyAuthPending() == 1);
+    }
+
+    // ── automatic GHOST → IDENTIFY keeps its observable behaviour ────────
+    {
+        auto r = new LedgerRig;
+        r.t.noteManualLine("PRIVMSG NickServ :GHOST me pw");
+        r.t.noteManualLine("PRIVMSG NickServ :IDENTIFY pw");
+        const echoes = r.feed("@msgid=g1 :me!~m@h PRIVMSG NickServ :GHOST me pw")
+            && r.feed("@msgid=g2 :me!~m@h PRIVMSG NickServ :IDENTIFY pw");
+        const replies = !r.feed("@+reply=g1 " ~ LEDGER_NS ~ "NOTICE me :Ghost with your nick has been killed.")
+            && !r.feed("@+reply=g2 " ~ LEDGER_NS ~ "NOTICE me :Password accepted - you are now recognized.");
+        check("automatic GHOST then IDENTIFY: echoes hidden, verdicts ordinary, ledger resolved in order",
+            echoes && replies && r.t.legacyAuthPending() == 0);
+    }
+
+    // ── hand-off and bounds ──────────────────────────────────────────────
+    {
+        auto r = new LedgerRig;
+        r.t.restoreLegacyAuth(1);
+        r.run(r.request(ServiceAction.accountIdentify, `{"account":"acct","password":"x"}`, ""));
+        check("a pending count handed over by the previous engine blocks structured auth",
+            r.last.reasonCode == "legacy_auth_pending");
+        r.feed(LEDGER_NS ~ "NOTICE me :Password incorrect.");
+        check("until a recognised verdict arrives on the retained socket", r.t.legacyAuthPending() == 0);
+        foreach (_; 0 .. SERVICES_LEGACY_AUTH_MAX + 1) r.t.noteManualLine("ID pw");
+        r.feed(LEDGER_NS ~ "NOTICE me :Password incorrect.");
+        check("a saturated ledger stays blocked until the socket is replaced",
+            r.t.legacyAuthPending() == SERVICES_LEGACY_AUTH_MAX + 1);
+        r.t.onDisconnect();
+        check("and a new socket clears it", r.t.legacyAuthPending() == 0);
+    }
+    return results;
+}
+
+} // version (ServicesWireHarness)

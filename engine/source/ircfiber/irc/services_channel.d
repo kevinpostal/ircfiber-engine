@@ -271,20 +271,28 @@ private AnopeGrammar grammarFor(string versionText) {
 
 // ── Line matching ─────────────────────────────────────────────────────────
 
-/// Anchored match of `msgid` at line `i`, tolerating a 2.1 LineWrapper split
-/// across up to three physical lines. `used` = lines consumed.
+/// Anchored match of `msgid` at line `i`. On 2.1 a reply longer than
+/// options:linelength is split by LineWrapper at its last breaking space,
+/// which is dropped (misc.cpp GetLine), so up to three physical lines are
+/// rejoined with one space. 2.0 has no LineWrapper (only `\n` in the msgid
+/// itself), so it never joins. A following line that is itself a complete
+/// occurrence of `msgid` is a separate message, never a continuation — this
+/// keeps e.g. an INFO row + "nick is the founder of #c." from reading as one
+/// founder line with a garbage nick. `used` = lines consumed.
 private bool matchAt(AnopeGrammar g, string msgid, const string[] lines, size_t i,
         out string[] caps, out size_t used) {
     if (i >= lines.length) return false;
     if (g.matches(msgid, lines[i], caps)) { used = 1; return true; }
+    if (!g.v21) return false;
     string joined = lines[i];
-    string tight = lines[i];
     foreach (k; 1 .. 3) {
         if (i + k >= lines.length) break;
+        string[] alone;
+        if (g.matches(msgid, lines[i + k], alone)) break;
         joined ~= " " ~ lines[i + k];
-        tight ~= lines[i + k];
-        if (g.matches(msgid, joined, caps) || g.matches(msgid, tight, caps)) { used = k + 1; return true; }
+        if (g.matches(msgid, joined, caps)) { used = k + 1; return true; }
     }
+    caps = null;
     return false;
 }
 
@@ -744,19 +752,26 @@ private void parseStatus(AnopeGrammar g, const string[] seg, ref ChannelSnapshot
     else if (lineIs(g, M_STATUS_FOUNDER, seg[0], caps)) s.statusFounder = true;
     else if (lineIs(g, M_STATUS_NONE, seg[0], caps)) s.statusNone = true;
     else if (lineIs(g, M_STATUS_HEADER, seg[0], caps)) {
+        // 2.1 LineWrapper splits replies longer than options:linelength at
+        // the last space (dropping it), so long masks wrap these lines.
+        size_t used;
         while (i + 1 < seg.length) {
-            if (lineIs(g, M_STATUS_MATCH, seg[i + 1], caps) && caps.length == 3) {
+            if (matchAt(g, M_STATUS_MATCH, seg, i + 1, caps, used) && caps.length == 3) {
                 s.statusEntries ~= [caps[1].strip, caps[2].strip];
-                ++i;
-            } else if (lineIs(g, M_STATUS_MATCH_FROM, seg[i + 1], caps)) {
+                i += used;
+            } else if (matchAt(g, M_STATUS_MATCH_FROM, seg, i + 1, caps, used)) {
                 // Chained channel access: the privilege belongs to another
                 // channel's provider/levels; not evidence for this channel.
-                ++i;
+                i += used;
             } else break;
         }
     } else { s.problems ~= "status_unrecognised"; return; }
-    foreach (l; seg[i + 1 .. $]) {
-        if (lineIs(g, M_STATUS_AKICK_NC, l, caps) || lineIs(g, M_STATUS_AKICK_MASK, l, caps)) continue;
+    for (size_t k = i + 1; k < seg.length;) {
+        size_t used;
+        if (matchAt(g, M_STATUS_AKICK_NC, seg, k, caps, used) || matchAt(g, M_STATUS_AKICK_MASK, seg, k, caps, used)) {
+            k += used;
+            continue;
+        }
         s.problems ~= "status_unexpected_lines";
         return;
     }
@@ -879,8 +894,17 @@ private void parseFlags(AnopeGrammar g, const string[] seg, ref ChannelSnapshot 
         }
         if (!ended) { s.problems ~= "flags_unterminated"; return; }
     } else { s.problems ~= "flags_unrecognised"; return; }
-    for (; i < seg.length; ++i) {
-        if (g.v21 && lineIs(g, M_ACCESS_FOREIGN_21, seg[i])) continue;
+    // CHAN_ACCESS_FOREIGN ("N access entries from other access systems not
+    // shown; use FLAGS #c LIST * ALL to view all access entries.") follows
+    // whenever XOP/ACCESS entries exist; with a real channel name it is
+    // longer than the default 100-byte linelength and arrives wrapped.
+    while (i < seg.length) {
+        string[] fc;
+        size_t used;
+        if (g.v21 && matchAt(g, M_ACCESS_FOREIGN_21, seg, i, fc, used)) {
+            i += used;
+            continue;
+        }
         s.problems ~= "flags_unexpected_lines";
         return;
     }
@@ -1100,6 +1124,10 @@ private struct Authority {
     /// Flag letter → privilege (HELP FLAGS description ↔ HELP LEVELS DESC).
     string[char] flagPrivilege;
     bool flagsMapped;
+    /// LEVELS LIST was read: `enabled` holds every privilege it shows that
+    /// is not "(disabled)" (AccessGroup::HasPriv is false for disabled ones).
+    bool levelsKnown;
+    bool[string] enabled;
 }
 
 private struct Cap {
@@ -1114,7 +1142,11 @@ private Authority deriveAuthority(ServicesTransaction txn, const ref ChannelSnap
     if (!a.identified || !s.registered) return a;
     a.founder = s.statusFounder || (s.founder.length > 0 && txn.sameNick(s.founder, actor.account));
     a.superAdmin = s.statusSuper;
-    foreach (name, lvl; s.levels) if (lvl == "disabled") a.disabled[name] = true;
+    a.levelsKnown = s.levelsRead;
+    foreach (name, lvl; s.levels) {
+        if (lvl == "disabled") a.disabled[name] = true;
+        else a.enabled[name] = true;
+    }
     // Gated reads the service refused (cs_status / cs_access / cs_mode /
     // cs_akick): the actor lacks that privilege (and the override privs).
     if (s.statusDenied) a.denied["ACCESS_CHANGE"] = true;
@@ -1159,9 +1191,14 @@ private Cap privState(const ref Authority a, string priv) {
     if (a.superAdmin) return Cap("allowed", "");
     // AccessGroup::HasPriv: founders hold every privilege not disabled.
     if (a.founder) return (priv in a.disabled) ? Cap("denied", "privilege_disabled") : Cap("allowed", "");
+    // Actual denials and disabled levels outrank derived evidence.
     if (priv in a.disabled) return Cap("denied", "privilege_disabled");
-    if (priv in a.allowed) return Cap("allowed", "");
     if (priv in a.denied) return Cap("denied", "service_denied");
+    // Entry-derived privileges (HELP tier lists, flag letters, numeric
+    // levels) only count while the channel's real LEVELS show the privilege
+    // enabled; non-founders usually cannot read LEVELS, so this stays unknown.
+    if (priv in a.allowed)
+        return a.levelsKnown && (priv in a.enabled) ? Cap("allowed", "") : Cap("unknown", "levels_unverified");
     return Cap("unknown", "privilege_unverified");
 }
 
@@ -1173,7 +1210,7 @@ private string[] actorPrivileges(const ref Authority a, const ref ChannelSnapsho
         foreach (name; levelsSource.levelNames) if (!(name in a.disabled)) result ~= name;
         if (a.founder && !result.canFind("FOUNDER")) result ~= "FOUNDER";
     } else {
-        foreach (name, _; a.allowed) if (!(name in a.disabled)) result ~= name;
+        foreach (name, _; a.allowed) if (privState(a, name).state == "allowed") result ~= name;
     }
     sort(result);
     return result;
@@ -1843,14 +1880,37 @@ private bool isServicePrefix(ServicesTransaction txn, string prefix, ServicesEnd
     return icmp(prefix, ep.server) == 0;
 }
 
-/// cs_topic.cpp Set → Channel::ChangeTopic: the exact TOPIC from ChanServ.
-private bool topicObserved(ServicesTransaction txn, const ref ServiceFrame f, string channel, string topic) {
+/// cs_topic Set → Channel::ChangeTopic sends from `ci->WhoSends()`: the
+/// assigned BotServ bot when there is one, else ChanServ (2.1
+/// regchannel.cpp WhoSends; 2.0 the same, inspircd3 SVSTOPIC). True when
+/// the frame holds the exact TOPIC from the verified ChanServ pin (no bot
+/// assigned, `botPrefix` empty) or from exactly the WHOIS-verified assigned
+/// bot `botPrefix` (nick!ident@host).
+private bool topicObserved(ServicesTransaction txn, const ref ServiceFrame f, string channel, string topic,
+        string botPrefix) {
     foreach (e; f.effects) {
         if (e.command != "TOPIC" || !e.params.length || !sameChannel(txn, e.params[0], channel)) continue;
         auto text = e.params.length >= 2 ? e.params[1] : "";
-        if (text == topic && isServicePrefix(txn, e.prefix, txn.endpoint)) return true;
+        if (text != topic) continue;
+        if (!botPrefix.length ? isServicePrefix(txn, e.prefix, txn.endpoint) : samePrefix(txn, e.prefix, botPrefix))
+            return true;
     }
     return false;
+}
+
+/// nick!ident@host equality (casemapped nick, exact ident, host ASCII-fold).
+private bool samePrefix(ServicesTransaction txn, string a, string b) {
+    auto ab = a.indexOf('!'), aa = a.indexOf('@'), bb = b.indexOf('!'), ba = b.indexOf('@');
+    if (ab <= 0 || aa <= ab || bb <= 0 || ba <= bb) return false;
+    return txn.sameNick(a[0 .. ab], b[0 .. bb]) && a[ab + 1 .. aa] == b[bb + 1 .. ba]
+        && icmp(a[aa + 1 .. $], b[ba + 1 .. $]) == 0;
+}
+
+/// Topic text Anope would re-join differently: its command parser splits on
+/// spaces and joins parameters with one space (command.cpp), so leading,
+/// trailing or doubled spaces could never be observed verbatim.
+private bool canonicalSpacing(string text) {
+    return !text.length || (text[0] != ' ' && text[$ - 1] != ' ' && !text.canFind("  "));
 }
 
 private bool findAccount(ServicesTransaction txn, const ref ChannelSnapshot s, string account, out AccessRow row) {
@@ -1871,14 +1931,22 @@ private bool sameFlagSet(string a, string b) {
     return x == y;
 }
 
+/// Raw lines of a snapshot frame may be attached as details only when it
+/// carried neither INFO (2.1 show_all prints `Mode lock: <string incl. key>`,
+/// possibly wrapped) nor MODE LOCK LIST (key parameters): failures of those
+/// reads cannot prove which lines hold a key, so they report structured
+/// reasons only.
+private bool exposesRawDetails(uint parts) {
+    return !(parts & (Part.info | Part.modeLocks));
+}
+
 private void readFailed(ServicesTransaction txn, const ref ChannelSnapshot s, const ref ServiceFrame f) {
-    auto hidden = lockSecrets(s);
-    if (!frameComplete(f)) {
-        completeIncomplete(txn, f, hidden);
-        return;
-    }
-    txn.complete(ServiceStatus.unconfirmed, s.problems.length ? s.problems[0] : "unrecognised_reply",
-        Json.undefined, "", Json.undefined, safeDetails(txn, f.lines, hidden));
+    string reason = !frameComplete(f) ? (f.reason.length ? f.reason : "frame_incomplete")
+        : s.problems.length ? s.problems[0] : "unrecognised_reply";
+    auto status = !frameComplete(f) && f.outcome == ServiceFrameOutcome.unavailable && !txn.dispatched
+        ? ServiceStatus.unavailable : ServiceStatus.unconfirmed;
+    txn.complete(status, reason, Json.undefined, "", Json.undefined,
+        exposesRawDetails(s.parts) ? safeDetails(txn, f.lines, lockSecrets(s)) : null);
 }
 
 // ── ChanServ: INFO / REGISTER / topic options ─────────────────────────────
@@ -1973,7 +2041,9 @@ private final class ChannelOptionOperation : ChannelOperation {
 }
 
 /// TOPIC <#c> SET [topic]: Anope sends no reply on success, so the proof
-/// is the exact TOPIC the verified ChanServ sets while the frame is open.
+/// is the exact TOPIC from the client that `ChannelInfo::WhoSends()` uses:
+/// the assigned bot (BotServ INFO, then WHOIS on the verified services
+/// server, both BEFORE the write) or, with none assigned, the ChanServ pin.
 private final class ChannelTopicSetOperation : ChannelOperation {
     void run(ServicesTransaction txn) {
         AnopeGrammar g;
@@ -1983,6 +2053,10 @@ private final class ChannelTopicSetOperation : ChannelOperation {
         auto topicLen = txn.isupport("TOPICLEN");
         if (isNumber(topicLen) && topic.length > topicLen.to!long) {
             txn.complete(ServiceStatus.rejected, "topic_too_long");
+            return;
+        }
+        if (!canonicalSpacing(topic)) {
+            txn.complete(ServiceStatus.rejected, "noncanonical_spacing");
             return;
         }
         readAuthorized(txn, g, channel, 0, false, (ChannelSnapshot s, Authority a, ServiceFrame f) {
@@ -1998,31 +2072,66 @@ private final class ChannelTopicSetOperation : ChannelOperation {
             auto body = "TOPIC " ~ channel ~ " SET" ~ (topic.length ? " " ~ topic : "");
             if (!txn.fits(body)) { txn.complete(ServiceStatus.rejected, "line_too_long"); return; }
             auto rules = [AckRule(M_CHAN_NOT_IN_USE, AckKind.rejected, "channel_not_in_use")];
-            ServiceFrameTerminal terminal = (const ref ServiceFrame fr) {
-                return topicObserved(txn, fr, channel, topic)
-                    || classify(g, servicePlainLines(fr), rules.dup).state == "rejected";
-            };
-            txn.frame(writeSpec(txn, body, ServiceFrameKind.observe, terminal), (ServiceFrame w) {
-                if (!frameComplete(w)) {
-                    txn.complete(ServiceStatus.unconfirmed,
-                        w.outcome == ServiceFrameOutcome.deadline && txn.dispatched ? "no_effect_observed"
-                            : (w.reason.length ? w.reason : "frame_incomplete"),
-                        Json.undefined, "", Json.undefined, safeDetails(txn, w.lines, null));
+
+            void write(string botPrefix) {
+                ServiceFrameTerminal terminal = (const ref ServiceFrame fr) {
+                    return topicObserved(txn, fr, channel, topic, botPrefix)
+                        || classify(g, servicePlainLines(fr), rules.dup).state == "rejected";
+                };
+                txn.frame(writeSpec(txn, body, ServiceFrameKind.observe, terminal), (ServiceFrame w) {
+                    if (!frameComplete(w)) {
+                        txn.complete(ServiceStatus.unconfirmed,
+                            w.outcome == ServiceFrameOutcome.deadline && txn.dispatched ? "no_effect_observed"
+                                : (w.reason.length ? w.reason : "frame_incomplete"),
+                            Json.undefined, "", Json.undefined, safeDetails(txn, w.lines, null));
+                        return;
+                    }
+                    auto ack = classify(g, servicePlainLines(w), rules.dup);
+                    if (ack.state != "rejected" && topicObserved(txn, w, channel, topic, botPrefix)) {
+                        ack.state = "accepted";
+                        ack.reason = "";
+                    }
+                    auto details = safeDetails(txn, w.lines, null);
+                    readAuthorized(txn, g, channel, 0, false, (ChannelSnapshot rb, Authority ra, ServiceFrame rf) {
+                        bool ok = frameComplete(rf) && rb.infoRead;
+                        // INFO hides Last topic on secret channels without INFO.
+                        bool expected = ok && (!rb.topicKnown || rb.topic == plainText(topic));
+                        auto view = channelInfoView(rb);
+                        completeWrite(txn, ack, ok, expected, false, view, servicesRevision(txn, view),
+                            infoCapabilities(txn, rb, ra), details);
+                    });
+                });
+            }
+
+            // Which client will send the TOPIC: BotServ INFO #c (CS→BS peer
+            // read). No BotServ at all ⇒ no bot can be assigned ⇒ ChanServ.
+            txn.frameOn(ServiceId.botServ, readSpec(["INFO " ~ channel]), (ServiceFrame bf) {
+                if (bf.outcome == ServiceFrameOutcome.unavailable && bf.reason == "service_absent") {
+                    write("");
                     return;
                 }
-                auto ack = classify(g, servicePlainLines(w), rules.dup);
-                if (ack.state != "rejected" && topicObserved(txn, w, channel, topic)) {
-                    ack.state = "accepted";
-                    ack.reason = "";
+                if (!frameComplete(bf)) {
+                    txn.complete(ServiceStatus.unavailable, "bot_assignment_unknown");
+                    return;
                 }
-                auto details = safeDetails(txn, w.lines, null);
-                readAuthorized(txn, g, channel, 0, false, (ChannelSnapshot rb, Authority ra, ServiceFrame rf) {
-                    bool ok = frameComplete(rf) && rb.infoRead;
-                    // INFO hides Last topic on secret channels without INFO.
-                    bool expected = ok && (!rb.topicKnown || rb.topic == plainText(topic));
-                    auto view = channelInfoView(rb);
-                    completeWrite(txn, ack, ok, expected, false, view, servicesRevision(txn, view),
-                        infoCapabilities(txn, rb, ra), details);
+                auto b = parseBotInfo(g, txn, channel, servicePlainLines(bf));
+                if (!b.read || !b.registered) {
+                    // Denied BotServ INFO (no INFO privilege) or unrecognised
+                    // text: the sender cannot be proven, so nothing is sent.
+                    txn.complete(ServiceStatus.unavailable, b.denied ? "bot_assignment_denied" : "bot_assignment_unknown");
+                    return;
+                }
+                if (!b.assigned.length) {
+                    write("");
+                    return;
+                }
+                txn.whois(b.assigned, (ServicesWhois who) {
+                    if (!who.complete || !who.present || !txn.sameNick(who.nick.length ? who.nick : b.assigned, b.assigned)
+                            || icmp(who.server, txn.endpoint.server) != 0 || !who.ident.length || !who.host.length) {
+                        txn.complete(ServiceStatus.unavailable, "assigned_bot_unverified");
+                        return;
+                    }
+                    write(b.assigned ~ "!" ~ who.ident ~ "@" ~ who.host);
                 });
             });
         });
@@ -2108,7 +2217,7 @@ private final class ChannelAccessListOperation : ChannelOperation {
                 txn.complete(complete ? ServiceStatus.confirmed : ServiceStatus.unconfirmed,
                     complete ? "" : (s.accessDenied ? "denied" : s.problems.length ? s.problems[0] : "access_list_unavailable"),
                     view, servicesRevision(txn, accessBasis(s)), accessCapabilities(s, a),
-                    complete ? null : safeDetails(txn, f.lines, lockSecrets(s)));
+                    null);
             }
             if (!s.registered || !s.flagsAvailable) { finish(); return; }
             // The flag letters this network actually configures, for the
@@ -2154,57 +2263,124 @@ private final class ChannelAccessSetOperation : ChannelOperation {
             if (cap.state != "allowed") { completeCap(txn, cap); return; }
             AccessRow before;
             bool had = findAccount(txn, s, account, before);
+            // Without a verified live nick the only safe subject is the
+            // account's existing entry (offline management from the table):
+            // Anope resolves a bare name as a nick (possibly another
+            // account's grouped nick or a live user), so a new grant needs
+            // the fresh WHOIS of `targetNick`.
+            if (!targetNick.length && !had) { txn.complete(ServiceStatus.rejected, "target_unverified"); return; }
             if (had && provider == "xop" && before.provider == "xop" && icmp(before.value, value) == 0) {
                 txn.complete(ServiceStatus.rejected, "unchanged");
                 return;
             }
-            // One native command each; XOP/ACCESS ADD replace any existing
-            // entry of the account themselves (cs_xop/cs_access DoAdd) and
-            // FLAGS MODIFY converts it — never DEL followed by ADD.
-            string body;
-            switch (provider) {
-                case "xop": body = value ~ " " ~ channel ~ " ADD " ~ account; break;
-                case "access": body = "ACCESS " ~ channel ~ " ADD " ~ account ~ " " ~ value.to!int.to!string; break;
-                default: body = "FLAGS " ~ channel ~ " MODIFY " ~ account ~ " " ~ value; break;
+            auto subject = had ? before.mask : account;
+            FlagChange[] changes;
+            if (provider == "flags" && !parseFlagChanges(value, changes)) {
+                txn.complete(ServiceStatus.rejected, "invalid_flags");
+                return;
             }
-            if (!txn.fits(body)) { txn.complete(ServiceStatus.rejected, "line_too_long"); return; }
-            verifyServicesTarget(txn, account, targetNick, (bool targetOk) {
-                if (!targetOk) return;
-                txn.frame(writeSpec(txn, body, ServiceFrameKind.ordinary), (ServiceFrame w) {
-                    if (!frameComplete(w)) { completeIncomplete(txn, w); return; }
-                    auto ack = classify(g, servicePlainLines(w), accessAddRules(provider));
-                    auto details = safeDetails(txn, w.lines, null);
-                    readSnapshot(txn, g, channel, Part.info | Part.access, false, (ChannelSnapshot rb, ServiceFrame rf) {
-                        bool ok = frameComplete(rf) && rb.infoRead && rb.accessComplete();
-                        AccessRow after;
-                        bool has = findAccount(txn, rb, account, after);
-                        bool expected;
-                        switch (provider) {
-                            case "xop":
-                                expected = has && after.provider == "xop" && icmp(after.value, value) == 0;
-                                break;
-                            case "access":
-                                expected = has && after.provider == "access" && isNumber(after.value)
-                                    && after.value.to!long == value.to!long;
-                                break;
-                            default:
-                                // The acknowledgement states the resulting set.
-                                if (ack.accepted.length && ack.accepted[$ - 1].length == 3)
-                                    expected = has && after.provider == "flags"
-                                        && sameFlagSet(after.value, ack.accepted[$ - 1][2].strip);
-                                else if (ack.accepted.length)
-                                    expected = !has;
-                                break;
-                        }
-                        bool changed = had != has || (has && (after.provider != before.provider || after.value != before.value));
-                        auto view = accessView(rb, a, s);
-                        completeWrite(txn, ack, ok, expected, changed, view, servicesRevision(txn, accessBasis(rb)),
-                            accessCapabilities(rb, a), details);
+            void send(string body) {
+                if (!txn.fits(body)) { txn.complete(ServiceStatus.rejected, "line_too_long"); return; }
+                verifyServicesTarget(txn, account, targetNick, (bool targetOk) {
+                    if (!targetOk) return;
+                    txn.frame(writeSpec(txn, body, ServiceFrameKind.ordinary), (ServiceFrame w) {
+                        if (!frameComplete(w)) { completeIncomplete(txn, w); return; }
+                        auto ack = classify(g, servicePlainLines(w), accessAddRules(provider));
+                        auto details = safeDetails(txn, w.lines, null);
+                        readSnapshot(txn, g, channel, Part.info | Part.access, false, (ChannelSnapshot rb, ServiceFrame rf) {
+                            bool ok = frameComplete(rf) && rb.infoRead && rb.accessComplete();
+                            AccessRow after;
+                            bool has = findAccount(txn, rb, account, after);
+                            bool expected;
+                            switch (provider) {
+                                case "xop":
+                                    expected = has && after.provider == "xop" && icmp(after.value, value) == 0;
+                                    break;
+                                case "access":
+                                    expected = has && after.provider == "access" && isNumber(after.value)
+                                        && after.value.to!long == value.to!long;
+                                    break;
+                                default:
+                                    // Every requested letter's final state, not
+                                    // the acknowledged set (cs_flags skips
+                                    // letters it cannot apply silently).
+                                    expected = flagChangesHold(changes, has && after.provider == "flags",
+                                        has ? after.value : "");
+                                    break;
+                            }
+                            bool changed = had != has || (has && (after.provider != before.provider || after.value != before.value));
+                            auto view = accessView(rb, a, s);
+                            completeWrite(txn, ack, ok, expected, changed, view, servicesRevision(txn, accessBasis(rb)),
+                                accessCapabilities(rb, a), details);
+                        });
                     });
                 });
-            });
+            }
+            switch (provider) {
+                case "xop": send(value ~ " " ~ channel ~ " ADD " ~ subject); break;
+                case "access": send("ACCESS " ~ channel ~ " ADD " ~ subject ~ " " ~ value.to!int.to!string); break;
+                default:
+                    // Every letter must be one this network actually defines
+                    // (HELP FLAGS) — founders included, since cs_flags
+                    // ignores unknown letters yet still acknowledges.
+                    txn.frame(readSpec(["HELP FLAGS"]), (ServiceFrame hf) {
+                        if (!frameComplete(hf)) {
+                            txn.complete(ServiceStatus.unavailable, "flag_definitions_unavailable");
+                            return;
+                        }
+                        auto defs = parseFlagsHelp(g, hf);
+                        foreach (c; changes) if (!(c.letter in defs)) {
+                            txn.complete(ServiceStatus.rejected, "unknown_flag");
+                            return;
+                        }
+                        send("FLAGS " ~ channel ~ " MODIFY " ~ subject ~ " " ~ flagsWire(changes));
+                    });
+                    break;
+            }
         });
     }
+}
+
+private struct FlagChange {
+    bool add;
+    char letter;
+}
+
+/// `+AO-v` → explicit per-letter changes (protocol already limits the
+/// value to letters and signs).
+private bool parseFlagChanges(string value, out FlagChange[] changes) {
+    bool add = true;
+    bool signed;
+    foreach (c; value) {
+        if (c == '+' || c == '-') { add = c == '+'; signed = true; continue; }
+        if (!isAlpha(c)) return false;
+        changes ~= FlagChange(add, c);
+    }
+    return signed && changes.length > 0;
+}
+
+/// Wire form with a sign before every letter and a trailing sign:
+/// cs_flags DoModify tries `FindPrivilege(flags.substr(i))` at each letter,
+/// so no suffix of this string can ever be a privilege name.
+private string flagsWire(const FlagChange[] changes) {
+    string w;
+    foreach (c; changes) {
+        w ~= c.add ? '+' : '-';
+        w ~= c.letter;
+    }
+    return w ~ (changes.length && changes[$ - 1].add ? "+" : "-");
+}
+
+/// Final state of every requested letter holds in the read-back flag set
+/// (an absent entry has no flags). The last change of a letter wins.
+private bool flagChangesHold(const FlagChange[] changes, bool isFlagsEntry, string flags) {
+    bool[char] want;
+    foreach (c; changes) want[c.letter] = c.add;
+    foreach (letter, add; want) {
+        if (add && !(isFlagsEntry && flags.canFind(letter))) return false;
+        if (!add && isFlagsEntry && flags.canFind(letter)) return false;
+    }
+    return true;
 }
 
 private final class ChannelAccessRemoveOperation : ChannelOperation {
@@ -2444,14 +2620,18 @@ private final class ChannelModeLockChangeOperation : ChannelOperation {
             auto verb = change == "add" ? "ADD" : change == "remove" ? "DEL" : "SET";
             auto body = "MODE " ~ channel ~ " LOCK " ~ verb ~ " " ~ wire;
             if (!txn.fits(body)) { txn.complete(ServiceStatus.rejected, "line_too_long"); return; }
-            string[] hidden = lockSecrets(s);
-            foreach (r; reqs) if (r.mode == 'k' && r.param.length) hidden ~= r.param;
+            // MODE LOCK replies echo lock parameters (keys), possibly wrapped
+            // by 2.1 LineWrapper: no raw details at all, structured view only.
             txn.frame(writeSpec(txn, body, ServiceFrameKind.ordinary), (ServiceFrame w) {
-                if (!frameComplete(w)) { completeIncomplete(txn, w, hidden); return; }
+                if (!frameComplete(w)) {
+                    txn.complete(w.outcome == ServiceFrameOutcome.unavailable && !txn.dispatched
+                        ? ServiceStatus.unavailable : ServiceStatus.unconfirmed,
+                        w.reason.length ? w.reason : "frame_incomplete");
+                    return;
+                }
                 auto ack = classify(g, servicePlainLines(w), lockRules(g));
                 readSnapshot(txn, g, channel, Part.modeLocks, false, (ChannelSnapshot rb, ServiceFrame rf) {
-                    auto allHidden = hidden ~ lockSecrets(rb);
-                    auto details = safeDetails(txn, w.lines, allHidden);
+                    string[] details;
                     bool ok = frameComplete(rf) && rb.locksRead;
                     bool expected = ok;
                     foreach (r; reqs) {
@@ -3015,6 +3195,32 @@ void channelServicesChecks(void delegate(string name, bool cond) ok) {
             && basis["entries"][1]["value"].get!string == "10");
     }
 
+    // Real 2.1 FLAGS LIST without ALL on a channel holding only XOP/ACCESS
+    // entries: CHAN_ACCESS_FOREIGN with the actual channel name exceeds the
+    // 100-byte LineWrapper width ("FLAGS\x1B#c\x1BLIST\x1B*\x1BALL" cannot
+    // break) and splits at the last breaking space before "view".
+    {
+        ChannelSnapshot s;
+        s.channel = "#fixture-services";
+        parseFlags(g21, ["No matching entries on #fixture-services access list.",
+            "4 access entries from other access systems not shown; use FLAGS #fixture-services LIST * ALL to",
+            "view all access entries."], s);
+        ok("2.1 flags: wrapped foreign-entry footer is one recognised message",
+            s.flagsRead && s.flagsAvailable && !s.flagsNumbers.length && !s.problems.length);
+        ChannelSnapshot t;
+        t.channel = "#fixture-services";
+        parseFlags(g21, ["No matching entries on #fixture-services access list.",
+            "4 access entries from other access systems not shown; use FLAGS #fixture-services LIST * ALL to",
+            "view all access entries.", "something else"], t);
+        ok("2.1 flags: an unknown line after the footer still fails closed", !t.flagsRead && t.problems.length);
+        ChannelSnapshot st;
+        parseStatus(g21, ["Access for me on #fixture-services:",
+            "me matches access entry averyveryverylongaccountname-on-fixture, which has privilege",
+            "SOP."], st);
+        ok("2.1 status: wrapped match line is parsed", st.statusRead && st.statusEntries.length == 1
+            && st.statusEntries[0][1] == "SOP");
+    }
+
     // Translated (de_DE) header/end lines and FLEXIBLE rows.
     {
         ChannelSnapshot s;
@@ -3171,6 +3377,34 @@ void channelServicesChecks(void delegate(string name, bool cond) ok) {
             "Nick  Mask  Real name", "Helper  h@s  Helper", "2 bots available."], wrong));
     }
 
+    // 2.0 (no +reply, no LineWrapper): INFO's last row must not join the
+    // following STATUS founder line into one "%s is the founder of %s."
+    // whose nick capture swallows the INFO row.
+    {
+        string[] text = ["Information for channel #extnet-services:", "        Founder: extfounder",
+            "     Registered: Nov 06 2026 10:00:00 UTC", "        Options: Peace, Topic retention",
+            "extfounder is the founder of #extnet-services."];
+        ServiceFrame f;
+        f.outcome = ServiceFrameOutcome.completed;
+        foreach (t; text) {
+            ServiceReplyLine l;
+            l.text = t;
+            l.plain = t;
+            f.lines ~= l;
+        }
+        string[][] segs;
+        auto split = splitBodies(f, text, [openerOf(g20, [M_CHAN_INFO_HEADER_20]), openerOf(g20, [M_STATUS_FOUNDER])], segs);
+        ChannelSnapshot s;
+        if (split && segs.length == 2) parseStatus(g20, segs[1], s);
+        ok("2.0 segmentation: INFO rows stay INFO, STATUS founder line parses",
+            split && segs.length == 2 && segs[0].length == 4 && s.statusRead && s.statusFounder);
+        string[] caps;
+        size_t used;
+        ok("wrap join: a complete following message is never a continuation",
+            !matchAt(g21, M_STATUS_FOUNDER, ["Options: Peace", "x is the founder of #c."], 0, caps, used)
+            && !matchAt(g20, M_STATUS_FOUNDER, ["Options: Peace x is", "the founder of #c."], 0, caps, used));
+    }
+
     // Body segmentation without +reply: a description cannot forge the next
     // body's opener because openers are anchored whole-line source text.
     {
@@ -3189,9 +3423,72 @@ void channelServicesChecks(void delegate(string name, bool cond) ok) {
             && segs[1] == ["Access denied."]);
     }
 
-    // Mode-lock planning needs ISUPPORT; validated here without a socket.
     ok("flag sets: only sorted unique letters", isFlagSet("AOv") && !isFlagSet("SOP") && !isFlagSet("AAO"));
     ok("topic compare strips formatting", plainText("\x02hi\x02 \x0304,01there") == "hi there");
+
+    // Key privacy: reads carrying INFO or MODE LOCK LIST never expose raw
+    // lines, whatever way they fail (deadline, truncation, split, parse).
+    ok("details: INFO / MODE LOCK reads never expose raw lines",
+        !exposesRawDetails(AUTHORITY_PARTS) && !exposesRawDetails(Part.modeLocks)
+        && !exposesRawDetails(Part.info | Part.access) && exposesRawDetails(Part.akick));
+    {
+        // A 2.1-wrapped lock row splits the key onto a continuation line the
+        // parser rejects: the key is then unknown to lockSecrets, and only
+        // the parts gate keeps the raw lines out of details.
+        ChannelSnapshot s;
+        s.parts = Part.modeLocks;
+        parseModeLocks(g21, ["Mode locks for #c:", "Mode  Param", "+k    CANARY", "KEY bob Nov 06 2026"], s);
+        ok("details: wrapped key canary is unparsed and raw details stay suppressed",
+            !s.locksRead && !lockSecrets(s).canFind("CANARYKEY") && !exposesRawDetails(s.parts));
+    }
+
+    // FLAGS: explicit per-letter wire, every requested letter checked.
+    {
+        FlagChange[] changes;
+        ok("flags: delta parsed per letter", parseFlagChanges("+AO-v", changes) && changes.length == 3
+            && changes[0].add && changes[1].letter == 'O' && !changes[2].add);
+        ok("flags: no suffix can be a privilege name", flagsWire(changes) == "+A+O-v-"
+            && flagsWire([FlagChange(true, 'O'), FlagChange(true, 'P')]) == "+O+P+");
+        FlagChange[] x;
+        parseFlagChanges("+x", x);
+        ok("flags: skipped letter is not confirmed by the unchanged set", !flagChangesHold(x, true, "o"));
+        ok("flags: applied add and removal hold", flagChangesHold(changes, true, "AOt")
+            && !flagChangesHold(changes, true, "AOv"));
+        FlagChange[] remove;
+        parseFlagChanges("-v", remove);
+        ok("flags: removing the last letter removes the entry", flagChangesHold(remove, false, ""));
+        FlagChange[] none;
+        ok("flags: unsigned or empty values are refused", !parseFlagChanges("AO", none) && !parseFlagChanges("+", none));
+    }
+
+    // Non-founder derived privileges need enabled LEVELS; denials win.
+    {
+        Authority a;
+        a.identified = true;
+        a.allowed["TOPIC"] = true;
+        ok("authority: derived privilege without LEVELS is unknown", privState(a, "TOPIC").state == "unknown");
+        a.levelsKnown = true;
+        a.enabled["TOPIC"] = true;
+        ok("authority: derived privilege with enabled LEVELS is allowed", privState(a, "TOPIC").state == "allowed");
+        a.denied["TOPIC"] = true;
+        ok("authority: actual service denial outranks derived evidence", privState(a, "TOPIC").state == "denied");
+        Authority d;
+        d.identified = true;
+        d.allowed["SET"] = true;
+        d.levelsKnown = true;
+        d.disabled["SET"] = true;
+        ok("authority: disabled level denies", privState(d, "SET").state == "denied");
+        Authority f;
+        f.identified = true;
+        f.founder = true;
+        f.disabled["TOPIC"] = true;
+        ok("authority: founder holds enabled privileges only", privState(f, "MODE").state == "allowed"
+            && privState(f, "TOPIC").state == "denied");
+    }
+
+    ok("topic: Anope-normalised spacing refused before sending",
+        canonicalSpacing("a b") && canonicalSpacing("") && !canonicalSpacing("a  b") && !canonicalSpacing(" a")
+        && !canonicalSpacing("a "));
 }
 
 unittest {

@@ -41,9 +41,10 @@ import std.uni : icmp;
 import vibe.data.json : Json;
 
 import ircfiber.irc.services;
-import ircfiber.irc.services_grammar : AnopeGrammar;
-import ircfiber.irc.services_operation : HelpEvidence, readServicesHelp, frameComplete, servicesRevision,
+import ircfiber.irc.services_grammar : AnopeGrammar, ANOPE_20_VERSION, ANOPE_21_VERSION, normalizeServiceText;
+import ircfiber.irc.services_operation : HelpEvidence, readServicesHelp, servicesRevision,
     requireServicesRevision, verifyServicesTarget, putServiceCapability, serviceParam;
+static import ircfiber.irc.services_operation;
 import ircfiber.services.config : ServiceId;
 import ircfiber.services.protocol : ServiceAction, ServiceStatus;
 
@@ -51,6 +52,7 @@ import ircfiber.services.protocol : ServiceAction, ServiceStatus;
 
 /// Installs every account*, personal host* and memo* adapter.
 void registerIdentityServicesOperations() {
+    setLegacyAuthTerminalClassifier(&legacyAuthTerminal);
     reg(ServiceAction.accountInfo, &runAccountInfo);
     reg(ServiceAction.accountIdentify, &runAccountIdentify);
     reg(ServiceAction.accountRegister, &runAccountRegister);
@@ -497,11 +499,27 @@ private string[] refusalMsgids(const string[3][] specific) {
     return out_;
 }
 
+/// Whole, fenced and unambiguous: a `+reply` line the transport could not
+/// place (kept private, absent from `lines`) may have been this request's
+/// answer, so such a frame is treated like a truncated one.
+private bool frameComplete(const ref ServiceFrame f) {
+    return ircfiber.irc.services_operation.frameComplete(f) && !f.ambiguous;
+}
+
 private string incompleteReason(const ref ServiceFrame f) {
     if (f.reason.length) return f.reason;
     if (f.outcome == ServiceFrameOutcome.deadline) return "deadline";
     if (f.truncated) return "truncated";
+    if (f.ambiguous) return "ambiguous_reply";
     return "frame_incomplete";
+}
+
+/// A write frame with an unplaceable `+reply` builds no verdict, data or
+/// details: the unplaced line may be its real answer.
+private bool ambiguousWrite(ServicesTransaction txn, const ref ServiceFrame f) {
+    if (!f.ambiguous) return false;
+    txn.complete(ServiceStatus.unconfirmed, "ambiguous_reply");
+    return true;
 }
 
 /// A read frame that cannot be parsed as a whole answers the request.
@@ -619,6 +637,96 @@ private bool paramBool(ServicesTransaction txn, string key) {
 private long paramLong(ServicesTransaction txn, string key) {
     auto v = txn.request.params[key];
     return v.type == Json.Type.int_ ? v.get!long : 0;
+}
+
+// ── Legacy (untagged) authentication terminal classifier ───────────────────
+
+/// Final replies of IDENTIFY, REGISTER, CONFIRM, GROUP and RECOVER (acks,
+/// effects and every refusal those commands send). A syntax error's
+/// terminal is its `Syntax:` line; the MORE_INFO line that follows it when a
+/// HELP command exists is deliberately not terminal, so every verdict yields
+/// exactly one terminal line.
+private string[] authTerminalMsgids() {
+    string[] ids = [M_IDENTIFY_OK, M_REGISTERED, M_REGISTERED_MASK_20, M_CONFIRMED, M_EMAIL_CONFIRMED_20,
+        M_GROUPED_21, M_GROUPED_20, M_RECOVER_HOLD, M_RECOVER_NONE, M_RECOVER_GHOST, M_RECOVER_REGAINED,
+        M_RECOVER_REMOVED_21, M_RECOVER_REMOVED_20];
+    foreach (list; [COMMON_REFUSALS, IDENTIFY_REFUSALS, REGISTER_REFUSALS, CONFIRM_REFUSALS, GROUP_REFUSALS,
+            RECOVER_REFUSALS])
+        foreach (ref r; list) ids ~= r[0];
+    foreach (m; UNKNOWN_COMMAND) ids ~= m;
+    return ids;
+}
+
+/// printf-style wildcard match over one normalized template segment:
+/// `%s` any text, `%d`/`%u`/`%zu`/`%i` digits, `%N$…` positional, `%%`.
+bool printfSegmentMatch(string tmpl, string line) {
+    if (!tmpl.length) return !line.length;
+    if (tmpl[0] != '%') return line.length && line[0] == tmpl[0] && printfSegmentMatch(tmpl[1 .. $], line[1 .. $]);
+    size_t i = 1;
+    if (i < tmpl.length && tmpl[i] == '%')
+        return line.length && line[0] == '%' && printfSegmentMatch(tmpl[2 .. $], line[1 .. $]);
+    size_t j = i;
+    while (j < tmpl.length && isDigit(tmpl[j])) ++j;
+    if (j < tmpl.length && tmpl[j] == '$') i = j + 1;
+    while (i < tmpl.length && (tmpl[i] == 'z' || tmpl[i] == 'l' || tmpl[i] == 'h')) ++i;
+    if (i >= tmpl.length) return false;
+    const conv = tmpl[i];
+    const rest = tmpl[i + 1 .. $];
+    const digits = conv == 'd' || conv == 'u' || conv == 'i';
+    foreach (k; (digits ? 1 : 0) .. line.length + 1) {
+        if (digits && !isDigit(line[k - 1])) break;
+        if (printfSegmentMatch(rest, line[k .. $])) return true;
+    }
+    return false;
+}
+
+private size_t literalLength(string tmpl) {
+    size_t n;
+    for (size_t i = 0; i < tmpl.length; ++i) {
+        if (tmpl[i] != '%') {
+            ++n;
+            continue;
+        }
+        ++i;
+        while (i < tmpl.length && !"sdui%".canFind(tmpl[i])) ++i;
+    }
+    return n;
+}
+
+private bool authTerminalFor(AnopeGrammar g, string line) {
+    if (!g.supported || !line.length) return false;
+    foreach (v; g.variants(M_SYNTAX))
+        if (v.length && line.stripLeft.startsWith(v ~ ":")) return true;
+    foreach (id; authTerminalMsgids()) {
+        if (g.has(id, line)) return true;
+        foreach (v; g.variants(id)) {
+            // 2.0 `\n` messages end with their last part; 2.1 `LineWrapper`
+            // wraps long replies at spaces, so the last physical line is a
+            // space-aligned tail (long enough not to match stray text).
+            const nl = v.lastIndexOf('\n');
+            const last = nl < 0 ? v : v[nl + 1 .. $];
+            if (nl >= 0 && printfSegmentMatch(last, line)) return true;
+            foreach (k, ch; last)
+                if (ch == ' ' && k + 1 < last.length) {
+                    const tail = last[k + 1 .. $];
+                    if (literalLength(tail) >= 20 && printfSegmentMatch(tail, line)) return true;
+                }
+        }
+    }
+    return false;
+}
+
+/// Transport classifier for untagged (legacy) authentication resolution:
+/// true iff `plainLine` is the terminal reply of IDENTIFY, REGISTER,
+/// CONFIRM, GROUP or RECOVER (any alias of them) in English or any shipped
+/// locale of the endpoint's release; both releases when it is unknown.
+/// Unsolicited notices (memo arrival, nick protection, vhost activation,
+/// confirmation prompts) and unknown text are false.
+bool legacyAuthTerminal(string versionText, string plainLine) {
+    const line = normalizeServiceText(plainLine);
+    auto g = grammarFor(versionText);
+    if (g.supported) return authTerminalFor(g, line);
+    return authTerminalFor(grammarFor(ANOPE_21_VERSION), line) || authTerminalFor(grammarFor(ANOPE_20_VERSION), line);
 }
 
 // ── NickServ INFO ──────────────────────────────────────────────────────────
@@ -933,6 +1041,7 @@ private void runAccountIdentify(ServicesTransaction txn, AnopeGrammar g) {
     };
     requireHelp(txn, "IDENTIFY", ServiceAction.accountIdentify, () {
         txn.frame(writeSpec(txn, body_, ServiceFrameKind.asyncAuth, terminal), (ServiceFrame f) {
+            if (ambiguousWrite(txn, f)) return;
             auto e = evaluateIdentify(g, f);
             auto details = hasPrivateText(g, f) ? null : txn.details(f.lines);
             if (e.conflicting) return completeConflict(txn, details);
@@ -1034,6 +1143,7 @@ private void runAccountRegister(ServicesTransaction txn, AnopeGrammar g) {
         // REGISTER is synchronous (no IdentifyRequest); its login and
         // confirmation prompts precede the end fence.
         txn.frame(writeSpec(txn, body_, ServiceFrameKind.ordinary), (ServiceFrame f) {
+            if (ambiguousWrite(txn, f)) return;
             auto e = evaluateRegister(g, f);
             auto details = hasPrivateText(g, f) ? null : txn.details(f.lines);
             if (e.conflicting) return completeConflict(txn, details);
@@ -1088,6 +1198,7 @@ private void runAccountConfirm(ServicesTransaction txn, AnopeGrammar g) {
     if (!fitsOrReject(txn, body_)) return;
     requireHelp(txn, confirmCommand(g), ServiceAction.accountConfirm, () {
         txn.frame(writeSpec(txn, body_, ServiceFrameKind.ordinary), (ServiceFrame f) {
+            if (ambiguousWrite(txn, f)) return;
             auto e = evaluateConfirm(g, f);
             auto details = hasPrivateText(g, f) ? null : txn.details(f.lines);
             if (e.conflicting) return completeConflict(txn, details);
@@ -1112,11 +1223,47 @@ private void runAccountConfirm(ServicesTransaction txn, AnopeGrammar g) {
 
 // ── GLIST / GROUP ──────────────────────────────────────────────────────────
 
+/// Anope 2.1 `LineWrapper` (src/misc.cpp, used by every User::SendMessage)
+/// splits a reply longer than `options:linelength` (default 100, kept by
+/// the managed config) at the last space before the limit, so one list row
+/// can continue on the next line (e.g. a GLIST row's `(90 days from now)`).
+/// Anope 2.0 never wraps.
+private enum size_t ANOPE21_LINE_LENGTH = 100;
+
+/// `cur` can be the wrapped continuation of `prev`: the word that starts it
+/// would not have fitted on `prev` (LineWrapper breaks once the printable
+/// length reaches the limit, at the last space).
+bool wrapContinuation(string prevPlain, string curPlain) {
+    if (!curPlain.length) return false;
+    const sp = curPlain.indexOf(' ');
+    const word = sp < 0 ? curPlain.length : cast(size_t) sp;
+    return prevPlain.length + 1 + word >= ANOPE21_LINE_LENGTH;
+}
+
 /// Own-account GLIST (ns_group.cpp CommandNSGList): FIXED/MONOSPACE table,
 /// or 2.1 FLEXIBLE rows, framed by the header and the count footer.
 struct GroupList {
     bool ok;
     string[] nicks;
+}
+
+/// Fixed-table row: the nick, then column padding plus the two-space
+/// separator (ListFormatter), then the next column.
+private bool glistRow(string text, out string nick) {
+    if (!text.length || text[0] == ' ') return false;
+    const sp = text.indexOf(' ');
+    if (sp <= 0 || !text[sp .. $].startsWith("  ")) return false;
+    const rest = text[sp .. $].stripLeft;
+    if (!rest.length) return false;
+    nick = text[0 .. sp];
+    return true;
+}
+
+private bool glistFlexibleRow(AnopeGrammar g, string line, out string nick) {
+    string[string] v;
+    if (!templateRow(g, M_GLIST_ROW_EXPIRES_21, line, v) && !templateRow(g, M_GLIST_ROW_21, line, v)) return false;
+    nick = v.get("nick", "").strip;
+    return nick.length && !nick.canFind(' ');
 }
 
 GroupList parseGroupList(AnopeGrammar g, const ref ServiceFrame f) {
@@ -1138,33 +1285,48 @@ GroupList parseGroupList(AnopeGrammar g, const ref ServiceFrame f) {
             break;
         }
     }
-    if (header < 0 || footer < 0 || footer <= header + 1) return r;
+    if (header < 0 || footer < 0 || footer <= header + 1 || count == 0) return r;
     auto rows = f.lines[header + 1 .. footer];
-    string[string] vars;
-    const flexible = g.v21 && (templateRow(g, M_GLIST_ROW_EXPIRES_21, rows[0].plain, vars)
-        || templateRow(g, M_GLIST_ROW_21, rows[0].plain, vars));
-    if (flexible) {
-        foreach (ref l; rows) {
-            string[string] v;
-            if (!templateRow(g, M_GLIST_ROW_EXPIRES_21, l.plain, v) && !templateRow(g, M_GLIST_ROW_21, l.plain, v))
-                return r;
-            auto nick = v.get("nick", "").strip;
-            if (!nick.length || nick.canFind(' ')) return r;
-            r.nicks ~= nick;
+
+    // 2.1 FLEXIBLE: each row a translated template; a wrapped row's tail
+    // (a line that is no row itself) joins it with the space it was split at.
+    string[] flexible;
+    bool flexOk = g.v21;
+    for (size_t i = 0; flexOk && i < rows.length;) {
+        string logical = rows[i].plain;
+        size_t j = i + 1;
+        string nick;
+        while (j < rows.length && !glistFlexibleRow(g, rows[j].plain, nick)
+                && wrapContinuation(rows[j - 1].plain, rows[j].plain)) {
+            logical ~= " " ~ rows[j].plain;
+            ++j;
         }
-    } else {
-        // rows[0] is the translated column header; "  " starts a wrapped
-        // continuation of the previous row.
-        foreach (ref l; rows[1 .. $]) {
-            const text = rowText(l);
-            if (text.startsWith(" ")) continue;
-            const sp = text.indexOf(' ');
-            const nick = sp < 0 ? text : text[0 .. sp];
-            if (!nick.length) return r;
-            r.nicks ~= nick;
-        }
+        if (!glistFlexibleRow(g, logical, nick)) flexOk = false;
+        else flexible ~= nick;
+        i = j;
     }
-    r.ok = r.nicks.length == count && count > 0;
+    if (flexOk && flexible.length == count) {
+        r.nicks = flexible;
+        r.ok = true;
+        return r;
+    }
+
+    // FIXED/MONOSPACE: rows[0] is the translated column header. A line
+    // starting with "  " is ListFormatter's own column break; on 2.1 a line
+    // that is no row but continues the previous one is a LineWrapper tail.
+    string prev = rows[0].plain;
+    foreach (ref l; rows[1 .. $]) {
+        const text = rowText(l);
+        string nick;
+        if (glistRow(text, nick)) r.nicks ~= nick;
+        else if (text.startsWith(" ")) {
+        } else if (!g.v21 || !r.nicks.length || !wrapContinuation(prev, l.plain)) {
+            r.nicks = null;
+            return r;
+        }
+        prev = l.plain;
+    }
+    r.ok = r.nicks.length == count;
     return r;
 }
 
@@ -1238,6 +1400,7 @@ private void runAccountGroup(ServicesTransaction txn, AnopeGrammar g) {
     };
     requireHelp(txn, "GROUP", ServiceAction.accountGroup, () {
         txn.frame(writeSpec(txn, body_, ServiceFrameKind.asyncAuth, terminal), (ServiceFrame f) {
+            if (ambiguousWrite(txn, f)) return;
             auto e = evaluateGroup(g, f);
             auto details = txn.details(f.lines);
             if (e.conflicting) return completeConflict(txn, details);
@@ -1316,6 +1479,7 @@ private void runAccountRecover(ServicesTransaction txn, AnopeGrammar g) {
     };
     requireHelp(txn, "RECOVER", ServiceAction.accountRecover, () {
         txn.frame(writeSpec(txn, body_, ServiceFrameKind.asyncAuth, terminal), (ServiceFrame f) {
+            if (ambiguousWrite(txn, f)) return;
             auto e = evaluateRecover(g, f);
             auto details = txn.details(f.lines);
             if (e.conflicting) return completeConflict(txn, details);
@@ -1411,6 +1575,7 @@ private void runAccountPrivacy(ServicesTransaction txn, AnopeGrammar g) {
                     accountCanonical(before.account, true, !before.unconfirmed)), nickInfoJson(before),
                     Json.undefined)) return;
             txn.frame(writeSpec(txn, body_, ServiceFrameKind.ordinary), (ServiceFrame f) {
+                if (ambiguousWrite(txn, f)) return;
                 const accepted = privacyAccepted(g, f, field, enabled, account, txn.endpoint.nick, &txn.sameNick);
                 auto details = txn.details(f.lines);
                 if (!accepted) {
@@ -1625,6 +1790,7 @@ private void runHostRequest(ServicesTransaction txn, AnopeGrammar g) {
                 return;
             }
             txn.frame(writeSpec(txn, body_, ServiceFrameKind.ordinary), (ServiceFrame f) {
+                if (ambiguousWrite(txn, f)) return;
                 string mask;
                 const accepted = hostRequestAccepted(g, f, mask);
                 // The DNS variant carries a validation token: recognised
@@ -1673,6 +1839,7 @@ private void runHostOn(ServicesTransaction txn, AnopeGrammar g) {
     requireHelp(txn, "ON", ServiceAction.hostOn, () {
         hostPrecheck(txn, g, (HostState s) {
             txn.frame(writeSpec(txn, "ON", ServiceFrameKind.ordinary), (ServiceFrame f) {
+                if (ambiguousWrite(txn, f)) return;
                 string mask;
                 const accepted = hostOnAccepted(g, f, mask);
                 auto details = txn.details(f.lines);
@@ -1719,6 +1886,7 @@ private void runHostOff(ServicesTransaction txn, AnopeGrammar g) {
     requireHelp(txn, "OFF", ServiceAction.hostOff, () {
         hostPrecheck(txn, g, (HostState s) {
             txn.frame(writeSpec(txn, "OFF", ServiceFrameKind.ordinary), (ServiceFrame f) {
+                if (ambiguousWrite(txn, f)) return;
                 const accepted = g.has(M_HOST_OFF, f);
                 auto details = txn.details(f.lines);
                 if (!accepted) {
@@ -1837,14 +2005,27 @@ MemoInbox parseMemoList(AnopeGrammar g, const ref ServiceFrame f) {
     }
     if (!g.matches(M_MEMO_LIST_HEADER, lines[0].plain, c) || lines.length < 2) return r;
     auto rows = lines[1 .. $];
-    MemoEntry e;
-    const flexible = g.v21 && parseFlexibleMemoRow(g, rows[0].plain, e);
+    MemoEntry probe;
+    // A header row never matches the flexible template.
+    const flexible = g.v21 && parseFlexibleMemoRow(g, rows[0].plain, probe);
+    string prev = rows[0].plain;
     foreach (ref l; flexible ? rows : rows[1 .. $]) {
         MemoEntry entry;
-        if (!(flexible ? parseFlexibleMemoRow(g, l.plain, entry) : parseMemoRow(rowText(l), entry))) return r;
-        // A full LIST is positional: 1..n with no gaps.
-        if (entry.number != r.entries.length + 1) return r;
-        r.entries ~= entry;
+        if (flexible ? parseFlexibleMemoRow(g, l.plain, entry) : parseMemoRow(rowText(l), entry)) {
+            // A full LIST is positional: 1..n with no gaps.
+            if (entry.number != r.entries.length + 1) {
+                r.entries = null;
+                return r;
+            }
+            r.entries ~= entry;
+        } else if (g.v21 && r.entries.length && wrapContinuation(prev, l.plain)) {
+            // LineWrapper tail of the previous row: its last column (date).
+            r.entries[$ - 1].sentAt ~= " " ~ l.plain.strip;
+        } else {
+            r.entries = null;
+            return r;
+        }
+        prev = l.plain;
     }
     r.ok = r.entries.length > 0;
     return r;
@@ -1928,13 +2109,90 @@ private void runMemoList(ServicesTransaction txn, AnopeGrammar g) {
     });
 }
 
+/// Anchored printf capture over one normalized template, in argument order
+/// (`%N$` reordering honoured). `%d`/`%u`/`%i`/`%zu` take digits; arguments
+/// flagged in `noSpace` are non-empty and space-free (nicks). The shortest
+/// reading of every free `%s` that lets the rest match is taken, so a final
+/// free-text argument (a date) runs up to the template's closing literal.
+bool printfCapture(string tmpl, string line, const bool[] noSpace, out string[] caps) {
+    string[size_t] found;
+    bool rec(string t, string l, size_t nextArg) {
+        if (!t.length) return !l.length;
+        if (t[0] != '%') return l.length && l[0] == t[0] && rec(t[1 .. $], l[1 .. $], nextArg);
+        if (t.length > 1 && t[1] == '%') return l.length && l[0] == '%' && rec(t[2 .. $], l[1 .. $], nextArg);
+        size_t i = 1, j = 1;
+        while (j < t.length && isDigit(t[j])) ++j;
+        size_t arg = nextArg, next = nextArg + 1;
+        if (j > 1 && j < t.length && t[j] == '$') {
+            arg = t[1 .. j].to!size_t - 1;
+            next = nextArg;
+            i = j + 1;
+        }
+        while (i < t.length && (t[i] == 'z' || t[i] == 'l' || t[i] == 'h')) ++i;
+        if (i >= t.length) return false;
+        const conv = t[i];
+        const rest = t[i + 1 .. $];
+        const digits = conv == 'd' || conv == 'u' || conv == 'i';
+        const tight = arg < noSpace.length && noSpace[arg];
+        foreach (k; (digits || tight ? 1 : 0) .. l.length + 1) {
+            if (k > 0) {
+                const ch = l[k - 1];
+                if ((digits && !isDigit(ch)) || (tight && ch == ' ')) break;
+            }
+            const v = l[0 .. k];
+            if (auto p = arg in found) {
+                if (*p == v && rec(rest, l[k .. $], next)) return true;
+                continue;
+            }
+            found[arg] = v;
+            if (rec(rest, l[k .. $], next)) return true;
+            found.remove(arg);
+        }
+        return false;
+    }
+    if (!rec(tmpl, line, 0)) return false;
+    foreach (a; 0 .. found.length) {
+        auto p = a in found;
+        if (p is null) return false;
+        caps ~= *p;
+    }
+    return true;
+}
+
+/// `Memo %d from %s (%s).` — the date comes from `Anope::strftime`, which
+/// appends a translated `(%s ago)` / `(%s from now)` / `(now)`, so the
+/// generic matcher finds the sender/date split ambiguous. The sender is a
+/// nick (no spaces) and the date runs to the closing `).`.
+private bool memoReadHeader(AnopeGrammar g, string line, out string[] caps) {
+    if (g.matches(M_MEMO_READ_HEADER, line, caps) && caps.length >= 3) return true;
+    foreach (v; g.variants(M_MEMO_READ_HEADER))
+        if (printfCapture(v, line, [false, true, false], caps) && caps.length >= 3) return true;
+    caps = null;
+    return false;
+}
+
+/// The optional delete hint naming exactly this memo number.
+private bool memoReadHint(AnopeGrammar g, string line, uint expected) {
+    const want = expected.to!string;
+    foreach (m; [M_MEMO_READ_HINT_21, M_MEMO_READ_HINT_20]) {
+        string[] h;
+        if (g.matches(m, line, h) && h.length && h[$ - 1] == want) return true;
+        foreach (v; g.variants(m))
+            if (printfCapture(v, line, null, h) && h.length && h[$ - 1] == want) return true;
+    }
+    return false;
+}
+
 /// One memo READ (ms_read.cpp DoRead): header, optional delete hint, then
 /// body. The body is attacker-controlled and may imitate a header, so only
 /// the first line can be the header and everything after it is body. A
-/// partial frame (deadline, truncation) never yields text. With `+reply`
-/// correlation only lines answering our READ count (MemoServ's untagged
-/// arrival notices are not body); without it, an arrival notice in the
-/// window makes the body ambiguous and nothing is returned.
+/// partial frame (deadline, truncation) never yields text. Anope 2.1 tags
+/// CommandSource replies with `+reply` (users.cpp): on a correlated frame
+/// only lines answering our READ count (MemoServ's untagged arrival notices
+/// are not body). Anope 2.0 never tags replies, so even a frame whose own
+/// msgid was learned from an echo collects them untagged; there (and on any
+/// uncorrelated frame) an arrival notice in the window makes the body
+/// ambiguous and nothing is returned.
 struct MemoReadView {
     bool ok;
     uint number;
@@ -1947,7 +2205,7 @@ MemoReadView parseMemoRead(AnopeGrammar g, const ref ServiceFrame f, uint expect
     MemoReadView r;
     if (!frameComplete(f)) return r;
     const(ServiceReplyLine)[] lines;
-    if (f.replyCorrelated) {
+    if (g.v21 && f.replyCorrelated) {
         foreach (ref l; f.lines)
             if (l.attribution == ServiceReplyAttribution.reply) lines ~= l;
     } else {
@@ -1955,17 +2213,18 @@ MemoReadView parseMemoRead(AnopeGrammar g, const ref ServiceFrame f, uint expect
         lines = f.lines;
     }
     if (lines.length < 2) return r;
+    // The header may be wrapped by 2.1's LineWrapper (long nick/locale
+    // date): it is the first line, or the first two joined by one space.
     string[] c;
-    if (!g.matches(M_MEMO_READ_HEADER, lines[0].plain, c) || c.length < 3) return r;
+    size_t start;
+    if (memoReadHeader(g, lines[0].plain, c)) start = 1;
+    else if (lines.length >= 3 && memoReadHeader(g, lines[0].plain ~ " " ~ lines[1].plain, c)) start = 2;
+    else return r;
     if (c[0] != expected.to!string) return r;
     r.number = expected;
     r.sender = c[1];
     r.sentAt = c[2];
-    size_t start = 1;
-    string[] h;
-    if ((g.matches(M_MEMO_READ_HINT_21, lines[1].plain, h) || g.matches(M_MEMO_READ_HINT_20, lines[1].plain, h))
-            && h.length && h[$ - 1] == expected.to!string)
-        start = 2;
+    if (start < lines.length && memoReadHint(g, lines[start].plain, expected)) ++start;
     if (start >= lines.length) return r;
     string[] body_;
     foreach (ref l; lines[start .. $]) body_ ~= l.plain;
@@ -2013,6 +2272,7 @@ private void runMemoRead(ServicesTransaction txn, AnopeGrammar g) {
             }
             // READ marks the memo read: a mutation with one number only.
             txn.frame(writeSpec(txn, "READ " ~ number.to!string, ServiceFrameKind.ordinary), (ServiceFrame f) {
+                if (ambiguousWrite(txn, f)) return;
                 auto memo = parseMemoRead(g, f, number);
                 if (!memo.ok) {
                     ServiceStatus st;
@@ -2022,7 +2282,7 @@ private void runMemoRead(ServicesTransaction txn, AnopeGrammar g) {
                     // whose first line is the refusal counts.
                     if (firstLineRefusal(g, f, MEMO_REFUSALS, st, why)) txn.complete(st, why);
                     else if (!frameComplete(f)) txn.complete(ServiceStatus.unconfirmed, incompleteReason(f));
-                    else if (!f.replyCorrelated && g.hasAny(MEMO_ARRIVALS, f))
+                    else if (!(g.v21 && f.replyCorrelated) && g.hasAny(MEMO_ARRIVALS, f))
                         txn.complete(ServiceStatus.unconfirmed, "ambiguous_reply");
                     else txn.complete(ServiceStatus.unconfirmed, f.lines.length ? "unrecognized_reply" : "no_reply");
                     return;
@@ -2065,6 +2325,7 @@ private void runMemoSend(ServicesTransaction txn, AnopeGrammar g) {
                 recipient.startsWith("#") ? "" : targetNick, (bool ok) {
             if (!ok) return;
             txn.frame(writeSpec(txn, body_, ServiceFrameKind.ordinary), (ServiceFrame f) {
+                if (ambiguousWrite(txn, f)) return;
                 // Only recognised texts: an unknown-command echo would carry the memo.
                 auto details = recognizedDetails(txn, g, f, [M_MEMO_SENT] ~ refusalMsgids(MEMO_SEND_REFUSALS));
                 if (memoSent(g, f, recipient, &txn.sameNick)) {
@@ -2110,6 +2371,7 @@ private void runMemoDelete(ServicesTransaction txn, AnopeGrammar g) {
             }
             txn.frame(writeSpec(txn, "DEL " ~ n.to!string, ServiceFrameKind.ordinary, null, memoArrivalRelease(g)),
                     (ServiceFrame f) {
+                if (ambiguousWrite(txn, f)) return;
                 auto details = recognizedDetails(txn, g, f, [M_MEMO_DELETED] ~ refusalMsgids(MEMO_REFUSALS));
                 if (!memoDeleted(g, f, n)) {
                     ServiceStatus st;
@@ -2384,6 +2646,10 @@ unittest {
     auto truncated = testFrame(lines);
     truncated.truncated = true;
     assert(!parseMemoRead(g, truncated, 1).ok, "truncated frame must not yield a memo");
+    auto unplaced = testFrame(lines);
+    unplaced.ambiguous = true;
+    assert(!parseMemoRead(g, unplaced, 1).ok, "an unplaceable +reply makes the frame unusable");
+    assert(incompleteReason(unplaced) == "ambiguous_reply");
     // Correlated: the untagged arrival notice is not READ output.
     auto correlated = testFrame(["Memo 1 from bob (Nov 06 2026).",
         "You have a new memo from mallory. Type \x02/msg MemoServ READ\x1B2\x02 to read it.", "hello"]);
@@ -2396,4 +2662,133 @@ unittest {
     auto plain = testFrame(["Memo 1 from bob (Nov 06 2026).",
         "You have a new memo from mallory. Type \x02/msg MemoServ READ\x1B2\x02 to read it.", "hello"]);
     assert(!parseMemoRead(g, plain, 1).ok);
+}
+
+@("services identity: legacy auth terminal classifier")
+unittest {
+    // Acks and refusals, English and translated, any release.
+    assert(legacyAuthTerminal(TEST_V21, "Password accepted - you are now recognized."));
+    assert(legacyAuthTerminal(TEST_V21, "Passwort akzeptiert - Du bist jetzt angemeldet."));
+    assert(legacyAuthTerminal(TEST_V20, "Password incorrect."));
+    assert(legacyAuthTerminal(TEST_V20, "Please wait 30 seconds before using the GROUP command again."));
+    assert(legacyAuthTerminal(TEST_V21, "Unknown command \x02ID\x02. Type \x02/msg NickServ HELP\x02 for help."));
+    // 2.0 two-line RECOVER removal: its last part ends the reply.
+    assert(legacyAuthTerminal(TEST_V20, "to release services's hold on your nick."));
+    // Unknown release: union of both.
+    assert(legacyAuthTerminal("", "You are now in the group of \x02alice\x02."));
+    assert(legacyAuthTerminal("", "Your nickname now belongs to the account \x02alice\x02."));
+    // Unsolicited notices and unknown text are not terminal.
+    assert(!legacyAuthTerminal(TEST_V21, "You have a new memo from bob. Type \x02/msg MemoServ READ\x1B3\x02 to read it."));
+    assert(!legacyAuthTerminal(TEST_V21, "Your vhost of \x02cool.example\x02 is now activated."));
+    assert(!legacyAuthTerminal(TEST_V21, "All new accounts must be confirmed by an administrator. Please wait for your registration to be confirmed."));
+    assert(!legacyAuthTerminal(TEST_V21, "hello world"));
+    assert(printfSegmentMatch("Please wait %d seconds.", "Please wait 12 seconds."));
+    assert(!printfSegmentMatch("Please wait %d seconds.", "Please wait x seconds."));
+    // A syntax error yields exactly one terminal: `Syntax:`, not MORE_INFO.
+    assert(legacyAuthTerminal(TEST_V21, "Syntax: \x02REGISTER \x1Fpassword\x1F \x1F[email]\x1F\x02"));
+    assert(!legacyAuthTerminal(TEST_V21, "Type \x02/msg NickServ HELP REGISTER\x02 for more information."));
+    assert(!legacyAuthTerminal(TEST_V20, "\x02/msg NickServ HELP REGISTER\x02 for more information."));
+}
+
+@("services identity: memo READ header with Anope::strftime's relative age")
+unittest {
+    auto g = new AnopeGrammar(TEST_V21);
+    // ms_read.cpp: `Memo %d from %s (%s).` with strftime "<%c> (<n> ago)".
+    auto f = testFrame(["Memo 1 from bob (Thu Nov  6 12:00:00 2026 (5 seconds ago)).",
+        "To delete, type: \x02/msg MemoServ DEL\x1B1\x02", "hello there"]);
+    auto r = parseMemoRead(g, f, 1);
+    assert(r.ok && r.sender == "bob" && r.sentAt == "Thu Nov  6 12:00:00 2026 (5 seconds ago)");
+    assert(r.text == "hello there", "the delete hint is not body");
+    auto now = testFrame(["Memo 2 from carol (Thu Nov  6 12:00:00 2026 (now)).", "hi"]);
+    auto rn = parseMemoRead(g, now, 2);
+    assert(rn.ok && rn.sender == "carol" && rn.text == "hi");
+    // LineWrapper split of a long header: first two lines joined.
+    auto wrapped = testFrame(["Memo 3 from averyveryverylongnicknameindeed (Thursday 6 November 2026",
+        "12:00:00 (5 seconds ago)).", "body"]);
+    auto rw = parseMemoRead(g, wrapped, 3);
+    assert(rw.ok && rw.sender == "averyveryverylongnicknameindeed" && rw.text == "body");
+    // A body line imitating a dated header stays body.
+    auto fake = testFrame(["Memo 4 from bob (Thu Nov  6 2026 (now)).",
+        "Memo 5 from mallory (Thu Nov  6 2026 (now)).", "x"]);
+    auto rf = parseMemoRead(g, fake, 4);
+    assert(rf.ok && rf.sender == "bob" && rf.text == "Memo 5 from mallory (Thu Nov  6 2026 (now)).\nx");
+    string[] caps;
+    assert(printfCapture("%2$s hat %1$s (%3$s).", "bob hat 7 (a (b)).", [false, true, false], caps)
+        && caps == ["7", "bob", "a (b)"]);
+}
+
+@("services identity: Anope 2.0 memo READ (untagged, echo-correlated frame)")
+unittest {
+    auto g = new AnopeGrammar(TEST_V20);
+    // 2.0 ms_read.cpp DoRead: header with Anope::strftime "%b %d %H:%M:%S %Y %Z (%s ago)",
+    // hint `To delete, type: \002%s%s %s %d\002` (StrictPrivmsg "/msg ", nick, DEL), body.
+    string[] lines = ["Memo 1 from bob (Nov 06 12:00:00 2026 UTC (5 seconds ago)).",
+        "To delete, type: \x02/msg MemoServ DEL 1\x02", "hello from 2.0"];
+    auto f = testFrame(lines);
+    // Own msgid learned from echo-message, but 2.0 sends no +reply: lines are window.
+    f.replyCorrelated = true;
+    auto r = parseMemoRead(g, f, 1);
+    assert(r.ok && r.sender == "bob" && r.sentAt == "Nov 06 12:00:00 2026 UTC (5 seconds ago)");
+    assert(r.text == "hello from 2.0", "the 2.0 delete hint is not body");
+    auto strict = testFrame(["Memo 2 from carol (Nov 06 12:00:00 2026 UTC (now)).",
+        "To delete, type: \x02/MemoServ DEL 2\x02", "hi"]);
+    auto rs = parseMemoRead(g, strict, 2);
+    assert(rs.ok && rs.sender == "carol" && rs.text == "hi");
+    // The 2.0 two-line arrival notice in the window makes the body ambiguous.
+    auto arrival = testFrame(["Memo 1 from bob (Nov 06 12:00:00 2026 UTC (5 seconds ago)).",
+        "You have a new memo from mallory.", "Type \x02/msg MemoServ READ 2\x02 to read it.", "hello"]);
+    arrival.replyCorrelated = true;
+    assert(!parseMemoRead(g, arrival, 1).ok);
+    // 2.1 keeps strict +reply attribution: untagged window lines are not READ output.
+    auto g21 = new AnopeGrammar(TEST_V21);
+    auto untagged = testFrame(["Memo 1 from bob (Thu Nov  6 12:00:00 2026 (now)).", "x"]);
+    untagged.replyCorrelated = true;
+    assert(!parseMemoRead(g21, untagged, 1).ok);
+}
+
+@("services identity: GLIST exactly as the live fixtures send it (2.1 LineWrapper, 2.0 fixed)")
+unittest {
+    // Managed 2.1 fixture, verbatim: the row exceeds linelength 100 and
+    // LineWrapper moves `(90 days from now)` onto its own line.
+    auto g = new AnopeGrammar(TEST_V21);
+    auto managed = testFrame(["List of nicknames belonging to your account:",
+        "Nick        Registered                                            Expires",
+        "fixoffline  Sat Nov  7 01:08:31 2026 (5 minutes, 54 seconds ago)  Fri 05 Feb 2027 01:08:31 AM UTC",
+        "(90 days from now)",
+        "1 nickname in the account."]);
+    auto r = parseGroupList(g, managed);
+    assert(r.ok && r.nicks == ["fixoffline"]);
+    // Two grouped nicks, the first row wrapped, the second not.
+    auto two = testFrame(["List of nicknames belonging to your account:",
+        "Nick          Registered                                            Expires",
+        "fixoffline    Sat Nov  7 01:08:31 2026 (5 minutes, 54 seconds ago)  Fri 05 Feb 2027 01:08:31 AM UTC",
+        "(90 days from now)",
+        "fixoffline_2  Sat Nov  7 01:10:00 2026 (4 minutes ago)  does not expire",
+        "2 nicknames in the account."]);
+    r = parseGroupList(g, two);
+    assert(r.ok && r.nicks == ["fixoffline", "fixoffline_2"]);
+    // A short stray line after a short row is no wrap: the reply is not understood.
+    auto stray = testFrame(["List of nicknames belonging to your account:", "Nick   Registered  Expires",
+        "alice  Nov 7 2026  never", "(stray)", "1 nickname in the account."]);
+    assert(!parseGroupList(g, stray).ok);
+    // Flexible 2.1 row wrapped after its registered date.
+    auto flex = testFrame(["List of nicknames belonging to your account:",
+        "\x02fixoffline\x02: registered on Sat Nov  7 01:08:31 2026 (5 minutes, 54 seconds ago); expires in Fri 05",
+        "Feb 2027 01:08:31 AM UTC (90 days from now)", "1 nickname in the account."]);
+    r = parseGroupList(g, flex);
+    assert(r.ok && r.nicks == ["fixoffline"]);
+    // External 2.0.20 fixture, verbatim (no wrapping in 2.0).
+    auto g20 = new AnopeGrammar(TEST_V20);
+    auto external = testFrame(["List of nicknames in your group:", "Nick       Expires",
+        "extmember  Nov 28 01:09:27 2026 UTC (20 days, 23 hours, 54 minutes from now)",
+        "1 nickname(s) in the group."]);
+    r = parseGroupList(g20, external);
+    assert(r.ok && r.nicks == ["extmember"]);
+    // A memo LIST row wrapped the same way keeps its whole date.
+    auto memos = testFrame(["Memos for fixoffline:", "Number  Sender                          Date/Time",
+        "* 1     averyveryverylongsendernickname  Sat Nov  7 01:08:31 2026 (5 minutes, 54 seconds ago) and",
+        "more", "  2     bob                             Sat Nov  7 01:09:00 2026 (now)"]);
+    auto inbox = parseMemoList(g, memos);
+    assert(inbox.ok && inbox.entries.length == 2
+        && inbox.entries[0].sentAt == "Sat Nov  7 01:08:31 2026 (5 minutes, 54 seconds ago) and more");
 }

@@ -24,7 +24,7 @@ import vibe.data.json : Json, parseJsonString;
 
 import ircfiber.irc.parser : parseIRCLineNamed;
 import ircfiber.irc.services;
-import ircfiber.irc.connection : servicesTransportWireChecks;
+import ircfiber.irc.connection : servicesTransportWireChecks, servicesLegacyMetaChecks;
 import ircfiber.irc.services_grammar : servicesGrammarChecks;
 import ircfiber.irc.services_operation : servicesOperationChecks;
 import ircfiber.irc.services_channel : channelServicesChecks;
@@ -805,6 +805,8 @@ int main() {
     transportChecks();
     mutationPreflightChecks();
     frameBoundsChecks();
+    foreach (c; servicesLegacyAuthChecks()) ok(c.name, c.passed);
+    foreach (c; servicesLegacyMetaChecks()) ok(c.name, c.passed);
     servicesGrammarChecks((n, c) => ok(n, c));
     servicesOperationChecks((n, c) => ok(n, c));
     channelServicesChecks((n, c) => ok(n, c));

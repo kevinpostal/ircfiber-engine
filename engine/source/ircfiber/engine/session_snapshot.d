@@ -155,6 +155,10 @@ struct SessionSnapshot {
     /// fence tokens, commands, credentials or reply text.
     string[] servicesQuietPrefixes;
     long servicesQuietUntilMs;
+    /// Legacy NickServ authentication commands (manual/automatic) sent on
+    /// this socket whose verdict had not arrived: a count only, no text.
+    /// Restored on any attach to the same held socket; 0 in older META.
+    long servicesLegacyAuthPending;
 
     // ── Egress bookkeeping (Mullvad slot the session rides) ──────────
     /// Slot label ("" = direct).
@@ -203,6 +207,7 @@ Json toJSON(ref SessionSnapshot s) {
     j["servicesAccount"] = s.servicesAccount;
     j["servicesQuietPrefixes"] = jsonArrayOf(s.servicesQuietPrefixes);
     j["servicesQuietUntilMs"] = s.servicesQuietUntilMs;
+    j["servicesLegacyAuthPending"] = s.servicesLegacyAuthPending;
 
     auto cfg = Json.emptyObject;
     cfg["id"] = s.config.id.toString();
@@ -352,6 +357,19 @@ SessionSnapshot fromJSON(Json j) {
     if (isArr(j["servicesQuietPrefixes"]))
         foreach (v; j["servicesQuietPrefixes"]) s.servicesQuietPrefixes ~= str(v);
     s.servicesQuietUntilMs = integer(j["servicesQuietUntilMs"]);
+    {
+        // Absent (older META): 0, by contract. Present but not a sane count
+        // (wrong type, negative, beyond the bound): fail closed — 64 saturates
+        // the next engine's ledger, so structured authentication waits for a
+        // real verdict or a new socket rather than trusting garbage as "none".
+        auto v = j["servicesLegacyAuthPending"];
+        if (v.type == Json.Type.undefined) s.servicesLegacyAuthPending = 0;
+        else if (v.type != Json.Type.int_) s.servicesLegacyAuthPending = 64;
+        else {
+            const pending = v.get!long;
+            s.servicesLegacyAuthPending = pending < 0 || pending > 64 ? 64 : pending;
+        }
+    }
 
     auto cfg = j["config"];
     if (isObj(cfg)) {
@@ -486,6 +504,19 @@ unittest {
     auto quiet = fromJSON(toJSON(s));
     assert(quiet.servicesQuietPrefixes == ["NickServ!services@services.example"]
         && quiet.servicesQuietUntilMs == 1_700_000_030_000);
+    // The legacy-auth handoff is a bounded count; older META reads 0.
+    assert(old.servicesLegacyAuthPending == 0);
+    s.servicesLegacyAuthPending = 2;
+    assert(fromJSON(toJSON(s)).servicesLegacyAuthPending == 2);
+    auto hostile = toJSON(s);
+    hostile["servicesLegacyAuthPending"] = 1_000_000;
+    assert(fromJSON(hostile).servicesLegacyAuthPending == 64);
+    hostile["servicesLegacyAuthPending"] = -1;
+    assert(fromJSON(hostile).servicesLegacyAuthPending == 64, "a corrupt present count fails closed");
+    hostile["servicesLegacyAuthPending"] = "2";
+    assert(fromJSON(hostile).servicesLegacyAuthPending == 64, "a mistyped present count fails closed");
+    hostile.remove("servicesLegacyAuthPending");
+    assert(fromJSON(hostile).servicesLegacyAuthPending == 0, "an absent count is an older engine's META");
 
     auto bad = Json.emptyObject;
     bad["schemaTag"] = "IRCFv0";

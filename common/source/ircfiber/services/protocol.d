@@ -287,6 +287,23 @@ bool isAuthentication(ServiceAction action) pure nothrow {
         || action == ServiceAction.accountRecover;
 }
 
+/// Anope tokenizes command parameters; reject text it would silently normalize.
+bool canonicalServicesSpacing(string text) @safe pure nothrow @nogc {
+    if (!text.length) return true;
+    if (text[0] == ' ' || text[$ - 1] == ' ') return false;
+    foreach (i; 1 .. text.length)
+        if (text[i] == ' ' && text[i - 1] == ' ') return false;
+    return true;
+}
+
+string servicesNativeParamRejection(const ref ServicesRequest request) {
+    string key;
+    if (request.action == ServiceAction.channelTopicSet) key = "topic";
+    else if (request.action == ServiceAction.globalSend) key = "text";
+    else return "";
+    return canonicalServicesSpacing(request.params[key].get!string) ? "" : "noncanonical_spacing";
+}
+
 /// Validate exact parameter shapes before any value reaches an IRC builder.
 Json validateParams(ServiceAction action, Json j) {
     requireObject(j);

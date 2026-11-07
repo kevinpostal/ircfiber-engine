@@ -4921,6 +4921,12 @@ final class PersistentIRCClient {
         bool                servicesWakeDeferred;
         /// A transaction started or ended since the last META write.
         bool                servicesMarkerDirty;
+        /// `drainServicesQueue` is running (it may yield on the META write).
+        bool                servicesDraining;
+        version (ServicesWireHarness) {
+            /// Harness stand-in for the holder META write (true = written).
+            bool delegate(SessionSnapshot) servicesMetaSink;
+        }
         // Ident (username) extracted from nick!user@host in JOIN/353
         string[string]      idents;
         string[]            queryBuffers;
@@ -5544,6 +5550,10 @@ final class PersistentIRCClient {
         const quiet = services.marker();
         s.servicesQuietPrefixes = quiet.prefixes.dup;
         s.servicesQuietUntilMs = quiet.untilMs;
+        // Non-secret count of legacy NickServ auth commands on this socket
+        // still awaiting their verdict: the next engine keeps structured
+        // authentication blocked until a real verdict or a new socket.
+        s.servicesLegacyAuthPending = cast(long) services.handoffAuthPending();
         return s;
     }
 
@@ -5656,6 +5666,10 @@ final class PersistentIRCClient {
         // nothing bound to the previous engine's reading of it carries over.
         mintConnectionEpoch();
         services.restoreQuiet(s.servicesQuietPrefixes, s.servicesQuietUntilMs);
+        // The retained socket may still deliver a verdict for an auth command
+        // the previous engine sent, graceful swap or crash alike.
+        if (s.servicesLegacyAuthPending > 0)
+            services.restoreLegacyAuth(cast(size_t) s.servicesLegacyAuthPending);
         // What the holder buffered while detached replays first: history.
         attachBacklogBytes = r.entry.bufferedBytes > 0 ? r.entry.bufferedBytes : 0;
         // Egress bookkeeping: the session still rides its Mullvad slot, so
@@ -11174,11 +11188,27 @@ private void processEvents() {
     /// real pacer allows. Never through `outboundQueue`/`pacedQueue`, so
     /// none of it can be replayed or snapshotted.
     private void drainServicesQueue() {
-        if (state != ConnectionState.connected || detachedForHotSwap) return;
-        const now = unixMsNow();
+        if (state != ConnectionState.connected || detachedForHotSwap || servicesDraining) return;
+        servicesDraining = true;
+        scope (exit) servicesDraining = false;
         while (true) {
             const line = services.nextWrite();
             if (!line.length) return;
+            // The non-secret marker (in-flight pseudoclients, the auth
+            // hand-off count) is durable in the holder META before any
+            // services line can reach the socket — or nothing leaves.
+            if (servicesMarkerDirty) {
+                servicesMarkerDirty = false;
+                if (!publishMetaStrict()) {
+                    servicesMarkerDirty = true;
+                    services.failClosedMeta();
+                    return;
+                }
+                // The META write may have yielded.
+                if (state != ConnectionState.connected || detachedForHotSwap) return;
+                continue;
+            }
+            const now = unixMsNow();
             if (floodTrusted && cmdBucket.waitMs(now, trustedRate) > 0) return;
             if (pacer.waitMs(line.length + 2, now) > 0) return;
             services.popWrite();
@@ -11192,6 +11222,48 @@ private void processEvents() {
         }
     }
 
+    /// Writes the holder META now. True when it was written, or when there
+    /// is no held registered socket to protect (no holder, not registered:
+    /// a META-less entry is never adopted). False: the caller must not send.
+    private bool publishMetaStrict() {
+        version (ServicesWireHarness) {
+            if (servicesMetaSink !is null) return servicesMetaSink(snapshotSession(false));
+        }
+        if (holder is null || holderConnId.length == 0 || state != ConnectionState.connected) return true;
+        try {
+            auto s = snapshotSession(false);
+            try holder.setMeta(holderConnId, toJSON(s));
+            catch (HolderErrorException e) {
+                if (e.code != "too_large") throw e;
+                s.channelUsers = null;
+                s.usersDropped = true;
+                holder.setMeta(holderConnId, toJSON(s));
+            }
+            metaWarned = false;
+            return true;
+        } catch (Exception e) {
+            logJsonMap("warn", "connection", "Holder META write failed — services line not sent",
+                ["network": config.name, "holderId": holderConnId, "err": e.msg, "event": "services_meta_fail"]);
+            return false;
+        }
+    }
+
+    /// Records the NickServ auth commands `note` finds in an outgoing manual
+    /// line and makes the new hand-off count durable in the holder META
+    /// BEFORE the line can reach the socket. False: the META write failed;
+    /// the note is undone and the line must not be sent (never queued).
+    private bool gateLegacyAuth(scope void delegate() note) {
+        const before = services.legacyAuthState();
+        note();
+        if (services.legacyAuthPending() == before.pending) return true;
+        servicesMarkerDirty = false;
+        if (publishMetaStrict()) return true;
+        services.restoreLegacyAuthState(before);
+        emitLog("warn", "A services login was not sent: its hand-off record could not be saved."
+            ~ " Try again in a moment.");
+        return false;
+    }
+
     /// Runs one validated services request as this connection's live user.
     /// `complete` is called exactly once with the request's result (the
     /// caller adds `network`). The holder marker is published before the
@@ -11200,10 +11272,8 @@ private void processEvents() {
         servicesWakeDeferred = true;
         try services.execute(request, complete, issuedMs);
         finally servicesWakeDeferred = false;
-        if (servicesMarkerDirty) {
-            servicesMarkerDirty = false;
-            publishMeta(false);
-        }
+        // The marker is published by the drain, strictly, before the
+        // transaction's first line leaves.
         drainServicesQueue();
     }
 
@@ -13105,6 +13175,11 @@ private void processEvents() {
             return;
         }
         if (!admitServiceLine(line)) return;
+        // A NickServ auth command leaving now (manual, alias, bouncer,
+        // automatic IDENTIFY/GHOST) is remembered until its verdict.
+        if (state == ConnectionState.connected || (state == ConnectionState.connecting && transportAlive)) {
+            if (!gateLegacyAuth(() { services.noteManualLine(line); })) return;
+        }
         if (fromClient && line.length > 6 && line[0 .. 6].toUpper() == "WHOIS ") {
             auto args = line[6 .. $].strip();
             const sp = args.lastIndexOf(' ');
@@ -13212,6 +13287,7 @@ private void processEvents() {
             return;
         }
         if (!admitServiceMessage(target, text)) return;
+        if (command == "PRIVMSG" && !gateLegacyAuth(() { services.noteManualMessage(target, text); })) return;
         // A services credential or private memo is never echoed into chat
         // history by us; the server's own echo is intercepted on arrival.
         const sensitive = sensitiveServiceMessage(target, text, effectiveServices());
@@ -15544,6 +15620,104 @@ ServicesWireCheck[] servicesTransportWireChecks(out string[] wire) {
         results_.length == 9 && results_[8].reasonCode == "offline");
 
     wire = got.dup;
+    return results;
+}
+
+/// Hand-off ordering over a localhost socket: a legacy NickServ auth line
+/// and a typed transaction's first line leave only after the holder META
+/// carrying the non-secret hand-off count/marker was written; a failed
+/// META write sends nothing and queues nothing. (`servicesMetaSink` stands
+/// in for the holder.)
+ServicesWireCheck[] servicesLegacyMetaChecks() {
+    import std.algorithm : any;
+    import std.uuid : randomUUID;
+    import core.time : msecs;
+    import vibe.core.channel : createChannel;
+    import vibe.core.core : sleep;
+    import vibe.core.net : listenTCP;
+    import vibe.data.json : parseJsonString;
+    import vibe.stream.operations : readLine;
+    import ircfiber.services.config : ServicePin, ServiceId, ServicesProvider;
+    import ircfiber.services.protocol : ServiceAction, ServiceStatus;
+
+    ServicesWireCheck[] results;
+    void check(string name, bool passed) { results ~= ServicesWireCheck(name, passed); }
+    string[] got;
+    auto listener = listenTCP(0, (TCPConnection peer) {
+        try {
+            while (!peer.empty) got ~= (cast(const(char)[]) peer.readLine()).idup;
+        } catch (Exception) {}
+        try peer.close(); catch (Exception) {}
+    }, "127.0.0.1");
+    auto ch = createChannel!IRCRawEvent();
+    NetworkConfig cfg;
+    cfg.nick = "me";
+    cfg.host = "127.0.0.1";
+    cfg.services.provider = ServicesProvider.anope;
+    cfg.services.server = "services.test";
+    cfg.services.pins[ServiceId.nickServ] = ServicePin("NickServ", "services", "services.test");
+    auto c = new PersistentIRCClient(cfg, ch);
+    void cleanup() {
+        try clearServicesOperations(); catch (Exception) {}
+        try c.connection.close(); catch (Exception) {}
+        try { listener.stopListening(); sleep(10.msecs); } catch (Exception) {}
+        try ch.close(); catch (Exception) {}
+    }
+    scope (exit) cleanup();
+    bool wired(string needle) { return got.any!(l => l.canFind(needle)); }
+    bool queued(string needle) {
+        return c.outboundQueue.any!(l => l.canFind(needle)) || c.pacedQueue.any!(l => l.canFind(needle));
+    }
+
+    c.connection = connectTCP("127.0.0.1", listener.bindAddress.port);
+    c.connectedAtMs = unixMsNow();
+    c.state = ConnectionState.connected;
+    c.beginServicesGeneration();
+    c.processLine(":s 900 me me!u@h acct :You are now logged in as acct");
+
+    long[] counts;
+    long linesAtMeta;
+    bool metaOk = true;
+    c.servicesMetaSink = (SessionSnapshot s) {
+        counts ~= s.servicesLegacyAuthPending;
+        linesAtMeta = c.linesOut;
+        return metaOk;
+    };
+
+    c.sendRaw("PRIVMSG NickServ :IDENTIFY canary1", true);
+    sleep(100.msecs);
+    check("a manual IDENTIFY's hand-off count is in META before the line reaches the socket",
+        counts == [1] && c.linesOut == linesAtMeta + 1 && wired("canary1"));
+    c.sendRaw("PRIVMSG NickServ :INFO me", true);
+    check("a non-auth service line needs no META write", counts.length == 1);
+
+    metaOk = false;
+    c.sendRaw("PRIVMSG NickServ :IDENTIFY canary2", true);
+    c.sendMessage("NickServ", "IDENTIFY canary3");
+    sleep(100.msecs);
+    check("when the META write fails the auth line is neither sent nor queued",
+        !wired("canary2") && !wired("canary3") && !queued("canary2") && !queued("canary3"));
+    check("and the tentative ledger entry is undone",
+        c.services.legacyAuthPending() == 1 && c.snapshotSession(false).servicesLegacyAuthPending == 1);
+
+    registerServicesOperation(ServiceAction.accountInfo, new WireInfoOperation);
+    auto j = parseJsonString(`{"params":{"account":"acct"}}`);
+    j["requestId"] = randomUUID().toString();
+    j["action"] = "accountInfo";
+    j["expectedConnectionEpoch"] = c.getConnectionEpoch();
+    j["expectedActorAccount"] = "acct";
+    ServicesResult[] answered;
+    const before = got.length;
+    c.executeServices(ServicesRequest.fromJson(j), (ServicesResult r) { answered ~= r; });
+    sleep(100.msecs);
+    check("a typed transaction whose marker cannot be written sends nothing and ends stale",
+        answered.length == 1 && answered[0].status == ServiceStatus.stale
+        && answered[0].reasonCode == "meta_unavailable" && got.length == before);
+
+    auto next = new PersistentIRCClient(cfg, ch);
+    next.services.restoreLegacyAuth(cast(size_t) c.snapshotSession(false).servicesLegacyAuthPending);
+    check("the next engine on the same socket keeps the count (no transient zero)",
+        next.snapshotSession(false).servicesLegacyAuthPending == 1);
     return results;
 }
 

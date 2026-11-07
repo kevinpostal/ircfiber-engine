@@ -180,7 +180,8 @@ private bool sameAsciiFold(string a, string b) @safe pure nothrow @nogc {
 
 /// Completed between both verified fences, nothing dropped.
 bool frameComplete(const ref ServiceFrame frame) @safe pure nothrow @nogc {
-    return frame.outcome == ServiceFrameOutcome.completed && !frame.truncated && frame.startFenced && frame.endFenced;
+    return frame.outcome == ServiceFrameOutcome.completed && !frame.truncated && !frame.ambiguous
+        && frame.startFenced && frame.endFenced;
 }
 
 /// Formatting-free reply lines in arrival order.
