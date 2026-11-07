@@ -163,6 +163,15 @@ struct RedisKeys {
     /// members (record expired) are pruned by the reader.
     static string bncClients() { return "irc:bnc:clients"; }
 
+    /// Presence record of one connected chat WebSocket (JSON, 150 s TTL
+    /// refreshed by inbound frames). Keyed by a random per-handshake id,
+    /// written by every gateway, read by the admin sessions API.
+    static string wsClient(string connectionId) { return "irc:ws:client:" ~ connectionId; }
+    /// Set of connection ids that have a `wsClient` record. Explicit index
+    /// rather than SCAN (see `bncClients`); members whose record expired
+    /// are pruned by the reader.
+    static string wsClients() { return "irc:ws:clients"; }
+
     /// Per-user bouncer event trail (LPUSH, capped 50, 90-day TTL).
     static string bncAudit(string userId) { return "irc:bnc:audit:" ~ userId; }
 

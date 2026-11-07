@@ -176,6 +176,20 @@ final class UserRepository {
             Bson(["$set": Bson(["isTestAccount": Bson(value)])])).matchedCount > 0;
     }
 
+    /// Atomically adds (`enabled`) or removes the exact `services-manager`
+    /// role, only while the stored `roles` array still equals `expectedRoles`
+    /// (same strings, same order) as just read. No other field or role is
+    /// written. False when no user has `id` with those roles (a concurrent
+    /// edit): the caller must reread rather than retry. Throws on database
+    /// errors.
+    bool setServicesManager(UUID id, const(string)[] expectedRoles, bool enabled) {
+        auto expected = Bson(expectedRoles.map!(r => Bson(r)).array);
+        string op = enabled ? "$addToSet" : "$pull";
+        return collection.updateOne(
+            Bson(["id": Bson(id.toString()), "roles": expected]),
+            Bson([op: Bson(["roles": Bson("services-manager")])])).matchedCount > 0;
+    }
+
     /// Returns the user's bouncer password, or `""` when none is set. Kept
     /// off `User`/`toJson` so it never rides on `/api/me` or session caches.
     string getBncToken(UUID id) {
