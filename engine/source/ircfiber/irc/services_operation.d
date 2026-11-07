@@ -350,9 +350,12 @@ void verifyServicesTarget(ServicesTransaction txn, string account, string target
 
 // ── Capabilities and parameters ────────────────────────────────────────────
 
-/// `{state, reasonCode?}`; state is allowed | denied | unknown | unsupported.
+/// `{state, reasonCode?}`; state is allowed | service_checked | denied |
+/// unknown | unsupported. Only allowed and service_checked are requestable;
+/// service_checked means the service itself authorizes at execution.
 Json serviceCapability(string state, string reasonCode = "") {
-    enforce(state == "allowed" || state == "denied" || state == "unknown" || state == "unsupported",
+    enforce(state == "allowed" || state == "service_checked" || state == "denied"
+        || state == "unknown" || state == "unsupported",
         "Invalid services capability state");
     auto j = Json.emptyObject;
     j["state"] = state;
@@ -360,8 +363,19 @@ Json serviceCapability(string state, string reasonCode = "") {
     return j;
 }
 
+/// Channel (ChanServ) and BotServ operations: the only actions whose
+/// capability may be service_checked. Identity, operator and staff actions
+/// keep strictly proven permissions.
+bool serviceCheckedAction(ServiceAction action) {
+    import std.algorithm.searching : startsWith;
+    const name = action.to!string;
+    return name.startsWith("channel") || name.startsWith("bot");
+}
+
 /// Sets `capabilities[action]` (creating the object).
 void putServiceCapability(ref Json capabilities, ServiceAction action, string state, string reasonCode = "") {
+    enforce(state != "service_checked" || serviceCheckedAction(action),
+        "service_checked is only valid for channel and BotServ actions");
     if (capabilities.type != Json.Type.object) capabilities = Json.emptyObject;
     capabilities[action.to!string] = serviceCapability(state, reasonCode);
 }
@@ -515,6 +529,20 @@ version (ServicesWireHarness) {
         ok("capability: shape and validation", cap["state"].get!string == "denied"
             && cap["reasonCode"].get!string == "access_denied" && threw
             && caps["channelAccessSet"]["state"].get!string == "unknown");
+        putServiceCapability(caps, ServiceAction.channelAccessSet, "service_checked", "service_authorization_required");
+        putServiceCapability(caps, ServiceAction.botAssign, "service_checked", "service_authorization_required");
+        bool staffThrew, identityThrew;
+        try putServiceCapability(caps, ServiceAction.akillAdd, "service_checked");
+        catch (Exception) staffThrew = true;
+        try putServiceCapability(caps, ServiceAction.accountPrivacy, "service_checked");
+        catch (Exception) identityThrew = true;
+        ok("capability: service_checked only for channel and BotServ actions",
+            caps["channelAccessSet"]["state"].get!string == "service_checked"
+            && caps["channelAccessSet"]["reasonCode"].get!string == "service_authorization_required"
+            && caps["botAssign"]["state"].get!string == "service_checked"
+            && staffThrew && identityThrew
+            && caps["akillAdd"].type == Json.Type.undefined
+            && caps["accountPrivacy"].type == Json.Type.undefined);
     }
 
     private bool revisionTokenSafe(string s) @safe pure nothrow @nogc {

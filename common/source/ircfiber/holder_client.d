@@ -16,7 +16,7 @@
  * (default) or `tcp://host:port`. Token: `IRCFIBER_HOLDER_TOKEN` (sent in
  * HELLO/DIAL/ATTACH when non-empty; mandatory on TCP holders).
  */
-module ircfiber.engine.holder_client;
+module ircfiber.holder_client;
 
 import core.time : Duration, msecs, seconds;
 import std.conv : to;
@@ -32,7 +32,6 @@ import vibe.core.sync : TaskMutex;
 import vibe.data.json : Json, parseJsonString;
 import vibe.stream.operations : readLine;
 
-import ircfiber.build_info : buildInfo;
 import ircfiber.logging : logJsonMap;
 import ircfiber.redis.protocol : TlsInfo;
 
@@ -507,7 +506,7 @@ final class HolderClient {
         auto hello = Json.emptyObject;
         hello["proto"] = HOLDER_PROTO;
         hello["serverId"] = serverId;
-        hello["engine"] = buildInfo().shortHash;
+        hello["engine"] = environment.get("IRCFIBER_BUILD_SHORT", "dev");
         if (token.length) hello["token"] = token;
         writeLine(c, "HELLO " ~ hello.toString());
         auto ok = expectOk(readIpcLine(c));

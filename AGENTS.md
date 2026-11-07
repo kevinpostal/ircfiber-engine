@@ -353,7 +353,7 @@ from the live OVH engine against meth.cat (remote, ngircd) and IRC Fiber
 ## Engine IRC connections go through the holder
 
 The engine's transport is always a vibe `TCPConnection` relay stream to
-the connection holder (`ircfiber.engine.holder_client`); TLS, SOCKS5 and
+the connection holder (`ircfiber.holder_client`); TLS, SOCKS5 and
 Happy Eyeballs live in `engine/holder/source/holder/dial.d`. Egress
 policy (Mullvad slots, pins, bans) stays in `connection.d`
 (`happyEyeballsConnect`), which issues one holder `DIAL` per candidate

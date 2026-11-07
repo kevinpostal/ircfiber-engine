@@ -11,7 +11,7 @@ import ircfiber.models.irc_event : IRCRawEvent;
 import ircfiber.models.network : Network, NetworkConfig;
 import ircfiber.irc.connection : PersistentIRCClient;
 import ircfiber.storage.redis : RedisStorage;
-import ircfiber.engine.holder_client : HolderClient, HolderEntry, AttachResult;
+import ircfiber.holder_client : HolderClient, HolderEntry, AttachResult;
 import ircfiber.engine.session_snapshot : SessionSnapshot;
 import ircfiber.redis.protocol : RedisKeys;
 import ircfiber.logging : logJsonMap;
@@ -611,7 +611,7 @@ final class ConnectionManager {
     /// exists for the network, that would double-socket the server. Any
     /// other attach error falls back to a fresh dial.
     void attachNetwork(NetworkConfig config, UUID userId, HolderEntry entry, SessionSnapshot snapshot) {
-        import ircfiber.engine.holder_client : HolderErrorException, HolderUnavailableException;
+        import ircfiber.holder_client : HolderErrorException, HolderUnavailableException;
         import vibe.core.core : runTask, sleep;
         import core.time : seconds;
         if (config.servicesProvisioningPending) return;

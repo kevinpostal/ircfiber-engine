@@ -31,7 +31,7 @@ import ircfiber.db.network : NetworkRepository;
 import ircfiber.db.user : UserRepository;
 import ircfiber.db.messages : MessageRepository;
 import ircfiber.redis.protocol : RedisKeys, StateTTL;
-import ircfiber.engine.holder_client : HolderClient, HolderEntry, HolderUnavailableException;
+import ircfiber.holder_client : HolderClient, HolderEntry, HolderUnavailableException;
 import ircfiber.engine.session_snapshot : SessionSnapshot, fromJSON;
 
 /// Context holding all engine dependencies.

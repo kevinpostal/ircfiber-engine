@@ -24,8 +24,10 @@
  *    LEVELS, XOP tiers against `HELP <tier>`, FLAGS letters against
  *    `HELP FLAGS` + `HELP LEVELS DESC`, and service denials of the gated
  *    reads. Live `@`/`%` never grants persisted access and there is no
- *    built-in XOP ladder: a non-founder's rank check that only the
- *    network configuration knows stays `unknown` and disables the write;
+ *    built-in XOP ladder. Positive entry/HELP evidence that the channel's
+ *    LEVELS (or a non-founder's rank) cannot confirm is `service_checked`:
+ *    the reviewed write may be sent and ChanServ/BotServ authorizes it;
+ *    without positive evidence it stays `unknown` and disables the write;
  *  - every write re-reads state, re-checks the browser's revision, the
  *    capability and (for nick-menu targets) a fresh WHOIS account, sends
  *    exactly one mutating body, then reads back. Success requires the
@@ -1133,6 +1135,15 @@ private struct Authority {
 private struct Cap {
     string state;
     string reason;
+    /// FLAGS write whose changed letters must each map to a requestable
+    /// actor privilege (cs_flags.cpp DoModify) before anything is sent.
+    bool flagsSubset;
+}
+
+/// Only allowed and service_checked capabilities may reach a native send;
+/// unknown, denied and unsupported never do.
+private bool channelCapRequestable(Cap cap) {
+    return cap.state == "allowed" || cap.state == "service_checked";
 }
 
 private Authority deriveAuthority(ServicesTransaction txn, const ref ChannelSnapshot s) {
@@ -1195,10 +1206,14 @@ private Cap privState(const ref Authority a, string priv) {
     if (priv in a.disabled) return Cap("denied", "privilege_disabled");
     if (priv in a.denied) return Cap("denied", "service_denied");
     // Entry-derived privileges (HELP tier lists, flag letters, numeric
-    // levels) only count while the channel's real LEVELS show the privilege
-    // enabled; non-founders usually cannot read LEVELS, so this stays unknown.
-    if (priv in a.allowed)
-        return a.levelsKnown && (priv in a.enabled) ? Cap("allowed", "") : Cap("unknown", "levels_unverified");
+    // levels) are proven only while the channel's real LEVELS show the
+    // privilege enabled. Non-founders usually cannot read LEVELS: positive
+    // evidence then lets the reviewed command reach ChanServ, which checks
+    // it itself. Without positive evidence the privilege stays unknown.
+    if (priv in a.allowed) {
+        if (!a.levelsKnown) return Cap("service_checked", "service_authorization_required");
+        return (priv in a.enabled) ? Cap("allowed", "") : Cap("unknown", "levels_unverified");
+    }
     return Cap("unknown", "privilege_unverified");
 }
 
@@ -1664,14 +1679,23 @@ private Cap accessWriteCap(const ref ChannelSnapshot s, const ref Authority a, s
     if (a.founder || a.superAdmin) return Cap("allowed", "");
     auto change = privState(a, "ACCESS_CHANGE");
     if (change.state == "denied") return change;
-    // FLAGS skips the rank comparison when the actor's own highest entry is
-    // a flags entry and checks each changed flag against the actor's own
-    // privileges (cs_flags.cpp DoModify) — decidable from evidence.
-    if (provider == "flags" && change.state == "allowed" && a.flagsMapped && a.actorProviders.length
-            && a.actorProviders.all!(p => p == "flags"))
-        return Cap("allowed", "flags_subset");
+    const requestable = channelCapRequestable(change);
+    if (provider == "flags") {
+        // FLAGS skips the rank comparison when the actor's own highest entry
+        // is a flags entry and checks each changed flag against the actor's
+        // own privileges (cs_flags.cpp DoModify): flagChangeCap decides.
+        if (requestable && a.flagsMapped && a.actorProviders.length
+                && a.actorProviders.all!(p => p == "flags"))
+            return change.state == "allowed" ? Cap("allowed", "flags_subset", true)
+                : Cap("service_checked", "service_authorization_required", true);
+        return Cap("unknown", "rank_unverifiable");
+    }
     // XOP/ACCESS compare the target with the actor's highest entry by the
-    // configured privilege ranks/tier order, which a user cannot read.
+    // configured privilege ranks/tier order, which a user cannot read. With
+    // ACCESS_CHANGE evidence and a resolved own entry of this provider,
+    // ChanServ's own rank/target checks decide the reviewed ADD/DEL.
+    if (requestable && a.actorProviders.canFind(provider))
+        return Cap("service_checked", "service_authorization_required");
     return Cap("unknown", "rank_unverifiable");
 }
 
@@ -1687,11 +1711,14 @@ private Json accessCapabilities(const ref ChannelSnapshot s, const ref Authority
     auto caps = Json.emptyObject;
     putCap(caps, ServiceAction.channelAccessList, s.accessDenied ? Cap("denied", "service_denied")
         : s.accessRead ? Cap("allowed", "") : Cap("unknown", "access_list_unavailable"));
+    // Prefer a proven provider, then a service-checked one, then the
+    // non-requestable states.
     Cap best = Cap("unknown", "rank_unverifiable");
     foreach (p; ["xop", "access", "flags"]) {
         auto c = accessWriteCap(s, a, p);
         if (c.state == "allowed") { best = c; break; }
-        if (c.state == "denied" || c.state == "unsupported") best = c;
+        if (best.state == "service_checked") continue;
+        if (c.state == "service_checked" || c.state == "denied" || c.state == "unsupported") best = c;
     }
     putCap(caps, ServiceAction.channelAccessSet, best);
     putCap(caps, ServiceAction.channelAccessRemove, best);
@@ -1973,7 +2000,7 @@ private final class ChannelRegisterOperation : ChannelOperation {
             if (!frameComplete(f) || !s.infoRead) { readFailed(txn, s, f); return; }
             if (!requireServicesRevision(txn, servicesRevision(txn, channelInfoView(s)))) return;
             auto cap = registerCap(txn, s, a);
-            if (cap.state != "allowed") { completeCap(txn, cap); return; }
+            if (!channelCapRequestable(cap)) { completeCap(txn, cap); return; }
             auto desc = serviceParam(txn, "description");
             auto body = "REGISTER " ~ channel ~ (desc.length ? " " ~ desc : "");
             if (!txn.fits(body)) { txn.complete(ServiceStatus.rejected, "line_too_long"); return; }
@@ -2017,7 +2044,7 @@ private final class ChannelOptionOperation : ChannelOperation {
             if (!frameComplete(f) || !s.infoRead) { readFailed(txn, s, f); return; }
             if (!requireServicesRevision(txn, servicesRevision(txn, channelInfoView(s)))) return;
             auto cap = registeredPriv(s, a, topicLock ? "TOPIC" : "SET");
-            if (cap.state != "allowed") { completeCap(txn, cap); return; }
+            if (!channelCapRequestable(cap)) { completeCap(txn, cap); return; }
             auto current = topicLock ? s.topicLock : s.keepTopic;
             if (s.optionsRead && current == enabled) { txn.complete(ServiceStatus.rejected, "unchanged"); return; }
             auto body = topicLock ? "TOPIC " ~ channel ~ (enabled ? " LOCK" : " UNLOCK")
@@ -2063,7 +2090,7 @@ private final class ChannelTopicSetOperation : ChannelOperation {
             if (!frameComplete(f) || !s.infoRead) { readFailed(txn, s, f); return; }
             if (!requireServicesRevision(txn, servicesRevision(txn, channelInfoView(s)))) return;
             auto cap = registeredPriv(s, a, "TOPIC");
-            if (cap.state != "allowed") { completeCap(txn, cap); return; }
+            if (!channelCapRequestable(cap)) { completeCap(txn, cap); return; }
             if (s.topicKnown && s.topic == topic && plainText(topic) == topic) {
                 // An identical topic produces no observable TOPIC.
                 txn.complete(ServiceStatus.rejected, "unchanged");
@@ -2195,12 +2222,19 @@ private string flagLetters(string changes) {
     return r;
 }
 
-private Cap flagChangeCap(const ref Authority a, string letters) {
+/// Every changed letter must map to a privilege the actor holds
+/// (allowed) or positively evidences (service_checked); service_checked in
+/// `base` or any letter makes the whole change service_checked.
+private Cap flagChangeCap(const ref Authority a, string letters, Cap base) {
+    bool checked = base.state == "service_checked";
     foreach (c; letters) {
         auto p = c in a.flagPrivilege;
-        if (p is null || privState(a, *p).state != "allowed") return Cap("unknown", "flag_privilege_unverified");
+        if (p is null) return Cap("unknown", "flag_privilege_unverified");
+        const st = privState(a, *p).state;
+        if (st == "service_checked") checked = true;
+        else if (st != "allowed") return Cap("unknown", "flag_privilege_unverified");
     }
-    return Cap("allowed", "");
+    return checked ? Cap("service_checked", "service_authorization_required") : Cap("allowed", "");
 }
 
 private final class ChannelAccessListOperation : ChannelOperation {
@@ -2257,10 +2291,10 @@ private final class ChannelAccessSetOperation : ChannelOperation {
                     accessCapabilities(s, a)))
                 return;
             auto cap = accessWriteCap(s, a, provider);
-            if (cap.state == "allowed" && provider == "xop" && !s.tierAvailable.get(value, false))
+            if (channelCapRequestable(cap) && provider == "xop" && !s.tierAvailable.get(value, false))
                 cap = Cap("unsupported", "tier_unavailable");
-            if (cap.state == "allowed" && cap.reason == "flags_subset") cap = flagChangeCap(a, flagLetters(value));
-            if (cap.state != "allowed") { completeCap(txn, cap); return; }
+            if (channelCapRequestable(cap) && cap.flagsSubset) cap = flagChangeCap(a, flagLetters(value), cap);
+            if (!channelCapRequestable(cap)) { completeCap(txn, cap); return; }
             AccessRow before;
             bool had = findAccount(txn, s, account, before);
             // Without a verified live nick the only safe subject is the
@@ -2409,8 +2443,8 @@ private final class ChannelAccessRemoveOperation : ChannelOperation {
             if (provider != "flags" && txn.sameNick(account, txn.actor.account) && s.accessComplete())
                 cap = Cap("allowed", "");
             else cap = accessWriteCap(s, a, provider);
-            if (cap.state == "allowed" && cap.reason == "flags_subset") cap = flagChangeCap(a, before.value);
-            if (cap.state != "allowed") { completeCap(txn, cap); return; }
+            if (channelCapRequestable(cap) && cap.flagsSubset) cap = flagChangeCap(a, before.value, cap);
+            if (!channelCapRequestable(cap)) { completeCap(txn, cap); return; }
             string body;
             switch (provider) {
                 case "xop": body = before.value ~ " " ~ channel ~ " DEL " ~ before.mask; break;
@@ -2609,7 +2643,7 @@ private final class ChannelModeLockChangeOperation : ChannelOperation {
             }
             if (!requireServicesRevision(txn, servicesRevision(txn, registeredView(modeLocksView(s), s.registered)))) return;
             auto cap = modeLockCap(s, a);
-            if (cap.state != "allowed") { completeCap(txn, cap); return; }
+            if (!channelCapRequestable(cap)) { completeCap(txn, cap); return; }
             LockRequest[] reqs;
             string wire, reason;
             bool stale;
@@ -2708,7 +2742,7 @@ private final class ChannelAkickChangeOperation : ChannelOperation {
             }
             if (!requireServicesRevision(txn, servicesRevision(txn, registeredView(akickView(s), s.registered)))) return;
             auto cap = akickCap(s, a);
-            if (cap.state != "allowed") { completeCap(txn, cap); return; }
+            if (!channelCapRequestable(cap)) { completeCap(txn, cap); return; }
             string target = mask;
             if (!adding) {
                 uint number;
@@ -3028,7 +3062,7 @@ private final class BotChangeOperation : ChannelOperation {
                 }
                 if (!requireServicesRevision(txn, servicesRevision(txn, botView(channel, b)))) return;
                 auto cap = botPriv(s, a, b, change == BotChange.assign || change == BotChange.unassign ? "ASSIGN" : "SET");
-                if (cap.state != "allowed") { completeCap(txn, cap); return; }
+                if (!channelCapRequestable(cap)) { completeCap(txn, cap); return; }
                 string body;
                 AckRule[] rules;
                 final switch (change) {
@@ -3461,29 +3495,215 @@ void channelServicesChecks(void delegate(string name, bool cond) ok) {
         ok("flags: unsigned or empty values are refused", !parseFlagChanges("AO", none) && !parseFlagChanges("+", none));
     }
 
-    // Non-founder derived privileges need enabled LEVELS; denials win.
+    // Non-founder derived privileges: enabled LEVELS prove them; positive
+    // evidence the LEVELS cannot confirm is service_checked; denials win.
     {
+        Authority none;
+        none.identified = true;
+        ok("authority: no positive evidence stays unknown",
+            privState(none, "TOPIC") == Cap("unknown", "privilege_unverified"));
         Authority a;
         a.identified = true;
         a.allowed["TOPIC"] = true;
-        ok("authority: derived privilege without LEVELS is unknown", privState(a, "TOPIC").state == "unknown");
+        ok("authority: positive evidence without readable LEVELS is service_checked",
+            privState(a, "TOPIC") == Cap("service_checked", "service_authorization_required"));
         a.levelsKnown = true;
+        ok("authority: readable LEVELS not listing the privilege stay unknown",
+            privState(a, "TOPIC") == Cap("unknown", "levels_unverified"));
         a.enabled["TOPIC"] = true;
         ok("authority: derived privilege with enabled LEVELS is allowed", privState(a, "TOPIC").state == "allowed");
         a.denied["TOPIC"] = true;
         ok("authority: actual service denial outranks derived evidence", privState(a, "TOPIC").state == "denied");
+        Authority refused;
+        refused.identified = true;
+        refused.allowed["MODE"] = true;
+        refused.denied["MODE"] = true;
+        ok("authority: service denial outranks evidence while LEVELS are unreadable",
+            privState(refused, "MODE") == Cap("denied", "service_denied"));
         Authority d;
         d.identified = true;
         d.allowed["SET"] = true;
         d.levelsKnown = true;
         d.disabled["SET"] = true;
         ok("authority: disabled level denies", privState(d, "SET").state == "denied");
+        Authority anon;
+        anon.allowed["TOPIC"] = true;
+        ok("authority: unidentified evidence is denied", privState(anon, "TOPIC").state == "denied");
         Authority f;
         f.identified = true;
         f.founder = true;
         f.disabled["TOPIC"] = true;
         ok("authority: founder holds enabled privileges only", privState(f, "MODE").state == "allowed"
             && privState(f, "TOPIC").state == "denied");
+        ok("authority: only allowed and service_checked are requestable",
+            channelCapRequestable(Cap("allowed", "")) && channelCapRequestable(Cap("service_checked", ""))
+            && !channelCapRequestable(Cap("unknown", "")) && !channelCapRequestable(Cap("denied", ""))
+            && !channelCapRequestable(Cap("unsupported", "")) && !channelCapRequestable(Cap("", "")));
+
+        // Channel/BotServ privileges carried through the serialised caps.
+        ChannelSnapshot reg;
+        reg.registered = true;
+        reg.infoRead = true;
+        Authority sop;
+        sop.identified = true;
+        sop.allowed["MODE"] = true;
+        sop.allowed["AKICK"] = true;
+        sop.allowed["ASSIGN"] = true;
+        BotState bot;
+        Json caps;
+        putCap(caps, ServiceAction.channelModeLockChange, modeLockCap(reg, sop));
+        putCap(caps, ServiceAction.channelAkickAdd, akickCap(reg, sop));
+        putCap(caps, ServiceAction.botAssign, botPriv(reg, sop, bot, "ASSIGN"));
+        putCap(caps, ServiceAction.botGreet, botPriv(reg, sop, bot, "SET"));
+        ok("authority: service_checked serialises for ChanServ and BotServ actions",
+            caps["channelModeLockChange"]["state"].get!string == "service_checked"
+            && caps["channelModeLockChange"]["reasonCode"].get!string == "service_authorization_required"
+            && caps["channelAkickAdd"]["state"].get!string == "service_checked"
+            && caps["botAssign"]["state"].get!string == "service_checked"
+            && caps["botGreet"]["state"].get!string == "unknown");
+        auto unregistered = reg;
+        unregistered.registered = false;
+        ok("authority: evidence never makes an unregistered channel writable",
+            modeLockCap(unregistered, sop).state == "unsupported");
+    }
+
+    // Access writes: founders bypass; same-provider positive evidence is
+    // service_checked where ranks cannot be read; FLAGS keeps its subset rule.
+    {
+        ChannelSnapshot s;
+        s.registered = true;
+        s.infoRead = true;
+        s.accessRead = true;
+        s.tiersRead = true;
+        s.accessAvailable = true;
+        s.flagsAvailable = true;
+        s.tierAvailable["SOP"] = true;
+        s.tierAvailable["AOP"] = true;
+        s.tierAvailable["HOP"] = true;
+
+        Authority founder;
+        founder.identified = true;
+        founder.founder = true;
+        ok("access: founder keeps the proven bypass",
+            accessWriteCap(s, founder, "xop") == Cap("allowed", "")
+            && accessWriteCap(s, founder, "flags") == Cap("allowed", ""));
+
+        // An SOP whose HELP SOP lists ACCESS_CHANGE; LEVELS unreadable.
+        Authority sop;
+        sop.identified = true;
+        sop.actorProviders = ["xop"];
+        sop.actorTiers = ["SOP"];
+        sop.allowed["ACCESS_CHANGE"] = true;
+        ok("access: SOP with ACCESS_CHANGE evidence may request XOP changes",
+            accessWriteCap(s, sop, "xop") == Cap("service_checked", "service_authorization_required"));
+        ok("access: other providers stay rank-unverifiable without an own entry there",
+            accessWriteCap(s, sop, "access") == Cap("unknown", "rank_unverifiable")
+            && accessWriteCap(s, sop, "flags") == Cap("unknown", "rank_unverifiable"));
+        auto caps = accessCapabilities(s, sop);
+        ok("access: published set/remove capability is service_checked",
+            caps["channelAccessSet"]["state"].get!string == "service_checked"
+            && caps["channelAccessSet"]["reasonCode"].get!string == "service_authorization_required"
+            && caps["channelAccessRemove"]["state"].get!string == "service_checked");
+        auto noFlags = s;
+        noFlags.flagsAvailable = false;
+        ok("access: service_checked outranks a later unsupported provider",
+            accessCapabilities(noFlags, sop)["channelAccessSet"]["state"].get!string == "service_checked");
+
+        Authority aop;
+        aop.identified = true;
+        aop.actorProviders = ["xop"];
+        aop.actorTiers = ["AOP"];
+        aop.allowed["TOPIC"] = true;
+        ok("access: no ACCESS_CHANGE evidence stays unknown",
+            accessWriteCap(s, aop, "xop") == Cap("unknown", "rank_unverifiable")
+            && accessCapabilities(s, aop)["channelAccessSet"]["state"].get!string == "unknown");
+        Authority unresolved;
+        unresolved.identified = true;
+        unresolved.actorProviders = ["?"];
+        unresolved.allowed["ACCESS_CHANGE"] = true;
+        ok("access: an unresolved own entry is not same-provider evidence",
+            accessWriteCap(s, unresolved, "xop").state == "unknown");
+
+        auto refused = sop;
+        refused.denied["ACCESS_CHANGE"] = true;
+        ok("access: a service denial wins over SOP evidence",
+            accessWriteCap(s, refused, "xop") == Cap("denied", "service_denied")
+            && accessCapabilities(s, refused)["channelAccessSet"]["state"].get!string == "denied");
+        auto disabled = sop;
+        disabled.levelsKnown = true;
+        disabled.disabled["ACCESS_CHANGE"] = true;
+        ok("access: a disabled ACCESS_CHANGE level wins over SOP evidence",
+            accessWriteCap(s, disabled, "xop") == Cap("denied", "privilege_disabled"));
+        auto incomplete = s;
+        incomplete.tiersRead = false;
+        ok("access: an incomplete list is never requestable",
+            accessWriteCap(incomplete, sop, "xop") == Cap("unknown", "access_list_incomplete"));
+        auto noTiers = s;
+        noTiers.tierAvailable = null;
+        ok("access: no writable tier is unsupported",
+            accessWriteCap(noTiers, sop, "xop") == Cap("unsupported", "provider_unavailable"));
+
+        // Numeric ACCESS actor with readable LEVELS: proven ACCESS_CHANGE,
+        // rank still decided by ChanServ.
+        Authority numeric;
+        numeric.identified = true;
+        numeric.actorProviders = ["access"];
+        numeric.allowed["ACCESS_CHANGE"] = true;
+        numeric.levelsKnown = true;
+        numeric.enabled["ACCESS_CHANGE"] = true;
+        ok("access: proven ACCESS_CHANGE with unreadable rank is service_checked",
+            accessWriteCap(s, numeric, "access") == Cap("service_checked", "service_authorization_required")
+            && accessWriteCap(s, numeric, "xop").state == "unknown");
+
+        // FLAGS: flags-only actor, complete letter mapping.
+        Authority fl;
+        fl.identified = true;
+        fl.actorProviders = ["flags"];
+        fl.actorFlags = "ft";
+        fl.flagsMapped = true;
+        fl.flagPrivilege['f'] = "ACCESS_CHANGE";
+        fl.flagPrivilege['t'] = "TOPIC";
+        fl.flagPrivilege['s'] = "SET";
+        fl.allowed["ACCESS_CHANGE"] = true;
+        fl.allowed["TOPIC"] = true;
+        auto flagsCap = accessWriteCap(s, fl, "flags");
+        ok("flags access: evidenced ACCESS_CHANGE is a service_checked subset write",
+            flagsCap.state == "service_checked" && flagsCap.flagsSubset);
+        ok("flags access: evidenced letters stay service_checked",
+            flagChangeCap(fl, "t", flagsCap) == Cap("service_checked", "service_authorization_required"));
+        ok("flags access: a letter without positive evidence is blocked",
+            flagChangeCap(fl, "ts", flagsCap) == Cap("unknown", "flag_privilege_unverified"));
+        ok("flags access: an unmapped letter is blocked",
+            flagChangeCap(fl, "z", flagsCap) == Cap("unknown", "flag_privilege_unverified"));
+        auto flDenied = fl;
+        flDenied.denied["TOPIC"] = true;
+        ok("flags access: a denied letter is blocked",
+            flagChangeCap(flDenied, "t", accessWriteCap(s, flDenied, "flags")).state == "unknown");
+        auto mixed = fl;
+        mixed.actorProviders = ["flags", "xop"];
+        ok("flags access: a non-flags own entry keeps the rank check",
+            accessWriteCap(s, mixed, "flags") == Cap("unknown", "rank_unverifiable"));
+        auto unmapped = fl;
+        unmapped.flagsMapped = false;
+        ok("flags access: an incomplete letter mapping is not requestable",
+            accessWriteCap(s, unmapped, "flags").state == "unknown");
+
+        auto proven = fl;
+        proven.levelsKnown = true;
+        proven.enabled["ACCESS_CHANGE"] = true;
+        proven.enabled["TOPIC"] = true;
+        auto provenCap = accessWriteCap(s, proven, "flags");
+        ok("flags access: proven privileges keep the allowed subset path",
+            provenCap == Cap("allowed", "flags_subset", true)
+            && flagChangeCap(proven, "t", provenCap) == Cap("allowed", ""));
+        auto partly = fl;
+        partly.levelsKnown = true;
+        partly.enabled["ACCESS_CHANGE"] = true;
+        ok("flags access: a readable-LEVELS letter not enabled is blocked",
+            flagChangeCap(partly, "t", accessWriteCap(s, partly, "flags")).state == "unknown");
+        ok("flags access: the base state carries through an empty letter set",
+            flagChangeCap(proven, "", provenCap).state == "allowed"
+            && flagChangeCap(fl, "", flagsCap).state == "service_checked");
     }
 
     ok("topic: Anope-normalised spacing refused before sending",

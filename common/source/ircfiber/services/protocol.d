@@ -25,7 +25,9 @@ enum ServiceAction {
 }
 
 enum ServiceStatus { confirmed, rejected, unconfirmed, unavailable, stale }
-enum ServicePermission { allowed, denied, unknown, unsupported }
+/// `service_checked`: a reviewed channel/BotServ operation may be submitted,
+/// but the service itself authorizes it at execution; never proven allowed.
+enum ServicePermission { allowed, service_checked, denied, unknown, unsupported }
 enum AccessProvider { xop, access, flags }
 enum LockChange { add, remove, set }
 enum PrivacyField { email, status, mask, quit }

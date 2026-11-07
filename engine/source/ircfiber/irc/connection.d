@@ -34,7 +34,7 @@ import ircfiber.irc.sasl : buildSaslPlainPayload, ScramSha256Client;
 import ircfiber.irc.ban_classify : isBanError, isThrottleError;
 import ircfiber.storage.buffer : sanitizeUtf8;
 import ircfiber.engine.session_snapshot : SessionSnapshot, ServerFeaturesSnapshot, SESSION_SNAPSHOT_SCHEMA, toJSON;
-import ircfiber.engine.holder_client : HolderClient, DialTag, DialProxy, DialRequest, DialResult, DialEvent,
+import ircfiber.holder_client : HolderClient, DialTag, DialProxy, DialRequest, DialResult, DialEvent,
     DialProgress, AttachResult, HolderEntry, DialFailedException, HolderUnavailableException, HolderErrorException;
 import ircfiber.logging : logJsonMap, logException;
 import ircfiber.observability : recordCounter, recordGauge, recordHistogram;
