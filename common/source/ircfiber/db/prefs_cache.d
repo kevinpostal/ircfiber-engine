@@ -88,6 +88,9 @@ final class PrefsCache {
         // Update in place if already present.
         if (auto pp = userId in map_) {
             node = *pp;
+            // A Redis read can yield, then resume after a newer save.
+            // Never let that delayed snapshot roll back confirmed preferences.
+            if (prefs.prefVersion < node.prefs.prefVersion) return;
             node.prefs = prefs;
             node.lastAccess = MonoTime.currTime;
             if (node !is head_)
@@ -225,6 +228,24 @@ unittest {
     assert(!got.isNull);
     assert(got.get.prefVersion == 2, "update must replace value");
     assert(cache.length == 1, "update must not increase count");
+}
+
+@("PrefsCache: a delayed read cannot undo a completed welcome save")
+unittest {
+    import ircfiber.db.preferences : WelcomeTour;
+    auto cache = new PrefsCache(5, dur!"seconds"(30));
+    const uid = randomUUID();
+    UserPreferences pending;
+    pending.prefVersion = 3;
+    pending.welcomeTour = WelcomeTour(1, 0, "pending");
+    auto saved = pending;
+    saved.prefVersion = 4;
+    saved.welcomeTour = WelcomeTour(1, 0, "skipped");
+    cache.set(uid, saved);
+    cache.set(uid, pending); // Redis GET started before the save, resumed after it.
+    const current = cache.get(uid).get;
+    assert(current.prefVersion == 4);
+    assert(current.welcomeTour.get.status == "skipped", "a saved dismissal must not reopen or defer key setup");
 }
 
 @("PrefsCache: remove deletes entry")
