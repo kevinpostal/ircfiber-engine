@@ -80,6 +80,29 @@ string sanitizeUtf8(string input) @safe {
     return () @trusted { return cast(string)result; } ();
 }
 
+/// Preserve message state on both Redis write paths, matching toCompactJson.
+private void appendReplyReactionTags(ref Json msg, ref const(IRCRawEvent) event) @trusted {
+    Json tags;
+    try tags = parseJsonString(event.tagsJson);
+    catch (Exception) { return; }
+    if (tags.type != Json.Type.object) return;
+    static immutable string[3][3] fields = [
+        ["rp", "+reply", "+draft/reply"],
+        ["rx", "+react", "+draft/react"],
+        ["ux", "+unreact", "+draft/unreact"],
+    ];
+    foreach (ref field; fields) {
+        foreach (tag; field[1 .. $]) {
+            auto value = tag in tags;
+            if (!value || value.type != Json.Type.string) continue;
+            auto text = value.get!string;
+            if (!text.length) continue;
+            msg[field[0]] = Json(sanitizeUtf8(text));
+            break;
+        }
+    }
+}
+
 /**
  * Decentralized Buffer Manager
  * 
@@ -548,6 +571,7 @@ final class BufferManager {
         // without the services badge.
         auto acct = event.getTag("account");
         if (acct.length && acct != "*") msg["a"] = Json(sanitizeUtf8(acct));
+        appendReplyReactionTags(msg, event);
 
         // eid is set by the processor before the event reaches the buffer;
         // it's required for scrollback ordering and stream resume.
@@ -876,6 +900,7 @@ final class BufferManager {
         if (msgid.length) {
             msg["m"] = Json(sanitizeUtf8(msgid));
         }
+        appendReplyReactionTags(msg, event);
 
         const networkId = event.networkId.length > 0 ? event.networkId : event.network;
         const channel = event.channel.length > 0 ? normalizeChannel(event.channel) : "_server";

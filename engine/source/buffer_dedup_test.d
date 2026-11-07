@@ -190,6 +190,67 @@ void test_clear_buffer_drops_both_dedup_spellings(RedisStorage redis) {
     check!("cleared buffer accepts the event again")(bm.appendIRCEvent(again, "engine1"));
 }
 
+void test_reply_and_reaction_history(RedisStorage redis) {
+    stderr.writeln("\n[history] replies and reaction transitions survive Redis replay");
+    foreach (legacy; [false, true]) {
+        foreach (draftTags; [false, true]) {
+            auto bm = new BufferManager(redis);
+            const nid = randomUUID().toString();
+            scope (exit) cleanup(redis, nid);
+            IRCRawEvent event(string command, string msgid, long t) {
+                auto ev = IRCRawEvent("TestNet", command);
+                ev.networkId = nid;
+                ev.channel = "#chan";
+                ev.nick = "alice";
+                ev.timestampMs = t;
+                ev.addTag("msgid", msgid);
+                ev.setParams(["#chan"]);
+                return ev;
+            }
+            void append(IRCRawEvent ev) {
+                if (legacy) bm.appendIRCEvent(ev);
+                else bm.appendIRCEvent(ev, "engine1");
+            }
+            auto original = event("PRIVMSG", "original", 1);
+            original.text = "hello";
+            append(original);
+            auto reply = event("PRIVMSG", "reply", 2);
+            reply.text = "answer";
+            reply.addTag(draftTags ? "+draft/reply" : "+reply", "original");
+            if (!draftTags) reply.addTag("+draft/reply", "wrong-target");
+            append(reply);
+            auto reaction = event("TAGMSG", "reaction", 3);
+            reaction.addTag(draftTags ? "+draft/reply" : "+reply", "original");
+            reaction.addTag(draftTags ? "+draft/react" : "+react", "👍");
+            if (!draftTags) {
+                reaction.addTag("+draft/reply", "wrong-target");
+                reaction.addTag("+draft/react", "👀");
+            }
+            append(reaction);
+            auto removal = event("TAGMSG", "removal", 4);
+            removal.addTag(draftTags ? "+draft/reply" : "+reply", "original");
+            removal.addTag(draftTags ? "+draft/unreact" : "+unreact", "👍");
+            if (!draftTags) removal.addTag("+draft/unreact", "👀");
+            append(removal);
+            auto typing = event("TAGMSG", "typing", 5);
+            typing.addTag("+typing", "active");
+            append(typing);
+
+            auto history = legacy ? bm.getRecent(nid, "#chan", 50)
+                                  : bm.getRecent("engine1", nid, "#chan", 50);
+            check!("history retains both reaction transitions but excludes typing")(history.length == 4);
+            if (history.length != 4) continue;
+            check!("reply still names its original message")(history[1]["rp"].get!string == "original");
+            check!("reaction target and emoji survive reload")(
+                history[2]["rp"].get!string == "original" && history[2]["rx"].get!string == "👍");
+            check!("reaction removal survives reload")(
+                history[3]["rp"].get!string == "original" && history[3]["ux"].get!string == "👍");
+            check!("replayed transitions retain their actor and order")(
+                history[2]["n"].get!string == "alice" && history[2]["t"].get!long < history[3]["t"].get!long);
+        }
+    }
+}
+
 int main() {
     stderr.writeln("BufferManager dedup regression suite");
     RedisStorage redis;
@@ -206,6 +267,7 @@ int main() {
     test_legacy_server_scoped_set_is_adopted(redis);
     test_distinct_events_are_not_collapsed(redis);
     test_clear_buffer_drops_both_dedup_spellings(redis);
+    test_reply_and_reaction_history(redis);
 
     writeln("\n", passed, " passed, ", failed, " failed");
     return failed == 0 ? 0 : 1;

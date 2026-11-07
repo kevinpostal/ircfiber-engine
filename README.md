@@ -82,6 +82,17 @@ dub --root=engine test && dub --root=common test
 python3 -m pytest tests/irc_parity -v  # against mock ircd
 ```
 
+### Reaction history regression
+
+With an isolated Redis listening on `127.0.0.1:6379`:
+
+```bash
+dub --root=engine build --config=buffer-dedup-test
+./engine/buffer-dedup-test
+```
+
+The Redis round trip checks reply targets and ordered reaction add/remove rows through the actual scrollback writer and filtered reader, including tag aliases, preferred-tag precedence, legacy/namespaced storage and typing-noise exclusion.
+
 ### VPN egress reliability
 
 The `nordvpn` network pin uses **static SOCKS exits only**; if none can dial,
