@@ -153,6 +153,22 @@ final class UserRepository {
         return docFromBson(doc);
     }
 
+    /// Users whose IDs are in `ids`, unordered; unknown IDs are absent and
+    /// duplicates are queried once. Bounded `$in` queries (`idInFilters`);
+    /// empty input does no I/O. Mongo errors propagate; an undecodable record
+    /// is skipped, so callers treat it like a missing user.
+    User[] findByIds(UUID[] ids) {
+        User[] result;
+        foreach (filter; idInFilters(ids)) {
+            foreach (doc; collection.find(filter)) {
+                if (doc.isNull) continue;
+                try result ~= docFromBson(doc);
+                catch (Exception e) logWarn("UserRepository.findByIds: skipping broken doc: %s", e.msg);
+            }
+        }
+        return result;
+    }
+
     /// Creates a new user account, including its initial `isTestAccount`.
     void create(User user) {
         auto doc = userToBson(user);
@@ -584,4 +600,39 @@ unittest {
     assert(escapeRegexLiteral("a[b]c") == "a\\[b\\]c");
     assert(escapeRegexLiteral("x|y") == "x\\|y");
     assert(escapeRegexLiteral(".*") == "\\.\\*", "a wildcard username must not match everything");
+}
+
+/// Most IDs one bulk `$in` lookup sends to Mongo.
+enum size_t ID_IN_QUERY_MAX = 128;
+
+/// `{id: {$in: [...]}}` filters covering the distinct `ids` in sorted chunks
+/// of at most `ID_IN_QUERY_MAX`; none for empty input.
+Bson[] idInFilters(UUID[] ids) {
+    auto keys = ids.map!(id => id.toString()).array;
+    keys.sort();
+    auto distinct = keys.uniq.array;
+    Bson[] filters;
+    for (size_t i = 0; i < distinct.length; i += ID_IN_QUERY_MAX) {
+        Bson[] values;
+        foreach (k; distinct[i .. min(i + ID_IN_QUERY_MAX, $)]) values ~= Bson(k);
+        filters ~= Bson(["id": Bson(["$in": Bson(values)])]);
+    }
+    return filters;
+}
+
+@("idInFilters dedupes and bounds bulk id lookups")
+unittest {
+    assert(idInFilters([]).length == 0);
+    auto a = parseUUID("11111111-1111-1111-1111-111111111111");
+    auto b = parseUUID("22222222-2222-2222-2222-222222222222");
+    auto one = idInFilters([b, a, b]);
+    assert(one.length == 1);
+    auto values = one[0]["id"]["$in"];
+    assert(values.length == 2 && values[0].get!string == a.toString() && values[1].get!string == b.toString());
+
+    UUID[] many;
+    foreach (i; 0 .. 2 * ID_IN_QUERY_MAX + 1) many ~= randomUUID();
+    auto chunks = idInFilters(many);
+    assert(chunks.length == 3);
+    assert(chunks[0]["id"]["$in"].length == ID_IN_QUERY_MAX && chunks[2]["id"]["$in"].length == 1);
 }

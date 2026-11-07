@@ -320,6 +320,18 @@ struct RedisKeys {
     /// Opaque, single-use live-connection identity ticket; SET NX EX 30.
     static string mlsPeerTicket(string ticket) { return "irc:mls:peer:" ~ ticket; }
 
+    /// Disposable MLS peer presence locator (JSON `{networkId, serverId,
+    /// connectedAtMs, prefix}`, SET EX 30 at every connected engine state
+    /// snapshot). A hint only: the gateway re-verifies it against both
+    /// authoritative snapshots. `networkKey` is the canonical lowercase
+    /// `host:port`; `foldedNick` is the nick folded per ISUPPORT CASEMAPPING.
+    static string mlsPeerPresence(string networkKey, string foldedNick) {
+        import std.digest : LetterCase, toHexString;
+        import std.digest.sha : sha256Of;
+        auto hex = toHexString!(LetterCase.lower)(sha256Of(networkKey ~ "\0" ~ foldedNick));
+        return "irc:mls:presence:" ~ hex[].idup;
+    }
+
     /// Avatar upload rate limit: INCR + 1h EXPIRE, per user.
     static string avatarUploadRate(string userId) { return "irc:avatar:ratelimit:" ~ userId; }
 
@@ -1141,4 +1153,15 @@ unittest {
     assert(RedisKeys.notifyRate("patch", "u1") == "irc:notify:rl:patch:u1");
     assert(RedisKeys.notifyEmailSwitch() == "irc:config:notifyEmail");
     assert(RedisKeys.notifyWebPushSwitch() == "irc:config:notifyWebPush");
+}
+
+@("RedisKeys.mlsPeerPresence hashes the NUL-separated network key and folded nick")
+unittest {
+    const key = RedisKeys.mlsPeerPresence("irc.gangnet.org:6697", "carlo{");
+    assert(key == "irc:mls:presence:f23029c683ce2812548dc112bfcfcc7fd54834e2bc0181b37d78209ee1f6c468");
+    // Fold-sensitive and separator-delimited: callers must fold first.
+    assert(RedisKeys.mlsPeerPresence("irc.gangnet.org:6697", "carlo[")
+        == "irc:mls:presence:f6abbd334a5c39b44df1e681fff8a17ad3bbaac70e21ff6ef408e110d4e9ec26");
+    assert(key != RedisKeys.mlsPeerPresence("irc.gangnet.org:6697c", "arlo{"));
+    assert(key != RedisKeys.mlsPeerPresence("irc.gangnet.org:6697", "carlo{\0"));
 }

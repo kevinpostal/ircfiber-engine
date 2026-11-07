@@ -25,19 +25,29 @@
 # Prints `PASS graceful` and `PASS crash`; exits non-zero on the first
 # failed assertion. Env: GATEWAY_URL (http://127.0.0.1:8090), COMPOSE_FILE
 # (the local stack compose), KEEP_NETWORK=1 to leave the test network.
+# Existing isolated fixtures may set HOTSWAP_*_SERVICE (ENGINE/HOLDER/
+# GATEWAY/MOCK) and HOTSWAP_*_CONTAINER (ENGINE/HOLDER/MOCK). An empty
+# HOTSWAP_MOCK_COMPOSE disables the default local-stack overlay.
+# HOTSWAP_USE_RUNNING_STACK=1 starts only the mock, leaving the fixture's
+# already-running holders, gateway and databases untouched.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 INFRA_ROOT=$(cd "$SCRIPT_DIR/../../.." && pwd)
 COMPOSE_FILE=${COMPOSE_FILE:-$INFRA_ROOT/site/deploy/local/docker-compose.yml}
-MOCK_COMPOSE=$SCRIPT_DIR/fixtures/docker-compose.mock-irc.yml
+MOCK_COMPOSE=${HOTSWAP_MOCK_COMPOSE-$SCRIPT_DIR/fixtures/docker-compose.mock-irc.yml}
 GATEWAY=${GATEWAY_URL:-http://127.0.0.1:8090}
 USERNAME=${HOTSWAP_USER:-hotswap}
 PASSWORD=${HOTSWAP_PASS:-hotswap123}
 EMAIL=${HOTSWAP_EMAIL:-hotswap@local.test}
-ENGINE=ircfiber-engine
-HOLDER=ircfiber-holder
-MOCK=mock-irc
+ENGINE_SERVICE=${HOTSWAP_ENGINE_SERVICE:-ircfiber-engine}
+HOLDER_SERVICE=${HOTSWAP_HOLDER_SERVICE:-ircfiber-holder}
+GATEWAY_SERVICE=${HOTSWAP_GATEWAY_SERVICE:-ircfiber-gateway}
+MOCK_SERVICE=${HOTSWAP_MOCK_SERVICE:-mock-irc}
+MOCK_HOST=${HOTSWAP_MOCK_HOST:-$MOCK_SERVICE}
+ENGINE=${HOTSWAP_ENGINE_CONTAINER:-$ENGINE_SERVICE}
+HOLDER=${HOTSWAP_HOLDER_CONTAINER:-$HOLDER_SERVICE}
+MOCK=${HOTSWAP_MOCK_CONTAINER:-$MOCK_SERVICE}
 MOCK_LINES=/tmp/mock-irc.lines
 MOCK_RESULT=/tmp/holder-mock-irc.result
 MOCK_INJECT=/tmp/mock-irc.inject
@@ -45,7 +55,11 @@ NET_NAME="HotSwap_$(date +%s)"
 NET_ID=""
 JAR=$(mktemp /tmp/hot-swap-XXXXXX.cookies)
 
-dc() { docker compose -f "$COMPOSE_FILE" -f "$MOCK_COMPOSE" "$@"; }
+dc() {
+    local files=(-f "$COMPOSE_FILE")
+    [[ -z "$MOCK_COMPOSE" ]] || files+=(-f "$MOCK_COMPOSE")
+    docker compose "${files[@]}" "$@"
+}
 say() { printf '\033[36m→ %s\033[0m\n' "$*"; }
 ok() { printf '\033[92m✓ %s\033[0m\n' "$*"; }
 fail() { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
@@ -100,14 +114,22 @@ join_channel() {
 attached_count() { engine_log_since "$1" | grep -c '"event":"attached"' || true; }
 
 # ── 0. Stack ─────────────────────────────────────────────────────────────
-say "starting local stack + mock-irc ($COMPOSE_FILE)"
-dc up -d --remove-orphans redis mongo "$MOCK" "$HOLDER" ircfiber-gateway "$ENGINE"
+say "starting mock-irc ($COMPOSE_FILE)"
+if [[ "${HOTSWAP_USE_RUNNING_STACK:-0}" == 1 ]]; then
+    dc up -d --no-deps "$MOCK_SERVICE"
+else
+    dc up -d --remove-orphans redis mongo "$MOCK_SERVICE" "$HOLDER_SERVICE" "$GATEWAY_SERVICE" "$ENGINE_SERVICE"
+fi
+[[ -n "${HOTSWAP_ENGINE_CONTAINER:-}" ]] || ENGINE=$(dc ps -q "$ENGINE_SERVICE")
+[[ -n "${HOTSWAP_HOLDER_CONTAINER:-}" ]] || HOLDER=$(dc ps -q "$HOLDER_SERVICE")
+[[ -n "${HOTSWAP_MOCK_CONTAINER:-}" ]] || MOCK=$(dc ps -q "$MOCK_SERVICE")
+[[ -n "$ENGINE" && -n "$HOLDER" && -n "$MOCK" ]] || fail "cannot resolve engine, holder or mock container"
 wait_for 90 "gateway /health" 'curl -fsS "$GATEWAY/health"'
 wait_for 60 "holder --status" 'holder_status'
 wait_for 30 "mock-irc listening" 'docker logs "$MOCK" 2>&1 | grep listening'
 # The mock may already be running from another local scenario. Reset its
 # socket counter and recorded lines before asserting one preserved socket.
-dc restart "$MOCK" >/dev/null
+dc restart "$MOCK_SERVICE" >/dev/null
 wait_for 30 "reset mock-irc listening" 'docker logs "$MOCK" 2>&1 | grep listening'
 ok "stack up"
 
@@ -120,8 +142,8 @@ curl -s -c "$JAR" -b "$JAR" -X POST "$GATEWAY/login" \
 api GET /api/networks | jq -e 'type == "array"' >/dev/null || fail "login failed (no session)"
 
 LOG_MARK=$(engine_log_lines)
-say "creating network $NET_NAME → $MOCK:16668 (plain TCP)"
-RESP=$(api POST /api/networks "{\"name\":\"$NET_NAME\",\"host\":\"$MOCK\",\"port\":16668,\"tls\":\"disabled\",\"nick\":\"hotswap\",\"realName\":\"Hot Swap\",\"egressNodeId\":\"direct\",\"autoJoinChannels\":[]}")
+say "creating network $NET_NAME → $MOCK_HOST:16668 (plain TCP)"
+RESP=$(api POST /api/networks "{\"name\":\"$NET_NAME\",\"host\":\"$MOCK_HOST\",\"port\":16668,\"tls\":\"disabled\",\"nick\":\"hotswap\",\"realName\":\"Hot Swap\",\"egressNodeId\":\"direct\",\"autoJoinChannels\":[]}")
 NET_ID=$(printf '%s' "$RESP" | jq -r '.id // .networkId // empty')
 [[ -n "$NET_ID" ]] || fail "create network failed: $RESP"
 ok "network $NET_ID"
@@ -172,7 +194,7 @@ assert_swapped() {
 # ── (a) graceful: SIGTERM = detach, new engine reattaches ────────────────
 say "(a) graceful swap: docker compose restart $ENGINE"
 LOG_MARK=$(engine_log_lines); MARK=$(mock_lines_count)
-dc restart "$ENGINE"
+dc restart "$ENGINE_SERVICE"
 wait_for 90 "engine reattached after restart" '[[ "$(attached_count "$LOG_MARK")" -ge 1 ]]'
 sleep 2
 assert_swapped "$LOG_MARK" "$MARK" graceful
@@ -190,7 +212,7 @@ say "engine down — injecting PING :x at the mock (expect the holder's PONG)"
 docker exec "$MOCK" sh -c "printf 'PING :x\r\n' > $MOCK_INJECT"
 wait_for 15 "PONG :x from the holder" 'mock_lines_since "$MARK" | grep -q "^PONG :x$"'
 ok "crash: holder answered PING :x while the engine was down"
-dc up -d --no-deps "$ENGINE"
+dc up -d --no-deps "$ENGINE_SERVICE"
 wait_for 90 "engine reattached after crash" '[[ "$(attached_count "$LOG_MARK")" -ge 1 ]]'
 sleep 2
 assert_swapped "$LOG_MARK" "$MARK" crash

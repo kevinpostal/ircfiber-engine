@@ -12,6 +12,7 @@ import ircfiber.engine.bootstrap : EngineContext;
 import ircfiber.models.network : Network;
 import ircfiber.redis.protocol : RedisKeys, NetworkStateSnapshot,
     RetryStatus, FailInfoSnapshot, TlsInfo, PROTOCOL_VERSION;
+import ircfiber.irc.mls_peer : IrcPrefix, canonicalNetworkKey, normalizeFiberChannel, parseFullPrefix;
 import ircfiber.irc.connection : EgressSlotView, egressLocations, egressSlotViews,
     refreshEgressState, servicesAccountStateName;
 import ircfiber.irc.egress_catalog : ExitLocation;
@@ -378,8 +379,80 @@ void writeStateSnapshotForNetwork(ref EngineContext ctx, Network net, string ser
     // Use server-namespaced key if in decentralized mode
     if (serverId.length > 0) {
         ctx.redis.hset(RedisKeys.state(serverId, net.config.id.toString()), "data", snap.toJson().toString());
+        // MLS peer presence hint, refreshed by every publication (events and
+        // the heartbeat); stale entries expire, and the gateway re-verifies
+        // each against both authoritative snapshots.
+        string presenceKey, presenceValue;
+        if (mlsPresenceEntry(snap, net.config.id.toString(), serverId, net.config.host, net.config.port,
+                presenceKey, presenceValue))
+            ctx.redis.getDb().setEX(presenceKey, MLS_PRESENCE_TTL_SECS, presenceValue);
     } else {
         // Legacy non-namespaced key
         ctx.redis.hset(RedisKeys.state_legacy(net.config.id.toString()), "data", snap.toJson().toString());
     }
+}
+
+/// Lifetime of an MLS peer presence locator; the 10 s heartbeat refreshes it.
+enum long MLS_PRESENCE_TTL_SECS = 30;
+
+/// MLS peer presence locator for a namespaced snapshot: the key
+/// (`RedisKeys.mlsPeerPresence` of the canonical `host:port` and the own nick
+/// folded per ISUPPORT CASEMAPPING) and JSON `{networkId, serverId,
+/// connectedAtMs, prefix}`. False unless the snapshot is a connected
+/// generation with a full own prefix and a peer-supported CASEMAPPING.
+bool mlsPresenceEntry(const ref NetworkStateSnapshot snap, string networkId, string serverId,
+        string host, ushort port, out string key, out string value) {
+    if (serverId.length == 0 || networkId.length == 0 || !snap.connected || snap.connectedAtMs <= 0)
+        return false;
+    IrcPrefix own;
+    if (!parseFullPrefix(snap.ownPrefix, own)) return false;
+    string mapping = "rfc1459";
+    if (auto m = "CASEMAPPING" in snap.isupport)
+        if ((*m).length) mapping = *m;
+    if (mapping != "ascii" && mapping != "rfc1459" && mapping != "rfc1459-strict") return false;
+    key = RedisKeys.mlsPeerPresence(canonicalNetworkKey(host, port), normalizeFiberChannel(own.nick, mapping));
+    auto j = Json.emptyObject;
+    j["networkId"] = Json(networkId);
+    j["serverId"] = Json(serverId);
+    j["connectedAtMs"] = Json(snap.connectedAtMs);
+    j["prefix"] = Json(snap.ownPrefix);
+    value = j.toString();
+    return true;
+}
+
+@("mlsPresenceEntry indexes only connected, identified, namespaced generations")
+unittest {
+    import vibe.data.json : parseJsonString;
+    NetworkStateSnapshot s;
+    s.connected = true;
+    s.connectedAtMs = 1_700_000_000_000;
+    s.ownPrefix = "Carlo[!c@host.a";
+    s.isupport = ["CASEMAPPING": "rfc1459"];
+    string key, value;
+    assert(mlsPresenceEntry(s, "net-1", "srv-1", "IRC.GangNet.org", 6697, key, value));
+    assert(key == RedisKeys.mlsPeerPresence("irc.gangnet.org:6697", "carlo{"));
+    const j = parseJsonString(value);
+    assert(j["networkId"].get!string == "net-1" && j["serverId"].get!string == "srv-1");
+    assert(j["connectedAtMs"].get!long == 1_700_000_000_000 && j["prefix"].get!string == "Carlo[!c@host.a");
+
+    s.isupport = ["CASEMAPPING": "ascii"];
+    assert(mlsPresenceEntry(s, "net-1", "srv-1", "irc.gangnet.org", 6697, key, value));
+    assert(key == RedisKeys.mlsPeerPresence("irc.gangnet.org:6697", "carlo["));
+    s.isupport = null;
+    assert(mlsPresenceEntry(s, "net-1", "srv-1", "irc.gangnet.org", 6697, key, value)
+        && key == RedisKeys.mlsPeerPresence("irc.gangnet.org:6697", "carlo{"), "absent CASEMAPPING is rfc1459");
+
+    assert(!mlsPresenceEntry(s, "net-1", "", "irc.gangnet.org", 6697, key, value), "legacy snapshots are not indexed");
+    auto t = s;
+    t.isupport = ["CASEMAPPING": "unicode"];
+    assert(!mlsPresenceEntry(t, "net-1", "srv-1", "irc.gangnet.org", 6697, key, value));
+    t = s;
+    t.connected = false;
+    assert(!mlsPresenceEntry(t, "net-1", "srv-1", "irc.gangnet.org", 6697, key, value));
+    t = s;
+    t.connectedAtMs = 0;
+    assert(!mlsPresenceEntry(t, "net-1", "srv-1", "irc.gangnet.org", 6697, key, value));
+    t = s;
+    t.ownPrefix = "Carlo";
+    assert(!mlsPresenceEntry(t, "net-1", "srv-1", "irc.gangnet.org", 6697, key, value));
 }

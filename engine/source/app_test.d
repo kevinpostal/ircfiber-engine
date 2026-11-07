@@ -42,6 +42,7 @@ import ircfiber.irc.services;
 import ircfiber.irc.services_identity;
 import ircfiber.irc.services_channel;
 import ircfiber.engine.consumer;
+import ircfiber.engine.state;
 
 private uint g_passed;
 private uint g_failed;
@@ -81,7 +82,8 @@ int main() {
         ircfiber.irc.services,
         ircfiber.irc.services_identity,
         ircfiber.irc.services_channel,
-        ircfiber.engine.consumer
+        ircfiber.engine.consumer,
+        ircfiber.engine.state
     )();
     writefln("\n%d passed, %d failed", g_passed, g_failed);
     exit(g_failed == 0 ? 0 : 1);

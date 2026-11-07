@@ -13,6 +13,7 @@ import ircfiber.services.config : decodeStoredServicesConfig, ServicesConfig;
 import ircfiber.db.mongo;
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.redis.protocol : RedisKeys;
+import ircfiber.db.user : idInFilters;
 
 /// Repository for network configurations.
 final class NetworkRepository {
@@ -156,6 +157,25 @@ final class NetworkRepository {
         try uid = parseUUID(doc["userId"].get!string);
         catch (Exception) uid = UUID.init;
         return NetworkWithUser(docToConfig(doc), uid);
+    }
+
+    /// Networks whose IDs are in `ids`, each with its owner (`UUID.init`
+    /// when the record has no userId, which `isOwnedBy` refuses). Unordered;
+    /// unknown IDs are absent and duplicates are queried once. Bounded `$in`
+    /// queries (`idInFilters`); empty input does no I/O. Mongo errors
+    /// propagate; an undecodable record is skipped like a missing network.
+    NetworkWithUser[] findByIdsWithUsers(UUID[] ids) {
+        NetworkWithUser[] result;
+        foreach (filter; idInFilters(ids)) {
+            foreach (doc; collection.find(filter)) {
+                UUID uid;
+                try uid = parseUUID(doc["userId"].get!string);
+                catch (Exception) uid = UUID.init;
+                try result ~= NetworkWithUser(docToConfig(doc), uid);
+                catch (Exception e) logWarn("NetworkRepository.findByIdsWithUsers: skipping broken doc: %s", e.msg);
+            }
+        }
+        return result;
     }
 
     /// Every network on `host` that carries a NickServ credential, with its
