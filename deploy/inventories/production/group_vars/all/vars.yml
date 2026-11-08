@@ -190,14 +190,10 @@ mullvad_sidecars:
 # "SASL required from VPN/datacenter ranges" policy, which
 # isSaslRequiredRefusal/hostSaslGateUntil in connection.d already routes
 # around for any network that gates the same way — not a per-IP ban).
-# Limited to Stockholm/Chicago: no Amsterdam-area host authenticated in
-# either sweep (0 of 16 attempts) — this account appears unprovisioned for
-# NL on the current SOCKS5 fleet. Re-run `/tmp/nordscan.py`-style serial
-# testing (concurrency=1 — NordVPN enforces a tight per-account concurrent-
-# session cap, see NORDVPN_BATCH_SIZE/IPINFO_BATCH_SIZE in the site repo)
-# before trusting any other host from the API list; many came back rejected
-# purely from contention with this box's own background refresher/sweep,
-# not a real per-host answer.
+# Additional Chicago/Phoenix hosts below were verified 2026-11-08 with
+# SOCKS authentication, certificate-verified TLS and a Super Nets 001 welcome.
+# Probe new hosts serially: NordVPN enforces a tight per-account concurrent
+# session cap (see NORDVPN_BATCH_SIZE/IPINFO_BATCH_SIZE in the site repo).
 nordvpn_proxies:
   - { name: "nord-se-sto-1", host: "socks-se8.nordvpn.com", port: 1080, countryCode: "se", country: "Sweden", city: "Stockholm" }  # was se13 — stopped authenticating 2026-11-01, see matrix
   - { name: "nord-se-sto-2", host: "socks-se14.nordvpn.com", port: 1080, countryCode: "se", country: "Sweden", city: "Stockholm" }
@@ -209,6 +205,9 @@ nordvpn_proxies:
   - { name: "nord-us-chi-2", host: "socks-us35.nordvpn.com", port: 1080, countryCode: "us", country: "United States", city: "Chicago" }
   - { name: "nord-us-chi-3", host: "socks-us36.nordvpn.com", port: 1080, countryCode: "us", country: "United States", city: "Chicago" }
   - { name: "nord-us-chi-4", host: "socks-us38.nordvpn.com", port: 1080, countryCode: "us", country: "United States", city: "Chicago" }
+  - { name: "nord-us-chi-5", host: "socks-us39.nordvpn.com", port: 1080, countryCode: "us", country: "United States", city: "Chicago" }
+  - { name: "nord-us-phx-1", host: "socks-us55.nordvpn.com", port: 1080, countryCode: "us", country: "United States", city: "Phoenix" }
+  - { name: "nord-us-phx-2", host: "socks-us56.nordvpn.com", port: 1080, countryCode: "us", country: "United States", city: "Phoenix" }
 
 # --- Gateway defaults ---------------------------------------------------------
 ircfiber_gateway_log_level: "info"
