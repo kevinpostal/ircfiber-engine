@@ -24,6 +24,11 @@ At **Rabl** I ran `Celery` + `RabbitMQ` (10K+ jobs/day) and at **National Servic
 * **Sharded + resilient:** `ServerRegistry` shards networks across `engine` hosts, `EngineJanitor` TTL (Redis `EXPIRE 600s`), `NetworkStateSnapshot` survives `docker restart` / host reboot — same patterns as `Celery` + `Redis` + `Mongo` I shipped.
 * **Ops:** `Containerfile.engine` (`base` → `builder-common` → `builder-engine` → `runtime-engine`) **never compiles `frontend/`/`backend/`** — `make ship-engine` (ircfiber-infra) builds on the prod host and hot-swaps `ircfiber-engine-*` only, gateway stays up.
 
+Server ban/throttle classification ignores IRC colour/style codes and letter
+spacing, including Super Nets' decorated `ENTER THE VOID` refusal. A rejected
+exit is host-banned by the existing routing policy; the next attempt uses another
+eligible exit within the network's selected provider rather than retrying that IP.
+
 Part of [kevinpostal/irc-fiber](https://github.com/kevinpostal/irc-fiber) superproject.
 
 ## Quick start
