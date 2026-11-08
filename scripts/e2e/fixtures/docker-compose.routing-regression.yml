@@ -1,0 +1,140 @@
+# Standalone, disposable legacy failover/hot-swap fixture. The wrapper supplies
+# a unique project/run and starts south only when the failover scenario needs it.
+x-labels: &labels
+  ircfiber.fixture: routing-regression
+  ircfiber.fixture.run: ${ROUTING_REGRESSION_RUN:?wrapper must supply a unique run id}
+x-runtime: &runtime
+  labels: *labels
+  restart: "no"
+x-env: &env
+  IRCFIBER_REDIS_URL: redis://192.0.2.2:6379/0
+  IRCFIBER_MONGO_URL: mongodb://192.0.2.3:27017/ircfiber_regression_fixture
+  IRCFIBER_DEFAULT_NETWORK_HOST: default.regression.test
+  IRCFIBER_DEFAULT_NETWORK_PORT: "16668"
+  IRCFIBER_DEFAULT_NETWORK_TLS: disabled
+  IRCFIBER_OTEL_ENABLED: "0"
+  IRCFIBER_BUGSINK_ENABLED: "0"
+  IRCFIBER_LOG_LEVEL: debug
+  IRCFIBER_IPV6_PREFIX: ""
+  IRCFIBER_MULLVAD_POOL: ""
+  IRCFIBER_NORDVPN_POOL: socks5://north:test:test@192.0.2.30:1080,socks5://south:test:test@192.0.2.31:1080
+x-fixture: &fixture
+  <<: *runtime
+  build:
+    context: .
+    dockerfile: Containerfile.routing-regression
+  image: ${ROUTING_REGRESSION_RUN}-endpoint:fresh
+
+services:
+  redis:
+    <<: *runtime
+    image: redis:7-alpine
+    command: [redis-server, --save, "", --appendonly, "no"]
+    volumes: [redis-data:/data]
+    networks:
+      fixture: {ipv4_address: 192.0.2.2}
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  mongo:
+    <<: *runtime
+    image: mongo:7
+    volumes: [mongo-data:/data/db]
+    networks:
+      fixture: {ipv4_address: 192.0.2.3}
+    healthcheck:
+      test: [CMD, mongosh, --quiet, --eval, "db.adminCommand('ping')"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+  ircfiber-gateway:
+    <<: *runtime
+    build:
+      context: ../../../../site
+      dockerfile: Containerfile
+      target: runtime-gateway
+    image: ${ROUTING_REGRESSION_RUN}-gateway:fresh
+    command: [/app/irc-fiber]
+    environment: *env
+    extra_hosts: &irc-hosts
+      - default.regression.test=192.0.2.10
+      - alpha.example.org=192.0.2.10
+      - beta.example.net=192.0.2.10
+    networks:
+      fixture: {ipv4_address: 192.0.2.4}
+    depends_on:
+      redis: {condition: service_healthy}
+      mongo: {condition: service_healthy}
+  ircfiber-holder:
+    <<: *runtime
+    build:
+      context: ../../..
+      dockerfile: Containerfile.engine
+      target: runtime-holder
+    image: ${ROUTING_REGRESSION_RUN}-holder:fresh
+    command: [/app/irc-fiber-holder]
+    environment:
+      <<: *env
+      IRCFIBER_SERVER_ID: fixture-regression
+      IRCFIBER_HOLDER_ADDR: unix:///run/ircfiber/holder.sock
+      IRCFIBER_DIAL_PRIVATE_HOSTS: mock-irc
+    extra_hosts: *irc-hosts
+    volumes: [holder-ipc:/run/ircfiber]
+    networks: [fixture]
+    healthcheck:
+      test: [CMD, /app/irc-fiber-holder, --check]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  ircfiber-engine:
+    <<: *runtime
+    build:
+      context: ../../..
+      dockerfile: Containerfile.engine
+      target: runtime-engine
+    image: ${ROUTING_REGRESSION_RUN}-engine:fresh
+    command: [/app/irc-fiber-engine]
+    environment:
+      <<: *env
+      IRCFIBER_SERVER_ID: fixture-regression
+      IRCFIBER_HOLDER_ADDR: unix:///run/ircfiber/holder.sock
+    extra_hosts: *irc-hosts
+    volumes: [holder-ipc:/run/ircfiber:ro]
+    networks: [fixture]
+    stop_grace_period: 35s
+    depends_on:
+      ircfiber-holder: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      mongo: {condition: service_healthy}
+  mock-irc:
+    <<: *fixture
+    command: [python3, -u, /fixture/holder_mock_irc.py, "16668", /tmp/holder-mock-irc.result]
+    environment:
+      MOCK_IRC_TARGET_INJECT: "1"
+    networks:
+      fixture: {ipv4_address: 192.0.2.10}
+  egress-a:
+    <<: *fixture
+    command: [python3, -u, /fixture/socks_exit.py]
+    networks:
+      fixture: {ipv4_address: 192.0.2.30}
+  egress-b:
+    <<: *fixture
+    command: [python3, -u, /fixture/socks_exit.py]
+    networks:
+      fixture: {ipv4_address: 192.0.2.31}
+
+networks:
+  fixture:
+    labels: *labels
+    internal: true
+    ipam:
+      config:
+        - subnet: 192.0.2.0/24
+          ip_range: 192.0.2.128/25
+volumes:
+  redis-data: {labels: *labels}
+  mongo-data: {labels: *labels}
+  holder-ipc: {labels: *labels}

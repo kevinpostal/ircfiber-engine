@@ -1358,6 +1358,28 @@ private void announceEgressQuarantine(string label, size_t distinct, long cooldo
     }
 }
 
+/// Only the winning verified trial announces recovery. Announcement failure
+/// must not retain the completed trial or disturb its surviving socket.
+private void announceEgressRecovery(string label, long nowMs) nothrow {
+    if (gEgressRedis is null) return;
+    try {
+        auto db = gEgressRedis.getDb();
+        auto event = Json([
+            "type": Json("notice"), "ts": Json(nowMs), "actor": Json("engine"),
+            "kind": Json("egress_recovery"),
+            "text": Json("VPN exit " ~ label ~ " recovered: registered for at least "
+                ~ (EGRESS_TRIAL_SUSTAIN_MS / 1000).to!string
+                ~ " seconds and answered a post-window keepalive; admission reopened."
+                ~ " Existing sessions were left running."),
+        ]);
+        db.rpush("irc:logs:outbox", event.toString());
+        db.ltrim("irc:logs:outbox", -1000, -1);
+    } catch (Exception e) {
+        try logWarn("VPN exit recovery #staff announcement failed: %s", e.msg);
+        catch (Exception) {}
+    }
+}
+
 /// Correlates established-session losses per static exit (process-local
 /// detection evidence) and, at two distinct IRC hosts inside the window,
 /// opens the exit's durable circuit. The quarantine is queued in-process
@@ -6447,6 +6469,7 @@ final class PersistentIRCClient {
         if (r == "ok") {
             emitLog("info", "VPN exit " ~ label ~ " passed its recovery trial (registered "
                 ~ (EGRESS_TRIAL_SUSTAIN_MS / 1000).to!string ~ "s, keepalive answered) and takes new connections again.");
+            announceEgressRecovery(label, nowMsSafe());
             clearEgressTrial();
         } else if (r == "stale") {
             clearEgressTrial();

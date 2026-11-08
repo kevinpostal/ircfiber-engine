@@ -1,0 +1,5 @@
+FROM python:3.12-alpine
+WORKDIR /fixture
+# Copy the existing protocol servers: no workstation bind mounts or substitutes.
+COPY holder_mock_irc.py socks_exit.py /fixture/
+ENV PYTHONUNBUFFERED=1

@@ -55,10 +55,14 @@ def write_result():
         return text
 
 
-def record_line(text):
+def record_line(text, nick=None):
     with lock:
         with open(LINES_FILE, "a") as f:
             f.write(text + "\n")
+        if (os.environ.get("MOCK_IRC_TARGET_INJECT") == "1" and nick
+                and all(c.isalnum() or c in "_-" for c in nick)):
+            with open(LINES_FILE + ".target." + nick, "a") as f:
+                f.write(text + "\n")
 
 
 def send(conn, line):
@@ -75,6 +79,26 @@ def welcome(conn, nick):
 def names(conn, nick, chan):
     send(conn, f":{SERVER} 353 {nick} = {chan} :@{nick}")
     send(conn, f":{SERVER} 366 {nick} {chan} :End of /NAMES list")
+
+
+def targeted_inject_loop(conn, stop, current_nick):
+    """Opt-in per-nick wire injection; never consume another live socket's file."""
+    while not stop.is_set():
+        nick = current_nick()
+        if nick and all(c.isalnum() or c in "_-" for c in nick):
+            path = INJECT_FILE + ".target." + nick
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+                os.remove(path)
+                if data:
+                    print(f"mock_irc: target inject {nick}: {data!r}", flush=True)
+                    conn.sendall(data)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                print(f"mock_irc: target inject error {nick}: {e}", flush=True)
+        stop.wait(0.2)
 
 
 def inject_loop(conn, stop):
@@ -100,6 +124,9 @@ def handle(conn, addr, ino):
     stop = threading.Event()
     threading.Thread(target=inject_loop, args=(conn, stop), daemon=True).start()
     nick = None
+    if os.environ.get("MOCK_IRC_TARGET_INJECT") == "1":
+        threading.Thread(target=targeted_inject_loop,
+                         args=(conn, stop, lambda: nick), daemon=True).start()
     user_seen = False
     welcomed = False
     buf = b""
@@ -114,7 +141,7 @@ def handle(conn, addr, ino):
                 line, _, buf = buf.partition(b"\n")
                 text = line.rstrip(b"\r").decode("utf-8", errors="replace")
                 print(f"mock_irc: rcv: {text!r}", flush=True)
-                record_line(text)
+                record_line(text, nick)
                 parts = text.split(" ")
                 cmd = parts[0].upper() if parts else ""
                 if cmd == "CAP" and len(parts) > 1 and parts[1].upper() == "LS":

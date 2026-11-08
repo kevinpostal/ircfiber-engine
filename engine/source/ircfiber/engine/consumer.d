@@ -126,10 +126,17 @@ void startCommandConsumers(ref EngineContext ctx) {
     }
 }
 
+// Reconciliation and control traffic can both start the same consumer.
+// Multiple BLPOP readers destroy upstream command ordering.
+private bool[string] commandConsumers;
+
 /// Spawns the command consumer task for the given network.
 void spawnNetworkCommandConsumer(ref EngineContext ctx, string networkId) {
+    if (networkId in commandConsumers) return;
+    commandConsumers[networkId] = true;
     auto serverId = ctx.localServer.serverId;
     runSafeTask({
+        scope(exit) commandConsumers.remove(networkId);
         auto key = RedisKeys.cmd(serverId, networkId);
         while (true) {
             try {

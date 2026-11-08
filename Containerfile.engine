@@ -64,21 +64,19 @@ SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
 
 # ============================================================================
-# Stage: builder-common — fetch deps + build the shared common library.
+# Stage: builder-common — shared common library sources.
 #
-# `dub build --parallel` parallelizes LDC compile jobs within a config.
-# Without `--force`, dub reuses the incremental module cache in the
-# /build/.dub + /root/.dub cache mounts, so editing one file recompiles
-# only that module.
+# Compile common with its consumers below, under the same locked cache mount.
+# DUB checks source mtimes, not contents, and its package/version build cache
+# survives COPY changes and can contain artifacts from another checkout.
 # ============================================================================
 FROM base AS builder-common
 
 COPY common/dub.sdl common/dub.selections.json ./common/
 COPY common/source/ ./common/source/
 
-RUN --mount=type=cache,target=/build/.dub,sharing=locked \
-    --mount=type=cache,target=/root/.dub,sharing=locked \
-    dub build --root=common --compiler=ldc2 --build=release --parallel
+# No standalone build here: a cached RUN cannot refresh the mutable DUB cache
+# for a later uncached consumer build.
 
 # ============================================================================
 # Stage: builder-engine — engine binaries only (irc-fiber-engine + migrates)
@@ -96,8 +94,12 @@ COPY engine/holder/ ./engine/holder/
 # String-imported Anope message catalogs (services_grammar.d) + attribution.
 COPY engine/catalogs/ ./engine/catalogs/
 
+# Invalidate only workspace-package artifacts on an uncached compile layer.
+# The irc-fiber cache also contains its holder subpackage and migrate configs.
+# Keep all downloaded packages and compiled third-party dependencies cached.
 RUN --mount=type=cache,target=/build/.dub,sharing=locked \
     --mount=type=cache,target=/root/.dub,sharing=locked \
+    rm -rf /root/.dub/cache/irc-fiber-common /root/.dub/cache/irc-fiber && \
     dub build --root=engine --compiler=ldc2 --build=release --parallel && \
     dub build --root=engine :holder --compiler=ldc2 --build=release --parallel && \
     dub build --root=engine --config=janitor-migrate --compiler=ldc2 --build=release --parallel && \
