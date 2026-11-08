@@ -43,7 +43,7 @@ import ircfiber.logging : logJsonMap, logException;
 import ircfiber.observability : recordCounter, recordGauge, recordHistogram;
 import ircfiber.tracing : withSpan, Span;
 import ircfiber.async : safeFiberRun;
-import ircfiber.irc.ipv6 : ipv6ForUser, normalizePrefix;
+import ircfiber.irc.ipv6 : ipv6ForConnection, parseRoutedIpv6Prefix;
 import ircfiber.irc.parser : ChannelListRow, parseChannelListRow, enforceLineBound;
 import ircfiber.irc.pacer : FakeLagPacer, FloodLimits, ChannelLineLimit, LineRateWindow,
     MultilineLimits, UNKNOWN_USER_LIMITS, KNOWN_USER_LIMITS, parseMultilineCap,
@@ -994,15 +994,11 @@ shared static this() {
     try { if (gIpv6Lock is null) gIpv6Lock = new Object(); } catch (Throwable) {}
 }
 
-// ── Per-user IPv6 (IRCCloud-style) ───────────────────────────────────────────
-// Each user gets a deterministic /128 inside a routed /64 (or /48).
-// The host is configured with `ip -6 route add local <prefix>/64 dev lo`
-// and `net.ipv6.ip_nonlocal_bind=1` so any IID in the prefix is bindable
-// without a per-user `ip addr add`. The engine then does
-//   connectTCP(dst, port, ipv6ForUser(prefix, ownerId), 0, timeout)
-// which gives each UID its own source IP — bypassing per-IP session limits.
+// ── Saved-connection IPv6 reservations ───────────────────────────────────────
+// A provider-owned, aligned global-unicast /64 and the persisted connection IID
+// determine a reservation. It is not a source address until an IPv6-only native
+// holder dial uses it; shared-direct Happy Eyeballs must not bind this pool.
 private __gshared string gIpv6Prefix;
-private __gshared string gIpv6PoolHost;
 private __gshared bool gIpv6Loaded;
 private __gshared Object gIpv6Lock;
 
@@ -1024,48 +1020,18 @@ private void loadIpv6ConfigUnlocked() {
     auto ep = getenv(toStringz("IRCFIBER_IPV6_PREFIX"));
     if (ep !is null) {
         auto raw = ep[0 .. strlen(ep)].idup;
-        gIpv6Prefix = normalizePrefix(raw);
-        if (gIpv6Prefix.length > 0)
-            logInfo("IPv6 per-user: prefix=%s (from IRCFIBER_IPV6_PREFIX)", gIpv6Prefix);
-        else if (raw.strip().length > 0)
-            logWarn("IPv6 per-user: IRCFIBER_IPV6_PREFIX='%s' looks invalid (no colon)", raw);
-    }
-    auto hp = getenv(toStringz("IRCFIBER_IPV6_POOL_HOST"));
-    if (hp !is null) {
-        auto raw = hp[0 .. strlen(hp)].idup.strip();
-        gIpv6PoolHost = raw;
-        if (gIpv6PoolHost.length > 0)
-            logInfo("IPv6 per-user: poolHost=%s (from IRCFIBER_IPV6_POOL_HOST)", gIpv6PoolHost);
+        ubyte[16] prefix;
+        if (parseRoutedIpv6Prefix(raw, prefix)) {
+            gIpv6Prefix = raw;
+            logInfo("IPv6 connection pool: prefix=%s (from IRCFIBER_IPV6_PREFIX)", gIpv6Prefix);
+        } else if (raw.length > 0) {
+            logWarn("IPv6 connection pool disabled: IRCFIBER_IPV6_PREFIX must be an aligned global-unicast /64");
+        }
     }
     if (gIpv6Prefix.length == 0)
-        logInfo("IPv6 per-user: disabled (IRCFIBER_IPV6_PREFIX not set) — using direct/Mullvad egress");
+        logInfo("IPv6 connection pool: disabled");
 }
 
-/// Returns the deterministic IPv6 source address for a user, or "" if IPv6 is
-/// not configured or the uid is nil. Handles both UUID and string forms.
-string ipv6BindForUser(UUID uid) {
-    loadIpv6Config();
-    string p;
-    if (gIpv6Lock !is null) synchronized (gIpv6Lock) { p = gIpv6Prefix; }
-    else p = gIpv6Prefix;
-    if (p.length == 0) return "";
-    if (uid == UUID.init) return "";
-    return ipv6ForUser(p, uid);
-}
-string ipv6BindForUser(string userIdStr) {
-    if (userIdStr.length == 0) return "";
-    try {
-        import std.uuid : parseUUID;
-        return ipv6BindForUser(parseUUID(userIdStr));
-    } catch (Exception) {
-        loadIpv6Config();
-        string p;
-        if (gIpv6Lock !is null) synchronized (gIpv6Lock) { p = gIpv6Prefix; }
-        else p = gIpv6Prefix;
-        if (p.length == 0) return "";
-        return ipv6ForUser(p, userIdStr);
-    }
-}
 private string mullvadLabelFromHost(string h) {
     auto base = h.split(":")[0];
     auto dash = base.lastIndexOf("-");
@@ -2251,20 +2217,19 @@ private string proxyLocationText(const MullvadProxy* proxy) nothrow {
 }
 
 /// One dial through exactly one egress, performed by the holder. Direct
-/// dials (`proxy is null`) are DNS + Happy Eyeballs (+ optional per-user
-/// IPv6 bind) inside the holder, which composes their `dns`/`attempt`/
-/// `attempt_fail` timeline lines; proxied dials are a single SOCKS5
+/// dials (`proxy is null`) are shared-source DNS + Happy Eyeballs inside the
+/// holder, which composes their `dns`/`attempt`/`attempt_fail` timeline lines;
+/// proxied dials are a single SOCKS5
 /// CONNECT through the sidecar (the exit resolves the name), and this
 /// wrapper composes their `attempt`/`attempt_fail` lines and keeps the
 /// Mullvad success/failure accounting. Every forwarded event carries the
 /// candidate egress identity so the timeline can name it.
 private TCPConnection happyEyeballsConnectWithProxy(HolderClient holder, DialTag tag, string host, ushort port,
                                                     string tlsMode, MullvadProxy* proxy,
-                                                    string ipv6BindAddr, ConnectProgress progress,
+                                                    ConnectProgress progress,
                                                     out DialResult dr) {
     if (proxy !is null) logInfo("%s egress %s (%s:%d) for %s:%d", proxy.controlSocket.length > 0 ? "Mullvad" : "NordVPN", proxy.label, proxy.host, proxy.port, host, port);
-    else if (ipv6BindAddr.length > 0) logInfo("IPv6 per-user egress %s for %s:%d", ipv6BindAddr, host, port);
-    const egressLabel = proxy !is null ? (proxy.controlSocket.length > 0 ? "Mullvad exit " : "NordVPN exit ") ~ proxy.label : (ipv6BindAddr.length > 0 ? "ipv6:" ~ ipv6BindAddr : "direct");
+    const egressLabel = proxy !is null ? (proxy.controlSocket.length > 0 ? "Mullvad exit " : "NordVPN exit ") ~ proxy.label : "direct";
     if (holder is null) throw new HolderUnavailableException("no connection holder configured");
 
     DialRequest req;
@@ -2278,7 +2243,9 @@ private TCPConnection happyEyeballsConnectWithProxy(HolderClient holder, DialTag
         req.hasProxy = true;
         req.proxy = DialProxy(proxy.host, proxy.port, proxy.username, proxy.password);
     }
-    req.bindIp6 = proxy is null ? ipv6BindAddr : "";
+    // Native IPv6 needs an explicit IPv6-only transport tier. A reservation
+    // must never leak into the existing shared-direct/dual-stack route.
+    req.bindIp6 = "";
     req.connectTimeoutMs = CONNECT_TIMEOUT_SECONDS * 1000;
     req.tlsTimeoutMs = TLS_HANDSHAKE_TIMEOUT_SECONDS * 1000;
     req.starttlsTimeoutMs = STARTTLS_REPLY_TIMEOUT_MS;
@@ -2576,19 +2543,19 @@ private alias EgressDial = TCPConnection delegate(MullvadProxy* proxy, out DialR
 
 private TCPConnection happyEyeballsConnect(HolderClient holder, DialTag tag, string host, ushort port,
                                            string tlsMode, RoutingPreferences routing, bool unauthenticated,
-                                           string ipv6BindAddr, ConnectProgress progress,
+                                           ConnectProgress progress,
                                            string avoidLabel, out EgressUsed used, out DialResult dr) {
     TCPConnection dialOne(MullvadProxy* proxy, out DialResult r) {
-        return happyEyeballsConnectWithProxy(holder, tag, host, port, tlsMode, proxy, ipv6BindAddr, progress, r);
+        return happyEyeballsConnectWithProxy(holder, tag, host, port, tlsMode, proxy, progress, r);
     }
     return connectThroughEgressPlan(&dialOne, tag.networkId, host, port, tlsMode, routing,
-        unauthenticated, ipv6BindAddr, progress, avoidLabel, used, dr);
+        unauthenticated, "", progress, avoidLabel, used, dr);
 }
 
 /// Concrete identity of one candidate route, as the route memory keys it.
 /// A proxy is its slot plus sidecar address plus current exit, so a
 /// retargeted slot starts without evidence instead of inheriting the old
-/// exit's; direct includes the per-user IPv6 bind source. Caller holds
+/// exit's; direct includes the candidate source identity. Caller holds
 /// gMullvadLock (slot exit fields are retargeted in place under it).
 private string routeIdentityLocked(const(MullvadProxy)* p, string ipv6BindAddr) {
     if (p is null) return "direct|" ~ ipv6BindAddr;
@@ -5080,13 +5047,11 @@ final class PersistentIRCClient {
         // REST gateway can correlate which channels we still owe a fetch to.
         bool[string]        chathistoryInFlight;  // keyed by lowercase channel
 
-        // Per-user IPv6 (IRCCloud-style): deterministic source IP per UID.
+        // Ownership metadata is independent of the saved connection's IID.
         import std.uuid : UUID;
         UUID                ownerId;
         /// Browser IP forwarded via WEBIRC on the fiber network ("" = none).
         string              clientIp;
-        string              ipv6BindCache;
-        bool                ipv6BindResolved;
         // Smart routing: Redis access for failure reporting + reassignment detection.
         RedisStorage        redis;
         /// This engine's server ID (used for failure reporting + assignment check).
@@ -5139,8 +5104,8 @@ final class PersistentIRCClient {
         /// address is the only reliable "did we use IPv6" signal — the
         /// egress fields above only describe the SOCKS hop.
         string              activePeerIp;
-        /// Local source IP of the live socket: the per-user IPv6 bind, the
-        /// container/host address, or the Tailnet IP of the SOCKS sidecar.
+        /// Local source IP observed by the holder on the live socket, not a
+        /// proposed/reserved address or a separately probed VPN public IP.
         string              activeLocalIp;
         /// Consecutive "SSL/TLS tunnel closed" failures on the current
         /// egress for this host; drives the inferred-ban egress rotation
@@ -5219,8 +5184,6 @@ final class PersistentIRCClient {
         this.redis        = redisStore;
         this.serverId     = sid;
         this.ownerId      = owner;
-        this.ipv6BindResolved = false;
-        this.ipv6BindCache = "";
         // Never park: Duration.zero = retry forever at the 6 h tier (tiers/caps/jitter unchanged). The reconnect_gave_up path below is retained but unreachable unless a future cap returns.
         this.backoff      = new ExponentialBackoff(3.seconds, RECONNECT_MAX_DELAY_SECS.seconds, 0, Duration.zero);
         this.state        = ConnectionState.disconnected;
@@ -6506,7 +6469,7 @@ final class PersistentIRCClient {
         auto oldProfile = config.profileMetadata.dup;
         auto oldMonitor = config.monitoredNicks.dup;
         const oldServices = effectiveServices();
-        config = cfg; ipv6BindResolved = false; ipv6BindCache = "";
+        config = cfg;
         if (effectiveServices() != oldServices) {
             services.onConfigChanged();
             announceServicesInvalidated();
@@ -6532,21 +6495,22 @@ final class PersistentIRCClient {
         if (oldAvatar != newAvatar) syncPublicAvatar();
     }
 
-    /// Owner UUID (for per-user IPv6). Exposed for the manager / session snapshot.
+    /// Owner UUID exposed for the manager / session snapshot, not allocation.
     @property UUID getOwnerId() const { return ownerId; }
-    void setOwnerId(UUID uid) { ownerId = uid; ipv6BindResolved = false; ipv6BindCache = ""; }
+    void setOwnerId(UUID uid) { ownerId = uid; }
 
-    /// Cached per-user IPv6 bind address (empty when prefix unset).
+    /// Reserved address for this saved connection on this engine's pool.
+    /// Missing/malformed IID or prefix means no native candidate, never a
+    /// transient allocation. Observed active addresses come only from holder
+    /// localIp/peerIp; resolving a reservation does not change those fields.
     string resolveIpv6Bind() {
-        if (ipv6BindResolved) return ipv6BindCache;
-        ipv6BindResolved = true;
-        ipv6BindCache = ipv6BindForUser(ownerId);
-        if (ipv6BindCache.length > 0)
-            logInfo("IPv6 bind for %s owner %s → %s", config.name, ownerId.toString(), ipv6BindCache);
-        return ipv6BindCache;
+        if (config.id == UUID.init) return "";
+        loadIpv6Config();
+        string prefix;
+        if (gIpv6Lock !is null) synchronized (gIpv6Lock) { prefix = gIpv6Prefix; }
+        else prefix = gIpv6Prefix;
+        return ipv6ForConnection(prefix, config.ipv6Iid);
     }
-    /// IPv6 actually used (for admin display)
-    @property string getIpv6Bind() { return resolveIpv6Bind(); }
 
     // ── Connection loop ───────────────────────────────────────────────────────
 
@@ -7266,13 +7230,13 @@ final class PersistentIRCClient {
     /// One holder-backed connect through the egress policy loop. Sets the
     /// transport, the holder connection id, the active egress/socket
     /// bookkeeping and the TLS details; emits the post-connect timeline.
-    private void dialViaHolder(string tlsMode, string ipv6Bind) {
+    private void dialViaHolder(string tlsMode) {
         if (holder is null) throw new HolderUnavailableException("no connection holder configured");
         dialTlsMode = tlsMode;
         DialResult dr;
         withSpan("irc.tcp_connect",
             ["network": config.name, "host": config.host, "port": config.port.to!string,
-             "routing": config.routing.toJson().toString(), "ipv6Bind": ipv6Bind, "tls": tlsMode],
+             "routing": config.routing.toJson().toString(), "tls": tlsMode],
             (ref Span ts) {
             EgressUsed used;
             // Release before the new connect: happyEyeballsConnect takes the
@@ -7286,7 +7250,7 @@ final class PersistentIRCClient {
             const now = unixMsNow();
             if (now >= avoidUntilMs) { avoidEgressLabel = ""; avoidUntilMs = 0; }
             connection = happyEyeballsConnect(holder, tag, config.host, config.port, tlsMode,
-                config.routing, config.sasl == SASLMechanism.none, ipv6Bind,
+                config.routing, config.sasl == SASLMechanism.none,
                 &onDialEvent, avoidEgressLabel, used, dr);
             holderConnId = dr.id;
             activeEgressLabel = used.label;
@@ -7413,13 +7377,11 @@ final class PersistentIRCClient {
              "attempt": backoff.currentAttempt().to!string,
              "event": "reconnect_attempt"]);
 
-        // Resolve per-user IPv6 once (cached). Empty when IRCFIBER_IPV6_PREFIX unset.
-        string ipv6Bind = resolveIpv6Bind();
-        logInfo("Connecting to %s:%s (Happy Eyeballs) ipv6Bind=%s routing=%s owner=%s",
-            config.host, config.port, ipv6Bind.length ? ipv6Bind : "-", config.routing.toJson().toString(), ownerId.toString());
+        logInfo("Connecting to %s:%s (Happy Eyeballs) routing=%s owner=%s",
+            config.host, config.port, config.routing.toJson().toString(), ownerId.toString());
         dialPlainFallback = false;
         try {
-            dialViaHolder(holderTlsMode(config.tls), ipv6Bind);
+            dialViaHolder(holderTlsMode(config.tls));
         } catch (DialFailedException e) {
             if (e.phase != "tls" && e.phase != "starttls") throw e;
             logJsonMap("warn", "connection",
@@ -7443,7 +7405,7 @@ final class PersistentIRCClient {
             logWarn("TLS handshake failed for %s, falling back to plain text", config.host);
             emitLog("warn", "TLS handshake failed — falling back to plain text as configured.");
             dialPlainFallback = true;
-            dialViaHolder("none", resolveIpv6Bind());
+            dialViaHolder("none");
             logInfo("Plain fallback TCP via egress '%s' (%s/%s) to %s:%d", activeEgressLabel.length ? activeEgressLabel : "direct", activeEgressHost.length ? activeEgressHost : "direct", activeEgressIp.length ? activeEgressIp : "-", config.host, config.port);
             logJsonMap("info", "connection", "TLS handshake failed; fell back to plain text", ["network": config.name, "host": config.host, "egress": activeEgressLabel.length ? activeEgressLabel : "direct", "egressHost": activeEgressHost, "egressIp": activeEgressIp, "event": "tls_plain_fallback"]);
             logInfo("Connected to %s:%s without TLS via %s", config.host, config.port, activeEgressLabel.length ? activeEgressLabel : "direct");

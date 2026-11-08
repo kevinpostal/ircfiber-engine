@@ -773,6 +773,10 @@ private int parseIntSafe(string s, int defaultVal = 100) {
 private NetworkConfig parseNetworkConfig(Json j) {
     NetworkConfig cfg;
     cfg.id = parseUUID(j["id"].get!string);
+    // Internal full-config field only. Never synthesize an IID from owner/id
+    // or fill a missing value during a dial; Mongo owns immutable allocation.
+    if (j["ipv6Iid"].type == Json.Type.string)
+        cfg.ipv6Iid = j["ipv6Iid"].get!string;
     cfg.name = j["name"].get!string;
     cfg.host = j["host"].get!string;
     cfg.port = cast(ushort) j["port"].get!int;

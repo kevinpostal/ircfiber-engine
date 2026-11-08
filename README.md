@@ -172,7 +172,19 @@ For a provider-assigned **shared /128**, set `ircfiber_public_ipv6_address`,
 `ircfiber_public_ipv6_gateway`, and `ircfiber_public_ipv6_interface` in host
 inventory. The engine role persists a netplan overlay and adds the address
 and routes without restarting networking or containers. This is separate from
-`ircfiber_ipv6_prefix`, which requires an actually routed per-user prefix.
+`ircfiber_ipv6_prefix`, which accepts only an aligned global-unicast routed
+`/64`. Each saved connection has an immutable random `ipv6Iid`, allocated
+atomically in Mongo with a unique partial index. Its address reservation uses
+that IID and the serving node's pool, never the owner's UUID, nick or host.
+Missing/invalid IIDs or prefixes produce no reservation; the engine never
+generates a transient replacement. Different saved connections have different
+IIDs; reconnects and hot swaps retain them.
+
+A reservation is not evidence of an active source. Until the IPv6-only native
+transport tier is available, shared-direct uses no pool bind, including its
+plaintext fallback. Holder-observed `localIp`/`peerIp` remain the transport
+evidence; active-route status belongs to the native transport integration.
+The obsolete per-owner rDNS pool setting has been removed.
 An assigned IPv6 route does not override a remote server's access policy.
 
 ```bash

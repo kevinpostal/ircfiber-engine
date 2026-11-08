@@ -1,6 +1,6 @@
 ---
-# Per-user IPv6 host prep (IRCCloud-style: one /128 per user inside a
-# ROUTED prefix). Included by roles/engine/tasks/main.yml and by
+# Saved-connection IPv6 host prep (one reserved /128 per saved connection in a
+# ROUTED /64). Included by roles/engine/tasks/main.yml and by
 # site/deploy/playbooks/engine-deploy.yml (via the role) so both deploy paths converge.
 #
 # Prerequisite the playbook cannot create: the prefix must actually be
@@ -16,7 +16,7 @@
 - name: Configure the provider-assigned shared public IPv6
   ansible.builtin.include_tasks: public_ipv6.yml
 
-- name: Configure per-user IPv6 (host-level, idempotent)
+- name: Configure saved-connection IPv6 pool (host-level, idempotent)
   when: ircfiber_ipv6_prefix is defined and ircfiber_ipv6_prefix | length > 0
   block:
     - name: Enable IPv6 non-local bind (allows binding any IID in the routed prefix)
@@ -32,7 +32,7 @@
         _ipv6_prefix_nocidr: "{{ ircfiber_ipv6_prefix.split('/')[0] }}"
         _ipv6_prefix_len: "{{ ircfiber_ipv6_prefix.split('/')[1] | default('64') }}"
 
-    - name: Add local route for the per-user IPv6 prefix (makes every IID bindable)
+    - name: Add local route for the saved-connection IPv6 pool (makes every IID bindable)
       ansible.builtin.command: >
         ip -6 route add local {{ _ipv6_prefix_nocidr }}/{{ _ipv6_prefix_len }} dev lo
       register: _ipv6_route_add
@@ -45,7 +45,7 @@
         mode: "0644"
         content: |
           [Unit]
-          Description=IRC Fiber per-user IPv6 local route ({{ ircfiber_ipv6_prefix }})
+          Description=IRC Fiber saved-connection IPv6 local route ({{ ircfiber_ipv6_prefix }})
           After=network-online.target
           Wants=network-online.target
           [Service]

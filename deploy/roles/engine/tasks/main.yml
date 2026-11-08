@@ -48,7 +48,7 @@
     group: root
     mode: "0750"
 
-- name: IPv6 host prep (shared assigned address and optional per-user prefix)
+- name: IPv6 host prep (shared assigned address and optional saved-connection pool)
   ansible.builtin.include_tasks: ipv6.yml
 
 - name: Render engine env file

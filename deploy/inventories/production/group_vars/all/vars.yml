@@ -135,18 +135,14 @@ ircfiber_engine_image_full: "{{ ircfiber_engine_image_name }}:{{ docker_image_ta
 ircfiber_engine_bind_address: "0.0.0.0"
 ircfiber_engine_admin_port: 8091
 ircfiber_engine_log_level: "info"
-# Per-user IPv6 (IRCCloud-style): a prefix ROUTED to the engine host that
-# gives each user their own /128 (low 64 bits of their UUID as the IID).
-# Leave empty to disable — the engine still prefers AAAA (Happy Eyeballs,
-# IPv6 first) but every user shares the host's single IPv6 address.
-# Example: "2001:db8:abcd:12::/64". Setting this switches the engine
-# container to --network host (bridge NAT66 would masquerade the per-user
-# source away) and runs roles/engine/tasks/ipv6.yml on the host.
-# NOT usable with the on-link /64 an OVH VPS shows in netplan: only the
-# assigned /128 is routed (verified 2026-09-04).
+# Saved-connection IPv6 pool: an aligned global-unicast /64 routed to the
+# provider node. Each saved network has an immutable random Mongo IID;
+# owner/nick/host changes and reconnects do not allocate a different IID.
+# Example shape: "2001:db8:abcd:12::/64" (documentation only, never deploy).
+# Leave empty to disable native reservations. Shared-direct stays unbound;
+# using a reservation requires the separate IPv6-only holder transport tier.
+# An OVH on-link /64 is NOT a routed pool: only its assigned /128 works.
 ircfiber_ipv6_prefix: ""
-# rDNS pool host for id-<uid>.pool (e.g. "highgate.ircfiber.com") — optional, for PTR/WHOIS
-ircfiber_ipv6_pool_host: ""
 
 # --- Mullvad egress slots (local sidecars on the engine host, retargetable) --
 # Long-lived SOCKS slots the engine drives through each sidecar's own
