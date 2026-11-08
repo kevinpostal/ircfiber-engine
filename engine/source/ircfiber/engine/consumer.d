@@ -851,3 +851,20 @@ unittest {
     j["routing"] = Json.init;
     assert(!parseNetworkConfig(j).routing.valid);
 }
+
+@("engine control: internal IID is preserved verbatim without allocating missing identities")
+unittest {
+    NetworkConfig original;
+    original.host = "irc.example.org";
+    original.nick = "fixture";
+    original.ipv6Iid = "a516446655440123";
+    auto j = original.toJson();
+    assert(parseNetworkConfig(j).ipv6Iid == original.ipv6Iid);
+    foreach (value; [Json.init, Json(null), Json(42)]) {
+        j["ipv6Iid"] = value;
+        assert(parseNetworkConfig(j).ipv6Iid == "");
+    }
+    j["ipv6Iid"] = "malformed";
+    assert(parseNetworkConfig(j).ipv6Iid == "malformed",
+        "invalid stored identity stays invalid; resolving it must fail closed");
+}

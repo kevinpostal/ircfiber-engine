@@ -3314,6 +3314,62 @@ unittest {
     assert(h.connect(host, testRouting([RouteKind.nordvpn])) == ["nord-se"], "healed store-side: dialable again");
 }
 
+@("IPv6 reservation uses only the saved IID and serving pool, not mutable connection metadata")
+unittest {
+    import vibe.core.channel : createChannel;
+    const savedPrefix = gIpv6Prefix;
+    const savedLoaded = gIpv6Loaded;
+    scope(exit) {
+        gIpv6Prefix = savedPrefix;
+        gIpv6Loaded = savedLoaded;
+    }
+    gIpv6Prefix = "2001:db8:1234:5678::/64";
+    gIpv6Loaded = true;
+    NetworkConfig cfg;
+    cfg.id = parseUUID("550e8400-e29b-41d4-a716-446655440001");
+    cfg.ipv6Iid = "a516446655440123";
+    cfg.nick = "fixture";
+    cfg.host = "irc.example.org";
+    auto ch = createChannel!IRCRawEvent();
+    scope(exit) ch.close();
+    auto c = new PersistentIRCClient(cfg, ch, null, "fixture-engine",
+        parseUUID("550e8400-e29b-41d4-a716-446655440002"));
+    const reserved = c.resolveIpv6Bind();
+    assert(reserved == "2001:db8:1234:5678:a516:4466:5544:123");
+    c.activeLocalIp = "192.0.2.10";
+    c.activePeerIp = "192.0.2.20";
+    c.setOwnerId(parseUUID("550e8400-e29b-41d4-a716-446655440003"));
+    cfg.nick = "renamed";
+    cfg.host = "other.example.org";
+    c.updateConfig(cfg);
+    assert(c.resolveIpv6Bind() == reserved);
+    assert(c.activeLocalIp == "192.0.2.10" && c.activePeerIp == "192.0.2.20",
+        "a reservation must not overwrite observed transport evidence");
+    auto reconnect = new PersistentIRCClient(cfg, ch);
+    assert(reconnect.resolveIpv6Bind() == reserved);
+    cfg.id = parseUUID("550e8400-e29b-41d4-a716-446655440004");
+    cfg.ipv6Iid = "a516446655440124";
+    auto clone = new PersistentIRCClient(cfg, ch);
+    assert(clone.resolveIpv6Bind() != reserved);
+    foreach (bad; ["", "A516446655440123", "a716446655440123",
+                   "000000000000ffff", "fdffffffffffff80", "not-an-iid"]) {
+        cfg.ipv6Iid = bad;
+        c.updateConfig(cfg);
+        assert(c.resolveIpv6Bind() == "");
+    }
+    cfg.ipv6Iid = "a516446655440123";
+    c.updateConfig(cfg);
+    foreach (bad; ["", "2001:db8:1234:5678::", "2001:db8:1234:5678::/48",
+                   "2001:db8:1234:5678::1/64", "fd00:1234::/64"]) {
+        gIpv6Prefix = bad;
+        assert(c.resolveIpv6Bind() == "");
+    }
+    gIpv6Prefix = "2001:db8:1234:5678::/64";
+    cfg.id = UUID.init;
+    c.updateConfig(cfg);
+    assert(c.resolveIpv6Bind() == "", "unsaved configs cannot acquire a native identity");
+}
+
 @("egress trial: a client settles its trial only through the fenced store, and carries it across a swap")
 unittest {
     import vibe.core.channel : createChannel;
