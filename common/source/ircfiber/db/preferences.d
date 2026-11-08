@@ -151,10 +151,10 @@ enum MAX_HIGHLIGHT_WORDS = 100;
 enum MAX_HIGHLIGHT_WORD_BYTES = 64;
 
 /// How a `clientPrefs` value is validated.
-enum ClientPrefKind { bool_, enum_, int_, intEnum, string_ }
+enum ClientPrefKind { bool_, enum_, int_, intEnum }
 
 /// One `clientPrefs` key: its kind and allowed values (`options` for enum_,
-/// `min`..`max` for int_ (inclusive) and the byte cap for string_ (`max`), `ints` for intEnum).
+/// `min`..`max` for int_ (inclusive), `ints` for intEnum).
 struct ClientPrefSpec {
     string key;
     ClientPrefKind kind;
@@ -166,12 +166,11 @@ struct ClientPrefSpec {
 
 /// Per-device web client prefs, in wire order (the frontend keeps the identical list).
 immutable ClientPrefSpec[] CLIENT_PREFS = [
-    ClientPrefSpec("theme", ClientPrefKind.enum_, ["dark", "midnight", "dusk", "tropic", "emerald", "sand", "orchid"]),
+    ClientPrefSpec("theme", ClientPrefKind.enum_, ["dark", "light", "gruvbox", "monokai"]),
     ClientPrefSpec("textSize", ClientPrefKind.enum_, TEXT_SIZE_VALUES),
     ClientPrefSpec("compactMode", ClientPrefKind.bool_),
     ClientPrefSpec("sidebarLeft", ClientPrefKind.bool_),
     ClientPrefSpec("messageLayout", ClientPrefKind.enum_, ["compact", "comfortable", "separate"]),
-    ClientPrefSpec("customCSS", ClientPrefKind.string_, null, 0, 32_768),
     ClientPrefSpec("defaultScrollPreset", ClientPrefKind.int_, null, 0, 4),
     ClientPrefSpec("inlineImages", ClientPrefKind.bool_),
     ClientPrefSpec("inlineVideos", ClientPrefKind.bool_),
@@ -1108,9 +1107,6 @@ private string clientPrefError(const ref ClientPrefSpec spec, Json v) {
         case ClientPrefKind.intEnum:
             return v.type == Json.Type.int_ && spec.ints.canFind(v.get!long) ? ""
                 : spec.key ~ " must be one of " ~ spec.ints.map!(i => i.to!string).join(", ");
-        case ClientPrefKind.string_:
-            return v.type == Json.Type.string && v.get!string.length <= spec.max ? ""
-                : spec.key ~ " must be a string of at most " ~ spec.max.to!string ~ " bytes";
     }
 }
 
@@ -2577,8 +2573,6 @@ unittest {
 
 @("checkClientPrefsPatch: per-kind validation, null deletes, unknown keys ignored, any flag")
 unittest {
-    import std.array : replicate;
-
     bool any;
     string field;
     assert(checkClientPrefsPatch(Json.emptyArray, any, field) == "body must be object");
@@ -2601,9 +2595,12 @@ unittest {
     assert(err("compactMode", Json(true)) == "");
     assert(err("compactMode", Json(1)) == "compactMode must be boolean");
     // enum
-    assert(err("theme", Json("orchid")) == "");
-    assert(err("theme", Json("light")) == "theme must be one of dark, midnight, dusk, tropic, emerald, sand, orchid");
+    foreach (theme; ["dark", "light", "gruvbox", "monokai"])
+        assert(err("theme", Json(theme)) == "");
+    foreach (theme; ["midnight", "dusk", "tropic", "emerald", "sand", "orchid"])
+        assert(err("theme", Json(theme)).length);
     assert(err("theme", Json(true)).length);
+    assert(err("theme", Json(1)).length);
     assert(err("linkPreviewSize", Json("large")) == "");
     // int range, inclusive bounds
     assert(err("defaultScrollPreset", Json(0)) == "" && err("defaultScrollPreset", Json(4)) == "");
@@ -2615,16 +2612,12 @@ unittest {
     assert(err("awayAfterMinutes", Json(30)) == "");
     assert(err("awayAfterMinutes", Json(10)) == "awayAfterMinutes must be one of 5, 15, 30, 60");
     assert(err("awayAfterMinutes", Json("15")).length);
-    // string length cap in bytes
-    assert(err("customCSS", Json("")) == "");
-    assert(err("customCSS", Json(replicate("a", 32_768))) == "");
-    assert(err("customCSS", Json(replicate("a", 32_769))) == "customCSS must be a string of at most 32768 bytes");
-    assert(err("customCSS", Json(3)).length);
     // null is valid for any key (it deletes it)
     assert(err("theme", Json(null)) == "");
 
     auto unknown = Json.emptyObject;
     unknown["inlineTweets"] = Json(true);
+    unknown["customCSS"] = Json("body{display:none}");
     assert(checkClientPrefsPatch(unknown, any, field) == "" && !any, "unknown keys alone are not a client pref");
     unknown["inlineImages"] = Json(false);
     assert(checkClientPrefsPatch(unknown, any, field) == "" && any);
@@ -2633,19 +2626,23 @@ unittest {
 @("applyClientPrefsPatch sets and deletes keys into a new object, ignoring unknown keys")
 unittest {
     auto base = Json.emptyObject;
-    base["theme"] = Json("dusk");
+    base["theme"] = Json("gruvbox");
     base["textSize"] = Json("s");
     Json prefs = base;
     auto patch = Json.emptyObject;
     patch["textSize"] = Json(null);
     patch["compactMode"] = Json(true);
     patch["inlineTweets"] = Json(true);
+    patch["customCSS"] = Json("body{display:none}");
     applyClientPrefsPatch(prefs, patch);
-    assert(prefs["theme"].get!string == "dusk");
+    assert(prefs["theme"].get!string == "gruvbox");
     assert("textSize" !in prefs, "null deletes the key");
     assert(prefs["compactMode"].get!bool);
     assert("inlineTweets" !in prefs);
+    assert("customCSS" !in prefs);
     assert(base["textSize"].get!string == "s" && "compactMode" !in base, "the old object is untouched");
+    applyClientPrefsPatch(prefs, parseJsonString(`{"theme":null}`));
+    assert("theme" !in prefs && base["theme"].get!string == "gruvbox");
 }
 
 @("clientPrefs round-trip on the account and a device; bad stored keys are dropped and flag a repair")
@@ -2653,7 +2650,7 @@ unittest {
     enum id = "11111111-2222-4333-8444-555555555555";
     UserPreferences p;
     auto cp = Json.emptyObject;
-    cp["theme"] = Json("sand");
+    cp["theme"] = Json("light");
     cp["awayAfterMinutes"] = Json(60);
     p.clientPrefs = cp;
     DeviceProfile d;
@@ -2661,7 +2658,7 @@ unittest {
     d.name = "Work laptop";
     d.autoName = "Chrome on macOS";
     auto dcp = Json.emptyObject;
-    dcp["customCSS"] = Json(".x{}");
+    dcp["compactMode"] = Json(true);
     d.clientPrefs = dcp;
     d.clientPrefsSet = true;
     p.devices[id] = d;
@@ -2683,9 +2680,10 @@ unittest {
     assert(l.prefs.devices[id].clientPrefs.type == Json.Type.object && l.prefs.devices[id].clientPrefs.length == 0);
 
     auto badCp = Json.emptyObject;
-    badCp["theme"] = Json("light");
+    badCp["theme"] = Json("sand");
     badCp["textSize"] = Json("l");
     badCp["inlineTweets"] = Json(true);
+    badCp["customCSS"] = Json("body{display:none}");
     auto j = Json.emptyObject;
     j["clientPrefs"] = badCp;
     const s = UserPreferences.fromJson(j);
@@ -2714,7 +2712,7 @@ unittest {
     enum long now = 1_800_000_000_000;
     UserPreferences p;
     auto cp = Json.emptyObject;
-    cp["theme"] = Json("emerald");
+    cp["theme"] = Json("monokai");
     p.clientPrefs = cp;
     bool changed;
     auto prof = ensureDeviceProfile(p, id, "", now, changed, "", "", "", DEVICE_KIND_WEB, "Firefox on Linux");
@@ -2722,9 +2720,9 @@ unittest {
     assert(prof.kind == DEVICE_KIND_WEB && prof.autoName == "Firefox on Linux");
     assert(prof.clientPrefs == cp && !prof.clientPrefsSet);
     auto patch = Json.emptyObject;
-    patch["theme"] = Json("dusk");
+    patch["theme"] = Json("gruvbox");
     applyClientPrefsPatch(prof.clientPrefs, patch);
-    assert(p.clientPrefs["theme"].get!string == "emerald", "the seed is a copy, not shared");
+    assert(p.clientPrefs["theme"].get!string == "monokai", "the seed is a copy, not shared");
 
     prof = ensureDeviceProfile(p, id, "", now + 60_000, changed, "", "", "", DEVICE_KIND_WEB, "Firefox on Linux");
     assert(!changed, "the same autoName writes nothing");
@@ -2764,12 +2762,13 @@ unittest {
     enum id = "11111111-2222-4333-8444-555555555555";
     UserPreferences p;
     auto acct = Json.emptyObject;
-    acct["theme"] = Json("midnight");
+    acct["theme"] = Json("light");
     p.clientPrefs = acct;
     bool changed;
     auto prof = ensureDeviceProfile(p, id, "", 1000, changed, "", "", "", DEVICE_KIND_WEB, "Safari on macOS");
     auto devPrefs = Json.emptyObject;
     devPrefs["textSize"] = Json("l");
+    devPrefs["theme"] = Json("monokai");
     prof.chatScalePct = 130;
     prof.clientPrefs = devPrefs;
     prof.showUserIcons = false;
