@@ -126,13 +126,36 @@ struct DialRequest {
     string sni;
     bool hasProxy;
     DialProxy proxy;
-    /// Per-user IPv6 source bind for direct dials; "" = none.
+    /// Actual requested source bind, never evidence of the socket's source.
     string bindIp6;
     int connectTimeoutMs = 10_000;
     int tlsTimeoutMs = 10_000;
     int starttlsTimeoutMs = 15_000;
+    string addressFamily = "any";
+
+    void validate() const {
+        if (addressFamily != "any" && addressFamily != "ipv6")
+            throw new HolderErrorException("bad_request", "unknown addressFamily");
+        if (addressFamily == "ipv6") {
+            import core.sys.posix.arpa.inet : inet_pton;
+            import core.sys.posix.sys.socket : AF_INET6;
+            if (hasProxy || !bindIp6.length || bindIp6.length > 45)
+                throw new HolderErrorException("bad_request", "ipv6 requires an IPv6 source and no proxy");
+            char[46] text = void;
+            foreach (i, c; bindIp6) {
+                if (c == '\0')
+                    throw new HolderErrorException("bad_request", "invalid IPv6 source");
+                text[i] = c;
+            }
+            text[bindIp6.length] = '\0';
+            ubyte[16] address;
+            if (inet_pton(AF_INET6, text.ptr, address.ptr) != 1)
+                throw new HolderErrorException("bad_request", "invalid IPv6 source");
+        }
+    }
 
     Json toJson(string token) const {
+        validate();
         auto j = Json.emptyObject;
         if (token.length) j["token"] = token;
         j["tag"] = tag.toJson();
@@ -151,6 +174,7 @@ struct DialRequest {
             j["proxy"] = Json(null);
         }
         j["bindIp6"] = bindIp6.length ? Json(bindIp6) : Json(null);
+        j["addressFamily"] = addressFamily;
         j["connectTimeoutMs"] = connectTimeoutMs;
         j["tlsTimeoutMs"] = tlsTimeoutMs;
         j["starttlsTimeoutMs"] = starttlsTimeoutMs;
@@ -250,6 +274,15 @@ struct HolderStatus {
     long detached;
     long closed;
     long bufferedBytes;
+    /// Missing capability metadata is an old holder: shared direct only.
+    string[] dialFamilies;
+
+    bool supportsFamily(string family) const {
+        if (family == "any") return true;
+        if (family != "ipv6") return false;
+        foreach (value; dialFamilies) if (value == family) return true;
+        return false;
+    }
 
     static HolderStatus fromJson(Json j) {
         HolderStatus s;
@@ -263,6 +296,18 @@ struct HolderStatus {
         s.detached = jsonLong(j, "detached");
         s.closed = jsonLong(j, "closed");
         s.bufferedBytes = jsonLong(j, "bufferedBytes");
+        if (j["dialFamilies"].type == Json.Type.array) {
+            bool valid = true;
+            foreach (value; j["dialFamilies"]) {
+                if (value.type != Json.Type.string
+                        || (value.get!string != "any" && value.get!string != "ipv6")) {
+                    valid = false;
+                    break;
+                }
+                s.dialFamilies ~= value.get!string;
+            }
+            if (!valid) s.dialFamilies = null;
+        }
         return s;
     }
 }
@@ -647,12 +692,15 @@ final class HolderClient {
     /// on `CONNECTED`; throws `DialFailedException` on `FAILED`,
     /// `HolderUnavailableException` when the holder cannot be reached.
     DialResult dial(DialRequest req, DialProgress progress) {
+        auto requestPayload = req.toJson(token);
+        if (req.addressFamily == "ipv6" && !status().supportsFamily("ipv6"))
+            throw new DialFailedException("holder", "holder lacks IPv6-only dial capability");
         auto c = open(OPEN_TIMEOUT);
         bool keep;
         scope (exit) if (!keep) closeQuietly(c);
         c.readTimeout = DIAL_TIMEOUT;
         try {
-            writeLine(c, "DIAL " ~ req.toJson(token).toString());
+            writeLine(c, "DIAL " ~ requestPayload.toString());
         } catch (Exception e) {
             throw new HolderUnavailableException("holder dial write failed: " ~ e.msg);
         }

@@ -17,9 +17,16 @@ dependency "vibe-d" version="~>0.10.0"
 dependency "vibe-d:redis" version="~>0.10.0"
 dependency "vibe-d:mongodb" version="~>0.10.0"
 dependency "diet-ng" version="~>1.8"
+dependency "openssl" version="~>3.4.0"
 
 configuration "library" {
     targetType "library"
+}
+
+// Fixture-only entropy hooks; production library has no injectable allocator.
+configuration "routing-policy-test" {
+    targetType "library"
+    versions "VibeUseFibers" "RoutingPolicyTest"
 }
 configuration "unittest" {
     targetType "library"

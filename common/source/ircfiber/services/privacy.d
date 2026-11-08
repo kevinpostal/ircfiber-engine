@@ -226,6 +226,8 @@ private bool sensitiveLineOne(string line, const ServicesConfig cfg) @safe pure 
     if (rest.length && rest[0] == ':') rest = afterWord(rest);
     const verb = upperWord(rest);
     switch (verb) {
+        case "REGISTER": case "VERIFY":
+            return true;
         case "PRIVMSG": case "NOTICE": case "SQUERY": {
             // `PRIVMSG bob,NickServ :IDENTIFY pw` reaches NickServ too.
             const targets = word(rest);

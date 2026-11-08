@@ -79,6 +79,12 @@ struct ConnectionServer {
     string gitMessage;
     /// GitHub commit URL.
     string gitCommitUrl;
+    /// Enforced routing contract. Old metadata decodes to zero, never capable.
+    int routingPolicyVersion;
+    /// Explicit transport capabilities, not inferred from health or node names.
+    string[] supportedRoutes;
+    /// Verified native pool only; empty unless IPv6 capability is usable.
+    string ipv6Prefix;
     /// Serializes to JSON.
     Json toJson() const {
         auto j = Json.emptyObject;
@@ -93,6 +99,9 @@ struct ConnectionServer {
         j["maxConnections"] = Json(maxConnections);
         j["fallbackOnly"] = Json(fallbackOnly);
         j["draining"] = Json(draining);
+        j["routingPolicyVersion"] = Json(routingPolicyVersion);
+        j["supportedRoutes"] = serializeToJson(supportedRoutes);
+        j["ipv6Prefix"] = Json(ipv6Prefix);
         j["registrationUnavailableFor"] = serializeToJson(registrationUnavailableFor);
         if (gitHash.length) j["gitHash"] = Json(gitHash);
         if (gitShort.length) j["gitShort"] = Json(gitShort);
@@ -127,6 +136,36 @@ struct ConnectionServer {
         if (j["maxConnections"].type != Json.Type.undefined) s.maxConnections = j["maxConnections"].get!int;
         if (j["fallbackOnly"].type != Json.Type.undefined) s.fallbackOnly = j["fallbackOnly"].get!bool;
         if (j["draining"].type != Json.Type.undefined) s.draining = j["draining"].get!bool;
+        if (j["routingPolicyVersion"].type == Json.Type.int_)
+            s.routingPolicyVersion = j["routingPolicyVersion"].get!int;
+        if (j["ipv6Prefix"].type == Json.Type.string) {
+            import ircfiber.irc.ipv6 : parseRoutedIpv6Prefix;
+            ubyte[16] prefix;
+            if (parseRoutedIpv6Prefix(j["ipv6Prefix"].get!string, prefix))
+                s.ipv6Prefix = j["ipv6Prefix"].get!string;
+        }
+        bool native;
+        if (j["supportedRoutes"].type == Json.Type.array) {
+            import ircfiber.irc.routing_policy : routeKindFromToken;
+            bool valid = true;
+            uint seen;
+            foreach (value; j["supportedRoutes"]) {
+                if (value.type != Json.Type.string) { valid = false; break; }
+                const token = value.get!string;
+                uint bit;
+                try { bit = 1u << cast(uint)routeKindFromToken(token); }
+                catch (Exception) { valid = false; break; }
+                if (seen & bit) { valid = false; break; }
+                seen |= bit;
+                if (token == "ipv6") {
+                    if (!s.ipv6Prefix.length) continue;
+                    native = true;
+                }
+                s.supportedRoutes ~= token;
+            }
+            if (!valid) { s.supportedRoutes = null; native = false; }
+        }
+        if (!native) s.ipv6Prefix = "";
         if (j["registrationUnavailableFor"].type != Json.Type.undefined) {
             foreach (item; j["registrationUnavailableFor"]) s.registrationUnavailableFor ~= item.get!string;
         }

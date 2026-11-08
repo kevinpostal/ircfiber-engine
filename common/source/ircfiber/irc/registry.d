@@ -12,6 +12,14 @@ import vibe.db.redis.redis : RedisDatabase;
 import ircfiber.irc.server : ConnectionServer, NetworkAssignment;
 import ircfiber.redis.protocol : RedisKeys;
 import ircfiber.storage.redis : RedisStorage;
+import ircfiber.db.network : NetworkRepository;
+import ircfiber.irc.routing_policy : EffectiveRoutingPolicy, resolveRoutingPolicy,
+    routingPolicyFromJson, routeToken;
+import ircfiber.irc.routing_policy_store : loadRoutingPolicy, requireRoutingUpgrade,
+    RoutingPolicyUnavailableException;
+import ircfiber.irc.routing_moves : requestNetworkMove, networkMoveFenced,
+    RoutingMoveConflictException, NETWORK_ROUTING_LEASE_TTL_SECONDS;
+import ircfiber.netaddr : canonicalHost;
 
 /// Summary of connections per IRC host for the admin dashboard.
 struct HostConnectionSummary {
@@ -77,17 +85,6 @@ final class ServerRegistry {
      * Critical: Sets initial buffer offset to prevent ID collision.
      * This is the fix for IRCCloud's 2020 data leak vulnerability.
      */
-    /// Direct, minimal self-assignment: write `networkId → serverId`
-    /// directly into the canonical hash. Used during bootstrap when
-    /// the engine is the first server to come online (no healthy
-    /// peers in the registry yet), so `assignNetwork` would otherwise
-    /// fail and the network would be dropped on every restart.
-    /// Caller is responsible for ensuring no other server should own
-    /// this network (typically by checking `getAllServers().length == 0`
-    /// first).
-    void selfAssignNetwork(string networkId, string serverId) {
-        db.hset(RedisKeys.networkAssignments(), networkId, serverId);
-    }
 
     /// Registers a new connection server in the registry.
     void registerServer(ConnectionServer server) {
@@ -95,22 +92,18 @@ final class ServerRegistry {
             throw new Exception("Server ID must be non-empty");
         }
 
-        // Check if server already exists
+        // Registration refreshes capabilities too; heartbeat alone must not
+        // retain an older process's transport advertisement.
         const existing = getServer(server.serverId);
-        if (existing.serverId.length > 0) {
-            logWarn("Server %s already registered, updating heartbeat", server.serverId);
-            // Re-registration implies the engine restarted — clear any stale
-            // draining state so the new process is eligible for assignments.
-            // Tests (draining_test: registerServer clears draining) expect
-            // both the hash field and TTL key to be removed.
-            try { db.hdel(RedisKeys.server(server.serverId), "draining"); } catch (Exception) {}
-            try { db.del(RedisKeys.draining(server.serverId)); } catch (Exception) {}
-            // Also clear the draining flag in the persisted data JSON
-            auto fresh = getServer(server.serverId);
-            if (fresh.serverId.length > 0 && fresh.draining) {
-                fresh.draining = false;
-                syncServerState(server.serverId, fresh);
-            }
+        if (existing.serverId.length) {
+            server.bufferOffset = existing.bufferOffset;
+            server.lastHeartbeat = Clock.currTime.toUnixTime!long * 1000;
+            server.isHealthy = true;
+            server.draining = false;
+            db.hset(RedisKeys.server(server.serverId), "data", server.toJson().toString());
+            db.hset(RedisKeys.server(server.serverId), "isHealthy", "true");
+            db.hdel(RedisKeys.server(server.serverId), "draining");
+            db.del(RedisKeys.draining(server.serverId));
             updateHeartbeat(server.serverId);
             return;
         }
@@ -142,67 +135,38 @@ final class ServerRegistry {
             server.serverId, server.bindAddress, server.bufferOffset);
     }
 
-    /**
-     * Unregister a connection server (graceful shutdown or failure).
-     *
-     * Postcondition: Server removed from registry.
-     * Side effect: Reassigns all networks to healthy servers.
-     */
+    /// Removing registry metadata never proves that a remote holder closed.
+    /// Keep canonical ownership and reverse evidence until a fenced move can
+    /// obtain an explicit source acknowledgement.
     void unregisterServer(string serverId) {
-        auto key = RedisKeys.server(serverId);
-        db.del(key);
+        db.del(RedisKeys.server(serverId));
         db.srem(RedisKeys.serverList(), serverId);
-        // Drop the per-engine assignments mirror so a future engine with
-        // the same serverId doesn't inherit stale network mappings.
-        db.del(RedisKeys.serverAssignments(serverId));
-
-        // Reassign networks
-        auto networks = getNetworksForServer(serverId);
-        foreach (netId; networks) {
-            reassignNetwork(netId);
-        }
-
-        logInfo("Unregistered connection server: %s", serverId);
+        logInfo("Unregistered connection server %s; retaining its canonical ownership", serverId);
     }
 
-    /// Mirror the engine's current network assignments into a per-server
-    /// hash so getAllAssignments() can recover if the canonical
-    /// `irc:assignments` hash is evicted by Redis LRU. Each field is a
-    /// networkId; the value is the serverId. The engine calls this on
-    /// every heartbeat — a no-op when the engine has no networks.
-    ///
-    /// Filters out empty/invalid ids. An empty string in the mirror would
-    /// block the per-engine reassignment recovery and survive across
-    /// engine restarts as a ghost row in the admin's Network Assignments
-    /// table — the original symptom that triggered the
-    /// fix/orphan-connection-delete change.
+    /// Publish actual local clients/held-session evidence, not a canonical
+    /// assignment echo. Empty evidence clears the reverse mirror. A stale
+    /// source cannot republish an assigned-away row after a completed move.
     void publishServerAssignments(string serverId, string[] networkIds) {
-        auto key = RedisKeys.serverAssignments(serverId);
-        // Guard: never wipe the mirror with an empty list when the mirror
-        // already holds assignments. This prevents the destructive feedback
-        // loop where an empty canonical (irc:assignments) -> 0 canonical
-        // -> publish 0 -> wipes mirror -> recovery via mirrors also 0.
-        // Keep the last good mirror so getAllAssignments() can still
-        // recover until the canonical is rebuilt from Mongo.
-        if (networkIds.length == 0) {
-            try {
-                auto existing = db.hlen(key);
-                if (existing > 0) {
-                    logWarn("publishServerAssignments: refusing to wipe mirror %s (%d entries) with empty list — keeping last good state", key, existing);
-                    return;
-                }
-            } catch (Exception e) {}
+        if (!serverId.length) return;
+        string[] args = [serverId];
+        foreach (id; networkIds) {
+            try { if (id.length && parseUUID(id[]) != UUID.init) args ~= id; }
+            catch (Exception) {}
         }
-        // Replace atomically: delete the mirror and re-populate. A short
-        // window where the mirror is empty is acceptable because the
-        // canonical hash is the primary source; the mirror only matters
-        // during recovery, and an empty mirror just means "no networks
-        // to recover from this engine".
-        db.del(key);
-        foreach (netId; networkIds) {
-            if (netId.length == 0) continue;
-            db.hset(key, netId, serverId);
-        }
+        db.eval!string(q"LUA
+local mirrorType = redis.call('TYPE', KEYS[1]).ok
+if mirrorType ~= 'none' and mirrorType ~= 'hash' then error('invalid assignment mirror') end
+-- Read/validate the canonical hash before replacing any evidence.
+local keep = {}
+for i = 2, #ARGV do
+  local owner = redis.call('HGET', KEYS[2], ARGV[i])
+  if not owner or owner == ARGV[1] then keep[#keep + 1] = ARGV[i] end
+end
+redis.call('DEL', KEYS[1])
+for _, id in ipairs(keep) do redis.call('HSET', KEYS[1], id, ARGV[1]) end
+return '1'
+LUA", [RedisKeys.serverAssignments(serverId), RedisKeys.networkAssignments()], args);
     }
 
     /**
@@ -224,23 +188,13 @@ final class ServerRegistry {
         auto now = Clock.currTime.toUnixTime!long * 1000;
         logInfo("updateHeartbeat: %s -> %s", serverId, now);
         db.hset(key, "lastHeartbeat", now.to!string);
+        db.hset(key, "isHealthy", "true");
         // A live heartbeat ends the hot-swap grace window: the first beat
         // of the replacement engine clears the stamp its predecessor left.
         try { db.hdel(key, "hotswapAt"); } catch (Exception) {}
         db.sadd(RedisKeys.serverList(), serverId);
-        // Heartbeat implies the engine is alive — clear stale draining
-        // flags so a previously-draining engine that recovers becomes
-        // schedulable again. Tests expect TTL key to be deleted here.
-        try { db.hdel(key, "draining"); } catch (Exception) {}
-        try { db.del(RedisKeys.draining(serverId)); } catch (Exception) {}
-        // Also ensure data JSON reflects not-draining
-        try {
-            auto s = getServer(serverId);
-            if (s.serverId.length > 0 && s.draining) {
-                s.draining = false;
-                syncServerState(serverId, s);
-            }
-        } catch (Exception) {}
+        // Draining is explicit operator/shutdown intent, not a stale heartbeat
+        // artifact. A live process must not erase it merely by heartbeating.
     }
 
     /**
@@ -333,6 +287,7 @@ final class ServerRegistry {
 
         try {
             auto server = ConnectionServer.fromJson(parseJson(data));
+            if (server.serverId != serverId) return ConnectionServer.init;
 
             // Override with live heartbeat/health fields (updated separately by engine)
             server.lastHeartbeat = parseMsField(db.hget(key, "lastHeartbeat"), server.lastHeartbeat);
@@ -380,8 +335,10 @@ final class ServerRegistry {
     /// between the old engine exiting and the new one's first beat, which
     /// clears the stamp again.
     private static bool heartbeatFresh(ref const ConnectionServer s, long now) {
-        return (now - s.lastHeartbeat) < 60_000
-            || (s.hotswapAt > 0 && (now - s.hotswapAt) < HOTSWAP_GRACE_MS);
+        return (s.lastHeartbeat > 0 && s.lastHeartbeat <= now + 1_000
+                && (now - s.lastHeartbeat) < 60_000)
+            || (s.hotswapAt > 0 && s.hotswapAt <= now + 1_000
+                && (now - s.hotswapAt) < HOTSWAP_GRACE_MS);
     }
 
     /**
@@ -445,95 +402,217 @@ final class ServerRegistry {
             .array;
     }
 
-    /**
-     * Assign a network to a connection server.
-     *
-     * Algorithm: Least-loaded healthy server (round-robin with weight).
-     *
-     * Invariant: After assignment, networkId exists in server.assignedNetworks.
-     * Invariant: After assignment, Redis has reverse mapping.
-     *
-     * Rejects empty networkIds — a past bug surfaced as a ghost row in
-     * the admin Network Assignments table (an empty string sitting at
-     * index 0 of the engine's assignedNetworks array, surviving every
-     * heartbeat because nothing filtered it out). Returning early with
-     * an empty serverId and a clear warning makes the orphan impossible
-     * to introduce via this code path.
-     */
-    string assignNetwork(string networkId) {
-        if (networkId.length == 0) {
-            logWarn("assignNetwork called with empty networkId — refusing (would create a ghost row)");
-            return "";
+    private struct CapacityContext {
+        string host;
+        string networkId;
+        bool existingHostSlot;
+        string[string] assignments;
+        size_t[string] loads;
+        size_t[string] hostLoads;
+    }
+
+    private CapacityContext capacityContext(string networkId, string host = "") {
+        CapacityContext ctx;
+        ctx.networkId = networkId;
+        auto repo = new NetworkRepository(redis);
+        string savedHost;
+        if (networkId.length) {
+            const cfg = repo.findById(parseUUID(networkId[]));
+            if (cfg.id != UUID.init) savedHost = canonicalHost(cfg.host);
         }
-        auto healthy = getHealthyServers();
-        if (healthy.length == 0) {
-            logWarn("No healthy connection servers available for network %s "
-                ~ "— falling back to any registered server", networkId);
-            auto all = getAllServers();
-            if (all.length == 0) {
-                logWarn("No registered servers at all, cannot assign network %s", networkId);
-                return "";
+        // Explicit host is a validated prospective edit supplied by lifecycle;
+        // admin/worker/claim callers omit it to use canonical saved context.
+        ctx.host = host.length ? canonicalHost(host) : savedHost;
+        ctx.existingHostSlot = savedHost.length != 0 && ctx.host == savedHost;
+        ctx.assignments = redis.hgetAll(RedisKeys.networkAssignments());
+        UUID[] ids;
+        foreach (id, owner; ctx.assignments) {
+            if (!id.length || !owner.length) continue;
+            ctx.loads[owner]++;
+            if (ctx.host.length) {
+                try { ids ~= parseUUID(id[]); }
+                catch (Exception) {}
             }
-            healthy = all;
         }
-
-        // Score each healthy server by priority (higher = better) and
-        // current load (fewer assigned networks = better). Filter out
-        // fallbackOnly servers when other healthy options exist.
-        ConnectionServer[] pool;
-        foreach (s; healthy) {
-            if (!s.fallbackOnly) pool ~= s;
+        if (ids.length) {
+            foreach (row; repo.findByIdsWithUsers(ids)) {
+                if (canonicalHost(row.config.host) != ctx.host) continue;
+                const owner = row.config.id.toString() in ctx.assignments;
+                if (owner !is null) ctx.hostLoads[*owner]++;
+            }
         }
-        if (pool.length == 0) pool = healthy; // everyone is fallbackOnly
-
-        // Sort: priority desc, then load asc, so highest-priority
-        // least-loaded server wins. Stable sort preserves order among
-        // equal-scored servers.
-        import std.algorithm : sort;
-        pool.sort!((a, b) {
-            if (a.priority != b.priority)
-                return a.priority > b.priority;
-            return a.assignedNetworks.length < b.assignedNetworks.length;
-        });
-        ConnectionServer best = pool[0];
-
-        // Update server record
-        best.assignedNetworks ~= networkId;
-        auto key = RedisKeys.server(best.serverId);
-        db.hset(key, "data", best.toJson().toString());
-
-        // Store reverse mapping
-        db.hset(RedisKeys.networkAssignments(), networkId, best.serverId);
-
-        // Set a TTL-backed lease so the gateway can detect orphaned
-        // assignments when an engine dies without unregistering.
-        setLease(networkId, best.serverId);
-
-        logInfo("Assigned network %s to server %s", networkId, best.serverId);
-        return best.serverId;
+        return ctx;
     }
 
-    /**
-     * Reassign a network to a different server (e.g., after server failure).
-     */
-    string reassignNetwork(string networkId) {
-        // Remove from old server
-        auto oldServerId = getServerForNetwork(networkId);
-        if (oldServerId.length > 0) {
-            auto old = getServer(oldServerId);
-            old.assignedNetworks = old.assignedNetworks
-                .filter!(n => n != networkId)
-                .array;
-            auto key = RedisKeys.server(oldServerId);
-            db.hset(key, "data", old.toJson().toString());
-        }
-
-        // Remove reverse mapping
-        db.hdel(RedisKeys.networkAssignments(), networkId);
-
-        // Assign to new server
-        return assignNetwork(networkId);
+    private static size_t routingTier(const ConnectionServer server,
+                                      const EffectiveRoutingPolicy effective) {
+        if (!effective.available || server.routingPolicyVersion != 1)
+            return size_t.max;
+        foreach (i, route; effective.order)
+            if (server.supportedRoutes.canFind(routeToken(route))) return i;
+        return size_t.max;
     }
+
+    private bool eligible(const ConnectionServer server, const EffectiveRoutingPolicy effective,
+                          ref const CapacityContext ctx) {
+        const now = Clock.currTime.toUnixTime!long * 1000;
+        if (!server.serverId.length || !server.isHealthy || !heartbeatFresh(server, now)
+                || isDraining(server.serverId) || routingTier(server, effective) == size_t.max)
+            return false;
+        const existing = ctx.networkId in ctx.assignments;
+        // A full engine retains its own existing same-host slot. A host edit
+        // consumes a slot at the prospective host even on the current engine.
+        // Overall canonical load is a separate selection tie-break.
+        if (ctx.existingHostSlot && existing !is null && *existing == server.serverId) return true;
+        if (server.maxConnections > 0 && ctx.host.length) {
+            const count = server.serverId in ctx.hostLoads;
+            if (count !is null && *count >= server.maxConnections) return false;
+        }
+        return true;
+    }
+
+    /// Validate an explicit target without requiring it to win selection.
+    /// Omitted host uses saved context; explicit host is a prospective edit.
+    bool routingServerEligible(const ConnectionServer server, const EffectiveRoutingPolicy effective,
+                               string networkId = "", string host = "",
+                               string[string]* validatedAssignments = null) {
+        auto ctx = capacityContext(networkId, host);
+        if (validatedAssignments !is null) *validatedAssignments = ctx.assignments;
+        return eligible(server, effective, ctx);
+    }
+
+    /// Tier capability precedes fallback-only, priority, total canonical load,
+    /// and finally server ID. There is no registered-but-unhealthy fallback.
+    ConnectionServer selectRoutingServer(const EffectiveRoutingPolicy effective,
+                                        string excludeServerId = "", string networkId = "",
+                                        string host = "") {
+        if (!effective.available || !effective.order.length) return ConnectionServer.init;
+        auto ctx = capacityContext(networkId, host);
+        ConnectionServer best;
+        size_t bestTier = size_t.max;
+        size_t bestLoad;
+        foreach (server; getAllServers()) {
+            if (server.serverId == excludeServerId || !eligible(server, effective, ctx)) continue;
+            const tier = routingTier(server, effective);
+            const count = server.serverId in ctx.loads;
+            const load = count is null ? 0 : *count;
+            const better = !best.serverId.length || tier < bestTier
+                || (tier == bestTier && (
+                    (best.fallbackOnly && !server.fallbackOnly)
+                    || (best.fallbackOnly == server.fallbackOnly && (
+                        server.priority > best.priority
+                        || (server.priority == best.priority && (
+                            load < bestLoad || (load == bestLoad && server.serverId < best.serverId)))))));
+            if (better) { best = server; bestTier = tier; bestLoad = load; }
+        }
+        return best;
+    }
+
+    /// New provisioning, or local recovery with actual client/holder evidence,
+    /// may claim an unowned row. A concurrent claimant is returned, not stolen.
+    /// A reverse mirror is prior ownership evidence, not a disposable hint.
+    string claimNetwork(string networkId, string targetServerId) {
+        if (!networkId.length || !targetServerId.length) return "";
+        const cfg = (new NetworkRepository(redis)).findById(parseUUID(networkId[]));
+        if (cfg.id == UUID.init || cfg.disabled || cfg.servicesProvisioningPending) return "";
+        requireRoutingUpgrade(db, targetServerId);
+        const policyRaw = db.get(RedisKeys.egressRoutingPolicy());
+        const effective = resolveRoutingPolicy(routingPolicyFromJson(parseJsonString(policyRaw)), cfg.host, cfg.routing);
+        if (!effective.available) throw new RoutingPolicyUnavailableException();
+        if (!effective.order.length) return "";
+        const targetRaw = db.hget(RedisKeys.server(targetServerId), "data");
+        auto server = ConnectionServer.fromJson(parseJsonString(targetRaw));
+        const live = getServer(targetServerId);
+        if (server.serverId != targetServerId || live.serverId != targetServerId) return "";
+        // Validate the exact capability/capacity bytes used by the CAS, with
+        // live liveness overlays rather than a second metadata snapshot.
+        server.lastHeartbeat = live.lastHeartbeat;
+        server.hotswapAt = live.hotswapAt;
+        server.isHealthy = live.isHealthy;
+        auto ctx = capacityContext(networkId);
+        const current = networkId in ctx.assignments;
+        if (current !is null && (*current).length) return *current;
+        if (!eligible(server, effective, ctx)) return "";
+        // The Lua claim verifies the complete canonical assignment snapshot.
+        // Concurrent claims on different rows therefore cannot oversubscribe
+        // a per-host cap computed above.
+        string[] args = [networkId, targetServerId, policyRaw, targetRaw,
+            NETWORK_ROUTING_LEASE_TTL_SECONDS.to!string, RedisKeys.serverAssignments("")];
+        foreach (id, owner; ctx.assignments) { args ~= id; args ~= owner; }
+        auto reply = db.eval!string(CLAIM_SCRIPT,
+            [RedisKeys.networkAssignments(), RedisKeys.lease(networkId), RedisKeys.routingMove(networkId),
+             RedisKeys.egressRoutingPolicy(), RedisKeys.server(targetServerId), RedisKeys.draining(targetServerId),
+             RedisKeys.routingSchemaVersion()], args);
+        return reply.empty ? "" : reply.front.idup;
+    }
+
+    /// Reconciliation is sticky. Only explicit reconnect/routing callers run
+    /// the selector to replace an otherwise healthy capable owner.
+    string assignNetwork(string networkId) {
+        if (!networkId.length) return "";
+        const cfg = (new NetworkRepository(redis)).findById(parseUUID(networkId[]));
+        if (cfg.id == UUID.init || cfg.disabled || cfg.servicesProvisioningPending) return "";
+        requireRoutingUpgrade(db);
+        auto owner = getServerForNetwork(networkId);
+        if (!owner.length) {
+            // Bootstrap is not new provisioning. With no uniquely evidenced
+            // previous owner it cannot know that a holder has no old socket.
+            getAllAssignments();
+            owner = getServerForNetwork(networkId);
+            if (!owner.length) return "";
+        }
+        if (networkMoveFenced(db, networkId)) return owner;
+        const effective = resolveRoutingPolicy(loadRoutingPolicy(db), cfg.host, cfg.routing);
+        if (!effective.available) throw new RoutingPolicyUnavailableException();
+        if (!effective.order.length) return owner; // parked, never moved/dialed
+        const currentServer = getServer(owner);
+        if (routingServerEligible(currentServer, effective, networkId)) return owner;
+        auto target = selectRoutingServer(effective, owner, networkId);
+        if (target.serverId.length) requestNetworkMove(db, networkId, target.serverId);
+        return owner; // destination becomes owner only after close acknowledgement
+    }
+
+    private enum CLAIM_SCRIPT = q"LUA
+local current = redis.call('HGET', KEYS[1], ARGV[1])
+if current and current ~= '' then return current end
+-- A surviving lease is prior-holder evidence even when hashes were evicted.
+-- Only that same owner may self-heal; a different owner needs close proof.
+local previousLease = redis.call('GET', KEYS[2])
+if previousLease and previousLease ~= ARGV[2] then return '' end
+if redis.call('EXISTS', KEYS[3]) ~= 0 or redis.call('GET', KEYS[7]) ~= '1'
+    or redis.call('GET', KEYS[4]) ~= ARGV[3] or redis.call('HGET', KEYS[5], 'data') ~= ARGV[4]
+    or redis.call('HGET', KEYS[5], 'draining') == 'true' or redis.call('EXISTS', KEYS[6]) ~= 0 then return '' end
+local ok, server = pcall(cjson.decode, ARGV[4])
+if not ok or server.draining == true or server.routingPolicyVersion ~= 1 then return '' end
+local health = redis.call('HGET', KEYS[5], 'isHealthy')
+if (health and health ~= 'true') or (not health and server.isHealthy ~= true) then return '' end
+local heartbeat = tonumber(redis.call('HGET', KEYS[5], 'lastHeartbeat') or server.lastHeartbeat)
+local swap = tonumber(redis.call('HGET', KEYS[5], 'hotswapAt') or '0')
+local time = redis.call('TIME')
+local now = tonumber(time[1]) * 1000 + math.floor(tonumber(time[2]) / 1000)
+if not heartbeat or heartbeat <= 0 or heartbeat > now + 1000
+    or (now - heartbeat >= 60000 and (swap <= 0 or swap > now + 1000 or now - swap >= 180000)) then return '' end
+if redis.call('HLEN', KEYS[1]) ~= (#ARGV - 6) / 2 then return '' end
+for i = 7, #ARGV, 2 do
+  if redis.call('HGET', KEYS[1], ARGV[i]) ~= ARGV[i + 1] then return '' end
+end
+-- Scan all reverse evidence atomically. A conflicting or malformed mirror
+-- cannot be bypassed by choosing a different fresh owner.
+local cursor = '0'
+repeat
+  local batch = redis.call('SCAN', cursor, 'MATCH', ARGV[6] .. '*', 'COUNT', 100)
+  cursor = batch[1]
+  for _, key in ipairs(batch[2]) do
+    local previous = redis.call('HGET', key, ARGV[1])
+    if previous and (previous ~= ARGV[2] or key ~= ARGV[6] .. previous) then return '' end
+  end
+until cursor == '0'
+if redis.call('HSETNX', KEYS[1], ARGV[1], ARGV[2]) ~= 1 then
+  return redis.call('HGET', KEYS[1], ARGV[1]) or ''
+end
+redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[5])
+return ARGV[2]
+LUA";
 
     /**
      * Get server ID for a network.
@@ -574,12 +653,6 @@ final class ServerRegistry {
         return result;
     }
 
-    /// TTL for network assignment lease keys (90 seconds).
-    /// The engine renews this every 10s in its heartbeat loop.
-    /// If the engine dies, leases expire within 90s and the gateway
-    /// detects the orphaned assignment on the next health check cycle.
-    private enum LEASE_TTL_SECONDS = 90;
-
     /**
      * Set a lease for a network assignment.
      *
@@ -588,20 +661,18 @@ final class ServerRegistry {
      * Called by assignNetwork() and the engine's heartbeat loop.
      */
     void setLease(string networkId, string serverId) {
-        auto key = RedisKeys.lease(networkId);
-        db.set(key, serverId);
-        db.expire(key, LEASE_TTL_SECONDS);
+        db.eval!string(q"LUA
+if redis.call('HGET', KEYS[1], ARGV[1]) ~= ARGV[2] then return '0' end
+redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3])
+return '1'
+LUA", [RedisKeys.networkAssignments(), RedisKeys.lease(networkId)],
+            [networkId, serverId, NETWORK_ROUTING_LEASE_TTL_SECONDS.to!string]);
     }
 
-    /**
-     * Renew (extend) the lease for a network assignment.
-     *
-     * Called by the engine's heartbeat loop for every network
-     * assigned to it. Resets the TTL to LEASE_TTL_SECONDS.
-     */
+    /// Refresh a canonical lease without replacing another operation's owner.
     void renewLease(string networkId) {
-        auto key = RedisKeys.lease(networkId);
-        db.expire(key, LEASE_TTL_SECONDS);
+        const owner = getServerForNetwork(networkId);
+        if (owner.length) setLease(networkId, owner);
     }
 
     /**
@@ -617,24 +688,29 @@ final class ServerRegistry {
         return actual.length > 0 && actual == expectedServerId;
     }
 
-    /**
-     * Reassign all networks assigned to a given server.
-     *
-     * Scans the irc:assignments hash and reassigns every network
-     * whose value matches serverId. Idempotent — safe to call on
-     * a server that has already been cleaned up.
-     */
+    /// Graceful shutdown recovery also uses the positive-close coordinator.
+    /// Unreachable sources keep ownership; stale health is not closure proof.
     void reassignServerNetworks(string serverId) {
         foreach (na; getAllAssignments()) {
-            if (na.serverId == serverId) {
-                try {
-                    reassignNetwork(na.networkId);
-                } catch (Exception e) {
-                    logError("Failed to reassign network %s from server %s: %s",
-                        na.networkId, serverId, e.msg);
-                }
+            if (na.serverId != serverId) continue;
+            try { requestAlternative(na.networkId, serverId); }
+            catch (Exception e) {
+                logError("Could not request move of %s from %s: %s", na.networkId, serverId, e.msg);
             }
         }
+    }
+
+    private bool requestAlternative(string networkId, string owner) {
+        if (networkMoveFenced(db, networkId)) return false;
+        const cfg = (new NetworkRepository(redis)).findById(parseUUID(networkId[]));
+        if (cfg.id == UUID.init || cfg.disabled || cfg.servicesProvisioningPending) return false;
+        requireRoutingUpgrade(db);
+        const effective = resolveRoutingPolicy(loadRoutingPolicy(db), cfg.host, cfg.routing);
+        if (!effective.available || !effective.order.length) return false;
+        auto target = selectRoutingServer(effective, owner, networkId);
+        if (!target.serverId.length) return false;
+        requestNetworkMove(db, networkId, target.serverId);
+        return true;
     }
 
     /**
@@ -674,176 +750,41 @@ final class ServerRegistry {
         return newOffset;
     }
 
-    /**
-     * Health check all servers.
-     * 
-     * Marks stale servers as unhealthy and triggers reassignments.
-     * Should be called periodically (every 30s by gateway heartbeat).
-     */
+    /// Health and metadata reconciliation cannot transfer ownership. Only
+    /// explicitly acknowledged moves do; registration and priority changes
+    /// never rebalance healthy sessions.
     void healthCheckAll() {
-        auto now = Clock.currTime.toUnixTime!long * 1000;
-
-        // Phase 1: Check all registered servers for stale heartbeats
-        // A server that detached for a hot swap keeps its networks for
-        // HOTSWAP_GRACE_MS without heartbeats (heartbeatFresh); only past
-        // that do we mark it stale and reassign.
-        foreach (s; getAllServers()) {
-            if (!heartbeatFresh(s, now)) {
-                logWarn("Server %s heartbeat stale (last: %d ms ago, hotswapAt: %d), marking unhealthy",
-                    s.serverId, now - s.lastHeartbeat, s.hotswapAt);
-                s.isHealthy = false;
-                auto key = RedisKeys.server(s.serverId);
-                db.hset(key, "data", s.toJson().toString());
-
-                // Reassign all networks
-                foreach (netId; s.assignedNetworks) {
-                    try {
-                        reassignNetwork(netId);
-                    } catch (Exception e) {
-                        logError("Failed to reassign network %s: %s", netId, e.msg);
-                    }
-                }
-            }
+        const now = Clock.currTime.toUnixTime!long * 1000;
+        foreach (server; getAllServers()) {
+            if (heartbeatFresh(server, now)) continue;
+            // Do not let a concurrent heartbeat lose to this stale read.
+            db.eval!string(q"LUA
+local beat = tonumber(redis.call('HGET', KEYS[1], 'lastHeartbeat') or ARGV[1])
+local swap = tonumber(redis.call('HGET', KEYS[1], 'hotswapAt') or '0')
+if beat and tonumber(ARGV[2]) - beat >= 60000
+    and (swap <= 0 or tonumber(ARGV[2]) - swap >= tonumber(ARGV[3])) then
+  redis.call('HSET', KEYS[1], 'isHealthy', 'false')
+end
+return '1'
+LUA", [RedisKeys.server(server.serverId)],
+                [server.lastHeartbeat.to!string, now.to!string, HOTSWAP_GRACE_MS.to!string]);
         }
-
-        // Phase 2: Check each assignment's server is alive.
-        // Uses a two-layer check:
-        //   1. Server heartbeat — if the server exists and has a fresh
-        //      heartbeat, it's alive regardless of lease state. This
-        //      handles the transitional period after deploy where old
-        //      assignments don't have lease keys yet (the engine's next
-        //      heartbeat will create them).
-        //   2. Lease — if the server is dead (no heartbeat or deleted),
-        //      the lease should also be missing/expired. Only reassign
-        //      when BOTH the server heartbeat AND lease are gone.
-        foreach (na; getAllAssignments()) {
-            const server = getServer(na.serverId);
-            const serverIsAlive = server.serverId.length > 0
-                && server.isHealthy
-                && heartbeatFresh(server, now);
-
-            if (serverIsAlive) {
-                // Server is healthy — ensure the lease exists for future
-                // crash detection. This is the first heartbeat after deploy
-                // where an old assignment didn't have a lease yet.
-                if (!hasValidLease(na.networkId, na.serverId)) {
-                    logInfo("Network %s: server %s alive but lease missing — setting lease",
-                        na.networkId, na.serverId);
-                    setLease(na.networkId, na.serverId);
-                }
-            } else {
-                // Server is dead — verify the lease is also gone before
-                // reassigning (belt + suspenders: if the server heartbeat
-                // just went stale but the lease renewal hasn't failed yet,
-                // we give the engine a grace period).
-                if (!hasValidLease(na.networkId, na.serverId)) {
-                    logWarn("Network %s assigned to dead server %s (no lease) — reassigning",
-                        na.networkId, na.serverId);
-                    try {
-                        reassignNetwork(na.networkId);
-                    } catch (Exception e) {
-                        logError("Failed to reassign orphaned network %s: %s",
-                            na.networkId, e.msg);
-                    }
-                }
-            }
-        }
-
-        // Phase 3: Reconcile orphaned assignments — networks that appear
-        // in irc:assignments but are not in the assigned server's own
-        // assignedNetworks list, or networks assigned to servers that no
-        // longer exist. These can arise from stale heartbeat data, partial
-        // reassignments, or manual Redis edits.
-        foreach (na; getAllAssignments()) {
-            auto server = getServer(na.serverId);
-            if (server.serverId.length == 0) {
-                // Server was deleted from the registry — reassign.
-                logWarn("Network %s assigned to non-existent server %s — reassigning",
-                    na.networkId, na.serverId);
-                try {
-                    reassignNetwork(na.networkId);
-                } catch (Exception e) {
-                    logError("Failed to reassign orphaned network %s: %s",
-                        na.networkId, e.msg);
-                }
-            } else if (server.isHealthy && !canFind(server.assignedNetworks, na.networkId)) {
-                // Server is alive but doesn't list this network in its
-                // assignedNetworks — mismatch. Reassign to a proper home.
-                logWarn("Network %s assigned to server %s but server has no record — reassigning",
-                    na.networkId, na.serverId);
-                try {
-                    reassignNetwork(na.networkId);
-                } catch (Exception e) {
-                    logError("Failed to reassign orphaned network %s: %s",
-                        na.networkId, e.msg);
-                }
-            }
-        }
-
-        // Also check for per-network connection failures that need reassignment
-        checkNetworkFailures();
-
-        // Phase 4: Priority rebalancing — move networks from lower-priority
-        // servers to higher-priority ones. Without this, existing assignments
-        // are sticky and priority config changes have no effect until the
-        // assigned server fails or an admin explicitly reassigns.
-        phase4PriorityRebalance();
-
-        // Phase 5: Clear stale draining flags.
-        // If an engine set draining=true (60s TTL during handoff) and then
-        // crashed without clearing it, or its heartbeat went stale (>60s),
-        // the TTL key may still exist but the engine is gone. A stale
-        // draining flag prevents the gateway from assigning new networks to
-        // that server, so we clear it once the heartbeat is stale.
-        // Deliberately the raw 60 s test, not heartbeatFresh: a hot-swapping
-        // engine has no draining flag to protect, and a drained engine that
-        // has stopped beating should be cleaned up regardless of any grace.
-        foreach (s; getAllServers()) {
-            if (now - s.lastHeartbeat > 60_000 && isDraining(s.serverId)) {
-                logInfo("Health check: clearing stale draining for %s (heartbeat %d ms ago)",
-                    s.serverId, now - s.lastHeartbeat);
-                clearDraining(s.serverId);
-            }
-        }
-    }
-    /// Phase 4 of healthCheckAll: move networks to the highest-priority
-    /// healthy server. When an admin raises a server's priority, existing
-    /// networks on lower-priority servers migrate within one health check cycle.
-    ///
-    /// Networks already on the best server are left in place. Each reassignment
-    /// goes through assignNetwork() which respects both priority and load.
-    private void phase4PriorityRebalance() {
-        auto allAssignments = getAllAssignments();
-        if (allAssignments.length == 0) return;
-
-        auto healthy = getHealthyServers();
-        if (healthy.length < 2) return;
-
-        // Best candidate: highest priority, ties broken by fewest networks
-        import std.algorithm : sort;
-        healthy.sort!((a, b) {
-            if (a.priority != b.priority)
-                return a.priority > b.priority;
-            return a.assignedNetworks.length < b.assignedNetworks.length;
-        });
-        auto best = healthy[0];
-
-        foreach (na; allAssignments) {
-            if (na.serverId == best.serverId) continue;
-
-            auto current = getServer(na.serverId);
-            if (current.serverId.length == 0) continue;
-            if (best.priority <= current.priority) continue;
-
-            logInfo("Priority rebalance: moving network %s from %s (priority %d) to %s (priority %d)",
-                na.networkId, na.serverId, current.priority, best.serverId, best.priority);
-
+        foreach (assignment; getAllAssignments()) {
             try {
-                reassignNetwork(na.networkId);
+                if (isServerHealthy(assignment.serverId)) {
+                    if (!hasValidLease(assignment.networkId, assignment.serverId))
+                        setLease(assignment.networkId, assignment.serverId);
+                    // A missing assignedNetworks entry is repaired by that
+                    // owner's heartbeat; it is never permission to steal.
+                } else {
+                    requestAlternative(assignment.networkId, assignment.serverId);
+                }
             } catch (Exception e) {
-                logError("Priority rebalance failed for network %s: %s", na.networkId, e.msg);
+                logWarn("Ownership recovery for %s remains fenced/unavailable: %s",
+                    assignment.networkId, e.msg);
             }
         }
+        checkNetworkFailures();
     }
 
     /**
@@ -868,15 +809,8 @@ final class ServerRegistry {
         db.del(RedisKeys.networkFail(networkId));
     }
 
-    /**
-     * Check all networks for persistent connection failures and reassign.
-     *
-     * If a network has >= 3 failures within the last 5 minutes on its current
-     * server AND a different healthy server exists, reassign the network to
-     * spread the load and bypass the failing IRC server's IP-based ban.
-     *
-     * Called automatically by healthCheckAll(), or can be called independently.
-     */
+    /// Repeated transport failures may request an eligible alternative, but
+    /// cannot bypass the source-holder close acknowledgement.
     void checkNetworkFailures() {
         const now = Clock.currTime.toUnixTime!long * 1000;
         const healthy = getHealthyServers();
@@ -904,14 +838,11 @@ final class ServerRegistry {
             auto error = db.hget(failKey, "error");
             if (error.length == 0) error = "unknown error";
 
-            logWarn("Network %s has %d failures on server %s (error: %s) — reassigning to alternate server",
-                na.networkId, failCount, na.serverId, error);
-
             try {
-                reassignNetwork(na.networkId);
-                clearNetworkFailure(na.networkId);
+                if (requestAlternative(na.networkId, na.serverId))
+                    clearNetworkFailure(na.networkId);
             } catch (Exception e) {
-                logError("Failed to reassign failing network %s: %s", na.networkId, e.msg);
+                logError("Failed to request move for failing network %s: %s", na.networkId, e.msg);
             }
         }
     }
@@ -989,7 +920,7 @@ final class ServerRegistry {
         import std.algorithm : sort;
 
         HostConnectionSummary[string] hostMap;
-        auto netRepo = new NetworkRepository();
+        auto netRepo = new NetworkRepository(redis);
 
         // Query all networks from MongoDB directly — the irc:assignments
         // Redis hash can be stale and contain UUIDs for deleted networks.
@@ -1026,82 +957,63 @@ final class ServerRegistry {
         return result;
     }
 
-    /**
-     * Get all network assignments.
-     *
-     * The raw Redis hash maps networkId → serverId exactly as stored.
-     *
-     * Self-heals from per-engine assignment mirrors if the canonical
-     * `irc:assignments` hash is missing (LRU eviction, manual cleanup).
-     * Each engine writes its own network set on every heartbeat, so the
-     * union of all `irc:server-assignments:*` hashes reconstructs the
-     * canonical mapping. We also re-publish into the canonical hash so
-     * subsequent reads stay fast.
-     */
+    /// Recover only a uniquely evidenced previous owner. This restores
+    /// ownership, never transfers it: even a dead source holder may still
+    /// have an open socket. Contradictory mirrors fail closed, including
+    /// during partial canonical eviction.
     NetworkAssignment[] getAllAssignments() {
+        db.eval!string(RECOVER_ASSIGNMENTS_SCRIPT,
+            [RedisKeys.networkAssignments()],
+            [RedisKeys.serverAssignments(""), RedisKeys.routingMove(""),
+             RedisKeys.lease(""), NETWORK_ROUTING_LEASE_TTL_SECONDS.to!string]);
         NetworkAssignment[] result;
-        auto raw = redis.hgetAll(RedisKeys.networkAssignments());
-
-        if (raw.length == 0) {
-            raw = recoverAssignmentsFromMirrors();
-            if (raw.length > 0) {
-                logWarn("irc:assignments hash was empty — recovered %d "
-                    ~ "network→server mapping(s) from per-engine mirrors",
-                    raw.length);
-                foreach (netId, serverId; raw) {
-                    if (netId.length == 0 || serverId.length == 0) continue;
-                    db.hset(RedisKeys.networkAssignments(), netId, serverId);
-                }
-            }
-        }
-
-        foreach (netId, serverId; raw) {
-            // A blank field is a ghost row (seen 2026-09-02: "Network  assigned
-            // to server ovh ... reassigning" → "assignNetwork called with empty
-            // networkId"). Drop it from Redis instead of churning on it.
-            if (netId.length == 0 || serverId.length == 0) {
-                try db.hdel(RedisKeys.networkAssignments(), netId);
-                catch (Exception) {}
-                continue;
-            }
-            NetworkAssignment na;
-            na.networkId = netId;
-            na.serverId = serverId;
-            result ~= na;
+        foreach (networkId, serverId; redis.hgetAll(RedisKeys.networkAssignments())) {
+            if (!networkId.length || !serverId.length) continue;
+            try { if (parseUUID(networkId[]) == UUID.init) continue; }
+            catch (Exception) { continue; }
+            NetworkAssignment assignment;
+            assignment.networkId = networkId;
+            assignment.serverId = serverId;
+            result ~= assignment;
         }
         return result;
     }
 
-    /// SCAN-based recovery of network→server mappings from per-engine
-    /// assignment mirrors. Each mirror is `irc:server-assignments:<sid>`
-    /// with one field per networkId. Last-write-wins when two engines
-    /// claim the same networkId (which would already be a logic bug);
-    /// we keep the first one seen to stay deterministic.
-    private string[string] recoverAssignmentsFromMirrors() {
-        import std.algorithm : filter, map;
-        import std.array : array;
-        enum prefix = "irc:server-assignments:";
-        enum prefixLen = prefix.length;
-
-        string[string] result;
-        string cursor = "0";
-        do {
-            auto sr = redis.scanKeys(cursor, RedisKeys.serverAssignmentsPattern(), 100);
-            cursor = sr.cursor;
-            foreach (key; sr.keys) {
-                if (key.length <= prefixLen) continue;
-                auto fields = redis.hgetAll(key);
-                foreach (netId, serverId; fields) {
-                    // Trust the mirror's stored serverId; it's set by the
-                    // engine itself and can't drift.
-                    if (netId.length == 0 || serverId.length == 0) continue;
-                    if (netId !in result)
-                        result[netId] = serverId;
-                }
-            }
-        } while (cursor != "0");
-        return result;
-    }
+    private enum RECOVER_ASSIGNMENTS_SCRIPT = q"LUA
+local function validNetwork(id)
+  if #id ~= 36 or string.sub(id, 9, 9) ~= '-' or string.sub(id, 14, 14) ~= '-'
+      or string.sub(id, 19, 19) ~= '-' or string.sub(id, 24, 24) ~= '-' then return false end
+  local hex = string.gsub(id, '-', '')
+  return #hex == 32 and not string.find(hex, '[^0-9a-fA-F]')
+end
+-- Validate the primary type before doing any restoration.
+redis.call('HLEN', KEYS[1])
+local owners = {}
+local cursor = '0'
+repeat
+  local batch = redis.call('SCAN', cursor, 'MATCH', ARGV[1] .. '*', 'COUNT', 100)
+  cursor = batch[1]
+  for _, key in ipairs(batch[2]) do
+    local fields = redis.call('HGETALL', key)
+    for i = 1, #fields, 2 do
+      local id, owner = fields[i], fields[i + 1]
+      if validNetwork(id) then
+        if owner == '' or key ~= ARGV[1] .. owner then owners[id] = false
+        elseif owners[id] == nil then owners[id] = owner
+        elseif owners[id] ~= owner then owners[id] = false end
+      end
+    end
+  end
+until cursor == '0'
+for id, owner in pairs(owners) do
+  if owner and redis.call('EXISTS', ARGV[2] .. id) == 0 then
+    if redis.call('HSETNX', KEYS[1], id, owner) == 1 then
+      redis.call('SET', ARGV[3] .. id, owner, 'EX', ARGV[4])
+    end
+  end
+end
+return '1'
+LUA";
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

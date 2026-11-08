@@ -8,6 +8,9 @@ import std.string : strip, toLower, split;
 import vibe.data.json : Json;
 import ircfiber.netaddr : canonicalHost, isIpLiteral;
 
+/// JSON/Lua/browser revisions must remain exact integers.
+enum long MAX_ROUTING_POLICY_REVISION = 9_007_199_254_740_991L;
+
 enum RouteKind { ipv6, mullvad, nordvpn, direct }
 
 class RoutingValidationException : Exception {
@@ -90,6 +93,7 @@ struct EffectiveRoutingPolicy {
     string preferredExit;
     long revision;
     bool available = true;
+    string errorCode;
 }
 
 RoutingPolicyDocument defaultRoutingPolicy() {
@@ -134,13 +138,15 @@ RoutingPolicyDocument routingPolicyFromJson(Json j) {
     requireKeys(j, ["schema", "revision", "global", "hosts"], "policy");
     if (j["schema"].type != Json.Type.int_ || j["schema"].get!long != 1)
         throw new RoutingValidationException("policy.schema must be 1");
-    if (j["revision"].type != Json.Type.int_ || j["revision"].get!long < 0)
-        throw new RoutingValidationException("policy.revision must be a nonnegative integer");
+    if (j["revision"].type != Json.Type.int_ || j["revision"].get!long < 0
+            || j["revision"].get!long > MAX_ROUTING_POLICY_REVISION)
+        throw new RoutingValidationException("policy.revision must be a nonnegative exact JSON integer");
     RoutingPolicyDocument doc;
     doc.revision = j["revision"].get!long;
     doc.global = scopeFromJson(j["global"], false, "policy.global");
     if (j["hosts"].type != Json.Type.array)
         throw new RoutingValidationException("policy.hosts must be an array");
+    bool[string] seenHosts;
     foreach (row; j["hosts"]) {
         requireKeys(row, ["host", "order", "blockedRoutes"], "policy.hosts entry");
         if (row["host"].type != Json.Type.string)
@@ -148,8 +154,8 @@ RoutingPolicyDocument routingPolicyFromJson(Json j) {
         const raw = row["host"].get!string;
         if (!validRoutingHost(raw)) throw new RoutingValidationException("invalid policy host: " ~ raw);
         const host = canonicalHost(raw);
-        foreach (previous; doc.hosts)
-            if (previous.host == host) throw new RoutingValidationException("duplicate canonical policy host: " ~ host);
+        if (host in seenHosts) throw new RoutingValidationException("duplicate canonical policy host: " ~ host);
+        seenHosts[host] = true;
         doc.hosts ~= RoutingHostPolicy(host, scopeFromJson(row, true, "policy.hosts entry"));
     }
     return doc;
@@ -162,6 +168,7 @@ pure EffectiveRoutingPolicy resolveRoutingPolicy(const RoutingPolicyDocument doc
     effective.revision = doc.revision;
     if (doc.schema != 1 || doc.global.inherit || !preferences.valid) {
         effective.available = false;
+        effective.errorCode = preferences.valid ? "routing_policy_unavailable" : "invalid_stored_routing";
         return effective;
     }
     effective.preferredExit = preferences.preferredExit;
@@ -175,9 +182,13 @@ pure EffectiveRoutingPolicy resolveRoutingPolicy(const RoutingPolicyDocument doc
             if (!effective.blockedRoutes.canFind(route)) effective.blockedRoutes ~= route;
         break;
     }
-    const(RouteKind)[] chosen = preferences.inherit ? defaults : preferences.order;
+    import ircfiber.default_network : DEFAULT_FIBER_HOST;
+    const firstParty = canonical == canonicalHost(DEFAULT_FIBER_HOST);
+    const(RouteKind)[] chosen = firstParty && preferences.inherit
+        ? [RouteKind.direct] : preferences.inherit ? defaults : preferences.order;
     foreach (route; chosen)
-        if (!effective.blockedRoutes.canFind(route)) effective.order ~= route;
+        if ((!firstParty || route == RouteKind.direct) && !effective.blockedRoutes.canFind(route))
+            effective.order ~= route;
     return effective;
 }
 

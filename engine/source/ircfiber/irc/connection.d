@@ -26,8 +26,8 @@ import core.time : Duration, dur, msecs, seconds, minutes;
 import ircfiber.models.irc_event : IRCRawEvent;
 import ircfiber.models.network : NetworkConfig, SASLMechanism, TLSMode, normalizeChannelName, lastSeenBufferKey;
 import ircfiber.default_network : DEFAULT_FIBER_HOST;
-import ircfiber.irc.routing_policy : RouteKind, RoutingPreferences, defaultRoutingPolicy,
-    resolveRoutingPolicy;
+import ircfiber.irc.routing_policy : RouteKind, RoutingPreferences, EffectiveRoutingPolicy, routeToken;
+import ircfiber.irc.routing_policy_store : loadEffectiveRoutingPolicy;
 import ircfiber.metadata : USER_METADATA_KEYS, CHANNEL_METADATA_KEYS, PROFILE_KEYS, isValidMetadataValue;
 import ircfiber.db.lastseen : LastSeenRepository, heartbeatEchoJson;
 import ircfiber.redis.protocol : RedisKeys, TlsInfo;
@@ -37,6 +37,11 @@ import ircfiber.irc.sasl : buildSaslPlainPayload, ScramSha256Client;
 import ircfiber.irc.ban_classify : isBanError, isThrottleError;
 import ircfiber.storage.buffer : sanitizeUtf8;
 import ircfiber.engine.session_snapshot : SessionSnapshot, ServerFeaturesSnapshot, SESSION_SNAPSHOT_SCHEMA, toJSON;
+import ircfiber.irc.history_recovery : HistoryRecoveryMixin;
+public import ircfiber.irc.history_recovery : HistoryRequestResult;
+import ircfiber.irc.bnc_connection : BncConnectionMixin;
+public import ircfiber.irc.bnc_ownership : BncCommandOwner;
+import ircfiber.irc.bnc_ownership : BncPendingWrite;
 import ircfiber.holder_client : HolderClient, DialTag, DialProxy, DialRequest, DialResult, DialEvent,
     DialProgress, AttachResult, HolderEntry, DialFailedException, HolderUnavailableException, HolderErrorException;
 import ircfiber.logging : logJsonMap, logException;
@@ -138,6 +143,7 @@ private immutable string[] DESIRED_CAPS_BASE = [
     "draft/channel-rename",
     "draft/extended-isupport",
     "draft/oper-tag",
+    "draft/account-registration",
 ];
 
 private immutable string[] DESIRED_CAPS_SASL = ["sasl"];
@@ -662,6 +668,61 @@ private __gshared RedisStorage gEgressRedis;
 void setEgressRedis(RedisStorage redis) {
     gEgressRedis = redis;
     gAdmissionStore = redis is null ? null : new RedisAdmissionStore(redis);
+    gRoutingPolicySource = redis is null ? null : new RedisRoutingPolicySource(redis);
+}
+
+/// Current durable policy, never a last-known-permissive cache. Like admission,
+/// the source is initialized by setEgressRedis during bootstrap. Only the
+/// unittest harness substitutes a source; production never seeds defaults.
+private interface RoutingPolicySource {
+    EffectiveRoutingPolicy read(string host, const RoutingPreferences routing);
+}
+
+private final class RedisRoutingPolicySource : RoutingPolicySource {
+    private RedisStorage redis;
+    this(RedisStorage redis) { this.redis = redis; }
+    EffectiveRoutingPolicy read(string host, const RoutingPreferences routing) {
+        return loadEffectiveRoutingPolicy(redis.getDb(), host, routing);
+    }
+}
+
+private __gshared RoutingPolicySource gRoutingPolicySource;
+
+/// A policy refusal is not transport/host failure evidence. Keep it distinct
+/// throughout the dial loop, including refusals at the final holder boundary.
+private class RoutingPolicyBlockedException : Exception {
+    string code;
+    this(string code, string detail = "") {
+        this.code = code;
+        super(code == "routing_policy_unavailable" || code == "invalid_stored_routing"
+            ? code : "Routing policy permits no available route" ~ detail);
+    }
+}
+
+private EffectiveRoutingPolicy currentRoutingPolicy(string host, const RoutingPreferences routing) {
+    EffectiveRoutingPolicy unavailable;
+    unavailable.available = false;
+    unavailable.errorCode = routing.valid ? "routing_policy_unavailable" : "invalid_stored_routing";
+    if (!routing.valid || gRoutingPolicySource is null) return unavailable;
+    try {
+        return gRoutingPolicySource.read(host, routing);
+    } catch (Exception) {
+        return unavailable;
+    }
+}
+
+private RouteKind[] requireRoutingOrder(string host, const RoutingPreferences routing) {
+    auto effective = currentRoutingPolicy(host, routing);
+    if (!effective.available)
+        throw new RoutingPolicyBlockedException(effective.errorCode);
+    if (effective.order.length == 0)
+        throw new RoutingPolicyBlockedException("routing_policy_blocked");
+    return effective.order;
+}
+
+private void requirePermittedRoute(string host, const RoutingPreferences routing, RouteKind kind) {
+    if (!requireRoutingOrder(host, routing).canFind(kind))
+        throw new RoutingPolicyBlockedException("routing_policy_blocked");
 }
 
 // ── Durable egress admission ─────────────────────────────────────────────────
@@ -742,6 +803,10 @@ version (unittest) {
         string[] verdicts;
         EgressEndpointRef[] quarantined;
         string[] quarantineReasons;
+        void delegate(EgressEndpointRef) onAdmit;
+        void delegate() onRead;
+        string[] admittedLabels;
+        string[] readLabels;
 
         void set(string label, string state) {
             EgressAdmission a;
@@ -752,12 +817,16 @@ version (unittest) {
 
         EgressAdmission[] read(const(EgressEndpointRef)[] exits, long nowMs) {
             if (failing) throw new Exception("redis down");
+            foreach (e; exits) readLabels ~= e.label;
+            if (onRead !is null) onRead();
             EgressAdmission[] r;
             foreach (e; exits) r ~= (e.label in states) ? states[e.label] : EgressAdmission.init;
             return r;
         }
         EgressDialAdmit admit(EgressEndpointRef e, bool allowTrial, long claimMs, long nowMs) {
             if (failing) throw new Exception("redis down");
+            admittedLabels ~= e.label;
+            if (onAdmit !is null) onAdmit(e);
             EgressDialAdmit r;
             r.allowed = true;
             if (auto scripted = e.label in admitReplies) r = *scripted;
@@ -871,10 +940,12 @@ private EgressAdmission[] readAdmissions(const(EgressEndpointRef)[] exits) nothr
     return r;
 }
 
-/// Admission of every pool exit by label, read outside the pool lock.
-private EgressAdmission[string] poolAdmissions() {
+/// Snapshot only policy-eligible pool exits, outside the pool lock.
+private EgressAdmission[string] poolAdmissions(const RouteKind[] order) {
     EgressEndpointRef[] refs;
-    withPoolLock({ foreach (ref p; mullvadPool) refs ~= exitRef(&p); });
+    withPoolLock({
+        foreach (ref p; mullvadPool) if (order.canFind(p.provider)) refs ~= exitRef(&p);
+    });
     auto verdicts = readAdmissions(refs);
     EgressAdmission[string] byLabel;
     foreach (i, r; refs) byLabel[r.label] = verdicts[i];
@@ -1030,6 +1101,59 @@ private void loadIpv6ConfigUnlocked() {
     }
     if (gIpv6Prefix.length == 0)
         logInfo("IPv6 connection pool: disabled");
+}
+
+/// Native transport is advertised and planned only after the node's physical
+/// routing gate has passed and this holder explicitly supports family-only DIAL.
+string nativeIpv6Prefix(HolderClient holder) {
+    import std.process : environment;
+    if (environment.get("IRCFIBER_IPV6_ROUTING_VERIFIED", "") != "1" || holder is null) return "";
+    loadIpv6Config();
+    string prefix;
+    if (gIpv6Lock !is null) synchronized (gIpv6Lock) { prefix = gIpv6Prefix; }
+    else prefix = gIpv6Prefix;
+    ubyte[16] binary;
+    if (!parseRoutedIpv6Prefix(prefix, binary)) return "";
+    try { return holder.status().supportsFamily("ipv6") ? prefix : ""; }
+    catch (Exception) { return ""; }
+}
+
+/// Pool metadata, not labels/controllability, defines provider capability.
+string[] supportedRoutingRoutes(HolderClient holder, out string ipv6Prefix) {
+    ipv6Prefix = nativeIpv6Prefix(holder);
+    string[] routes;
+    if (ipv6Prefix.length) routes ~= "ipv6";
+    loadMullvadPool();
+    withPoolLock({
+        foreach (ref p; mullvadPool) {
+            const token = routeToken(p.provider);
+            if (!routes.canFind(token)) routes ~= token;
+        }
+    });
+    routes ~= "direct";
+    return routes;
+}
+
+private string restoredHeldRoute(const ref HolderEntry entry, const ref SessionSnapshot meta) {
+    const label = entry.tag.egressLabel;
+    if (label.length == 0) {
+        // Never reinterpret an old shared IPv6 socket as a native reservation.
+        return meta.activeRoute == "ipv6" && entry.localIp.length
+                && entry.localIp == meta.localIp && entry.localIp.canFind(":")
+            ? "ipv6" : "direct";
+    }
+    string provider;
+    loadMullvadPool();
+    withPoolLock({
+        foreach (ref p; mullvadPool) if (p.label == label) {
+            provider = routeToken(p.provider);
+            break;
+        }
+    });
+    if (provider.length) return provider;
+    // New META can preserve a removed pool entry's explicit provider.
+    return meta.egressLabel == label && (meta.activeRoute == "mullvad" || meta.activeRoute == "nordvpn")
+        ? meta.activeRoute : "";
 }
 
 private string mullvadLabelFromHost(string h) {
@@ -1247,36 +1371,35 @@ private MullvadProxy*[] getHealthyProxiesLocked() {
     return healthy;
 }
 
-/// "Mullvad" / "NordVPN" prefix for logs and UI text, resolved by provider
-/// rather than hardcoded: Mullvad slots are Tailscale-controlled
-/// (controlSocket set); NordVPN/static slots are not — see MullvadProxy's
-/// controlSocket doc and tierAndOrderProxies, which key off the same field.
-/// Keying off controlSocket (not credential presence) stays correct even
-/// when a static slot's shared creds are temporarily empty. Looks the slot
-/// up by label at display time instead of threading a provider field
-/// through DialEvent/EgressUsed/SessionSnapshot; falls back to "Mullvad"
-/// if the slot is gone from the pool (e.g. reattached after a restart).
+/// Provider display comes only from configured pool metadata. A removed or
+/// unknown slot remains unknown; retargetability does not identify a provider.
 private string egressProviderName(string label) {
-    if (label.length == 0) return "Mullvad";
-    if (gMullvadLock !is null) synchronized (gMullvadLock) {
-        foreach (ref pr; mullvadPool) if (pr.label == label) return pr.controlSocket.length > 0 ? "Mullvad" : "NordVPN";
-        return "Mullvad";
-    }
-    foreach (ref pr; mullvadPool) if (pr.label == label) return pr.controlSocket.length > 0 ? "Mullvad" : "NordVPN";
-    return "Mullvad";
+    string name = "VPN";
+    withPoolLock({
+        foreach (ref pr; mullvadPool) if (pr.label == label) {
+            if (pr.provider == RouteKind.mullvad) name = "Mullvad";
+            else if (pr.provider == RouteKind.nordvpn) name = "NordVPN";
+            break;
+        }
+    });
+    return name;
 }
 
-@("egressProviderName: NordVPN (static, no controlSocket) vs Mullvad (controlSocket) vs unknown label")
+@("egress provider identity is independent of labels and retargetability")
 unittest {
     auto saved = mullvadPool.dup;
     scope(exit) mullvadPool = saved;
-    mullvadPool = null;
-    mullvadPool ~= MullvadProxy("sidecar.ts.net", 1080, "de", 0, 0, "/ctl/de.sock");
-    mullvadPool ~= MullvadProxy("socks-se12.nordvpn.com", 1080, "nord-se-sto-7", 0, 0, "");
-    assert(egressProviderName("de") == "Mullvad");
-    assert(egressProviderName("nord-se-sto-7") == "NordVPN");
-    assert(egressProviderName("gone-from-pool") == "Mullvad");
-    assert(egressProviderName("") == "Mullvad");
+    MullvadProxy mull, nord;
+    mull.label = "nordvpn-looking-label";
+    mull.provider = RouteKind.mullvad;
+    nord.label = "mullvad-looking-label";
+    nord.provider = RouteKind.nordvpn;
+    nord.controlSocket = "/ctl/available.sock";
+    mullvadPool = [mull, nord];
+    assert(egressProviderName(mull.label) == "Mullvad");
+    assert(egressProviderName(nord.label) == "NordVPN");
+    assert(egressProviderName("removed") == "VPN");
+    assert(egressProviderName("") == "VPN");
 }
 
 private void recordMullvadSuccess(string label) {
@@ -1329,6 +1452,28 @@ private void announceEgressQuarantine(string label, size_t distinct, long cooldo
         db.ltrim("irc:logs:outbox", -1000, -1);
     } catch (Exception e) {
         logWarn("VPN exit quarantine #staff announcement failed: %s", e.msg);
+    }
+}
+
+/// Only the winning verified trial announces recovery. Announcement failure
+/// must not retain the completed trial or disturb its surviving socket.
+private void announceEgressRecovery(string label, long nowMs) nothrow {
+    if (gEgressRedis is null) return;
+    try {
+        auto db = gEgressRedis.getDb();
+        auto event = Json([
+            "type": Json("notice"), "ts": Json(nowMs), "actor": Json("engine"),
+            "kind": Json("egress_recovery"),
+            "text": Json("VPN exit " ~ label ~ " recovered: registered for at least "
+                ~ (EGRESS_TRIAL_SUSTAIN_MS / 1000).to!string
+                ~ " seconds and answered a post-window keepalive; admission reopened."
+                ~ " Existing sessions were left running."),
+        ]);
+        db.rpush("irc:logs:outbox", event.toString());
+        db.ltrim("irc:logs:outbox", -1000, -1);
+    } catch (Exception e) {
+        try logWarn("VPN exit recovery #staff announcement failed: %s", e.msg);
+        catch (Exception) {}
     }
 }
 
@@ -1606,12 +1751,15 @@ enum DIRECT_EGRESS_LABEL = "direct";
 /// exit is healthy, so counting the slot would fail over through gated
 /// exits forever.
 private bool hasAlternativeEgressForHost(string hostLower, string bannedKey, bool unauthenticated = false,
-                                         RoutingPreferences routing = RoutingPreferences.init) {
+                                         RoutingPreferences routing = RoutingPreferences.init,
+                                         string nativeSource = "") {
+    auto order = configuredRoutingOrder(hostLower, routing);
+    if (order.length == 0) return false;
     loadMullvadPool();
-    const order = configuredRoutingOrder(hostLower, routing);
     // Read once outside the pool lock: an excluded exit is not an
     // alternative that can justify immediately retrying a ban/SASL gate.
-    const admissions = poolAdmissions();
+    const admissions = poolAdmissions(order);
+    order = configuredRoutingOrder(hostLower, routing);
     const now = nowMsSafe();
     bool admissible(string label) {
         auto a = label in admissions;
@@ -1621,6 +1769,10 @@ private bool hasAlternativeEgressForHost(string hostLower, string bannedKey, boo
     bool check() {
         if (order.length == 0) return false;
         const skipGated = unauthenticated && hostHasSaslGatesLocked(hostLower);
+        const nativeKey = "ipv6:" ~ nativeSource;
+        if (nativeSource.length && order.canFind(RouteKind.ipv6) && nativeKey != bannedKey
+                && !isEgressBannedForHost(hostLower, nativeKey)
+                && !(skipGated && isEgressSaslGatedLocked(hostLower, nativeKey))) return true;
         foreach (p; getHealthyProxiesForHostLocked(hostLower)) {
             if (!order.canFind(p.provider)) continue;
             if (!admissible(p.label)) continue;
@@ -1643,9 +1795,9 @@ private bool hasAlternativeEgressForHost(string hostLower, string bannedKey, boo
 }
 
 /// Direct path host-banned? Read under the pool lock like the proxy checks.
-private bool isDirectBannedForHost(string hostLower) {
-    if (gMullvadLock !is null) synchronized (gMullvadLock) return isEgressBannedForHost(hostLower, DIRECT_EGRESS_LABEL);
-    return isEgressBannedForHost(hostLower, DIRECT_EGRESS_LABEL);
+private bool isRouteBannedForHost(string hostLower, string key) {
+    if (gMullvadLock !is null) synchronized (gMullvadLock) return isEgressBannedForHost(hostLower, key);
+    return isEgressBannedForHost(hostLower, key);
 }
 
 // ── Egress slot control: read location, retarget, refcount ───────────────────
@@ -1891,6 +2043,7 @@ void startDailyReachabilityRefresh() nothrow {
 /// Copy-by-value snapshot of one slot, taken under the lock, for publishing.
 struct EgressSlotView {
     string label;
+    string provider;
     string host;
     string locationId;
     string exitHostname;
@@ -1916,6 +2069,7 @@ EgressSlotView[] egressSlotViews() nothrow {
         foreach (ref p; mullvadPool) {
             EgressSlotView v;
             v.label = p.label;
+            v.provider = routeToken(p.provider);
             v.host = p.host;
             v.port = p.port;
             // A retargetable slot reports its real location; a static one has
@@ -2216,20 +2370,34 @@ private string proxyLocationText(const MullvadProxy* proxy) nothrow {
     return proxy.exitCity.length ? proxy.exitCity ~ ", " ~ proxy.exitCountry : proxy.exitCountry;
 }
 
-/// One dial through exactly one egress, performed by the holder. Direct
-/// dials (`proxy is null`) are shared-source DNS + Happy Eyeballs inside the
-/// holder, which composes their `dns`/`attempt`/`attempt_fail` timeline lines;
-/// proxied dials are a single SOCKS5
+/// A transport route is explicit: an unproxied native source is not shared
+/// direct, and route memory/admission may only reorder within its tier.
+private struct RouteCandidate {
+    RouteKind kind;
+    MullvadProxy* proxy;
+    string sourceAddress;
+    string hostBanKey;
+    bool recovery;
+    string memoryKey;
+    string skippedReason;
+}
+
+/// One dial through an explicit route, performed by the holder. Unproxied
+/// candidates are either IPv6-only/source-bound or shared dual-stack. The
+/// holder composes their DNS/attempt events; VPN routes make one SOCKS5
 /// CONNECT through the sidecar (the exit resolves the name), and this
 /// wrapper composes their `attempt`/`attempt_fail` lines and keeps the
 /// Mullvad success/failure accounting. Every forwarded event carries the
 /// candidate egress identity so the timeline can name it.
 private TCPConnection happyEyeballsConnectWithProxy(HolderClient holder, DialTag tag, string host, ushort port,
-                                                    string tlsMode, MullvadProxy* proxy,
+                                                    string tlsMode, RouteCandidate candidate, RoutingPreferences routing,
                                                     ConnectProgress progress,
-                                                    out DialResult dr) {
-    if (proxy !is null) logInfo("%s egress %s (%s:%d) for %s:%d", proxy.controlSocket.length > 0 ? "Mullvad" : "NordVPN", proxy.label, proxy.host, proxy.port, host, port);
-    const egressLabel = proxy !is null ? (proxy.controlSocket.length > 0 ? "Mullvad exit " : "NordVPN exit ") ~ proxy.label : "direct";
+                                                    out DialResult dr,
+                                                    scope DialResult delegate(DialRequest, DialProgress, RouteKind) ownedDial = null) {
+    auto proxy = candidate.proxy;
+    const providerName = proxy !is null && proxy.provider == RouteKind.mullvad ? "Mullvad" : "NordVPN";
+    if (proxy !is null) logInfo("%s egress %s (%s:%d) for %s:%d", providerName, proxy.label, proxy.host, proxy.port, host, port);
+    const egressLabel = proxy !is null ? providerName ~ " exit " ~ proxy.label : routeToken(candidate.kind);
     if (holder is null) throw new HolderUnavailableException("no connection holder configured");
 
     DialRequest req;
@@ -2243,9 +2411,8 @@ private TCPConnection happyEyeballsConnectWithProxy(HolderClient holder, DialTag
         req.hasProxy = true;
         req.proxy = DialProxy(proxy.host, proxy.port, proxy.username, proxy.password);
     }
-    // Native IPv6 needs an explicit IPv6-only transport tier. A reservation
-    // must never leak into the existing shared-direct/dual-stack route.
-    req.bindIp6 = "";
+    req.addressFamily = candidate.kind == RouteKind.ipv6 ? "ipv6" : "any";
+    req.bindIp6 = candidate.sourceAddress;
     req.connectTimeoutMs = CONNECT_TIMEOUT_SECONDS * 1000;
     req.tlsTimeoutMs = TLS_HANDSHAKE_TIMEOUT_SECONDS * 1000;
     req.starttlsTimeoutMs = STARTTLS_REPLY_TIMEOUT_MS;
@@ -2268,8 +2435,9 @@ private TCPConnection happyEyeballsConnectWithProxy(HolderClient holder, DialTag
     };
 
     if (proxy is null) {
-        // Direct: the holder resolves, races and reports; nothing to account.
-        dr = holder.dial(req, wrapped);
+        // Unproxied: the holder resolves, filters/races and reports.
+        requirePermittedRoute(host, routing, candidate.kind);
+        dr = ownedDial is null ? holder.dial(req, wrapped) : ownedDial(req, wrapped, candidate.kind);
         return dr.stream;
     }
     // One CONNECT with the hostname: the exit resolves it (see the holder's
@@ -2281,11 +2449,15 @@ private TCPConnection happyEyeballsConnectWithProxy(HolderClient holder, DialTag
     report(wrapped, "attempt", "Trying " ~ target ~ ":" ~ port.to!string ~ " via " ~ egressLabel
         ~ " (exit resolves the name, up to " ~ HAPPY_EYEBALLS_RACE_TIMEOUT_SECONDS.to!string ~ "s)…");
     try {
-        dr = holder.dial(req, wrapped);
+        requirePermittedRoute(host, routing, proxy.provider);
+        dr = ownedDial is null ? holder.dial(req, wrapped) : ownedDial(req, wrapped, candidate.kind);
         recordMullvadSuccess(proxy.label);
         return dr.stream;
     } catch (HolderUnavailableException e) {
         // The exit was never tried — leave its counters alone.
+        throw e;
+    } catch (RoutingPolicyBlockedException e) {
+        // No holder DIAL occurred: no transport/exit failure accounting.
         throw e;
     } catch (Exception e) {
         if (countsAgainstExitHealth(e)) recordMullvadFailure(proxy.label);
@@ -2337,15 +2509,17 @@ private bool isRouteDialFailure(Exception e) nothrow {
 /// different fibers and the ban policy keys off the location — a crossed
 /// value would ban the wrong exit.
 struct EgressUsed {
-    /// "" = direct, else the slot label ("de"). Identifies the slot whose
+    RouteKind kind;
+    string fallbackReason;
+    /// "" = unproxied, else the slot label ("de"). Identifies the slot whose
     /// refcount the caller now holds.
     string label;
     /// "host:port" of the SOCKS sidecar; "" for direct.
     string host;
     /// Resolved IP of the sidecar for admin display; "" for direct.
     string ip;
-    /// Per-host ban key of the exit: its location id ("de-ber") when known,
-    /// else `slot:<label>` for a slot whose location cannot be read.
+    /// Concrete host-ban key: direct, ipv6:<observed-source>, a VPN location
+    /// ("de-ber") or `slot:<label>` when its location is unavailable.
     string locationId;
     /// Human text for the UI, e.g. "Berlin, Germany"; "" when unknown.
     string locationText;
@@ -2371,24 +2545,11 @@ private string preferredExitFallbackCopy(string reason) nothrow {
     }
 }
 
-/// The managed first-party destination never tries VPN exits. Explicit
-/// preferences may restrict its direct route, but cannot enable another tier.
-private bool firstPartyDirectOnly(string hostLower, const RoutingPreferences routing) @safe pure {
-    import ircfiber.netaddr : canonicalHost;
-    return routing.valid && canonicalHost(hostLower) == DEFAULT_FIBER_HOST;
-}
-
-/// Step 1 uses the explicit legacy-equivalent defaults. Step 3 replaces this
-/// document with the current durable administrative policy at every dial.
-private RouteKind[] configuredRoutingOrder(string hostLower, const RoutingPreferences routing) {
-    if (!routing.valid) return [];
-    const firstParty = firstPartyDirectOnly(hostLower, routing);
-    auto effective = resolveRoutingPolicy(defaultRoutingPolicy(), hostLower,
-        firstParty && routing.inherit ? RoutingPreferences(false, [RouteKind.direct], "", true) : routing);
-    if (!effective.available) return [];
-    if (firstParty)
-        return effective.order.canFind(RouteKind.direct) ? [RouteKind.direct] : [];
-    return effective.order;
+/// Every caller, including ban/SASL alternatives, uses the same fresh durable
+/// policy and shared first-party rules. No defaults survive an unavailable read.
+private RouteKind[] configuredRoutingOrder(string host, const RoutingPreferences routing) {
+    auto effective = currentRoutingPolicy(host, routing);
+    return effective.available ? effective.order : [];
 }
 
 /// Reliability tiering + smart routing for Automatic egress. Mullvad's
@@ -2538,18 +2699,23 @@ unittest {
     assert(orderStaticProxies([&de], "network-a", 1_000, "").length == 0);
 }
 
-/// One holder `DIAL` through exactly one candidate egress (`null` = direct).
-private alias EgressDial = TCPConnection delegate(MullvadProxy* proxy, out DialResult dr);
+/// One holder DIAL through exactly one explicit transport candidate.
+private alias EgressDial = TCPConnection delegate(RouteCandidate candidate, out DialResult dr);
 
 private TCPConnection happyEyeballsConnect(HolderClient holder, DialTag tag, string host, ushort port,
                                            string tlsMode, RoutingPreferences routing, bool unauthenticated,
-                                           ConnectProgress progress,
-                                           string avoidLabel, out EgressUsed used, out DialResult dr) {
-    TCPConnection dialOne(MullvadProxy* proxy, out DialResult r) {
-        return happyEyeballsConnectWithProxy(holder, tag, host, port, tlsMode, proxy, progress, r);
+                                           string ipv6BindAddr, ConnectProgress progress,
+                                           string avoidLabel, out EgressUsed used, out DialResult dr,
+                                           scope bool delegate() mayDial = null,
+                                           scope DialResult delegate(DialRequest, DialProgress, RouteKind) ownedDial = null) {
+    TCPConnection dialOne(RouteCandidate candidate, out DialResult r) {
+        if (mayDial !is null && !mayDial()) throw new HolderUnavailableException("connection stopped before dial");
+        return happyEyeballsConnectWithProxy(holder, tag, host, port, tlsMode, candidate, routing, progress, r, ownedDial);
     }
+    const nativeSource = ipv6BindAddr.length && requireRoutingOrder(host, routing).canFind(RouteKind.ipv6)
+        && nativeIpv6Prefix(holder).length ? ipv6BindAddr : "";
     return connectThroughEgressPlan(&dialOne, tag.networkId, host, port, tlsMode, routing,
-        unauthenticated, "", progress, avoidLabel, used, dr);
+        unauthenticated, nativeSource, progress, avoidLabel, used, dr, mayDial);
 }
 
 /// Concrete identity of one candidate route, as the route memory keys it.
@@ -2569,7 +2735,8 @@ private void noteRouteOutcome(string endpointKey, string hostLower, MullvadProxy
                               string ipv6BindAddr, string selectedKey, bool ok) nothrow {
     withPoolLock({
         if (routeIdentityLocked(proxy, ipv6BindAddr) != selectedKey) return;
-        const banKey = proxy is null ? DIRECT_EGRESS_LABEL : slotBanKey(proxy).toLower();
+        const banKey = proxy !is null ? slotBanKey(proxy).toLower()
+            : ipv6BindAddr.length ? "ipv6:" ~ ipv6BindAddr : DIRECT_EGRESS_LABEL;
         gRouteMemory.record(endpointKey, hostLower, selectedKey, banKey, ok, nowMsSafe());
     });
 }
@@ -2579,20 +2746,20 @@ private void noteRouteOutcome(string endpointKey, string hostLower, MullvadProxy
 private TCPConnection connectThroughEgressPlan(scope EgressDial dial, string networkId, string host, ushort port,
                                                string tlsMode, RoutingPreferences routing, bool unauthenticated,
                                                string ipv6BindAddr, ConnectProgress progress,
-                                               string avoidLabel, out EgressUsed used, out DialResult dr) {
+                                               string avoidLabel, out EgressUsed used, out DialResult dr,
+                                               scope bool delegate() mayDial = null) {
     import std.string : toLower;
     auto hostLower = host.toLower();
-    const order = configuredRoutingOrder(hostLower, routing);
-    if (order.length == 0)
-        throw new Exception("Routing policy permits no available route");
+    auto order = requireRoutingOrder(hostLower, routing);
     auto healthyForHost = getHealthyProxiesForHost(hostLower);
+    order = requireRoutingOrder(hostLower, routing);
     const orderNowMs = unixMsNow();
     const endpointKey = routeEndpointKey(hostLower, port, tlsMode.toLower());
     // Filter the complete permitted provider set before pin resolution,
     // admission, ranking or retargeting sees a candidate.
     MullvadProxy*[] eligible;
     foreach (p; healthyForHost) if (order.canFind(p.provider)) eligible ~= p;
-    auto admissions = poolAdmissions();
+    auto admissions = poolAdmissions(order);
     bool[string] notAdmitted;
     withPoolLock({
         foreach (ref p; mullvadPool) {
@@ -2624,26 +2791,29 @@ private TCPConnection connectThroughEgressPlan(scope EgressDial dial, string net
             break;
         }
     });
-    MullvadProxy*[] toTry;
-    MullvadProxy*[] gatedLast;
-    string[] gatedKeys;
-    bool[] recoveryCandidate;
-    string[] routeKeys;
+    RouteCandidate[] toTry, gatedLast;
+    string[] unavailable;
     foreach (kind; order) {
-        // Native IPv6 needs the holder family capability in step 4. It must
-        // not be represented by today's dual-stack, null-proxy direct dial.
-        if (kind == RouteKind.ipv6) continue;
-        if (kind == RouteKind.direct) {
-            if (!isDirectBannedForHost(hostLower)) {
-                if (unauthenticated && isEgressSaslGatedForHost(hostLower, DIRECT_EGRESS_LABEL)) {
-                    gatedLast ~= null;
-                    gatedKeys ~= routeIdentityLocked(null, ipv6BindAddr);
-                } else {
-                    toTry ~= null;
-                    recoveryCandidate ~= false;
-                    routeKeys ~= routeIdentityLocked(null, ipv6BindAddr);
-                }
+        if (mayDial !is null && !mayDial()) throw new HolderUnavailableException("connection stopped during routing");
+        // Admission/location lookups may yield; never resolve a pin or retarget
+        // a provider disabled since the initial planning read.
+        if (!requireRoutingOrder(hostLower, routing).canFind(kind)) continue;
+        if (kind == RouteKind.ipv6 || kind == RouteKind.direct) {
+            const source = kind == RouteKind.ipv6 ? ipv6BindAddr : "";
+            if (kind == RouteKind.ipv6 && source.length == 0) {
+                unavailable ~= "ipv6 [unavailable]: native transport or saved IPv6 allocation unavailable";
+                continue;
             }
+            const banKey = kind == RouteKind.ipv6 ? "ipv6:" ~ source : DIRECT_EGRESS_LABEL;
+            if (!isRouteBannedForHost(hostLower, banKey)) {
+                auto candidate = RouteCandidate(kind, null, source, banKey, false,
+                    routeIdentityLocked(null, source), unavailable.join("; "));
+                // A known SASL gate is ineligible until all ungated routes
+                // have failed; preserve configured order within each group.
+                if (unauthenticated && isEgressSaslGatedForHost(hostLower, banKey)) gatedLast ~= candidate;
+                else toTry ~= candidate;
+            }
+            else unavailable ~= banKey ~ " [avoided]: host ban";
             continue;
         }
         MullvadProxy*[] regular, gated, trials;
@@ -2657,16 +2827,16 @@ private TCPConnection connectThroughEgressPlan(scope EgressDial dial, string net
             if (unauthenticated && isEgressSaslGatedForHost(hostLower, slotBanKey(p))) continue;
             trials ~= p;
         }
+        auto excluded = notAdmitted.dup;
+        withPoolLock({
+            foreach (ref p; mullvadPool)
+                if (p.provider != kind) excluded[p.label] = true;
+        });
         MullvadProxy* preferredSlot;
         if (routing.preferredExit.length && preferredProvider == kind) {
-            // Exclude other providers even for an existing location match or
-            // a new retarget. A saved preference cannot grant that provider.
-            auto excluded = notAdmitted.dup;
-            withPoolLock({
-                foreach (ref p; mullvadPool)
-                    if (p.provider != kind) excluded[p.label] = true;
-            });
+            // A location match and an idle retarget must stay in this tier.
             string reason;
+            if (!requireRoutingOrder(hostLower, routing).canFind(kind)) continue;
             auto slot = acquireSlotForPin(hostLower, routing.preferredExit, reason, excluded);
             if (slot !is null && slot.provider == kind
                     && !(unauthenticated && isEgressSaslGatedForHost(hostLower, slotBanKey(slot)))) {
@@ -2681,14 +2851,16 @@ private TCPConnection connectThroughEgressPlan(scope EgressDial dial, string net
             const target = bestUnbannedLocationFor(hostLower);
             if (target.length) {
                 string reason;
-                auto slot = acquireSlotForPin(hostLower, target, reason, notAdmitted);
+                if (!requireRoutingOrder(hostLower, routing).canFind(kind)) continue;
+                auto slot = acquireSlotForPin(hostLower, target, reason, excluded);
                 if (slot !is null && slot.provider == kind) regular ~= slot;
             }
         }
+        if (!requireRoutingOrder(hostLower, routing).canFind(kind)) continue;
         void appendTier(MullvadProxy*[] tier, bool recovery, bool rankMemory) {
             tier = tierAndOrderProxies(tier, mullvadRR, networkId, orderNowMs, avoidLabel);
             auto keys = new string[tier.length];
-            foreach (i, p; tier) keys[i] = routeIdentityLocked(p, ipv6BindAddr);
+            foreach (i, p; tier) keys[i] = routeIdentityLocked(p, "");
             // Route memory is strictly local to this configured provider
             // tier. Gated/recovery candidates cannot escape their sub-tier.
             if (rankMemory && tier.length > 1)
@@ -2704,49 +2876,43 @@ private TCPConnection connectThroughEgressPlan(scope EgressDial dial, string net
                 }
             }
             foreach (i, p; tier) {
-                if (!recovery && !rankMemory) {
-                    gatedLast ~= p;
-                    gatedKeys ~= keys[i];
-                } else {
-                    toTry ~= p;
-                    recoveryCandidate ~= recovery;
-                    routeKeys ~= keys[i];
-                }
+                auto candidate = RouteCandidate(kind, p, "", slotBanKey(p), recovery, keys[i], unavailable.join("; "));
+                if (!recovery && !rankMemory) gatedLast ~= candidate;
+                else toTry ~= candidate;
             }
         }
         if (gMullvadLock !is null) synchronized (gMullvadLock) {
             appendTier(regular, false, true);
-            appendTier(gated, false, false);
             appendTier(trials, true, false);
+            appendTier(gated, false, false);
         } else {
             appendTier(regular, false, true);
-            appendTier(gated, false, false);
             appendTier(trials, true, false);
+            appendTier(gated, false, false);
         }
     }
-    // SASL gates are last resorts, never a reason to retry the same gated
-    // registration forever while another permitted provider can admit it.
-    foreach (i, p; gatedLast) {
-        toTry ~= p;
-        recoveryCandidate ~= false;
-        routeKeys ~= gatedKeys[i];
-    }
+    toTry ~= gatedLast;
     if (toTry.length == 0)
-        throw new Exception("Routing policy permits no available route" ~ admissionSummary);
+        throw new RoutingPolicyBlockedException("routing_policy_blocked", admissionSummary
+            ~ (unavailable.length ? " (" ~ unavailable.join("; ") ~ ")" : ""));
     Exception lastErr;
-    // One "route [phase]: reason" per failed dial, for the diagnosis below.
     string[] failures;
-    foreach (i, proxy; toTry) {
+    foreach (candidate; toTry) {
+        if (mayDial !is null && !mayDial()) throw new HolderUnavailableException("connection stopped during routing");
+        auto proxy = candidate.proxy;
+        const kind = candidate.kind;
+        if (!requireRoutingOrder(hostLower, routing).canFind(kind)) continue;
         // Atomic re-check right before the dial: a drain or quarantine that
         // landed after planning still stops it, and only a recovery-tier
         // candidate may claim the exit's single trial.
         string trialToken;
         if (proxy !is null) {
-            const adm = admitDial(exitRef(proxy), recoveryCandidate[i]);
+            const adm = admitDial(exitRef(proxy), candidate.recovery);
             if (!adm.allowed) {
                 failures ~= proxy.label ~ " [admission]: " ~ adm.blockedState;
                 if (lastErr is null)
-                    lastErr = new Exception("VPN exit " ~ proxy.label ~ " is not admitting new connections ("
+                    lastErr = new RoutingPolicyBlockedException("routing_policy_blocked",
+                        "VPN exit " ~ proxy.label ~ " is not admitting new connections ("
                         ~ adm.blockedState ~ ")" ~ (vpnOnly ? " — not falling back to direct" : ""));
                 logJsonMap("info", "connection", "Egress dial refused by admission",
                     ["host": hostLower, "label": proxy.label, "admission": adm.blockedState,
@@ -2763,11 +2929,18 @@ private TCPConnection connectThroughEgressPlan(scope EgressDial dial, string net
             }
         }
         try {
-            auto conn = dial(proxy, dr);
-            // Positive evidence: the holder answers CONNECTED only after TCP
-            // and the configured TLS/STARTTLS completed.
-            noteRouteOutcome(endpointKey, hostLower, proxy, ipv6BindAddr, routeKeys[i], true);
+            // Admission and progress callbacks can yield. Check again after
+            // the claim, immediately before the transport seam; the real
+            // holder wrapper also checks after composing its progress event.
+            requirePermittedRoute(hostLower, routing, kind);
+            auto conn = dial(candidate, dr);
+            // CONNECTED is observed transport evidence, not a reservation.
+            noteRouteOutcome(endpointKey, hostLower, proxy, candidate.sourceAddress, candidate.memoryKey, true);
             used = EgressUsed.init;
+            used.kind = kind;
+            used.locationId = kind == RouteKind.ipv6 ? "ipv6:" ~ dr.localIp : candidate.hostBanKey;
+            used.fallbackReason = candidate.skippedReason
+                ~ (candidate.skippedReason.length && failures.length ? "; " : "") ~ failures.join("; ");
             if (proxy !is null) {
                 used.label = proxy.label;
                 used.host = proxy.host ~ ":" ~ proxy.port.to!string;
@@ -2790,9 +2963,18 @@ private TCPConnection connectThroughEgressPlan(scope EgressDial dial, string net
             if (trialToken.length)
                 settleTrial(exitRef(proxy), trialToken, EgressTrialOutcome.abort, "");
             throw e;
+        } catch (RoutingPolicyBlockedException e) {
+            if (trialToken.length)
+                settleTrial(exitRef(proxy), trialToken, EgressTrialOutcome.abort, "");
+            if (e.code != "routing_policy_blocked") throw e;
+            // Another explicitly permitted tier may remain. No route/health
+            // evidence is recorded for a policy refusal.
+            lastErr = e;
+            continue;
         } catch (Exception e) {
             lastErr = e;
-            logWarn("happyEyeballsConnect via %s failed for %s:%d: %s, trying next egress", proxy ? proxy.label : "direct", host, port, e.msg);
+            logWarn("happyEyeballsConnect via %s failed for %s:%d: %s, trying next egress",
+                candidate.hostBanKey, host, port, e.msg);
             // A trial dial that reached the exit and failed reopens the
             // circuit with the next cooldown; a holder-side refusal never
             // exercised the exit and only releases the claim.
@@ -2805,13 +2987,12 @@ private TCPConnection connectThroughEgressPlan(scope EgressDial dial, string net
             // Recorded before the ban checks below: a ban forgets the
             // route's memos, so no stale cooling entry outlives it.
             if (isRouteDialFailure(e))
-                noteRouteOutcome(endpointKey, hostLower, proxy, ipv6BindAddr, routeKeys[i], false);
-            failures ~= (proxy !is null ? proxy.label : ipv6BindAddr.length > 0 ? "ipv6:" ~ ipv6BindAddr : "direct")
-                ~ " [" ~ dialFailurePhase(e) ~ "]: " ~ shortConnectError(e.msg);
+                noteRouteOutcome(endpointKey, hostLower, proxy, candidate.sourceAddress, candidate.memoryKey, false);
+            failures ~= candidate.hostBanKey ~ " [" ~ dialFailurePhase(e) ~ "]: " ~ shortConnectError(e.msg);
             // On TLS timeout specifically, ban this egress for this host so the next proxy is tried immediately
             // rather than re-cycling the same wedged exit.
-            if (proxy !is null && e.msg.canFind("TLS handshake timed out")) {
-                banEgressForHost(host, slotBanKey(proxy));
+            if (e.msg.canFind("TLS handshake timed out")) {
+                banEgressForHost(host, candidate.hostBanKey);
             }
             // OpenSSL "wrong version number" (0A00010B) right after tcp_open
             // means the bytes we got back were not a TLS record at all — a
@@ -2830,8 +3011,8 @@ private TCPConnection connectThroughEgressPlan(scope EgressDial dial, string net
             // (applyBanPolicy's full HOST_EGRESS_BAN_MS), not the shorter
             // inferred ban: we are reading the same server-side rejection,
             // just through a different code path.
-            if (proxy !is null && e.msg.canFind("wrong version number")) {
-                banEgressForHost(host, slotBanKey(proxy));
+            if (e.msg.canFind("wrong version number")) {
+                banEgressForHost(host, candidate.hostBanKey);
             }
             continue;
         }
@@ -2849,7 +3030,7 @@ private TCPConnection connectThroughEgressPlan(scope EgressDial dial, string net
             report(progress, "info", "No route reached " ~ stripHostBrackets(host) ~ ":" ~ port.to!string
                 ~ " — " ~ summary ~ ".");
     }
-    throw lastErr ? lastErr : new Exception("All connection attempts failed for " ~ host ~ ":" ~ port.to!string);
+    throw lastErr ? lastErr : new RoutingPolicyBlockedException("routing_policy_blocked");
 }
 
 /// Failure phase for diagnostics: the holder's typed `FAILED` phase
@@ -2862,6 +3043,25 @@ private string dialFailurePhase(Exception e) nothrow {
 }
 
 version (unittest) {
+    private final class ScriptedRoutingPolicySource : RoutingPolicySource {
+        import ircfiber.irc.routing_policy : routingPolicyFromJson, resolveRoutingPolicy;
+        import vibe.data.json : parseJsonString;
+        string raw;
+        bool failing;
+
+        EffectiveRoutingPolicy read(string host, const RoutingPreferences routing) {
+            if (failing) throw new Exception("policy storage unavailable");
+            return resolveRoutingPolicy(routingPolicyFromJson(parseJsonString(raw)), host, routing);
+        }
+
+        void block(RouteKind[] routes) {
+            auto doc = routingPolicyFromJson(parseJsonString(raw));
+            doc.global.blockedRoutes = routes;
+            doc.revision++;
+            raw = doc.toJson().toString();
+        }
+    }
+
     private RoutingPreferences testRouting(RouteKind[] order, string preferredExit = "") {
         RoutingPreferences routing;
         routing.inherit = false;
@@ -2881,6 +3081,8 @@ version (unittest) {
         bool[string][string] savedDaily;
         ExitRelay[] savedRelays;
         EgressAdmissionStore savedStore;
+        RoutingPolicySource savedPolicy;
+        ScriptedRoutingPolicySource policy;
         /// Admission backend for this harness: every exit healthy until a
         /// test scripts otherwise.
         ScriptedAdmissionStore admission;
@@ -2890,6 +3092,7 @@ version (unittest) {
         /// Called with each candidate as its dial starts.
         void delegate(MullvadProxy*) onDial;
         string[] dialed;
+        RouteCandidate[] candidates;
         EgressUsed used;
         Exception failed;
         PendingQuarantine[string] savedPending;
@@ -2900,6 +3103,11 @@ version (unittest) {
             h.savedMemory = gRouteMemory; h.savedBans = hostEgressBanUntil; h.savedGates = hostSaslGateUntil;
             h.savedDaily = dailyReachabilityBanned; h.savedRelays = gExitRelays; h.savedStore = gAdmissionStore;
             h.savedPending = gPendingQuarantines;
+            h.savedPolicy = gRoutingPolicySource;
+            h.policy = new ScriptedRoutingPolicySource;
+            // An explicit fixture seed, not a production fallback.
+            h.policy.raw = `{"schema":1,"revision":0,"global":{"order":["mullvad","nordvpn","direct"],"blockedRoutes":[]},"hosts":[]}`;
+            gRoutingPolicySource = h.policy;
             mullvadPool = pool; mullvadPoolLoaded = true; gRouteMemory = RouteMemory.init;
             hostEgressBanUntil = null; hostSaslGateUntil = null; dailyReachabilityBanned = null; gExitRelays = null;
             gPendingQuarantines = null;
@@ -2913,6 +3121,7 @@ version (unittest) {
             gRouteMemory = savedMemory; hostEgressBanUntil = savedBans; hostSaslGateUntil = savedGates;
             dailyReachabilityBanned = savedDaily; gExitRelays = savedRelays; gAdmissionStore = savedStore;
             gPendingQuarantines = savedPending;
+            gRoutingPolicySource = savedPolicy;
         }
 
         /// Two Mullvad slots (Mullvad tier) and one static NordVPN-style exit.
@@ -2928,9 +3137,11 @@ version (unittest) {
             return [de, ch, nord];
         }
 
-        TCPConnection fakeDial(MullvadProxy* p, out DialResult r) {
-            const name = p is null ? "direct" : p.label;
+        TCPConnection fakeDial(RouteCandidate candidate, out DialResult r) {
+            auto p = candidate.proxy;
+            const name = p !is null ? p.label : candidate.kind == RouteKind.ipv6 ? "ipv6" : "direct";
             dialed ~= name;
+            candidates ~= candidate;
             if (onDial !is null) onDial(p);
             if (auto outcome = name in failWith) {
                 switch (*outcome) {
@@ -2941,17 +3152,20 @@ version (unittest) {
                 }
             }
             r.peerIp = "192.0.2.1";
+            r.localIp = candidate.sourceAddress.length ? candidate.sourceAddress : "192.0.2.2";
             return TCPConnection.init;
         }
 
         /// One connect; returns the routes dialed, in order. The Mullvad
         /// rotation restarts at its first slot every call.
         string[] connect(string host, RoutingPreferences routing = RoutingPreferences.init, ushort port = 6697, string tls = "implicit",
-                         bool unauthenticated = false, string avoid = "", string ipv6 = "") {
+                         bool unauthenticated = false, string avoid = "", string ipv6 = "",
+                         scope bool delegate() mayDial = null) {
             dialed = null; used = EgressUsed.init; failed = null; mullvadRR = 0;
+            candidates = null;
             DialResult dr;
             try connectThroughEgressPlan(&fakeDial, "network-a", host, port, tls, routing, unauthenticated,
-                ipv6, null, avoid, used, dr);
+                ipv6, null, avoid, used, dr, mayDial);
             catch (Exception e) failed = e;
             return dialed;
         }
@@ -2976,6 +3190,214 @@ version (unittest) {
                 unixMsNow(), at);
         }
     }
+}
+
+@("native routes: configured tier beats remembered VPN, fallback never carries the reservation")
+unittest {
+    auto h = EgressPlanHarness.open(EgressPlanHarness.standardPool());
+    scope(exit) h.close();
+    enum host = "native.example.org";
+    enum source = "2001:db8:1234:5678:a516:4466:5544:123";
+    auto routing = testRouting([RouteKind.ipv6, RouteKind.nordvpn]);
+    h.remember(host, "nord-se", true);
+    assert(h.connect(host, routing, 6697, "implicit", false, "", source) == ["ipv6"]);
+    assert(h.used.kind == RouteKind.ipv6 && h.used.locationId == "ipv6:" ~ source);
+    assert(h.candidates[0].proxy is null && h.candidates[0].sourceAddress == source);
+    h.failWith["ipv6"] = "tls";
+    assert(h.connect(host, routing, 6697, "implicit", false, "", source) == ["ipv6", "nord-se"]);
+    assert(h.used.kind == RouteKind.nordvpn && h.used.fallbackReason.length);
+    assert(h.candidates[1].proxy !is null && h.candidates[1].sourceAddress == "");
+    h.failWith = null;
+    assert(h.connect(host, routing, 6697, "implicit", false, "", source) == ["ipv6"]);
+    assert(h.used.fallbackReason == "");
+    assert(h.connect(host, testRouting([RouteKind.direct]), 6697, "implicit", false, "", source) == ["direct"]);
+    assert(h.candidates[0].kind == RouteKind.direct && h.candidates[0].sourceAddress == "");
+}
+
+@("native routes: address-specific bans and current blocks exclude only concrete permitted routes")
+unittest {
+    auto h = EgressPlanHarness.open(EgressPlanHarness.standardPool());
+    scope(exit) h.close();
+    enum host = "native.example.org";
+    enum source = "2001:db8:1234:5678:a516:4466:5544:123";
+    enum other = "2001:db8:1234:5678:a516:4466:5544:124";
+    auto routing = testRouting([RouteKind.ipv6, RouteKind.nordvpn]);
+    banEgressForHost(host, "ipv6:" ~ source);
+    assert(h.connect(host, routing, 6697, "implicit", false, "", source) == ["nord-se"]);
+    assert(h.connect(host, routing, 6697, "implicit", false, "", other) == ["ipv6"]);
+    assert(!isRouteBannedForHost(host, DIRECT_EGRESS_LABEL));
+    h.failWith["ipv6"] = "tls";
+    auto policy = h.policy;
+    h.onDial = (MullvadProxy* p) { if (p is null) policy.block([RouteKind.nordvpn]); };
+    assert(h.connect(host, routing, 6697, "implicit", false, "", other) == ["ipv6"]);
+    assert(h.failed !is null && h.candidates.length == 1);
+    h.onDial = null;
+    assert(h.connect(host, testRouting([])).length == 0);
+    assert(cast(RoutingPolicyBlockedException) h.failed !is null);
+}
+
+@("native routes: reattachment classifies actual held entry and tolerates old META")
+unittest {
+    auto h = EgressPlanHarness.open(EgressPlanHarness.standardPool());
+    scope(exit) h.close();
+    HolderEntry entry;
+    SessionSnapshot meta;
+    entry.localIp = "2001:db8:1234:5678:a516:4466:5544:123";
+    assert(restoredHeldRoute(entry, meta) == "direct");
+    entry.tag.egressLabel = "nord-se";
+    assert(restoredHeldRoute(entry, meta) == "nordvpn");
+    h.proxy("nord-se").controlSocket = "/ctl/misleading.sock";
+    assert(restoredHeldRoute(entry, meta) == "nordvpn");
+    entry.tag.egressLabel = "";
+    meta.activeRoute = "ipv6";
+    meta.localIp = entry.localIp;
+    assert(restoredHeldRoute(entry, meta) == "ipv6");
+    meta.localIp = "2001:db8:1234:5678:a516:4466:5544:124";
+    assert(restoredHeldRoute(entry, meta) == "direct");
+    string prefix;
+    assert(supportedRoutingRoutes(null, prefix) == ["mullvad", "nordvpn", "direct"] && prefix == "");
+}
+
+@("native routes: stopping a failed in-flight candidate prevents the next provider")
+unittest {
+    auto h = EgressPlanHarness.open(EgressPlanHarness.standardPool());
+    scope(exit) h.close();
+    bool running = true;
+    h.onDial = (MullvadProxy* p) { running = false; };
+    h.failWith["ipv6"] = "tls";
+    assert(h.connect("native.example.org", testRouting([RouteKind.ipv6, RouteKind.nordvpn]),
+        6697, "implicit", false, "", "2001:db8:1234:5678:a516:4466:5544:123", () => running) == ["ipv6"]);
+    assert(cast(HolderUnavailableException) h.failed !is null);
+}
+
+@("native routes: preregistration avoidance is concrete, bounded and never changes the IID")
+unittest {
+    import vibe.core.channel : createChannel;
+    auto h = EgressPlanHarness.open(EgressPlanHarness.standardPool());
+    scope(exit) h.close();
+    NetworkConfig cfg;
+    cfg.id = parseUUID("550e8400-e29b-41d4-a716-446655440001");
+    cfg.host = "native.example.org";
+    cfg.ipv6Iid = "a516446655440123";
+    cfg.routing = testRouting([RouteKind.ipv6, RouteKind.nordvpn]);
+    auto channel = createChannel!IRCRawEvent();
+    scope(exit) channel.close();
+    auto c = new PersistentIRCClient(cfg, channel);
+    c.holderConnId = "fixture";
+    c.activeRoute = "ipv6";
+    c.activeLocalIp = "2001:db8:1234:5678:a516:4466:5544:123";
+    c.activeEgressLocationId = "ipv6:" ~ c.activeLocalIp;
+    const before = nowMsSafe();
+    c.avoidFailedRegistrationRoute("Registration timeout: 001 not received", false);
+    assert(isRouteBannedForHost(cfg.host, c.activeEgressLocationId));
+    const expiry = hostEgressBanUntil[cfg.host][c.activeEgressLocationId];
+    assert(expiry >= before + TLS_CLOSED_ROTATE_BAN_MS && expiry <= nowMsSafe() + TLS_CLOSED_ROTATE_BAN_MS);
+    assert(!isRouteBannedForHost(cfg.host, DIRECT_EGRESS_LABEL));
+    assert(c.config.ipv6Iid == cfg.ipv6Iid && c.routingFallbackReason.length);
+    hostEgressBanUntil = null;
+    c.config.routing = testRouting([RouteKind.ipv6]);
+    c.avoidFailedRegistrationRoute("Server closed the connection during registration", false);
+    assert(!isRouteBannedForHost(cfg.host, c.activeEgressLocationId));
+    c.config.routing = cfg.routing;
+    c.avoidFailedRegistrationRoute("SASL authentication failed", true);
+    assert(!isRouteBannedForHost(cfg.host, c.activeEgressLocationId));
+}
+
+@("egress policy: missing, malformed and unreadable current policy never reuse permissive state")
+unittest {
+    auto h = EgressPlanHarness.open(EgressPlanHarness.standardPool());
+    scope(exit) h.close();
+    enum host = "irc.example.org";
+    const seed = h.policy.raw;
+    assert(h.connect(host) == ["de"]);
+    foreach (raw; ["", "{", `{"schema":1,"revision":1,"global":{"order":["unknown"],"blockedRoutes":[]},"hosts":[]}`]) {
+        h.policy.raw = raw;
+        assert(h.connect(host).length == 0);
+        auto refusal = cast(RoutingPolicyBlockedException) h.failed;
+        assert(refusal !is null && refusal.code == "routing_policy_unavailable");
+        assert(!hasAlternativeEgressForHost(host, "slot:failed"));
+    }
+    h.policy.raw = seed;
+    h.policy.failing = true;
+    assert(h.connect(host).length == 0);
+    assert(!hasAlternativeEgressForHost(host, "slot:failed"));
+    h.policy.failing = false;
+    assert(h.connect(host) == ["de"], "only a fresh successful read unblocks dialing");
+    gRoutingPolicySource = null;
+    assert(h.connect(DEFAULT_FIBER_HOST).length == 0, "managed direct also requires durable policy");
+}
+
+@("egress policy: hard blocks precede pins, memory, admission, SASL and recovery candidates")
+unittest {
+    auto h = EgressPlanHarness.open(EgressPlanHarness.standardPool());
+    scope(exit) h.close();
+    enum host = "irc.example.org";
+    h.remember(host, "nord-se", true);
+    h.admission.set("nord-se", "recovering");
+    gateEgressForHost(host, "slot:nord-se");
+    h.policy.block([RouteKind.nordvpn, RouteKind.direct]);
+    auto routing = testRouting([RouteKind.nordvpn, RouteKind.mullvad, RouteKind.direct], "nord-se");
+    assert(h.connect(host, routing) == ["de"]);
+    assert(!h.admission.readLabels.canFind("nord-se"));
+    assert(!h.admission.admittedLabels.canFind("nord-se"));
+    assert(!hasAlternativeEgressForHost(host, "de-ber", true, testRouting([RouteKind.nordvpn, RouteKind.direct])));
+    h.policy.block([RouteKind.mullvad, RouteKind.nordvpn, RouteKind.direct]);
+    assert(h.connect(host, routing).length == 0);
+    assert(!hasAlternativeEgressForHost(host, "de-ber", true, routing));
+    assert(h.connect(DEFAULT_FIBER_HOST).length == 0, "first-party fast path cannot bypass direct block");
+}
+
+@("egress policy: host blocks union with global limits across canonical names and ports")
+unittest {
+    auto h = EgressPlanHarness.open(EgressPlanHarness.standardPool());
+    scope(exit) h.close();
+    h.policy.raw = `{"schema":1,"revision":7,"global":{"order":["mullvad","nordvpn","direct"],"blockedRoutes":["mullvad"]},"hosts":[{"host":"irc.example.org","order":null,"blockedRoutes":["nordvpn"]}]}`;
+    auto routing = testRouting([RouteKind.nordvpn, RouteKind.mullvad, RouteKind.direct], "nord-se");
+    assert(h.connect("IRC.EXAMPLE.ORG.", routing, 6667, "none") == ["direct"]);
+    assert(h.connect("irc.example.org", routing, 6697, "implicit") == ["direct"]);
+    assert(h.connect("other.example.org", routing) == ["nord-se"]);
+    assert(h.connect("irc.example.org", testRouting([RouteKind.nordvpn])).length == 0);
+}
+
+@("egress policy: a block inserted after planning excludes pin resolution and admission")
+unittest {
+    auto h = EgressPlanHarness.open(EgressPlanHarness.standardPool());
+    scope(exit) h.close();
+    auto policy = h.policy;
+    h.admission.onRead = { policy.block([RouteKind.mullvad]); };
+    assert(h.connect("irc.example.org", testRouting([RouteKind.mullvad, RouteKind.nordvpn], "de-ber")) == ["nord-se"]);
+    assert(h.admission.admittedLabels == ["nord-se"]);
+}
+
+@("egress policy: post-admission block aborts a claimed recovery trial before transport")
+unittest {
+    auto h = EgressPlanHarness.open(EgressPlanHarness.standardPool());
+    scope(exit) h.close();
+    h.admission.set("nord-se", "recovering");
+    h.admission.admitReplies["nord-se"] = EgressDialAdmit(true, "policy-race", "");
+    auto policy = h.policy;
+    h.admission.onAdmit = (EgressEndpointRef exit) {
+        if (exit.label == "nord-se") policy.block([RouteKind.nordvpn]);
+    };
+    assert(h.connect("irc.example.org", testRouting([RouteKind.nordvpn, RouteKind.mullvad])) == ["de"]);
+    assert(h.admission.openTrials.length == 0);
+    assert(h.admission.verdicts == ["nord-se:abort"]);
+    assert(h.standing("irc.example.org", "nord-se") == RouteStanding.neutral);
+}
+
+@("egress policy: changes during one dial forbid every later retry and final direct fallback")
+unittest {
+    auto h = EgressPlanHarness.open(EgressPlanHarness.standardPool());
+    scope(exit) h.close();
+    auto policy = h.policy;
+    h.failWith["de"] = "tls";
+    h.onDial = (MullvadProxy* p) {
+        policy.block([RouteKind.mullvad, RouteKind.nordvpn, RouteKind.direct]);
+    };
+    assert(h.connect("irc.example.org") == ["de"]);
+    assert(cast(RoutingPolicyBlockedException) h.failed !is null);
+    assert(h.connect("irc.example.org").length == 0);
+    assert(h.admission.admittedLabels == ["de"]);
 }
 
 @("egress plan: empty, malformed and native-only preferences cannot dial shared direct")
@@ -3177,6 +3599,15 @@ unittest {
     assert(hasAlternativeEgressForHost(host, "slot:nord-se", false, testRouting([RouteKind.mullvad, RouteKind.nordvpn], "de-ber")));
     vpn.admission.states["ch"].trialUntilMs = nowMsSafe() + 60_000;
     assert(!hasAlternativeEgressForHost(host, "slot:nord-se", false, testRouting([RouteKind.mullvad, RouteKind.nordvpn], "de-ber")));
+}
+
+@("egress plan: admission lost after planning parks without a host transport failure")
+unittest {
+    auto h = EgressPlanHarness.open(EgressPlanHarness.standardPool());
+    scope(exit) h.close();
+    h.admission.admitReplies["nord-se"] = EgressDialAdmit(false, "", "trial");
+    assert(h.connect("irc.example.org", testRouting([RouteKind.nordvpn])).length == 0);
+    assert(cast(RoutingPolicyBlockedException) h.failed !is null);
 }
 
 @("egress plan: drained, quarantined and unavailable exits are never dialed, by any route")
@@ -3888,6 +4319,9 @@ private final class ConnectionServicesHost : ServicesHost {
     ServicesActor actor() { return c.servicesActor(); }
     ServicesConfig servicesConfig() { return c.effectiveServices(); }
     string isupport(string key) { return c.isupportMap.get(key, ""); }
+    bool hasCapability(string name) { return c.hasCap(name); }
+    string capabilityValue(string name) { return c.capValues.get(name, ""); }
+    string socketIdentity() { return c.holderConnId.length ? c.holderConnId : c.nativeSocketId; }
 
     size_t lineLimit() {
         if (auto v = "LINELEN" in c.isupportMap) {
@@ -3912,7 +4346,7 @@ private final class ConnectionServicesHost : ServicesHost {
             if (at >= 0) t = t[0 .. at];
             return t.length && c.sameNick(t, serviceNick);
         }
-        foreach (l; c.pacedQueue) if (addressed(l)) return true;
+        foreach (entry; c.pacedQueue) if (addressed(entry.line)) return true;
         foreach (l; c.outboundQueue) if (addressed(l)) return true;
         return false;
     }
@@ -4309,24 +4743,50 @@ package(ircfiber) void setSSLVerify(ref FailInfo dst, string type_, string error
 /// uppercase them so consumers can do `if ("KICKLEN" in net.isupport)`
 /// without worrying about how the server happened to spell the
 /// trailing token.
-private void applyIsupport(
+private bool applyIsupport(
     ref ServerFeatures f,
     ref string[string] map,
     string token,
 ) {
-    // `-TOKEN` withdraws a previously advertised token (RFC 2812 / modern
-    // 005, also how draft/extended-isupport updates arrive). The 005
-    // callers skip params[0] already, so a pre-registration `005 *` from
-    // the ISUPPORT command lands here unchanged.
-    if (token.length > 1 && token[0] == '-') {
-        map.remove(toUpper(token[1 .. $]));
-        return;
+    if (token.length == 0) return false;
+    const withdrawing = token[0] == '-';
+    if (withdrawing) token = token[1 .. $];
+    const eq = token.indexOf("=");
+    const rawKey = eq >= 0 ? token[0 .. eq] : token;
+    if (rawKey.length == 0 || (withdrawing && eq >= 0)) return false;
+    foreach (char c; rawKey)
+        if (!(c >= 'A' && c <= 'Z') && !(c >= 'a' && c <= 'z')
+            && !(c >= '0' && c <= '9')) return false;
+    const key = toUpper(rawKey);
+    if (withdrawing) {
+        bool changed = map.remove(key);
+        switch (key) {
+            case "NETWORK":
+                changed = changed || f.network != ServerFeatures.init.network;
+                f.network = ServerFeatures.init.network; break;
+            case "PREFIX":
+                changed = changed || f.prefix != ServerFeatures.init.prefix;
+                f.prefix = ServerFeatures.init.prefix; break;
+            case "CHANMODES":
+                changed = changed || f.chanModes != ServerFeatures.init.chanModes;
+                f.chanModes = ServerFeatures.init.chanModes; break;
+            case "NICKLEN":
+                changed = changed || f.maxNickLen != ServerFeatures.init.maxNickLen;
+                f.maxNickLen = ServerFeatures.init.maxNickLen; break;
+            case "TOPICLEN":
+                changed = changed || f.topicLen != ServerFeatures.init.topicLen;
+                f.topicLen = ServerFeatures.init.topicLen; break;
+            case "CHANLIMIT":
+                changed = changed || f.maxChannels != ServerFeatures.init.maxChannels;
+                f.maxChannels = ServerFeatures.init.maxChannels; break;
+            default: break;
+        }
+        return changed;
     }
-    auto eq = token.indexOf("=");
-    string key = eq >= 0 ? token[0 .. eq] : token;
-    string val = eq >= 0 ? token[eq + 1 .. $] : "";
-    if (key.length == 0) return;
-    map[toUpper(key)] = val;
+    const val = eq >= 0 ? token[eq + 1 .. $] : "";
+    if (auto previous = key in map)
+        if (*previous == val) return false;
+    map[key] = val;
 
     switch (key) {
         case "NETWORK":   f.network     = val; break;
@@ -4347,6 +4807,7 @@ private void applyIsupport(
             break;
         default: break;
     }
+    return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4911,6 +5372,7 @@ final class PersistentIRCClient {
         /// RPL_WELCOME and every attach of a held socket (hot swap / crash),
         /// "" once the socket is gone. Service operations are bound to it.
         string              connectionEpoch;
+        string              nativeSocketId;
         /// The SERVICES_STATE tuple last published, so only changes are.
         string[4]           announcedServicesState = ["unknown", "", "", "unavailable"];
         ulong               announcedServicesGeneration;
@@ -4977,7 +5439,7 @@ final class PersistentIRCClient {
         /// Message lines waiting for the pacer to admit them. Only user
         /// traffic (PRIVMSG/NOTICE) is parked here; protocol-critical lines
         /// (PING/PONG/CAP/NICK/registration) always go out immediately.
-        string[]            pacedQueue;
+        BncPendingWrite[]   pacedQueue;
         enum MAX_PACED_QUEUE = 2_000;
         /// Per-channel `+f` line-rate ceiling and its sliding window,
         /// keyed by lowercase channel.
@@ -5036,22 +5498,6 @@ final class PersistentIRCClient {
         /// query is issued at most once per channel per connection.
         bool[string]        chanFloodProbed;
 
-        // IRCv3 BATCH tracking, keyed by reference tag. Batches nest
-        // (labeled-response around chathistory), so every open batch is
-        // tracked; a line's own `batch` tag picks its entry. Multiline
-        // batches buffer their lines here until `BATCH -ref`.
-        static struct OpenBatch {
-            string type;
-            string target;
-            string label;
-            string[] lines;
-            bool[] concat;
-            string cmd;
-            IRCRawEvent first;
-            /// Ref of the batch this one is nested in ("" = top level).
-            string parent;
-        }
-        OpenBatch[string]   openBatches;
 
         // ISUPPORT features
         ServerFeatures      serverFeatures;
@@ -5098,10 +5544,8 @@ final class PersistentIRCClient {
         long[string]        channelLatestTs;     // keyed by lowercase channel
         long[string]        channelEarliestTs;
 
-        // Pending chathistory request bookkeeping. Tracks in-flight LATEST /
-        // BEFORE / AFTER / AROUND requests so we can throttle and so the
-        // REST gateway can correlate which channels we still owe a fetch to.
-        bool[string]        chathistoryInFlight;  // keyed by lowercase channel
+        mixin HistoryRecoveryMixin;
+        mixin BncConnectionMixin;
 
         // Ownership metadata is independent of the saved connection's IID.
         import std.uuid : UUID;
@@ -5163,6 +5607,9 @@ final class PersistentIRCClient {
         /// Local source IP observed by the holder on the live socket, not a
         /// proposed/reserved address or a separately probed VPN public IP.
         string              activeLocalIp;
+        /// Actual selected transport; never derived from a proposed reservation.
+        string              activeRoute;
+        string              routingFallbackReason;
         /// Consecutive "SSL/TLS tunnel closed" failures on the current
         /// egress for this host; drives the inferred-ban egress rotation
         /// in the reconnect loop. Reset on any other failure and on 001.
@@ -5191,6 +5638,8 @@ final class PersistentIRCClient {
         bool                metaDirty;
         /// A connection-loop fiber currently owns this client.
         bool                loopRunning;
+        bool                dialStopIntent;
+        uint                heldAttachOperations;
         // Tracks sessionNick before an optimistic NICK update in sendRaw.
         // The NICK handler checks this to correlate the server's echo back
         // to us post-optimistic-update, since event.nick (old nick) won't
@@ -5240,6 +5689,7 @@ final class PersistentIRCClient {
         this.redis        = redisStore;
         this.serverId     = sid;
         this.ownerId      = owner;
+        this.nativeSocketId = randomUUID().toString();
         // Never park: Duration.zero = retry forever at the 6 h tier (tiers/caps/jitter unchanged). The reconnect_gave_up path below is retained but unreachable unless a future cap returns.
         this.backoff      = new ExponentialBackoff(3.seconds, RECONNECT_MAX_DELAY_SECS.seconds, 0, Duration.zero);
         this.state        = ConnectionState.disconnected;
@@ -5254,6 +5704,7 @@ final class PersistentIRCClient {
         this.randomNickPersisted = false;
         this.ghostReclaimAttempted = false;
         this.services = new ServicesTransport(new ConnectionServicesHost(this));
+        restoreHistoryCoverage();
     }
 
     /// Starts the connection loop in a background task. No-op for a
@@ -5262,7 +5713,7 @@ final class PersistentIRCClient {
     /// retrying an attach to a held session (a fresh dial would double-
     /// socket the server).
     void start() {
-        if (state == ConnectionState.connected) return;
+        if (isShutdownRequested || dialStopIntent || state == ConnectionState.connected) return;
         if (loopRunning || attachPending) return;
         // Set state immediately so any snapshot taken before the fiber runs
         // reflects the actual intent. Without this, a freshly created client
@@ -5316,6 +5767,19 @@ final class PersistentIRCClient {
         });
     }
 
+    /// Quiescence is loop completion, not a disconnected transport snapshot.
+    bool getStopping() const {
+        import ircfiber.term_signal : termSignal;
+        return isShutdownRequested || dialStopIntent || termSignal() != 0;
+    }
+    bool getMoveQuiescent() const {
+        return isShutdownRequested && !loopRunning && heldAttachOperations == 0;
+    }
+    void beginHeldAttach() { heldAttachOperations++; }
+    void endHeldAttach() { heldAttachOperations--; }
+    void inhibitNewDials() { dialStopIntent = true; }
+    void requestMoveStop() { isShutdownRequested = true; }
+
     /// Stops the connection and requests shutdown. If `quitReason` is
     /// supplied (or default empty), a QUIT is sent first so the server
     /// emits a final ERROR and closes the link cleanly; otherwise the
@@ -5361,6 +5825,7 @@ final class PersistentIRCClient {
     /// `processEvents()`; the loop finishes its current line first, then
     /// spins until `resumeAfterDetach()` brings the count back to zero.
     void pauseForDetach() {
+        dialStopIntent = true;
         import core.atomic : atomicOp;
         atomicOp!"+="(detachPauseCount, 1);
         logJsonMap("info", "connection",
@@ -5380,6 +5845,7 @@ final class PersistentIRCClient {
             return;
         }
         if (prev - 1 == 0) {
+            if (!detachedForHotSwap && !isShutdownRequested) dialStopIntent = false;
             logJsonMap("info", "connection",
                 "Detach pause released",
                 ["network": config.name,
@@ -5479,6 +5945,7 @@ final class PersistentIRCClient {
         s.isAway = isAway;
         s.awayMessage = awayMessage;
         s.ackedCaps = getAckedCaps();
+        s.capValues = getCapValues();
         s.queryBuffers = queryBuffers.dup;
         s.queryAccounts = queryAccounts.dup;
         s.queryHosts = queryHosts.dup;
@@ -5486,8 +5953,9 @@ final class PersistentIRCClient {
         // A services credential or private memo line never rides in META:
         // the next engine would replay it, and META is not a secret store.
         foreach (l; outboundQueue) if (!isSensitiveServiceLine(l)) s.outboundQueue ~= l;
-        if (graceful)
-            foreach (l; pacedQueue) if (!isSensitiveServiceLine(l)) s.outboundQueue ~= l;
+        foreach (entry; pacedQueue)
+            if (!isSensitiveServiceLine(entry.line)) s.bncPendingWrites ~= entry;
+        s.bncOwnershipPayload = bncOwnership is null ? "" : bncOwnership.snapshot();
         s.channelState = channelState.dup;
         s.channelTopics = channelTopics.dup;
         // Duplicate the associative array of user lists.
@@ -5504,7 +5972,7 @@ final class PersistentIRCClient {
         s.channelEarliestMsgid = channelEarliestMsgid.dup;
         s.channelLatestTs = channelLatestTs.dup;
         s.channelEarliestTs = channelEarliestTs.dup;
-        s.chathistoryInFlight = chathistoryInFlight.dup;
+        captureHistoryState(s);
         s.transportWasPlain = !tlsInfoValid;
         s.wasConnected = (state == ConnectionState.connected);
         s.capturedAtMs = unixMsNow();
@@ -5532,6 +6000,8 @@ final class PersistentIRCClient {
         s.egressTrialPort = egressTrialExit.port;
         s.peerIp = activePeerIp;
         s.localIp = activeLocalIp;
+        s.activeRoute = getActiveRoute();
+        s.routingFallbackReason = routingFallbackReason;
         // Peer tickets are bound to the connection generation and the
         // verified prefix; the next engine keeps both rather than
         // re-deriving them.
@@ -5547,6 +6017,7 @@ final class PersistentIRCClient {
         const quiet = services.marker();
         s.servicesQuietPrefixes = quiet.prefixes.dup;
         s.servicesQuietUntilMs = quiet.untilMs;
+        s.servicesNativeQuiet = quiet.native;
         // Non-secret count of legacy NickServ auth commands on this socket
         // still awaiting their verdict: the next engine keeps structured
         // authentication blocked until a real verdict or a new socket.
@@ -5623,7 +6094,6 @@ final class PersistentIRCClient {
         channelEarliestMsgid = s.channelEarliestMsgid.dup;
         channelLatestTs = s.channelLatestTs.dup;
         channelEarliestTs = s.channelEarliestTs.dup;
-        chathistoryInFlight = s.chathistoryInFlight.dup;
         serverFeatures.network = s.serverFeatures.network;
         serverFeatures.prefix = s.serverFeatures.prefix;
         serverFeatures.chanModes = s.serverFeatures.chanModes;
@@ -5631,6 +6101,7 @@ final class PersistentIRCClient {
         serverFeatures.maxNickLen = s.serverFeatures.maxNickLen;
         serverFeatures.topicLen = s.serverFeatures.topicLen;
         isupportMap = s.isupportMap.dup;
+        capValues = s.capValues.dup;
         serverSoftware = s.serverSoftware;
         // Socket / TLS facts come from the holder (it owns the socket).
         activePeerIp = r.entry.peerIp;
@@ -5662,7 +6133,16 @@ final class PersistentIRCClient {
         // This engine interprets the socket from here on: a fresh epoch, so
         // nothing bound to the previous engine's reading of it carries over.
         mintConnectionEpoch();
-        services.restoreQuiet(s.servicesQuietPrefixes, s.servicesQuietUntilMs);
+        restoreHistoryState(s);
+        bncState().restore(s.bncOwnershipPayload);
+        pacedQueue = s.bncPendingWrites.dup;
+        foreach (entry; pacedQueue)
+            if (entry.owner.request.length) bncState().restorePendingWrite(entry);
+        ServicesQuietMarker retainedQuiet;
+        retainedQuiet.prefixes = s.servicesQuietPrefixes.dup;
+        retainedQuiet.untilMs = s.servicesQuietUntilMs;
+        retainedQuiet.native = s.servicesNativeQuiet;
+        services.restoreQuiet(retainedQuiet);
         // The retained socket may still deliver a verdict for an auth command
         // the previous engine sent, graceful swap or crash alike.
         if (s.servicesLegacyAuthPending > 0)
@@ -5673,11 +6153,18 @@ final class PersistentIRCClient {
         // re-take the hold — `retargetSlotByLabel` must refuse to move it
         // and `bounceNetworksOnEgress(label)` must find it, exactly as
         // before the swap.
-        activeEgressLabel = s.egressLabel.length ? s.egressLabel : r.entry.tag.egressLabel;
+        activeEgressLabel = r.entry.tag.egressLabel;
         activeEgressHost = s.egressHost;
         activeEgressIp = s.egressIp;
         activeEgressLocationId = s.egressLocationId;
         activeEgressLocation = s.egressLocationText;
+        // Old META stays attachable; its proxy provider comes only from
+        // explicit pool metadata, and old unproxied sockets remain direct.
+        activeRoute = restoredHeldRoute(r.entry, s);
+        routingFallbackReason = s.routingFallbackReason;
+        if (activeRoute == "ipv6")
+            activeEgressLocationId = "ipv6:" ~ r.entry.localIp;
+        else if (activeRoute == "direct") activeEgressLocationId = DIRECT_EGRESS_LABEL;
         egressSlotLabel = activeEgressLabel;
         egressSlotHeld = activeEgressLabel.length > 0;
         if (egressSlotHeld) holdSlot(activeEgressLabel);
@@ -5736,6 +6223,9 @@ final class PersistentIRCClient {
         // re-adding the ones still here, which is what a resync was always
         // meant to do. Paced by writeRaw like any other line.
         foreach (chan; channelState.byKey) sendRaw("NAMES " ~ chan);
+        // Registry additions must take effect on retained sockets too.
+        // SUB and unchanged profile SETs are idempotent upstream.
+        if (hasCap("draft/metadata-2")) publishOwnMetadata();
         if (ownPrefix.length == 0 || servicesAccountState == ServicesAccountState.unknown)
             requestSelfWho();
         announceServicesState();
@@ -5757,6 +6247,7 @@ final class PersistentIRCClient {
     /// keeps a META-less entry that the next engine closes and re-dials.
     void detachForHotSwap() {
         const live = state == ConnectionState.connected && holderConnId.length > 0;
+        services.prepareNativeDetach();
         if (live) publishMeta(true);
         // In-flight services requests end here (stale, or unconfirmed when a
         // command already left); the META above carries only their marker.
@@ -5914,8 +6405,8 @@ final class PersistentIRCClient {
     @property FailInfo getLastFailInfo() const {
         return lastFailInfo;
     }
-    /// Mullvad egress actually used for the live TCP connection.
-    /// "" = direct (no SOCKS), else label like "de"/"se".
+    /// Proxy slot last selected; "" for native IPv6/shared direct. Use
+    /// getActiveRoute for the actual transport tier.
     @property string getActiveEgressLabel() const { return activeEgressLabel; }
     @property string getActiveEgressHost() const { return activeEgressHost; }
     @property string getActiveEgressIp() const { return activeEgressIp; }
@@ -5928,8 +6419,14 @@ final class PersistentIRCClient {
         return activeEgressLocation.length ? activeEgressLocation : activeEgressLabel;
     }
     /// Remote/local IPs of the live TCP socket; "" when not connected.
-    @property string getActivePeerIp() const { return activePeerIp; }
-    @property string getActiveLocalIp() const { return activeLocalIp; }
+    private bool hasActiveTransport() const nothrow {
+        return holderConnId.length > 0 && !detachedForHotSwap
+            && (state == ConnectionState.connected || state == ConnectionState.connecting);
+    }
+    @property string getActivePeerIp() const { return hasActiveTransport() ? activePeerIp : ""; }
+    @property string getActiveLocalIp() const { return hasActiveTransport() ? activeLocalIp : ""; }
+    @property string getActiveRoute() const { return hasActiveTransport() ? activeRoute : ""; }
+    @property string getRoutingFallbackReason() const { return routingFallbackReason; }
     /// Round trip of the last answered lag probe in ms; -1 when unknown.
     @property long getLagMs() const nothrow { return lagMs; }
     /// Unix ms of RPL_WELCOME for the live connection; 0 when not connected.
@@ -6444,6 +6941,7 @@ final class PersistentIRCClient {
         if (r == "ok") {
             emitLog("info", "VPN exit " ~ label ~ " passed its recovery trial (registered "
                 ~ (EGRESS_TRIAL_SUSTAIN_MS / 1000).to!string ~ "s, keepalive answered) and takes new connections again.");
+            announceEgressRecovery(label, nowMsSafe());
             clearEgressTrial();
         } else if (r == "stale") {
             clearEgressTrial();
@@ -6499,6 +6997,10 @@ final class PersistentIRCClient {
         return foldNickMapped(stripNickPrefix(nick), casemapping());
     }
 
+    private string historyFold(string target) {
+        return normalizeFiberChannel(target, casemapping());
+    }
+
     /// The server's ISUPPORT CASEMAPPING, defaulting to rfc1459 (the
     /// common one). Shared by `sameNick` and every roster fold, so the two
     /// can never disagree about whether two spellings are one member.
@@ -6517,13 +7019,18 @@ final class PersistentIRCClient {
         return result;
     }
 
+    string[string] getCapValues() const {
+        string[string] values;
+        foreach (name, value; capValues) values[name] = value;
+        return values;
+    }
+
     /// Updates the network configuration. Our own metadata keys and the
     /// MONITOR list are diffed and pushed live; while disconnected nothing
     /// goes out, the next registration publishes whatever is current then.
     void updateConfig(NetworkConfig cfg) {
         const oldAvatar = config.effectiveAvatarUrl();
         auto oldProfile = config.profileMetadata.dup;
-        auto oldMonitor = config.monitoredNicks.dup;
         const oldServices = effectiveServices();
         config = cfg;
         if (effectiveServices() != oldServices) {
@@ -6538,16 +7045,7 @@ final class PersistentIRCClient {
                 foreach (l; metadataCommands(k, oldProfile.get(k, ""), config.profileMetadata.get(k, "")))
                     sendRaw(l);
         }
-        if (live && monitorSupported()) {
-            bool[string] before, after;
-            foreach (n; oldMonitor) before[foldNick(n)] = true;
-            foreach (n; config.monitoredNicks) after[foldNick(n)] = true;
-            string[] removed, added;
-            foreach (n; oldMonitor) if (!(foldNick(n) in after)) removed ~= n;
-            foreach (n; config.monitoredNicks) if (!(foldNick(n) in before)) added ~= n;
-            foreach (l; monitorLines("-", removed, monitorLimit())) sendRaw(l);
-            foreach (l; monitorLines("+", added, monitorLimit())) sendRaw(l);
-        }
+        if (live) reconcileMonitorUnion();
         if (oldAvatar != newAvatar) syncPublicAvatar();
     }
 
@@ -6566,6 +7064,26 @@ final class PersistentIRCClient {
         if (gIpv6Lock !is null) synchronized (gIpv6Lock) { prefix = gIpv6Prefix; }
         else prefix = gIpv6Prefix;
         return ipv6ForConnection(prefix, config.ipv6Iid);
+    }
+
+    private bool hasAllowedAlternative(string banKey, bool unauthenticated = false) {
+        const source = nativeIpv6Prefix(holder).length ? resolveIpv6Bind() : "";
+        return hasAlternativeEgressForHost(config.host.toLower(), banKey, unauthenticated, config.routing, source);
+    }
+
+    /// Avoid a selected but silently filtered transport only for the existing
+    /// inferred-ban window and only when another permitted route can serve it.
+    private void avoidFailedRegistrationRoute(string failure, bool hadServerError) {
+        if (isShutdownRequested || detachedForHotSwap || hadServerError || holderConnId.length == 0) return;
+        const lower = failure.toLower();
+        if (!(lower.canFind("registration timeout") || lower.canFind("closed")
+                || lower.canFind("connection reset") || lower.canFind("broken pipe")
+                || lower.canFind("transport dead") || lower.canFind("transport not alive"))) return;
+        const key = activeEgressKey();
+        if (!hasAllowedAlternative(key, config.sasl == SASLMechanism.none)) return;
+        banEgressForHost(config.host, key, TLS_CLOSED_ROTATE_BAN_MS);
+        routingFallbackReason = key ~ " [pre-registration transport]: " ~ failure;
+        throttledUntil = 0;
     }
 
     // ── Connection loop ───────────────────────────────────────────────────────
@@ -6649,6 +7167,7 @@ final class PersistentIRCClient {
             } catch (Throwable e) {
                 const wasRegistered = state == ConnectionState.connected;
                 const hadServerError = lastErrorText.length > 0;
+                const hadSelectedTransport = holderConnId.length > 0;
                 sessionUptimeMs = connectedAtMs > 0 ? unixMsNow() - connectedAtMs : 0;
                 // Enterprise: catch Throwable (not just Exception) — SyncError@(0) from
                 // unsynchronized __gshared access previously killed the TaskFiber
@@ -6669,6 +7188,24 @@ final class PersistentIRCClient {
                     try transportClose(); catch (Throwable) {}
                     state = ConnectionState.waiting_to_retry;
                     backoff.reset();
+                    emitZeroRetryStatus();
+                    foreach (_; 0 .. 50) {
+                        if (isShutdownRequested) break;
+                        sleep(100.msecs);
+                    }
+                    continue;
+                }
+                if (auto policy = cast(RoutingPolicyBlockedException) e) {
+                    // No upstream dial is permitted. Park on a fixed cadence
+                    // so restoring durable policy resumes without a restart.
+                    // Do not call handleDisconnection or count a host failure.
+                    lastEmittedReason = policy.msg;
+                    lastDisconnectReason = policy.msg;
+                    state = ConnectionState.waiting_to_retry;
+                    emitLog("error", policy.msg);
+                    try eventChannel.put(IRCRawEvent.makeDisconnected(
+                        config.name, config.id.toString(), policy.msg));
+                    catch (Exception) {}
                     emitZeroRetryStatus();
                     foreach (_; 0 .. 50) {
                         if (isShutdownRequested) break;
@@ -6724,6 +7261,7 @@ final class PersistentIRCClient {
                     lastEmittedReason = displayReason;
                     lastDisconnectReason = displayReason;
                 }
+                if (!wasRegistered) avoidFailedRegistrationRoute(errMsg, hadServerError);
 
                 // handleDisconnection now emits the DISCONNECTED lifecycle
                 // event so the frontend sees the state transition for ALL
@@ -6777,13 +7315,14 @@ final class PersistentIRCClient {
                 if (reason.canFind("TLS handshake timed out") || errMsg.canFind("TLS handshake timed out")) {
                     recordCounter("ircfiber.tls_handshake.timeout_disconnect", 1, ["host": config.host]);
                     // Ban the egress this network used for this host so the next attempt tries a different exit.
-                    if (activeEgressLocationId.length > 0) banEgressForHost(config.host, activeEgressLocationId);
+                    if (hadSelectedTransport && activeEgressLocationId.length > 0)
+                        banEgressForHost(config.host, activeEgressLocationId);
                     recordHostFailure(config.host, config.port);
                 }
                 // Keep Mullvad's existing accounting for silent drops. Static
                 // exits instead use qualified, cross-host observations above.
-                if (reason.canFind("PONG timeout")
-                    || reason.canFind("transport not alive") || reason.canFind("transport dead")) {
+                if (hadSelectedTransport && (reason.canFind("PONG timeout")
+                    || reason.canFind("transport not alive") || reason.canFind("transport dead"))) {
                     recordCounter("ircfiber.keepalive.timeout_disconnect", 1, ["host": config.host, "egress": activeEgressLabel]);
                     if (!isStaticProxy(activeEgressLabel)) {
                         if (activeEgressLocationId.length > 0) banEgressForHost(config.host, activeEgressLocationId);
@@ -6797,13 +7336,14 @@ final class PersistentIRCClient {
                 // egress, with another route available, means rotate — the
                 // same failover a spelled-out Z-line gets in applyBanPolicy,
                 // but with a shorter host-ban since we are inferring.
-                const tlsClosed = reason.canFind("tunnel closed") || errMsg.canFind("tunnel closed");
+                const tlsClosed = hadSelectedTransport
+                    && (reason.canFind("tunnel closed") || errMsg.canFind("tunnel closed"));
                 consecutiveTlsClosed = tlsClosed ? consecutiveTlsClosed + 1 : 0;
                 if (tlsClosed && consecutiveTlsClosed >= TLS_CLOSED_ROTATE_AFTER) {
                     import std.string : toLower;
                     const banKey = activeEgressLocationId.length > 0
                         ? activeEgressLocationId : DIRECT_EGRESS_LABEL;
-                    if (hasAlternativeEgressForHost(config.host.toLower(), banKey, false, config.routing)) {
+                    if (hasAllowedAlternative(banKey)) {
                         banEgressForHost(config.host, banKey, TLS_CLOSED_ROTATE_BAN_MS);
                         consecutiveTlsClosed = 0;
                         emitLog("info", "TLS handshake keeps being closed via "
@@ -7001,17 +7541,6 @@ final class PersistentIRCClient {
             // during the active backoff window. Cleared by
             // emitZeroRetryStatus() on every backoff.reset() site.
             activeRetryDelayMs   = delayMs;
-            // Reset the PONG/data timestamp so the new connection attempt
-            // gets a fresh 300s grace period. Without this, a stale
-            // `lastPongReceivedSecs` from a previous successful
-            // connection (or the engine-start time) makes the
-            // 5-minute PONG timeout fire immediately on the first
-            // no-data iteration of the new attempt, producing a
-            // death loop where the engine reconnects and trips the
-            // PONG timeout without giving the new connection a
-            // chance to send or receive any traffic.
-            lastPongReceivedSecs = Clock.currTime.toUnixTime!long;
-            lastDataReceivedSecs = Clock.currTime.toUnixTime!long;
             resetConnectionTelemetry();
             // W1-T01-rev1: ordering — emit the user-visible queued log
             // line FIRST so it lands in the chat timestamped before the
@@ -7125,6 +7654,27 @@ final class PersistentIRCClient {
                 config.name, e.msg);
             catch (Exception) {}
         }
+    }
+
+    /// Apply exactly the token parameters, independent of trailer wording.
+    /// Value replacements and withdrawals are changes even at equal map size.
+    private bool applyIsupportReply(ref IRCRawEvent event) {
+        const params = event.getParams();
+        const end = params.length - (event.hasTrailingParam && params.length ? 1 : 0);
+        const oldMonitor = isupportMap.get("MONITOR", "\x00");
+        const oldMapping = casemapping();
+        bool changed;
+        if (end > 1)
+            foreach (token; params[1 .. end])
+                changed = applyIsupport(serverFeatures, isupportMap, token) || changed;
+        if (changed) {
+            metaDirty = true;
+            publishIsupportEvent();
+            if (state == ConnectionState.connected && redis !is null
+                && (oldMonitor != isupportMap.get("MONITOR", "\x00") || oldMapping != casemapping()))
+                reconcileMonitorUnion();
+        }
+        return changed;
     }
 
     /// Publish a synthetic `ISUPPORT` event carrying the engine's
@@ -7288,6 +7838,16 @@ final class PersistentIRCClient {
     /// bookkeeping and the TLS details; emits the post-connect timeline.
     private void dialViaHolder(string tlsMode) {
         if (holder is null) throw new HolderUnavailableException("no connection holder configured");
+        import ircfiber.irc.dial_guard : ownsNetworkForDial, dialWithOwnership;
+        bool mayDial() {
+            return !getStopping && !detachedForHotSwap
+                && ownsNetworkForDial(redis, serverId, config.id.toString());
+        }
+        DialResult ownedDial(DialRequest req, DialProgress progress, RouteKind kind) {
+            return dialWithOwnership(holder, req, progress, redis, serverId,
+                () => getStopping || detachedForHotSwap,
+                () { requirePermittedRoute(config.host, config.routing, kind); });
+        }
         dialTlsMode = tlsMode;
         DialResult dr;
         withSpan("irc.tcp_connect",
@@ -7307,7 +7867,8 @@ final class PersistentIRCClient {
             if (now >= avoidUntilMs) { avoidEgressLabel = ""; avoidUntilMs = 0; }
             connection = happyEyeballsConnect(holder, tag, config.host, config.port, tlsMode,
                 config.routing, config.sasl == SASLMechanism.none,
-                &onDialEvent, avoidEgressLabel, used, dr);
+                resolveIpv6Bind(), &onDialEvent, avoidEgressLabel, used, dr,
+                &mayDial, &ownedDial);
             holderConnId = dr.id;
             activeEgressLabel = used.label;
             activeEgressHost = used.host;
@@ -7321,6 +7882,9 @@ final class PersistentIRCClient {
             egressTrialProbeSentMs = 0;
             activePeerIp = dr.peerIp;
             activeLocalIp = dr.localIp;
+            activeRoute = routeToken(used.kind);
+            if (used.fallbackReason.length || used.kind == RouteKind.ipv6)
+                routingFallbackReason = used.fallbackReason;
             tlsInfoValid = dr.tlsOk;
             tlsInfo = dr.tls;
             ts.setStatusOk();
@@ -7366,6 +7930,7 @@ final class PersistentIRCClient {
             throw new Exception("Shutdown requested");
         }
         state = ConnectionState.connecting;
+        nativeSocketId = randomUUID().toString();
         disconnectedEmitted = false;
         ackedCaps.clear();
         capValues.clear();
@@ -7411,9 +7976,8 @@ final class PersistentIRCClient {
         // per TCP connection, so it dies with the old socket; the same goes
         // for in-flight CHATHISTORY flags the dead connection can never
         // answer (they would suppress fresh backfills forever).
-        openBatches = null;
+        resetHistorySocket();
         capReqOutstanding = 0;
-        chathistoryInFlight.clear();
         serverFeatures = ServerFeatures.init;
         // Drop any tokens leftover from the previous connection attempt;
         // the new server's 005 stream will repopulate this map. Without
@@ -7496,7 +8060,19 @@ final class PersistentIRCClient {
              "event": "register_complete"]);
 
         state = ConnectionState.connected;
+        // Registration is fresh inbound evidence. Backoff may have lasted
+        // longer than the keepalive deadline; never carry its old clock into
+        // the first event-loop iteration of this newly registered socket.
+        lastPongReceivedSecs = Clock.currTime.toUnixTime!long;
+        lastDataReceivedSecs = lastPongReceivedSecs;
+        idleEmitted = false;
         beginServicesGeneration();
+        bncState().newSocket(unixMsNow());
+        BncPendingWrite[] ordinaryWrites;
+        foreach (entry; pacedQueue)
+            if (!entry.owner.request.length) ordinaryWrites ~= entry;
+        pacedQueue = ordinaryWrites;
+        startHistoryRecovery();
         // The backoff is not reset here: runConnectionLoop resets it only
         // after the session stays up STABLE_SESSION_RESET_MS, so a server
         // that accepts then drops us keeps backing off.
@@ -7543,7 +8119,7 @@ final class PersistentIRCClient {
     /// edit in the network form, or for the Fiber network a
     /// NickServ-password site login — each re-enables and pushes
     /// `reconnectNetwork`. The account name is logged; the credential never is.
-    private void parkNetwork(string msg, string failType, string event) {
+    private void parkNetwork(string msg, string failType, string event, string reason = "") {
         import ircfiber.db.network : NetworkRepository;
         try {
             (new NetworkRepository()).setDisabled(config.id, true);
@@ -7566,7 +8142,7 @@ final class PersistentIRCClient {
         if (failType.length) {
             FailInfo info;
             info.type_ = failType;
-            info.reason = msg;
+            info.reason = reason.length ? reason : msg;
             lastFailInfo = info;
             try eventChannel.put(IRCRawEvent.makeConnectionFail(config.name, config.id.toString(),
                 info.type_, info.reason, info.killedReason, info.sslVerifyError));
@@ -7587,6 +8163,19 @@ final class PersistentIRCClient {
     private string saslRequiredMessage() const {
         return config.host ~ " only accepts IRC Fiber connections that log in with SASL. Add your account under "
             ~ SASL_SETTINGS_HINT ~ ", then Save — not reconnecting until then.";
+    }
+
+    private void rejectAccountRequired(ref const IRCRawEvent event) {
+        const params = event.getParams();
+        const required = event.command == "draft/ACCOUNTREQUIRED"
+            || (event.command == "FAIL" && params.length >= 2
+                && params[0] == "*" && params[1] == "ACCOUNT_REQUIRED");
+        if (!required || !isServerPrefix(event)) return;
+        string message = "This network requires an existing account and SASL login. Configure SASL before reconnecting.";
+        if (capValues.get("draft/account-registration", "").split(",").canFind("before-connect"))
+            message ~= " Early registration is available only through an early-registration-capable client.";
+        parkNetwork(message, "sasl_required", "account_required", "account_required");
+        throw new SaslParkedException(message);
     }
 
     /// Definitive SASL rejection (904/905): services are reachable and refuse
@@ -7837,6 +8426,14 @@ final class PersistentIRCClient {
                     linesIn++;
 
                     auto evt = parseIRCLine(line);
+                    evt.network = config.name;
+                    evt.timestampMs = resolveTimestamp(evt);
+                    auto replay = replayContext(evt);
+                    if (services.interceptNative(evt, replay.historical, false)) continue;
+                    if (handleReplayBatch(evt, replay) || replayQuarantined(evt)) continue;
+                    if (accumulateReplayMultiline(evt)) continue;
+                    if (replay.historical) { processHistoricalEvent(evt, replay); continue; }
+                    rejectAccountRequired(evt);
                     // Set by a case below to keep this line out of the
                     // generic publish at the bottom of the loop.
 
@@ -8016,21 +8613,7 @@ final class PersistentIRCClient {
 
                         // ── ISUPPORT ──────────────────────────────────────────
                         case "005":
-                            auto params = evt.getParams();
-                            // params[0] = our nick; params[1..n-1] = tokens; params[n-1] = "are supported..."
-                            bool mapChanged = false;
-                            foreach (token; params.length > 1 ? params[1 .. $ - 1] : params[0 .. 0]) {
-                                if (token.length == 0) continue;
-                                immutable auto before = isupportMap.length;
-                                applyIsupport(serverFeatures, isupportMap, token);
-                                if (isupportMap.length != before) mapChanged = true;
-                            }
-                            // After the 005 stream finishes (welcomed =
-                            // true), publish one network_isupport event
-                            // so the frontend's categorised panel can
-                            // render the catalog lookup without having
-                            // to re-parse the raw 005 message stream.
-                if (mapChanged) publishIsupportEvent();
+                            applyIsupportReply(evt);
                             break;
 
                         // ── RPL_WHOISUSER (311): nick user host * :realname ──
@@ -8322,12 +8905,6 @@ final class PersistentIRCClient {
             sendRaw("JOIN " ~ batch);
         if (autoJoin.length > 0) scheduleJoinConfirmSweep();
 
-        // MONITOR is per connection: re-arm the persisted list.
-        if (monitorSupported() && config.monitoredNicks.length)
-            foreach (l; monitorLines("+", config.monitoredNicks, monitorLimit())) {
-                sendRaw(l);
-                logInfo("%s sent (monitor re-armed for %s)", l, config.name);
-            }
 
         // ── Post-registration commands ─────────────────────────────────────
         // NickServ IDENTIFY (if configured) — sent BEFORE user-supplied
@@ -8498,6 +9075,8 @@ private void processEvents() {
             // Services: deadlines, then the dedicated paced write queue.
             services.tick();
             drainServicesQueue();
+            tickHistoryRecovery();
+            if (bncOwnership !is null) bncOwnership.tick(unixMsNow());
 
             yield();
             // Detach pause: while a hot-swap detach is being prepared, spin
@@ -8625,6 +9204,7 @@ private void processEvents() {
     /// "the direct host IP (ip)" for the egress of the current connection,
     /// as the ban and SASL-gate copy names it.
     private string egressVia() {
+        if (activeRoute == "ipv6") return "native IPv6" ~ (activeLocalIp.length ? " (" ~ activeLocalIp ~ ")" : "");
         return activeEgressLabel.length > 0
             ? egressProviderName(activeEgressLabel) ~ " exit " ~ egressDisplay() ~ (activeEgressIp.length ? " (" ~ activeEgressIp ~ ")" : "")
             : "the direct host IP" ~ (activeLocalIp.length ? " (" ~ activeLocalIp ~ ")" : "");
@@ -8671,7 +9251,7 @@ private void processEvents() {
                  "event": "egress_sasl_gate"]);
             // preferredExit is not a hard pin: try another route only when
             // the complete saved provider order permits that alternative.
-            if (hasAlternativeEgressForHost(config.host.toLower(), key, true, config.routing)) {
+            if (hasAllowedAlternative(key, true)) {
                 throttledUntil = 0;
                 emitLog("info", config.host ~ " only admits SASL logins via " ~ egressVia()
                     ~ " — trying a different route.");
@@ -8729,9 +9309,10 @@ private void processEvents() {
         const hostLower = config.host.toLower();
         const unauthenticated = config.sasl == SASLMechanism.none;
         banEgressForHost(config.host, banKey);
+        routingFallbackReason = banKey ~ " [registration ban]: " ~ text;
         logJsonMap("warn", "connection", "Egress host-banned after G/K/Z-line",
             ["network": config.name, "host": config.host, "egress": banKey, "event": "egress_host_ban"]);
-        if (hasAlternativeEgressForHost(hostLower, banKey, unauthenticated, config.routing)) {
+        if (hasAllowedAlternative(banKey, unauthenticated)) {
             throttledUntil = 0;
             emitLog("info", "Banned via " ~ via ~ " — retrying through a different exit.");
             logJsonMap("warn", "connection", "Server BAN detected — failing over to another egress",
@@ -8953,7 +9534,6 @@ private void processEvents() {
         moveKey(channelEarliestMsgid, oldL, newL);
         moveKey(channelLatestTs, oldL, newL);
         moveKey(channelEarliestTs, oldL, newL);
-        moveKey(chathistoryInFlight, oldL, newL);
         moveKey(channelMetadata, oldL, newL);
         if (sicmp(lastFloodNoticeChannel, oldChan) == 0) lastFloodNoticeChannel = newChan;
         // chan\0nick
@@ -9179,40 +9759,75 @@ private void processEvents() {
         processEvent(event);
     }
 
+    /// Resolve message destinations once, using this session's CASEMAPPING
+    /// and tracked query spelling rather than parser guesses or client case.
+    private bool resolveConversation(ref IRCRawEvent event) {
+        if (event.command != "PRIVMSG" && event.command != "NOTICE"
+            && event.command != "REDACT" && event.command != "TAGMSG")
+            return false;
+        event.channel = "";
+        const params = event.getParams();
+        if (params.length == 0 || params[0].length == 0) return true;
+        const target = params[0];
+        if (channelTypes().indexOf(target[0]) >= 0) {
+            event.channel = target;
+            return true;
+        }
+        if (event.nick.length == 0) return true;
+        const outgoing = sessionNick.length > 0 && sameNick(event.nick, sessionNick);
+        string other = outgoing ? target : event.nick;
+        bool tracked;
+        foreach (query; queryBuffers) {
+            if (!sameNick(query, other)) continue;
+            other = query;
+            tracked = true;
+            break;
+        }
+        event.channel = other;
+        if (event.getTag("ctcp").length) return true;
+        if (!tracked) queryBuffers ~= other;
+        // Only ordinary messages update query-follow identity evidence.
+        // TAGMSG without account-tag is not evidence of a logout.
+        if (!outgoing && (event.command == "PRIVMSG" || event.command == "NOTICE")) {
+            const key = foldNick(other);
+            const account = event.getTag("account");
+            if (account.length) queryAccounts[key] = account;
+            else queryAccounts.remove(key);
+            if (event.hostmask.length) queryHosts[key] = event.hostmask;
+        }
+        return true;
+    }
+
     /// Everything `processLine` does after parsing. Also re-entered with
     /// the one message a closed `draft/multiline` batch reassembles.
     private void processEvent(IRCRawEvent event) {
         scope (exit) announceServicesInvalidated();
+        auto replay = replayContext(event);
 
         // Reserved FIBERMLS control packets never reach multiline
         // accumulation, query tracking, buffers, history or logs.
         if (interceptFiberMls(event)) return;
+        if (services.interceptNative(event, replay.historical, lineFromBacklog)) return;
+        if (!replay.historical && !replayQuarantined(event)) rejectAccountRequired(event);
 
         // Services fences, correlated private replies, engine WHOIS/VERSION
         // probes and private own echoes never reach CTCP handling, buffers,
         // history, persistence or bouncers.
         if (services.intercept(event, fiberHistorical(event))) return;
-
-        // Fix DM echo channel: parser sets channel=nick for all non-channel
-        // PRIVMSG/NOTICE (correct for incoming, wrong for our own echo).
-        // When echo-message is negotiated, the server echoes our own
-        // PRIVMSG as `:ourNick!... PRIVMSG target :text`. Parser then
-        // sets channel=ourNick, but the conversation buffer should be
-        // `target` (the recipient). Detect our own nick and rewrite.
-        if ((event.command == "PRIVMSG" || event.command == "NOTICE")
-            && event.nick.length > 0 && sessionNick.length > 0) {
-            import std.uni : icmp;
-            if (icmp(event.nick, sessionNick) == 0) {
-                auto p = event.getParams();
-                if (p.length > 0 && p[0].length > 0
-                    && p[0][0] != '#' && p[0][0] != '&'
-                    && p[0][0] != '+' && p[0][0] != '!') {
-                    // Outgoing DM echo — channel should be the target nick,
-                    // not our own nick.
-                    event.channel = p[0];
-                }
-            }
+        const privateResponse = !inMultilineMerge && bncState().observeResponse(event, replay.historical);
+        if (handleReplayBatch(event, replay)) return;
+        if (privateResponse) return;
+        if (replayQuarantined(event)) return;
+        if (accumulateReplayMultiline(event)) return;
+        if (replay.historical) {
+            processHistoricalEvent(event, replay);
+            return;
         }
+        if (observeMonitorNumeric(event)) return;
+        publishBncPresence(event);
+        if (replay.label.length && !replay.label.startsWith("bnc-")
+            && !replay.label.startsWith("hist-") && !event.getTag("label").length)
+            event.addTag("label", replay.label);
 
         if (event.command == "PING") {
             auto params = event.getParams();
@@ -9260,18 +9875,6 @@ private void processEvents() {
 
         if (handleMetadataLine(event)) return;
 
-        // draft/multiline: member lines are one message, published whole
-        // when `BATCH -ref` closes the batch (see `case "BATCH"`).
-        if (event.command == "PRIVMSG" || event.command == "NOTICE") {
-            if (auto ob = event.getTag("batch") in openBatches) {
-                if (ob.type == "draft/multiline") {
-                    if (ob.lines.length == 0) { ob.first = event; ob.cmd = event.command; }
-                    ob.lines ~= event.text;
-                    ob.concat ~= event.hasTag("draft/multiline-concat");
-                    return;
-                }
-            }
-        }
 
         string[] quitChannels;
         string[] nickChannels;
@@ -9324,7 +9927,8 @@ private void processEvents() {
                         // wire format and takes the per-channel in-flight
                         // slot the BATCH close releases — the hand-rolled
                         // `sendRaw` here did neither.
-                        requestChathistory(chan, "LATEST", "", 100);
+                        beginTargetRecovery(chan);
+                        drainHistoryQueue();
                         // no-implicit-names: the server sends no 353/366
                         // burst for our JOIN unless asked.
                         if (hasCap("no-implicit-names")) sendRaw("NAMES " ~ chan);
@@ -10300,19 +10904,7 @@ private void processEvents() {
                 auto fp = event.getParams();
                 if (fp.length >= 3 && fp[0] == "REDACT" && event.channel.length == 0)
                     event.channel = fp[2]; // FAIL REDACT <code> <target> … → the target buffer
-                // A refused CHATHISTORY never opens a batch, so its in-flight
-                // flag would lock that channel's history until reconnect.
-                if (event.command == "FAIL" && fp.length >= 1 && fp[0] == "CHATHISTORY") {
-                    bool cleared = false;
-                    foreach (param; fp[1 .. $]) {
-                        if (param.toLower in chathistoryInFlight) {
-                            clearChathistoryInFlight(param);
-                            cleared = true;
-                            break;
-                        }
-                    }
-                    if (!cleared) chathistoryInFlight.clear();
-                }
+                if (handleHistoryFailure(event)) return;
                 break;
 
             // ── Message redaction (draft/message-redaction cap) ────────────
@@ -10342,15 +10934,7 @@ private void processEvents() {
 
             // ── ISUPPORT ─────────────────────────────────────────────────────
             case "005":
-                auto params = event.getParams();
-                bool mapChanged = false;
-                foreach (token; params.length > 1 ? params[1 .. $ - 1] : params[0 .. 0]) {
-                    if (token.length == 0) continue;
-                    immutable auto before = isupportMap.length;
-                    applyIsupport(serverFeatures, isupportMap, token);
-                    if (isupportMap.length != before) mapChanged = true;
-                }
-                if (mapChanged) { publishIsupportEvent(); metaDirty = true; }
+                applyIsupportReply(event);
                 break;
 
             // ── CTCP ──────────────────────────────────────────────────────────
@@ -10426,75 +11010,6 @@ private void processEvents() {
                 }
                 break;
 
-            // ── BATCH (chathistory / labeled-response / multiline) ─────────────
-            // The close form carries a SINGLE parameter and arrives as a
-            // trailing on InspIRCd 4 (`:irc.example.org BATCH :-1`). The old
-            // `params.length >= 2` guard skipped it, so the batch never
-            // closed and every later event was tagged `batch=chathistory`.
-            // parseBatchOpen/parseBatchClose own both shapes. Batches are
-            // tracked per reference tag, so nested batches (labeled-response
-            // around chathistory) no longer overwrite each other.
-            case "BATCH": {
-                import ircfiber.irc.parser : parseBatchOpen, parseBatchClose;
-                import std.algorithm : map;
-                import std.array : array;
-                auto params = event.getParams();
-                string batchRef, batchType, batchTarget;
-                if (parseBatchOpen(params, batchRef, batchType, batchTarget)) {
-                    OpenBatch ob;
-                    ob.type = batchType;
-                    ob.target = batchTarget;
-                    ob.label = event.getTag("label");
-                    ob.parent = event.getTag("batch");
-                    openBatches[batchRef] = ob;
-                } else if (parseBatchClose(params, batchRef)) {
-                    auto found = batchRef in openBatches;
-                    if (found is null) return;
-                    auto ob = *found;
-                    openBatches.remove(batchRef);
-                    switch (ob.type) {
-                        case "chathistory":
-                            // Clear in-flight flag so the next CHATHISTORY
-                            // request for the channel can go through.
-                            if (ob.target.length > 0) clearChathistoryInFlight(ob.target);
-                            break;
-                        case "labeled-response":
-                            if (ob.label.length > 0) clearPendingLabel(ob.label);
-                            break;
-                        case "draft/multiline":
-                            if (ob.lines.length == 0) break;
-                            // One message: lines joined by "\n", except where
-                            // a line continues the previous one (concat).
-                            string joined = ob.lines[0];
-                            foreach (i; 1 .. ob.lines.length)
-                                joined ~= (ob.concat[i] ? "" : "\n") ~ ob.lines[i];
-                            auto merged = ob.first;
-                            auto mp = merged.getParams();
-                            if (mp.length > 0) mp[$ - 1] = joined;
-                            merged.paramsJson = Json(mp.map!(s => Json(s)).array).toString();
-                            merged.text = joined;
-                            // The message belongs to whatever batch held the
-                            // multiline batch (a chathistory replay), if any.
-                            merged.addTag("batch", ob.parent);
-                            // labeled-response puts the label on the BATCH line
-                            // when the whole reply is this one batch.
-                            if (ob.label.length && merged.getTag("label").length == 0)
-                                merged.addTag("label", ob.label);
-                            // A control packet split across a multiline
-                            // batch is never a request (no splitting).
-                            {
-                                const outerMerge = inMultilineMerge;
-                                inMultilineMerge = true;
-                                scope (exit) inMultilineMerge = outerMerge;
-                                processEvent(merged);
-                            }
-                            break;
-                        default:
-                            break;
-                    }
-                }
-                return; // Don't publish BATCH events to the UI
-            }
 
             // ── labeled-response ACK: a labeled command with no other reply.
             case "ACK":
@@ -10746,63 +11261,15 @@ private void processEvents() {
                 break;
         }
 
-        // Track private query buffers for both incoming and outgoing DMs.
-        // The old check `channel.length==0` never fired because parser always
-        // sets channel for PRIVMSG. Instead detect DM by target not being a
-        // channel prefix.
-        if (event.getTag("ctcp").length == 0
-            && (event.command == "PRIVMSG" || event.command == "NOTICE")) {
-            auto p = event.getParams();
-            if (p.length > 0 && p[0].length > 0
-                && p[0][0] != '#' && p[0][0] != '&'
-                && p[0][0] != '+' && p[0][0] != '!') {
-                string other;
-                import std.uni : icmp;
-                // Outgoing echo (nick == session nick): the counterparty is
-                // our typed target. Incoming: the sender's nick, which the
-                // server reports in authoritative case.
-                bool outgoing = event.nick.length > 0 && sessionNick.length > 0
-                    && icmp(event.nick, sessionNick) == 0;
-                if (outgoing) {
-                    other = p[0];
-                } else {
-                    other = event.nick;
-                }
-                if (other.length > 0) {
-                    // Casemapping-aware dedup: "nickserv" and "NickServ" are
-                    // the same counterparty (sameNick folds per ISUPPORT
-                    // CASEMAPPING, default rfc1459). Incoming traffic adopts
-                    // the server case so the tracked name — and everything
-                    // derived from it — converges to what is actually on
-                    // IRC; outgoing traffic adopts whatever is tracked.
-                    ptrdiff_t found = -1;
-                    foreach (i, q; queryBuffers) {
-                        if (sameNick(q, other)) { found = i; break; }
-                    }
-                    if (found < 0) {
-                        queryBuffers ~= other;
-                    } else if (!outgoing && queryBuffers[found] != other) {
-                        queryBuffers[found] = other;
-                    }
-                    // Who they are, for `dmFollowsNick`: their latest
-                    // message's account-tag and user@host.
-                    if (!outgoing) {
-                        const key = foldNick(other);
-                        const acct = event.getTag("account");
-                        if (acct.length) queryAccounts[key] = acct;
-                        else queryAccounts.remove(key);
-                        if (event.hostmask.length) queryHosts[key] = event.hostmask;
-                    }
-                }
-            }
-        }
+        // Conversation routing is authoritative for all message commands,
+        // including TAGMSG's non-row typing and reaction events.
 
         // Set channel for channel-scoped events that didn't set it explicitly.
         // For PRIVMSG the channel is params[0] (e.g. "#scroll").  For numeric
         // replies like 404 the target nick is params[0] and the channel is
         // params[1] (e.g. ":server 404 nick #channel :reason").  Walk all
         // params to find the first channel-like value.
-        if (event.channel.length == 0) {
+        if (!resolveConversation(event) && event.channel.length == 0) {
             auto p = event.getParams();
             foreach (param; p) {
                 if (param.length > 0 && (param[0] == '#' || param[0] == '&')) {
@@ -10811,47 +11278,7 @@ private void processEvents() {
                 }
             }
         }
-        // DM fallback: parser no longer sets channel for non-channel PRIVMSG
-        // (see parser.d). Resolve to counterparty here session-aware.
-        if (event.channel.length == 0
-            && (event.command == "PRIVMSG" || event.command == "NOTICE" || event.command == "REDACT")) {
-            auto p = event.getParams();
-            if (p.length > 0 && p[0].length > 0
-                && p[0][0] != '#' && p[0][0] != '&'
-                && p[0][0] != '+' && p[0][0] != '!') {
-                import std.uni : icmp;
-                if (event.nick.length > 0 && sessionNick.length > 0
-                    && icmp(event.nick, sessionNick) == 0) {
-                    // Our echo carries the typed target; resolve to the
-                    // tracked canonical form so a repeat `/msg nickserv`
-                    // reuses the server-case channel instead of forking a
-                    // lowercase twin on the wire.
-                    event.channel = p[0];
-                    foreach (q; queryBuffers) {
-                        if (sameNick(q, p[0])) { event.channel = q; break; }
-                    }
-                } else {
-                    event.channel = event.nick;
-                }
-            }
-        }
 
-        // Batch membership comes from the line's OWN `batch` tag: only a
-        // line inside a chathistory batch is history (a live line that
-        // arrives while a backfill batch is open stays live), and an
-        // unknown ref means unbatched.
-        {
-            const ownBatch = openBatches.get(event.getTag("batch"), OpenBatch.init);
-            if (ownBatch.type == "chathistory") {
-                event.addTag("batch", "chathistory");
-            } else if (ownBatch.type == "labeled-response" && ownBatch.label.length
-                       && event.getTag("label").length == 0) {
-                // labeled-response: the label rides on the BATCH line only;
-                // give it to each reply so correlation below (and the
-                // frontend's labeled FAIL handling) sees it.
-                event.addTag("label", ownBatch.label);
-            }
-        }
 
         // Diagnostics retain the original IRC wire fields, but never touch a
         // query's identity, history cursor, or author metadata.
@@ -11058,9 +11485,8 @@ private void processEvents() {
         announceServicesInvalidated();
     }
 
-    /// A live self ACCOUNT or WHOX row: our login is `account` ("" = none).
-    /// Registry upkeep matches 900/901, but only when the statement changes
-    /// what we hold (a WHOX refresh is not a fresh login).
+    /// Server-observed self ACCOUNT/WHOX/WHOIS or authentic native SUCCESS.
+    /// Registry upkeep matches 900/901 only when the observed login changes.
     private void observeOwnAccount(string account) {
         const next = account.length ? ServicesAccountState.account : ServicesAccountState.none;
         if (next == servicesAccountState && account == servicesAccount) return;
@@ -11279,6 +11705,7 @@ private void processEvents() {
             if (p.label.length) sendLabeledMessage(p.target, p.text, p.label);
             else sendMessage(p.target, p.text);
         } else {
+            if (services.submitManualNative(p.text, p.expectedConnectionEpoch)) return true;
             sendRaw(p.text, true);
         }
         return true;
@@ -11905,6 +12332,11 @@ private void processEvents() {
     private string[] desiredCapList() {
         string[] caps = DESIRED_CAPS_BASE.dup;
         if (config.sasl != SASLMechanism.none) caps ~= DESIRED_CAPS_SASL;
+        if (("draft/chathistory" in capValues) !is null
+            && ("batch" in capValues) !is null
+            && ("server-time" in capValues) !is null
+            && ("message-tags" in capValues) !is null)
+            caps ~= "draft/event-playback";
         return caps;
     }
 
@@ -11932,6 +12364,16 @@ private void processEvents() {
     /// and the ACKs that answer our own late REQs). The caller still
     /// publishes the line so the frontend's cap set follows it live.
     private void handleCapLine(ref IRCRawEvent event, bool registered) {
+        const nativeWasAcked = hasCap("draft/account-registration");
+        const nativeValue = capValues.get("draft/account-registration", "");
+        scope (exit) {
+            Json values = Json.emptyObject;
+            foreach (name, value; capValues) values[name] = Json(value);
+            event.capValuesPayload = values.toString();
+            if (nativeWasAcked != hasCap("draft/account-registration")
+                || nativeValue != capValues.get("draft/account-registration", ""))
+                services.onRegistrationCapabilityChanged();
+        }
         auto params = event.getParams();
         if (params.length < 2) return;
         // params[0] = our nick (or *), params[1] = subcommand
@@ -12000,13 +12442,17 @@ private void processEvents() {
             foreach (cap; capLine.split(" ")) {
                 auto c = cap.strip();
                 if (c.length == 0) continue;
-                if (c[0] == '-') { ackedCaps.remove(c[1 .. $]); continue; }
-                if (!hasCap(c)) newly ~= c;
-                ackedCaps[c] = true;
+                if (c[0] == '-') { ackedCaps.remove(capNameOf(c[1 .. $])); continue; }
+                const name = capNameOf(c);
+                if (!name.length) continue;
+                recordCapValues(c);
+                if (!hasCap(name)) newly ~= name;
+                ackedCaps[name] = true;
             }
             if (registered) {
                 if (newly.canFind("draft/metadata-2")) publishOwnMetadata();
                 if (newly.canFind("draft/read-marker")) reseedReadMarkers();
+                if (newly.canFind("draft/chathistory") || newly.canFind("chathistory")) startHistoryRecovery();
                 if (newly.canFind("sasl") && lateSaslPending) sendRaw("AUTHENTICATE PLAIN");
                 return;
             }
@@ -12264,7 +12710,8 @@ private void processEvents() {
     /// Protocol-critical traffic (PING/PONG, CAP, NICK, registration) must
     /// never be delayed and is written by `sendRaw` directly; it is still
     /// *charged* to the bucket so the model tracks the server's real view.
-    private void enqueuePaced(string line) {
+    private void enqueuePaced(string line, BncCommandOwner owner = BncCommandOwner.init,
+            string epoch = "", string wireLabel = "") {
         if (pacedQueue.length >= MAX_PACED_QUEUE) {
             logJsonMap("warn", "connection",
                 "Paced outbound queue full — dropping line",
@@ -12272,9 +12719,11 @@ private void processEvents() {
                  "networkId": config.id.toString(),
                  "queued": pacedQueue.length.to!string,
                  "event": "flood_queue_full"]);
+            if (owner.request.length)
+                bncState().reject(owner, "TOO_MANY_PENDING", "Too many outstanding labeled requests", wireLabel, epoch);
             return;
         }
-        pacedQueue ~= line;
+        pacedQueue ~= BncPendingWrite(line, owner, epoch, wireLabel);
         // Give the first line a chance to leave immediately rather than
         // waiting for the next 50 ms event-loop tick.
         drainPacedQueue();
@@ -12461,7 +12910,8 @@ private void processEvents() {
         const startedWith = pacedQueue.length;
 
         while (pacedQueue.length > 0) {
-            auto line = pacedQueue[0];
+            const entry = pacedQueue[0];
+            const line = entry.line;
             // The server charges fake lag on the whole command it receives.
             const cmdBytes = line.length + 2;      // + CRLF
             if (floodTrusted && cmdBucket.waitMs(now, trustedRate) > 0) {
@@ -12507,7 +12957,11 @@ private void processEvents() {
 
             pacedQueue = pacedQueue[1 .. $];
             lastPacedWriteMs = now;      // writeRaw charges the bucket
-            try writeRaw(line);
+            try {
+                if (entry.owner.request.length)
+                    bncState().writeOwned(line, entry.owner, now, entry.epoch, entry.wireLabel);
+                else writeRaw(line);
+            }
             catch (Exception e) {
                 logInfo("Paced write failed for %s: %s", config.name, e.msg);
                 return;
@@ -13156,10 +13610,25 @@ private void processEvents() {
     /// Sends a raw IRC line. `fromClient` marks a line a client typed or
     /// sent (the `raw` command), whose WHO replies are published to it.
     void sendRaw(string line, bool fromClient = false) {
+        sendRawAdmitted(line, fromClient);
+    }
+
+    private void sendRawAdmitted(string line, bool fromClient,
+            BncCommandOwner owner = BncCommandOwner.init, string wireLabel = "",
+            string expectedEpoch = "", string[string] clientTags = null) {
+        const owned = owner.request.length != 0;
+        bool attemptedOwnedWrite;
+        scope (exit) if (owned && !attemptedOwnedWrite)
+            bncState().reject(owner, "COMMAND_REJECTED", "Upstream command was rejected", wireLabel, expectedEpoch);
+        if (owned && !preflightBncWrite(owner, wireLabel, expectedEpoch)) {
+            attemptedOwnedWrite = true;
+            return;
+        }
         // Reserved FIBERMLS control never takes the generic paths below
         // (outbound queue across reconnects, optimistic bookkeeping): only a
         // well-formed private QUERY leaves, through its own paced queue.
         if (carriesFiberMls(line)) {
+            if (owned) return;
             submitFiberProbe(line);
             return;
         }
@@ -13197,7 +13666,8 @@ private void processEvents() {
         import std.uni : icmp;
         if (line.length >= 4 && icmp(line[0 .. 4], "LIST") == 0
             && (line.length == 4 || line[4] == ' ')) {
-            beginChannelList(line.length > 5 ? line[5 .. $].strip() : "");
+            // Owned query output is streamed privately, never folded into shared LIST chunks.
+            if (!owned) beginChannelList(line.length > 5 ? line[5 .. $].strip() : "");
         }
         // Remember what we asked to join. Every JOIN — auto-join burst, a
         // sidebar click, /raw, a bouncer client — funnels through here, so
@@ -13209,7 +13679,12 @@ private void processEvents() {
         // Every WHO — the engine's sweep and a client's own — funnels
         // through here too, in the order the server will answer them.
         if (line.length >= 4 && icmp(line[0 .. 4], "WHO ") == 0) {
-            trackWho(line, fromClient);
+            if (!owned) trackWho(line, fromClient);
+        }
+        if (owned) {
+            attemptedOwnedWrite = true;
+            bncState().writeOwned(tagPrefix("", clientTags) ~ line, owner, unixMsNow(), expectedEpoch, wireLabel);
+            return;
         }
         if (state == ConnectionState.disconnected ||
             (state == ConnectionState.connecting && !transportAlive)) {
@@ -13265,12 +13740,25 @@ private void processEvents() {
     ///     — so it is admitted as a unit or not at all.
     ///  4. Otherwise the lines are queued behind the fake-lag pacer.
     private void sendUserMessage(string command, string target, string text,
-                                 string label, string[string] tags = null) {
+                                 string label, string[string] tags = null,
+                                 BncCommandOwner owner = BncCommandOwner.init,
+                                 string wireLabel = "", string expectedEpoch = "") {
+        const owned = owner.request.length != 0;
+        bool attemptedOwnedWrite;
+        scope (exit) if (owned && !attemptedOwnedWrite)
+            bncState().reject(owner, "COMMAND_REJECTED", "Upstream command was rejected", wireLabel, expectedEpoch);
+        if (owned && !preflightBncWrite(owner, wireLabel, expectedEpoch)) {
+            attemptedOwnedWrite = true;
+            return;
+        }
+        if (!target.length) return;
+        foreach (character; target) if (character <= ' ' || character == '\x7f') return;
         // Reserved FIBERMLS discovery is never chat: no split, batch, label,
         // pacer queue or synthetic echo. An untagged PRIVMSG goes through the
         // same validated, per-recipient probe queue as a raw line; anything
         // else carrying the reserved command anywhere is dropped.
         if (carriesFiberMls(text)) {
+            if (owned) return;
             if (command == "PRIVMSG" && tags.length == 0)
                 submitFiberProbe("PRIVMSG " ~ target ~ " :" ~ text);
             return;
@@ -13293,17 +13781,36 @@ private void processEvents() {
             pendingLabels[label] = Clock.currTime.toUnixTime!long * 1000;
 
         const prefix = tagPrefix(labeled ? label : "", tags);
-        if (lines.length > 1 && tryMultilineBatch(command, target, lines, concat, prefix)) {
-            // Batch accepted.
-        } else {
+        const multiline = lines.length > 1
+            ? tryMultilineBatch(command, target, lines, concat, prefix, owner, wireLabel, expectedEpoch)
+            : MultilineAdmission.fallback;
+        if (multiline == MultilineAdmission.rejected) {
+            attemptedOwnedWrite = true;
+            return;
+        }
+        if (multiline == MultilineAdmission.fallback) {
+            string[] childLabels;
+            if (owned) {
+                size_t count;
+                foreach (line; lines) if (line.length) ++count;
+                if (pacedQueue.length + count > MAX_PACED_QUEUE) return;
+                childLabels = new string[count];
+                if (count == 1) childLabels[0] = wireLabel;
+                else foreach (ref childLabel; childLabels) childLabel = "bnc-" ~ randomUUID().toString();
+                if (count > 1 && !bncState().prepareOwnedGroup(owner, wireLabel, childLabels, expectedEpoch, unixMsNow())) {
+                    attemptedOwnedWrite = true;
+                    return;
+                }
+            }
+            size_t child;
             foreach (i, line; lines) {
-                if (line.length == 0) continue;   // no blank bare messages
-                string wire = i == 0
-                    ? prefix ~ command ~ " " ~ target ~ " :" ~ line
-                    : command ~ " " ~ target ~ " :" ~ line;
-                enqueuePaced(wire);
+                if (!line.length) continue;
+                const wire = (i == 0 || owned ? prefix : "") ~ command ~ " " ~ target ~ " :" ~ line;
+                if (owned) enqueuePaced(wire, owner, expectedEpoch, childLabels[child++]);
+                else enqueuePaced(wire);
             }
         }
+        attemptedOwnedWrite = owned;
 
         if (!hasCap("echo-message") && !sensitive) {
             foreach (i, line; lines) {
@@ -13314,29 +13821,30 @@ private void processEvents() {
         }
     }
 
-    /// Writes `lines` as one `draft/multiline` BATCH, or returns false when
-    /// the server's limits (or its current fake lag) do not allow it.
-    /// `prefix` is the `@tags ` prefix for the opening line, or empty.
-    private bool tryMultilineBatch(string command, string target,
-                                   string[] lines, bool[] concat, string prefix) {
+    private enum MultilineAdmission { fallback, sent, rejected }
+
+    /// A refused write is distinct from an unsupported batch: never replay a partial batch.
+    private MultilineAdmission tryMultilineBatch(string command, string target,
+            string[] lines, bool[] concat, string prefix,
+            BncCommandOwner owner = BncCommandOwner.init, string wireLabel = "", string expectedEpoch = "") {
         const ml = multilineLimits();
-        if (!ml.usable()) return false;
-        if (state != ConnectionState.connected) return false;
+        if (!ml.usable()) return MultilineAdmission.fallback;
+        if (state != ConnectionState.connected) return MultilineAdmission.fallback;
 
         // UnrealIRCd also clamps a batch to the channel's +f 'm'/'t' limit.
         int maxLines = ml.maxLines;
         auto floodLim = floodLimitFor(target);
         if (floodLim.valid() && (maxLines == 0 || floodLim.lines < maxLines))
             maxLines = floodLim.lines;
-        if (maxLines > 0 && lines.length > maxLines) return false;
-        if (multilineByteCount(lines, concat) > cast(size_t)ml.maxBytes) return false;
+        if (maxLines > 0 && lines.length > maxLines) return MultilineAdmission.fallback;
+        if (multilineByteCount(lines, concat) > cast(size_t)ml.maxBytes) return MultilineAdmission.fallback;
 
         // Anything already queued must go first, or the paste would arrive
         // out of order.
-        if (pacedQueue.length > 0) return false;
+        if (pacedQueue.length > 0) return MultilineAdmission.fallback;
 
         const now = unixMsNow();
-        if (!pacer.canStartBatch(now)) return false;
+        if (!pacer.canStartBatch(now)) return MultilineAdmission.fallback;
 
         const ref_ = nextBatchRef();
         // The whole batch is one fake-lag lump, so the per-write charge in
@@ -13345,7 +13853,10 @@ private void processEvents() {
         scope (exit) chargeSuppressed = false;
         try {
             auto open = "BATCH +" ~ ref_ ~ " draft/multiline " ~ target;
-            writeRaw(prefix ~ open);
+            if (owner.request.length) {
+                if (!bncState().writeOwned(prefix ~ open, owner, now, expectedEpoch, wireLabel).length)
+                    return MultilineAdmission.rejected;
+            } else writeRaw(prefix ~ open);
             foreach (i, line; lines) {
                 const bool isConcat = i < concat.length && concat[i];
                 auto tags = isConcat
@@ -13356,7 +13867,9 @@ private void processEvents() {
             writeRaw("BATCH -" ~ ref_);
         } catch (Exception e) {
             logInfo("Multiline batch write failed for %s: %s", config.name, e.msg);
-            return false;
+            if (owner.request.length)
+                bncState().reject(owner, "UPSTREAM_UNAVAILABLE", "No connected upstream", wireLabel, expectedEpoch);
+            return MultilineAdmission.rejected;
         }
         // The server charges the whole batch one clamped lump when it closes.
         pacer.chargeBatch(lines, now);
@@ -13370,7 +13883,7 @@ private void processEvents() {
              "bytes":     multilineByteCount(lines, concat).to!string,
              "event":     "multiline_batch_sent"]);
         recordCounter("ircfiber.multiline.batch", 1, ["network": config.name]);
-        return true;
+        return MultilineAdmission.sent;
     }
 
     /// Batch reference tags must be unique per connection.
@@ -13380,7 +13893,15 @@ private void processEvents() {
 
     /// Whether the server advertised MONITOR support (ISUPPORT token).
     bool monitorSupported() {
-        return ("MONITOR" in isupportMap) !is null;
+        auto value = "MONITOR" in isupportMap;
+        if (value is null) return false;
+        if (!value.length) return true;
+        bool positive;
+        foreach (character; *value) {
+            if (character < '0' || character > '9') return false;
+            positive = positive || character != '0';
+        }
+        return positive;
     }
 
     /// ISUPPORT `MONITOR=<n>` — the most targets one list may hold; 0 when
@@ -13525,59 +14046,6 @@ private void processEvents() {
         return channelEarliestMsgid.get(key, "");
     }
 
-    /// Sends a CHATHISTORY request if the cap is negotiated. The server
-    /// will respond with a BATCH wrapping the historical messages, which
-    /// are already persisted via the normal event processor.
-    /// `command` is one of: "LATEST", "BEFORE", "AFTER", "AROUND", "BETWEEN".
-    /// For BEFORE/AFTER/AROUND `refMsgid` must be non-empty.
-    void requestChathistory(string channel, string command, string refMsgid, int limit) {
-        if (!hasChathistoryCap()) return;
-        import ircfiber.irc.chathistory : buildChathistoryLine;
-        import std.uni : toLower;
-        auto key = toLower(channel);
-        // ISUPPORT CHATHISTORY=<n> is the server's per-request maximum.
-        if (auto mx = "CHATHISTORY" in isupportMap) {
-            int cap;
-            try cap = (*mx).to!int; catch (Exception) {}
-            if (cap > 0 && (limit <= 0 || limit > cap)) limit = cap;
-        }
-        // MSGREFTYPES without `msgid`: the server only takes timestamp
-        // selectors, so a cursor we recorded is sent as its server-time.
-        if (auto rt = "MSGREFTYPES" in isupportMap) {
-            if (!(*rt).split(",").canFind("msgid"))
-                refMsgid = msgidRefAsTimestamp(key, refMsgid);
-        }
-        auto line = buildChathistoryLine(command, channel, refMsgid, limit);
-        if (line is null) {
-            logWarn("Invalid CHATHISTORY request: cmd=%s channel=%s refMsgid=%s",
-                command, channel, refMsgid);
-            return;
-        }
-        // Throttle: at most one in-flight request per channel.
-        if (key in chathistoryInFlight) {
-            logInfo("CHATHISTORY %s %s already in flight, skipping", command, channel);
-            return;
-        }
-        chathistoryInFlight[key] = true;
-        sendRaw(line);
-        logInfo("CHATHISTORY %s %s sent (refMsgid=%s, limit=%d)",
-            command, channel, refMsgid.length ? refMsgid : "<none>", limit);
-    }
-
-    /// Clears the in-flight flag for a channel — called when the
-    /// corresponding BATCH ends.
-    void clearChathistoryInFlight(string channel) {
-        if (channel.length == 0) return;
-        import std.uni : toLower;
-        chathistoryInFlight.remove(toLower(channel));
-    }
-
-    /// True if a CHATHISTORY request is currently in flight for the channel.
-    bool isChathistoryInFlight(string channel) const {
-        if (channel.length == 0) return false;
-        import std.uni : toLower;
-        return (toLower(channel) in chathistoryInFlight) !is null;
-    }
 
     /// Sends a JOIN command. Ensures leading `#` so bare names like `testing`
     /// never become a PRIVMSG target (auto-join normalization defense).
@@ -14405,6 +14873,384 @@ version (unittest) version = FiberMlsChecks;
 version (FiberMlsWireHarness) version = FiberMlsChecks;
 
 version (FiberMlsChecks) {
+struct Ircv3Check {
+    string name;
+    bool passed;
+}
+
+/// Exercises the same parser, state transitions and publication channel as
+/// the socket reader. Called explicitly by connection-registration-test.
+Ircv3Check[] ircv3ProtocolChecks(out string[] wire) {
+    import vibe.core.channel : createChannel;
+    Ircv3Check[] results;
+    foreach (command; ["PRIVMSG", "NOTICE", "REDACT", "TAGMSG"]) {
+        foreach (outgoing; [false, true]) {
+            NetworkConfig cfg;
+            cfg.nick = "m[e]";
+            auto ch = createChannel!IRCRawEvent();
+            auto client = new PersistentIRCClient(cfg, ch);
+            client.ackedCaps["echo-message"] = true;
+            client.queryBuffers = ["B[ob]"];
+            const source = outgoing ? "M{E}" : "b{OB}";
+            const target = outgoing ? "b{ob}" : "M{E}";
+            const suffix = command == "TAGMSG" ? "" : " :hello";
+            const line = "@+typing=active;+reply=ref;+draft/react=x :" ~ source
+                ~ "!u@h " ~ command ~ " " ~ target ~ suffix;
+            wire ~= line;
+            client.processLine(line);
+            ch.close();
+            IRCRawEvent event;
+            bool found;
+            while (ch.tryConsumeOne(event)) {
+                if (event.command != command) continue;
+                found = event.channel == "B[ob]";
+            }
+            results ~= Ircv3Check(command ~ (outgoing ? " own echo" : " incoming")
+                ~ " uses the CASEMAPPING-equivalent canonical DM", found);
+        }
+    }
+    foreach (target; ["#chan", "&chan", "+chan", "!chan"]) {
+        NetworkConfig cfg;
+        cfg.nick = "me";
+        auto ch = createChannel!IRCRawEvent();
+        auto client = new PersistentIRCClient(cfg, ch);
+        client.isupportMap["CHANTYPES"] = "#&+!";
+        client.processLine(":bob!u@h TAGMSG " ~ target);
+        ch.close();
+        IRCRawEvent event;
+        bool found;
+        while (ch.tryConsumeOne(event))
+            if (event.command == "TAGMSG") found = event.channel == target;
+        results ~= Ircv3Check("TAGMSG retains channel " ~ target, found);
+    }
+    foreach (line; ["TAGMSG me", ":bob!u@h TAGMSG", ":me!u@h TAGMSG :"]) {
+        NetworkConfig cfg;
+        cfg.nick = "me";
+        auto ch = createChannel!IRCRawEvent();
+        auto client = new PersistentIRCClient(cfg, ch);
+        client.processLine(line);
+        ch.close();
+        IRCRawEvent event;
+        bool empty = client.queryBuffers.length == 0;
+        while (ch.tryConsumeOne(event))
+            if (event.command == "TAGMSG") empty = empty && event.channel.length == 0;
+        results ~= Ircv3Check("incomplete TAGMSG creates no phantom query: " ~ line, empty);
+    }
+    {
+        import vibe.data.json : parseJsonString;
+        NetworkConfig cfg;
+        cfg.nick = "me";
+        auto ch = createChannel!IRCRawEvent();
+        auto client = new PersistentIRCClient(cfg, ch);
+        client.metaDirty = false;
+        foreach (line; [
+            ":s 005 * NETWORK=Example NICKLEN=30 FOO=bar",
+            ":s 005 me NICKLEN=42",
+            ":s 005 me -FOO",
+            ":s 005 me NICKLEN=42 NETWORK=Example :custom server prose",
+            ":s 005 me NICKLEN=42 :",
+            ":s 005 me -NICKLEN",
+            ":s 005 me -NICKLEN",
+            ":s 005 me =bad BAD-KEY=x :ignored",
+        ]) {
+            wire ~= line;
+            client.processLine(line);
+        }
+        ch.close();
+        IRCRawEvent[] published;
+        IRCRawEvent event;
+        while (ch.tryConsumeOne(event))
+            if (event.command == "ISUPPORT") published ~= event;
+        results ~= Ircv3Check("005 publishes exactly the four effective changes", published.length == 4);
+        if (published.length == 4) {
+            const first = parseJsonString(published[0].text);
+            const replacement = parseJsonString(published[1].text);
+            const withdrawal = parseJsonString(published[2].text);
+            const reset = parseJsonString(published[3].text);
+            results ~= Ircv3Check("trailerless 005 retains its final real token",
+                first["FOO"].get!string == "bar" && first["NICKLEN"].get!string == "30");
+            results ~= Ircv3Check("same-size replacement publishes the complete updated map",
+                replacement["NICKLEN"].get!string == "42" && replacement["FOO"].get!string == "bar");
+            results ~= Ircv3Check("withdrawal publishes the full map without the removed token",
+                withdrawal["FOO"].type == Json.Type.undefined && withdrawal["NETWORK"].get!string == "Example");
+            results ~= Ircv3Check("withdrawn legacy value resets to its default",
+                reset["NICKLEN"].type == Json.Type.undefined && client.serverFeatures.maxNickLen == ServerFeatures.init.maxNickLen);
+        }
+        results ~= Ircv3Check("effective ISUPPORT changes dirty the session snapshot", client.metaDirty);
+    }
+    {
+        ServerFeatures features;
+        string[string] support;
+        bool valid = true;
+        foreach (token; ["network=Example", "prefix=(ov)@+", "chanmodes=b,k,l,im",
+                         "nicklen=42", "topiclen=300", "chanlimit=#:20"])
+            valid = applyIsupport(features, support, token) && valid;
+        valid = valid && features.network == "Example" && features.maxNickLen == 42
+            && features.topicLen == 300 && features.maxChannels == 20;
+        valid = !applyIsupport(features, support, "NICKLEN=42") && valid;
+        valid = applyIsupport(features, support, "NICKLEN=invalid") && valid;
+        valid = valid && features.maxNickLen == 42;
+        foreach (key; ["NETWORK", "PREFIX", "CHANMODES", "NICKLEN", "TOPICLEN", "CHANLIMIT"])
+            valid = applyIsupport(features, support, "-" ~ key) && valid;
+        valid = valid && features == ServerFeatures.init && support.length == 0;
+        foreach (token; ["", "-", "=bad", "-FOO=bar", "BAD KEY=x", "BAD-KEY=x", "-NETWORK"])
+            valid = !applyIsupport(features, support, token) && valid;
+        results ~= Ircv3Check("normalized legacy values, invalid numbers and effective withdrawals", valid);
+    }
+    {
+        NetworkConfig cfg;
+        cfg.nick = "me";
+        auto ch = createChannel!IRCRawEvent();
+        auto client = new PersistentIRCClient(cfg, ch);
+        const pronouns = "  they/them <b>verbatim</b>  ";
+        client.processLine(":s METADATA alice pronouns * :" ~ pronouns);
+        client.processLine(":s METADATA alice color * :#80a0ff");
+        results ~= Ircv3Check("user metadata caches verbatim pronouns and valid color",
+            client.userMetadata.get("alice", null).get("pronouns", "") == pronouns
+            && client.userMetadata.get("alice", null).get("color", "") == "#80a0ff");
+        client.processLine(":s METADATA alice pronouns * :she/they");
+        client.processLine(":s METADATA alice color * :#ABCDEF");
+        results ~= Ircv3Check("user metadata replacements replace both prior values",
+            client.userMetadata.get("alice", null).get("pronouns", "") == "she/they"
+            && client.userMetadata.get("alice", null).get("color", "") == "#ABCDEF");
+        client.processLine(":s METADATA alice pronouns * :unsafe\x7fvalue");
+        client.processLine(":s METADATA alice color * :#12345g");
+        results ~= Ircv3Check("invalid incoming replacements cannot leave renderable profile values",
+            "alice" !in client.userMetadata);
+        client.processLine(":s METADATA alice pronouns * :" ~ pronouns);
+        client.processLine(":s METADATA alice color * :#80a0ff");
+        client.processLine(":alice!u@h NICK bob");
+        results ~= Ircv3Check("NICK moves pronouns and color without retaining the old identity",
+            "alice" !in client.userMetadata
+            && client.userMetadata.get("bob", null).get("pronouns", "") == pronouns
+            && client.userMetadata.get("bob", null).get("color", "") == "#80a0ff");
+        client.processLine(":s METADATA bob pronouns * :");
+        client.processLine(":s METADATA bob color *");
+        results ~= Ircv3Check("empty and valueless metadata remove the profile keys",
+            "bob" !in client.userMetadata);
+        client.processLine(":s METADATA bob pronouns * :they/them");
+        client.processLine(":s METADATA bob color * :#80a0ff");
+        client.processLine(":bob!u@h QUIT :bye");
+        results ~= Ircv3Check("QUIT removes both user profile values", "bob" !in client.userMetadata);
+        client.processLine(":s METADATA #profile pronouns * :they/them");
+        client.processLine(":s METADATA #profile color * :#80a0ff");
+        results ~= Ircv3Check("pronouns and color remain invalid channel metadata",
+            "#profile" !in client.channelMetadata);
+        ch.close();
+        IRCRawEvent event;
+        while (ch.tryConsumeOne(event)) {}
+    }
+    {
+        import ircfiber.engine.session_snapshot : HistoryCursor, HistoryRecovery;
+        NetworkConfig cfg;
+        cfg.nick = "me";
+        auto ch = createChannel!IRCRawEvent();
+        auto client = new PersistentIRCClient(cfg, ch);
+        client.connectionEpoch = "history-check";
+        client.ackedCaps["draft/chathistory"] = true;
+        client.ackedCaps["batch"] = true;
+        client.processLine(":me!u@h JOIN #present");
+        client.processLine(":alice!u@h JOIN #present");
+        client.channelTopics["#present"] = "current";
+        client.userMetadata["alice"]["pronouns"] = "current";
+        client.historyPages = null;
+        client.historyAutomaticQueue = null;
+        client.outboundQueue = null;
+        IRCRawEvent event;
+        while (ch.tryConsumeOne(event, Duration.zero)) {}
+        client.processLine("BATCH +outer labeled-response");
+        client.processLine("@batch=outer BATCH +history chathistory #past");
+        foreach (line; [":me!u@h JOIN #past", ":alice!u@h NICK old",
+                       ":alice!u@h QUIT :gone", ":alice!u@h TOPIC #present :old",
+                       ":s METADATA alice pronouns * :old", ":me!u@h PART #present"]) {
+            client.processLine("@batch=history " ~ line);
+        }
+        client.processLine("@batch=history BATCH +multi draft/multiline #past");
+        client.processLine("@batch=multi :me!u@h PRIVMSG me :first");
+        client.processLine("@batch=multi :me!u@h PRIVMSG me :second");
+        client.processLine("BATCH -multi");
+        client.processLine("@batch=history;+typing=active :alice!u@h TAGMSG me");
+        client.processLine(":live!u@h PRIVMSG me :live");
+        client.processLine("BATCH -history");
+        client.processLine("BATCH -outer");
+        IRCRawEvent[] rows;
+        while (ch.tryConsumeOne(event, Duration.zero)) rows ~= event;
+        size_t historicalRows, liveRows, mergedRows;
+        bool targetCorrect = true;
+        foreach (row; rows) {
+            if (row.getTag("batch") == "chathistory") {
+                ++historicalRows;
+                targetCorrect = targetCorrect && row.channel == "#past";
+                if (row.command == "PRIVMSG" && row.text == "first\nsecond") ++mergedRows;
+            } else if (row.command == "PRIVMSG" && row.channel == "live") ++liveRows;
+        }
+        results ~= Ircv3Check("nested replay preserves historical own/state rows and assembles multiline once",
+            historicalRows == 7 && mergedRows == 1 && targetCorrect && liveRows == 1);
+        results ~= Ircv3Check("historical identity, membership, metadata and topic cannot mutate current state",
+            client.sessionNick == "me" && "#past" !in client.channelState
+            && "#present" in client.channelState && client.channelUsers["#present"].length == 2
+            && client.channelTopics["#present"] == "current"
+            && client.userMetadata["alice"]["pronouns"] == "current"
+            && !client.queryBuffers.canFind("old") && client.outboundQueue.length == 0);
+        client.processLine("@batch=missing :alice!u@h PRIVMSG me :not live");
+        client.processLine("BATCH +missing chathistory #past");
+        client.processLine("@batch=missing :alice!u@h NICK forged");
+        results ~= Ircv3Check("unknown and reused batch references stay quarantined",
+            !ch.tryConsumeOne(event, Duration.zero) && client.sessionNick == "me");
+        client.processLine("BATCH -missing");
+        ch.close();
+    }
+    {
+        import ircfiber.engine.session_snapshot : HistoryCursor, HistoryRecovery;
+        NetworkConfig cfg;
+        cfg.nick = "me";
+        auto ch = createChannel!IRCRawEvent();
+        auto client = new PersistentIRCClient(cfg, ch);
+        client.connectionEpoch = "pages-check";
+        client.ackedCaps["draft/chathistory"] = true;
+        client.isupportMap["CHATHISTORY"] = "20";
+        client.isupportMap["MSGREFTYPES"] = "msgid,timestamp";
+        HistoryRecovery coverage;
+        coverage.target = "#gap";
+        coverage.lowerBound = HistoryCursor("old", 1_700_000_000_000, true);
+        coverage.state = "complete";
+        client.historyRecovery["#gap"] = coverage;
+        client.beginTargetRecovery("#gap");
+        client.drainHistoryQueue();
+        const firstId = client.historyPages.keys[0];
+        client.processLine("BATCH +p chathistory #gap");
+        client.processLine("@batch=p;time=2023-11-14T22:13:40.000Z;msgid=z :a!u@h PRIVMSG #gap :one");
+        client.processLine("@batch=p;time=2023-11-14T22:13:40.000Z;msgid=a :a!u@h PRIVMSG #gap :two");
+        client.processLine("BATCH -p");
+        results ~= Ircv3Check("short nonempty history page awaits ordered storage checkpoint",
+            client.historyPages[firstId].awaitingCommit && client.outboundQueue.length == 1
+            && client.historyPages[firstId].proposed.state == "recovering");
+        client.confirmHistoryPage(firstId, true);
+        results ~= Ircv3Check("committed page continues BEFORE first opaque msgid across timestamp ties",
+            client.outboundQueue.length == 2
+            && client.outboundQueue[$ - 1] == "CHATHISTORY BEFORE #gap msgid=z 20"
+            && client.historyRecovery["#gap"].lowerBound.msgid == "old");
+        const secondId = client.historyPages.keys[0];
+        client.processLine("@draft/chathistory-end BATCH +p2 chathistory #gap");
+        client.processLine("@batch=p2;time=2023-11-14T22:13:00.000Z;msgid=older :a!u@h PRIVMSG #gap :older");
+        client.processLine("BATCH -p2");
+        client.failHistoryStorage(secondId, client.connectionEpoch);
+        client.confirmHistoryPage(secondId, false);
+        results ~= Ircv3Check("failed row storage cannot commit newer coverage",
+            client.historyRecovery["#gap"].lowerBound.msgid == "old"
+            && client.historyRecovery["#gap"].state == "stalled"
+            && client.historyPages.length == 0);
+        IRCRawEvent event;
+        while (ch.tryConsumeOne(event, Duration.zero)) {}
+        ch.close();
+    }
+    foreach (failure; ["INVALID_PARAMS", "INVALID_MSGID", "MSGID_EXPIRED"]) {
+        import ircfiber.engine.session_snapshot : HistoryCursor, HistoryRecovery;
+        NetworkConfig cfg;
+        cfg.nick = "me";
+        auto ch = createChannel!IRCRawEvent();
+        auto client = new PersistentIRCClient(cfg, ch);
+        client.connectionEpoch = "expired-reference-check";
+        client.ackedCaps["draft/chathistory"] = true;
+        client.isupportMap["MSGREFTYPES"] = "msgid,timestamp";
+        HistoryRecovery recovery;
+        recovery.target = "#gap";
+        recovery.lowerBound = HistoryCursor("covered", 1_700_000_000_000, true);
+        recovery.nextBefore = HistoryCursor("expired", 1_700_000_020_000, true);
+        recovery.state = "recovering";
+        client.historyRecovery["#gap"] = recovery;
+        client.queueAutomaticHistory("#gap", "BEFORE", "msgid=expired");
+        client.drainHistoryQueue();
+        client.processLine(":s FAIL CHATHISTORY " ~ failure ~ " #gap :Reference is no longer available");
+        results ~= Ircv3Check(failure ~ " retries the retained boundary using timestamp overlap",
+            client.outboundQueue.length == 2
+            && client.outboundQueue[$ - 1].startsWith("CHATHISTORY BEFORE #gap timestamp=")
+            && client.historyRecovery["#gap"].timestampFallback
+            && client.historyRecovery["#gap"].lowerBound.msgid == "covered"
+            && client.historyPages.length == 1);
+        IRCRawEvent event;
+        while (ch.tryConsumeOne(event, Duration.zero)) {}
+        ch.close();
+    }
+    {
+        import ircfiber.engine.session_snapshot : HistoryCursor, HistoryRecovery;
+        NetworkConfig cfg;
+        cfg.nick = "me";
+        auto ch = createChannel!IRCRawEvent();
+        auto client = new PersistentIRCClient(cfg, ch);
+        client.connectionEpoch = "timestamp-check";
+        client.ackedCaps["draft/chathistory"] = true;
+        client.isupportMap["CHATHISTORY"] = "3";
+        client.isupportMap["MSGREFTYPES"] = "timestamp";
+        HistoryRecovery coverage;
+        coverage.target = "#ties";
+        coverage.lowerBound = HistoryCursor("", 1_699_999_980_000, true);
+        coverage.state = "complete";
+        client.historyRecovery["#ties"] = coverage;
+        client.beginTargetRecovery("#ties");
+        client.drainHistoryQueue();
+        const id = client.historyPages.keys[0];
+        client.processLine("BATCH +t chathistory #ties");
+        client.processLine("@batch=t;time=2023-11-14T22:13:20.000Z :a!u@h PRIVMSG #ties :tie one");
+        client.processLine("@batch=t;time=2023-11-14T22:13:20.000Z :a!u@h PRIVMSG #ties :tie two");
+        client.processLine("@batch=t;time=2023-11-14T22:13:21.000Z :a!u@h PRIVMSG #ties :newer");
+        client.processLine("BATCH -t");
+        client.confirmHistoryPage(id, true);
+        results ~= Ircv3Check("timestamp-only mixed pages overlap the boundary group toward newer time",
+            client.outboundQueue[$ - 1] == "CHATHISTORY BEFORE #ties timestamp=2023-11-14T22:13:21.000Z 3");
+        client.processLine("BATCH +repeat chathistory #ties");
+        foreach (_; 0 .. 3)
+            client.processLine("@batch=repeat;time=2023-11-14T22:13:20.000Z :a!u@h PRIVMSG #ties :clipped tie");
+        client.processLine("BATCH -repeat");
+        results ~= Ircv3Check("clipped timestamp boundary remains stalled instead of skipping retained ties",
+            client.historyRecovery["#ties"].state == "stalled"
+            && client.historyRecovery["#ties"].reasonCode == "timestamp_boundary"
+            && client.historyRecovery["#ties"].lowerBound.timestampMs == coverage.lowerBound.timestampMs);
+        auto snapshot = client.snapshotSession();
+        auto next = new PersistentIRCClient(cfg, ch);
+        next.connectionEpoch = "adopted-check";
+        next.ackedCaps["draft/chathistory"] = true;
+        next.restoreHistoryState(snapshot);
+        results ~= Ircv3Check("holder adoption retains scheduled retry for a closed stalled page",
+            ("#ties" in next.historyRetryAt) !is null);
+        next.historyRecovery["*targets"] = HistoryRecovery.init;
+        next.historyRecovery["*targets"].target = "*targets";
+        next.historyRecovery["*targets"].state = "stalled";
+        next.historyRecovery["*targets"].discoveryUpperBoundMs = 1_700_000_010_000;
+        next.historyRetryAt["*targets"] = 0;
+        next.tickHistoryRecovery();
+        results ~= Ircv3Check("discovery retry reconstructs bounded TARGETS rather than invalid channel history",
+            next.outboundQueue.length == 1 && next.outboundQueue[0].startsWith("CHATHISTORY TARGETS timestamp="));
+        IRCRawEvent event;
+        while (ch.tryConsumeOne(event, Duration.zero)) {}
+        ch.close();
+    }
+    {
+        NetworkConfig cfg;
+        cfg.nick = "me";
+        auto ch = createChannel!IRCRawEvent();
+        auto old = new PersistentIRCClient(cfg, ch);
+        old.processLine("BATCH +history chathistory #past");
+        old.processLine("@batch=history BATCH +partial draft/multiline #past");
+        old.processLine("@batch=partial :me!u@h PRIVMSG me :before handoff");
+        auto snapshot = old.snapshotSession(true);
+        auto next = new PersistentIRCClient(cfg, ch);
+        next.connectionEpoch = "reader-two";
+        next.restoreHistoryState(snapshot);
+        next.processLine("@batch=partial :me!u@h PRIVMSG me :after handoff");
+        next.processLine("BATCH -partial");
+        next.processLine("BATCH -history");
+        IRCRawEvent event;
+        IRCRawEvent[] rows;
+        while (ch.tryConsumeOne(event, Duration.zero)) rows ~= event;
+        results ~= Ircv3Check("retained ancestry and partial multiline assemble one historical own message after handoff",
+            rows.length == 1 && rows[0].text == "before handoff\nafter handoff"
+            && rows[0].channel == "#past" && rows[0].getTag("batch") == "chathistory");
+        ch.close();
+    }
+    return results;
+}
+
 
 /// One named outbound-discovery check. Shared by the module unittest and
 /// the `connection-registration-test` harness (built with the
@@ -15044,9 +15890,8 @@ unittest {
     auto acct = run([":a!u@h ACCOUNT acct", ":a!u@h ACCOUNT *"]);
     assert(("a" in acct[0].getAccounts()) is null);
 
-    // A live line whose batch is unknown is not history, even while a
-    // chathistory batch is open.
-    auto hist = run(["BATCH +x chathistory #c", "@batch=y :s PRIVMSG #c :live",
+    // Unbatched live traffic stays live while a history batch is open.
+    auto hist = run(["BATCH +x chathistory #c", ":s PRIVMSG #c :live",
                      "@batch=x :s PRIVMSG #c :old", "BATCH -x"]);
     auto msgs = hist[1].filter!(e => e.command == "PRIVMSG").array;
     assert(msgs.length == 2);
@@ -15240,9 +16085,6 @@ unittest {
         drain(t);
     }
 
-    // ISUPPORT removal tokens drop the key.
-    auto isup = run([":s 005 me MONITOR=100 WHOX :are supported", ":s 005 me -WHOX :are supported"]);
-    assert(("WHOX" in isup[0].getIsupport()) is null && isup[0].getIsupport()["MONITOR"] == "100");
 }
 
 @("inbound framing sanitizes whole lines, so a UTF-8 char split across reads survives")
@@ -15536,7 +16378,7 @@ ServicesWireCheck[] servicesTransportWireChecks(out string[] wire) {
         events.any!(e => e.command == "NOTICE" && e.nick == "NickServ" && e.text == "Unsolicited reminder"));
     check("a manual line to the service during the transaction is refused, not queued",
         !got.any!(l => l.canFind("hunter2")) && !c.outboundQueue.any!(l => l.canFind("hunter2"))
-        && !c.pacedQueue.any!(l => l.canFind("hunter2")));
+        && !c.pacedQueue.any!(entry => entry.line.canFind("hunter2")));
     check("nothing services-related went through the reconnect or paced queues",
         c.outboundQueue.length == 0 && c.pacedQueue.length == 0);
 
@@ -15645,7 +16487,7 @@ ServicesWireCheck[] servicesLegacyMetaChecks() {
     scope (exit) cleanup();
     bool wired(string needle) { return got.any!(l => l.canFind(needle)); }
     bool queued(string needle) {
-        return c.outboundQueue.any!(l => l.canFind(needle)) || c.pacedQueue.any!(l => l.canFind(needle));
+        return c.outboundQueue.any!(line => line.canFind(needle)) || c.pacedQueue.any!(entry => entry.line.canFind(needle));
     }
 
     c.connection = connectTCP("127.0.0.1", listener.bindAddress.port);

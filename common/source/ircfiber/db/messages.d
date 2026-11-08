@@ -18,6 +18,26 @@ import ircfiber.models.network : normalizeChannelName;
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.storage.buffer : sanitizeUtf8;
 
+/// Exact references follow Mongo's (t, eid, _id) order, never opaque msgid order.
+/// A non-exact zero timestamp is unbounded.
+struct HistoryBoundary {
+    long timestampMs;
+    long eid;
+    string storageId;
+    string msgid;
+    bool exact;
+    bool hasEid;
+}
+
+int compareHistoryBoundaries(const ref HistoryBoundary a, const ref HistoryBoundary b) {
+    if (a.timestampMs != b.timestampMs) return a.timestampMs < b.timestampMs ? -1 : 1;
+    if (!a.exact || !b.exact) return 0;
+    if (a.hasEid != b.hasEid) return a.hasEid ? 1 : -1;
+    if (a.hasEid && a.eid != b.eid) return a.eid < b.eid ? -1 : 1;
+    import std.string : cmp;
+    return cmp(a.storageId, b.storageId);
+}
+
 /// Days a `messages` row stays in Mongo before the TTL monitor deletes it.
 /// Read once per process by `MessageRepository.ensureIndexes`.
 enum MESSAGE_RETENTION_DAYS_DEFAULT = 30;
@@ -83,7 +103,7 @@ final class MessageRepository {
     /// CHAT_PAYLOAD_RE widened for IRCv3 `draft/event-playback` clients:
     /// channel events replay alongside the chat rows.
     private static immutable string EVENT_PAYLOAD_RE =
-        `"c"\s*:\s*"(PRIVMSG|NOTICE|REDACT|TAGMSG|JOIN|PART|QUIT|KICK|MODE|NICK|TOPIC)"`;
+        `"c"\s*:\s*"(PRIVMSG|NOTICE|REDACT|TAGMSG|JOIN|PART|QUIT|KICK|MODE|NICK|TOPIC|ACCOUNT|CHGHOST|SETNAME|METADATA|RENAME|AWAY)"`;
 
     private static void applyNoiseExclusion(ref Bson filter, string channel) {
         if (channel == "_server")
@@ -123,6 +143,7 @@ final class MessageRepository {
         try {
             // Primary compound index: pagination by timestamp
             collection.createIndex(indexKeys(["networkId", "channel", "-t", "serverId"]));
+            collection.createIndex(indexKeys(["networkId", "channel", "-t", "-eid", "-_id", "serverId"]));
             // eid index: the network-wide replay (`getAfterEidForNetwork`) walks
             // eid in order and stops at its limit; eid cursor lookups are one key.
             collection.createIndex(indexKeys(["networkId", "-eid", "channel", "serverId"]));
@@ -506,85 +527,127 @@ final class MessageRepository {
         return readPayloads(filter, count);
     }
 
-    /**
-     * IRCv3 CHATHISTORY-style window query (used by the bouncer).
-     *
-     * Returns up to `count` chat rows with `afterTs < t < beforeTs`
-     * (either bound 0 = unbounded), taken from the newest end of the
-     * window (`fromNewest`, for LATEST/BEFORE) or the oldest end (AFTER).
-     * Always oldest-first. Only PRIVMSG/NOTICE/REDACT rows count towards
-     * `count`, plus TAGMSG/JOIN/PART/QUIT/KICK/MODE/NICK/TOPIC when
-     * `events` (draft/event-playback) is set (the `phase` filter is still
-     * the caller's job).
-     */
+    /// Exclusive bounds; selected rows are always returned in ascending storage order.
     Json[] getWindow(string serverId, string networkId, string channel,
-                     long afterTs, long beforeTs, int count, bool fromNewest, bool events = false) @trusted {
-        channel = normalizeChannel(channel);
-        if (count <= 0) count = 50;
-        if (count > 1000) count = 1000;
+                     HistoryBoundary after, HistoryBoundary before, int count,
+                     bool fromNewest, bool events = false) @trusted {
+        return historyWindow(serverId, networkId, channel, after, before, count, fromNewest, events);
+    }
 
+    private static Bson boundaryFilter(HistoryBoundary boundary, bool after, bool inclusive = false) {
+        const op = after ? "$gt" : "$lt";
+        const edgeOp = inclusive ? (after ? "$gte" : "$lte") : op;
+        if (!boundary.exact)
+            return Bson(["t": Bson([edgeOp: Bson(boundary.timestampMs)])]);
+        Bson[] alternatives = [Bson(["t": Bson([op: Bson(boundary.timestampMs)])])];
+        if (boundary.hasEid) {
+            if (!after)
+                alternatives ~= Bson(["t": Bson(boundary.timestampMs), "eid": Bson(["$exists": Bson(false)])]);
+            alternatives ~= Bson(["t": Bson(boundary.timestampMs), "eid": Bson([op: Bson(boundary.eid)])]);
+        } else if (after) {
+            alternatives ~= Bson(["t": Bson(boundary.timestampMs), "eid": Bson(["$exists": Bson(true)])]);
+        }
+        auto same = Bson(["t": Bson(boundary.timestampMs),
+            "eid": boundary.hasEid ? Bson(boundary.eid) : Bson(["$exists": Bson(false)]),
+            "_id": Bson([edgeOp: Bson(boundary.storageId)])]);
+        alternatives ~= same;
+        return Bson(["$or": Bson(alternatives)]);
+    }
+
+    private Json[] historyWindow(string serverId, string networkId, string channel,
+            HistoryBoundary after, HistoryBoundary before, int count, bool fromNewest,
+            bool events, bool includeAfter = false) @trusted {
+        if (count <= 0) return [];
+        count = min(count, 1000);
+        channel = normalizeChannel(channel);
         Bson filter = serverId.length > 0
             ? Bson(["serverId": Bson(serverId), "networkId": Bson(networkId), "channel": Bson(channel)])
             : Bson(["networkId": Bson(networkId), "channel": Bson(channel)]);
-        if (afterTs > 0 || beforeTs > 0) {
-            Bson range = Bson.emptyObject;
-            if (afterTs > 0) range["$gt"] = Bson(afterTs);
-            if (beforeTs > 0) range["$lt"] = Bson(beforeTs);
-            filter["t"] = range;
-        }
-        // `$regex` operator form: a bare BsonRegex value in a top-level
-        // filter field matched nothing through vibe.d 0.10.3 in practice.
+        Bson[] bounds;
+        if (after.exact || after.timestampMs != 0) bounds ~= boundaryFilter(after, true, includeAfter);
+        if (before.exact || before.timestampMs != 0) bounds ~= boundaryFilter(before, false);
+        if (bounds.length) filter["$and"] = Bson(bounds);
         filter["payload"] = Bson(["$regex": Bson(events ? EVENT_PAYLOAD_RE : CHAT_PAYLOAD_RE)]);
-        if (fromNewest) return readPayloads(filter, count);
-
         FindOptions options;
-        options.sort = Bson(["t": Bson(1)]);
+        auto order = Bson.emptyObject;
+        foreach (key; ["t", "eid", "_id"]) order[key] = Bson(fromNewest ? -1 : 1);
+        options.sort = order;
         options.limit = cast(long) count;
-        Json[] out_;
+        Json[] rows;
         foreach (doc; collection.find(filter, options)) {
-            const p = doc["payload"];
-            if (p.type != Bson.Type.string) continue;
-            try out_ ~= parseJsonString(p.get!string);
+            if (doc["payload"].type != Bson.Type.string) continue;
+            try rows ~= parseJsonString(doc["payload"].get!string);
             catch (Exception e) logWarn("Failed to parse stored message payload: %s", e.msg);
         }
-        return out_;
+        if (fromNewest) rows.reverse;
+        return rows;
     }
 
-    /// Timestamp (unix ms) of the row with `eid` in a network, or 0 when
-    /// unknown. Backs the bouncer's missed-message filter, which needs the
-    /// cursor's timestamp to tell backfill copies of already-seen rows
-    /// (old `t`, safe to skip) from genuinely missed rows.
-    long timestampOfEid(string serverId, string networkId, long eid) @trusted {
-        if (serverId.length == 0 || eid <= 0) return 0;
-        auto doc = collection.findOne(Bson([
-            "serverId": Bson(serverId),
-            "networkId": Bson(networkId),
-            "eid": Bson(eid)
-        ]));
-        return doc.isNull ? 0 : readBsonTimestamp(doc["t"]);
+    /// Include the selected exact row once, between strict older/newer halves.
+    Json[] getAround(string serverId, string networkId, string channel,
+            HistoryBoundary center, int count, bool events = false) @trusted {
+        if (count <= 0) return [];
+        const half = count / 2;
+        return historyWindow(serverId, networkId, channel, HistoryBoundary.init, center, half, true, events)
+            ~ historyWindow(serverId, networkId, channel, center, HistoryBoundary.init,
+                count - half, false, events, true);
     }
 
-    /// Timestamp (unix ms) of the row with `msgid` in a buffer, or 0 when unknown.
-    long timestampOfMsgid(string serverId, string networkId, string channel, string msgid) @trusted {
+
+    /// False is an unknown reference, never an unbounded window.
+    bool boundaryOfMsgid(string serverId, string networkId, string channel, string msgid,
+            out HistoryBoundary boundary) @trusted {
         channel = normalizeChannel(channel);
         Bson filter = serverId.length > 0
             ? Bson(["serverId": Bson(serverId), "networkId": Bson(networkId), "channel": Bson(channel), "msgid": Bson(msgid)])
             : Bson(["networkId": Bson(networkId), "channel": Bson(channel), "msgid": Bson(msgid)]);
-        auto doc = collection.findOne(filter);
-        return doc.isNull ? 0 : readBsonTimestamp(doc["t"]);
+        FindOptions options;
+        options.sort = indexKeys(["t", "eid", "_id"]);
+        options.limit = 1;
+        Bson doc;
+        foreach (candidate; collection.find(filter, options)) { doc = candidate; break; }
+        if (doc.isNull) return false;
+        boundary.timestampMs = readBsonTimestamp(doc["t"]);
+        boundary.hasEid = doc["eid"].type == Bson.Type.long_ || doc["eid"].type == Bson.Type.int_;
+        boundary.eid = readBsonTimestamp(doc["eid"]);
+        boundary.storageId = doc["_id"].get!string;
+        boundary.msgid = msgid;
+        boundary.exact = true;
+        return true;
     }
 
-    /// Timestamp (unix ms) of the newest chat row of a buffer inside
-    /// `afterTs < t < beforeTs` (0 = unbounded), or 0 when there is none.
-    /// Backs CHATHISTORY TARGETS.
+    /// Filter the actual latest retained chat row, not the latest within the interval.
     long latestTimestamp(string serverId, string networkId, string channel,
                          long afterTs, long beforeTs) @trusted {
-        auto rows = getWindow(serverId, networkId, channel, afterTs, beforeTs, 1, true);
+        auto rows = getWindow(serverId, networkId, channel, HistoryBoundary.init, HistoryBoundary.init, 1, true);
         foreach (ev; rows) {
             if (ev.type != Json.Type.object) continue;
-            if (auto t = "t" in ev) if (t.type == Json.Type.int_) return t.get!long;
+            if (auto t = "t" in ev) if (t.type == Json.Type.int_) {
+                const ts = t.get!long;
+                return (afterTs == 0 || ts > afterTs) && (beforeTs == 0 || ts < beforeTs) ? ts : 0;
+            }
         }
         return 0;
+    }
+
+    /// Previously delivered identities among a reconnect page; timestamps are not identity.
+    bool[string] deliveredHistoryKeys(string serverId, string networkId, Json[] rows, long throughEid) @trusted {
+        Bson[] identities;
+        foreach (row; rows) {
+            if (row["m"].type != Json.Type.string || !row["m"].get!string.length) continue;
+            if (row["ch"].type != Json.Type.string) continue;
+            identities ~= Bson(["channel": Bson(normalizeChannel(row["ch"].get!string)),
+                "msgid": Bson(row["m"].get!string)]);
+        }
+        bool[string] keys;
+        if (!identities.length) return keys;
+        auto filter = Bson(["serverId": Bson(serverId), "networkId": Bson(networkId),
+            "eid": Bson(["$lte": Bson(throughEid)]), "$or": Bson(identities)]);
+        foreach (doc; collection.find(filter)) {
+            if (doc["msgid"].type == Bson.Type.string && doc["channel"].type == Bson.Type.string)
+                keys[doc["channel"].get!string ~ "\0m" ~ doc["msgid"].get!string] = true;
+        }
+        return keys;
     }
 
     /// Fetch older messages using a timestamp cursor (fallback when

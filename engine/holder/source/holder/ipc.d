@@ -18,6 +18,7 @@ import vibe.core.stream : IOMode;
 import vibe.data.json : Json, parseJsonString;
 import ircfiber.async : safeFiberRun;
 import ircfiber.logging : logJsonMap;
+import ircfiber.irc.ipv6 : ipv6InRoutedPrefix;
 import holder.dial : DialFailed, DialOutcome, dialUpstream, unixMsNow;
 import holder.held : Held;
 import holder.protocol;
@@ -143,6 +144,8 @@ struct HolderConfig {
     size_t detachBufferBytes;
     long detachMaxSecs;
     long closedRetainSecs;
+    /// Provider-owned, strictly validated /64. Empty disables source binds.
+    string routedIpv6Prefix;
 
     /// Over TCP the token is mandatory; over unix it is enforced when set.
     @property bool tokenRequired() const { return !addr.isUnix; }
@@ -170,7 +173,16 @@ HolderConfig configFromEnv() {
     c.detachBufferBytes = cast(size_t) envLong(ENV_DETACH_BUFFER_BYTES, DETACH_BUFFER_BYTES);
     c.detachMaxSecs = envLong(ENV_DETACH_MAX_SECS, DETACH_MAX_SECS);
     c.closedRetainSecs = envLong(ENV_CLOSED_RETAIN_SECS, CLOSED_RETAIN_SECS);
+    c.routedIpv6Prefix = environment.get("IRCFIBER_IPV6_PREFIX", "");
     return c;
+}
+
+/// Run only after authenticating DIAL. This applies to source-bound requests
+/// of either family mode; "any" must not be an escape from pool ownership.
+void validateSourcePool(const ref DialRequest req, string routedPrefix) {
+    req.validateTransport();
+    if (req.bindIp6.length && !ipv6InRoutedPrefix(routedPrefix, req.bindIp6))
+        throw new Exception("DIAL: IPv6 source is outside the configured routed pool");
 }
 
 // ── Server ──────────────────────────────────────────────────────────────────
@@ -248,6 +260,7 @@ final class HolderServer {
         auto j = Json.emptyObject;
         j["proto"] = PROTO_VERSION;
         j["serverId"] = cfg.serverId;
+        j["dialFamilies"] = Json([Json("any"), Json("ipv6")]);
         j["holder"] = cfg.buildShort;
         j["pid"] = cast(long) thisProcessID;
         j["uptimeMs"] = unixMsNow() - startedAtMs;
@@ -425,7 +438,10 @@ final class HolderServer {
     private void dial(ref TCPConnection c, Json payload) {
         if (auto code = tokenError(payload)) { writeLine(c, errLine(code, "bad token")); return; }
         DialRequest req;
-        try req = DialRequest.fromJson(payload);
+        try {
+            req = DialRequest.fromJson(payload);
+            validateSourcePool(req, cfg.routedIpv6Prefix);
+        }
         catch (Exception e) { writeLine(c, errLine(ERR_BAD_REQUEST, e.msg)); return; }
 
         auto fields = ["network": req.tag.name, "networkId": req.tag.networkId,

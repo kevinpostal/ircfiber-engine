@@ -1,7 +1,7 @@
 /**
- * Real-socket regression harness for `dialUpstream`'s direct per-address
- * fallback (dub: `dub run :holder --config=dial-fallback-test` from
- * `engine/engine`).
+ * Real-socket regression harness for direct per-address fallback, strict
+ * native IPv6 and authenticated source-pool enforcement (dub:
+ * `dub run :holder --config=dial-fallback-test` from `engine/engine`).
  *
  * One TLS hostname resolves (through the real resolver cache) to `::1`
  * then `127.0.0.1` on one port; loopback listeners play the upstream ircd
@@ -29,9 +29,12 @@ import vibe.core.net : TCPConnection, TCPListener, WaitForDataStatus, connectTCP
 import vibe.core.stream : IOMode;
 import vibe.stream.operations : readLine;
 import vibe.stream.tls : TLSContext, TLSContextKind, TLSStream, createTLSContext, createTLSStream;
+import vibe.data.json : Json, parseJsonString;
+import holder.ipc : HolderConfig, HolderServer, connectHolderAddr, parseHolderAddr;
+import ircfiber.holder_client : HolderClient, ClientDialRequest = DialRequest, DialFailedException;
 import holder.dial : DialFailed, DialOutcome, ResolvedAddr, createTLSStreamWithTimeout, dialUpstream,
     seedResolvedAddresses;
-import holder.protocol : DialRequest, EventLine;
+import holder.protocol : DialRequest, EventLine, ConnectedLine, parseFirstLine;
 
 private enum HOST = "fallback.harness.test";
 private enum BLOCKED_HOST = "blocked.harness.test";
@@ -457,6 +460,295 @@ private void caseDestinationPolicy() {
     check(v6.accepts == 0 && v4.accepts == 0, "no address dialed");
 }
 
+/// The same physical listeners used by the dual-stack cases must never see
+/// an IPv4 accept from a native attempt, including protocol failures.
+private void caseNativeFailure(Upstream behavior, string tls, long timeoutMs = 1_000) {
+    begin("IPv6-only " ~ tls ~ " " ~ behavior.to!string ~ ": no IPv4 fallback");
+    auto v6 = new Endpoint("::1", behavior), v4 = new Endpoint("127.0.0.1", Upstream.tls);
+    const port = bindPair(v6, v4);
+    scope (exit) stopPair(v6, v4);
+    seedBothFamilies(HOST);
+    auto req = request(HOST, port, tls, timeoutMs, "::1");
+    req.addressFamily = "ipv6";
+    req.starttlsTimeoutMs = timeoutMs;
+    int ticks;
+    bool ticking = true;
+    runTask(() nothrow {
+        while (ticking) {
+            try sleep(50.msecs); catch (Exception) { return; }
+            ticks++;
+        }
+    });
+    scope (exit) ticking = false;
+    const start = MonoTime.currTime;
+    DialFailed failed;
+    try {
+        auto o = dialUpstream(req, null);
+        check(false, "native failure unexpectedly returned " ~ o.peerIp);
+        closeOutcome(o);
+    } catch (DialFailed e) failed = e;
+    const expectedPhase = tls == "starttls" && behavior == Upstream.silent ? "starttls" : "tls";
+    check(failed !is null && failed.phase == expectedPhase, "native protocol failure is terminal");
+    check((MonoTime.currTime - start).total!"msecs" < 6_000, "native failure remains bounded");
+    sleep(300.msecs);
+    check(v6.accepts == 1, "one IPv6 socket was tried");
+    check(v4.accepts == 0, "healthy IPv4 listener received ZERO accepts");
+    if (behavior == Upstream.silent || behavior == Upstream.plaintext)
+        check(v6.clientClosed, "failed IPv6 socket closed");
+    if (behavior == Upstream.silent)
+        check(ticks >= 15, "scheduler progresses during the native protocol deadline");
+}
+
+private void caseNativeTcpFailure() {
+    begin("IPv6-only TCP refusal: healthy IPv4 listener is never tried");
+    auto v6 = new Endpoint("::1", Upstream.silent), v4 = new Endpoint("127.0.0.1", Upstream.tls);
+    const port = bindPair(v6, v4);
+    scope (exit) stopPair(v6, v4);
+    v6.listener.stopListening();
+    v6.listener = TCPListener.init;
+    seedBothFamilies(HOST);
+    auto req = request(HOST, port, "implicit", 1_000, "::1");
+    req.addressFamily = "ipv6";
+    DialFailed failed;
+    try {
+        auto o = dialUpstream(req, null);
+        check(false, "native TCP refusal unexpectedly returned " ~ o.peerIp);
+        closeOutcome(o);
+    } catch (DialFailed e) failed = e;
+    check(failed !is null && failed.phase == "tcp", "native TCP refusal stays a failed dial");
+    sleep(300.msecs);
+    check(v4.accepts == 0, "TCP refusal produced ZERO IPv4 accepts");
+}
+
+private void caseNativeSuccess() {
+    begin("IPv6-only TLS: original SNI, actual source, no IPv4 socket");
+    auto v6 = new Endpoint("::1", Upstream.tls), v4 = new Endpoint("127.0.0.1", Upstream.tls);
+    const port = bindPair(v6, v4);
+    scope (exit) stopPair(v6, v4);
+    seedBothFamilies(HOST);
+    auto req = request(HOST, port, "implicit", 5_000, "::1");
+    req.addressFamily = "ipv6";
+    auto o = dialUpstream(req, null);
+    scope (exit) closeOutcome(o);
+    check(o.peerIp == "::1" && o.localIp == "::1", "observed native peer and bound source are IPv6");
+    check(v6.sni == [HOST], "native TLS preserves the original SNI");
+    roundTrip(o, v6);
+    sleep(300.msecs);
+    check(v6.accepts == 1 && v4.accepts == 0, "only the IPv6 listener accepted");
+}
+
+private void caseNativeAOnly() {
+    begin("IPv6-only A-only DNS: no_ipv6_destination, zero TCP accepts");
+    auto v6 = new Endpoint("::1", Upstream.tls), v4 = new Endpoint("127.0.0.1", Upstream.tls);
+    const port = bindPair(v6, v4);
+    scope (exit) stopPair(v6, v4);
+    seedResolvedAddresses(HOST, [ResolvedAddr("127.0.0.1", AddressFamily.INET)]);
+    auto req = request(HOST, port, "implicit", 5_000, "::1");
+    req.addressFamily = "ipv6";
+    DialFailed failed;
+    try {
+        auto o = dialUpstream(req, null);
+        check(false, "A-only destination unexpectedly connected");
+        closeOutcome(o);
+    } catch (DialFailed e) failed = e;
+    check(failed !is null && failed.phase == "no_ipv6_destination", "A-only native dial has an explicit phase");
+    sleep(300.msecs);
+    check(v6.accepts == 0 && v4.accepts == 0, "A-only native dial opened zero sockets");
+    // A public IPv4 literal is also removed, without ever contacting it.
+    req.host = "192.0.2.1";
+    failed = null;
+    try {
+        auto o = dialUpstream(req, null);
+        check(false, "IPv4 literal unexpectedly connected");
+        closeOutcome(o);
+    } catch (DialFailed e) failed = e;
+    check(failed !is null && (failed.phase == "no_ipv6_destination" || failed.phase == "blocked"),
+        "IPv4 literal is refused before TCP (destination protection may reject documentation space)");
+}
+
+/// Exercises the actual authenticated IPC boundary, not only a helper.
+/// No production loopback exception is added: successful loopback source
+/// fixtures above call dialUpstream directly inside HolderDialHarness.
+private void caseSourcePoolBoundary(string dir) {
+    begin("authenticated IPC: strict family, native/proxy and source-pool boundaries");
+    auto v6 = new Endpoint("::1", Upstream.tls), v4 = new Endpoint("127.0.0.1", Upstream.tls);
+    const port = bindPair(v6, v4);
+    scope (exit) stopPair(v6, v4);
+    seedBothFamilies(HOST);
+    seedBothFamilies(BLOCKED_HOST);
+    HolderConfig cfg;
+    cfg.serverId = "dial-harness";
+    cfg.token = "fixture-only-token";
+    cfg.addrText = "unix://" ~ buildPath(dir, "holder.sock");
+    cfg.addr = parseHolderAddr(cfg.addrText);
+    cfg.closedRetainSecs = 60;
+    cfg.detachMaxSecs = 60;
+    cfg.detachBufferBytes = 64 * 1024;
+    auto server = new HolderServer(cfg);
+    server.start();
+    scope (exit) { server.quitAll(); server.stop(); }
+    check(server.statusJson()["dialFamilies"] == Json([Json("any"), Json("ipv6")]), "STATUS advertises both dial families");
+
+    string exchange(Json payload) {
+        auto c = connectHolderAddr(cfg.addr.toNetworkAddress(true), 3.seconds);
+        scope (exit) c.close();
+        send(c, "DIAL " ~ payload.toString() ~ "\n");
+        foreach (_; 0 .. 10) {
+            if (c.waitForDataEx(3.seconds) != WaitForDataStatus.dataAvailable)
+                throw new Exception("IPC DIAL response timed out");
+            auto line = cast(string) readLine(c, 1024 * 1024, "\n").idup;
+            if (line.length >= 6 && line[0 .. 6] == "EVENT ") continue;
+            return line;
+        }
+        throw new Exception("too many IPC events");
+    }
+    void rejected(Json payload, string label, string code = "bad_request") {
+        const line = exchange(payload);
+        check(line.length > 4 && line[0 .. 4] == "ERR ", label ~ ": expected ERR, got " ~ line);
+        if (line.length > 4 && line[0 .. 4] == "ERR ")
+            check(parseJsonString(line[4 .. $])["code"].get!string == code, label ~ ": rejection code");
+    }
+    auto req = request(HOST, port, "implicit", 1_000, "::1");
+    req.addressFamily = "ipv6";
+    req.token = cfg.token;
+    auto payload = req.toJson();
+    rejected(payload, "unconfigured source pool");
+    server.cfg.routedIpv6Prefix = "2001:db8:1234:5678::/64";
+    rejected(payload, "loopback is not a production pool exception");
+    payload["bindIp6"] = "2001:db8:1234:5679:a516:4466:5544:123";
+    rejected(payload, "out-of-prefix native source");
+    payload["addressFamily"] = "any";
+    rejected(payload, "any mode cannot bypass source-pool ownership");
+    payload["addressFamily"] = "unknown";
+    rejected(payload, "unknown family");
+    payload["addressFamily"] = Json(null);
+    rejected(payload, "non-string family");
+    payload["addressFamily"] = "ipv6";
+    payload["bindIp6"] = "";
+    rejected(payload, "native without source");
+    payload["bindIp6"] = "2001:db8:1234:5678:a516:4466:5544:123";
+    auto proxy = Json.emptyObject;
+    proxy["host"] = "127.0.0.1";
+    proxy["port"] = cast(int) port;
+    payload["proxy"] = proxy;
+    rejected(payload, "native with proxy");
+    payload["proxy"] = Json(null);
+    payload["token"] = "wrong";
+    rejected(payload, "authentication precedes dial validation", "auth");
+    payload["token"] = cfg.token;
+    payload["host"] = BLOCKED_HOST;
+    auto response = exchange(payload);
+    check(response.length > 7 && response[0 .. 7] == "FAILED ", "in-pool source passes IPC validation");
+    if (response.length > 7 && response[0 .. 7] == "FAILED ")
+        check(parseJsonString(response[7 .. $])["phase"].get!string == "blocked",
+            "public destination guard still runs before native filtering");
+    sleep(300.msecs);
+    check(v6.accepts == 0 && v4.accepts == 0, "all boundary negatives opened ZERO upstream sockets");
+}
+
+/// A real IPC peer with the pre-capability STATUS shape. Its any-family DIAL
+/// uses physical upstream sockets; the shared client's native guard must stop
+/// before opening a DIAL channel to a holder that cannot constrain the family.
+private void caseOldHolderCapability() {
+    begin("old holder: native DIAL count zero, any still carries an upstream round trip");
+    auto v6 = new Endpoint("::1", Upstream.tls), v4 = new Endpoint("127.0.0.1", Upstream.tls);
+    const port = bindPair(v6, v4);
+    scope (exit) stopPair(v6, v4);
+    seedResolvedAddresses(HOST, [ResolvedAddr("127.0.0.1", AddressFamily.INET)]);
+    int dialCommands, statusCommands;
+    TCPConnection[] controls;
+    string[] fixtureErrors;
+    auto oldStatus = Json.emptyObject;
+    oldStatus["proto"] = 1;
+    oldStatus["serverId"] = "old-holder-fixture";
+    oldStatus["holder"] = "pre-dialFamilies-fixture";
+    // Deliberately no dialFamilies, just like a retained old holder.
+    void serveOldHolder(TCPConnection c) {
+        scope (exit) c.close();
+        string verb;
+        Json payload;
+        parseFirstLine(cast(string) readLine(c, 1024 * 1024, "\n").idup, verb, payload);
+        if (verb == "HELLO") {
+            check(payload["serverId"].get!string == "old-holder-fixture", "old-holder HELLO identity");
+            controls ~= c;
+            send(c, "OK " ~ oldStatus.toString() ~ "\n");
+            while (true) {
+                string line;
+                try line = cast(string) readLine(c, 1024 * 1024, "\n").idup;
+                catch (Exception) { return; } // fixture teardown closes control
+                parseFirstLine(line, verb, payload);
+                if (verb != "STATUS") throw new Exception("unexpected old-holder control " ~ verb);
+                statusCommands++;
+                send(c, "OK " ~ oldStatus.toString() ~ "\n");
+            }
+        }
+        if (verb != "DIAL") throw new Exception("unexpected old-holder first line " ~ verb);
+        dialCommands++;
+        // Old holders did not read addressFamily; simulate that wire behavior.
+        payload["addressFamily"] = "any";
+        auto req = DialRequest.fromJson(payload);
+        auto o = dialUpstream(req, null);
+        scope (exit) closeOutcome(o);
+        auto connected = ConnectedLine("old-c-1", o.peerIp, o.localIp, o.peerPort, o.localPort, 1, o.tlsInfo);
+        send(c, "CONNECTED " ~ connected.toJson().toString() ~ "\n");
+        const line = cast(string) readLine(c).idup;
+        o.tls.write(cast(const(ubyte)[]) (line ~ "\r\n"));
+        o.tls.flush();
+        send(c, cast(string) readLine(o.tls).idup ~ "\r\n");
+    }
+    auto listener = listenTCP(0, (TCPConnection c) @trusted nothrow {
+        try serveOldHolder(c);
+        catch (Exception e) {
+            try fixtureErrors ~= e.msg; catch (Exception) {}
+        }
+    }, "127.0.0.1");
+    void closeFixture() {
+        listener.stopListening();
+        foreach (c; controls) {
+            try { c.close(); } catch (Exception) {}
+        }
+    }
+    scope (exit) closeFixture();
+    auto client = new HolderClient("old-holder-fixture",
+        "tcp://127.0.0.1:" ~ listener.bindAddress.port.to!string, "fixture-only-token");
+    client.connectControl();
+    const status = client.status();
+    check(status.supportsFamily("any") && !status.supportsFamily("ipv6"),
+        "missing capability preserves any only");
+    ClientDialRequest nativeReq;
+    nativeReq.host = HOST;
+    nativeReq.port = port;
+    nativeReq.tls = "implicit";
+    nativeReq.sni = HOST;
+    nativeReq.addressFamily = "ipv6";
+    nativeReq.bindIp6 = "2001:db8:1234:5678:a516:4466:5544:123";
+    DialFailedException rejected;
+    try {
+        auto unexpected = client.dial(nativeReq, null);
+        unexpected.stream.close();
+        check(false, "shared client must refuse native transport through old holder");
+    } catch (DialFailedException e) rejected = e;
+    check(rejected !is null && rejected.phase == "holder", "native rejected at holder capability gate");
+    sleep(300.msecs);
+    check(statusCommands >= 2, "native request performs a fresh STATUS capability check");
+    check(dialCommands == 0, "old holder received ZERO native DIAL commands");
+    check(v6.accepts == 0 && v4.accepts == 0, "capability failure opened ZERO upstream sockets");
+
+    auto anyReq = nativeReq;
+    anyReq.addressFamily = "any";
+    anyReq.bindIp6 = "";
+    auto result = client.dial(anyReq, null);
+    scope (exit) result.stream.close();
+    check(result.peerIp == "127.0.0.1", "old holder any request reaches physical IPv4 upstream");
+    send(result.stream, "PING :old-holder-any\r\n");
+    check(cast(string) readLine(result.stream).idup == ":127.0.0.1 PONG PING :old-holder-any",
+        "any mode carries a real upstream application round trip");
+    check(dialCommands == 1 && v4.accepts == 1 && v6.accepts == 0,
+        "one permitted any DIAL and one physical IPv4 accept");
+    check(v4.sni == [HOST], "old-holder any transport retains SNI");
+    check(fixtureErrors.length == 0, "old-holder IPC fixture completed without errors");
+}
+
 int main() {
     string why;
     if (!ipv6LoopbackAvailable(why)) {
@@ -486,6 +778,16 @@ int main() {
             casePlainTcpUnchanged();
             caseStarttlsFallback();
             caseDestinationPolicy();
+            caseNativeSuccess();
+            caseNativeFailure(Upstream.closesBeforeTls, "implicit");
+            caseNativeFailure(Upstream.silent, "implicit");
+            caseNativeFailure(Upstream.plaintext, "implicit");
+            caseNativeFailure(Upstream.starttlsThenCloses, "starttls");
+            caseNativeFailure(Upstream.silent, "starttls");
+            caseNativeTcpFailure();
+            caseNativeAOnly();
+            caseSourcePoolBoundary(dir);
+            caseOldHolderCapability();
         } catch (Throwable t) {
             try gFailures ~= gCase ~ ": unexpected " ~ t.toString(); catch (Throwable) {}
         }

@@ -378,6 +378,9 @@ void putServiceCapability(ref Json capabilities, ServiceAction action, string st
         "service_checked is only valid for channel and BotServ actions");
     if (capabilities.type != Json.Type.object) capabilities = Json.emptyObject;
     capabilities[action.to!string] = serviceCapability(state, reasonCode);
+    if (action == ServiceAction.accountRegister || action == ServiceAction.accountConfirm)
+        capabilities[action.to!string]["registration"] = Json(["protocol": Json("nickserv"),
+            "beforeConnect": Json(false), "customAccountName": Json(false), "emailRequired": Json(false)]);
 }
 
 /// A validated request parameter as text: strings as sent, booleans

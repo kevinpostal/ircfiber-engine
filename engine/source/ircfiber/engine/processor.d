@@ -10,6 +10,132 @@ import ircfiber.models.network : Network;
 import ircfiber.engine.bootstrap : EngineContext;
 import ircfiber.engine.state : writeStateSnapshotForNetwork;
 import ircfiber.redis.protocol : RedisKeys, StateTTL;
+import ircfiber.engine.session_snapshot : HistoryRecovery, historyRecoveryFromJSON,
+    historyRecoveryToJSON;
+import ircfiber.irc.mls_peer : normalizeFiberChannel;
+import vibe.data.json : Json, parseJsonString;
+
+private struct HistoryCheckpoint {
+    string requestId;
+    string connectionEpoch;
+    string target;
+    HistoryRecovery recovery;
+}
+
+private HistoryCheckpoint parseHistoryCheckpoint(string text) {
+    auto j = parseJsonString(text);
+    if (j.type != Json.Type.object || j["requestId"].type != Json.Type.string
+            || !j["requestId"].get!string.length
+            || j["connectionEpoch"].type != Json.Type.string
+            || !j["connectionEpoch"].get!string.length
+            || j["target"].type != Json.Type.string)
+        throw new Exception("Invalid history checkpoint envelope");
+    HistoryCheckpoint checkpoint;
+    checkpoint.requestId = j["requestId"].get!string;
+    checkpoint.connectionEpoch = j["connectionEpoch"].get!string;
+    checkpoint.target = j["target"].get!string;
+    checkpoint.recovery = historyRecoveryFromJSON(j["recovery"]);
+    if (checkpoint.recovery.target != checkpoint.target)
+        throw new Exception("History checkpoint target mismatch");
+    return checkpoint;
+}
+
+private string historyStorageKey(string networkId, string requestId, string epoch) {
+    return networkId ~ "\0" ~ epoch ~ "\0" ~ requestId;
+}
+
+private string historyCheckpointField(string target, string[string] isupport) {
+    if (target.length == 0 || target == "*targets") return "*targets";
+    string mapping = "rfc1459";
+    if (auto value = "CASEMAPPING" in isupport) mapping = *value;
+    return normalizeFiberChannel(target, mapping);
+}
+
+private bool isHistorical(ref const IRCRawEvent event) {
+    return event.getTag("batch") == "chathistory";
+}
+
+/// Runs in the same ordered drain as the page rows, before assigning an eid.
+/// Redis scrollback/dedup is authoritative; asynchronous Mongo is unchanged.
+private void consumeHistoryCheckpoint(ref EngineContext ctx, ref IRCRawEvent event,
+        ref bool[string] failedStorage) {
+    auto checkpoint = parseHistoryCheckpoint(event.text);
+    const failureKey = historyStorageKey(event.networkId, checkpoint.requestId, checkpoint.connectionEpoch);
+    auto nid = parseUUID(event.networkId[]);
+    auto client = ctx.connManager.getClient(nid);
+    if (client is null || client.getConnectionEpoch() != checkpoint.connectionEpoch
+            || !client.ownsHistoryRequest(checkpoint.requestId, checkpoint.connectionEpoch)) {
+        failedStorage.remove(failureKey);
+        return;
+    }
+    bool committed;
+    try {
+        import ircfiber.irc.dial_guard : ownsNetworkForDial;
+        const serverId = ctx.localServer.serverId;
+        auto row = ctx.networkRepo.findByIdWithUser(nid);
+        const owner = ctx.connManager.getOwnerId(nid);
+        if (owner.length && owner == row.userId.toString() && row.config.id == nid
+                && !row.config.disabled && !row.config.servicesProvisioningPending
+                && ownsNetworkForDial(ctx.redis, serverId, event.networkId)
+                && failureKey !in failedStorage
+                && ctx.connManager.getClient(nid) is client
+                && client.ownsHistoryRequest(checkpoint.requestId, checkpoint.connectionEpoch)) {
+            const field = historyCheckpointField(checkpoint.target, client.getIsupport());
+            // Fence the write itself, not just the preceding yielding lookups.
+            auto result = ctx.redis.getDb().eval!string(
+                "if redis.call('HGET',KEYS[1],ARGV[1]) ~= ARGV[2] or redis.call('EXISTS',KEYS[2]) ~= 0 then return '0' end "
+                ~ "redis.call('HSET',KEYS[3],ARGV[3],ARGV[4]); return '1'",
+                [RedisKeys.networkAssignments(), RedisKeys.routingMove(event.networkId),
+                    RedisKeys.historyRecovery(event.networkId)],
+                [event.networkId, serverId, field, historyRecoveryToJSON(checkpoint.recovery).toString()]);
+            committed = !result.empty && result.front == "1";
+        }
+    } catch (Exception e) {
+        logWarn("History checkpoint storage failed for %s: %s", event.networkId, e.msg);
+    }
+    failedStorage.remove(failureKey);
+    // A replacement client must never acknowledge its predecessor's page.
+    if (ctx.connManager.getClient(nid) is client
+            && client.ownsHistoryRequest(checkpoint.requestId, checkpoint.connectionEpoch))
+        ctx.connManager.confirmHistoryPage(nid, checkpoint.requestId, committed);
+}
+
+private void noteHistoryStorageFailure(ref EngineContext ctx, ref IRCRawEvent event,
+        ref bool[string] failedStorage) {
+    const requestId = event.getTag("history_request");
+    const epoch = event.getTag("history_epoch");
+    if (!requestId.length || !epoch.length) return;
+    failedStorage[historyStorageKey(event.networkId, requestId, epoch)] = true;
+    if (auto client = ctx.connManager.getClient(parseUUID(event.networkId[])))
+        client.failHistoryStorage(requestId, epoch);
+}
+
+private void noteAcceptedLiveHistory(ref EngineContext ctx, ref IRCRawEvent event) {
+    if (isHistorical(event)) return;
+    if (auto client = ctx.connManager.getClient(parseUUID(event.networkId[])))
+        client.noteAcceptedLiveHistory(event);
+}
+
+/// Private BNC envelopes never acquire an eid, enter storage, or touch the
+/// resumable user stream. The network's canonical owner selects the channel.
+private void publishPrivateBncEvent(ref EngineContext ctx, ref IRCRawEvent event) {
+    const response = event.command == "BNC_RESPONSE";
+    const raw = response ? event.bncResponsePayload : event.bncPresencePayload;
+    if (!raw.length || isHistorical(event)) return;
+    auto payload = parseJsonString(raw);
+    if (payload.type != Json.Type.object || payload["nid"].type != Json.Type.string
+            || payload["nid"].get!string != event.networkId) return;
+    const owner = ctx.connManager.getOwnerId(parseUUID(event.networkId[]));
+    if (!owner.length) return;
+    payload["type"] = response ? "bnc_response" : "bnc_presence";
+    // Fence publication as well as admission against an assignment move.
+    auto publication = ctx.redis.getDb().eval!string(
+        "if redis.call('HGET',KEYS[1],ARGV[1]) ~= ARGV[2] or redis.call('EXISTS',KEYS[2]) ~= 0 then return '0' end "
+        ~ "redis.call('PUBLISH',KEYS[3],ARGV[3]); return '1'",
+        [RedisKeys.networkAssignments(), RedisKeys.routingMove(event.networkId), RedisKeys.events(owner)],
+        [event.networkId, ctx.localServer.serverId, payload.toString()]);
+    if (publication.empty || publication.front != "1") return;
+}
 
 /// IRC server-log phase events that are purely transient connection-state
 /// (TCP open, TLS handshake, registration steps). They never appear in
@@ -52,6 +178,7 @@ private bool isTransientServerLogPhase(ref IRCRawEvent event) nothrow @safe {
  */
 void startEventProcessor(ref EngineContext ctx) {
     auto serverId = ctx.localServer.serverId;
+    bool[string] failedHistoryStorage;
 
     while (true) {
         bool processedAny = false;
@@ -62,8 +189,10 @@ void startEventProcessor(ref EngineContext ctx) {
         // operations can be batched by the client and the WebSocket
         // gateway receives the burst as a contiguous stream.
         foreach (batch; 0 .. 50) {
+            IRCRawEvent event;
+            bool storageResolved;
             try {
-                IRCRawEvent event;
+                storageResolved = false;
                 if (!ctx.eventChannel.tryConsumeOne(event)) break;
                 processedAny = true;
 
@@ -80,9 +209,20 @@ void startEventProcessor(ref EngineContext ctx) {
                     continue;
                 }
 
+                if (event.command == "HISTORY_CHECKPOINT") {
+                    consumeHistoryCheckpoint(ctx, event, failedHistoryStorage);
+                    continue;
+                }
+                if (event.command == "BNC_RESPONSE" || event.command == "BNC_PRESENCE") {
+                    storageResolved = true;
+                    publishPrivateBncEvent(ctx, event);
+                    continue;
+                }
+                const historical = isHistorical(event);
+
                 // Internal identity changes refresh proof immediately, without
                 // exposing a synthetic chat event or spending a history eid.
-                if (event.command == "own_prefix") {
+                if (!historical && event.command == "own_prefix") {
                     foreach (net; ctx.connManager.getNetworks()) {
                         if (net.config.id.toString() != event.networkId) continue;
                         writeStateSnapshotForNetwork(ctx, net, serverId);
@@ -94,7 +234,7 @@ void startEventProcessor(ref EngineContext ctx) {
                 // IRCCloud-style: assign a global sequential eid to every
                 // event. This is the primary key for pagination, dedup,
                 // and stream resume — always present, never missing.
-                event.eid = ctx.redis.incr(RedisKeys.globalEid());
+                event.eid = ctx.redis.getDb().incr(RedisKeys.globalEid());
                 logDebug("Engine event [server=%s]: %s %s (eid=%d)", serverId, event.network, event.command, event.eid);
 
                 // Publish-only events: assigned an eid and published live,
@@ -128,7 +268,7 @@ void startEventProcessor(ref EngineContext ctx) {
                 // under it, so history follows the rename. Same best-effort
                 // shape as the NICK-follow rename below: storage must never
                 // break the loop.
-                if (event.command == "RENAME") {
+                if (!historical && event.command == "RENAME") {
                     try {
                         auto rp = event.getParams();
                         if (rp.length >= 2 && rp[0].length > 0 && rp[1].length > 0) {
@@ -154,7 +294,11 @@ void startEventProcessor(ref EngineContext ctx) {
                 // downstream can collapse those — while the scrollback kept
                 // exactly one. That is the "it showed my JOIN twice" class
                 // of bug: duplicated live rows over a clean scrollback.
-                if (!publishOnly && !ctx.bufferManager.appendIRCEvent(event, serverId)) {
+                const stored = publishOnly || ctx.bufferManager.appendIRCEvent(event, serverId);
+                // A false dedup verdict means already accepted, never storage failure.
+                storageResolved = true;
+                if (!publishOnly) noteAcceptedLiveHistory(ctx, event);
+                if (!stored) {
                     logDebug("Dropping duplicate %s eid=%d for %s/%s (already in scrollback)",
                         event.command, event.eid, event.network,
                         event.channel.length ? event.channel : "_server");
@@ -235,7 +379,7 @@ void startEventProcessor(ref EngineContext ctx) {
                     }
                 }
 
-                if (foundNet && (event.command == "001"
+                if (!historical && foundNet && (event.command == "001"
                     || event.command == "CONNECT" || event.command == "CONNECTED"
                     || event.command == "DISCONNECT" || event.command == "DISCONNECTED"
                     || event.command == "JOIN"
@@ -292,7 +436,7 @@ void startEventProcessor(ref EngineContext ctx) {
                 // new nick must append after the rename, otherwise RENAMENX
                 // sees an existing destination and the history splits.
                 // Best-effort try/catch: storage must never break the loop.
-                if (foundNet && event.command == "NICK" && event.channel.length == 0
+                if (!historical && foundNet && event.command == "NICK" && event.channel.length == 0
                     && event.getTag("query_follow").length > 0) {
                     try {
                         auto nickParams = event.getParams();
@@ -311,7 +455,7 @@ void startEventProcessor(ref EngineContext ctx) {
                 }
 
                 // Persist autoJoinChannels changes to MongoDB when we join/part/kick
-                if (foundNet && (event.command == "JOIN" || event.command == "PART" || event.command == "KICK"
+                if (!historical && foundNet && (event.command == "JOIN" || event.command == "PART" || event.command == "KICK"
                                  || event.command == "RENAME")) {
                     auto client = ctx.connManager.getClient(matchedNet.config.id);
                     if (client !is null) {
@@ -332,9 +476,16 @@ void startEventProcessor(ref EngineContext ctx) {
                         if (isOwnEvent) {
                             runTask(() nothrow {
                                 try {
-                                    auto ownerIdStr = ctx.connManager.getOwnerId(matchedNet.config.id);
-                                    if (ownerIdStr.length > 0) {
-                                        ctx.networkRepo.save(client.getConfig, parseUUID(ownerIdStr));
+                                    import ircfiber.irc.dial_guard : ownsNetworkForDial;
+                                    const ownerIdStr = ctx.connManager.getOwnerId(matchedNet.config.id);
+                                    auto row = ctx.networkRepo.findByIdWithUser(matchedNet.config.id);
+                                    if (ownerIdStr.length > 0 && row.userId.toString() == ownerIdStr
+                                            && ownsNetworkForDial(ctx.redis, serverId, event.networkId)) {
+                                        // Runtime channel bookkeeping must not
+                                        // write an older routing/IID/tenant copy.
+                                        row.config.autoJoinChannels = client.getConfig.autoJoinChannels;
+                                        row.config.partedChannels = client.getConfig.partedChannels;
+                                        ctx.networkRepo.save(row.config, row.userId);
                                     }
                                 } catch (Exception e) {
                                     logWarn("Failed to persist autoJoinChannels for %s: %s", event.network, e.msg);
@@ -344,6 +495,10 @@ void startEventProcessor(ref EngineContext ctx) {
                     }
                 }
             } catch (Exception e) {
+                if (!storageResolved && event.command != "HISTORY_CHECKPOINT") {
+                    try noteHistoryStorageFailure(ctx, event, failedHistoryStorage);
+                    catch (Exception failure) logWarn("Could not attribute history storage failure: %s", failure.msg);
+                }
                 logError("Engine event processor error: %s", e.msg);
             }
         }
@@ -351,4 +506,49 @@ void startEventProcessor(ref EngineContext ctx) {
         // (IRC connection, etc.) get CPU time.
         if (!processedAny) yield();
     }
+}
+
+/// Standalone regressions for the exact internal envelope and storage attribution.
+void historyCheckpointRegressionChecks() {
+    auto record = parseJsonString(`{"version":1,"target":"#Case[","lowerBound":{"msgid":"z","timestampMs":1000,"hasServerTime":true},"nextBefore":{"msgid":"a","timestampMs":1000,"hasServerTime":true},"discoveryUpperBoundMs":2000,"state":"recovering","reasonCode":"reconnect"}`);
+    auto envelope = Json.emptyObject;
+    envelope["requestId"] = "request-1";
+    envelope["connectionEpoch"] = "epoch-1";
+    envelope["target"] = "#Case[";
+    envelope["recovery"] = record;
+    auto checkpoint = parseHistoryCheckpoint(envelope.toString());
+    assert(checkpoint.requestId == "request-1" && checkpoint.connectionEpoch == "epoch-1");
+    assert(checkpoint.recovery.lowerBound.msgid == "z");
+    assert(checkpoint.recovery.nextBefore.msgid == "a");
+    assert(historyCheckpointField(checkpoint.target, ["CASEMAPPING": "rfc1459"]) == "#case{");
+    assert(historyCheckpointField(checkpoint.target, ["CASEMAPPING": "ascii"]) == "#case[");
+    assert(historyCheckpointField("", null) == "*targets");
+    assert(historyCheckpointField("*targets", null) == "*targets");
+    bool[string] failures;
+    const failureKey = historyStorageKey("network-1", checkpoint.requestId, checkpoint.connectionEpoch);
+    failures[failureKey] = true;
+    assert(historyStorageKey("network-1", "request-2", "epoch-1") !in failures);
+    assert(historyStorageKey("network-1", "request-1", "epoch-2") !in failures);
+    assert(historyStorageKey("network-2", "request-1", "epoch-1") !in failures);
+    assert(failureKey in failures);
+    foreach (kind; 0 .. 5) {
+        auto invalid = parseJsonString(envelope.toString());
+        if (kind == 0) invalid["target"] = "#other";
+        if (kind == 1) invalid.remove("connectionEpoch");
+        if (kind == 2) invalid["requestId"] = "";
+        if (kind == 3) invalid["recovery"]["state"] = "done";
+        if (kind == 4) invalid["recovery"]["version"] = 2;
+        bool rejected;
+        try parseHistoryCheckpoint(invalid.toString()); catch (Exception) rejected = true;
+        assert(rejected, "Malformed or misattributed checkpoint must fail closed");
+    }
+    IRCRawEvent historical;
+    historical.tagsJson = `{"batch":"chathistory","history_request":"request-1","history_epoch":"epoch-1"}`;
+    assert(isHistorical(historical));
+    // Internal attribution must not become a public compact key.
+    auto compact = historical.toCompactJson();
+    assert(compact["history_request"].type == Json.Type.undefined);
+    assert(compact["history_epoch"].type == Json.Type.undefined);
+    historical.tagsJson = `{"batch":"live-labeled-response"}`;
+    assert(!isHistorical(historical), "A live response batch is not historical");
 }

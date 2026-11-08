@@ -227,6 +227,7 @@ public IRCRawEvent parseIRCLinePublic(string line, NetworkConfig config) {
     string trailing;
     auto colon = line.indexOf(" :");
     if (colon >= 0) {
+        event.hasTrailingParam = true;
         trailing = line[colon + 2 .. $];
         line     = line[0 .. colon];
     }
@@ -237,44 +238,20 @@ public IRCRawEvent parseIRCLinePublic(string line, NetworkConfig config) {
         if (parts.length > 1) event.setParams(parts[1 .. $]);
     }
 
-    if (trailing.length > 0) {
+    if (event.hasTrailingParam) {
         auto params = event.getParams();
         params ~= trailing;
         event.setParams(params);
         event.text = trailing;
     }
 
-    // RPL_ISUPPORT (005): the trailing "are supported by this server"
-    // is RFC 2812 §5.1.4 boilerplate, not useful as msg.text. Servers
-    // typically send ISUPPORT as multiple 005 replies, each carrying a
-    // subset of tokens plus the same trailing — so without this override
-    // every 005 in the `_server` log renders as the trailer three times
-    // and the actual tokens (CHANTYPES=#, EXCEPTS, KICKLEN, …) are
-    // hidden inside msg.params that numericBody() never reads.
-    //
-    // Rewrite event.text to the joined ISUPPORT tokens (skip the user's
-    // nick at params[0] and the exact canonical trailer) so the server
-    // log shows real ISUPPORT data instead of three copies of the
-    // trailer. We use an exact-match check for the RFC trailer so
-    // near-variants ("are supported by my server", "supported by this
-    // server") are preserved as legitimate tokens rather than stripped.
+    // Display only ISUPPORT tokens: the recipient and any wire trailing
+    // parameter are not tokens, regardless of the trailer's contents.
     if (event.command == "005") {
         auto p = event.getParams();
-        if (p.length > 1) {
-            string[] tokens;
-            foreach (idx, tok; p) {
-                if (idx == 0) continue;
-                if (idx + 1 == p.length && tok == "are supported by this server")
-                    continue;
-                tokens ~= tok;
-            }
-            // Empty tokens → no real ISUPPORT data was delivered (just
-            // the boilerplate trailer). Clear text so the _server log
-            // doesn't render the placeholder either.
-            event.text = tokens.length > 0 ? tokens.join(" ") : "";
-        } else {
-            event.text = "";
-        }
+        auto end = p.length;
+        if (event.hasTrailingParam && end > 0) --end;
+        event.text = end > 1 ? p[1 .. end].join(" ") : "";
     }
 
     // ── Channel derivation ───────────────────────────────────────────

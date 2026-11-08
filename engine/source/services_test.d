@@ -55,6 +55,8 @@ final class FakeHost : ServicesHost {
     long now = 1_700_000_000_000;
     string epoch = "11111111-1111-4111-8111-111111111111";
     string nick = "me";
+    string socketId = "fake-socket";
+    string[string] caps;
     ServicesActor who = ServicesActor(ServicesActorState.account, "acct");
     ServicesConfig cfg;
     string[] written;
@@ -65,6 +67,9 @@ final class FakeHost : ServicesHost {
 
     long nowMs() { return now; }
     string liveEpoch() { return epoch; }
+    bool hasCapability(string name) { return (name in caps) !is null; }
+    string capabilityValue(string name) { auto p = name in caps; return p is null ? "" : *p; }
+    string socketIdentity() { return socketId; }
     string ownNick() { return nick; }
     bool isOwnNick(string n) { return icmp(n, nick) == 0; }
     bool sameNick(string a, string b) { return icmp(a, b) == 0; }
@@ -160,11 +165,12 @@ struct Rig {
     }
 
     /// Answers the pending pin WHOIS and VERSION like a healthy NickServ.
-    void verify(string host_ = "services.test", string server = "services.test", string nick = "NickServ") {
+    void verify(string host_ = "services.test", string server = "services.test", string nick = "NickServ",
+            string versionText = "Anope-2.1.0 services.test") {
         feed(":s 311 me " ~ nick ~ " services " ~ host_ ~ " * :Services");
         feed(":s 312 me " ~ nick ~ " " ~ server ~ " :Anope");
         feed(":s 318 me " ~ nick ~ " :End of /WHOIS list.");
-        feed(":" ~ nick ~ "!services@" ~ host_ ~ " NOTICE me :\x01VERSION Anope-2.1.0 services.test\x01");
+        feed(":" ~ nick ~ "!services@" ~ host_ ~ " NOTICE me :\x01VERSION " ~ versionText ~ "\x01");
     }
 
     /// Token of the n-th fence written (0-based), "" if none.
@@ -627,7 +633,8 @@ void transportChecks() {
     // ── history and privacy ──────────────────────────────────────────
     {
         auto r = Rig.make();
-        r.t.restoreQuiet(["NickServ!services@services.test"], r.host.now + 10_000);
+        auto marker = ServicesQuietMarker(["NickServ!services@services.test"], r.host.now + 10_000);
+        r.t.restoreQuiet(marker);
         ok("after a takeover, backlog replies from the in-flight pseudoclient are suppressed",
             r.feed(SVC ~ "NOTICE me :Password accepted", true));
         ok("live private replies inside the marker window stay private too (late replies after a takeover)",
@@ -789,6 +796,278 @@ void credentialDetailsChecks() {
             && !wire.canFind(first) && !wire.canFind(last));
 }
 
+void nativeIdentityChecks() {
+    import ircfiber.irc.services_identity : registerIdentityServicesOperations;
+    import ircfiber.irc.services_grammar : ANOPE_21_VERSION;
+    stderr.writeln("\n[services.native.identity] self evidence versus public NickServ INFO");
+    registerIdentityServicesOperations();
+    scope (exit) {
+        clearServicesOperations();
+        setLegacyAuthTerminalClassifier(null);
+    }
+    Rig nativeRig(bool trusted = true) {
+        auto r = Rig.make(trusted);
+        r.host.caps["draft/account-registration"] = "min-password-length=4,max-password-length=32";
+        return r;
+    }
+    void answerInfo(ref Rig r) {
+        r.feed(SVC ~ "NOTICE me :Information about nick \x02other\x02:");
+        r.feed(SVC ~ "NOTICE me :Account: other (ID: 8)");
+        r.fenceReply(1);
+    }
+    {
+        auto r = nativeRig();
+        r.host.cfg.provider = ServicesProvider.disabled;
+        r.run(r.request(ServiceAction.accountInfo, `{"account":"ACCT"}`));
+        ok("own account view returns observed native identity even with NickServ disabled",
+            r.last.status == ServiceStatus.confirmed
+            && r.last.data["nick"].get!string == "me"
+            && r.last.data["account"].get!string == "acct"
+            && r.last.data["identified"].get!bool
+            && r.last.capabilities["accountRegister"]["registration"]["protocol"].get!string == "native"
+            && !r.host.written.length);
+        r.host.who = ServicesActor(ServicesActorState.none, "");
+        foreach (params; [`{"account":"ME"}`, `{"targetNick":"ME"}`]) {
+            r.run(r.request(ServiceAction.accountInfo, params, ""));
+            ok("unidentified self view exposes registration but never invents an account",
+                r.last.status == ServiceStatus.confirmed
+                && r.last.data["nick"].get!string == "me"
+                && r.last.data["account"].get!string == ""
+                && !r.last.data["identified"].get!bool
+                && r.last.capabilities["accountRegister"]["registration"]["protocol"].get!string == "native"
+                && !r.host.written.length);
+        }
+    }
+    {
+        auto r = nativeRig();
+        r.host.cfg.provider = ServicesProvider.disabled;
+        foreach (params; [`{"account":"other"}`, `{"targetNick":"other"}`,
+                `{"account":"acct","targetNick":"other"}`, `{"account":"other","targetNick":"me"}`]) {
+            r.run(r.request(ServiceAction.accountInfo, params));
+            ok("foreign INFO cannot masquerade as self when legacy services are disabled",
+                r.last.status == ServiceStatus.unavailable
+                && r.last.reasonCode == "services_disabled"
+                && r.last.data.type == Json.Type.undefined && !r.host.written.length);
+        }
+    }
+    {
+        auto r = nativeRig();
+        r.run(r.request(ServiceAction.accountInfo, `{"account":"other"}`));
+        ok("native capability does not bypass public INFO endpoint discovery",
+            !r.results.length && r.host.written == ["WHOIS NickServ"]);
+        r.verify("services.test", "services.test", "NickServ", ANOPE_21_VERSION ~ " services.test");
+        r.fenceReply(0);
+        ok("approved public INFO uses the real legacy adapter and requested account",
+            !r.results.length && r.host.written.canFind("PRIVMSG NickServ@services.test :INFO other"));
+        answerInfo(r);
+        ok("public INFO returns the queried account rather than our native identity",
+            r.last.status == ServiceStatus.confirmed
+            && r.last.data["registered"].get!bool
+            && r.last.data["nick"].get!string == "other"
+            && r.last.data["account"].get!string == "other"
+            && r.last.data["identified"].type == Json.Type.undefined
+            && r.last.capabilities.type == Json.Type.undefined);
+    }
+    {
+        auto r = nativeRig();
+        r.run(r.request(ServiceAction.accountInfo, `{"targetNick":"guest"}`));
+        r.verify("services.test", "services.test", "NickServ", ANOPE_21_VERSION ~ " services.test");
+        ok("foreign nickname lookup still waits for fresh account evidence",
+            !r.results.length && r.host.written.canFind("WHOIS guest")
+            && !r.host.written.any!(line => line.canFind("INFO ")));
+        r.feed(":s 311 me guest user host * :Guest");
+        r.feed(":s 330 me guest other :is logged in as");
+        r.feed(":s 318 me guest :End of /WHOIS list.");
+        r.fenceReply(0);
+        answerInfo(r);
+        ok("foreign grouped nickname resolves and reports its actual public account",
+            r.last.status == ServiceStatus.confirmed
+            && r.last.data["targetNick"].get!string == "guest"
+            && r.last.data["targetAccount"].get!string == "other"
+            && r.last.data["account"].get!string == "other");
+    }
+    {
+        auto r = nativeRig(false);
+        r.run(r.request(ServiceAction.accountInfo, `{"account":"other"}`));
+        ok("native registration never authorizes an untrusted public INFO endpoint",
+            r.last.status == ServiceStatus.unavailable
+            && r.last.reasonCode == "untrusted_endpoint" && !r.host.written.length);
+    }
+    {
+        auto r = nativeRig();
+        r.run(r.request(ServiceAction.accountInfo, `{"account":"other"}`));
+        r.verify("evil.example");
+        ok("public INFO still rejects a NickServ pin mismatch with native registration active",
+            r.last.status == ServiceStatus.unavailable && r.last.reasonCode == "pin_mismatch"
+            && !r.host.written.any!(line => line.canFind("INFO ")));
+    }
+    {
+        auto r = nativeRig();
+        r.run(r.request(ServiceAction.accountInfo, `{"account":"other"}`));
+        r.feed(":s 311 me NickServ services services.test * :Services");
+        r.feed(":s 312 me NickServ services.test :Anope");
+        r.feed(":s 318 me NickServ :End of /WHOIS list.");
+        r.feed(SVC ~ "NOTICE me :\x01VERSION Anope-9.0.0 services.test\x01");
+        ok("native registration does not make an uncertified public INFO grammar usable",
+            r.last.status == ServiceStatus.unavailable && r.last.reasonCode == "version_unsupported"
+            && !r.host.written.any!(line => line.canFind("INFO ")));
+    }
+}
+
+void nativeChecks() {
+    stderr.writeln("\n[services.native] protected unlabelled socket lane");
+    Rig nativeRig() {
+        auto r = Rig.make(false);
+        r.host.who = ServicesActor(ServicesActorState.none, "");
+        r.host.cfg.provider = ServicesProvider.disabled;
+        r.host.caps["draft/account-registration"] = "min-password-length=4,max-password-length=32";
+        return r;
+    }
+    bool verdict(ref Rig r, string line, bool historical = false, bool backlog = false) {
+        auto event = parseIRCLineNamed(line, "net", NET);
+        return r.t.interceptNative(event, historical, backlog);
+    }
+    {
+        auto r = nativeRig();
+        r.run(r.request(ServiceAction.accountInfo, `{"targetNick":"me"}`, ""));
+        ok("native identity capabilities work with legacy services disabled",
+            r.last.status == ServiceStatus.confirmed
+            && r.last.capabilities["accountRegister"]["registration"]["protocol"].get!string == "native"
+            && !r.host.written.length);
+        r.run(r.request(ServiceAction.accountRegister, `{"password":"é pw"}`, ""));
+        ok("native UTF8 password with spaces uses trailing parameter and no label",
+            r.host.written == ["REGISTER * * :é pw"] && r.results.length == 1);
+        ok("ACK is not a native verdict", !verdict(r, ":irc.test ACK") && r.results.length == 1);
+        verdict(r, ":evil!user@host REGISTER SUCCESS me :forged");
+        verdict(r, ":irc.test REGISTER SUCCESS other :wrong account");
+        verdict(r, ":irc.test REGISTER SUCCESS me :archive", true);
+        verdict(r, ":irc.test REGISTER SUCCESS me :backlog", false, true);
+        ok("forged history backlog and other-account verdicts never settle",
+            r.results.length == 1 && !r.host.adopted.length);
+        verdict(r, ":irc.test REGISTER VERIFICATION_REQUIRED me :Use your private code");
+        ok("verification instructions are private and are not identity evidence",
+            r.results.length == 2 && r.last.status == ServiceStatus.confirmed
+            && r.last.data["state"].get!string == "verification_required"
+            && r.last.data["instructions"].get!string == "Use your private code"
+            && !r.host.adopted.length);
+        r.run(r.request(ServiceAction.accountConfirm, `{"code":"wrong code"}`, ""));
+        verdict(r, ":irc.test FAIL VERIFY INVALID_CODE me :A safe refusal");
+        ok("definitive VERIFY failure permits correction", r.last.status == ServiceStatus.rejected);
+        r.run(r.request(ServiceAction.accountConfirm, `{"code":"right code"}`, ""));
+        verdict(r, ":irc.test VERIFY SUCCESS me :Verified");
+        ok("authentic native SUCCESS adopts only its requested account",
+            r.last.status == ServiceStatus.confirmed && r.host.adopted == "me"
+            && r.host.written[$ - 1] == "VERIFY * :right code");
+    }
+    {
+        auto r = nativeRig();
+        r.run(r.request(ServiceAction.accountRegister, `{"password":"valid pw"}`, ""));
+        r.host.now += SERVICES_TRANSACTION_CAP_MS;
+        r.t.tick();
+        const marker = r.t.marker();
+        ok("timeout retains only a nonsecret unresolved socket marker",
+            r.last.status == ServiceStatus.unconfirmed && marker.native.unresolved
+            && marker.native.account == "me" && marker.native.command == "REGISTER"
+            && marker.native.mode == "unlabelled" && marker.native.socketId == r.host.socketId);
+        r.run(r.request(ServiceAction.accountConfirm, `{"code":"next"}`, ""));
+        ok("timeout never unlocks an indistinguishable successor",
+            r.last.reasonCode == "native_auth_unresolved" && r.host.written.length == 1);
+        verdict(r, ":irc.test REGISTER SUCCESS me :Late");
+        ok("late terminal drain does not authenticate or deliver another result",
+            !r.host.adopted.length && !r.t.marker().native.unresolved && r.results.length == 2);
+        r.run(r.request(ServiceAction.accountConfirm, `{"code":"next"}`, ""));
+        ok("authentic drain releases lane", r.host.written.length == 2);
+        r.t.onRegistrationCapabilityChanged();
+        ok("capability changes retire dispatched work without losing quarantine",
+            r.last.status == ServiceStatus.unconfirmed && r.t.marker().native.unresolved);
+        r.host.socketId = "replacement-socket";
+        r.t.tick();
+        ok("replacement socket discards unresolved old ownership", !r.t.marker().native.unresolved);
+    }
+    {
+        auto r = nativeRig();
+        r.host.paced = true;
+        r.run(r.request(ServiceAction.accountRegister, `{"password":"valid pw"}`, ""));
+        r.host.caps["draft/account-registration"] = "email-required";
+        ok("native write revalidates capability options before dispatch",
+            !r.t.nextWrite().length && r.last.status == ServiceStatus.stale
+            && !r.host.written.length && !r.t.marker().native.unresolved);
+        r.host.paced = false;
+        r.run(r.request(ServiceAction.accountRegister, `{"password":"valid pw"}`, ""));
+        ok("email-required is enforced before write", r.last.reasonCode == "email_required");
+        r.host.caps["draft/account-registration"] = "min-password-length=6";
+        r.run(r.request(ServiceAction.accountRegister, `{"password":"éé"}`, ""));
+        ok("native minimum counts UTF8 bytes", r.last.reasonCode == "password_length");
+        r.run(r.request(ServiceAction.accountRegister, `{"password":"abcdef","account":"other"}`, ""));
+        ok("custom account requires advertised support", r.last.reasonCode == "custom_account_name_unsupported");
+        ServicesQuietMarker marker;
+        marker.native = NativeQuietMarker("", "", "", "invalid", true);
+        r.t.restoreQuiet(marker);
+        r.run(r.request(ServiceAction.accountConfirm, `{"code":"next"}`, ""));
+        verdict(r, ":irc.test VERIFY SUCCESS me :Cannot drain malformed ownership");
+        ok("malformed transferred marker fails closed until socket replacement",
+            r.last.reasonCode == "native_auth_unresolved" && r.t.marker().native.unresolved);
+    }
+    {
+        auto r = nativeRig();
+        r.run(r.request(ServiceAction.accountRegister, `{"password":"valid pw"}`, ""));
+        auto marker = r.t.marker();
+        r.t.onDetach();
+        auto adopted = nativeRig();
+        adopted.t.restoreQuiet(marker);
+        verdict(adopted, ":irc.test REGISTER VERIFICATION_REQUIRED me :Old private instructions", false, true);
+        ok("holder terminal drains transferred ownership without delivering private instructions",
+            !adopted.t.marker().native.unresolved && !adopted.results.length && !adopted.host.adopted.length);
+        ok("tagged and prefixed native manual commands are sensitive",
+            sensitiveServiceLine("@label=x :me!u@h REGISTER * * :canary pw", r.host.cfg)
+            && sensitiveServiceLine("VERIFY * :canary code", r.host.cfg));
+    }
+    {
+        auto r = nativeRig();
+        ok("manual native raw uses the same protected unlabelled lane",
+            r.t.submitManualNative("@label=client REGISTER * * :manual pw", r.host.epoch)
+            && r.host.written == ["REGISTER * * :manual pw"] && !r.results.length);
+        r.host.epoch = randomUUID().toString;
+        r.t.onEpoch();
+        r.run(r.request(ServiceAction.accountConfirm, `{"code":"next"}`, ""));
+        ok("epoch replacement on retained socket never clears native uncertainty",
+            r.last.reasonCode == "native_auth_unresolved" && r.host.written.length == 1);
+        verdict(r, ":irc.test REGISTER SUCCESS me :Drain old manual work");
+        ok("manual late drain cannot fabricate identity", !r.host.adopted.length);
+    }
+    {
+        import std.array : replicate;
+        auto r = nativeRig();
+        r.host.caps.remove("draft/account-registration");
+        r.run(r.request(ServiceAction.accountRegister, `{"password":"valid pw"}`, ""));
+        ok("unACKed native capability uses the real legacy unsupported path",
+            r.last.reasonCode == "services_disabled" && !r.host.written.length);
+        r.host.caps["draft/account-registration"] = "";
+        r.run(r.request(ServiceAction.accountRegister, Json(["password": Json("p".replicate(500))]).toString, ""));
+        ok("actual IRC line budget is enforced without splitting native secrets",
+            r.last.reasonCode == "line_too_long" && !r.host.written.length);
+        r.host.caps["draft/account-registration"] = "before-connect,custom-account-name,email-required";
+        r.run(r.request(ServiceAction.accountRegister,
+            `{"password":"valid pw","account":"custom","email":"scratch@example.test"}`, ""));
+        ok("advertised custom account and email survive native wire admission",
+            r.host.written == ["REGISTER custom scratch@example.test :valid pw"]);
+        verdict(r, ":irc.test REGISTER SUCCESS CUSTOM :Created");
+        ok("server-returned account spelling is retained as identity evidence", r.host.adopted == "CUSTOM");
+    }
+    {
+        auto r = nativeRig();
+        r.host.paced = true;
+        r.run(r.request(ServiceAction.accountRegister, `{"password":"valid pw"}`, ""));
+        r.t.prepareNativeDetach();
+        ok("graceful handoff never quarantines a native command that was not dispatched",
+            r.last.status == ServiceStatus.stale && !r.t.marker().native.unresolved && !r.t.queued);
+        r.run(r.request(ServiceAction.accountConfirm, `{"code":"next"}`, ""));
+        r.t.failClosedMeta();
+        ok("failed holder marker write drops unsent native secret and releases lane",
+            r.last.reasonCode == "meta_unavailable" && !r.t.marker().native.unresolved && !r.t.queued);
+    }
+}
+
 void wireChecks() {
     stderr.writeln("\n[services.wire] PersistentIRCClient over a localhost fake Anope");
     string[] wire;
@@ -802,9 +1081,11 @@ void wireChecks() {
 }
 
 int main() {
+    nativeChecks();
     transportChecks();
     mutationPreflightChecks();
     frameBoundsChecks();
+    nativeIdentityChecks();
     foreach (c; servicesLegacyAuthChecks()) ok(c.name, c.passed);
     foreach (c; servicesLegacyMetaChecks()) ok(c.name, c.passed);
     servicesGrammarChecks((n, c) => ok(n, c));

@@ -33,6 +33,8 @@ struct IRCRawEvent {
     /// engine via Redis INCR before processing. Every event has one —
     /// no phantom messages, no missing identifiers.
     long eid;
+    /// Parser-only wire boundary; never serialized into JSON or durable state.
+    bool hasTrailingParam;
     
     /// Construct a new IRCRawEvent
     this(string network, string command) {
@@ -92,6 +94,15 @@ struct IRCRawEvent {
     /// CHANNEL_LIST event. See `retryStatusPayload` for the
     /// string-vs-Json rationale.
     string channelListPayload;
+    /// Engine-only envelopes; processor consumes these before eid/storage.
+    string bncResponsePayload;
+    string bncPresencePayload;
+    /// UUID routing only; never downstream labels or sensitive payload.
+    string bncSession;
+    string bncBinding;
+    string bncRequest;
+    /// Authoritative ACKed capability values, carried only on live CAP events.
+    string capValuesPayload;
 
     /// Serialize to compact JSON
     Json toCompactJson() const {
@@ -102,6 +113,13 @@ struct IRCRawEvent {
         j["t"] = timestampMs;
         j["c"] = command;
         j["eid"] = eid;
+        if (bncSession.length) j["bncSession"] = Json(bncSession);
+        if (bncBinding.length) j["bncBinding"] = Json(bncBinding);
+        if (bncRequest.length) j["bncRequest"] = Json(bncRequest);
+        if (command == "CAP" && capValuesPayload.length) {
+            const values = parseJsonString(capValuesPayload);
+            if (values.type == Json.Type.object) j["capValues"] = values;
+        }
         if (nick.length) j["n"] = nick;
         if (hostmask.length) j["hm"] = hostmask;
         if (text.length) j["x"] = text;

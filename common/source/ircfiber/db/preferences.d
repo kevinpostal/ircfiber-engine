@@ -1935,9 +1935,7 @@ unittest {
 
 @("prefsRepo.mutate serializes concurrent read-modify-writes: prefVersion ends at N")
 unittest {
-    // Requires a local Redis on 127.0.0.1:6379. Skip if unavailable
-    // (e.g. CI runners without Redis) — the roundtrip test above is
-    // sufficient for CI; this one is for the dev box.
+    // Requires explicit isolated fixture admission; no default DB attempt.
     //
     // The savers are vibe.d tasks, not std.parallelism workers: vibe's Redis
     // ConnectionPool asserts "called from a foreign thread" the moment a
@@ -1955,15 +1953,9 @@ unittest {
     import core.time : seconds;
     import std.conv : to;
 
-    RedisStorage redis;
-    try {
-        redis = new RedisStorage();
-        redis.connect();
-        redis.ping();
-    } catch (Exception e) {
-        logWarn("Skipping prefsRepo concurrent test: Redis unavailable (%s)", e.msg);
-        return;
-    }
+    import ircfiber.testing.isolated_db : isolatedTestRedis;
+    auto redis = isolatedTestRedis("prefsRepo concurrent mutation");
+    if (redis is null) return;
 
     auto userId = randomUUID();
     string key = "prefs:" ~ userId.toString();
@@ -2105,16 +2097,9 @@ unittest {
 
 @("prefsRepo.load self-heals a corrupt blob by deleting the key")
 unittest {
-    // Requires local Redis (same gate as the atomicity test above).
-    RedisStorage redis;
-    try {
-        redis = new RedisStorage();
-        redis.connect();
-        redis.ping();
-    } catch (Exception e) {
-        logWarn("Skipping prefsRepo load-repair test: Redis unavailable (%s)", e.msg);
-        return;
-    }
+    import ircfiber.testing.isolated_db : isolatedTestRedis;
+    auto redis = isolatedTestRedis("prefsRepo corrupt blob repair");
+    if (redis is null) return;
 
     auto userId = randomUUID();
     string key = "prefs:" ~ userId.toString();
@@ -2142,16 +2127,9 @@ unittest {
 
 @("prefsRepo.save keeps every empty array field an array in Redis (no repair loop)")
 unittest {
-    // Requires local Redis (same gate as the atomicity test above).
-    RedisStorage redis;
-    try {
-        redis = new RedisStorage();
-        redis.connect();
-        redis.ping();
-    } catch (Exception e) {
-        logWarn("Skipping prefsRepo empty-array test: Redis unavailable (%s)", e.msg);
-        return;
-    }
+    import ircfiber.testing.isolated_db : isolatedTestRedis;
+    auto redis = isolatedTestRedis("prefsRepo empty arrays");
+    if (redis is null) return;
 
     auto userId = randomUUID();
     string key = "prefs:" ~ userId.toString();
@@ -3052,16 +3030,9 @@ unittest {
 
 @("prefsRepo: stale full saves from independently cached repositories never reopen or erase a tour")
 unittest {
-    // Requires local Redis (same gate as the atomicity test above).
-    RedisStorage redis;
-    try {
-        redis = new RedisStorage();
-        redis.connect();
-        redis.ping();
-    } catch (Exception e) {
-        logWarn("Skipping welcome tour persistence test: Redis unavailable (%s)", e.msg);
-        return;
-    }
+    import ircfiber.testing.isolated_db : isolatedTestRedis;
+    auto redis = isolatedTestRedis("welcome tour persistence");
+    if (redis is null) return;
 
     auto userId = randomUUID();
     auto userId2 = randomUUID();
@@ -3139,16 +3110,9 @@ unittest {
 
 @("createWithWelcomeTour: a lost or failed insert leaves no preferences behind")
 unittest {
-    // Requires local Redis (same gate as the atomicity test above).
-    RedisStorage redis;
-    try {
-        redis = new RedisStorage();
-        redis.connect();
-        redis.ping();
-    } catch (Exception e) {
-        logWarn("Skipping createWithWelcomeTour test: Redis unavailable (%s)", e.msg);
-        return;
-    }
+    import ircfiber.testing.isolated_db : isolatedTestRedis;
+    auto redis = isolatedTestRedis("createWithWelcomeTour insert failure");
+    if (redis is null) return;
     auto lost = randomUUID();
     auto failed = randomUUID();
     auto repo = new PreferencesRepository(redis, new PrefsCache());

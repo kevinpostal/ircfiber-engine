@@ -8,8 +8,8 @@ import vibe.core.log;
 import vibe.data.json : parseJsonString, Json, deserializeJson;
 
 import ircfiber.engine.bootstrap : EngineContext;
-import ircfiber.redis.protocol : RedisKeys, ControlMessage, IRCCommand;
-import ircfiber.models.network : NetworkConfig, TLSMode, SASLMechanism, sanitizeIdent;
+import ircfiber.redis.protocol : RedisKeys, ControlMessage, IRCCommand, StateTTL;
+import ircfiber.models.network : Network, NetworkConfig, TLSMode, SASLMechanism, sanitizeIdent;
 import ircfiber.services.config : decodeStoredServicesConfig;
 import ircfiber.services.protocol : ServicesResult;
 import ircfiber.storage.redis : RedisStorage;
@@ -19,6 +19,7 @@ import ircfiber.storage.buffer : BufferManager;
 import std.datetime.systime : Clock;
 import core.time : seconds, Duration, msecs;
 import ircfiber.irc.routing_policy : routingPreferencesFromJson, RoutingValidationException;
+import ircfiber.engine.state : writeStateSnapshotForNetwork;
 
 // ─────────────────────────────────────────────────────────────────────────
 // Reconnect-in-flight dedup
@@ -42,8 +43,10 @@ import ircfiber.irc.routing_policy : routingPreferencesFromJson, RoutingValidati
 private struct PendingReconnect {
     long atMs;
     string config;
+    ulong generation;
 }
 private PendingReconnect[string] pendingReconnects;
+private ulong reconnectGeneration;
 private enum RECONNECT_DEDUP_TTL_MS = 5_000;
 
 /// Returns true iff a reconnect for `networkId` with this `config` (its
@@ -60,12 +63,33 @@ bool isReconnectInFlight(string networkId, string config = "") {
 
 /// Marks a reconnect for `networkId` with this `config` as in flight.
 void markReconnectInFlight(string networkId, string config = "") {
-    pendingReconnects[networkId] = PendingReconnect(Clock.currTime.toUnixTime!long * 1000, config);
+    pendingReconnects[networkId] = PendingReconnect(Clock.currTime.toUnixTime!long * 1000,
+        config, ++reconnectGeneration);
 }
 
 /// Clears the in-flight reconnect marker for `networkId`.
 void clearReconnectInFlight(string networkId) nothrow {
     pendingReconnects.remove(networkId);
+}
+
+private void finishReconnect(string networkId, ulong generation) nothrow {
+    if (auto pending = networkId in pendingReconnects)
+        if (pending.generation == generation) pendingReconnects.remove(networkId);
+}
+
+@("a completed reconnect's stale cleanup cannot release a newer pending attempt")
+unittest {
+    enum id = "550e8400-e29b-41d4-a716-446655440001";
+    scope(exit) clearReconnectInFlight(id);
+    markReconnectInFlight(id, "saved-config");
+    const completed = pendingReconnects[id].generation;
+    clearReconnectInFlight(id);
+    markReconnectInFlight(id, "saved-config");
+    const pending = pendingReconnects[id].generation;
+    finishReconnect(id, completed);
+    assert(isReconnectInFlight(id, "saved-config"));
+    finishReconnect(id, pending);
+    assert(!isReconnectInFlight(id, "saved-config"));
 }
 
 private void runSafeTask(void delegate() dg) {
@@ -127,83 +151,64 @@ void startCommandConsumers(ref EngineContext ctx) {
     }
 }
 
-/// Spawns the command consumer task for the given network.
+/// One consumer per local network, including reconnect/reconciliation races.
+private bool[string] commandConsumers;
+private bool[string] activeMoves;
+
 void spawnNetworkCommandConsumer(ref EngineContext ctx, string networkId) {
+    const id = parseUUID(networkId[]);
+    if (networkId in commandConsumers) return;
+    commandConsumers[networkId] = true;
     auto serverId = ctx.localServer.serverId;
     runSafeTask({
+        scope(exit) commandConsumers.remove(networkId);
         auto key = RedisKeys.cmd(serverId, networkId);
+        string received;
         while (true) {
             try {
-                // If `addNetwork`/`reconnectNetwork` control handlers
-                // haven't finalized the network yet (race vs. `loadNetworks`
-                // at boot, vs. transient state during a hot swap), wait it out
-                // instead of exiting the loop. `break` here used to leak
-                // the consumer forever for any network added after a fresh
-                // engine start, leaving WS-queued cmds stuck in
-                // `irc:cmd:<server>:<network>`. See consumer.d issue 2026-07-03.
-                if (!ctx.connManager.hasNetwork(networkId)) {
-                    sleep(5.seconds);
-                    if (!ctx.connManager.hasNetwork(networkId)) continue;
+                import ircfiber.irc.dial_guard : ownsNetworkForDial;
+                if (!received.length) {
+                    auto client = ctx.connManager.getClient(id);
+                    if (!ownsNetworkForDial(ctx.redis, serverId, networkId)
+                            || client is null || client.getStopping) return;
+                    auto result = ctx.redis.blpop(key, 1);
+                    if (result.isNull) continue;
+                    received = result.get[1];
                 }
-                auto result = ctx.redis.blpop(key, 5);
-                if (!result.isNull) {
-                    auto raw = result.get[1];
-                    // Parse the JSON envelope first so genuine parse errors
-                    // (malformed payload from the gateway) are not silently
-                    // mislabeled as command-execution failures. Without this
-                    // split, every TLS-write error on a dead connection was
-                    // logged as "Failed to parse command", making diagnosis
-                    // impossible during reconnect storms.
-                    Json json;
-                    try {
-                        json = parseJsonString(raw);
-                    } catch (Exception e) {
-                        logJsonMap("warn", "consumer",
-                            "Malformed command JSON from Redis",
-                            [
-                                "networkId": networkId,
-                                "error":     e.msg,
-                                "event":     "cmd_parse_fail"
-                            ]);
-                        logWarn("Failed to parse command for %s: %s", networkId, e.msg);
-                        continue;
-                    }
-                    IRCCommand cmd;
-                    try {
-                        cmd = IRCCommand.fromJson(json);
-                    } catch (Exception e) {
-                        logJsonMap("warn", "consumer",
-                            "Valid JSON but invalid IRCCommand shape",
-                            [
-                                "networkId": networkId,
-                                "error":     e.msg,
-                                "event":     "cmd_shape_fail"
-                            ]);
-                        logWarn("Failed to parse command shape for %s: %s", networkId, e.msg);
-                        continue;
-                    }
-                    try {
-                        handleNetworkCommand(ctx, networkId, cmd);
-                    } catch (Exception e) {
-                        // Execution failure (most often: TLS write to a
-                        // closed IRC connection). The connection's writeRaw
-                        // already logs `tls_write_fail` so the upstream
-                        // root cause is captured there — this entry just
-                        // shows that the command was dropped from the queue.
-                        logJsonMap("warn", "consumer",
-                            "Command execution failed (likely closed connection)",
-                            [
-                                "networkId": networkId,
-                                "cmd":       cmd.cmd,
-                                "target":    cmd.target,
-                                "error":     e.msg,
-                                "event":     "cmd_exec_fail"
-                            ]);
-                        logWarn("Failed to execute command for %s: cmd=%s error=%s",
-                            networkId, cmd.cmd, e.msg);
-                    }
+                IRCCommand command;
+                try command = IRCCommand.fromJson(parseJsonString(received));
+                catch (Exception e) {
+                    received = "";
+                    logWarn("Malformed queued command for %s: %s", networkId, e.msg);
+                    continue;
                 }
+                auto row = ctx.networkRepo.findByIdWithUser(id);
+                if (row.config.id != id
+                        || (command.userId.length && command.userId != row.userId.toString())) {
+                    logJsonMap("warn", "consumer", "Queued command rejected: stale tenant",
+                        ["networkId": networkId, "event": "cmd_tenant_rejected"]);
+                    received = ""; // former tenant cannot use the new owner's socket
+                    continue;
+                }
+                // BLPOP may complete after a move/transfer. Recheck after the
+                // Mongo read and atomically enqueue to the latest canonical
+                // owner; no stale consumer may keep draining the source list.
+                if (!ownsNetworkForDial(ctx.redis, serverId, networkId)
+                        || !ctx.connManager.hasNetwork(networkId)
+                        || ctx.connManager.getClient(id).getStopping
+                        || ctx.connManager.getOwnerId(id) != row.userId.toString()) {
+                    import ircfiber.irc.routing_moves : enqueueRoutingCommand;
+                    if (!enqueueRoutingCommand(ctx.redis.getDb(), networkId, received))
+                        throw new Exception("command owner unavailable during handoff");
+                    received = "";
+                    return;
+                }
+                received = "";
+                try handleNetworkCommand(ctx, networkId, command);
+                catch (Exception e) logWarn("Command failed for %s: %s", networkId, e.msg);
             } catch (Exception e) {
+                // Keep a popped envelope until the ownership check/requeue
+                // succeeds, even when Redis temporarily disappears.
                 logError("Command consumer error for %s: %s", networkId, e.msg);
                 sleep(1.seconds);
             }
@@ -212,37 +217,77 @@ void spawnNetworkCommandConsumer(ref EngineContext ctx, string networkId) {
     });
 }
 
+/// Reserve IID, then reload the entire persisted row including its tenant.
+/// No queued config/userId is authoritative after a transfer or routing edit.
+auto loadCanonicalNetwork(ref EngineContext ctx, UUID id) {
+    auto config = ctx.networkRepo.findByIdWithIpv6Iid(id);
+    auto row = ctx.networkRepo.findByIdWithUser(id);
+    if (row.config.id != id || row.config.ipv6Iid != config.ipv6Iid)
+        throw new Exception("canonical network changed during identity reload");
+    return row;
+}
+
+bool canonicalRoutingParked(ref EngineContext ctx, const NetworkConfig config) {
+    import ircfiber.irc.routing_policy_store : loadEffectiveRoutingPolicy;
+    auto effective = loadEffectiveRoutingPolicy(ctx.redis.getDb(), config.host, config.routing);
+    return effective.available && effective.order.length == 0;
+}
+
+/// Only call after positive source quiescence. The removed client can no
+/// longer supply its owner to the ordinary event processor.
+private void publishStoppedNetwork(ref EngineContext ctx, NetworkConfig config,
+        UUID userId, string reason) {
+    Network parked;
+    parked.config = config;
+    parked.status = "disconnected";
+    writeStateSnapshotForNetwork(ctx, parked, ctx.localServer.serverId);
+    auto closed = IRCRawEvent.makeDisconnected(config.name, config.id.toString(), reason);
+    closed.eid = ctx.redis.incr(RedisKeys.globalEid());
+    auto json = closed.toCompactJson();
+    json["y"] = Json("irc_event");
+    json["serverId"] = Json(ctx.localServer.serverId);
+    const payload = json.toString();
+    const owner = userId.toString();
+    ctx.redis.publish(RedisKeys.events(owner), payload);
+    auto db = ctx.redis.getDb();
+    const stream = RedisKeys.userStream(owner);
+    db.lpush(stream, payload);
+    db.ltrim(stream, 0, 999);
+    db.expire(stream, StateTTL.USER_STREAM_TTL);
+}
+
 private void handleControlMessage(ref EngineContext ctx, ControlMessage msg) {
     import std.uuid : UUID;
     logInfo("Control message [server=%s]: %s network=%s", ctx.localServer.serverId, msg.action, msg.networkId);
+    // Deletion may remove canonical ownership first, but stale controls
+    // must never target an assigned-away socket or interrupt a move.
+    if (msg.networkId.length && (msg.action == "removeNetwork" || msg.action == "disconnectNetwork")) {
+        auto db = ctx.redis.getDb();
+        const owner = db.hget(RedisKeys.networkAssignments(), msg.networkId);
+        if ((owner.length && owner != ctx.localServer.serverId)
+                || db.exists(RedisKeys.routingMove(msg.networkId))) return;
+    }
 
     switch (msg.action) {
         case "addNetwork":
-            if (msg.config.type != Json.Type.undefined) {
-                auto cfg = parseNetworkConfig(msg.config);
-                auto uid = parseUUID(msg.userId);
-                // Stale control traffic must not start a held or disabled row,
-                // nor replace an already-running initial connection.
-                if (cfg.disabled || cfg.servicesProvisioningPending) {
-                    logWarn("addNetwork[%s]: network is disabled or awaiting services — ignoring",
-                            cfg.id.toString());
-                    break;
-                }
+            if (msg.networkId.length) {
+                auto row = loadCanonicalNetwork(ctx, parseUUID(msg.networkId[]));
+                auto cfg = row.config;
+                import ircfiber.irc.dial_guard : ownsNetworkForDial;
+                if (cfg.disabled || cfg.servicesProvisioningPending
+                        || !ownsNetworkForDial(ctx.redis, ctx.localServer.serverId, msg.networkId)) break;
                 if (ctx.connManager.hasNetwork(cfg.id)) break;
-                const assigned = ctx.serverRegistry.getServerForNetwork(cfg.id.toString());
-                if (assigned.length && assigned != ctx.localServer.serverId) break;
-                if (!assigned.length)
-                    ctx.serverRegistry.selfAssignNetwork(cfg.id.toString(), ctx.localServer.serverId);
-
-                ctx.connManager.addAndStartNetwork(cfg, uid);
-                spawnNetworkCommandConsumer(ctx, cfg.id.toString());
+                if (canonicalRoutingParked(ctx, cfg)) break;
+                ctx.connManager.addAndStartNetwork(cfg, row.userId);
+                spawnNetworkCommandConsumer(ctx, msg.networkId);
             }
             break;
         case "removeNetwork":
             if (msg.networkId.length) {
                 const key = msg.networkId;
-                ctx.connManager.forgetPublicAvatar(parseUUID(msg.networkId));
-                ctx.connManager.removeNetwork(parseUUID(msg.networkId));
+                auto id = parseUUID(msg.networkId[]);
+                ctx.connManager.forgetPublicAvatar(id);
+                ctx.connManager.removeNetwork(id);
                 // Tearing the client down emits its own farewell events —
                 // the QUIT echo and the `ERROR :Quit:` line — and those get
                 // persisted like any other event, into scrollback keys the
@@ -269,34 +314,27 @@ private void handleControlMessage(ref EngineContext ctx, ControlMessage msg) {
             break;
         case "disconnectNetwork":
             if (msg.networkId.length) {
-                auto id = parseUUID(msg.networkId);
-                const key = id.toString();
-                // Stop the client if it's connected (sends QUIT), then remove
-                // it from the manager so no auto-reconnect loop can retry.
-                ctx.connManager.disconnectNetwork(id, msg.reason);
-                ctx.connManager.removeNetwork(id);
-                // Clean up the stale Redis state snapshot so the gateway
-                // returns the correct disconnected state — otherwise the
-                // frontend's periodic sync will see the old 'connecting'
-                // snapshot and overwrite the local disconnected state.
-                try {
-                    auto db = ctx.redis.getDb();
-                    db.del(RedisKeys.state(ctx.localServer.serverId, key));
-                    db.del(RedisKeys.state_legacy(key));
-                } catch (Exception e) {
-                    logWarn("disconnectNetwork: failed to clean Redis state for %s: %s", key, e.msg);
-                }
+                auto id = parseUUID(msg.networkId[]);
+                auto row = ctx.networkRepo.findByIdWithUser(id);
+                const hadLocalHistory = ctx.connManager.hasNetworkHistory(id);
+                if (hadLocalHistory && !ctx.connManager.stopNetworkForMove(id, 60.seconds))
+                    throw new Exception("disconnect source quiescence unproven; inspect holder and irc:routing:dials");
+                if (hadLocalHistory)
+                    publishStoppedNetwork(ctx, row.config, row.userId, msg.reason);
             }
             break;
         case "reconnectNetwork":
-            if (msg.networkId.length && msg.config.type != Json.Type.undefined) {
-                auto cfg = parseNetworkConfig(msg.config);
-                if (cfg.disabled || cfg.servicesProvisioningPending) {
-                    logWarn("reconnectNetwork[%s]: network is disabled or awaiting services — ignoring",
-                            cfg.id.toString());
-                    break;
-                }
-                auto id = parseUUID(msg.networkId);
+            if (msg.networkId.length) {
+                auto row = loadCanonicalNetwork(ctx, parseUUID(msg.networkId[]));
+                auto cfg = row.config;
+                import ircfiber.irc.dial_guard : ownsNetworkForDial;
+                if (cfg.disabled || cfg.servicesProvisioningPending
+                        || !ownsNetworkForDial(ctx.redis, ctx.localServer.serverId, msg.networkId)) break;
+                auto id = parseUUID(msg.networkId[]);
+                // Registration completes the prior reconnect; the TTL only
+                // suppresses duplicate requests while that attempt is pending.
+                if (auto client = ctx.connManager.getClient(id))
+                    if (client.getConnected) clearReconnectInFlight(msg.networkId);
                 // Idempotency: a double-click in the frontend (or a
                 // bounce/retry from the gateway's WebSocket) can publish
                 // two `reconnectNetwork` messages within <50 ms. Without
@@ -305,7 +343,7 @@ private void handleControlMessage(ref EngineContext ctx, ControlMessage msg) {
                 // and producing a "connect→remove" loop. Block the
                 // second one and let the original proceed — unless it
                 // carries a different configuration (see pendingReconnects).
-                const configKey = msg.config.toString();
+                const configKey = cfg.toJson().toString();
                 if (isReconnectInFlight(msg.networkId, configKey)) {
                     logJsonMap("debug", "consumer",
                         "Reconnect dedup — another reconnectNetwork is in-flight",
@@ -317,6 +355,7 @@ private void handleControlMessage(ref EngineContext ctx, ControlMessage msg) {
                             // produce its own user-visible events.
                 }
                 markReconnectInFlight(msg.networkId, configKey);
+                const pendingGeneration = pendingReconnects[msg.networkId].generation;
 
                 // Emit a "queued" notice *immediately* so the frontend
                 // sees user-visible feedback the instant the control
@@ -337,26 +376,25 @@ private void handleControlMessage(ref EngineContext ctx, ControlMessage msg) {
                     logWarn("Failed to emit queued server-log notice for %s: %s",
                         cfg.name, e.msg);
                 }
-                ctx.connManager.removeNetwork(id);
-                // Jul 8 2026 fix: ensure the network→server assignment is
-                // published to `irc:assignments` before addAndStartNetwork.
-                // Pre-fix, reconnectNetwork only removed + added the local
-                // client without writing the canonical assignment, so the
-                // gateway's server-routing tables and the admin API
-                // believed the network was unassigned — even though the
-                // local client was connecting. This caused SuperNets and
-                // Gang Net (after my Bug 3 disabled-flag fix re-enabled
-                // them in MongoDB) to be missing from the assignment
-                // hash, blocking the admin "Connected" indicator and
-                // confusing the gateway's load-balancer.
-                auto sid = ctx.serverRegistry.assignNetwork(msg.networkId);
-                if (sid.length == 0 || sid != ctx.localServer.serverId) {
-                    logWarn("reconnectNetwork[%s]: assignNetwork returned %s (local=%s) — self-assigning to local",
-                        msg.networkId, sid, ctx.localServer.serverId);
-                    ctx.serverRegistry.selfAssignNetwork(msg.networkId, ctx.localServer.serverId);
+                const hadLocalHistory = ctx.connManager.hasNetworkHistory(id);
+                if (hadLocalHistory && !ctx.connManager.stopNetworkForMove(id, 60.seconds)) {
+                    finishReconnect(msg.networkId, pendingGeneration);
+                    throw new Exception("reconnect source quiescence unproven; inspect holder and irc:routing:dials");
                 }
-                auto uid = msg.userId.length ? parseUUID(msg.userId) : UUID.init;
-                ctx.connManager.addAndStartNetwork(cfg, uid);
+                if (!ownsNetworkForDial(ctx.redis, ctx.localServer.serverId, msg.networkId)) break;
+                // Waiting for a previous loop may have yielded across an edit
+                // or tenant transfer. Reload again before creating its successor.
+                row = loadCanonicalNetwork(ctx, id);
+                if (!ownsNetworkForDial(ctx.redis, ctx.localServer.serverId, msg.networkId)) break;
+                if (row.config.disabled || row.config.servicesProvisioningPending) break;
+                if (canonicalRoutingParked(ctx, row.config)) {
+                    finishReconnect(msg.networkId, pendingGeneration);
+                    if (hadLocalHistory)
+                        publishStoppedNetwork(ctx, row.config, row.userId,
+                            "Routing policy permits no available route");
+                    break;
+                }
+                ctx.connManager.addAndStartNetwork(row.config, row.userId);
                 spawnNetworkCommandConsumer(ctx, cfg.id.toString());
 
                 // Clear the dedup flag after the TTL window has elapsed so
@@ -369,24 +407,54 @@ private void handleControlMessage(ref EngineContext ctx, ControlMessage msg) {
                     try {
                         sleep((RECONNECT_DEDUP_TTL_MS + 100).msecs);
                     } catch (Exception) {}
-                    clearReconnectInFlight(msg.networkId);
+                    finishReconnect(msg.networkId, pendingGeneration);
                 }
                 runTask(&cleanupFn);
             }
             break;
         case "updateConfig":
-            if (msg.networkId.length && msg.config.type != Json.Type.undefined) {
-                auto cfg = parseNetworkConfig(msg.config);
-                ctx.connManager.updateConfig(cfg);
+            if (msg.networkId.length) {
+                import ircfiber.irc.dial_guard : ownsNetworkForDial;
+                if (!ownsNetworkForDial(ctx.redis, ctx.localServer.serverId, msg.networkId)) break;
+                auto row = loadCanonicalNetwork(ctx, parseUUID(msg.networkId[]));
+                auto id = row.config.id;
+                if (ctx.connManager.getOwnerId(id) != row.userId.toString()) {
+                    if (ctx.connManager.hasNetwork(id)
+                            && !ctx.connManager.stopNetworkForMove(id, 60.seconds))
+                        throw new Exception("tenant update source quiescence unproven");
+                    row = loadCanonicalNetwork(ctx, id);
+                    if (!row.config.disabled && !row.config.servicesProvisioningPending
+                            && ownsNetworkForDial(ctx.redis, ctx.localServer.serverId, msg.networkId))
+                        ctx.connManager.addAndStartNetwork(row.config, row.userId);
+                } else ctx.connManager.updateConfig(row.config);
             }
             break;
         case "migrateNetwork":
-            // NEW: Handle migration to another server
-            if (msg.networkId.length) {
-                auto id = parseUUID(msg.networkId);
-                ctx.connManager.disconnectNetwork(id, "");
-                ctx.connManager.removeNetwork(id);
-                logInfo("Network %s migrated away from server %s", msg.networkId, ctx.localServer.serverId);
+            if (msg.networkId.length && msg.config.type == Json.Type.object) {
+                // Dedicated task: holder CLOSE/LIST must never block unrelated
+                // control traffic. The shared acknowledgement is token+owner CAS.
+                runSafeTask({
+                    import ircfiber.irc.routing_moves : loadRoutingMove,
+                        acknowledgeNetworkMoveClosed, failRoutingMove;
+                    auto move = loadRoutingMove(ctx.redis.getDb(), msg.config["moveId"].get!string);
+                    if (move.moveId in activeMoves) return;
+                    activeMoves[move.moveId] = true;
+                    scope(exit) activeMoves.remove(move.moveId);
+                    if (move.networkId != msg.networkId || move.fromServerId != ctx.localServer.serverId
+                            || move.state != "processing"
+                            || ctx.redis.getDb().get(RedisKeys.routingMove(msg.networkId)) != move.moveId
+                            || ctx.serverRegistry.getServerForNetwork(msg.networkId) != move.fromServerId) return;
+                    try {
+                        if (!ctx.connManager.stopNetworkForMove(parseUUID(msg.networkId[]), 60.seconds)) {
+                            failRoutingMove(ctx.redis.getDb(), move,
+                                "source quiescence unproven; inspect holder and irc:routing:dials:" ~ move.fromServerId ~ ":" ~ move.networkId);
+                            return;
+                        }
+                        acknowledgeNetworkMoveClosed(ctx.redis.getDb(), move);
+                    } catch (Exception e) {
+                        failRoutingMove(ctx.redis.getDb(), move, "source holder closure failed: " ~ e.msg);
+                    }
+                });
             }
             break;
         case "retargetEgress":
@@ -446,6 +514,56 @@ private void handleNetworkCommand(ref EngineContext ctx, string networkId, IRCCo
         return;
     }
 
+    // Ownership is stamped by the authenticated gateway; never trust a queued
+    // tenant after transfer. The state machine performs live capability/epoch
+    // admission again at the actual upstream write.
+    if (cmd.bncSession.length || cmd.bncBinding.length || cmd.bncRequest.length) {
+        import ircfiber.irc.bnc_ownership : BncEngineState;
+        const actualOwner = ctx.connManager.getOwnerId(nid);
+        if (cmd.userId != actualOwner) return;
+        const owner = BncEngineState.ownerOf(cmd);
+        if (cmd.cmd == "raw" || cmd.cmd == "msg") {
+            string acceptedEpoch;
+            try {
+                auto payload = parseJsonString(cmd.bncPayload);
+                if (payload["epoch"].type == Json.Type.string)
+                    acceptedEpoch = payload["epoch"].get!string;
+            } catch (Exception) {}
+            auto client = ctx.connManager.getClient(nid);
+            const liveEpoch = client is null ? "" : client.getConnectionEpoch;
+            if (!acceptedEpoch.length || acceptedEpoch != liveEpoch) {
+                auto envelope = Json.emptyObject;
+                envelope["nid"] = networkId; envelope["sid"] = owner.session;
+                envelope["binding"] = owner.binding; envelope["request"] = owner.request;
+                envelope["operation"] = cmd.label.length ? cmd.label : "bnc-" ~ owner.request;
+                envelope["epoch"] = acceptedEpoch; envelope["seq"] = 1;
+                envelope["kind"] = "error";
+                envelope["code"] = !acceptedEpoch.length ? "INVALID_COMMAND"
+                    : liveEpoch.length ? "STALE_EPOCH" : "UPSTREAM_UNAVAILABLE";
+                envelope["text"] = !acceptedEpoch.length ? "Missing upstream connection epoch"
+                    : liveEpoch.length ? "Upstream connection changed" : "No connected upstream";
+                auto event = IRCRawEvent(networkId, "BNC_RESPONSE");
+                event.networkId = networkId; event.bncResponsePayload = envelope.toString();
+                ctx.eventChannel.put(event);
+                return;
+            }
+            // No yielding I/O between this check and the wrapper freezing
+            // its expectedEpoch; actual paced emission rechecks that epoch.
+        }
+        switch (cmd.cmd) {
+            case "msg":
+                ctx.connManager.submitBncMessage(nid, cmd.target, cmd.text, cmd.label, owner, cmd.tags);
+                return;
+            case "raw":
+                ctx.connManager.submitBncRaw(nid, cmd.text, cmd.label, owner, cmd.tags);
+                return;
+            case "bnc_monitor":
+                ctx.connManager.handleBncMonitor(nid, cmd,
+                    (Clock.currStdTime - 621_355_968_000_000_000L) / 10_000);
+                return;
+            default: return;
+        }
+    }
     switch (cmd.cmd) {
         case "msg":
             if (cmd.label.length > 0) {
@@ -470,7 +588,7 @@ private void handleNetworkCommand(ref EngineContext ctx, string networkId, IRCCo
             // additive (no new field needed in the struct).
             import ircfiber.irc.chathistory : parseChathistoryPayload;
             auto p = parseChathistoryPayload(cmd.text);
-            if (p.channel.length == 0) {
+            if (p.channel.length == 0 && p.command != "TARGETS") {
                 logWarn("chathistory command missing fields: %s", cmd.text);
                 break;
             }

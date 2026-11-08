@@ -133,8 +133,6 @@ struct RedisKeys {
     
     /// Legacy state key (non-namespaced)
     static string state_legacy(string networkId) { return "irc:state:" ~ networkId; }
-    /// Legacy command key (non-namespaced)
-    static string cmd_legacy(string networkId) { return "irc:cmd:" ~ networkId; }
     /// Legacy control queue key (non-namespaced)
     static string control_legacy() { return "irc:control"; }
 
@@ -184,6 +182,20 @@ struct RedisKeys {
 
     /// Routing config key (per-host max connections, etc.)
     static string routingConfig() { return "irc:routing:config"; }
+
+    /// Durable ordered routing defaults and administrative provider blocks.
+    static string egressRoutingPolicy() { return "irc:config:egressRoutingPolicy"; }
+    /// Rolling upgrade fence for network routing mutations.
+    static string routingSchemaVersion() { return "irc:config:routingSchemaVersion"; }
+    /// Monotonic rollback fence; clearing current blocks never clears this key.
+    static string routingHardBlocksActivated() { return "irc:config:routingHardBlocksActivated"; }
+
+    /// Pending controlled cross-engine reconnect operations.
+    static string routingMoves() { return "irc:routing:moves"; }
+    /// Short-lived per-network fence; value is the exact move token.
+    static string routingMove(string networkId) { return "irc:routing:move:" ~ networkId; }
+    /// Operation result retained independently of its ownership fence.
+    static string routingMoveStatus(string moveId) { return "irc:routing:move-status:" ~ moveId; }
 
     /// Engine config override key (admin settings per engine)
     static string engineConfig(string serverId) { return "irc:engine:config:" ~ serverId; }
@@ -250,6 +262,12 @@ struct RedisKeys {
     /// TTL — persists across restarts until the user explicitly changes
     /// their configured nick or the admin clears the key.
     static string networkNick(string networkId) { return "irc:nick:" ~ networkId; }
+
+    /// Committed recovery coverage; folded target fields and reserved *targets.
+    /// Deliberately persistent until network runtime state is purged.
+    static string historyRecovery(string networkId) { return "irc:history:recovery:" ~ networkId; }
+    /// Engine-owned per-holder MONITOR leases, removed with network runtime state.
+    static string bncMonitorSessions(string networkId) { return "irc:bnc:monitor:" ~ networkId; }
 
     /// Distributed janitor lock key. Exactly one process holds the lock
     /// at a time (SET NX EX). Held by the elected janitor for the lock
@@ -469,7 +487,8 @@ struct IRCCommand {
     string text;
     /// The channel name
     string channel;
-    /// The user identifier
+    /// Authenticated actor, stamped by current publishers. Older ordinary
+    /// queued commands may omit it; services commands require an identity.
     string userId;
     /// The timestamp in milliseconds
     long timestampMs;
@@ -478,6 +497,12 @@ struct IRCCommand {
     /// Client-only message tags to send with a `msg` (`+reply`, for
     /// example), unescaped; the connection escapes them for the wire.
     string[string] tags;
+    /// Private BNC routing; appended to preserve existing positional construction.
+    string bncSession;
+    string bncBinding;
+    string bncRequest;
+    long deadlineMs;
+    string bncPayload;
 
     /// Converts to JSON
     Json toJson() const {
@@ -489,6 +514,11 @@ struct IRCCommand {
         if (userId.length) j["userId"] = Json(userId);
         j["timestampMs"] = Json(timestampMs);
         if (label.length) j["label"] = Json(label);
+        if (bncSession.length) j["bncSession"] = Json(bncSession);
+        if (bncBinding.length) j["bncBinding"] = Json(bncBinding);
+        if (bncRequest.length) j["bncRequest"] = Json(bncRequest);
+        if (deadlineMs) j["deadlineMs"] = Json(deadlineMs);
+        if (bncPayload.length) j["bncPayload"] = Json(bncPayload);
         if (tags.length) {
             auto t = Json.emptyObject;
             foreach (k, v; tags) t[k] = Json(v);
@@ -507,6 +537,11 @@ struct IRCCommand {
         if (j["userId"].type != Json.Type.undefined) c.userId = j["userId"].get!string;
         if (j["timestampMs"].type != Json.Type.undefined) c.timestampMs = j["timestampMs"].get!long;
         if (j["label"].type != Json.Type.undefined) c.label = j["label"].get!string;
+        if (j["bncSession"].type == Json.Type.string) c.bncSession = j["bncSession"].get!string;
+        if (j["bncBinding"].type == Json.Type.string) c.bncBinding = j["bncBinding"].get!string;
+        if (j["bncRequest"].type == Json.Type.string) c.bncRequest = j["bncRequest"].get!string;
+        if (j["deadlineMs"].type == Json.Type.int_) c.deadlineMs = j["deadlineMs"].get!long;
+        if (j["bncPayload"].type == Json.Type.string) c.bncPayload = j["bncPayload"].get!string;
         if (j["tags"].type == Json.Type.object) {
             foreach (string k, Json v; j["tags"]) {
                 if (v.type == Json.Type.string) c.tags[k] = v.get!string;
@@ -690,6 +725,8 @@ struct NetworkStateSnapshot {
     long updatedAt;
     /// Negotiated IRCv3 capabilities
     string[] caps;
+    /// Advertised public capability options, separate from negotiated names.
+    string[string] capValues;
     /// Full ISUPPORT inventory the connected server advertised in its
     /// 005 reply stream. Used by the WS sync payload to ship the
     /// categorised "Server features" panel state to the frontend
@@ -697,8 +734,7 @@ struct NetworkStateSnapshot {
     /// Schema is identical to `Network.isupport` on the frontend:
     /// every key=value or bare flag the server sent, keyed upper-case.
     string[string] isupport;
-    /// Active Mullvad egress actually used for this network's live TCP
-    /// connection. "" = direct, else label like "de"/"se".
+    /// Observed VPN exit label for the live TCP connection; empty for native/direct.
     string activeEgressLabel;
     /// SOCKS proxy host that won (e.g. "tailscale-mullvad-de:1055").
     string activeEgressHost;
@@ -711,9 +747,13 @@ struct NetworkStateSnapshot {
     /// Remote IP of the live IRC socket (AAAA or A winner). "" when
     /// disconnected. Its family is the authoritative IPv6-vs-IPv4 signal.
     string peerIp;
-    /// Local source IP of the live IRC socket (per-user IPv6 bind, shared
-    /// host address, or SOCKS sidecar hop). "" when disconnected.
+    /// Actual local socket source (native pool, shared host, or proxy hop).
+    /// Not necessarily the IRC-visible source when using a VPN.
     string localIp;
+    /// Observed transport tier, never a requested or unused reservation.
+    string activeRoute;
+    /// Most recent reason an earlier permitted tier could not be used.
+    string routingFallbackReason;
     /// Channels the user has parted (for inactive sidebar)
     string[] partedChannels;
     /// W1-T01-rev1: structured retry state surfaced from the engine's
@@ -809,6 +849,9 @@ struct NetworkStateSnapshot {
             foreach (c; caps) arr ~= Json(c);
             j["caps"] = arr;
         }
+        auto capabilityOptions = Json.emptyObject;
+        foreach (name, value; capValues) capabilityOptions[name] = Json(value);
+        j["capValues"] = capabilityOptions;
         if (isupport.length) {
             // Always serialise (even when empty) so the frontend sees
             // an explicit "isupport" key and can distinguish a real
@@ -830,6 +873,8 @@ struct NetworkStateSnapshot {
         if (activeEgressLocation.length) j["activeEgressLocation"] = Json(activeEgressLocation);
         if (peerIp.length) j["peerIp"] = Json(peerIp);
         if (localIp.length) j["localIp"] = Json(localIp);
+        if (activeRoute.length) j["activeRoute"] = Json(activeRoute);
+        if (routingFallbackReason.length) j["routingFallbackReason"] = Json(routingFallbackReason);
         j["lagMs"] = Json(lagMs);
         j["connectedAtMs"] = Json(connectedAtMs);
         if (connected && connectedAtMs > 0 && ownPrefix.length)
@@ -897,6 +942,9 @@ struct NetworkStateSnapshot {
                 if (c.type == Json.Type.string) s.caps ~= c.get!string;
             }
         }
+        if (j["capValues"].type == Json.Type.object)
+            foreach (string name, value; j["capValues"])
+                if (value.type == Json.Type.string) s.capValues[name] = value.get!string;
         // Restore the full ISUPPORT map keyed upper-case. Older
         // snapshots without this field deserialise as empty — the
         // frontend will fall back to its own parsing in that case
@@ -918,6 +966,9 @@ struct NetworkStateSnapshot {
         if (j["activeEgressLocation"].type == Json.Type.string) s.activeEgressLocation = j["activeEgressLocation"].get!string;
         if (j["peerIp"].type == Json.Type.string) s.peerIp = j["peerIp"].get!string;
         if (j["localIp"].type == Json.Type.string) s.localIp = j["localIp"].get!string;
+        if (j["activeRoute"].type == Json.Type.string) s.activeRoute = j["activeRoute"].get!string;
+        if (j["routingFallbackReason"].type == Json.Type.string)
+            s.routingFallbackReason = j["routingFallbackReason"].get!string;
         if (j["lagMs"].type == Json.Type.int_) s.lagMs = j["lagMs"].get!long;
         if (j["connectedAtMs"].type == Json.Type.int_) s.connectedAtMs = j["connectedAtMs"].get!long;
         if (s.connected && s.connectedAtMs > 0 && j["ownPrefix"].type == Json.Type.string)

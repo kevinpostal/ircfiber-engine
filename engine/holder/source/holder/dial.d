@@ -31,7 +31,7 @@ import ircfiber.async : safeFiberRun;
 import ircfiber.netaddr : dialableAddresses, isInternalOnlyName, isIpLiteral,
     isPrivateAllowedHost, isPublicUnicast;
 import ircfiber.redis.protocol : TlsInfo;
-import holder.protocol : DialRequest, EventLine, TlsInfoJson, ircVerb;
+import holder.protocol : DialRequest, EventLine, TlsInfoJson, ircVerb, validIpv6Source;
 
 // ── Timeouts (moved verbatim from connection.d) ─────────────────────────────
 // Bounded network steps only: vibe's connectTCP/createTLSStream have no
@@ -487,8 +487,10 @@ private void finishHappyEyeballs(TCPConnection[] conns, Task[] tasks, int winner
 /// Vetted direct-dial candidates for `host` in Happy Eyeballs order: DNS
 /// (worker thread + cache), then the destination policy — unless `host` is
 /// allowlisted for internal addresses, only resolved public IPs are kept.
-/// Emits the `dns` line. Throws `DialFailed("dns"|"blocked", …)`.
-private ResolvedAddr[] directCandidates(string host, ushort port, string egressLabel, EventSink emit) {
+/// Emits the `dns` line. Destination protection precedes family filtering.
+/// Throws `DialFailed("dns"|"blocked"|"no_ipv6_destination", …)`.
+private ResolvedAddr[] directCandidates(string host, ushort port, string egressLabel,
+                                       string addressFamily, EventSink emit) {
     auto addrs = resolveAllAddresses(host, port);
     if (addrs.length == 0) {
         report(emit, "attempt_fail", "DNS lookup for " ~ host ~ " returned no addresses.");
@@ -515,6 +517,17 @@ private ResolvedAddr[] directCandidates(string host, ushort port, string egressL
         ResolvedAddr[] kept;
         foreach (a; addrs) if (allowed.canFind(a.ip)) kept ~= a;
         addrs = kept;
+    }
+    if (addressFamily == "ipv6") {
+        ResolvedAddr[] ipv6;
+        foreach (a; addrs) {
+            // Resolver metadata alone is insufficient for mapped IPv4.
+            if (a.family == AddressFamily.INET6 && validIpv6Source(a.ip))
+                ipv6 ~= a;
+        }
+        if (ipv6.length == 0)
+            throw new DialFailed("no_ipv6_destination", "No eligible IPv6 destination for " ~ host);
+        addrs = ipv6;
     }
 
     auto interleaved = interleaveAddressFamilies(addrs);
@@ -952,7 +965,7 @@ private int failureDepth(string phase) @safe pure nothrow @nogc {
 /// connect/TLS/STARTTLS timeouts; plain TCP ends at the first connect.
 private DialOutcome dialDirect(ref DialRequest req, Duration connectTimeout, EventSink emit) {
     const egressLabel = req.bindIp6.length > 0 ? "ipv6:" ~ req.bindIp6 : "direct";
-    const candidates = directCandidates(req.host, req.port, egressLabel, emit);
+    const candidates = directCandidates(req.host, req.port, egressLabel, req.addressFamily, emit);
     auto spent = new bool[candidates.length];
     immutable raceStartMs = Clock.currTime.toUnixTime!long * 1000;
     DialFailed furthest;
@@ -993,6 +1006,8 @@ private DialOutcome dialDirect(ref DialRequest req, Duration connectTimeout, Eve
 /// as each phase happens; throws `DialFailed` (phase + verbatim reason)
 /// on any failure, after closing whatever it opened.
 DialOutcome dialUpstream(ref DialRequest req, EventSink emit) {
+    try req.validateTransport();
+    catch (Exception e) { throw new DialFailed("bad_request", e.msg); }
     const target = stripHostBrackets(req.host);
     const connectTimeout = req.connectTimeoutMs.msecs;
     if (!req.hasProxy) return dialDirect(req, connectTimeout, emit);

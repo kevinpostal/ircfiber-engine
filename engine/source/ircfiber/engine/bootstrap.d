@@ -23,7 +23,7 @@ import ircfiber.irc.manager : ConnectionManager;
 import ircfiber.irc.server : ConnectionServer;
 import ircfiber.irc.registry : ServerRegistry;
 import ircfiber.irc.engine_janitor : EngineJanitor, purgeLocalServerNamespace, bumpServerStateTTLs;
-import ircfiber.irc.connection : setEgressRedis;
+import ircfiber.irc.connection : setEgressRedis, supportedRoutingRoutes;
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.storage.buffer : BufferManager;
 import ircfiber.db.mongo : AppMongoConnection;
@@ -33,6 +33,7 @@ import ircfiber.db.messages : MessageRepository;
 import ircfiber.redis.protocol : RedisKeys, StateTTL;
 import ircfiber.holder_client : HolderClient, HolderEntry, HolderUnavailableException;
 import ircfiber.engine.session_snapshot : SessionSnapshot, fromJSON;
+import ircfiber.irc.routing_moves : networkMoveFenced;
 
 /// Context holding all engine dependencies.
 struct EngineContext {
@@ -54,6 +55,22 @@ struct EngineContext {
     ConnectionServer localServer;   // NEW: this engine's identity
     /// Client of this engine's connection holder (owns every IRC socket).
     HolderClient holder;
+}
+
+/// Refresh on initial/re-registration and heartbeat: an older or unavailable
+/// holder must withdraw native capability rather than retain stale claims.
+void refreshRoutingCapabilities(ref EngineContext ctx, bool publish = false) {
+    import vibe.data.json : Json;
+    ctx.localServer.routingPolicyVersion = 1;
+    ctx.localServer.supportedRoutes = supportedRoutingRoutes(ctx.holder, ctx.localServer.ipv6Prefix);
+    if (!publish) return;
+    auto routes = Json.emptyArray;
+    foreach (route; ctx.localServer.supportedRoutes) routes ~= Json(route);
+    auto db = ctx.redis.getDb();
+    const key = RedisKeys.server(ctx.localServer.serverId);
+    db.hset(key, "routingPolicyVersion", "1");
+    db.hset(key, "supportedRoutes", routes.toString());
+    db.hset(key, "ipv6Prefix", ctx.localServer.ipv6Prefix);
 }
 
 /**
@@ -209,6 +226,7 @@ EngineContext bootstrapEngine() {
     localServer.bindAddress = bindAddress;
     localServer.port = adminPort;
     localServer.isHealthy = true;
+    localServer.routingPolicyVersion = 1;
     localServer.lastHeartbeat = Clock.currTime.toUnixTime!long * 1000;
     localServer.bufferOffset = 0; // Registry will set proper offset
     auto bi = buildInfo();
@@ -272,10 +290,15 @@ EngineContext bootstrapEngine() {
         eventChannel, serverRegistry, localServer, holder);
 }
 
+private bool networksLoading;
+private bool reconciliationRunning;
+
 /// Load networks from MongoDB and start IRC clients.
 /// Must be called from a runTask (the event loop must be running because
 /// Redis operations need the event loop to process I/O).
 void loadNetworks(ref EngineContext ctx) {
+    networksLoading = true;
+    scope(exit) networksLoading = false;
     import ircfiber.db.user : UserRepository;
     logInfo("Network loading task: loading networks from MongoDB");
 
@@ -301,7 +324,7 @@ void loadNetworks(ref EngineContext ctx) {
     HolderEntry[] heldAll;
     if (ctx.holder !is null) {
         try heldAll = ctx.holder.list();
-        catch (Exception e) logWarn("Network loading: holder LIST failed (%s) — dialing every network fresh", e.msg);
+        catch (Exception e) throw new Exception("Holder LIST unavailable; ownership recovery cannot dial safely: " ~ e.msg);
     }
     foreach (e; heldAll) {
         auto nid = e.tag.networkId;
@@ -325,48 +348,53 @@ void loadNetworks(ref EngineContext ctx) {
             continue;
         }
 
-        auto assignedServer = ctx.serverRegistry.getServerForNetwork(nw.config.id.toString());
-        bool shouldLoad = false;
+        // New/recovered clients must use the persisted reservation. In
+        // particular, bootstrap must not dial a row left saved but unassigned
+        // when HTTP provisioning failed to reserve its IID.
+        try {
+            import ircfiber.engine.consumer : loadCanonicalNetwork;
+            nw = loadCanonicalNetwork(ctx, nw.config.id);
+        } catch (Exception e) {
+            logWarn("Network loading: identity unavailable for %s — no new dial (%s)",
+                nw.config.id.toString(), e.msg);
+            // Allocation/storage failure must not close an established
+            // holder socket during the unconsumed-entry cleanup below.
+            if (auto entry = nw.config.id.toString() in held)
+                if (entry.state == "open") consumed[entry.id] = true;
+            skippedCount++;
+            continue;
+        }
+        if (nw.config.disabled || nw.config.servicesProvisioningPending) {
+            skippedCount++;
+            continue;
+        }
 
-        if (assignedServer == serverId) {
-            shouldLoad = true;
-        } else if (assignedServer.length == 0) {
-            const sid = ctx.serverRegistry.assignNetwork(nw.config.id.toString());
-            if (sid.length == 0) {
-                const allServers = ctx.serverRegistry.getAllServers();
-                if (allServers.length == 0) {
-                    logInfo("No servers registered yet — self-assigning %s (bootstrap race fix)",
-                        nw.config.name);
-                    try ctx.serverRegistry.selfAssignNetwork(nw.config.id.toString(), serverId);
-                    catch (Exception e) {
-                        logWarn("Self-assign failed for %s: %s", nw.config.name, e.msg);
-                        continue;
-                    }
-                    shouldLoad = true;
-                } else {
-                    logWarn("Skipping network %s — no healthy connection server available", nw.config.name);
-                    continue;
-                }
-            } else {
-                shouldLoad = true;
-            }
-        } else {
-            if (!ctx.serverRegistry.isServerHealthy(assignedServer)) {
-                auto assignedCfg = ctx.serverRegistry.getEngineConfig(assignedServer);
-                if (assignedCfg.priority > ctx.localServer.priority) {
-                    logInfo("Network %s assigned to %s (priority %d > %d) — deferring reclaim",
-                        nw.config.name, assignedServer, assignedCfg.priority, ctx.localServer.priority);
-                } else {
-                    logInfo("Reclaiming network %s from stale server %s", nw.config.name, assignedServer);
-                    try {
-                        ctx.serverRegistry.reassignNetwork(nw.config.id.toString());
-                        shouldLoad = true;
-                    } catch (Exception e) {
-                        logWarn("Failed to reassign network %s: %s", nw.config.name, e.msg);
+        const nidForAssignment = nw.config.id.toString();
+        if (networkMoveFenced(ctx.redis.getDb(), nidForAssignment)) {
+            // The coordinator owns closure while fenced; never clean up its
+            // source entries or instantiate another generation underneath it.
+            foreach (entry; heldAll)
+                if (entry.tag.networkId == nidForAssignment) consumed[entry.id] = true;
+            continue;
+        }
+        auto assignedServer = ctx.serverRegistry.getServerForNetwork(nidForAssignment);
+        if (!assignedServer.length) {
+            // Restore unique prior ownership first; arbitrary saved rows are
+            // not new provisioning and must not be assigned opportunistically.
+            assignedServer = ctx.serverRegistry.assignNetwork(nidForAssignment);
+            if (!assignedServer.length) {
+                if (auto entry = nidForAssignment in held) {
+                    if (entry.state == "open") {
+                        assignedServer = ctx.serverRegistry.claimNetwork(nidForAssignment, serverId);
+                        // An empty/unavailable plan cannot turn missing
+                        // assignment storage into permission to close a socket.
+                        if (!assignedServer.length) consumed[entry.id] = true;
                     }
                 }
             }
         }
+        const shouldLoad = assignedServer == serverId
+            && !networkMoveFenced(ctx.redis.getDb(), nidForAssignment);
 
         if (shouldLoad) {
             import std.uuid : UUID;
@@ -413,6 +441,8 @@ void loadNetworks(ref EngineContext ctx) {
                 }
             }
             if (!attached) {
+                import ircfiber.engine.consumer : canonicalRoutingParked;
+                if (canonicalRoutingParked(ctx, nw.config)) continue;
                 ctx.connManager.addNetwork(nw.config, nw.userId);
                 if (auto e = nid in held) if (e.state == "closed") {
                     // Dropped while no engine was reading: tell the user why
@@ -493,6 +523,85 @@ void loadNetworksWithRetry(ref EngineContext ctx) {
     }
 }
 
+private void startNetworkReconciliation(ref EngineContext ctx) {
+    if (networksLoading || reconciliationRunning) return;
+    reconciliationRunning = true;
+    runTask(() nothrow {
+        scope(exit) reconciliationRunning = false;
+        try {
+            import ircfiber.engine.consumer : loadCanonicalNetwork, spawnNetworkCommandConsumer;
+            import ircfiber.irc.routing_policy_store : loadRoutingPolicy;
+            import ircfiber.irc.routing_policy : resolveRoutingPolicy;
+            import ircfiber.irc.dial_guard : ownsNetworkForDial;
+            import std.uuid : parseUUID;
+            const sid = ctx.localServer.serverId;
+            ctx.serverRegistry.getAllAssignments();
+            foreach (network; ctx.connManager.getNetworks()) {
+                const nid = network.config.id.toString();
+                if (networkMoveFenced(ctx.redis.getDb(), nid)) continue;
+                auto owner = ctx.serverRegistry.getServerForNetwork(nid);
+                if (!owner.length) {
+                    // Actual local client evidence permits atomic self-heal;
+                    // a competing/ambiguous prior owner must not be overwritten.
+                    try owner = ctx.serverRegistry.claimNetwork(nid, sid);
+                    catch (Exception e) logWarn("Local ownership recovery blocked for %s: %s", nid, e.msg);
+                    if (!owner.length) continue;
+                }
+                auto row = ctx.networkRepo.findByIdWithUser(network.config.id);
+                auto client = ctx.connManager.getClient(network.config.id);
+                if (owner != sid || row.config.id == UUID.init || row.config.disabled
+                        || row.config.servicesProvisioningPending || (client !is null && client.getStopping)
+                        || ctx.connManager.getOwnerId(network.config.id) != row.userId.toString()) {
+                    if (!ctx.connManager.stopNetworkForMove(network.config.id, 60.seconds))
+                        logWarn("Reconciliation source closure unproven for %s; retaining stopped generation", nid);
+                }
+            }
+            foreach (nid; ctx.serverRegistry.getCanonicalNetworks(sid)) {
+                try {
+                    if (networkMoveFenced(ctx.redis.getDb(), nid)) continue;
+                    if (ctx.connManager.hasNetwork(nid)) {
+                        spawnNetworkCommandConsumer(ctx, nid);
+                        continue;
+                    }
+                    auto row = loadCanonicalNetwork(ctx, parseUUID(nid[]));
+                    if (row.config.disabled || row.config.servicesProvisioningPending) continue;
+                    if (!ownsNetworkForDial(ctx.redis, sid, nid)) continue;
+                    HolderEntry held;
+                    foreach (entry; ctx.holder.list())
+                        if (entry.tag.networkId == nid && entry.state == "open") { held = entry; break; }
+                    if (!ownsNetworkForDial(ctx.redis, sid, nid)) continue;
+                    bool adopted;
+                    if (held.id.length) {
+                        SessionSnapshot snapshot;
+                        bool usable;
+                        if (held.hasMeta) {
+                            try { snapshot = fromJSON(held.meta); usable = snapshot.wasConnected; }
+                            catch (Exception) {}
+                        }
+                        // Existing held sessions adopt even when new routes
+                        // are empty or durable policy is temporarily unreadable.
+                        if (usable) {
+                            ctx.connManager.attachNetwork(row.config, row.userId, held, snapshot);
+                            adopted = true;
+                        } else ctx.holder.close(held.id, "recovering incomplete registration");
+                    }
+                    if (!adopted) {
+                        auto policy = loadRoutingPolicy(ctx.redis.getDb());
+                        if (resolveRoutingPolicy(policy, row.config.host, row.config.routing).order.length == 0) continue;
+                        if (!ownsNetworkForDial(ctx.redis, sid, nid)) continue;
+                        ctx.connManager.addAndStartNetwork(row.config, row.userId);
+                    }
+                    spawnNetworkCommandConsumer(ctx, nid);
+                } catch (Exception e) {
+                    logWarn("Network reconciliation deferred for %s: %s", nid, e.msg);
+                }
+            }
+        } catch (Exception e) {
+            try logWarn("Network reconciliation failed: %s", e.msg); catch (Exception) {}
+        }
+    });
+}
+
 /**
  * Start heartbeat task to keep server registered and network leases renewed.
  *
@@ -507,13 +616,7 @@ void loadNetworksWithRetry(ref EngineContext ctx) {
  */
 void startHeartbeatTask(ref EngineContext ctx) {
     runTask(() nothrow {
-        // Bootstrap drain recovery: on the first heartbeat cycle,
-        // clear any stale draining flag that may have been left by a
-        // previous instance of this server that crashed mid-drain.
-        // We do this before the main loop so the gateway sees the
-        // cleared state immediately, not 10s later.
         int beat = 0;
-        bool firstCycle = true;
         // Backoff state — when a heartbeat cycle throws (e.g. Redis
         // unreachable), we don't want to busy-loop into the same
         // exception at 100% CPU. Hold off for `backoffMs`, doubling
@@ -526,24 +629,10 @@ void startHeartbeatTask(ref EngineContext ctx) {
             try logJsonMap("debug", "heartbeat", "Heartbeat loop top", ["beat": beat.to!string]);
             catch (Throwable) {}
             try {
-                // On the first cycle, explicitly clear stale draining.
-                if (firstCycle) {
-                    firstCycle = false;
-                    try {
-                        if (ctx.serverRegistry.isDraining(ctx.localServer.serverId)) {
-                            logWarn("Bootstrap: found stale draining flag for server %s — clearing",
-                                ctx.localServer.serverId);
-                        }
-                        ctx.serverRegistry.clearDraining(ctx.localServer.serverId);
-                    } catch (Throwable e) {
-                        string m; try { m = e.msg; } catch (Throwable) { m = "unknown"; }
-                        try logWarn("Bootstrap: failed to check/clear draining: %s", m);
-                        catch (Throwable) {}
-                    }
-                }
-
                 ctx.localServer.lastHeartbeat = Clock.currTime.toUnixTime!long * 1000;
+                ctx.localServer.routingPolicyVersion = 1;
                 ctx.serverRegistry.updateHeartbeat(ctx.localServer.serverId);
+                refreshRoutingCapabilities(ctx, true);
                 // Holder identity/counters next to the heartbeat so operators
                 // can see the holder every engine rides (skipped when the
                 // holder is unreachable — the engine's own beat still counts).
@@ -583,9 +672,9 @@ void startHeartbeatTask(ref EngineContext ctx) {
                         catch (Throwable) {}
                     }
                 }
-                // Ensure the local server struct never perpetuates a
-                // draining state across heartbeats.
-                ctx.localServer.draining = false;
+                // Draining is durable operator intent, not a stale process
+                // bit to clear merely because a replacement starts beating.
+                ctx.localServer.draining = ctx.serverRegistry.isDraining(ctx.localServer.serverId);
 
                 // Surface per-network registration-timeout markers.
                 ctx.localServer.registrationUnavailableFor =
@@ -599,6 +688,7 @@ void startHeartbeatTask(ref EngineContext ctx) {
                 catch (Throwable) {}
 
                 // Read canonical assignments from irc:assignments.
+                ctx.serverRegistry.getAllAssignments();
                 auto canonical = ctx.serverRegistry.getCanonicalNetworks(ctx.localServer.serverId);
 
                 // Renew leases for networks still assigned to us.
@@ -608,59 +698,9 @@ void startHeartbeatTask(ref EngineContext ctx) {
                 }
 
 
-                // Reconcile connManager against canonical: add any
-                // missing networks (load from Mongo if needed), remove
-                // any networks that no longer belong to us.
-                import std.algorithm : canFind, filter, map;
-                import std.array : array;
-                import std.uuid : UUID;
-                auto currentNetIds = ctx.connManager.getNetworks()
-                    .map!(n => n.config.id.toString()).array;
-
-                // Guard: if canonical is empty but we have local networks,
-                // this is likely a transient Redis wipe (assignments hash
-                // evicted) — not a legitimate admin reassignment. Disconnecting
-                // all networks would drop every IRC session. Instead, keep
-                // the local networks and try to repopulate the canonical
-                // hash from the local state so the next heartbeat recovers.
-                if (canonical.length == 0 && currentNetIds.length > 0) {
-                    auto allAssignments = ctx.serverRegistry.getAllAssignments();
-                    if (allAssignments.length == 0) {
-                        logError("CRITICAL: canonical empty (0) but local has %d networks and getAllAssignments also 0 — Redis wipe suspected, not disconnecting. Attempting to repopulate canonical from local state.", currentNetIds.length);
-                        foreach (netId; currentNetIds) {
-                            try {
-                                ctx.serverRegistry.selfAssignNetwork(netId, ctx.localServer.serverId);
-                                logInfo("Repopulated assignment %s -> %s from local state", netId, ctx.localServer.serverId);
-                            } catch (Throwable e) {
-                                string m; try { m = e.msg; } catch (Throwable) { m = "unknown"; }
-                                try logError("Failed to repopulate %s: %s", netId, m);
-                                catch (Throwable) {}
-                            }
-                        }
-                        // Re-read canonical after repopulation
-                        canonical = ctx.serverRegistry.getCanonicalNetworks(ctx.localServer.serverId);
-                        if (canonical.length == 0) {
-                            logWarn("Still 0 canonical after repopulation — skipping disconnect this cycle to avoid mass drop");
-                            canonical = currentNetIds.dup;
-                        }
-                    } else {
-                        logWarn("Canonical 0 but getAllAssignments has %d entries and local has %d — canonical may be stale, not disconnecting this cycle", allAssignments.length, currentNetIds.length);
-                        canonical = allAssignments.filter!(na => na.serverId == ctx.localServer.serverId).map!(na => na.networkId).array;
-                    }
-                }
-
-                // Disconnect networks no longer in canonical.
-                foreach (netId; currentNetIds) {
-                    if (!canFind(canonical, netId)) {
-                        logWarn("Network %s no longer assigned to this server — disconnecting", netId);
-                        try ctx.connManager.removeNetwork(UUID(netId));
-                        catch (Throwable e) {
-                            string m; try { m = e.msg; } catch (Throwable) { m = "unknown"; }
-                            try logError("Failed to disconnect from stolen network %s: %s", netId, m);
-                            catch (Throwable) {}
-                        }
-                    }
-                }
+                // Actual canonical reconciliation runs separately so a bounded
+                // holder close cannot stall heartbeat/control traffic.
+                startNetworkReconciliation(ctx);
 
                 ctx.localServer.assignedNetworks = canonical;
 
@@ -671,11 +711,19 @@ void startHeartbeatTask(ref EngineContext ctx) {
                     .filter!(n => n.length > 0)
                     .array;
 
-                // Mirror assignedNetworks into a per-engine hash.
-                try ctx.serverRegistry.publishServerAssignments(
-                    ctx.localServer.serverId,
-                    ctx.localServer.assignedNetworks);
-                catch (Throwable) {}
+                // Reverse mirrors are physical recovery evidence, not a copy
+                // of planned canonical assignments. An unavailable LIST must
+                // preserve evidence instead of declaring sockets gone.
+                try {
+                    string[] evidence;
+                    foreach (network; ctx.connManager.getNetworks())
+                        evidence ~= network.config.id.toString();
+                    foreach (entry; ctx.holder.list())
+                        if (entry.state == "open" && entry.tag.networkId.length
+                                && !evidence.canFind(entry.tag.networkId))
+                            evidence ~= entry.tag.networkId;
+                    ctx.serverRegistry.publishServerAssignments(ctx.localServer.serverId, evidence);
+                } catch (Throwable) {}
 
                 // Persist the now-clean assignedNetworks back to the server record.
                 try ctx.serverRegistry.syncServerState(
@@ -818,7 +866,12 @@ void startOrphanReaperTask(ref EngineContext ctx) {
 
                 foreach (net; ctx.connManager.getNetworks()) {
                     auto netId = net.config.id.toString();
-                    auto ownerId = ctx.connManager.getOwnerId(net.config.id);
+                    auto persisted = ctx.networkRepo.findByIdWithUser(net.config.id);
+                    if (persisted.config.id == UUID.init) continue;
+                    auto ownerId = persisted.userId.toString();
+                    if (ownerId != ctx.connManager.getOwnerId(net.config.id)
+                            || ctx.serverRegistry.getServerForNetwork(netId) != ctx.localServer.serverId
+                            || networkMoveFenced(ctx.redis.getDb(), netId)) continue;
 
                     // An empty ownerId means the network is not in
                     // networkOwners at all — that's a different bug.
@@ -832,8 +885,13 @@ void startOrphanReaperTask(ref EngineContext ctx) {
                         net.config.nick,
                         ownerId);
 
-                    // 1. Remove from connection manager — sends QUIT, closes socket
-                    ctx.connManager.removeNetwork(net.config.id);
+                    // Closure must precede cleanup; a stale cached tenant may
+                    // not disable a row transferred while the close was waiting.
+                    if (!ctx.connManager.stopNetworkForMove(net.config.id, 60.seconds)) continue;
+                    auto latest = ctx.networkRepo.findByIdWithUser(net.config.id);
+                    if (latest.userId != persisted.userId
+                            || ctx.serverRegistry.getServerForNetwork(netId) != ctx.localServer.serverId
+                            || networkMoveFenced(ctx.redis.getDb(), netId)) continue;
 
                     // 2. Persist disabled flag in MongoDB
                     try {
@@ -849,9 +907,7 @@ void startOrphanReaperTask(ref EngineContext ctx) {
                         auto db = ctx.redis.getDb();
                         db.del(RedisKeys.state(ctx.localServer.serverId, netId));
                         db.del(RedisKeys.state_legacy(netId));
-                        db.hdel(RedisKeys.networkAssignments(), netId);
                         db.del(RedisKeys.networkFail(netId));
-                        db.del(RedisKeys.lease(netId));
                         logInfo("Orphan reaper: cleaned Redis state for network %s", netId);
                     } catch (Exception e) {
                         logWarn("Orphan reaper: failed to clean Redis for %s: %s", netId, e.msg);

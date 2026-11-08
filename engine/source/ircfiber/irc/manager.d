@@ -9,15 +9,17 @@ import vibe.core.log;
 
 import ircfiber.models.irc_event : IRCRawEvent;
 import ircfiber.models.network : Network, NetworkConfig;
-import ircfiber.irc.connection : PersistentIRCClient;
+import ircfiber.irc.connection : PersistentIRCClient, HistoryRequestResult;
+import ircfiber.irc.bnc_ownership : BncCommandOwner;
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.holder_client : HolderClient, HolderEntry, AttachResult;
 import ircfiber.engine.session_snapshot : SessionSnapshot;
-import ircfiber.redis.protocol : RedisKeys;
+import ircfiber.redis.protocol : RedisKeys, IRCCommand;
 import ircfiber.logging : logJsonMap;
 import std.uuid : parseUUID;
 import vibe.data.json : Json;
 import std.datetime : Clock;
+import core.time : Duration;
 
 /// Per-host circuit breaker state. Tracks consecutive failures to the
 /// same host so we don't hammer unresponsive servers (getting us banned).
@@ -35,6 +37,12 @@ private struct HostCircuitBreaker {
 final class ConnectionManager {
     private {
         PersistentIRCClient[string] clients;
+        // Removed generations can still be inside holder DIAL. Keep them
+        // until their actual loop/attach completion, not just map removal.
+        PersistentIRCClient[][string] retiredClients;
+        bool[string] knownNetworks;
+        bool[string] moveStops;
+        bool terminating;
         Channel!IRCRawEvent mainEventChannel;
         UUID[string] networkOwners;
         RedisStorage redis;
@@ -82,10 +90,16 @@ final class ConnectionManager {
         return result;
     }
 
+    bool hasNetworkHistory(UUID id) const {
+        return (id.toString() in knownNetworks) !is null;
+    }
+
     /// Adds a network for a user and starts its IRC client.
     void addNetwork(NetworkConfig config, UUID userId) {
         if (config.servicesProvisioningPending) return;
         auto key = config.id.toString();
+        if (terminating || key in moveStops) return;
+        knownNetworks[key] = true;
         if (key in clients) {
             logWarn("Network %s already managed", config.name);
             return;
@@ -106,6 +120,8 @@ final class ConnectionManager {
     void addAndStartNetwork(NetworkConfig config, UUID userId) {
         if (config.servicesProvisioningPending) return;
         auto key = config.id.toString();
+        if (terminating || key in moveStops) return;
+        knownNetworks[key] = true;
         if (key in clients) {
             logWarn("Network %s already managed", config.name);
             return;
@@ -145,9 +161,52 @@ final class ConnectionManager {
             // check sees the admin's intent without waiting for a
             // process restart to reload from MongoDB.
             (*p).getConfig().disabled = true;
+            retiredClients[key] ~= *p;
             clients.remove(key);
             networkOwners.remove(key);
         }
+    }
+
+    /// Positive source closure, bounded independently of the control consumer.
+    /// Missing/untracked generations and ambiguous IPC are not closure proof.
+    bool stopNetworkForMove(UUID networkId, Duration timeout) {
+        import vibe.core.core : sleep;
+        import core.time : msecs;
+        import ircfiber.irc.dial_guard : networkDialsQuiescent;
+        import ircfiber.term_signal : termSignal;
+        const key = networkId.toString();
+        if (terminating || termSignal() != 0 || holder is null || key !in knownNetworks
+                || key in moveStops) return false;
+        moveStops[key] = true;
+        scope(exit) moveStops.remove(key);
+        const deadline = Clock.currTime + timeout;
+        PersistentIRCClient[] generations;
+        if (auto old = key in retiredClients) generations ~= *old;
+        if (auto client = key in clients) generations ~= *client;
+        foreach (client; generations) client.requestMoveStop();
+        foreach (client; generations) client.stop();
+        while (true) {
+            if (terminating || termSignal() != 0 || Clock.currTime >= deadline) return false;
+            bool quiet = true;
+            foreach (client; generations) if (!client.getMoveQuiescent) quiet = false;
+            if (quiet && networkDialsQuiescent(redis, serverId, key)) break;
+            sleep(25.msecs);
+        }
+        // Every generation is now unable to create another entry. CLOSE all,
+        // including entries a late DIAL returned after stop() first ran.
+        foreach (entry; holder.list()) {
+            if (Clock.currTime >= deadline || terminating || termSignal() != 0) return false;
+            if (entry.tag.networkId == key && entry.state == "open")
+                holder.close(entry.id, "routing move");
+        }
+        if (Clock.currTime >= deadline || terminating || termSignal() != 0) return false;
+        foreach (entry; holder.list())
+            if (entry.tag.networkId == key && entry.state == "open") return false;
+        if (!networkDialsQuiescent(redis, serverId, key)) return false;
+        clients.remove(key);
+        networkOwners.remove(key);
+        retiredClients.remove(key);
+        return true;
     }
 
     /// How long a removal is remembered. Long enough to outlive the event
@@ -447,14 +506,36 @@ final class ConnectionManager {
         }
     }
 
-    /// Issues a CHATHISTORY request on the named network. Silently no-ops
-    /// if the network isn't connected, the client doesn't have the
-    /// chathistory cap, or another request is in flight for the channel.
-    void requestChathistory(UUID networkId, string channel, string command,
+    /// Private BNC commands never use the web message-echo label registry.
+    void submitBncRaw(UUID networkId, string line, string wireLabel,
+            BncCommandOwner owner, string[string] clientTags = null) {
+        if (auto client = getClient(networkId))
+            client.submitBncRaw(line, wireLabel, owner, clientTags);
+    }
+
+    void submitBncMessage(UUID networkId, string target, string text, string wireLabel,
+            BncCommandOwner owner, string[string] clientTags = null) {
+        if (auto client = getClient(networkId))
+            client.submitBncMessage(target, text, wireLabel, owner, clientTags);
+    }
+
+    void handleBncMonitor(UUID networkId, IRCCommand command, long nowMs) {
+        if (auto client = getClient(networkId))
+            client.handleBncMonitor(command, nowMs);
+    }
+
+    /// Admission result distinguishes queued work from unsupported/invalid requests.
+    HistoryRequestResult requestChathistory(UUID networkId, string channel, string command,
                             string refMsgid, int limit) {
-        if (auto client = getClient(networkId)) {
-            client.requestChathistory(channel, command, refMsgid, limit);
-        }
+        if (auto client = getClient(networkId))
+            return client.requestChathistory(channel, command, refMsgid, limit);
+        return HistoryRequestResult.unsupported;
+    }
+
+    /// Called only by the ordered processor after the page's Redis verdict.
+    void confirmHistoryPage(UUID networkId, string requestId, bool committed) {
+        if (auto client = getClient(networkId))
+            client.confirmHistoryPage(requestId, committed);
     }
 
     /// Returns the latest msgid observed for the channel on the given network.
@@ -539,6 +620,7 @@ final class ConnectionManager {
     /// watcher task drives it): the upstream sockets live in the holder
     /// process, so nothing closes them "on exit" any more.
     void shutdown() {
+        terminating = true;
         import vibe.core.core : sleep;
         import core.time : msecs;
         foreach (client; clients) {
@@ -585,6 +667,23 @@ final class ConnectionManager {
     /// DISCONNECTED events. Bounded (each META write has a 10 s holder
     /// timeout; the process exits right after this returns).
     void detachAllForHotSwap() {
+        terminating = true;
+        foreach (client; clients) client.inhibitNewDials();
+        foreach (generations; retiredClients)
+            foreach (client; generations) client.inhibitNewDials();
+        // A successful hot swap drains tracked DIALs before process exit.
+        // On timeout the durable marker remains, denying later move ack.
+        import ircfiber.irc.dial_guard : networkDialsQuiescent;
+        import vibe.core.core : sleep;
+        import core.time : seconds, msecs;
+        const deadline = Clock.currTime + 60.seconds;
+        foreach (key; knownNetworks.byKey) {
+            while (!networkDialsQuiescent(redis, serverId, key)) {
+                if (Clock.currTime >= deadline)
+                    throw new Exception("hot swap has an unproven in-flight holder DIAL");
+                sleep(25.msecs);
+            }
+        }
         auto paused = pauseAllForDetach();
         size_t live;
         foreach (client; paused) {
@@ -616,6 +715,8 @@ final class ConnectionManager {
         import core.time : seconds;
         if (config.servicesProvisioningPending) return;
         auto key = config.id.toString();
+        if (terminating || key in moveStops) return;
+        knownNetworks[key] = true;
         if (key in clients) {
             logWarn("Network %s already managed", config.name);
             return;
@@ -626,6 +727,9 @@ final class ConnectionManager {
         removedAtMs.remove(key);
 
         bool tryAttach() {
+            if (terminating || client.getStopping) return true;
+            client.beginHeldAttach();
+            scope(exit) client.endHeldAttach();
             AttachResult r;
             try {
                 r = holder.attach(entry.id);
@@ -649,6 +753,11 @@ final class ConnectionManager {
                     ["network": config.name, "holderId": entry.id, "err": e.msg, "event": "attach_fail"]);
                 client.attachPending = false;
                 client.start();
+                return true;
+            }
+            if (terminating || client.getStopping) {
+                r.stream.close();
+                holder.close(entry.id, "routing move during attach");
                 return true;
             }
             client.attachPending = false;

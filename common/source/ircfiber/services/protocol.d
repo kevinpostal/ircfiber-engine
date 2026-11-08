@@ -44,8 +44,8 @@ struct AkickAddParams { string channel; string mask; string reason; }
 struct AkickRemoveParams { string channel; string entry; }
 struct BotAssignParams { string channel; string bot; }
 struct IdentifyParams { string account; string password; }
-struct RegisterParams { string password; string email; }
-struct ConfirmParams { string code; }
+struct RegisterParams { string password; string email; string account; }
+struct ConfirmParams { string code; string account; }
 struct GroupParams { string account; string password; }
 struct RecoverParams { string nick; string password; }
 struct PrivacyParams { PrivacyField field; bool enabled; }
@@ -59,6 +59,13 @@ struct AkillRemoveParams { string entry; }
 struct HostActivateParams { string nick; }
 struct HostRejectParams { string nick; string reason; }
 struct GlobalSendParams { string text; }
+
+/// Nonsecret result pickup identity; safe for worker handoff.
+struct ServicesResultRef {
+    string requestId;
+    ServiceAction action;
+    string expectedConnectionEpoch;
+}
 
 /// Only this envelope enters the expiring single-use payload store. Never log it.
 struct ServicesRequest {
@@ -352,8 +359,8 @@ Json validateParams(ServiceAction action, Json j) {
         case ServiceAction.channelAkickRemove: return decode!AkickRemoveParams(j);
         case ServiceAction.botAssign: return decode!BotAssignParams(j);
         case ServiceAction.accountIdentify: return decode!IdentifyParams(j);
-        case ServiceAction.accountRegister: return decode!RegisterParams(j, ["email"]);
-        case ServiceAction.accountConfirm: return decode!ConfirmParams(j);
+        case ServiceAction.accountRegister: return decode!RegisterParams(j, ["email", "account"]);
+        case ServiceAction.accountConfirm: return decode!ConfirmParams(j, ["account"]);
         case ServiceAction.accountGroup: return decode!GroupParams(j, ["password"]);
         case ServiceAction.accountRecover: return decode!RecoverParams(j, ["password"]);
         case ServiceAction.accountPrivacy: return decode!PrivacyParams(j);
@@ -411,6 +418,9 @@ private Json decode(T)(Json j, string[] optional = []) {
                 nickIdentifier(text, optional.canFind(field));
             else static if (field == "recipient") {
                 if (text.length && text[0] == '#') channelIdentifier(text); else accountIdentifier(text);
+            } else static if ((is(T == RegisterParams) && field == "password")
+                    || (is(T == ConfirmParams) && field == "code")) {
+                enforce(text.length <= 512 && !containsControl(text), "Invalid authentication secret");
             } else static if (field == "mask" || field == "entry" || field == "host" || field == "email"
                     || field == "code" || field == "password")
                 if (text.length || !optional.canFind(field)) token(text);
@@ -557,4 +567,21 @@ private string optionalString(Json j, string key) {
     j["owner"] = Json(randomUUID().toString);
     assertThrown(ServicesManualPayload.fromJson(j));
     assertThrown(ServicesManualPayload(p.requestId, "raw", "NickServ", "x", "", p.expectedConnectionEpoch).toJson());
+}
+
+@("registration secrets preserve UTF8 spaces but reject controls and byte overflow") unittest {
+    import std.exception : assertThrown;
+    import std.array : replicate;
+    auto registration = validateParams(ServiceAction.accountRegister, Json(["password": Json(" é pass ")]));
+    assert(registration["password"].get!string == " é pass ");
+    assert(registration["account"].get!string == "" && registration["email"].get!string == "");
+    auto confirmation = validateParams(ServiceAction.accountConfirm, Json(["code": Json(" code with spaces ")]));
+    assert(confirmation["code"].get!string == " code with spaces ");
+    foreach (secret; ["has\tcontrol", "has\x7fcontrol", "é".replicate(257)])
+        assertThrown(validateParams(ServiceAction.accountRegister, Json(["password": Json(secret)])));
+    assertThrown(validateParams(ServiceAction.accountConfirm, Json(["code": Json("bad\ncode")])));
+    assertThrown(validateParams(ServiceAction.accountIdentify,
+        Json(["account": Json("acct"), "password": Json("legacy spaces")])));
+    assertThrown(validateParams(ServiceAction.accountRegister,
+        Json(["password": Json("valid"), "account": Json("*")])));
 }

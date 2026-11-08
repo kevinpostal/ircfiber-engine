@@ -1,206 +1,157 @@
+/** Stable per-saved-connection addresses inside a provider-owned routed /64.
+ * Parsing/composition does not allocate an identity or imply that a socket used it.
+ */
 module ircfiber.irc.ipv6;
 
-import std.uuid : UUID, parseUUID;
-import std.string : strip, endsWith, indexOf, toLower;
-import std.conv : to;
-import std.algorithm : canFind;
+import core.sys.posix.arpa.inet : inet_pton, inet_ntop;
+import core.sys.posix.sys.socket : AF_INET6;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// IRCCloud-style per-user IPv6 (id-UID → 2001:db8::UID_HEX)
-// ─────────────────────────────────────────────────────────────────────────────
-// Each IRCCloud user connects from their own unique IPv6 address, mapped
-// from their user ID. We replicate that: given a routed /64 (or /48) and
-// a stable per-user UUID, derive a deterministic /128 inside the prefix.
-//
-// Provider gives you e.g. 2001:67c:2f08:1::/64 routed to the VPS.
-// User 550e8400-e29b-41d4-a716-446655440000 → take low 64 bits
-// (a716:4466:5544:0000) → 2001:67c:2f08:1:a716:4466:5544:0000
-// Tiny UIDs: short hex still works, e.g. id 1234 (0x4d2) → ::4d2
-// (but we always emit a full 64-bit IID for stability).
-//
-// Host must allow binding to any address in the prefix without an
-// explicit `ip addr add` per user:
-//   sysctl -w net.ipv6.ip_nonlocal_bind=1
-//   ip -6 route add local <prefix>/64 dev lo
-// or `ip addr add` + NDP proxy. The `local` route is cheapest.
-
-/// Strip CIDR suffix (/64, /48...) and whitespace.
-string normalizePrefix(string raw) @safe pure {
-    auto s = raw.strip();
-    if (s.length == 0) return "";
-    auto slash = s.indexOf("/");
-    if (slash >= 0) s = s[0 .. slash].strip();
-    return s;
+/// Only aligned global-unicast /64 CIDRs are routed pools. No guessed subnet,
+/// missing mask, surrounding whitespace, scoped address or textual fallback.
+bool parseRoutedIpv6Prefix(string cidr, out ubyte[16] prefix) @trusted nothrow @nogc {
+    prefix[] = 0;
+    if (cidr.length < 5 || cidr.length > 48 || cidr[$ - 3 .. $] != "/64") return false;
+    const address = cidr[0 .. $ - 3];
+    if (address.length > 45) return false;
+    foreach (char c; address)
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') || c == ':')) return false;
+    char[46] text = void;
+    text[0 .. address.length] = address;
+    text[address.length] = '\0';
+    ubyte[16] parsed;
+    if (inet_pton(AF_INET6, text.ptr, parsed.ptr) != 1) return false;
+    // The documentation prefix is deliberately accepted for isolated fixtures;
+    // enabling a node still requires provider ownership and return-path proof.
+    if ((parsed[0] & 0xe0) != 0x20) return false;
+    foreach (b; parsed[8 .. 16]) if (b != 0) return false;
+    prefix = parsed;
+    return true;
 }
 
-/// True if string looks like an IPv6 prefix (contains colon).
-bool isIPv6Prefix(string raw) @safe pure {
-    auto p = normalizePrefix(raw);
-    return p.length > 0 && p.canFind(":");
+/// Binary source membership; does not assert provider ownership or reachability.
+bool ipv6InRoutedPrefix(string cidr, string source) @trusted nothrow @nogc {
+    ubyte[16] prefix;
+    if (!parseRoutedIpv6Prefix(cidr, prefix) || !source.length || source.length > 45)
+        return false;
+    foreach (char c; source)
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
+                || (c >= 'A' && c <= 'F') || c == ':')) return false;
+    char[46] text = void;
+    text[0 .. source.length] = source;
+    text[source.length] = '\0';
+    ubyte[16] address;
+    return inet_pton(AF_INET6, text.ptr, address.ptr) == 1
+        && address[0 .. 8] == prefix[0 .. 8];
 }
 
-/// Derive the 64-bit Interface ID hex for a user from their UUID.
-/// Takes the low 64 bits (data[8..16]) of the std.uuid UUID, which for
-/// v4 UUIDs is random and stable per user. Falls back to FNV-1a of the
-/// string form if parsing fails.
-string iidHexForUser(UUID uid) @safe pure {
-    // UUID data is ubyte[16]; low 64 bits are data[8..16]
-    // Format as 16 lowercase hex chars.
-    import std.format : format;
-    ubyte[16] d = uid.data;
-    ulong lo = (cast(ulong) d[8] << 56) | (cast(ulong) d[9] << 48)
-             | (cast(ulong) d[10] << 40) | (cast(ulong) d[11] << 32)
-             | (cast(ulong) d[12] << 24) | (cast(ulong) d[13] << 16)
-             | (cast(ulong) d[14] << 8)  | (cast(ulong) d[15]);
-    // Avoid all-zero IID (would collide with subnet-router anycast ::).
-    // If lo==0 (nil UUID), use a non-zero sentinel.
-    if (lo == 0) lo = 0xFFFF_FFFF_FFFF_FFFEUL;
-    return format("%016x", lo);
+private int hexNibble(char c) @safe pure nothrow @nogc {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
 }
 
-/// FNV-1a 64-bit hash of a string, formatted as 16 hex chars.
-/// Used when we only have a string userId (e.g. from Redis) or a non-UUID.
-string iidHexForString(string s) @safe pure nothrow {
-    import std.format : format;
-    ulong h = 14695981039346656037UL;
-    foreach (c; s) {
-        h ^= cast(ubyte) c;
-        h *= 1099511628211UL;
+private bool usableIid(const ubyte[8] iid) @safe pure nothrow @nogc {
+    // RFC 4291 modified EUI-64 universal/local bit: locally assigned IID.
+    if ((iid[0] & 0x02) != 0) return false;
+    bool lowInfrastructure = true;
+    foreach (b; iid[0 .. 6]) if (b != 0) lowInfrastructure = false;
+    if (lowInfrastructure) return false;
+    // RFC 2526 reserved subnet-anycast IDs for modified EUI-64 subnets.
+    if (iid[0] == 0xfd && iid[7] >= 0x80) {
+        bool reserved = true;
+        foreach (b; iid[1 .. 7]) if (b != 0xff) reserved = false;
+        if (reserved) return false;
     }
-    if (h == 0) h = 0xFFFF_FFFF_FFFF_FFFEUL;
-    try return format("%016x", h);
-    catch (Exception) return "ffff000000000001";
+    return true;
 }
 
-/// Build the full per-user IPv6 address.
-/// prefix: e.g. "2001:67c:2f08:1::", "2001:db8:abcd:0012::/64", "2001:db8::1"
-// Returns "" if prefix is empty/invalid.
-string ipv6ForUser(string prefixRaw, UUID uid) @safe pure {
-    auto p = normalizePrefix(prefixRaw);
-    if (p.length == 0) return "";
-    if (!p.canFind(":")) return "";
-    auto iidHex = iidHexForUser(uid);
-    return joinPrefixAndIID(p, iidHex);
-}
-
-/// String overload: derive IID via FNV-1a of the string (for call sites that
-/// only have a string userId).
-string ipv6ForUser(string prefixRaw, string userIdStr) @safe pure {
-    auto p = normalizePrefix(prefixRaw);
-    if (p.length == 0) return "";
-    if (!p.canFind(":")) return "";
-    if (userIdStr.length == 0) return "";
-    // Try to parse as UUID first for stability with the UUID overload.
-    try {
-        import std.uuid : parseUUID;
-        auto uid = parseUUID(userIdStr);
-        return ipv6ForUser(prefixRaw, uid);
-    } catch (Exception) {}
-    auto iidHex = iidHexForString(userIdStr);
-    return joinPrefixAndIID(p, iidHex);
-}
-
-private string joinPrefixAndIID(string prefix, string iidHex) @safe pure {
-    // iidHex is 16 hex chars → 4 groups of 4: aaaa:bbbb:cccc:dddd
-    assert(iidHex.length == 16);
-    auto g1 = iidHex[0 .. 4];
-    auto g2 = iidHex[4 .. 8];
-    auto g3 = iidHex[8 .. 12];
-    auto g4 = iidHex[12 .. 16];
-    auto iid = g1 ~ ":" ~ g2 ~ ":" ~ g3 ~ ":" ~ g4;
-
-    // Normalize prefix handling:
-    // - "2001:db8:1::"  → "2001:db8:1:" + iid  (avoid ":::")
-    // - "2001:db8:1::/64" already stripped → "2001:db8:1::"
-    // - "2001:db8:1:"    → "2001:db8:1:" + iid
-    // - "2001:db8:1"     → "2001:db8:1:" + iid
-    // - "2001:db8::1"    → "2001:db8::1:" + iid  (rare, but keep)
-    if (prefix.endsWith("::")) {
-        // Keep the :: compression, append IID directly after it.
-        // "2001:db8:1::" + "a716:4466:5544:0000" → "2001:db8:1::a716:4466:5544:0000"
-        // But "::" already ends with ":", so just append IID without extra colon.
-        return prefix ~ iid;
-    } else if (prefix.endsWith(":")) {
-        return prefix ~ iid;
-    } else {
-        return prefix ~ ":" ~ iid;
+private bool parseIid(string hex, out ubyte[8] iid) @safe pure nothrow @nogc {
+    iid[] = 0;
+    if (hex.length != 16) return false;
+    foreach (i; 0 .. 8) {
+        const high = hexNibble(hex[i * 2]);
+        const low = hexNibble(hex[i * 2 + 1]);
+        if (high < 0 || low < 0) return false;
+        iid[i] = cast(ubyte)((high << 4) | low);
     }
+    return usableIid(iid);
 }
 
-/// Generate the rDNS-style hostname for a user, IRCCloud style:
-/// id-1234.highgate.irccloud.com → id-<short>.poolHost
-/// For UUIDs we use the first 8 hex chars (or a short hash) as the id.
-string rdnsForUser(UUID uid, string poolHost) @safe pure {
-    if (poolHost.length == 0) return "";
-    auto s = uid.toString();
-    // Use first 8 hex chars without dashes as short id (like IRCCloud's integer)
-    string hex;
-    foreach (c; s) if (c != '-') hex ~= c;
-    if (hex.length > 8) hex = hex[0 .. 8];
-    return "id-" ~ hex.toLower() ~ "." ~ poolHost;
+bool validIpv6Iid(string iidHex) @safe pure nothrow @nogc {
+    ubyte[8] iid;
+    return parseIid(iidHex, iid);
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────────
+/// Returns a source reservation, never evidence of the active transport.
+string ipv6ForConnection(string routedPrefix, string iidHex) @trusted {
+    ubyte[16] address;
+    ubyte[8] iid;
+    if (!parseRoutedIpv6Prefix(routedPrefix, address) || !parseIid(iidHex, iid)) return "";
+    address[8 .. 16] = iid[];
+    char[46] text;
+    if (inet_ntop(AF_INET6, address.ptr, text.ptr, cast(uint)text.length) is null) return "";
+    size_t length;
+    while (length < text.length && text[length]) ++length;
+    return text[0 .. length].idup;
+}
 
-@("normalizePrefix strips CIDR and whitespace")
+/// Eight CSPRNG bytes, fail closed. This creates a candidate IID only; Mongo's
+/// unique reservation is the sole authority for the saved connection identity.
+bool generateIpv6Iid(out string iidHex) @trusted {
+    import deimos.openssl.rand : RAND_bytes;
+    enum digits = "0123456789abcdef";
+    iidHex = null;
+    ubyte[8] raw;
+    scope(exit) raw[] = 0;
+    foreach (_; 0 .. 8) {
+        if (RAND_bytes(raw.ptr, cast(int)raw.length) != 1) return false;
+        raw[0] &= cast(ubyte)~0x02;
+        if (!usableIid(raw)) continue;
+        char[16] hex;
+        foreach (i, b; raw) {
+            hex[i * 2] = digits[b >> 4];
+            hex[i * 2 + 1] = digits[b & 0x0f];
+        }
+        iidHex = hex[].idup;
+        return true;
+    }
+    return false;
+}
+
+@("binary /64 composition preserves all four prefix and IID hextets")
 unittest {
-    assert(normalizePrefix(" 2001:db8::/64 ") == "2001:db8::");
-    assert(normalizePrefix("2001:db8::1") == "2001:db8::1");
-    assert(normalizePrefix("") == "");
+    assert(ipv6ForConnection("2001:db8:1234:5678::/64", "a516446655440123")
+        == "2001:db8:1234:5678:a516:4466:5544:123");
+    assert(ipv6ForConnection("2001:0DB8:0000:0000:0000:0000:0000:0000/64", "a516446655440123")
+        == "2001:db8::a516:4466:5544:123");
+    foreach (prefix; ["", "2001:db8::", "2001:db8::/128", "2001:db8::/48", "2001:db8::1/64",
+            "2001:db8:1/64", " 2001:db8::/64", "2001:db8::/64 ", "2001:db8::/064", "2001:db8::%en0/64",
+            "::ffff:192.0.2.0/64", "192.0.2.0/64", "fc00::/64", "fe80::/64", "ff02::/64", "::/64", "::1/64"])
+        assert(ipv6ForConnection(prefix, "a516446655440123") == "", prefix);
 }
 
-@("ipv6ForUser deterministic and valid")
+@("source membership uses binary prefix boundaries")
 unittest {
-    import std.uuid : parseUUID;
-    auto uid = parseUUID("550e8400-e29b-41d4-a716-446655440000");
-    auto a = ipv6ForUser("2001:67c:2f08:1::", uid);
-    auto b = ipv6ForUser("2001:67c:2f08:1::", uid);
-    assert(a == b);
-    assert(a == "2001:67c:2f08:1::a716:4466:5544:0000");
-    // CIDR suffix is ignored
-    assert(ipv6ForUser("2001:67c:2f08:1::/64", uid) == a);
-    // Different user → different address
-    auto uid2 = parseUUID("550e8400-e29b-41d4-a716-446655440001");
-    assert(ipv6ForUser("2001:67c:2f08:1::", uid2) != a);
+    assert(ipv6InRoutedPrefix("2001:db8:1:2::/64", "2001:0DB8:0001:0002::1234"));
+    foreach (source; ["2001:db8:1:3::1234", "2001:db8:1:20::1234", "::1",
+            "2001:db8:1:2::1234%en0", "2001:db8:1:2::1234\0", "192.0.2.1"])
+        assert(!ipv6InRoutedPrefix("2001:db8:1:2::/64", source), source);
+    assert(!ipv6InRoutedPrefix("2001:db8:1:2::1/64", "2001:db8:1:2::1234"));
 }
 
-@("ipv6ForUser string overload matches UUID overload")
+@("IID syntax, local bit, infrastructure and subnet-anycast reservations are enforced")
 unittest {
-    import std.uuid : parseUUID;
-    auto uid = parseUUID("550e8400-e29b-41d4-a716-446655440000");
-    assert(ipv6ForUser("2001:db8::", uid) == ipv6ForUser("2001:db8::", uid.toString()));
+    assert(validIpv6Iid("a516446655440123"));
+    assert(validIpv6Iid("0000000000010000"));
+    assert(validIpv6Iid("fdffffffffffff7f"));
+    foreach (iid; ["", "a51644665544012", "a5164466554401234", "A516446655440123", "g516446655440123",
+            "a716446655440123", "0000000000000000", "000000000000ffff", "fdffffffffffff80", "fdffffffffffffff"])
+        assert(ipv6ForConnection("2001:db8::/64", iid) == "", iid);
 }
 
-@("ipv6ForUser empty prefix returns empty")
+@("generated IID satisfies the source identity constraints")
 unittest {
-    import std.uuid : parseUUID;
-    auto uid = parseUUID("550e8400-e29b-41d4-a716-446655440000");
-    assert(ipv6ForUser("", uid) == "");
-    assert(ipv6ForUser("not-an-ipv6", uid) == "");
-}
-
-@("ipv6ForUser prefix without :: still works")
-unittest {
-    import std.uuid : parseUUID;
-    auto uid = parseUUID("550e8400-e29b-41d4-a716-446655440000");
-    // Prefix without trailing :: gets a colon inserted
-    assert(ipv6ForUser("2001:db8:1", uid) == "2001:db8:1:a716:4466:5544:0000");
-    assert(ipv6ForUser("2001:db8:1:", uid) == "2001:db8:1:a716:4466:5544:0000");
-}
-
-@("nil UUID does not produce ::")
-unittest {
-    import std.uuid : UUID;
-    auto nil = UUID.init;
-    auto a = ipv6ForUser("2001:db8::", nil);
-    assert(a.length > 0);
-    assert(a != "2001:db8::0000:0000:0000:0000");
-}
-
-@("rdnsForUser formats id-xxxx.pool")
-unittest {
-    import std.uuid : parseUUID;
-    auto uid = parseUUID("550e8400-e29b-41d4-a716-446655440000");
-    assert(rdnsForUser(uid, "highgate.irccloud.com") == "id-550e8400.highgate.irccloud.com");
-    assert(rdnsForUser(uid, "") == "");
+    string iid;
+    assert(generateIpv6Iid(iid));
+    assert(validIpv6Iid(iid));
 }

@@ -34,9 +34,9 @@ private string makeActor() {
  * safe on a clean namespace. Skips the handoff boot path
  * (`IRCFIBER_RELOAD_FROM_PID` set) so adopted sockets keep their state.
  *
- * Wipes `irc:*:<serverId>:*` keys + `irc:server:<id>` +
- * `irc:control:<id>` + `irc:server-assignments:<id>` atomically via Lua
- * so a parallel janitor can never re-create them mid-purge.
+ * Wipes ephemeral `irc:*:<serverId>:*` keys and server/control bookkeeping.
+ * Persistent DIAL uncertainty and reverse ownership evidence survive: neither
+ * a restart nor an absent heartbeat proves that the holder closed its sockets.
  *
  * NOT `*:<serverId>:*`: that also matched `scrollback:<serverId>:<net>:
  * <buffer>`, so every engine start deleted every user's chat history —
@@ -56,7 +56,10 @@ long purgeLocalServerNamespace(RedisDatabase db, string serverId) @trusted {
         "repeat\n" ~
         "  local res = redis.call('SCAN', cursor, 'MATCH', 'irc:*:' .. sid .. ':*', 'COUNT', 500)\n" ~
         "  cursor = res[1]\n" ~
-        "  local keys = res[2]\n" ~
+        "  local keys = {}\n" ~
+        "  for _, key in ipairs(res[2]) do\n" ~
+        "    if string.sub(key, 1, 18) ~= 'irc:routing:dials:' then keys[#keys + 1] = key end\n" ~
+        "  end\n" ~
         "  if #keys > 0 then\n" ~
         "    deleted = deleted + redis.call('UNLINK', unpack(keys))\n" ~
         "  end\n" ~
@@ -64,7 +67,6 @@ long purgeLocalServerNamespace(RedisDatabase db, string serverId) @trusted {
         "deleted = deleted + redis.call('UNLINK',\n" ~
         "  'irc:server:' .. sid,\n" ~
         "  'irc:control:' .. sid,\n" ~
-        "  'irc:server-assignments:' .. sid,\n" ~
         "  'irc:draining:' .. sid)\n" ~
         "redis.call('SREM', 'irc:servers', sid)\n" ~
         "return deleted\n";
@@ -267,7 +269,10 @@ final class EngineJanitor {
                 "local batch = tonumber(ARGV[3])\n" ~
                 "local res = redis.call('SCAN', cursor, 'MATCH', '*:' .. sid .. ':*', 'COUNT', batch)\n" ~
                 "cursor = res[1]\n" ~
-                "local keys = res[2]\n" ~
+                "local keys = {}\n" ~
+                "for _, key in ipairs(res[2]) do\n" ~
+                "  if string.sub(key, 1, 18) ~= 'irc:routing:dials:' then keys[#keys + 1] = key end\n" ~
+                "end\n" ~
                 "local deleted = 0\n" ~
                 "if #keys > 0 then\n" ~
                 "  deleted = redis.call('UNLINK', unpack(keys))\n" ~
@@ -306,7 +311,6 @@ final class EngineJanitor {
                 "  return 0\n" ~
                 "end\n" ~
                 "redis.call('SREM', 'irc:servers', sid)\n" ~
-                "redis.call('DEL', 'irc:server-assignments:' .. sid)\n" ~
                 "redis.call('DEL', 'irc:control:' .. sid)\n" ~
                 "local evt = cjson.encode({\n" ~
                 "  ts = tonumber(now),\n" ~

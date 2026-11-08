@@ -27,6 +27,10 @@
  *    fan-out: fences, correlated private replies, discovery WHOIS/VERSION,
  *    own echoes of frame commands and of sensitive service commands, and
  *    backlog replies a previous engine's transaction left in the holder.
+ * Native REGISTER/VERIFY instead use ACKed account-registration options and
+ * one unlabelled retained-socket lane. Only authentic explicit server
+ * verdicts settle it; cancellation after dispatch keeps a secret-free
+ * unresolved marker until terminal drain or replacement socket.
  *
  * What it deliberately does not do: interpret service text. Success is
  * never inferred from quiet time, a fence, an IRC ACK or unknown text.
@@ -52,6 +56,7 @@ import ircfiber.services.config : ServiceId, ServicesConfig, ServicesProvider, S
 import ircfiber.services.protocol : ServicesRequest, ServicesResult, ServiceAction, ServiceStatus,
     ServicesKeys, serviceFor, isAuthentication, permitsUnauthenticated, enforceServiceWireLimit;
 import ircfiber.services.privacy : serviceTarget, sensitiveServiceMessage;
+public import ircfiber.engine.session_snapshot : NativeQuietMarker;
 
 // ── Limits ─────────────────────────────────────────────────────────────────
 
@@ -132,6 +137,11 @@ interface ServicesHost {
     long nowMs();
     /// Live connection epoch; "" when no live, attached, registered socket.
     string liveEpoch();
+    /// ACKed capabilities and their public values; advertised-only is not support.
+    bool hasCapability(string name);
+    string capabilityValue(string name);
+    /// Retained holder socket id, or a fresh per-dial UUID.
+    string socketIdentity();
     /// Current own nick.
     string ownNick();
     /// `nick` is us (current, optimistic previous, verified prefix).
@@ -154,8 +164,8 @@ interface ServicesHost {
     void wake();
     /// The non-secret holder marker changed (transaction start/end).
     void markerChanged();
-    /// A suppressed WHOIS of our own current nick returned a 330 account:
-    /// record it as the server-stated login (never configuration).
+    /// Suppressed self-WHOIS or authentic live native SUCCESS: record the
+    /// server-stated login through the connection's identity-change path.
     void adoptOwnAccount(string account);
     /// Our live status prefixes on `channel` from the server-fed roster
     /// (`"@"`, `"~@"`, `""` = member without status). False when we are
@@ -604,6 +614,7 @@ private final class DiscoveryRun {
 struct ServicesQuietMarker {
     string[] prefixes;
     long untilMs;
+    NativeQuietMarker native;
 }
 
 /// Per-connection services transport.
@@ -620,6 +631,14 @@ final class ServicesTransport {
     private long[string] privateMsgids;
     private string[] privateMsgidOrder;
     private ServicesQuietMarker quiet;
+    private NativeQuietMarker nativeQuiet;
+    private ServicesRequest nativeRequest;
+    private void delegate(ServicesResult) nativeDeliver;
+    private string nativeEpoch;
+    private string nativeOptions;
+    private string nativeLine;
+    private long nativeDeadline;
+    private bool nativeWriteSelected;
     /// Requests waiting for the self-WHOIS before admission.
     private string[] pendingAdmission;
     /// Legacy NickServ authentication commands on THIS socket whose verdict
@@ -706,6 +725,244 @@ final class ServicesTransport {
     }
 
     // ── Request admission ─────────────────────────────────────────────
+    // Native authentication is one retained-socket lane, not a labeled
+    // operation: an asynchronous verdict can arrive after an early ACK.
+    private bool nativeAction(const ref ServicesRequest req) {
+        if (req.action == ServiceAction.accountRegister || req.action == ServiceAction.accountConfirm)
+            return true;
+        if (req.action != ServiceAction.accountInfo) return false;
+
+        // Native registration exposes only our observed identity, not an
+        // account directory. Every explicit foreign target still needs the
+        // approved NickServ endpoint, grammar and (when supplied) target WHOIS.
+        const account = req.params["account"].type == Json.Type.string ? req.params["account"].get!string : "";
+        const targetNick = req.params["targetNick"].type == Json.Type.string ? req.params["targetNick"].get!string : "";
+        if (targetNick.length && !host.isOwnNick(targetNick)) return false;
+        if (!account.length) return targetNick.length != 0;
+        const actor = host.actor();
+        return host.sameNick(account,
+            actor.state == ServicesActorState.account ? actor.account : host.ownNick());
+    }
+
+    private static string nativeCommandLine(string line) {
+        import std.string : stripLeft, indexOf, toUpper;
+        auto rest = line.stripLeft;
+        foreach (prefix; ['@', ':']) if (rest.length && rest[0] == prefix) {
+            auto sp = rest.indexOf(' ');
+            rest = sp < 0 ? "" : rest[sp + 1 .. $].stripLeft;
+        }
+        auto sp = rest.indexOf(' ');
+        const command = (sp < 0 ? rest : rest[0 .. sp]).toUpper;
+        return command == "REGISTER" || command == "VERIFY" ? command : "";
+    }
+
+    private bool sameActor(string expected) {
+        const actor = host.actor();
+        return expected.length ? actor.state == ServicesActorState.account
+            && host.sameNick(expected, actor.account) : actor.state != ServicesActorState.account;
+    }
+
+    private Json registrationOptions() {
+        import std.string : split, startsWith;
+        auto options = Json(["protocol": Json("native"), "beforeConnect": Json(false),
+            "customAccountName": Json(false), "emailRequired": Json(false)]);
+        foreach (token; host.capabilityValue("draft/account-registration").split(",")) {
+            if (token == "before-connect") options["beforeConnect"] = Json(true);
+            else if (token == "custom-account-name") options["customAccountName"] = Json(true);
+            else if (token == "email-required") options["emailRequired"] = Json(true);
+            else foreach (pair; [["min-password-length=", "minPasswordBytes"],
+                                ["max-password-length=", "maxPasswordBytes"]]) {
+                if (!token.startsWith(pair[0])) continue;
+                const value = token[pair[0].length .. $].to!long;
+                enforce(value > 0 && value <= 9_007_199_254_740_991L, "Invalid native password limit");
+                options[pair[1]] = Json(value);
+            }
+        }
+        auto min = "minPasswordBytes" in options;
+        auto max = "maxPasswordBytes" in options;
+        enforce(min is null || max is null || min.get!long <= max.get!long, "Invalid native password limits");
+        return options;
+    }
+
+    private Json nativeCapabilities(Json options) {
+        auto capability = Json(["state": Json("allowed"), "registration": options]);
+        return Json(["accountRegister": capability, "accountConfirm": capability]);
+    }
+
+    private void admitNative(ServicesRequest req, void delegate(ServicesResult) complete,
+            string epoch, long capAt) {
+        import ircfiber.services.protocol : validateParams;
+        syncNativeSocket();
+        if (!sameActor(req.expectedActorAccount))
+            return answerRequest(req, complete, epoch, ServiceStatus.stale, "actor_changed");
+        Json options;
+        try { options = registrationOptions(); req.params = validateParams(req.action, req.params); }
+        catch (Exception) { return answerRequest(req, complete, epoch, ServiceStatus.unavailable, "invalid_native_options"); }
+        if (req.action == ServiceAction.accountInfo) {
+            ServicesResult result;
+            result.requestId = req.requestId;
+            result.connectionEpoch = epoch;
+            result.action = req.action;
+            result.status = ServiceStatus.confirmed;
+            const actor = host.actor();
+            result.data = Json(["kind": Json("account"), "nick": Json(host.ownNick()),
+                "account": Json(actor.state == ServicesActorState.account ? actor.account : ""),
+                "identified": Json(actor.state == ServicesActorState.account)]);
+            result.capabilities = nativeCapabilities(options);
+            remember(result);
+            deliverSafely(complete, result);
+            return;
+        }
+        if (nativeQuiet.unresolved)
+            return answerRequest(req, complete, epoch, ServiceStatus.unavailable, "native_auth_unresolved");
+        if (activeCount() >= ServicesKeys.maxActivePerConnection || slots[ServiceId.nickServ].txn !is null
+                || legacyAuthPending())
+            return answerRequest(req, complete, epoch, ServiceStatus.unavailable, "service_busy");
+        string account = req.params["account"].get!string;
+        if (account.length && !options["customAccountName"].get!bool && !host.sameNick(account, host.ownNick()))
+            return answerRequest(req, complete, epoch, ServiceStatus.rejected, "custom_account_name_unsupported");
+        const wireAccount = account.length ? account : "*";
+        if (!account.length) account = host.ownNick();
+        const command = req.action == ServiceAction.accountRegister ? "REGISTER" : "VERIFY";
+        string line;
+        if (command == "REGISTER") {
+            const password = req.params["password"].get!string;
+            const email = req.params["email"].get!string;
+            if (options["emailRequired"].get!bool && !email.length)
+                return answerRequest(req, complete, epoch, ServiceStatus.rejected, "email_required");
+            auto min = "minPasswordBytes" in options;
+            auto max = "maxPasswordBytes" in options;
+            if ((min !is null && password.length < min.get!long)
+                    || (max !is null && password.length > max.get!long))
+                return answerRequest(req, complete, epoch, ServiceStatus.rejected, "password_length");
+            line = "REGISTER " ~ wireAccount ~ " " ~ (email.length ? email : "*") ~ " :" ~ password;
+        } else line = "VERIFY " ~ wireAccount ~ " :" ~ req.params["code"].get!string;
+        if (line.length + 2 > host.lineLimit())
+            return answerRequest(req, complete, epoch, ServiceStatus.rejected, "line_too_long");
+        nativeQuiet = NativeQuietMarker(host.socketIdentity(), command, account, "unlabelled", true);
+        nativeRequest = req;
+        nativeRequest.params = Json.undefined;
+        nativeDeliver = complete;
+        nativeEpoch = epoch;
+        nativeOptions = host.capabilityValue("draft/account-registration");
+        nativeDeadline = capAt;
+        nativeLine = line;
+        host.markerChanged();
+        host.wake();
+    }
+
+    /// Consumes native raw commands only from the protected single-use path.
+    bool submitManualNative(string line, string expectedEpoch) {
+        import ircfiber.irc.parser : parseIRCLineNamed;
+        if (!nativeCommandLine(line).length) return false;
+        auto event = parseIRCLineNamed(line, "", "22222222-2222-4222-8222-222222222222");
+        auto params = event.getParams();
+        ServicesRequest request;
+        request.requestId = randomUUID().toString;
+        request.expectedConnectionEpoch = expectedEpoch;
+        request.expectedActorAccount = host.actor().account;
+        try {
+            import ircfiber.services.protocol : validateParams;
+            if (event.command == "REGISTER" && params.length == 3) {
+                request.action = ServiceAction.accountRegister;
+                request.params = Json(["account": Json(params[0] == "*" ? "" : params[0]),
+                    "email": Json(params[1] == "*" ? "" : params[1]), "password": Json(params[2])]);
+            } else if (event.command == "VERIFY" && params.length == 2) {
+                request.action = ServiceAction.accountConfirm;
+                request.params = Json(["account": Json(params[0] == "*" ? "" : params[0]), "code": Json(params[1])]);
+            } else return true;
+            request.params = validateParams(request.action, request.params);
+            if (host.hasCapability("draft/account-registration"))
+                execute(request, (ServicesResult ignored) {});
+        } catch (Exception) {}
+        return true;
+    }
+
+    private void syncNativeSocket() {
+        if (nativeQuiet.unresolved && nativeQuiet.socketId != host.socketIdentity()) {
+            nativeQuiet = NativeQuietMarker.init;
+            if (nativeDeliver !is null) finishNative(ServiceStatus.unconfirmed, "socket_changed");
+        }
+    }
+
+    private void finishNative(ServiceStatus status, string reason, Json data = Json.undefined,
+            bool terminal = false) {
+        auto complete = nativeDeliver;
+        ServicesResult result;
+        result.requestId = nativeRequest.requestId;
+        result.action = nativeRequest.action;
+        result.connectionEpoch = nativeEpoch;
+        result.status = status;
+        result.reasonCode = reason;
+        result.data = data;
+        if (terminal || nativeLine.length) nativeQuiet = NativeQuietMarker.init;
+        nativeLine = "";
+        nativeDeliver = null;
+        nativeRequest = ServicesRequest.init;
+        nativeEpoch = "";
+        nativeOptions = "";
+        nativeWriteSelected = false;
+        host.markerChanged();
+        if (complete !is null) { remember(result); deliverSafely(complete, result); }
+    }
+
+    void onRegistrationCapabilityChanged() {
+        invalidateCapabilities();
+        if (nativeDeliver !is null)
+            finishNative(nativeLine.length ? ServiceStatus.stale : ServiceStatus.unconfirmed, "capabilities_changed");
+    }
+
+    /// Always consume verdicts, but settle only authentic live socket work.
+    bool interceptNative(ref IRCRawEvent event, bool historical, bool holderBacklog) {
+        import std.string : indexOf;
+        const p = event.getParams();
+        const fail = event.command == "FAIL" && p.length && (p[0] == "REGISTER" || p[0] == "VERIFY");
+        if (event.command != "REGISTER" && event.command != "VERIFY" && !fail) return false;
+        syncNativeSocket();
+        const server = event.prefix.length && event.prefix.indexOf('!') < 0 && event.prefix.indexOf('.') >= 0;
+        if (!server || !nativeQuiet.unresolved || nativeQuiet.mode != "unlabelled") return true;
+        const command = fail ? p[0] : event.command;
+        if (command != nativeQuiet.command) return true;
+        string account;
+        if (fail) {
+            if (p.length < 3) return true;
+            if (p.length > 3) account = p[2];
+        } else {
+            if (p.length < 3 || (p[0] != "SUCCESS" && p[0] != "VERIFICATION_REQUIRED")) return true;
+            if (p[0] == "VERIFICATION_REQUIRED" && command != "REGISTER") return true;
+            account = p[1];
+        }
+        if (account.length && !host.sameNick(account, nativeQuiet.account)) return true;
+        // Archives cannot drain a live lane. Holder backlog can only drain
+        // the previous owner's unresolved marker, never settle active work.
+        if (historical || (holderBacklog && nativeDeliver !is null)) return true;
+        if (nativeDeliver is null) {
+            nativeQuiet = NativeQuietMarker.init;
+            host.markerChanged();
+            return true;
+        }
+        if (holderBacklog || nativeLine.length || host.liveEpoch() != nativeEpoch) return true;
+        if (fail) {
+            import std.string : toLower;
+            const code = ["ACCOUNT_EXISTS", "BAD_ACCOUNT_NAME", "INVALID_EMAIL", "INVALID_CODE",
+                "UNACCEPTABLE_PASSWORD", "PASSWORD_TOO_SHORT", "PASSWORD_TOO_LONG",
+                "TEMPORARILY_UNAVAILABLE", "ALREADY_AUTHENTICATED", "REGISTRATION_DISABLED",
+                "VERIFICATION_FAILED", "ACCOUNT_REQUIRED", "NOT_REGISTERED"].canFind(p[1])
+                ? p[1].toLower : "native_rejected";
+            finishNative(ServiceStatus.rejected, code, Json.undefined, true);
+        }
+        else {
+            const acceptedAccount = account.length ? account : nativeQuiet.account;
+            auto data = Json(["kind": Json("registration"), "account": Json(acceptedAccount),
+                "state": Json(p[0] == "SUCCESS" ? "identified" : "verification_required")]);
+            if (p[0] == "VERIFICATION_REQUIRED") data["instructions"] = Json(p[$ - 1]);
+            const success = p[0] == "SUCCESS";
+            finishNative(ServiceStatus.confirmed, "", data, true);
+            if (success) host.adoptOwnAccount(acceptedAccount);
+        }
+        return true;
+    }
+
 
     /// Runs one validated request on the live connection. `complete` is
     /// called exactly once (possibly synchronously). `issuedMs` is the
@@ -740,6 +997,10 @@ final class ServicesTransport {
             return answerRequest(req, complete, epoch, ServiceStatus.stale, "epoch_stale");
         syncEpoch(epoch);
         if (now >= capAt) return answerRequest(req, complete, epoch, ServiceStatus.stale, "request_expired");
+        // Native registration has no provider/WHOIS dependency. It retains
+        // actor/epoch checks but does not discover or trust a pseudoclient.
+        if (host.hasCapability("draft/account-registration") && nativeAction(req))
+            return admitNative(req, complete, epoch, capAt);
 
         // No server statement about our login yet (no 900, no WHOX): ask
         // with a standard, suppressed WHOIS of our own nick. A non-empty
@@ -819,6 +1080,9 @@ final class ServicesTransport {
         if (op is null) return answer(ServiceStatus.unavailable, "adapter_unavailable");
         const service = serviceFor(req.action);
         auto slot = &slots[service];
+        syncNativeSocket();
+        if (isAuthentication(req.action) && nativeQuiet.unresolved)
+            return answer(ServiceStatus.unavailable, "native_auth_unresolved");
         if (slot.txn !is null) return answer(ServiceStatus.unavailable, "service_busy");
         if (isAuthentication(req.action) && slot.authAmbiguous)
             return answer(ServiceStatus.unavailable, "auth_pending_ambiguous");
@@ -853,6 +1117,12 @@ final class ServicesTransport {
     /// transaction is in flight: the caller must refuse it, not queue it.
     /// Returns the conventional nick of the busy service, or "".
     string lockedServiceFor(string line) {
+        syncNativeSocket();
+        if (nativeQuiet.unresolved) {
+            if (nativeCommandLine(line).length) return "REGISTER";
+            foreach (id; lineServiceTargets(line, host.servicesConfig()))
+                if (id == ServiceId.nickServ) return "NickServ";
+        }
         bool any;
         foreach (ref s; slots) if (s.txn !is null) { any = true; break; }
         if (!any) return "";
@@ -865,6 +1135,8 @@ final class ServicesTransport {
     /// `lockedServiceFor` for a chat message: only its target list counts
     /// (a multi-line body is several messages to the same targets).
     string lockedServiceForTargets(string targets) {
+        syncNativeSocket();
+        if (nativeQuiet.unresolved && targetsNickServ(targets, host.servicesConfig())) return "NickServ";
         bool any;
         foreach (ref s; slots) if (s.txn !is null) { any = true; break; }
         if (!any) return "";
@@ -891,6 +1163,14 @@ final class ServicesTransport {
         cancelAll("cancelled_disconnect");
         resetEpochState("");
         resetLegacyAuth();
+        syncNativeSocket();
+    }
+
+    /// Before graceful handoff META: unsent work has no verdict to drain.
+    /// Dispatched uncertainty remains marked on the retained socket.
+    void prepareNativeDetach() {
+        if (nativeDeliver !is null)
+            finishNative(nativeLine.length ? ServiceStatus.stale : ServiceStatus.unconfirmed, "cancelled_detach");
     }
 
     /// Hot-swap detach: the next engine sees the marker in META.
@@ -1005,6 +1285,8 @@ final class ServicesTransport {
     /// already dispatched had their marker published before their first
     /// line and continue.
     void failClosedMeta() {
+        if (nativeDeliver !is null && nativeLine.length)
+            finishNative(ServiceStatus.stale, "meta_unavailable");
         foreach (ref s; slots)
             if (s.txn !is null && !s.txn.bodiesWritten) cancelTransaction(s.txn, "meta_unavailable");
     }
@@ -1111,6 +1393,9 @@ final class ServicesTransport {
     /// The server stated our login (900/901/ACCOUNT/WHOX).
     void onOwnAccount(ServicesActor actor) {
         invalidateCapabilities();
+        if (nativeDeliver !is null && !sameActor(nativeRequest.expectedActorAccount)
+                && (actor.state != ServicesActorState.account || !host.sameNick(actor.account, nativeQuiet.account)))
+            finishNative(nativeLine.length ? ServiceStatus.stale : ServiceStatus.unconfirmed, "actor_changed");
         foreach (ref s; slots) s.authAmbiguous = false;
         foreach (ref s; slots) {
             auto txn = s.txn;
@@ -1131,14 +1416,24 @@ final class ServicesTransport {
     }
 
     /// Restores the previous engine's marker on attach.
-    void restoreQuiet(string[] prefixes, long untilMs) {
-        if (untilMs <= host.nowMs() || prefixes.length == 0) return;
-        quiet = ServicesQuietMarker(prefixes.dup, untilMs);
+    void restoreQuiet(const ref ServicesQuietMarker marker) {
+        if (marker.untilMs > host.nowMs() && marker.prefixes.length)
+            quiet = ServicesQuietMarker(marker.prefixes.dup, marker.untilMs);
+        if (marker.native.unresolved) {
+            nativeQuiet = marker.native;
+            if (!nativeQuiet.socketId.length || nativeQuiet.mode != "unlabelled"
+                    || (nativeQuiet.command != "REGISTER" && nativeQuiet.command != "VERIFY")) {
+                nativeQuiet = NativeQuietMarker(host.socketIdentity(), "", "", "invalid", true);
+            }
+            syncNativeSocket();
+        }
     }
 
     /// Marker for the holder META: prefixes of in-flight transactions.
     ServicesQuietMarker marker() {
         ServicesQuietMarker m;
+        syncNativeSocket();
+        m.native = nativeQuiet;
         foreach (ref s; slots) {
             if (s.txn is null || !s.endpoint.ident.length) continue;
             const p = s.endpoint.nick ~ "!" ~ s.endpoint.ident ~ "@" ~ s.endpoint.host;
@@ -1160,6 +1455,9 @@ final class ServicesTransport {
     void tick() {
         const now = host.nowMs();
         expire(now);
+        syncNativeSocket();
+        if (nativeDeliver !is null && now >= nativeDeadline)
+            finishNative(nativeLine.length ? ServiceStatus.stale : ServiceStatus.unconfirmed, "deadline");
         const epoch = host.liveEpoch();
         if (epoch != stateEpoch && (epoch.length || hasActiveWork())) syncEpoch(epoch);
         foreach (ref s; slots) {
@@ -1189,6 +1487,19 @@ final class ServicesTransport {
     string nextWrite() {
         const epoch = host.liveEpoch();
         const now = host.nowMs();
+        syncNativeSocket();
+        nativeWriteSelected = false;
+        if (nativeLine.length) {
+            if (now >= nativeDeadline || epoch != nativeEpoch
+                    || !host.hasCapability("draft/account-registration")
+                    || host.capabilityValue("draft/account-registration") != nativeOptions
+                    || !sameActor(nativeRequest.expectedActorAccount)) {
+                finishNative(ServiceStatus.stale, "capabilities_changed");
+            } else {
+                nativeWriteSelected = true;
+                return nativeLine;
+            }
+        }
         while (queue.length) {
             if (!epoch.length || queue[0].epoch != epoch) {
                 syncEpoch(epoch);
@@ -1225,6 +1536,12 @@ final class ServicesTransport {
 
     /// The line `nextWrite` returned was written to the socket.
     void popWrite() {
+        if (nativeWriteSelected) {
+            nativeWriteSelected = false;
+            nativeLine = "";
+            host.markerChanged();
+            return;
+        }
         if (!queue.length) return;
         auto q = queue[0];
         queue = queue[1 .. $];
@@ -1235,7 +1552,7 @@ final class ServicesTransport {
     }
 
     /// Lines waiting for the pacer.
-    @property size_t queued() const { return queue.length; }
+    @property size_t queued() const { return queue.length + (nativeLine.length ? 1 : 0); }
 
     // ── Inbound interception ──────────────────────────────────────────
 
@@ -1378,13 +1695,14 @@ final class ServicesTransport {
     }
 
     private bool inFlight(string requestId) {
+        if (nativeDeliver !is null && nativeRequest.requestId == requestId) return true;
         foreach (ref s; slots) if (s.txn !is null && s.txn.req.requestId == requestId) return true;
         return pendingAdmission.canFind(requestId)
             || (discovery !is null && discovery.req.requestId == requestId);
     }
 
     private size_t activeCount() {
-        size_t n = discovery !is null ? 1 : 0;
+        size_t n = (discovery !is null ? 1 : 0) + (nativeDeliver !is null ? 1 : 0);
         foreach (ref s; slots) if (s.txn !is null) ++n;
         return n;
     }
@@ -2118,6 +2436,8 @@ final class ServicesTransport {
     }
 
     private void cancelAll(string reason) {
+        if (nativeDeliver !is null)
+            finishNative(nativeLine.length ? ServiceStatus.stale : ServiceStatus.unconfirmed, reason);
         foreach (ref s; slots)
             if (s.txn !is null) cancelTransaction(s.txn, reason);
         if (discovery !is null) finishDiscovery(ServiceStatus.stale, reason);
@@ -2440,6 +2760,9 @@ private final class LedgerHost : ServicesHost {
     ServicesTransport t;
     long nowMs() { return now; }
     string liveEpoch() { return epoch; }
+    bool hasCapability(string) { return false; }
+    string capabilityValue(string) { return ""; }
+    string socketIdentity() { return "ledger-socket"; }
     string ownNick() { return "me"; }
     bool isOwnNick(string n) { return icmp(n, "me") == 0; }
     bool sameNick(string a, string b) { return icmp(a, b) == 0; }

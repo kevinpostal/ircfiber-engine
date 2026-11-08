@@ -29,6 +29,22 @@ spacing, including Super Nets' decorated `ENTER THE VOID` refusal. A rejected
 exit is host-banned by the existing routing policy; the next attempt uses another
 eligible exit within the network's selected provider rather than retrying that IP.
 
+## IRCv3 recovery
+
+Replay ancestry is resolved before current-state handlers. Historical state
+events stay in their enclosing conversation's timeline without changing the
+current roster, identity, topic, metadata or automatic actions. Nested multiline
+and valid open batches survive retained-socket adoption; malformed ancestry is
+quarantined rather than reclassified as live.
+
+Known gaps paginate from a frozen committed boundary; short nonempty pages do
+not imply completion. TARGETS discovery also finds missed conversations.
+`irc:history:recovery:<networkId>` stores committed per-target progress and
+`*targets` discovery state without a TTL. Ordered processor acknowledgement
+advances a page only after Redis append/dedup acceptance under current ownership.
+This preserves, rather than strengthens, existing asynchronous MongoDB durability.
+Unresolvable timestamp-only boundaries remain explicitly stalled.
+
 Part of [kevinpostal/irc-fiber](https://github.com/kevinpostal/irc-fiber) superproject.
 
 ## Quick start

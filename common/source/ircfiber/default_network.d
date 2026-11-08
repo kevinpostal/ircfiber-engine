@@ -35,12 +35,20 @@ import vibe.core.log;
 
 import ircfiber.models.network : NetworkConfig, TLSMode, SASLMechanism;
 import ircfiber.models.user : User;
-import ircfiber.db.network : NetworkRepository;
+import ircfiber.db.network : NetworkRepository, Ipv6IdentityException;
 import ircfiber.db.user : UserRepository;
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.redis.protocol : RedisKeys, ControlMessage;
 import ircfiber.irc.registry : ServerRegistry;
-import ircfiber.irc.routing_policy : RouteKind;
+import ircfiber.irc.routing_moves : requestNetworkMove, networkMoveFenced;
+import ircfiber.models.irc_event : IRCRawEvent;
+import ircfiber.irc.routing_policy : RouteKind, resolveRoutingPolicy;
+import ircfiber.irc.routing_policy_store : requireRoutingUpgrade, loadRoutingPolicy,
+    RoutingPolicyUnavailableException;
+
+class DefaultFiberPlacementException : Exception {
+    this(string message) { super(message); }
+}
 
 /// Hostname of the platform-provided IRC server. Overridable via
 /// `IRCFIBER_DEFAULT_NETWORK_HOST` — see the module doc.
@@ -183,9 +191,9 @@ string buildDefaultNick(User user) @safe {
  *   it held for NickServ provisioning; the legacy default assigns an engine
  *   and queues its first addNetwork message.
  *
- * Returns the (existing or new) config. If initial dispatch fails after
- * persistence, bootstrap can recover the enabled row; hard insert failures
- * still throw.
+ * Returns the (existing or new) config. Policy/upgrade/capability refusals
+ * occur before saving. A valid administrator-blocked plan is saved without
+ * assignment or dispatch. Identity/storage failures still throw.
  */
 NetworkConfig ensureDefaultFiberNetwork(
     User user,
@@ -206,9 +214,11 @@ NetworkConfig ensureDefaultFiberNetwork(
     // Skip if user already has a connection to irc.ircfiber.com — do not
     // clobber a network they may have added themselves or a pre-feature
     // default that is already wired up.
-    auto existing = networkRepo.findByUserId(user.id);
+    auto existing = networkRepo.findByUserIdDirect(user.id);
     foreach (ref cfg; existing) {
         if (cfg.host != DEFAULT_FIBER_HOST) continue;
+        const selectedServer = requireDefaultFiberPlacement(cfg, redis, serverRegistry);
+        cfg = networkRepo.findByIdWithIpv6Iid(cfg.id);
         // Top up default channels added after this account was provisioned
         // (e.g. #support). A channel the user deliberately parted stays
         // parted — partedChannels is the engine's PART record.
@@ -219,9 +229,12 @@ NetworkConfig ensureDefaultFiberNetwork(
             if (ch !in have && ch !in parted) { cfg.autoJoinChannels ~= ch; added ~= ch; }
         if (added.length) {
             networkRepo.save(cfg, user.id);   // also drops the userNetworks Redis cache
+            cfg = networkRepo.findByIdWithIpv6Iid(cfg.id);
             try {
                 const sid = serverRegistry.getServerForNetwork(cfg.id.toString());
-                if (sid.length > 0) {
+                if (sid.length > 0 && selectedServer.length
+                        && !networkMoveFenced(redis.getDb(), cfg.id.toString())) {
+                    requireRoutingUpgrade(redis.getDb(), sid);
                     auto up = ControlMessage("updateConfig", cfg.id.toString(), "", cfg.toJson());
                     up.timestampMs = Clock.currTime.toUnixTime!long * 1000;
                     redis.lpush(RedisKeys.control(sid), up.toJson().toString());
@@ -240,7 +253,9 @@ NetworkConfig ensureDefaultFiberNetwork(
     auto userRepo = new UserRepository();
     cfg.defaultAvatarUrl = userRepo.getAvatarUrl(user.id);
     cfg.profileMetadata = userRepo.getProfile(user.id);
+    requireDefaultFiberPlacement(cfg, redis, serverRegistry);
     networkRepo.save(cfg, user.id);
+    cfg = networkRepo.findByIdWithIpv6Iid(cfg.id);
 
     // Race guard: concurrent logins can both pass the `existing` check
     // and insert a duplicate DEFAULT_FIBER_HOST network. Re-read and
@@ -268,44 +283,67 @@ NetworkConfig ensureDefaultFiberNetwork(
             if (keep.id != cfg.id) {
                 // Our newly inserted cfg was deleted — return the keeper instead
                 // and don't push a control message for the deleted id.
-                return keep;
+                return networkRepo.findByIdWithIpv6Iid(keep.id);
             }
         }
-    } catch (Exception) {} // dedup best-effort
+    } catch (Ipv6IdentityException e) { throw e; }
+    catch (Exception) {} // dedup best-effort
 
     if (!cfg.servicesProvisioningPending)
         activateDefaultFiberNetwork(cfg, user.id, redis, serverRegistry);
     return cfg;
 }
 
+/// Shared policy-tier placement is checked before any provisioning write.
+private string requireDefaultFiberPlacement(const NetworkConfig cfg, RedisStorage redis,
+        ServerRegistry registry) {
+    const owner = registry.getServerForNetwork(cfg.id.toString());
+    requireRoutingUpgrade(redis.getDb(), owner);
+    const effective = resolveRoutingPolicy(loadRoutingPolicy(redis.getDb()), cfg.host, cfg.routing);
+    if (!effective.available)
+        throw new RoutingPolicyUnavailableException("Stored routing preferences are invalid");
+    if (!effective.order.length) return "";
+    const selected = registry.selectRoutingServer(effective, "", cfg.id.toString(), cfg.host);
+    if (!selected.serverId.length)
+        throw new DefaultFiberPlacementException("No capable healthy connection server is available");
+    requireRoutingUpgrade(redis.getDb(), selected.serverId);
+    return selected.serverId;
+}
+
 /// Dispatch the initial connection for an owned, enabled, completed network.
 /// Bootstrap recovers persisted rows when no engine or queue is available.
 void activateDefaultFiberNetwork(NetworkConfig cfg, UUID ownerId, RedisStorage redis,
                                  ServerRegistry serverRegistry) {
-    if (cfg.id == UUID.init || ownerId == UUID.init || cfg.disabled
-            || cfg.servicesProvisioningPending) return;
-    string serverId;
-    try {
-        serverId = serverRegistry.getServerForNetwork(cfg.id.toString());
-        if (!serverId.length) serverId = serverRegistry.assignNetwork(cfg.id.toString());
-    } catch (Exception e) {
-        logWarn("activateDefaultFiberNetwork: assignment failed for network=%s: %s",
-                cfg.id.toString(), e.msg);
+    if (cfg.id == UUID.init || ownerId == UUID.init) return;
+    auto repo = new NetworkRepository(redis);
+    repo.ensureIpv6Iid(cfg.id);
+    auto canonical = repo.findByIdWithUser(cfg.id);
+    if (!canonical.isOwnedBy(ownerId)) return;
+    cfg = canonical.config;
+    if (cfg.host != DEFAULT_FIBER_HOST || cfg.disabled || cfg.servicesProvisioningPending) return;
+    const selected = requireDefaultFiberPlacement(cfg, redis, serverRegistry);
+    if (!selected.length) return;
+    auto serverId = serverRegistry.getServerForNetwork(cfg.id.toString());
+    if (!serverId.length) serverId = serverRegistry.claimNetwork(cfg.id.toString(), selected);
+    if (!serverId.length)
+        throw new DefaultFiberPlacementException("No capable healthy connection server is available");
+    if (serverId != selected || networkMoveFenced(redis.getDb(), cfg.id.toString())) {
+        const move = requestNetworkMove(redis.getDb(), cfg.id.toString(), selected);
+        auto event = IRCRawEvent.makeServerLog(cfg.name, cfg.id.toString(), "info",
+            "Connection move pending: waiting for the current engine to close its upstream socket");
+        auto json = event.toCompactJson();
+        json["y"] = "irc_event";
+        json["serverId"] = serverId;
+        json["moveId"] = move.moveId;
+        json["targetServerId"] = move.targetServerId;
+        json["routingMoveState"] = move.state;
+        redis.publish(RedisKeys.events(ownerId.toString()), json.toString());
         return;
     }
-    if (!serverId.length) {
-        logWarn("activateDefaultFiberNetwork: no healthy server for network=%s — " ~
-                "engine will pick it up on next bootstrap", cfg.id.toString());
-        return;
-    }
-    try {
-        auto msg = ControlMessage("addNetwork", cfg.id.toString(), ownerId.toString(), cfg.toJson());
-        msg.timestampMs = Clock.currTime.toUnixTime!long * 1000;
-        redis.lpush(RedisKeys.control(serverId), msg.toJson().toString());
-    } catch (Exception e) {
-        logWarn("activateDefaultFiberNetwork: failed to push addNetwork for network=%s: %s — " ~
-                "engine will pick it up on next bootstrap", cfg.id.toString(), e.msg);
-    }
+    requireRoutingUpgrade(redis.getDb(), serverId);
+    auto msg = ControlMessage("addNetwork", cfg.id.toString(), ownerId.toString(), cfg.toJson());
+    msg.timestampMs = Clock.currTime.toUnixTime!long * 1000;
+    redis.lpush(RedisKeys.control(serverId), msg.toJson().toString());
 }
 
 @("buildDefaultFiberNetwork sets all required fields")

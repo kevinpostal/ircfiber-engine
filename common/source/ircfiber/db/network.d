@@ -11,6 +11,7 @@ import vibe.core.log;
 import ircfiber.models.network;
 import ircfiber.services.config : decodeStoredServicesConfig, ServicesConfig;
 import ircfiber.irc.routing_policy : RoutingPreferences, routingPreferencesFromJson;
+import ircfiber.irc.ipv6 : generateIpv6Iid, validIpv6Iid;
 import ircfiber.db.mongo;
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.redis.protocol : RedisKeys;
@@ -19,6 +20,14 @@ import ircfiber.db.user : idInFilters;
 /// Repository for network configurations.
 final class NetworkRepository {
     private MongoCollection collection;
+    private bool ipv6IidIndexReady;
+    /// Cache connections are thread-affine; background workers supply theirs.
+    private RedisStorage cache;
+
+    version (RoutingPolicyTest) {
+        bool delegate(out string) ipv6IidGeneratorForTest;
+        void delegate(UUID, string) beforeIpv6IidWriteForTest;
+    }
 
     /// Global Redis instance, set at boot from app.d / bootstrap.d.
     __gshared RedisStorage g_redis;
@@ -29,8 +38,9 @@ final class NetworkRepository {
         g_redis = redis;
     }
 
-    /// Creates a new network repository.
-    this() {
+    /// Creates a repository with the caller's cache connection, or the boot default.
+    this(RedisStorage cacheRedis = null) {
+        cache = cacheRedis is null ? g_redis : cacheRedis;
         collection = AppMongoConnection.getDb()["networks"];
         purgeLegacyBncTokens();
     }
@@ -67,9 +77,9 @@ final class NetworkRepository {
     /// Finds all networks for a user, using Redis cache when available.
     NetworkConfig[] findByUserId(UUID userId) {
         // Try Redis cache first
-        if (g_redis !is null) {
+        if (cache !is null) {
             auto key = RedisKeys.userNetworks(userId.toString());
-            auto cached = g_redis.getJson(key);
+            auto cached = cache.getJson(key);
             if (cached.type != Json.Type.null_) {
                 return deserializeNetworkConfigs(cached);
             }
@@ -84,13 +94,14 @@ final class NetworkRepository {
             NetworkConfig[] result;
             foreach (doc; collection.find(["userId": userId.toString()])) {
                 try { result ~= docToConfig(doc); }
+                catch (Ipv6IdentityException e) { throw e; }
                 catch (Exception e) { logWarn("NetworkRepository.findByUserId: skipping broken doc %s: %s", doc["id"].toString(), e.msg); }
             }
 
             // Cache in Redis (60s TTL) so frequent reads don't hammer Mongo.
             // The cache is invalidated on every create/update/delete of a network.
-            if (g_redis !is null) {
-                g_redis.setJson(RedisKeys.userNetworks(userId.toString()), serializeNetworkConfigs(result), 60);
+            if (cache !is null) {
+                cache.setJson(RedisKeys.userNetworks(userId.toString()), serializeNetworkConfigs(result), 60);
             }
 
             return result;
@@ -119,6 +130,7 @@ final class NetworkRepository {
             NetworkConfig[] result;
             foreach (doc; collection.find(["userId": userId.toString()])) {
                 try { result ~= docToConfig(doc); }
+                catch (Ipv6IdentityException e) { throw e; }
                 catch (Exception e) { logWarn("NetworkRepository.findByUserIdDirect: skipping broken doc %s: %s", doc["id"].toString(), e.msg); }
             }
             return result;
@@ -197,6 +209,117 @@ final class NetworkRepository {
         return result;
     }
 
+    /// Reserve only an absent identity. A corrupt or existing identity is
+    /// never overwritten, including by stale ordinary saves.
+    string ensureIpv6Iid(UUID networkId) {
+        try return reserveIpv6Iid(networkId);
+        catch (Ipv6IdentityException e) throw e;
+        catch (Exception e)
+            throw new Ipv6IdentityException("IPv6 identity reservation unavailable: " ~ e.msg);
+    }
+
+    /// Canonical config for assignment/control, never the caller's stale copy.
+    NetworkConfig findByIdWithIpv6Iid(UUID networkId) {
+        const iid = ensureIpv6Iid(networkId);
+        try {
+            auto cfg = findById(networkId);
+            if (cfg.id == UUID.init || cfg.ipv6Iid != iid)
+                throw new Ipv6IdentityException("IPv6 identity changed during canonical reload");
+            return cfg;
+        } catch (Ipv6IdentityException e) { throw e; }
+        catch (Exception e) {
+            throw new Ipv6IdentityException("IPv6 canonical reload unavailable: " ~ e.msg);
+        }
+    }
+
+    private string reserveIpv6Iid(UUID networkId) {
+        ensureIpv6IidIndex();
+        foreach (attempt; 0 .. 8) {
+            auto current = collection.findOne(["id": networkId.toString()]);
+            if (current.isNull) throw new Ipv6IdentityException("Network does not exist");
+            const existing = storedIpv6Iid(current);
+            if (existing.length) {
+                invalidateIpv6OwnerCache(current);
+                return existing;
+            }
+
+            string candidate;
+            bool generated;
+            version (RoutingPolicyTest) {
+                generated = ipv6IidGeneratorForTest !is null
+                    ? ipv6IidGeneratorForTest(candidate) : generateIpv6Iid(candidate);
+            } else {
+                generated = generateIpv6Iid(candidate);
+            }
+            if (!generated || !validIpv6Iid(candidate))
+                throw new Ipv6IdentityException("IPv6 identity entropy unavailable");
+            version (RoutingPolicyTest) {
+                if (beforeIpv6IidWriteForTest !is null)
+                    beforeIpv6IidWriteForTest(networkId, candidate);
+            }
+            // The checked findAndModify helper discards Mongo's numeric error
+            // code. Inspect the raw reply instead of classifying message text.
+            auto command = Bson.emptyObject;
+            command["findAndModify"] = Bson("networks");
+            command["query"] = Bson(["id": Bson(networkId.toString()),
+                "ipv6Iid": Bson(["$exists": Bson(false)])]);
+            command["update"] = Bson(["$set": Bson(["ipv6Iid": Bson(candidate)])]);
+            command["new"] = Bson(true);
+            const reply = AppMongoConnection.getDb().runCommandUnchecked(command);
+            if (reply["ok"].get!double != 1.0) {
+                if (reply["code"].type == Bson.Type.undefined || reply["code"].get!int != 11000)
+                    throw new Ipv6IdentityException("Mongo rejected IPv6 identity reservation");
+            } else {
+                auto reserved = reply["value"];
+                if (!reserved.isNull) {
+                    const iid = storedIpv6Iid(reserved);
+                    if (!iid.length) throw new Ipv6IdentityException("IPv6 reservation returned no identity");
+                    invalidateIpv6OwnerCache(reserved);
+                    return iid;
+                }
+            }
+            auto winner = collection.findOne(["id": networkId.toString()]);
+            if (winner.isNull) throw new Ipv6IdentityException("Network disappeared during IPv6 reservation");
+            const iid = storedIpv6Iid(winner);
+            if (iid.length) {
+                invalidateIpv6OwnerCache(winner);
+                return iid;
+            }
+        }
+        throw new Ipv6IdentityException("IPv6 identity collision retries exhausted");
+    }
+
+    private void ensureIpv6IidIndex() {
+        if (ipv6IidIndexReady) return;
+        // Mongo commands require the verb to be the first BSON field. An
+        // associative-array constructor can reorder it and is not safe here.
+        auto command = Bson.emptyObject;
+        command["createIndexes"] = Bson("networks");
+        command["indexes"] = Bson([Bson([
+            "key": Bson(["ipv6Iid": Bson(1)]),
+            "name": Bson("ipv6Iid_unique_v1"),
+            "unique": Bson(true),
+            "partialFilterExpression": Bson(["ipv6Iid": Bson(["$type": Bson("string")])])
+        ])]);
+        // Failure is fatal: reservations without this index are not unique.
+        AppMongoConnection.getDb().runCommandChecked(command);
+        ipv6IidIndexReady = true;
+    }
+
+    private static string storedIpv6Iid(const(Bson) doc) {
+        const field = doc.tryIndex("ipv6Iid");
+        if (field.isNull) return "";
+        const value = field.get;
+        if (value.type != Bson.Type.string || !validIpv6Iid(value.get!string))
+            throw new Ipv6IdentityException("Stored IPv6 identity is corrupt");
+        return value.get!string.idup;
+    }
+
+    private void invalidateIpv6OwnerCache(const(Bson) doc) {
+        if (cache !is null && doc["userId"].type == Bson.Type.string)
+            cache.del(RedisKeys.userNetworks(doc["userId"].get!string));
+    }
+
     /// Saves or updates a network configuration.
     void save(NetworkConfig config, UUID userId) {
         auto selector = Bson(["id": Bson(config.id.toString())]);
@@ -211,14 +334,15 @@ final class NetworkRepository {
         collection.updateOne(selector, update, options);
         // Invalidate per-user cache so findByUserId doesn't return stale [] for 60s
         // after a new network is provisioned (e.g. ensureDefaultFiberNetwork on register).
-        if (g_redis !is null) {
-            try g_redis.del(RedisKeys.userNetworks(userId.toString()));
+        if (cache !is null) {
+            try cache.del(RedisKeys.userNetworks(userId.toString()));
             catch (Exception) {}
         }
     }
 
     /// The `$set` document `save` writes: every user/admin-editable field.
     /// `servicesProvisioningPending` is insert-only (see `save`).
+    /// The immutable `ipv6Iid` is deliberately never written by this path.
     private static Bson persistedFields(ref NetworkConfig config, UUID userId) {
         return Bson([
             "id": Bson(config.id.toString()),
@@ -294,8 +418,8 @@ final class NetworkRepository {
             ]),
             Bson(["$set": fields]));
         if (result.modifiedCount != 1) return false;
-        if (g_redis !is null) {
-            try g_redis.del(RedisKeys.userNetworks(ownerId.toString()));
+        if (cache !is null) {
+            try cache.del(RedisKeys.userNetworks(ownerId.toString()));
             catch (Exception) {}
         }
         return true;
@@ -341,6 +465,13 @@ final class NetworkRepository {
         foreach (elem; json) {
             NetworkConfig cfg;
             cfg.id = parseUUID(elem["id"].get!string);
+            auto iid = elem["ipv6Iid"];
+            if (iid.type != Json.Type.undefined) {
+                if (iid.type != Json.Type.string
+                        || (iid.get!string.length && !validIpv6Iid(iid.get!string)))
+                    throw new Ipv6IdentityException("Cached IPv6 identity is corrupt");
+                cfg.ipv6Iid = iid.get!string;
+            }
             cfg.name = elem["name"].get!string;
             cfg.host = elem["host"].get!string;
             cfg.port = cast(ushort)elem["port"].get!int;
@@ -382,6 +513,7 @@ final class NetworkRepository {
     private static NetworkConfig docToConfig(const(Bson) doc) {
         NetworkConfig cfg;
         try { cfg.id = parseUUID(doc["id"].get!string); } catch (Exception) {}
+        cfg.ipv6Iid = storedIpv6Iid(doc);
         try { cfg.name = doc["name"].get!string; } catch (Exception) {}
         try { cfg.host = doc["host"].get!string; } catch (Exception) {}
         try { cfg.port = cast(ushort)doc["port"].get!int; } catch (Exception) {}
@@ -420,6 +552,11 @@ final class NetworkRepository {
         cfg.services = storedServices(doc["services"].toJson(), cfg.id.toString());
         return cfg;
     }
+}
+
+/// Allocation/corruption failures must not dispatch an upstream connection.
+class Ipv6IdentityException : Exception {
+    this(string message) { super(message); }
 }
 
 @("NetworkWithUser.isOwnedBy fails closed")

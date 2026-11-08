@@ -4,7 +4,7 @@
 #
 # Stage graph (engine):
 #   base             : Ubuntu 22.04 + LDC toolchain (apt cache mounted)
-#   builder-common   : dub fetch + shared `common` library build (engine)
+#   builder-common   : shared `common` library sources (engine)
 #   builder-engine   : engine binaries (`irc-fiber-engine`, `janitor-migrate`, `ircfiber-default-migrate`)
 #   runtime-engine   : slim Ubuntu + engine binaries only
 #
@@ -12,9 +12,10 @@
 #
 # Caching: the build context is a git checkout, so BuildKit's content hashing
 # of every COPY is the whole invalidation story — no CACHE_BUST sentinels, no
-# `dub --force`. The dub cache mounts persist across builds on the builder
-# host, so a one-file change is an incremental compile. Build identity lives
-# in an ENV-only layer at the very end of runtime-engine.
+# `dub --force`. The dub cache mounts retain fetched packages and compiled
+# third-party dependencies; workspace packages rebuild whenever their BuildKit
+# compile layer changes. Build identity lives in an ENV-only layer at the very
+# end of runtime-engine.
 #
 # Build: docker buildx build --target runtime-engine -f Containerfile.engine . -t test-engine
 #
@@ -64,21 +65,19 @@ SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
 
 # ============================================================================
-# Stage: builder-common — fetch deps + build the shared common library.
+# Stage: builder-common — shared common library sources.
 #
-# `dub build --parallel` parallelizes LDC compile jobs within a config.
-# Without `--force`, dub reuses the incremental module cache in the
-# /build/.dub + /root/.dub cache mounts, so editing one file recompiles
-# only that module.
+# Compile common with its consumers below, under the same locked cache mount.
+# DUB checks source mtimes, not contents, and its package/version build cache
+# survives COPY changes and can contain artifacts from another checkout.
 # ============================================================================
 FROM base AS builder-common
 
 COPY common/dub.sdl common/dub.selections.json ./common/
 COPY common/source/ ./common/source/
 
-RUN --mount=type=cache,target=/build/.dub,sharing=locked \
-    --mount=type=cache,target=/root/.dub,sharing=locked \
-    dub build --root=common --compiler=ldc2 --build=release --parallel
+# No standalone build here: a cached RUN cannot refresh the mutable DUB cache
+# for a later uncached consumer build.
 
 # ============================================================================
 # Stage: builder-engine — engine binaries only (irc-fiber-engine + migrates)
@@ -96,8 +95,12 @@ COPY engine/holder/ ./engine/holder/
 # String-imported Anope message catalogs (services_grammar.d) + attribution.
 COPY engine/catalogs/ ./engine/catalogs/
 
+# Invalidate only workspace-package artifacts on an uncached compile layer.
+# The irc-fiber cache also contains its holder subpackage and migrate configs.
+# Keep all downloaded packages and compiled third-party dependencies cached.
 RUN --mount=type=cache,target=/build/.dub,sharing=locked \
     --mount=type=cache,target=/root/.dub,sharing=locked \
+    rm -rf /root/.dub/cache/irc-fiber-common /root/.dub/cache/irc-fiber && \
     dub build --root=engine --compiler=ldc2 --build=release --parallel && \
     dub build --root=engine :holder --compiler=ldc2 --build=release --parallel && \
     dub build --root=engine --config=janitor-migrate --compiler=ldc2 --build=release --parallel && \
@@ -182,6 +185,7 @@ ENV IRCFIBER_VERSION=0.3.0 \
     IRCFIBER_BUILD_MESSAGE=$GIT_MESSAGE \
     IRCFIBER_BUILD_COMMIT_URL=https://github.com/kevinpostal/ircfiber-engine/commit/$GIT_HASH
 LABEL org.opencontainers.image.revision=$GIT_HASH
+LABEL com.ircfiber.routing-policy-version="1"
 
 # ============================================================================
 # Stage: runtime-holder — slim Ubuntu + the connection holder only.

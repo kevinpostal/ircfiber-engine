@@ -94,16 +94,9 @@ Json heartbeatEchoJson(long[string] changed) {
 
 @("LastSeenRepository.merge is advance-only and returns only changed fields")
 unittest {
-    // Requires a local Redis on 127.0.0.1:6379; skipped when unavailable.
-    RedisStorage redis;
-    try {
-        redis = new RedisStorage();
-        redis.connect();
-        redis.ping();
-    } catch (Exception e) {
-        logWarn("Skipping LastSeenRepository test: Redis unavailable (%s)", e.msg);
-        return;
-    }
+    import ircfiber.testing.isolated_db : isolatedTestRedis;
+    auto redis = isolatedTestRedis("LastSeenRepository.merge");
+    if (redis is null) return;
     auto userId = randomUUID();
     const key = RedisKeys.lastSeen(userId.toString());
     void cleanup() {

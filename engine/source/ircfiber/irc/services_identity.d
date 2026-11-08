@@ -1137,6 +1137,12 @@ private void runAccountRegister(ServicesTransaction txn, AnopeGrammar g) {
     const password = paramString(txn, "password");
     const email = paramString(txn, "email");
     const nick = txn.ownNick();
+    import ircfiber.services.protocol : token;
+    try { token(password); }
+    catch (Exception) { return txn.complete(ServiceStatus.rejected, "legacy_token_required"); }
+    const requested = paramString(txn, "account");
+    if (requested.length && !txn.sameNick(requested, nick))
+        return txn.complete(ServiceStatus.rejected, "custom_account_name_unsupported");
     const body_ = "REGISTER " ~ password ~ (email.length ? " " ~ email : "");
     if (!fitsOrReject(txn, body_)) return;
     requireHelp(txn, "REGISTER", ServiceAction.accountRegister, () {
@@ -1194,6 +1200,12 @@ RegistrationEval evaluateConfirm(AnopeGrammar g, const ref ServiceFrame f) {
 private void runAccountConfirm(ServicesTransaction txn, AnopeGrammar g) {
     const code = paramString(txn, "code");
     const nick = txn.ownNick();
+    import ircfiber.services.protocol : token;
+    try { token(code); }
+    catch (Exception) { return txn.complete(ServiceStatus.rejected, "legacy_token_required"); }
+    const requested = paramString(txn, "account");
+    if (requested.length && !txn.sameNick(requested, nick))
+        return txn.complete(ServiceStatus.rejected, "custom_account_name_unsupported");
     const body_ = (g.v21 ? "CONFIRM REGISTER " : "CONFIRM ") ~ code;
     if (!fitsOrReject(txn, body_)) return;
     requireHelp(txn, confirmCommand(g), ServiceAction.accountConfirm, () {

@@ -13,7 +13,7 @@ import vibe.core.log;
 
 import ircfiber.logging : logException, configureLogging, setLoggingEnabled, isLoggingEnabled;
 import ircfiber.engine.bootstrap : bootstrapEngine, startHeartbeatTask,
-    startOrphanReaperTask, loadNetworksWithRetry, EngineContext;
+    startOrphanReaperTask, loadNetworksWithRetry, refreshRoutingCapabilities, EngineContext;
 import ircfiber.tracing : configureTracing, startTracingExporter,
     isEnvEnabled, setTracingEnabled, isTracingEnabled;
 import ircfiber.observability : configureMetrics, setMetricsEnabled, isMetricsEnabled;
@@ -159,6 +159,7 @@ void main() {
     runTask(() nothrow {
         try {
             logInfo("Registration task STARTING for server %s", ctx.localServer.serverId);
+            refreshRoutingCapabilities(ctx);
             ctx.serverRegistry.registerServer(ctx.localServer);
             logInfo("Server registered via event loop: %s@%s",
                 ctx.localServer.serverId, ctx.localServer.bindAddress);

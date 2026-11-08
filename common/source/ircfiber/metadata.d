@@ -4,11 +4,11 @@
 module ircfiber.metadata;
 
 /// Registry user keys we store and surface (https://ircv3.net/registry#metadata-keys).
-immutable string[] USER_METADATA_KEYS = ["avatar", "bot", "display-name", "homepage", "status"];
+immutable string[] USER_METADATA_KEYS = ["avatar", "bot", "color", "display-name", "homepage", "pronouns", "status"];
 /// Registry channel keys we store and surface.
 immutable string[] CHANNEL_METADATA_KEYS = ["avatar", "display-name"];
 /// Keys a user may set on themselves via the web UI or the bouncer.
-immutable string[] PROFILE_KEYS = ["display-name", "status", "homepage"]; // user-settable via web/bouncer
+immutable string[] PROFILE_KEYS = ["display-name", "pronouns", "status", "homepage", "color"];
 /// Matches the ircd's advertised `draft/metadata-2=max-value-bytes=512`.
 enum MAX_METADATA_VALUE_BYTES = 512;
 
@@ -72,9 +72,18 @@ unittest {
     assert(!isValidMetadataValue("color", "red"));
     assert(!isValidMetadataValue("color", "#12345"));
     assert(!isValidMetadataValue("color", "#12345g"));
+    assert(!isValidMetadataValue("color", "#abc"));
+    assert(!isValidMetadataValue("color", "#12345678"));
+    assert(!isValidMetadataValue("color", " #123456"));
+    assert(!isValidMetadataValue("color", "#123456;background:red"));
 
     // others: valid UTF-8, no C0 controls, no DEL.
     assert(isValidMetadataValue("pronouns", "they/them"));
+    assert(isValidMetadataValue("pronouns", "  they/them  <b>verbatim</b>  "));
+    assert(!isValidMetadataValue("pronouns", "they\tthem"));
+    assert(!isValidMetadataValue("pronouns", "they\x00them"));
+    assert(!isValidMetadataValue("pronouns", "they\x7Fthem"));
+    assert(!isValidMetadataValue("pronouns", "bad\xFFutf8"));
     assert(isValidMetadataValue("display-name", "Zoë ✨"));
     assert(!isValidMetadataValue("status", "line\nbreak"));
     assert(!isValidMetadataValue("display-name", "del\x7F"));
@@ -90,6 +99,8 @@ unittest {
     import std.array : replicate;
     assert(isValidMetadataValue("status", "a".replicate(MAX_METADATA_VALUE_BYTES)));
     assert(!isValidMetadataValue("status", "a".replicate(MAX_METADATA_VALUE_BYTES + 1)));
+    assert(isValidMetadataValue("pronouns", "é".replicate(MAX_METADATA_VALUE_BYTES / 2)));
+    assert(!isValidMetadataValue("pronouns", "é".replicate(MAX_METADATA_VALUE_BYTES / 2 + 1)));
     enum prefix = "https://e.x/";
     assert(isValidMetadataValue("avatar", prefix ~ "a".replicate(MAX_METADATA_VALUE_BYTES - prefix.length)));
     assert(!isValidMetadataValue("avatar", prefix ~ "a".replicate(MAX_METADATA_VALUE_BYTES - prefix.length + 1)));

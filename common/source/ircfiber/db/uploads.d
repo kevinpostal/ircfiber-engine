@@ -196,39 +196,28 @@ final class UploadRepository {
 
 @("UploadRepository.updateContent updates file content")
 unittest {
-    if (!AppMongoConnection.isConnected) {
-        try AppMongoConnection.connect();
-        catch (Throwable) {}
-        if (!AppMongoConnection.isConnected) return;
-    }
-    try {
-        auto repo = new UploadRepository();
-        UploadRecord r;
-        r.id = randomUUID().toString();
-        r.userId = randomUUID().toString();
-        r.filename = "test.py";
-        r.mimeType = "text/x-python";
-        r.size = 10;
-        r.directUrl = "http://localhost:8090/uploads/abc.py";
-        r.createdAt = Clock.currTime.toUnixTime * 1000;
-        repo.insert(r);
-        bool ok = repo.updateContent(r.userId, r.id, "new content", "new.py", 11);
-        assert(ok);
-        auto fetched = repo.getById(r.userId, r.id);
-        assert(fetched.filename == "new.py");
-        assert(fetched.size == 11);
-        // Verify ownership check: wrong user should not update
-        bool wrong = repo.updateContent(randomUUID().toString(), r.id, "x", "x.py", 1);
-        assert(!wrong);
-        // Cleanup
-        repo.hardDelete(r.userId, r.id);
-    } catch (Throwable e) {
-        import core.exception : AssertError;
-        if (cast(AssertError) e) throw e;
-        // Mongo operation failed for other reason - treat as skip when not connected
-        if (!AppMongoConnection.isConnected) return;
-        throw e;
-    }
+    import ircfiber.testing.isolated_db : connectIsolatedTestMongo;
+    if (!connectIsolatedTestMongo("UploadRepository.updateContent")) return;
+    auto repo = new UploadRepository();
+    UploadRecord r;
+    r.id = randomUUID().toString();
+    r.userId = randomUUID().toString();
+    r.filename = "test.py";
+    r.mimeType = "text/x-python";
+    r.size = 10;
+    r.directUrl = "http://localhost:8090/uploads/abc.py";
+    r.createdAt = Clock.currTime.toUnixTime * 1000;
+    repo.insert(r);
+    bool ok = repo.updateContent(r.userId, r.id, "new content", "new.py", 11);
+    assert(ok);
+    auto fetched = repo.getById(r.userId, r.id);
+    assert(fetched.filename == "new.py");
+    assert(fetched.size == 11);
+    // Verify ownership check: wrong user should not update
+    bool wrong = repo.updateContent(randomUUID().toString(), r.id, "x", "x.py", 1);
+    assert(!wrong);
+    // Cleanup
+    repo.hardDelete(r.userId, r.id);
 }
 
 @("UploadRecord round-trips through Bson")

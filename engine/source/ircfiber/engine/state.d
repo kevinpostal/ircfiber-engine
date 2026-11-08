@@ -50,6 +50,8 @@ void writeStateSnapshots(ref EngineContext ctx) {
     publishEgressState(ctx, serverId);
     foreach (net; ctx.connManager.getNetworks()) {
         try {
+            if (auto client = ctx.connManager.getClient(net.config.id))
+                client.flushHistoryCoverage();
             writeStateSnapshotForNetwork(ctx, net, serverId);
         } catch (Exception e) {
             logWarn("Failed to snapshot network %s: %s", net.config.name, e.msg);
@@ -70,6 +72,7 @@ void writeStateSnapshots(ref EngineContext ctx) {
 private Json slotViewToJson(EgressSlotView v) {
     auto j = Json.emptyObject;
     j["label"] = Json(v.label);
+    j["provider"] = Json(v.provider);
     j["host"] = Json(v.host);
     j["port"] = Json(cast(long) v.port);
     j["locationId"] = Json(v.locationId);
@@ -84,6 +87,21 @@ private Json slotViewToJson(EgressSlotView v) {
     j["error"] = Json(v.lastError);
     j["admission"] = v.admission.toJson();
     return j;
+}
+
+@("published provider is independent of labels and retargetability")
+unittest {
+    EgressSlotView view;
+    view.label = "nord-looking-name";
+    view.provider = "mullvad";
+    view.controllable = false;
+    assert(slotViewToJson(view)["provider"].get!string == "mullvad");
+    view.label = "mullvad-looking-name";
+    view.provider = "nordvpn";
+    view.controllable = true;
+    assert(slotViewToJson(view)["provider"].get!string == "nordvpn");
+    view.provider = "";
+    assert(slotViewToJson(view)["provider"].get!string.length == 0);
 }
 
 /// The pickable location catalog as a JSON array.
@@ -172,6 +190,7 @@ void writeStateSnapshotForNetwork(ref EngineContext ctx, Network net, string ser
     auto clientForCaps = ctx.connManager.getClient(net.config.id);
     if (clientForCaps) {
         snap.caps = clientForCaps.getAckedCaps();
+        snap.capValues = clientForCaps.getCapValues();
     }
 
     snap.ownerId = ctx.connManager.getOwnerId(net.config.id);
@@ -291,21 +310,21 @@ void writeStateSnapshotForNetwork(ref EngineContext ctx, Network net, string ser
     if (clientForIsupport) {
         snap.isupport = clientForIsupport.getIsupport();
     }
-    // Active Mullvad egress that won the Happy Eyeballs race for this
-    // network. Surfaced to admin "which IP per IRC server".
+    // Actual transport tier and observed endpoints, plus separate proxy-hop
+    // metadata. A pool reservation is never active connection evidence.
     auto clientForEgress = ctx.connManager.getClient(net.config.id);
     if (clientForEgress) {
         snap.activeEgressLabel = clientForEgress.getActiveEgressLabel();
         snap.activeEgressHost = clientForEgress.getActiveEgressHost();
         snap.activeEgressIp = clientForEgress.getActiveEgressIp();
         snap.activeEgressLocation = clientForEgress.getActiveEgressLocation();
-        // Socket endpoints of the live connection: the peer's family is
-        // the admin's "IPv6 or IPv4?" answer; the local IP shows the
-        // per-user bind (or the shared host/NAT66 address). Gated on
-        // connected so a stale pair never outlives its socket.
+        snap.routingFallbackReason = clientForEgress.getRoutingFallbackReason();
+        // Actual holder socket endpoints, not a proposed pool reservation.
+        // Gate on connected so a stale pair never outlives its socket.
         if (snap.connected) {
             snap.peerIp = clientForEgress.getActivePeerIp();
             snap.localIp = clientForEgress.getActiveLocalIp();
+            snap.activeRoute = clientForEgress.getActiveRoute();
             snap.ownPrefix = clientForEgress.getOwnPrefix();
             // Engine-observed services identity of this epoch (getters
             // export nothing without a live, attached generation).

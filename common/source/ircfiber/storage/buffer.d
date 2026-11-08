@@ -585,11 +585,9 @@ final class BufferManager {
         const networkId = event.networkId.length > 0 ? event.networkId : event.network;
         const channel = event.channel.length > 0 ? normalizeChannel(event.channel) : "_server";
 
-        if (hasDedupKey(serverId, networkId, channel, msgid, event, params)) {
-            return false;
-        }
-        appendMessage(serverId, networkId, channel, msg);
-        return true;
+        if (!serverId.length) throw new Exception("Cannot append namespaced event without serverId");
+        return appendDeduplicatedEvent(KEY_PREFIX ~ serverId ~ ":" ~ networkId ~ ":" ~ channel,
+            serverId, networkId, channel, msgid, event, params, msg);
     }
 
     /// Network-scoped dedup set key for a buffer. Channel is normalized
@@ -619,15 +617,9 @@ final class BufferManager {
         }
     }
 
-    /// Compute a stable dedup key for an event and check it against
-    /// the buffer's Redis dedup set. Returns true if this event is a
-    /// duplicate and should be dropped. `serverId` is only used to adopt
-    /// the legacy server-scoped set; it is not part of the key.
-    private bool hasDedupKey(string serverId, string networkId, string channel,
-                             string msgid, IRCRawEvent event, string[] params) @trusted {
-        channel = normalizeChannel(channel);
-        auto dedupKey = dedupSetKey(networkId, channel);
-        adoptServerDedupSet(serverId, networkId, channel, dedupKey);
+    /// Stable member identity; transport/storage changes must not change it.
+    private string eventDedupMember(string channel, string msgid,
+            ref const IRCRawEvent event, string[] params) @trusted {
 
         string key;
         if (msgid.length > 0) {
@@ -665,11 +657,50 @@ final class BufferManager {
             hashInput ~= "|" ~ event.nick ~ "|" ~ event.text;
             key = "h:" ~ contentHash(hashInput, channel, event.timestampMs, params);
         }
-        auto db = redis.getDb();
-        auto added = db.sadd(dedupKey, key);
-        db.expire(dedupKey, DEDUP_TTL_SECS);
+        return key;
+    }
 
-        return added == 0;
+    /// Commit the row and its dedup verdict together. A failed append must
+    /// never poison a retry's authoritative "already accepted" verdict.
+    private bool appendDeduplicatedEvent(string bufferKey, string serverId,
+            string networkId, string channel, string msgid,
+            ref const IRCRawEvent event, string[] params, Json message) @trusted {
+        const dedupKey = dedupSetKey(networkId, channel);
+        adoptServerDedupSet(serverId, networkId, channel, dedupKey);
+        const member = eventDedupMember(channel, msgid, event, params);
+        enum lastRow = (MAX_SCROLLBACK - 1).to!string;
+        enum rowTTL = (86_400 * TTL_DAYS).to!string;
+        enum dedupTTL = DEDUP_TTL_SECS.to!string;
+        auto verdict = redis.getDb().eval!string(q"LUA
+local bufferType = redis.call('TYPE', KEYS[1]).ok
+local dedupType = redis.call('TYPE', KEYS[2]).ok
+if bufferType ~= 'none' and bufferType ~= 'list' then
+    return redis.error_reply('Scrollback key is not a list')
+end
+if dedupType ~= 'none' and dedupType ~= 'set' then
+    return redis.error_reply('Dedup key is not a set')
+end
+if redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 1 then
+    redis.call('EXPIRE', KEYS[2], ARGV[5])
+    return '0'
+end
+local appended = redis.pcall('LPUSH', KEYS[1], ARGV[2])
+if type(appended) == 'table' and appended.err then return appended end
+local added = redis.pcall('SADD', KEYS[2], ARGV[1])
+if type(added) == 'table' and added.err then
+    redis.call('LPOP', KEYS[1])
+    return added
+end
+redis.call('LTRIM', KEYS[1], 0, ARGV[3])
+redis.call('EXPIRE', KEYS[1], ARGV[4])
+redis.call('EXPIRE', KEYS[2], ARGV[5])
+return '1'
+LUA", [bufferKey, dedupKey],
+            [member, message.toString(), lastRow, rowTTL, dedupTTL]);
+        if (verdict.empty) throw new Exception("Missing atomic scrollback verdict");
+        if (verdict.front == "0") return false;
+        if (verdict.front != "1") throw new Exception("Invalid atomic scrollback verdict");
+        return true;
     }
 
     /// Stable, low-collision hash for messages without msgid.
@@ -905,20 +936,9 @@ final class BufferManager {
         const networkId = event.networkId.length > 0 ? event.networkId : event.network;
         const channel = event.channel.length > 0 ? normalizeChannel(event.channel) : "_server";
 
-        // Legacy path (no serverId) — shares the network-scoped dedup set
-        // with the namespaced path, so restarts and mode switches don't
-        // replay duplicates. This used to be a no-op: hasDedupKey bailed
-        // out whenever serverId was empty, which is every call here.
-        if (hasDedupKey("", networkId, channel, msgid, event, params)) return false;
-
-        auto key = KEY_PREFIX ~ networkId ~ ":" ~ channel;
-        auto db = redis.getDb();
-        auto msgStr = msg.toString();
-
-        db.lpush(key, msgStr);
-        db.ltrim(key, 0, MAX_SCROLLBACK - 1);
-        db.expire(key, 86_400 * TTL_DAYS);
-        return true;
+        // Legacy and namespaced paths share the same network-scoped dedup set.
+        return appendDeduplicatedEvent(KEY_PREFIX ~ networkId ~ ":" ~ channel,
+            "", networkId, channel, msgid, event, params, msg);
     }
 }
 
@@ -953,17 +973,10 @@ unittest {
 
 @("BufferManager.getUnreadTail returns newest chat rows after lastSeen, oldest-first, capped")
 unittest {
-    // Requires a local Redis on 127.0.0.1:6379; skipped when unavailable.
     import std.uuid : randomUUID;
-    RedisStorage redis;
-    try {
-        redis = new RedisStorage();
-        redis.connect();
-        redis.ping();
-    } catch (Exception e) {
-        logWarn("Skipping BufferManager.getUnreadTail test: Redis unavailable (%s)", e.msg);
-        return;
-    }
+    import ircfiber.testing.isolated_db : isolatedTestRedis;
+    auto redis = isolatedTestRedis("BufferManager.getUnreadTail");
+    if (redis is null) return;
     const netId = "netT-" ~ randomUUID().toString();
     const key = "scrollback:srvT:" ~ netId ~ ":#tail";
     const legacyKey = "scrollback:" ~ netId ~ ":#tail";
@@ -1001,4 +1014,58 @@ unittest {
     auto legacy = bm.getUnreadTail("", netId, "#tail", 0, 100);
     assert(legacy.length == 1);
     assert(legacy[0]["x"].get!string == "legacy");
+}
+
+/// Real-Redis regression hook. The caller must supply its isolated fixture
+/// connection; this never connects to a workstation-default database.
+void historyAtomicStorageRegressionChecks(RedisStorage redis) {
+    import std.uuid : randomUUID;
+    assert(redis !is null);
+    auto db = redis.getDb();
+    foreach (namespaced; [false, true]) {
+        const networkId = "history-storage-" ~ randomUUID().toString();
+        const legacyKey = "scrollback:" ~ networkId ~ ":#atomic";
+        const scopedKey = "scrollback:history-test:" ~ networkId ~ ":#atomic";
+        const rowKey = namespaced ? scopedKey : legacyKey;
+        const dedupKey = "dedup:" ~ networkId ~ ":#atomic";
+        void cleanup() {
+            try { db.del(legacyKey); db.del(scopedKey); db.del(dedupKey); }
+            catch (Exception) {}
+        }
+        scope (exit) cleanup();
+        auto manager = new BufferManager(redis);
+        auto event = IRCRawEvent("history-test", "PRIVMSG");
+        event.networkId = networkId;
+        event.channel = "#atomic";
+        event.nick = "old-peer";
+        event.text = "retained row";
+        event.timestampMs = 123_000;
+        event.addTag("msgid", "atomic-1");
+        bool append() {
+            return namespaced ? manager.appendIRCEvent(event, "history-test") : manager.appendIRCEvent(event);
+        }
+        db.set(rowKey, "wrong-type");
+        bool rejected;
+        try append(); catch (Exception) rejected = true;
+        assert(rejected && !db.exists(dedupKey),
+            "A failed scrollback append must not leave an accepted dedup member");
+        db.del(rowKey);
+        assert(append(), "The exact failed row must remain recoverable");
+        assert(!append(), "An already accepted row must return the duplicate verdict");
+        size_t rows;
+        foreach (_; db.lrange!(ubyte[])(rowKey, 0, -1)) ++rows;
+        assert(rows == 1, "Exactly one real row must be retained");
+        if (namespaced) {
+            assert(!manager.appendIRCEvent(event), "Legacy and namespaced paths share dedup identity");
+            assert(!db.exists(legacyKey));
+        }
+        db.del(rowKey);
+        db.del(dedupKey);
+        db.set(dedupKey, "wrong-type");
+        rejected = false;
+        try append(); catch (Exception) rejected = true;
+        assert(rejected && !db.exists(rowKey), "Invalid dedup storage must not append a row");
+        db.del(dedupKey);
+        assert(append() && !append(), "Retry after storage repair accepts the row only once");
+    }
 }

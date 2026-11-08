@@ -29,7 +29,11 @@ import ircfiber.irc.server : ConnectionServer;
 import ircfiber.irc.connection : parseJoinThrottleSeconds, remainingJoinDelayMs, joinBatches,
     memberNeedsRealname, channelNeedsRealnameWho, MAX_WHO_ENRICH_ATTEMPTS,
     upsertRosterEntry, applyNamesBurst, isSaslRequiredRefusal, extractServerReason,
-    saslMechanismOffered, fiberMlsBackstopChecks, fiberMlsWireChecks, servicesIdentityWireChecks;
+    saslMechanismOffered, fiberMlsBackstopChecks, fiberMlsWireChecks, servicesIdentityWireChecks,
+    ircv3ProtocolChecks;
+import ircfiber.engine.session_snapshot : historySnapshotRegressionChecks;
+import ircfiber.engine.processor : historyCheckpointRegressionChecks;
+import ircfiber.irc.bnc_ownership : runBncOwnershipProtocolChecks;
 import std.string : indexOf;
 
 /// Tracks the number of passing checks.
@@ -325,6 +329,13 @@ void main() {
     string[] servicesWire;
     foreach (check; servicesIdentityWireChecks(servicesWire)) ok(check.name, check.passed);
     foreach (line; servicesWire) stderr.writeln("    wire> ", line);
+    stderr.writeln("\n[connection.ircv3] protocol behavior");
+    string[] ircv3Wire;
+    foreach (check; ircv3ProtocolChecks(ircv3Wire)) ok(check.name, check.passed);
+    foreach (line; ircv3Wire) stderr.writeln("    wire> ", line);
+    historySnapshotRegressionChecks();
+    historyCheckpointRegressionChecks();
+    runBncOwnershipProtocolChecks();
     stderr.writeln("\n[", passed, " passed, ", failed, " failed]");
     if (failed > 0) core.stdc.stdlib.exit(1);
 }

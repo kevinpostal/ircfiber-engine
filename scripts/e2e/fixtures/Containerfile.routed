@@ -1,0 +1,6 @@
+FROM python:3.12-alpine
+RUN apk add --no-cache iproute2 openssl
+WORKDIR /fixture
+COPY routed_fixture.py /fixture/routed_fixture.py
+COPY routed_holder_client.py /fixture/routed_holder_client.py
+ENTRYPOINT ["python3", "-u", "/fixture/routed_fixture.py"]

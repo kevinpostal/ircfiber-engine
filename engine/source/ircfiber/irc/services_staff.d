@@ -1703,6 +1703,9 @@ version (ServicesWireHarness) {
 
         long nowMs() { return now; }
         string liveEpoch() { return epoch; }
+        bool hasCapability(string) { return false; }
+        string capabilityValue(string) { return ""; }
+        string socketIdentity() { return "staff-socket"; }
         string ownNick() { return nick; }
         bool isOwnNick(string n) { return icmp(n, nick) == 0; }
         bool sameNick(string a, string b) { return icmp(a, b) == 0; }

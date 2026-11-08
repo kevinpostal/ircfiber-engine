@@ -137,6 +137,8 @@ struct DialRequest {
     bool hasProxy;
     ProxySpec proxy;
     string bindIp6;
+    /// "any" preserves dual-stack Happy Eyeballs; "ipv6" never dials IPv4.
+    string addressFamily = "any";
     long connectTimeoutMs = 10_000;
     long tlsTimeoutMs = 10_000;
     long starttlsTimeoutMs = 15_000;
@@ -169,6 +171,13 @@ struct DialRequest {
             r.proxy.password = jstr(p, "password");
         }
         r.bindIp6 = jstr(j, "bindIp6");
+        auto family = j["addressFamily"];
+        if (family.type != Json.Type.undefined) {
+            if (family.type != Json.Type.string)
+                throw new Exception("DIAL: addressFamily must be any|ipv6");
+            r.addressFamily = family.get!string;
+        }
+        r.validateTransport();
         r.connectTimeoutMs = jlong(j, "connectTimeoutMs", r.connectTimeoutMs);
         r.tlsTimeoutMs = jlong(j, "tlsTimeoutMs", r.tlsTimeoutMs);
         r.starttlsTimeoutMs = jlong(j, "starttlsTimeoutMs", r.starttlsTimeoutMs);
@@ -177,7 +186,20 @@ struct DialRequest {
         return r;
     }
 
+    /// Also used by in-process callers, so bypassing JSON cannot relax the
+    /// native tier's family/bind/proxy contract.
+    void validateTransport() const {
+        if (addressFamily != "any" && addressFamily != "ipv6")
+            throw new Exception("DIAL: addressFamily must be any|ipv6");
+        if (addressFamily == "ipv6") {
+            if (hasProxy) throw new Exception("DIAL: ipv6 cannot use a proxy");
+            if (!validIpv6Source(bindIp6))
+                throw new Exception("DIAL: ipv6 requires a valid IPv6 source bind");
+        }
+    }
+
     Json toJson() const {
+        validateTransport();
         auto j = Json.emptyObject;
         if (token.length) j["token"] = token;
         j["tag"] = tag.toJson();
@@ -196,11 +218,34 @@ struct DialRequest {
             j["proxy"] = Json(null);
         }
         j["bindIp6"] = bindIp6.length ? Json(bindIp6) : Json(null);
+        j["addressFamily"] = addressFamily;
         j["connectTimeoutMs"] = connectTimeoutMs;
         j["tlsTimeoutMs"] = tlsTimeoutMs;
         j["starttlsTimeoutMs"] = starttlsTimeoutMs;
         return j;
     }
+}
+
+/// A literal IPv6 source, never an IPv4-mapped address. Pool authorization
+/// belongs to the authenticated IPC boundary; this only checks wire shape.
+package bool validIpv6Source(string source) @trusted nothrow @nogc {
+    import core.sys.posix.arpa.inet : inet_pton;
+    import core.sys.posix.sys.socket : AF_INET6;
+    if (source.length == 0 || source.length >= 46) return false;
+    char[46] text;
+    foreach (i, c; source) {
+        if (c == '\0') return false;
+        text[i] = c;
+    }
+    text[source.length] = '\0';
+    ubyte[16] bytes;
+    if (inet_pton(AF_INET6, text.ptr, bytes.ptr) != 1) return false;
+    bool zeroPrefix = true;
+    foreach (b; bytes[0 .. 10]) if (b) zeroPrefix = false;
+    if (zeroPrefix && bytes[10] == 0xff && bytes[11] == 0xff) return false;
+    bool unspecified = true;
+    foreach (b; bytes) if (b) unspecified = false;
+    return !unspecified && bytes[0] != 0xff;
 }
 
 /// `tls` object in `CONNECTED` and entries: the engine's `TlsInfo` plus `ok`.
@@ -361,7 +406,8 @@ struct ConnectedLine {
 
 /// Terminal `FAILED` line of a `DIAL`.
 struct FailedLine {
-    /// "dns" | "tcp" | "socks5" | "tls" | "starttls"
+    /// "dns" | "blocked" | "no_ipv6_destination" | "bad_request" |
+    /// "tcp" | "socks5" | "tls" | "starttls"
     string phase;
     string reason;
 
@@ -633,4 +679,28 @@ unittest {
     assert(verb == "670");
     assert(ircLastParam("a b :c d") == "c d");
     assert(ircLastParam("a b") == "b");
+}
+
+@("Native DIAL is strict and additive to old any requests")
+unittest {
+    import std.exception : assertThrown;
+    auto legacy = DialRequest.fromJson(parseJsonString(`{"host":"h","port":6667}`));
+    assert(legacy.addressFamily == "any");
+    auto nativeReq = DialRequest.fromJson(parseJsonString(
+        `{"host":"h","port":6697,"addressFamily":"ipv6","bindIp6":"2001:db8:1234:5678:a516:4466:5544:123"}`));
+    assert(nativeReq.addressFamily == "ipv6");
+    assert(DialRequest.fromJson(parseJsonString(nativeReq.toJson().toString())) == nativeReq);
+    foreach (bad; [
+        `{"host":"h","port":1,"addressFamily":"v6"}`,
+        `{"host":"h","port":1,"addressFamily":null}`,
+        `{"host":"h","port":1,"addressFamily":6}`,
+        `{"host":"h","port":1,"addressFamily":""}`,
+        `{"host":"h","port":1,"addressFamily":"ipv6"}`,
+        `{"host":"h","port":1,"addressFamily":"ipv6","bindIp6":"127.0.0.1"}`,
+        `{"host":"h","port":1,"addressFamily":"ipv6","bindIp6":"::"}`,
+        `{"host":"h","port":1,"addressFamily":"ipv6","bindIp6":"::ffff:7f00:1"}`,
+        `{"host":"h","port":1,"addressFamily":"ipv6","bindIp6":"2001:db8::1","proxy":{"host":"p","port":1080}}`,
+    ]) assertThrown(DialRequest.fromJson(parseJsonString(bad)));
+    nativeReq.hasProxy = true;
+    assertThrown(nativeReq.toJson());
 }

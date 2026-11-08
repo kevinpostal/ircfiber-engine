@@ -264,75 +264,75 @@ void runIsupportTests() {
     check!("ISUPPORT: missing parens")
         (parseIsupportPrefix("no-parens") == "");
 
-    // RPL_ISUPPORT (005) text rewrite: the trailing "are supported by this
-    // server" is RFC 2812 §5.1.4 boilerplate, NOT useful as msg.text. The
-    // parser must rewrite msg.text to the joined ISUPPORT tokens (skipping
-    // the user's nick at params[0] and the canonical trailer) so the
-    // `_server` log shows real tokens instead of three copies of the
-    // boilerplate. See the IRL bug: every 005 was rendering as just
-    // "are supported by this server" three times.
-    stderr.writeln("\n[ISUPPORT] 005 event.text rewrite");
-    {
-        auto cfg = mkConfig();
-        // Single 005 reply with a mix of key=value and bare-key tokens,
-        // plus the canonical trailer.
-        auto e = parseIRCLinePublic(
-            ":irc.example.org 005 Zod CHANTYPES=#& EXCEPTS INVEX " ~
-                "CHANMODES=b,e,I,k,l,imnpstSr :are supported by this server",
-            cfg);
-        check!("005: command is 005")(e.command == "005");
-        check!("005: text is joined tokens, NOT trailer")
-            (e.text == "CHANTYPES=#& EXCEPTS INVEX CHANMODES=b,e,I,k,l,imnpstSr");
-        check!("005: trailer stripped from text")
-            (e.text.indexOf("are supported") < 0);
-        check!("005: text starts with first ISUPPORT key")
-            (e.text.startsWith("CHANTYPES="));
-        check!("005: nick not in text")
-            (e.text.indexOf("Zod") < 0);
+    // 005 display text follows the wire parameter boundary, never a
+    // guess about whether the final parameter looks like prose or a token.
+    stderr.writeln("\n[ISUPPORT] 005 parameter boundaries");
+    auto cfg = mkConfig();
+    struct BoundaryCase {
+        string line;
+        string[] params;
+        string text;
+        bool trailing;
+    }
+    BoundaryCase[] cases = [
+        BoundaryCase(
+            ":irc.example.org 005 Zod NETWORK=Example NICKLEN=30 FOO=bar",
+            ["Zod", "NETWORK=Example", "NICKLEN=30", "FOO=bar"],
+            "NETWORK=Example NICKLEN=30 FOO=bar", false),
+        BoundaryCase(
+            ":irc.example.org 005 Zod CHANTYPES=#& EXCEPTS INVEX :are supported by this server",
+            ["Zod", "CHANTYPES=#&", "EXCEPTS", "INVEX", "are supported by this server"],
+            "CHANTYPES=#& EXCEPTS INVEX", true),
+        BoundaryCase(
+            ":irc.example.org 005 Zod NICKLEN=30 :implementation-specific prose",
+            ["Zod", "NICKLEN=30", "implementation-specific prose"],
+            "NICKLEN=30", true),
+        BoundaryCase(
+            ":irc.example.org 005 Zod NICKLEN=30 :FOO=bar",
+            ["Zod", "NICKLEN=30", "FOO=bar"],
+            "NICKLEN=30", true),
+        BoundaryCase(
+            ":irc.example.org 005 Zod NICKLEN=30 :",
+            ["Zod", "NICKLEN=30", ""], "NICKLEN=30", true),
+        BoundaryCase(
+            ":irc.example.org 005 Zod EXCEPTS INVEX",
+            ["Zod", "EXCEPTS", "INVEX"], "EXCEPTS INVEX", false),
+        BoundaryCase(
+            ":irc.example.org 005 Zod :no tokens",
+            ["Zod", "no tokens"], "", true),
+        BoundaryCase(
+            ":irc.example.org 005 Zod :",
+            ["Zod", ""], "", true),
+        BoundaryCase(
+            ":irc.example.org 005 Zod",
+            ["Zod"], "", false),
+        BoundaryCase(
+            ":irc.example.org 005",
+            [], "", false),
+    ];
+    foreach (c; cases) {
+        auto e = parseIRCLinePublic(c.line, cfg);
+        check!("005 boundary: command")(e.command == "005", c.line);
+        check!("005 boundary: complete params")(e.getParams() == c.params, c.line);
+        check!("005 boundary: display tokens")(e.text == c.text, c.line);
+        check!("005 boundary: trailing flag")(e.hasTrailingParam == c.trailing, c.line);
     }
     {
-        // 005 with a bare key (EXCEPTS, no value) should pass through.
-        auto cfg = mkConfig();
-        auto e = parseIRCLinePublic(
-            ":irc.example.org 005 Zod EXCEPTS INVEX :are supported by this server",
-            cfg);
-        check!("005 bare-keys: text is bare tokens")
-            (e.text == "EXCEPTS INVEX");
+        auto e = parseIRCLinePublic(":irc.example.org 005 Zod FOO=bar :", cfg);
+        const full = e.toJson();
+        const compact = e.toCompactJson();
+        e.hasTrailingParam = false;
+        check!("parser boundary flag: absent from full JSON")(e.toJson() == full);
+        check!("parser boundary flag: absent from compact JSON")(e.toCompactJson() == compact);
     }
     {
-        // 005 with only the trailer (no real ISUPPORT tokens at all —
-        // pathological but legal) — no rewrite should happen, text stays
-        // as the trailer so the empty case isn't misleading.
-        auto cfg = mkConfig();
-        auto e = parseIRCLinePublic(
-            ":irc.example.org 005 Zod :are supported by this server",
-            cfg);
-        check!("005 single-trail: text is empty after rewrite")
-            (e.text == "");
-    }
-    {
-        // 005 with NO trailing at all (some servers omit it on the last
-        // reply) — tokens should still be joined into text.
-        auto cfg = mkConfig();
-        auto e = parseIRCLinePublic(
-            ":irc.example.org 005 Zod FOO=bar BAZ=qux",
-            cfg);
-        check!("005 no-trailer: text is joined tokens")
-            (e.text == "FOO=bar BAZ=qux");
-    }
-    {
-        // Defensive: a non-trailer last token that happens to start with
-        // "are supported" but isn't the boilerplate must NOT be stripped.
-        auto cfg = mkConfig();
-        auto e = parseIRCLinePublic(
-            ":irc.example.org 005 Zod FOO=bar :are supported by my server",  // custom trailing
-            cfg);
-        check!("005 custom-trailer: trailer kept")
-            (e.text == "FOO=bar are supported by my server");
+        auto e = parseIRCLinePublic(":nick!u@h PRIVMSG #chan :", cfg);
+        check!("empty trailing: flag is set")(e.hasTrailingParam);
+        check!("empty trailing: parameter is preserved")(e.getParams() == ["#chan", ""]);
+        check!("empty trailing: text is empty")(e.text == "");
     }
     {
         // Sanity: a non-005 event keeps the standard trailing behavior.
-        auto cfg = mkConfig();
         auto e = parseIRCLinePublic(
             ":irc.example.org 332 Zod #design :Welcome to the channel",
             cfg);

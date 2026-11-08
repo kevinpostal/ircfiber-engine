@@ -108,6 +108,9 @@ string[] dedupChannels(string[] channels) @safe {
 struct NetworkConfig {
     /// The network ID
     UUID id;
+    /// Internal immutable random identity, reserved atomically after insertion.
+    /// Server/cache/control JSON only; browser responses redact this field.
+    string ipv6Iid;
     /// The network name
     string name;
     /// The server host
@@ -200,6 +203,7 @@ struct NetworkConfig {
     Json toJson() const {
         return Json([
             "id": Json(id.toString()),
+            "ipv6Iid": Json(ipv6Iid),
             "name": Json(name),
             "host": Json(host),
             "port": Json(port),

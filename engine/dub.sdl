@@ -96,6 +96,13 @@ configuration "parser-test" {
     versions "VibeUseFibers"
 }
 
+configuration "history-storage-test" {
+    targetType "executable"
+    targetName "history-storage-test"
+    mainSourceFile "source/history_storage_test.d"
+    versions "VibeUseFibers"
+}
+
 configuration "egress-catalog-test" {
     targetType "executable"
     targetName "egress-catalog-test"
@@ -269,10 +276,10 @@ subPackage {
     // First configuration = default: the holder daemon, unchanged.
     configuration "application" {
     }
-    // Real-socket TLS regression for dialUpstream's direct per-address
-    // fallback (::1 + 127.0.0.1 loopback upstreams, fresh openssl-minted
-    // certificates). `dub run :holder --config=dial-fallback-test`; exits
-    // non-zero, never skips, when IPv6 loopback or openssl is missing.
+    // Physical dual-stack fallback, IPv6-only no-fallback and authenticated
+    // source-pool boundary regression (::1 + 127.0.0.1 listeners and fresh
+    // openssl-minted certificates). `dub run :holder --config=dial-fallback-test`;
+    // exits non-zero, never skips, when IPv6 loopback or openssl is missing.
     configuration "dial-fallback-test" {
         targetName "holder-dial-fallback-test"
         mainSourceFile "holder/source/holder/dial_fallback_test.d"
