@@ -166,7 +166,7 @@ struct ClientPrefSpec {
 
 /// Per-device web client prefs, in wire order (the frontend keeps the identical list).
 immutable ClientPrefSpec[] CLIENT_PREFS = [
-    ClientPrefSpec("theme", ClientPrefKind.enum_, ["dark", "light", "gruvbox", "monokai", "dracula"]),
+    ClientPrefSpec("theme", ClientPrefKind.enum_, ["dark", "light", "gruvbox", "monokai", "dracula", "mirc"]),
     ClientPrefSpec("textSize", ClientPrefKind.enum_, TEXT_SIZE_VALUES),
     ClientPrefSpec("compactMode", ClientPrefKind.bool_),
     ClientPrefSpec("sidebarLeft", ClientPrefKind.bool_),
@@ -2595,7 +2595,7 @@ unittest {
     assert(err("compactMode", Json(true)) == "");
     assert(err("compactMode", Json(1)) == "compactMode must be boolean");
     // enum
-    foreach (theme; ["dark", "light", "gruvbox", "monokai", "dracula"])
+    foreach (theme; ["dark", "light", "gruvbox", "monokai", "dracula", "mirc"])
         assert(err("theme", Json(theme)) == "");
     foreach (theme; ["midnight", "dusk", "tropic", "emerald", "sand", "orchid"])
         assert(err("theme", Json(theme)).length);
