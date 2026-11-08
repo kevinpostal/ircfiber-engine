@@ -25,6 +25,9 @@ import core.time : Duration, dur, msecs, seconds, minutes;
 
 import ircfiber.models.irc_event : IRCRawEvent;
 import ircfiber.models.network : NetworkConfig, SASLMechanism, TLSMode, normalizeChannelName, lastSeenBufferKey;
+import ircfiber.default_network : DEFAULT_FIBER_HOST;
+import ircfiber.irc.routing_policy : RouteKind, RoutingPreferences, defaultRoutingPolicy,
+    resolveRoutingPolicy;
 import ircfiber.metadata : USER_METADATA_KEYS, CHANNEL_METADATA_KEYS, PROFILE_KEYS, isValidMetadataValue;
 import ircfiber.db.lastseen : LastSeenRepository, heartbeatEchoJson;
 import ircfiber.redis.protocol : RedisKeys, TlsInfo;
@@ -600,8 +603,8 @@ private enum REGISTRATION_WARN_AT_FRACTION_2     = 75;
 // hold (`heldUntilMs`) is never retargeted, so picking a location can never
 // yank another network's egress.
 //
-// Egress selection per NetworkConfig.egressNodeId ("pin"): "" = automatic,
-// "direct" = host address, "de" = any city in country, "de-ber" = that city.
+// NetworkConfig.routing supplies the complete provider order. preferredExit
+// only biases an eligible exit inside its provider; it never enables a route.
 // Smart picker is host-aware: when a server G/K/Z-lines an egress, that
 // *location* is auto-banned for that host for 12 h (no hostname hardcode).
 // Global circuit-breaker still marks a slot dead 30 s after 3 generic fails.
@@ -643,6 +646,8 @@ private struct MullvadProxy {
     /// Detection evidence only: the resulting quarantine is durable admission
     /// state (ircfiber.irc.egress_admission), never a field of this slot.
     long[string] recentLossAtMsByHost;
+    /// Explicit configured provider, independent of label or control support.
+    RouteKind provider = RouteKind.nordvpn;
 }
 private __gshared MullvadProxy[] mullvadPool;
 private __gshared size_t mullvadRR;
@@ -1160,7 +1165,9 @@ private void loadMullvadPoolUnlocked() {
         if (host.length == 0) continue;
         auto label = explicitLabel.length > 0 ? explicitLabel : mullvadLabelFromHost(host);
         auto sock = slotControlSocketPath(label);
-        mullvadPool ~= MullvadProxy(host, port, label, 0, 0, sock);
+        auto proxy = MullvadProxy(host, port, label, 0, 0, sock);
+        proxy.provider = RouteKind.mullvad;
+        mullvadPool ~= proxy;
         logInfo("Mullvad pool: %s → %s:%d (label=%s)", entry, host, port, label);
         logInfo("Mullvad slot %s: controllable=%s (socket=%s)", label,
             sock.length ? "true" : "false", sock.length ? sock : "-");
@@ -1249,6 +1256,7 @@ private void loadNordvpnPoolUnlocked() {
         if (host.length == 0) { logWarn("NordVPN pool: empty host for label=%s — skipped", label); continue; }
         MullvadProxy np;
         np.host = host; np.port = port; np.label = label; np.state = "ready";
+        np.provider = RouteKind.nordvpn;
         np.username = username; np.password = password;
         np.exitCountryCode = countryCode; np.exitCountry = country; np.exitCity = city;
         mullvadPool ~= np;
@@ -1613,15 +1621,10 @@ private MullvadProxy*[] getHealthyProxiesForHostLocked(string hostLower) {
 
 /// Pseudo-label for the un-proxied host IP. Lives in the same per-host ban
 /// table as the Mullvad labels so a Z/G/K-line on the bare OVH address is
-/// remembered exactly like a banned exit, and `NetworkConfig.egressNodeId`
-/// can pin it ("direct") the same way it pins a Mullvad label.
+/// remembered exactly like a banned exit. A routing order containing only
+/// `direct` selects this path without permitting VPN fallback.
 enum DIRECT_EGRESS_LABEL = "direct";
 
-/// "nordvpn" pins a network to healthy static exits only: no Mullvad or
-/// direct fallback. Established losses from independent IRC hosts temporarily
-/// quarantine a static exit; a single loss is only a per-client preference.
-/// Avoided and quarantined exits remain last-resort VPN candidates.
-enum NORDVPN_TIER_EGRESS_LABEL = "nordvpn";
 
 /// True when, after `bannedKey` was just banned (or SASL-gated) for
 /// `hostLower`, at least one other route to the host remains: a healthy exit
@@ -1637,8 +1640,9 @@ enum NORDVPN_TIER_EGRESS_LABEL = "nordvpn";
 /// exit is healthy, so counting the slot would fail over through gated
 /// exits forever.
 private bool hasAlternativeEgressForHost(string hostLower, string bannedKey, bool unauthenticated = false,
-                                         string egressPin = "") {
+                                         RoutingPreferences routing = RoutingPreferences.init) {
     loadMullvadPool();
+    const order = configuredRoutingOrder(hostLower, routing);
     // Read once outside the pool lock: an excluded exit is not an
     // alternative that can justify immediately retrying a ban/SASL gate.
     const admissions = poolAdmissions();
@@ -1649,24 +1653,23 @@ private bool hasAlternativeEgressForHost(string hostLower, string bannedKey, boo
             || (a.state == "recovering" && a.trialUntilMs <= now));
     }
     bool check() {
-        if (egressPin == DIRECT_EGRESS_LABEL) return false;
-        const nordOnly = egressPin == NORDVPN_TIER_EGRESS_LABEL;
+        if (order.length == 0) return false;
         const skipGated = unauthenticated && hostHasSaslGatesLocked(hostLower);
         foreach (p; getHealthyProxiesForHostLocked(hostLower)) {
-            if (nordOnly && p.controlSocket.length > 0) continue;
+            if (!order.canFind(p.provider)) continue;
             if (!admissible(p.label)) continue;
             const key = slotBanKey(p);
             if (key != bannedKey && !(skipGated && isEgressSaslGatedLocked(hostLower, key))) return true;
         }
         // A free controllable slot is an alternative in itself: it can be
         // retargeted to any city in the catalog that is not host-banned.
-        if (!nordOnly && !skipGated && gExitRelays.length > 0) {
+        if (order.canFind(RouteKind.mullvad) && !skipGated && gExitRelays.length > 0) {
             foreach (ref pr; mullvadPool)
-                if (pr.controlSocket.length > 0 && pr.activeConns == 0
+                if (pr.provider == RouteKind.mullvad && pr.controlSocket.length > 0 && pr.activeConns == 0
                     && now >= pr.heldUntilMs && pr.state != "retargeting" && admissible(pr.label))
                     return true;
         }
-        return egressPin.length == 0 && bannedKey != DIRECT_EGRESS_LABEL && !isEgressBannedForHost(hostLower, DIRECT_EGRESS_LABEL)
+        return order.canFind(RouteKind.direct) && bannedKey != DIRECT_EGRESS_LABEL && !isEgressBannedForHost(hostLower, DIRECT_EGRESS_LABEL)
             && !(skipGated && isEgressSaslGatedLocked(hostLower, DIRECT_EGRESS_LABEL));
     }
     if (gMullvadLock !is null) synchronized (gMullvadLock) return check();
@@ -2124,16 +2127,6 @@ private MullvadProxy* acquireSlotForPin(string hostLower, string pin, out string
     return &mullvadPool[candidate];
 }
 
-/// True when a user's pin addresses the exact route identified by `banKey`
-/// (see `slotBanKey`): the literal `direct` pseudo-label, a location the pin
-/// matches, or the label of a static slot. Drives "the user pinned the route
-/// that just got banned, so do not fail over behind their back".
-private bool pinCoversBanKey(string pin, string banKey) nothrow {
-    if (pin.length == 0 || banKey.length == 0) return false;
-    if (pin == banKey) return true;
-    if (banKey.length > 5 && banKey[0 .. 5] == "slot:" && banKey[5 .. $] == pin) return true;
-    return locationMatches(banKey, pin);
-}
 
 /// Location id of the best online relay that is not host-banned for
 /// `hostLower` — the target for an automatic retarget when every existing
@@ -2395,9 +2388,9 @@ struct EgressUsed {
     EgressEndpointRef trialExit;
 }
 
-/// User-facing copy for a Mullvad location pin that could not be honoured.
-/// The Nord tier pin is fail-closed and never uses this fallback.
-private string egressPinFallbackCopy(string reason) nothrow {
+/// User-facing copy when a preferred exit cannot be used. The routing order,
+/// not this preference, determines which alternative providers are allowed.
+private string preferredExitFallbackCopy(string reason) nothrow {
     switch (reason) {
         case "all-busy":
             return "All exits are in use right now — connecting via another exit; "
@@ -2411,31 +2404,25 @@ private string egressPinFallbackCopy(string reason) nothrow {
     }
 }
 
-/// First-party host on automatic egress: shared Mullvad exits are never
-/// used. A public exit's connectban bucket is shared with every stranger
-/// behind it, and stranger-driven reconnects loop-ban the exit (~8/hour
-/// trips threshold="8"); our session then dies as collateral, the Z-line
-/// host-bans the location for 12 h, and the ban policy fails everything
-/// over in circles. Direct is the internal alias and never shares a
-/// bucket, so for first-party it is direct or bust. An explicit exit pin
-/// still honours user choice (the fast path requires automatic egress).
-private bool firstPartyDirectOnly(string hostLower, string egressNodeId) @safe pure nothrow @nogc {
-    return hostLower == "irc.ircfiber.com" && egressNodeId.length == 0;
+/// The managed first-party destination never tries VPN exits. Explicit
+/// preferences may restrict its direct route, but cannot enable another tier.
+private bool firstPartyDirectOnly(string hostLower, const RoutingPreferences routing) @safe pure {
+    import ircfiber.netaddr : canonicalHost;
+    return routing.valid && canonicalHost(hostLower) == DEFAULT_FIBER_HOST;
 }
 
-/// Egress policy loop: picks the egresses to try (direct-only for the
-/// first-party ircd, pins, rotation, host bans, SASL gates, direct
-/// fallback) and issues one holder `DIAL` per candidate through
-/// `happyEyeballsConnectWithProxy`. `tlsMode` (`none`/`implicit`/`starttls`)
-/// is performed by the holder as part of the dial, so a TLS failure on one
-/// exit moves on to the next; a `TLS handshake timed out` bans the exit for
-/// this host. `unauthenticated` (the network has no SASL) orders routes the
-/// host SASL-gates last. Automatic egress then lets the per-endpoint route
-/// memory (gRouteMemory) move a route that recently completed a full dial
-/// to the front and one that recently failed to the back; every candidate
-/// is still dialed at most once per call. Every non-direct pin is VPN-only
-/// and fails closed rather than falling back to direct. `dr` carries the
-/// holder's `CONNECTED` facts for the winning dial.
+/// Step 1 uses the explicit legacy-equivalent defaults. Step 3 replaces this
+/// document with the current durable administrative policy at every dial.
+private RouteKind[] configuredRoutingOrder(string hostLower, const RoutingPreferences routing) {
+    if (!routing.valid) return [];
+    const firstParty = firstPartyDirectOnly(hostLower, routing);
+    auto effective = resolveRoutingPolicy(defaultRoutingPolicy(), hostLower,
+        firstParty && routing.inherit ? RoutingPreferences(false, [RouteKind.direct], "", true) : routing);
+    if (!effective.available) return [];
+    if (firstParty)
+        return effective.order.canFind(RouteKind.direct) ? [RouteKind.direct] : [];
+    return effective.order;
+}
 
 /// Reliability tiering + smart routing for Automatic egress. Mullvad's
 /// independent per-city sidecars have no shared-account contention and are
@@ -2500,7 +2487,7 @@ private MullvadProxy*[] orderStaticProxies(MullvadProxy*[] candidates,
     return ordered;
 }
 
-/// Mullvad rotation remains unchanged; static ranking is shared with pins.
+/// Mullvad rotation remains unchanged; static exits share reliability ranking.
 /// Caller holds gMullvadLock while reading shared slot state and rrIndex.
 private MullvadProxy*[] tierAndOrderProxies(MullvadProxy*[] healthy, ref size_t rrIndex,
                                             string networkId, long nowMs, string avoidLabel) {
@@ -2553,13 +2540,8 @@ unittest {
     assert(single.length == 1 && single[0].label == "de" && rr2 == 5);
 }
 
-/// Static-only pin uses the same order as Automatic without its Mullvad tier.
-private MullvadProxy*[] staticTierOnly(MullvadProxy*[] healthy, string networkId,
-                                       long nowMs, string avoidLabel) {
-    return orderStaticProxies(healthy, networkId, nowMs, avoidLabel);
-}
 
-@("staticTierOnly: proof, load, avoidance and last resort")
+@("orderStaticProxies: proof, load, avoidance and last resort")
 unittest {
     MullvadProxy de, a, b, never;
     de.label = "de"; de.controlSocket = "/ctl/de.sock";
@@ -2567,39 +2549,39 @@ unittest {
     b.label = "south"; b.lastSuccessMs = 800;
     never.label = "untested";
     auto healthy = [&de, &a, &b, &never];
-    auto ordered = staticTierOnly(healthy, "network-a", 1_000, "");
+    auto ordered = orderStaticProxies(healthy, "network-a", 1_000, "");
     assert(ordered.length == 3 && ordered[0] is &a && ordered[1] is &b && ordered[2] is &never);
     a.activeConns = 2; b.activeConns = 1;
-    assert(staticTierOnly(healthy, "network-a", 1_000, "")[0] is &b);
+    assert(orderStaticProxies(healthy, "network-a", 1_000, "")[0] is &b);
     a.activeConns = 0; b.activeConns = 0;
     // Equal recency exposes the deterministic per-network tie breaker.
     b.lastSuccessMs = a.lastSuccessMs;
     bool sawA, sawB;
     foreach (i; 0 .. 100) {
-        auto first = staticTierOnly(healthy, i.to!string, 1_000, "")[0];
+        auto first = orderStaticProxies(healthy, i.to!string, 1_000, "")[0];
         if (first is &a) sawA = true;
         if (first is &b) sawB = true;
     }
     assert(sawA && sawB);
     // The client's own avoided exit goes last but stays a candidate.
     b.lastSuccessMs = 800;
-    assert(staticTierOnly(healthy, "network-a", 1_300, "north")[0] is &b);
-    assert(staticTierOnly([&a], "network-a", 1_300, "north")[0] is &a);
-    assert(staticTierOnly(healthy, "network-a", 1_300, "")[2] is &never);
-    assert(staticTierOnly([&de], "network-a", 1_000, "").length == 0);
+    assert(orderStaticProxies(healthy, "network-a", 1_300, "north")[0] is &b);
+    assert(orderStaticProxies([&a], "network-a", 1_300, "north")[0] is &a);
+    assert(orderStaticProxies(healthy, "network-a", 1_300, "")[2] is &never);
+    assert(orderStaticProxies([&de], "network-a", 1_000, "").length == 0);
 }
 
 /// One holder `DIAL` through exactly one candidate egress (`null` = direct).
 private alias EgressDial = TCPConnection delegate(MullvadProxy* proxy, out DialResult dr);
 
 private TCPConnection happyEyeballsConnect(HolderClient holder, DialTag tag, string host, ushort port,
-                                           string tlsMode, string egressNodeId, bool unauthenticated,
+                                           string tlsMode, RoutingPreferences routing, bool unauthenticated,
                                            string ipv6BindAddr, ConnectProgress progress,
                                            string avoidLabel, out EgressUsed used, out DialResult dr) {
     TCPConnection dialOne(MullvadProxy* proxy, out DialResult r) {
         return happyEyeballsConnectWithProxy(holder, tag, host, port, tlsMode, proxy, ipv6BindAddr, progress, r);
     }
-    return connectThroughEgressPlan(&dialOne, tag.networkId, host, port, tlsMode, egressNodeId,
+    return connectThroughEgressPlan(&dialOne, tag.networkId, host, port, tlsMode, routing,
         unauthenticated, ipv6BindAddr, progress, avoidLabel, used, dr);
 }
 
@@ -2628,54 +2610,33 @@ private void noteRouteOutcome(string endpointKey, string hostLower, MullvadProxy
 /// The egress policy loop behind `happyEyeballsConnect`. `dial` performs one
 /// holder dial; it is the seam unit tests replace the holder transport with.
 private TCPConnection connectThroughEgressPlan(scope EgressDial dial, string networkId, string host, ushort port,
-                                               string tlsMode, string egressNodeId, bool unauthenticated,
+                                               string tlsMode, RoutingPreferences routing, bool unauthenticated,
                                                string ipv6BindAddr, ConnectProgress progress,
                                                string avoidLabel, out EgressUsed used, out DialResult dr) {
     import std.string : toLower;
     auto hostLower = host.toLower();
-    // Fast-path for the first-party InspIRCd instance (irc.ircfiber.com):
-    // On prod the host resolves via Docker alias internally. Direct is the
-    // internal alias and never shares a connectban bucket, so for
-    // first-party it is direct or bust: on failure the error propagates
-    // and the reconnect loop retries direct with backoff instead of
-    // failing over to a shared exit (see firstPartyDirectOnly). This is
-    // what fixed the 2026-08-26 outage where every Mullvad exit was
-    // throttled but direct via internal alias succeeded.
-    // Skipped while the ircd has the direct address banned (connectban
-    // Z-line): then exits are the only path left, and the ban policy
-    // already failed the network over to one.
-    if (firstPartyDirectOnly(hostLower, egressNodeId) && !isDirectBannedForHost(hostLower)) {
-        try {
-            auto directConn = dial(null, dr);
-            used = EgressUsed.init;
-            return directConn;
-        } catch (HolderUnavailableException e) {
-            throw e;
-        } catch (Exception e) {
-            logWarn("happyEyeballsConnect direct to %s failed (%s) — staying on direct, no exit failover", host, e.msg);
-            throw e;
-        }
-    }
-    // Generic host-aware egress picker: no per-hostname hardcode.
-    // - Globally dead proxies (failCount >= 3) are already filtered by
-    //   getHealthyProxies() / getHealthyProxiesForHost().
-    // - Per-host G/K/Z bans learned via banEgressForHost() are filtered
-    //   by getHealthyProxiesForHost(hostLower) so a G-lined exit for one
-    //   host never blocks it for another.
+    const order = configuredRoutingOrder(hostLower, routing);
+    if (order.length == 0)
+        throw new Exception("Routing policy permits no available route");
     auto healthyForHost = getHealthyProxiesForHost(hostLower);
     const orderNowMs = unixMsNow();
-    // Durable admission (drain, quarantine, recovery; Redis, read outside
-    // the pool lock) is applied to the final candidates before any ordering,
-    // pin or route memory sees them. Only `healthy` exits stay regular
-    // candidates; `recovering` exits become the single-trial last resort at
-    // the very end; drained, quarantined and unavailable exits are never
-    // dialed. Each dial re-checks atomically right before it starts.
+    const endpointKey = routeEndpointKey(hostLower, port, tlsMode.toLower());
+    // Filter the complete permitted provider set before pin resolution,
+    // admission, ranking or retargeting sees a candidate.
+    MullvadProxy*[] eligible;
+    foreach (p; healthyForHost) if (order.canFind(p.provider)) eligible ~= p;
     auto admissions = poolAdmissions();
     bool[string] notAdmitted;
-    foreach (label, a; admissions) if (!a.admitsDials) notAdmitted[label] = true;
+    withPoolLock({
+        foreach (ref p; mullvadPool) {
+            auto a = p.label in admissions;
+            if (!order.canFind(p.provider) || a is null || !a.admitsDials)
+                notAdmitted[p.label] = true;
+        }
+    });
     MullvadProxy*[] admitted, recovering;
     string[] admissionNotes;
-    foreach (p; healthyForHost) {
+    foreach (p; eligible) {
         auto a = p.label in admissions;
         if (a !is null && a.admitsDials) { admitted ~= p; continue; }
         const st = a is null ? "unavailable" : a.state;
@@ -2684,159 +2645,127 @@ private TCPConnection connectThroughEgressPlan(scope EgressDial dial, string net
             ? "quarantined (retry in " ~ ((a.retryAtMs - orderNowMs + 59_999) / 60_000).to!string ~ " min)"
             : st == "recovering" ? "awaiting a recovery trial" : st);
     }
-    healthyForHost = admitted;
-    if (egressNodeId.length == 0 && healthyForHost.length > 1) {
-        if (gMullvadLock !is null) synchronized (gMullvadLock) {
-            healthyForHost = tierAndOrderProxies(healthyForHost, mullvadRR, networkId, orderNowMs, avoidLabel);
-        } else {
-            healthyForHost = tierAndOrderProxies(healthyForHost, mullvadRR, networkId, orderNowMs, avoidLabel);
-        }
-    }
     const admissionSummary = admissionNotes.length
         ? " (VPN exits not admitting new connections: " ~ admissionNotes.join(", ") ~ ")" : "";
-    MullvadProxy*[] toTry;
-    // Pinned "direct": the user asked for the bare host IP — never route
-    // through an exit. If the host has banned it, the ban policy already
-    // told them to pick another route; honour the pin and let the ban
-    // window run.
-    const pinDirect = egressNodeId.length > 0 && egressNodeId.toLower() == DIRECT_EGRESS_LABEL;
-    const pinNordvpnTier = egressNodeId.length > 0 && egressNodeId.toLower() == NORDVPN_TIER_EGRESS_LABEL;
-    // Every other pin names a VPN location or exit. The user chose a VPN, so
-    // like the Nord tier it stays on VPN exits: the pinned exit first, then
-    // the existing "another exit" fallback, never the bare host address.
-    const pinLocation = egressNodeId.length > 0 && !pinDirect && !pinNordvpnTier;
-    const vpnOnly = pinNordvpnTier || pinLocation;
-    string egressBusyNote;
-    MullvadProxy* pinnedSlot;
-    if (pinNordvpnTier) {
-        // A Nord pin is VPN-only, including when every exit is unhealthy.
-        if (gMullvadLock !is null) synchronized (gMullvadLock)
-            toTry = staticTierOnly(healthyForHost, networkId, orderNowMs, avoidLabel);
-        else toTry = staticTierOnly(healthyForHost, networkId, orderNowMs, avoidLabel);
-        bool staticRecovery = false;
-        foreach (p; recovering) if (p.controlSocket.length == 0) staticRecovery = true;
-        if (toTry.length == 0 && !staticRecovery)
-            throw new Exception("No healthy NordVPN exit available for " ~ host ~ admissionSummary);
-    } else if (pinLocation && egressNodeId.toLower() in notAdmitted && isStaticProxy(egressNodeId.toLower())) {
-        // An exact static-exit pin never bypasses drain or quarantine: the
-        // existing "another VPN exit" fallback applies, never direct. A
-        // recovering pinned exit stays in the recovery tier below.
-        const st = admissions[egressNodeId.toLower()].state;
-        logJsonMap("warn", "connection", "Pinned egress not admitted",
-            ["host": hostLower, "pin": egressNodeId, "admission": st, "event": "egress_pin_not_admitted"]);
-        egressBusyNote = "Your pinned exit is not accepting new connections right now (" ~ st
-            ~ ") — connecting via another VPN exit; this network does not fall back to direct.";
-    } else if (pinLocation) {
-        // Country/city pin: reuse a slot already on that location, else
-        // retarget an idle one. A slot carrying live connections is never
-        // touched, so honouring this pin cannot drop another network.
-        string reason;
-        pinnedSlot = acquireSlotForPin(hostLower, egressNodeId.toLower(), reason, notAdmitted);
-        if (pinnedSlot !is null) {
-            toTry ~= pinnedSlot;
-        } else {
-            logWarn("Mullvad pin '%s' unavailable for %s (%s) — trying another VPN exit",
-                egressNodeId, hostLower, reason);
-            logJsonMap("warn", "connection", "Egress pin unavailable",
-                ["host": hostLower, "pin": egressNodeId, "reason": reason,
-                 "event": "egress_busy"]);
-            egressBusyNote = egressPinFallbackCopy(reason);
+    const vpnOnly = !order.canFind(RouteKind.direct);
+    // A known exact exit belongs only to its configured provider. Unknown
+    // country/city selectors may retarget Mullvad, never a disabled provider.
+    auto preferredProvider = RouteKind.mullvad;
+    withPoolLock({
+        foreach (ref p; mullvadPool) if (p.label == routing.preferredExit) {
+            preferredProvider = p.provider;
+            break;
         }
-    } else if (egressNodeId.length == 0 && healthyForHost.length == 0) {
-        // Automatic, and every existing exit is host-banned or dead: retarget
-        // one idle slot to the best location this host has not banned rather
-        // than falling straight through to the (possibly banned) direct route.
-        // At most one retarget per connect attempt — this is the only call.
-        auto target = bestUnbannedLocationFor(hostLower);
-        if (target.length > 0) {
+    });
+    MullvadProxy*[] toTry;
+    MullvadProxy*[] gatedLast;
+    string[] gatedKeys;
+    bool[] recoveryCandidate;
+    string[] routeKeys;
+    foreach (kind; order) {
+        // Native IPv6 needs the holder family capability in step 4. It must
+        // not be represented by today's dual-stack, null-proxy direct dial.
+        if (kind == RouteKind.ipv6) continue;
+        if (kind == RouteKind.direct) {
+            if (!isDirectBannedForHost(hostLower)) {
+                if (unauthenticated && isEgressSaslGatedForHost(hostLower, DIRECT_EGRESS_LABEL)) {
+                    gatedLast ~= null;
+                    gatedKeys ~= routeIdentityLocked(null, ipv6BindAddr);
+                } else {
+                    toTry ~= null;
+                    recoveryCandidate ~= false;
+                    routeKeys ~= routeIdentityLocked(null, ipv6BindAddr);
+                }
+            }
+            continue;
+        }
+        MullvadProxy*[] regular, gated, trials;
+        foreach (p; admitted) {
+            if (p.provider != kind) continue;
+            if (unauthenticated && isEgressSaslGatedForHost(hostLower, slotBanKey(p))) gated ~= p;
+            else regular ~= p;
+        }
+        foreach (p; recovering) {
+            if (p.provider != kind) continue;
+            if (unauthenticated && isEgressSaslGatedForHost(hostLower, slotBanKey(p))) continue;
+            trials ~= p;
+        }
+        MullvadProxy* preferredSlot;
+        if (routing.preferredExit.length && preferredProvider == kind) {
+            // Exclude other providers even for an existing location match or
+            // a new retarget. A saved preference cannot grant that provider.
+            auto excluded = notAdmitted.dup;
+            withPoolLock({
+                foreach (ref p; mullvadPool)
+                    if (p.provider != kind) excluded[p.label] = true;
+            });
             string reason;
-            auto slot = acquireSlotForPin(hostLower, target, reason, notAdmitted);
-            if (slot !is null) {
-                logInfo("Automatic egress: slot %s retargeted to %s for %s (no healthy exit left)",
-                    slot.label, target, hostLower);
-                toTry ~= slot;
-            } else {
-                logWarn("Automatic egress: no slot could take %s for %s (%s)",
-                    target, hostLower, reason);
+            auto slot = acquireSlotForPin(hostLower, routing.preferredExit, reason, excluded);
+            if (slot !is null && slot.provider == kind
+                    && !(unauthenticated && isEgressSaslGatedForHost(hostLower, slotBanKey(slot)))) {
+                preferredSlot = slot;
+                if (!regular.canFind(slot)) regular ~= slot;
+            } else if (slot is null) {
+                report(progress, "info", preferredExitFallbackCopy(reason));
+            }
+        } else if (kind == RouteKind.mullvad && regular.length == 0 && gated.length == 0) {
+            // Retarget only an eligible Mullvad slot; durable drains and
+            // quarantines still exclude it before any location lookup.
+            const target = bestUnbannedLocationFor(hostLower);
+            if (target.length) {
+                string reason;
+                auto slot = acquireSlotForPin(hostLower, target, reason, notAdmitted);
+                if (slot !is null && slot.provider == kind) regular ~= slot;
             }
         }
-    }
-    // SASL-gated routes (unauthenticated networks only): the host refuses
-    // this network there until it logs in, so they go after every other
-    // route, direct included. They are dialled only when nothing else is
-    // left — that attempt is what lets applySaslGatePolicy park the network
-    // with the right message instead of failing over in circles.
-    MullvadProxy*[] gated;
-    if (!pinDirect) {
-        foreach (p; healthyForHost) {
-            // The Nord pin excludes Mullvad even as a gated last resort.
-            if (pinNordvpnTier && p.controlSocket.length > 0) continue;
-            bool already = false;
-            foreach (q; toTry) if (q is p) { already = true; break; }
-            if (already) continue;
-            if (unauthenticated && isEgressSaslGatedForHost(hostLower, slotBanKey(p))) gated ~= p;
-            else toTry ~= p;
+        void appendTier(MullvadProxy*[] tier, bool recovery, bool rankMemory) {
+            tier = tierAndOrderProxies(tier, mullvadRR, networkId, orderNowMs, avoidLabel);
+            auto keys = new string[tier.length];
+            foreach (i, p; tier) keys[i] = routeIdentityLocked(p, ipv6BindAddr);
+            // Route memory is strictly local to this configured provider
+            // tier. Gated/recovery candidates cannot escape their sub-tier.
+            if (rankMemory && tier.length > 1)
+                rankByRouteMemory(gRouteMemory, endpointKey, tier, keys, orderNowMs,
+                    (size_t i) => avoidLabel.length == 0 || tier[i].label != avoidLabel);
+            // preferredExit is only a bias among admitted, ungated exits.
+            if (rankMemory && preferredSlot !is null) {
+                foreach (i, p; tier) if (p is preferredSlot) {
+                    const key = keys[i];
+                    tier = [p] ~ tier[0 .. i] ~ tier[i + 1 .. $];
+                    keys = [key] ~ keys[0 .. i] ~ keys[i + 1 .. $];
+                    break;
+                }
+            }
+            foreach (i, p; tier) {
+                if (!recovery && !rankMemory) {
+                    gatedLast ~= p;
+                    gatedKeys ~= keys[i];
+                } else {
+                    toTry ~= p;
+                    recoveryCandidate ~= recovery;
+                    routeKeys ~= keys[i];
+                }
+            }
+        }
+        if (gMullvadLock !is null) synchronized (gMullvadLock) {
+            appendTier(regular, false, true);
+            appendTier(gated, false, false);
+            appendTier(trials, true, false);
+        } else {
+            appendTier(regular, false, true);
+            appendTier(gated, false, false);
+            appendTier(trials, true, false);
         }
     }
-    // Direct is not a last resort for a VPN pin: fail closed when no VPN
-    // candidate can connect, then let the reconnect loop back off.
-    const directBanned = !pinDirect && isDirectBannedForHost(hostLower);
-    const directGated = !pinDirect && unauthenticated
-        && isEgressSaslGatedForHost(hostLower, DIRECT_EGRESS_LABEL);
-    if (!vpnOnly && (pinDirect || (!directBanned && !directGated))) toTry ~= null;
-    if (pinNordvpnTier) {
-        if (gMullvadLock !is null) synchronized (gMullvadLock)
-            gated = orderStaticProxies(gated, networkId, orderNowMs, avoidLabel);
-        else gated = orderStaticProxies(gated, networkId, orderNowMs, avoidLabel);
+    // SASL gates are last resorts, never a reason to retry the same gated
+    // registration forever while another permitted provider can admit it.
+    foreach (i, p; gatedLast) {
+        toTry ~= p;
+        recoveryCandidate ~= false;
+        routeKeys ~= gatedKeys[i];
     }
-    // The route memory may reorder only this prefix: SASL-gated routes stay last.
-    const rankEnd = toTry.length;
-    toTry ~= gated;
-    if (!vpnOnly && directGated && !directBanned) toTry ~= null;
-    if (!vpnOnly && !directBanned && toTry.length == 0) toTry ~= null;
-    else if (directBanned && !vpnOnly)
-        logWarn("Direct egress is host-banned for %s — trying %d exit(s) only", hostLower, cast(int) toTry.length);
-    // Recovery tier: exits whose quarantine cooldown elapsed, after every
-    // admitted route (direct included where policy allows it) and outside
-    // the route-memory prefix. Dialing one atomically claims the exit's
-    // single global trial; while another trial runs, the claim is refused.
-    // Same provider/pin scope as the regular candidates; SASL-gated exits
-    // are skipped for an unauthenticated network (the trial would be wasted).
-    const recoveryStart = toTry.length;
-    if (!pinDirect) {
-        MullvadProxy*[] tier;
-        foreach (p; recovering) {
-            if (pinNordvpnTier && p.controlSocket.length > 0) continue;
-            if (unauthenticated && isEgressSaslGatedForHost(hostLower, slotBanKey(p))) continue;
-            tier ~= p;
-        }
-        MullvadProxy*[] mullvadRecovery;
-        foreach (p; tier) if (p.controlSocket.length > 0) mullvadRecovery ~= p;
-        if (gMullvadLock !is null) synchronized (gMullvadLock)
-            toTry ~= mullvadRecovery ~ orderStaticProxies(tier, networkId, orderNowMs, avoidLabel);
-        else toTry ~= mullvadRecovery ~ orderStaticProxies(tier, networkId, orderNowMs, avoidLabel);
-    }
-    if (pinLocation && toTry.length == 0)
-        throw new Exception("No VPN exit available for pinned location '" ~ egressNodeId ~ "' to " ~ host
-            ~ " — not falling back to direct" ~ admissionSummary);
-    if (egressBusyNote.length > 0) report(progress, "info", egressBusyNote);
-    if (toTry.length > recoveryStart && recoveryStart == 0)
-        report(progress, "info", "No admitted route is left" ~ admissionSummary
-            ~ " — trying a VPN exit whose quarantine cooldown ended as its single recovery trial.");
-    // Identities are read once, under the lock, and stay aligned with toTry.
-    // Only Automatic is reordered: a pin is the user's route choice. Every
-    // candidate is still dialed exactly once per call — a cooling route is
-    // the last resort, not excluded.
-    const endpointKey = routeEndpointKey(hostLower, port, tlsMode.toLower());
-    auto routeKeys = new string[toTry.length];
-    void rankRoutes() {
-        foreach (i, p; toTry) routeKeys[i] = routeIdentityLocked(p, ipv6BindAddr);
-        if (egressNodeId.length == 0 && rankEnd > 1)
-            rankByRouteMemory(gRouteMemory, endpointKey, toTry[0 .. rankEnd], routeKeys[0 .. rankEnd],
-                orderNowMs, (size_t i) => avoidLabel.length == 0 || toTry[i] is null || toTry[i].label != avoidLabel);
-    }
-    if (gMullvadLock !is null) synchronized (gMullvadLock) rankRoutes();
-    else rankRoutes();
+    if (toTry.length == 0)
+        throw new Exception("Routing policy permits no available route" ~ admissionSummary);
     Exception lastErr;
     // One "route [phase]: reason" per failed dial, for the diagnosis below.
     string[] failures;
@@ -2846,7 +2775,7 @@ private TCPConnection connectThroughEgressPlan(scope EgressDial dial, string net
         // candidate may claim the exit's single trial.
         string trialToken;
         if (proxy !is null) {
-            const adm = admitDial(exitRef(proxy), i >= recoveryStart);
+            const adm = admitDial(exitRef(proxy), recoveryCandidate[i]);
             if (!adm.allowed) {
                 failures ~= proxy.label ~ " [admission]: " ~ adm.blockedState;
                 if (lastErr is null)
@@ -2912,9 +2841,6 @@ private TCPConnection connectThroughEgressPlan(scope EgressDial dial, string net
                 noteRouteOutcome(endpointKey, hostLower, proxy, ipv6BindAddr, routeKeys[i], false);
             failures ~= (proxy !is null ? proxy.label : ipv6BindAddr.length > 0 ? "ipv6:" ~ ipv6BindAddr : "direct")
                 ~ " [" ~ dialFailurePhase(e) ~ "]: " ~ shortConnectError(e.msg);
-            if (i == 0 && pinnedSlot !is null && proxy is pinnedSlot && toTry.length > 1)
-                report(progress, "info", "Your pinned exit could not connect — trying another VPN exit "
-                    ~ "(this network does not fall back to direct).");
             // On TLS timeout specifically, ban this egress for this host so the next proxy is tried immediately
             // rather than re-cycling the same wedged exit.
             if (proxy !is null && e.msg.canFind("TLS handshake timed out")) {
@@ -2969,6 +2895,13 @@ private string dialFailurePhase(Exception e) nothrow {
 }
 
 version (unittest) {
+    private RoutingPreferences testRouting(RouteKind[] order, string preferredExit = "") {
+        RoutingPreferences routing;
+        routing.inherit = false;
+        routing.order = order;
+        routing.preferredExit = preferredExit;
+        return routing;
+    }
     /// Runs the real egress policy loop against a scripted holder transport.
     /// Isolates every egress table the loop reads or writes and restores
     /// them in `close()`.
@@ -3018,6 +2951,8 @@ version (unittest) {
         /// Two Mullvad slots (Mullvad tier) and one static NordVPN-style exit.
         static MullvadProxy[] standardPool() {
             MullvadProxy de, ch, nord;
+            de.provider = ch.provider = RouteKind.mullvad;
+            nord.provider = RouteKind.nordvpn;
             de.label = "de"; de.host = "10.64.0.1"; de.port = 1080; de.controlSocket = "/ctl/de.sock";
             de.locationId = "de-ber"; de.exitHostname = "de-ber-wg-001";
             ch.label = "ch"; ch.host = "10.64.0.2"; ch.port = 1080; ch.controlSocket = "/ctl/ch.sock";
@@ -3044,11 +2979,11 @@ version (unittest) {
 
         /// One connect; returns the routes dialed, in order. The Mullvad
         /// rotation restarts at its first slot every call.
-        string[] connect(string host, string pin = "", ushort port = 6697, string tls = "implicit",
+        string[] connect(string host, RoutingPreferences routing = RoutingPreferences.init, ushort port = 6697, string tls = "implicit",
                          bool unauthenticated = false, string avoid = "", string ipv6 = "") {
             dialed = null; used = EgressUsed.init; failed = null; mullvadRR = 0;
             DialResult dr;
-            try connectThroughEgressPlan(&fakeDial, "network-a", host, port, tls, pin, unauthenticated,
+            try connectThroughEgressPlan(&fakeDial, "network-a", host, port, tls, routing, unauthenticated,
                 ipv6, null, avoid, used, dr);
             catch (Exception e) failed = e;
             return dialed;
@@ -3076,7 +3011,49 @@ version (unittest) {
     }
 }
 
-@("egress plan: a full-dial success leads, failures go last, every route is still dialed once")
+@("egress plan: empty, malformed and native-only preferences cannot dial shared direct")
+unittest {
+    auto h = EgressPlanHarness.open(EgressPlanHarness.standardPool());
+    scope(exit) h.close();
+    foreach (host; ["irc.example.org", DEFAULT_FIBER_HOST]) {
+        assert(h.connect(host, testRouting([])).length == 0 && h.failed !is null);
+        auto invalid = RoutingPreferences.init;
+        invalid.valid = false;
+        assert(h.connect(host, invalid).length == 0 && h.failed !is null);
+        assert(!hasAlternativeEgressForHost(host, "slot:failed", false, invalid));
+        assert(h.connect(host, testRouting([RouteKind.ipv6])).length == 0 && h.failed !is null);
+    }
+    assert(h.connect(DEFAULT_FIBER_HOST) == ["direct"]);
+    assert(h.connect(DEFAULT_FIBER_HOST ~ ".", testRouting([RouteKind.mullvad])).length == 0
+        && h.failed !is null, "first-party cannot dial a VPN even with an explicit saved order");
+    assert(h.connect(DEFAULT_FIBER_HOST, testRouting([RouteKind.nordvpn, RouteKind.direct])) == ["direct"]);
+    banEgressForHost(DEFAULT_FIBER_HOST, DIRECT_EGRESS_LABEL);
+    assert(h.connect(DEFAULT_FIBER_HOST).length == 0 && h.failed !is null);
+}
+
+@("egress plan: order controls tiers and preferred exits never enable excluded providers")
+unittest {
+    auto h = EgressPlanHarness.open(EgressPlanHarness.standardPool());
+    scope(exit) h.close();
+    enum host = "irc.example.org";
+    h.remember(host, "de", true);
+    assert(h.connect(host, testRouting([RouteKind.nordvpn, RouteKind.mullvad], "ch-zrh")) == ["nord-se"]);
+    assert(h.connect(host, testRouting([RouteKind.mullvad], "nord-se")) == ["de"]);
+    assert(h.connect(host, testRouting([RouteKind.nordvpn], "ch-zrh")) == ["nord-se"]);
+    assert(h.connect(host, testRouting([RouteKind.direct, RouteKind.nordvpn])) == ["direct"]);
+    assert(h.connect(host, testRouting([RouteKind.ipv6, RouteKind.nordvpn])) == ["nord-se"]);
+    h.failWith = ["de": "tls", "ch": "tcp", "nord-se": "tcp"];
+    assert(h.connect(host, testRouting([RouteKind.nordvpn, RouteKind.mullvad], "ch-zrh"))
+        == ["nord-se", "ch", "de"] && h.failed !is null);
+    assert(h.connect(host, testRouting([RouteKind.nordvpn], "de-ber"))
+        == ["nord-se"] && h.failed !is null);
+    // Provider identity is configured metadata, not control-socket presence.
+    h.proxy("de").controlSocket = "";
+    h.failWith = null;
+    assert(h.connect(host, testRouting([RouteKind.nordvpn], "de")) == ["nord-se"]);
+}
+
+@("egress plan: route memory never changes provider order; every route is tried once")
 unittest {
     auto h = EgressPlanHarness.open(EgressPlanHarness.standardPool());
     scope(exit) h.close();
@@ -3084,15 +3061,13 @@ unittest {
     // The host closes TLS from both Mullvad exits; the static exit works.
     h.failWith = ["de": "tls", "ch": "tls"];
     assert(h.connect(host) == ["de", "ch", "nord-se"] && h.failed is null && h.used.label == "nord-se");
-    // The exit that completed TCP+TLS now precedes the Mullvad-first order.
-    assert(h.connect(host) == ["nord-se"]);
-    // When it fails too, the untried direct path beats the cooling exits.
+    // A remembered NordVPN success cannot jump the Mullvad tier.
+    assert(h.connect(host) == ["de", "ch", "nord-se"]);
     h.failWith["nord-se"] = "tls";
-    assert(h.connect(host) == ["nord-se", "direct"] && h.failed is null && h.used.label == "");
-    // Every route failing: each is dialed exactly once, the recent success
-    // first, cooling routes last in policy order, and the call fails.
+    assert(h.connect(host) == ["de", "ch", "nord-se", "direct"] && h.failed is null && h.used.label == "");
+    // Direct success cannot jump either VPN tier on the next call.
     h.failWith["direct"] = "tcp";
-    assert(h.connect(host) == ["direct", "de", "ch", "nord-se"]);
+    assert(h.connect(host) == ["de", "ch", "nord-se", "direct"]);
     assert(cast(DialFailedException) h.failed !is null);
     foreach (route; ["direct", "de", "ch", "nord-se"])
         assert(h.standing(host, route) == RouteStanding.cooling, "a total failure promotes nothing");
@@ -3111,8 +3086,8 @@ unittest {
     assert(h.connect("irc.example.org") == ["de", "ch"]);
     h.failWith = null;
     assert(h.connect("IRC.Example.ORG") == ["ch"], "host names are compared case-insensitively");
-    assert(h.connect("irc.example.org", "", 6667) == ["de"]);
-    assert(h.connect("irc.example.org", "", 6697, "starttls") == ["de"]);
+    assert(h.connect("irc.example.org", RoutingPreferences.init, 6667) == ["de"]);
+    assert(h.connect("irc.example.org", RoutingPreferences.init, 6697, "starttls") == ["de"]);
     assert(h.connect("irc.example.net") == ["de"]);
 }
 
@@ -3132,12 +3107,12 @@ unittest {
     h.connect(host);
     h.onDial = null;
     assert(h.standing(host, "de") == RouteStanding.neutral);
-    // Direct evidence is per IPv6 bind source (fresh host: nothing else proven).
+    // Even old direct-source evidence cannot reorder the provider tiers.
     enum v6host = "irc.example.com";
     h.remember(v6host, "direct", true, 0, 6697, "implicit", "2001:db8::5");
     h.failWith = null;
-    assert(h.connect(v6host, "", 6697, "implicit", false, "", "2001:db8::5") == ["direct"]);
-    assert(h.connect(v6host, "", 6697, "implicit", false, "", "2001:db8::6") == ["de"]);
+    assert(h.connect(v6host, RoutingPreferences.init, 6697, "implicit", false, "", "2001:db8::5") == ["de"]);
+    assert(h.connect(v6host, RoutingPreferences.init, 6697, "implicit", false, "", "2001:db8::6") == ["de"]);
 }
 
 @("egress plan: holder-side failures are not route evidence")
@@ -3156,7 +3131,7 @@ unittest {
     }
 }
 
-@("egress plan: direct, NordVPN and location pins ignore route memory and never leak to direct")
+@("egress plan: complete explicit orders and eligible preferred exits never leak to another route")
 unittest {
     auto h = EgressPlanHarness.open(EgressPlanHarness.standardPool());
     scope(exit) h.close();
@@ -3165,19 +3140,20 @@ unittest {
     h.remember(host, "direct", true);
     h.remember(host, "de", false);
     h.failWith = ["direct": "tcp", "nord-se": "tls", "de": "tls", "ch": "tls"];
-    assert(h.connect(host, "direct") == ["direct"] && h.failed !is null);
-    assert(h.connect(host, "nordvpn") == ["nord-se"] && h.failed !is null);
-    // Location pin: pinned slot first, then the other VPN exits in pool
-    // order (no memory reordering), never direct.
-    assert(h.connect(host, "ch-zrh") == ["ch", "de", "nord-se"] && h.failed !is null);
+    assert(h.connect(host, testRouting([RouteKind.direct])) == ["direct"] && h.failed !is null);
+    assert(h.connect(host, testRouting([RouteKind.nordvpn])) == ["nord-se"] && h.failed !is null);
+    // A preferred exit biases only its provider tier, never the full order.
+    assert(h.connect(host, testRouting([RouteKind.mullvad, RouteKind.nordvpn], "ch-zrh"))
+        == ["ch", "de", "nord-se"] && h.failed !is null);
     h.failWith = null;
-    assert(h.connect(host, "ch-zrh") == ["ch"] && h.used.label == "ch");
+    assert(h.connect(host, testRouting([RouteKind.mullvad, RouteKind.nordvpn], "ch-zrh"))
+        == ["ch"] && h.used.label == "ch");
 
     // No VPN exit at all: a location pin fails closed without dialing.
     auto empty = EgressPlanHarness.open(null);
     scope(exit) empty.close();
-    assert(empty.connect(host, "de-ber").length == 0);
-    assert(empty.failed !is null && empty.failed.msg.canFind("not falling back to direct"));
+    assert(empty.connect(host, testRouting([RouteKind.mullvad, RouteKind.nordvpn], "de-ber")).length == 0);
+    assert(empty.failed !is null);
 }
 
 @("egress plan: host bans, SASL gates and avoidance outrank route memory")
@@ -3190,7 +3166,7 @@ unittest {
     gateEgressForHost(host, "slot:nord-se");
     h.remember(host, "nord-se", true);
     h.failWith = ["de": "tls", "ch": "tls", "direct": "tcp", "nord-se": "tls"];
-    assert(h.connect(host, "", 6697, "implicit", true) == ["de", "ch", "direct", "nord-se"]);
+    assert(h.connect(host, RoutingPreferences.init, 6697, "implicit", true) == ["de", "ch", "direct", "nord-se"]);
     // A confirmed host ban excludes the route and forgets its success.
     h.failWith = null;
     h.remember(host, "de", true);
@@ -3203,8 +3179,8 @@ unittest {
     scope(exit) a.close();
     a.remember(host, "nord-se", true);
     a.failWith = ["de": "tls", "ch": "tls"];
-    assert(a.connect(host, "", 6697, "implicit", false, "nord-se") == ["de", "ch", "nord-se"]);
-    assert(a.connect(host) == ["nord-se"], "without avoidance the proven exit leads");
+    assert(a.connect(host, RoutingPreferences.init, 6697, "implicit", false, "nord-se") == ["de", "ch", "nord-se"]);
+    assert(a.connect(host) == ["de", "ch", "nord-se"], "provider order still wins without avoidance");
 }
 
 @("egress plan: no candidate bypasses a direct ban or a VPN-only alternative policy")
@@ -3213,9 +3189,9 @@ unittest {
     scope(exit) h.close();
     enum host = "irc.example.org";
     assert(hasAlternativeEgressForHost(host, "slot:failed"));
-    assert(!hasAlternativeEgressForHost(host, "slot:failed", false, "de-ber"));
-    assert(!hasAlternativeEgressForHost(host, "slot:failed", false, "nordvpn"));
-    assert(!hasAlternativeEgressForHost(host, "slot:failed", false, "direct"));
+    assert(!hasAlternativeEgressForHost(host, "slot:failed", false, testRouting([RouteKind.mullvad, RouteKind.nordvpn], "de-ber")));
+    assert(!hasAlternativeEgressForHost(host, "slot:failed", false, testRouting([RouteKind.nordvpn])));
+    assert(!hasAlternativeEgressForHost(host, "direct", false, testRouting([RouteKind.direct])));
     banEgressForHost(host, DIRECT_EGRESS_LABEL);
     assert(h.connect(host).length == 0 && h.failed !is null);
     assert(!hasAlternativeEgressForHost(host, "slot:failed"));
@@ -3223,17 +3199,17 @@ unittest {
     auto vpn = EgressPlanHarness.open(EgressPlanHarness.standardPool());
     scope(exit) vpn.close();
     banEgressForHost(host, "slot:nord-se");
-    assert(hasAlternativeEgressForHost(host, "slot:nord-se", false, "de-ber"));
-    assert(!hasAlternativeEgressForHost(host, "slot:nord-se", false, "nordvpn"));
+    assert(hasAlternativeEgressForHost(host, "slot:nord-se", false, testRouting([RouteKind.mullvad, RouteKind.nordvpn], "de-ber")));
+    assert(!hasAlternativeEgressForHost(host, "slot:nord-se", false, testRouting([RouteKind.nordvpn])));
     // A drained or quarantined route must not clear the host's backoff
     // simply because the pool still contains its configuration entry.
     vpn.admission.set("de", "draining");
     vpn.admission.set("ch", "quarantined");
-    assert(!hasAlternativeEgressForHost(host, "slot:nord-se", false, "de-ber"));
+    assert(!hasAlternativeEgressForHost(host, "slot:nord-se", false, testRouting([RouteKind.mullvad, RouteKind.nordvpn], "de-ber")));
     vpn.admission.set("ch", "recovering");
-    assert(hasAlternativeEgressForHost(host, "slot:nord-se", false, "de-ber"));
+    assert(hasAlternativeEgressForHost(host, "slot:nord-se", false, testRouting([RouteKind.mullvad, RouteKind.nordvpn], "de-ber")));
     vpn.admission.states["ch"].trialUntilMs = nowMsSafe() + 60_000;
-    assert(!hasAlternativeEgressForHost(host, "slot:nord-se", false, "de-ber"));
+    assert(!hasAlternativeEgressForHost(host, "slot:nord-se", false, testRouting([RouteKind.mullvad, RouteKind.nordvpn], "de-ber")));
 }
 
 @("egress plan: drained, quarantined and unavailable exits are never dialed, by any route")
@@ -3254,26 +3230,28 @@ unittest {
     // Nord tier, an exact exit pin and a location pin fail closed undialed.
     h.admission.set("nord-se", "unavailable");
     assert(h.connect(host) == ["direct"] && h.used.label == "");
-    assert(h.connect(host, "nordvpn").length == 0 && h.failed !is null);
-    assert(h.failed.msg.canFind("No healthy NordVPN exit") && h.failed.msg.canFind("nord-se unavailable"));
-    assert(h.connect(host, "nord-se").length == 0 && h.failed.msg.canFind("not falling back to direct"));
-    assert(h.connect(host, "de-ber").length == 0 && h.failed.msg.canFind("not falling back to direct"));
+    assert(h.connect(host, testRouting([RouteKind.nordvpn])).length == 0 && h.failed !is null);
+    assert(h.connect(host, testRouting([RouteKind.nordvpn, RouteKind.mullvad], "nord-se")).length == 0 && h.failed !is null);
+    assert(h.connect(host, testRouting([RouteKind.mullvad, RouteKind.nordvpn], "de-ber")).length == 0 && h.failed !is null);
 }
 
-@("egress plan: an exact static pin cannot bypass a drain and falls back VPN-only")
+@("egress plan: an exact preferred exit cannot bypass a drain or change provider order")
 unittest {
     auto h = EgressPlanHarness.open(EgressPlanHarness.standardPool());
     scope(exit) h.close();
     enum host = "irc.example.org";
     h.admission.set("nord-se", "draining");
     h.failWith = ["de": "tls"];
-    assert(h.connect(host, "nord-se") == ["de", "ch"] && h.failed is null && h.used.label == "ch");
+    assert(h.connect(host, testRouting([RouteKind.nordvpn, RouteKind.mullvad], "nord-se"))
+        == ["de", "ch"] && h.failed is null && h.used.label == "ch");
     h.failWith["ch"] = "tcp";
-    assert(h.connect(host, "nord-se") == ["de", "ch"] && h.failed !is null, "never direct");
+    const attempted = h.connect(host, testRouting([RouteKind.nordvpn, RouteKind.mullvad], "nord-se"));
+    assert(attempted.length == 2 && attempted.canFind("de") && attempted.canFind("ch")
+        && h.failed !is null, "only the two permitted, admitted Mullvad exits may be attempted");
     // Resumed (admitted again): the pin is honoured first, as before.
     h.admission.states.remove("nord-se");
     h.failWith = null;
-    assert(h.connect(host, "nord-se") == ["nord-se"]);
+    assert(h.connect(host, testRouting([RouteKind.nordvpn, RouteKind.mullvad], "nord-se")) == ["nord-se"]);
 }
 
 @("egress plan: a recovering exit is the single-trial last resort and route memory cannot lift it")
@@ -3284,42 +3262,42 @@ unittest {
     h.admission.set("nord-se", "recovering");
     h.remember(host, "nord-se", true);
     h.failWith = ["de": "tls", "ch": "tls"];
-    // Automatic: every admitted route, direct included, precedes the trial.
-    assert(h.connect(host) == ["de", "ch", "direct"] && h.used.label == "");
-    assert(h.used.trialToken.length == 0 && h.admission.openTrials.length == 0,
-        "an admitted route won: the recovering exit's trial was never claimed");
-    h.failWith["direct"] = "tcp";
+    // An earlier healthy provider wins without claiming the next tier's
+    // recovery trial. Recovery stays within its configured provider tier.
+    h.failWith = null;
+    assert(h.connect(host) == ["de"] && h.used.trialToken.length == 0);
+    assert(h.admission.openTrials.length == 0);
+    h.failWith = ["de": "tls", "ch": "tls", "direct": "tcp"];
     h.admission.admitReplies["nord-se"] = EgressDialAdmit(true, "nonce:3", "");
-    // Direct's success leads, the cooling exits follow, the trial is last.
-    assert(h.connect(host) == ["direct", "de", "ch", "nord-se"]);
+    assert(h.connect(host) == ["de", "ch", "nord-se"]);
     assert(h.used.label == "nord-se" && h.used.trialToken == "nonce:3");
     assert(h.used.trialExit == EgressEndpointRef("nord-se", "10.64.0.3", 1080));
     assert(h.admission.openTrials == ["nonce:3": "nord-se"], "the trial stays owned by this connection");
     // Nord pin with only a recovering exit: that exit, as the trial.
     h.admission.openTrials = null;
-    assert(h.connect(host, "nordvpn") == ["nord-se"] && h.used.trialToken == "nonce:3");
+    assert(h.connect(host, testRouting([RouteKind.nordvpn])) == ["nord-se"] && h.used.trialToken == "nonce:3");
     // A failed trial dial reopens the circuit; a holder-side failure never
     // exercised the exit and only releases the claim.
     h.failWith["nord-se"] = "socks5";
     h.admission.openTrials = null;
-    assert(h.connect(host, "nordvpn") == ["nord-se"] && h.failed !is null);
+    assert(h.connect(host, testRouting([RouteKind.nordvpn])) == ["nord-se"] && h.failed !is null);
     assert(h.admission.openTrials.length == 0 && h.admission.verdicts == ["nord-se:failure"],
         "an exit failure ends the trial as failed, never leaves it claimed");
     h.failWith["nord-se"] = "holder-err";
     h.admission.verdicts = null;
-    h.connect(host, "nordvpn");
+    h.connect(host, testRouting([RouteKind.nordvpn]));
     assert(h.admission.openTrials.length == 0 && h.admission.verdicts == ["nord-se:abort"],
         "a holder refusal releases the claim without penalty");
     h.failWith["nord-se"] = "holder-down";
     h.admission.verdicts = null;
-    h.connect(host, "nordvpn");
+    h.connect(host, testRouting([RouteKind.nordvpn]));
     assert(cast(HolderUnavailableException) h.failed !is null);
     assert(h.admission.openTrials.length == 0 && h.admission.verdicts == ["nord-se:abort"]);
     // Another engine holds the trial: nothing is dialed, nothing leaks.
     h.failWith.remove("nord-se");
     h.admission.admitReplies["nord-se"] = EgressDialAdmit(false, "", "trial");
-    assert(h.connect(host, "nordvpn").length == 0 && h.failed !is null);
-    assert(h.failed.msg.canFind("not admitting") && h.failed.msg.canFind("not falling back to direct"));
+    assert(h.connect(host, testRouting([RouteKind.nordvpn])).length == 0 && h.failed !is null);
+    assert(h.admission.openTrials.length == 0);
 }
 
 @("egress plan: a verdict that changes after planning refuses the dial; no store fails VPN closed")
@@ -3333,12 +3311,12 @@ unittest {
     // Store outage: every VPN exit is `unavailable`.
     h.admission.failing = true;
     assert(h.connect(host) == ["direct"]);
-    assert(h.connect(host, "nordvpn").length == 0 && h.failed !is null);
-    assert(h.connect(host, "nord-se").length == 0 && h.failed !is null);
-    assert(h.connect(host, "ch-zrh").length == 0 && h.failed !is null);
+    assert(h.connect(host, testRouting([RouteKind.nordvpn])).length == 0 && h.failed !is null);
+    assert(h.connect(host, testRouting([RouteKind.nordvpn, RouteKind.mullvad], "nord-se")).length == 0 && h.failed !is null);
+    assert(h.connect(host, testRouting([RouteKind.mullvad, RouteKind.nordvpn], "ch-zrh")).length == 0 && h.failed !is null);
     // No store configured at all (no Redis): the same, never permissive.
     gAdmissionStore = null;
-    assert(h.connect(host, "nordvpn").length == 0 && h.failed !is null);
+    assert(h.connect(host, testRouting([RouteKind.nordvpn])).length == 0 && h.failed !is null);
     assert(h.connect(host) == ["direct"]);
     assert(readAdmissions([EgressEndpointRef("nord-se", "10.64.0.3", 1080)])[0].state == "unavailable");
 }
@@ -3355,18 +3333,18 @@ unittest {
     recordEstablishedEgressLoss("nord-se", "alpha.example.org", now - 2_000, now);
     recordEstablishedEgressLoss("nord-se", "beta.example.net", now - 1_000, now);
     assert(h.admission.quarantined.length == 0);
-    assert(h.connect(host, "nordvpn").length == 0 && h.failed !is null);
-    assert(h.failed.msg.canFind("nord-se unavailable"));
-    assert(h.connect(host, "nord-se") == ["de"] && h.used.label == "de", "an exact pin falls back VPN-only");
+    assert(h.connect(host, testRouting([RouteKind.nordvpn])).length == 0 && h.failed !is null);
+    assert(h.connect(host, testRouting([RouteKind.nordvpn, RouteKind.mullvad], "nord-se"))
+        == ["de"] && h.used.label == "de", "another allowed provider is the only fallback");
     auto published = readAdmissions([EgressEndpointRef("nord-se", "10.64.0.3", 1080)])[0];
     assert(published.state == "unavailable" && published.reason.canFind("not yet persisted"));
     // Once the store accepts the write its own verdict rules again.
     h.admission.refuseQuarantineWrites = false;
     h.admission.set("nord-se", "quarantined");
-    assert(h.connect(host, "nordvpn").length == 0 && h.admission.quarantined.length == 1);
+    assert(h.connect(host, testRouting([RouteKind.nordvpn])).length == 0 && h.admission.quarantined.length == 1);
     assert(readAdmissions([EgressEndpointRef("nord-se", "10.64.0.3", 1080)])[0].state == "quarantined");
     h.admission.states.remove("nord-se");
-    assert(h.connect(host, "nordvpn") == ["nord-se"], "healed store-side: dialable again");
+    assert(h.connect(host, testRouting([RouteKind.nordvpn])) == ["nord-se"], "healed store-side: dialable again");
 }
 
 @("egress trial: a client settles its trial only through the fenced store, and carries it across a swap")
@@ -6805,8 +6783,7 @@ final class PersistentIRCClient {
                     import std.string : toLower;
                     const banKey = activeEgressLocationId.length > 0
                         ? activeEgressLocationId : DIRECT_EGRESS_LABEL;
-                    const pinnedHere = pinCoversBanKey(config.egressNodeId.toLower(), banKey);
-                    if (!pinnedHere && hasAlternativeEgressForHost(config.host.toLower(), banKey, false, config.egressNodeId.toLower())) {
+                    if (hasAlternativeEgressForHost(config.host.toLower(), banKey, false, config.routing)) {
                         banEgressForHost(config.host, banKey, TLS_CLOSED_ROTATE_BAN_MS);
                         consecutiveTlsClosed = 0;
                         emitLog("info", "TLS handshake keeps being closed via "
@@ -7295,7 +7272,7 @@ final class PersistentIRCClient {
         DialResult dr;
         withSpan("irc.tcp_connect",
             ["network": config.name, "host": config.host, "port": config.port.to!string,
-             "egress": config.egressNodeId, "ipv6Bind": ipv6Bind, "tls": tlsMode],
+             "routing": config.routing.toJson().toString(), "ipv6Bind": ipv6Bind, "tls": tlsMode],
             (ref Span ts) {
             EgressUsed used;
             // Release before the new connect: happyEyeballsConnect takes the
@@ -7309,7 +7286,7 @@ final class PersistentIRCClient {
             const now = unixMsNow();
             if (now >= avoidUntilMs) { avoidEgressLabel = ""; avoidUntilMs = 0; }
             connection = happyEyeballsConnect(holder, tag, config.host, config.port, tlsMode,
-                config.egressNodeId, config.sasl == SASLMechanism.none, ipv6Bind,
+                config.routing, config.sasl == SASLMechanism.none, ipv6Bind,
                 &onDialEvent, avoidEgressLabel, used, dr);
             holderConnId = dr.id;
             activeEgressLabel = used.label;
@@ -7438,8 +7415,8 @@ final class PersistentIRCClient {
 
         // Resolve per-user IPv6 once (cached). Empty when IRCFIBER_IPV6_PREFIX unset.
         string ipv6Bind = resolveIpv6Bind();
-        logInfo("Connecting to %s:%s (Happy Eyeballs) ipv6Bind=%s egress=%s owner=%s",
-            config.host, config.port, ipv6Bind.length ? ipv6Bind : "-", config.egressNodeId, ownerId.toString());
+        logInfo("Connecting to %s:%s (Happy Eyeballs) ipv6Bind=%s routing=%s owner=%s",
+            config.host, config.port, ipv6Bind.length ? ipv6Bind : "-", config.routing.toJson().toString(), ownerId.toString());
         dialPlainFallback = false;
         try {
             dialViaHolder(holderTlsMode(config.tls), ipv6Bind);
@@ -8674,10 +8651,9 @@ private void processEvents() {
             logJsonMap("warn", "connection", "Server requires SASL via this egress",
                 ["network": config.name, "host": config.host, "egress": key, "message": text,
                  "event": "egress_sasl_gate"]);
-            // A pin is honoured like a banned pin is: no failover behind the
-            // user's back, and SASL makes the pinned route work anyway.
-            const pinned = pinCoversBanKey(config.egressNodeId.toLower(), key);
-            if (!pinned && hasAlternativeEgressForHost(config.host.toLower(), key, true, config.egressNodeId.toLower())) {
+            // preferredExit is not a hard pin: try another route only when
+            // the complete saved provider order permits that alternative.
+            if (hasAlternativeEgressForHost(config.host.toLower(), key, true, config.routing)) {
                 throttledUntil = 0;
                 emitLog("info", config.host ~ " only admits SASL logins via " ~ egressVia()
                     ~ " — trying a different route.");
@@ -8737,16 +8713,12 @@ private void processEvents() {
         banEgressForHost(config.host, banKey);
         logJsonMap("warn", "connection", "Egress host-banned after G/K/Z-line",
             ["network": config.name, "host": config.host, "egress": banKey, "event": "egress_host_ban"]);
-        // A pin covers the banned route when it names it exactly ("direct"),
-        // when it is the country/city pin that resolved to this location, or
-        // when it is the label of a static slot.
-        const pinnedBanned = pinCoversBanKey(config.egressNodeId.toLower(), banKey);
-        if (!pinnedBanned && hasAlternativeEgressForHost(hostLower, banKey, unauthenticated, config.egressNodeId.toLower())) {
+        if (hasAlternativeEgressForHost(hostLower, banKey, unauthenticated, config.routing)) {
             throttledUntil = 0;
             emitLog("info", "Banned via " ~ via ~ " — retrying through a different exit.");
             logJsonMap("warn", "connection", "Server BAN detected — failing over to another egress",
                 ["network": config.name, "message": text, "egress": banKey, "event": "server_ban_failover"]);
-        } else if (mayPark && unauthenticated && !pinnedBanned && hostHasSaslGates(hostLower)) {
+        } else if (mayPark && unauthenticated && hostHasSaslGates(hostLower)) {
             emitLog("info", "Banned via " ~ via ~ ", and every other route only admits connections that log in with SASL.");
             const msg = saslRequiredMessage();
             logJsonMap("error", "connection", "Server BAN with only SASL-gated routes left — parking",
@@ -8756,7 +8728,6 @@ private void processEvents() {
         } else {
             throttledUntil = Clock.currTime.toUnixTime!long * 1000 + 30 * 60 * 1000;
             emitLog("info", "Banned via " ~ via ~ " and no other exit is available"
-                ~ (pinnedBanned ? " (this network is pinned to it — change \"Connect via\" to use another route)" : "")
                 ~ " — retrying in 30 minutes.");
             logJsonMap("error", "connection", "Server BAN detected (ZLINE/GLINE) — 30m backoff",
                 ["network": config.name, "message": text, "egress": banKey, "event": "server_ban_detected"]);
@@ -13778,16 +13749,6 @@ unittest {
            "the real gate is minIntervalMs's separate 4s ceiling — a naive penaltyMs read would wait twice as long as the server actually requires");
 }
 
-@("firstPartyDirectOnly keeps first-party off shared exits")
-unittest {
-    assert(firstPartyDirectOnly("irc.ircfiber.com", ""));
-    assert(!firstPartyDirectOnly("irc.ircfiber.com", "de"),
-           "an explicit exit pin honours user choice");
-    assert(!firstPartyDirectOnly("irc.ircfiber.com", "direct"));
-    assert(!firstPartyDirectOnly("irc.example.org", ""),
-           "third-party hosts keep the pool");
-    assert(!firstPartyDirectOnly("", ""));
-}
 
 @("webircSwapSuppressed skips recently Z-lined addresses only")
 unittest {

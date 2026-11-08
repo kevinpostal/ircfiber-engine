@@ -10,6 +10,7 @@ import vibe.data.json;
 import vibe.core.log;
 import ircfiber.models.network;
 import ircfiber.services.config : decodeStoredServicesConfig, ServicesConfig;
+import ircfiber.irc.routing_policy : RoutingPreferences, routingPreferencesFromJson;
 import ircfiber.db.mongo;
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.redis.protocol : RedisKeys;
@@ -242,7 +243,7 @@ final class NetworkRepository {
             "disabled": Bson(config.disabled),
             "systemManaged": Bson(config.systemManaged),
             "autoJoinDelaySeconds": Bson(config.autoJoinDelaySeconds),
-            "egressNodeId": Bson(config.egressNodeId),
+            "routing": config.routing.valid ? Bson.fromJson(config.routing.toJson()) : Bson(null),
             "avatarUrl": Bson(config.avatarUrl),
             "defaultAvatarUrl": Bson(config.defaultAvatarUrl),
             "profileMetadata": serializeToBson(config.profileMetadata),
@@ -260,6 +261,18 @@ final class NetworkRepository {
             logWarn("NetworkRepository: network %s has an invalid services config (%s); using defaults",
                 networkId, error);
         return services;
+    }
+
+    /// Missing or malformed saved routing must never become automatic routing.
+    private static RoutingPreferences storedRouting(Json value, string networkId) {
+        try return routingPreferencesFromJson(value);
+        catch (Exception e) {
+            logWarn("NetworkRepository: network %s has invalid routing (%s); new dials blocked",
+                networkId, e.msg);
+            RoutingPreferences invalid;
+            invalid.valid = false;
+            return invalid;
+        }
     }
 
     /// Complete an initial signup exactly once; never create or re-arm a row.
@@ -288,10 +301,11 @@ final class NetworkRepository {
         return true;
     }
 
-    /// Sets the egress selection on a network without rewriting the full record.
-    void setEgressNodeId(UUID id, string egressNodeId) {
+    /// Updates only saved route preferences. Runtime policy filtering is separate.
+    void setRouting(UUID id, RoutingPreferences routing) {
+        auto validated = routingPreferencesFromJson(routing.toJson());
         auto selector = Bson(["id": Bson(id.toString())]);
-        auto update = Bson(["$set": Bson(["egressNodeId": Bson(egressNodeId)])]);
+        auto update = Bson(["$set": Bson(["routing": Bson.fromJson(validated.toJson())])]);
         collection.updateOne(selector, update);
     }
 
@@ -354,7 +368,7 @@ final class NetworkRepository {
                 const v = elem["autoJoinDelaySeconds"].get!int;
                 if (v > 0) cfg.autoJoinDelaySeconds = cast(uint) v;
             } catch (Exception) {}
-            try { cfg.egressNodeId = elem["egressNodeId"].get!string; } catch (Exception) {}
+            cfg.routing = storedRouting(elem["routing"], cfg.id.toString());
             try { cfg.avatarUrl = elem["avatarUrl"].get!string; } catch (Exception) {}
             try { cfg.defaultAvatarUrl = elem["defaultAvatarUrl"].get!string; } catch (Exception) {}
             try { cfg.profileMetadata = deserializeJson!(string[string])(elem["profileMetadata"]); } catch (Exception) {}
@@ -388,7 +402,12 @@ final class NetworkRepository {
             const v = doc["autoJoinDelaySeconds"].get!int;
             if (v > 0) cfg.autoJoinDelaySeconds = cast(uint) v;
         } catch (Exception) {}
-        try { cfg.egressNodeId = doc["egressNodeId"].get!string; } catch (Exception) {}
+        cfg.routing.valid = false;
+        try { cfg.routing = storedRouting(doc["routing"].toJson(), cfg.id.toString()); }
+        catch (Exception e) {
+            logWarn("NetworkRepository: network %s routing cannot be decoded (%s); new dials blocked",
+                cfg.id, e.msg);
+        }
         try { cfg.avatarUrl = doc["avatarUrl"].get!string; } catch (Exception) {}
         try { cfg.defaultAvatarUrl = doc["defaultAvatarUrl"].get!string; } catch (Exception) {}
         try { cfg.profileMetadata = deserializeBson!(string[string])(doc["profileMetadata"]); } catch (Exception) {}
@@ -463,4 +482,78 @@ unittest {
     // A corrupted stored value fails closed to the default.
     doc["services"] = Bson.fromJson(parseJsonString(`{"provider":"anope","managed":true}`));
     assert(NetworkRepository.docToConfig(doc).services.isDefault);
+}
+
+@("Saved routing round-trips Mongo and Redis without widening the route order")
+unittest {
+    import ircfiber.irc.routing_policy : RouteKind;
+    NetworkConfig cfg;
+    cfg.id = parseUUID("66666666-6666-6666-6666-666666666666");
+    cfg.name = "VPN only";
+    cfg.host = "irc.example.net";
+    cfg.nick = "alice";
+    cfg.realName = "Alice";
+    cfg.saslUsername = "account";
+    cfg.saslPassword = "secret";
+    cfg.autoJoinChannels = ["#saved"];
+    cfg.routing.inherit = false;
+    cfg.routing.order = [RouteKind.nordvpn, RouteKind.mullvad];
+    cfg.routing.preferredExit = "unavailable-exit";
+    const owner = parseUUID("77777777-7777-7777-7777-777777777777");
+    foreach (inherit; [false, true]) {
+        cfg.routing.inherit = inherit;
+        foreach (empty; [false, true]) {
+            cfg.routing.order = empty ? [] : [RouteKind.nordvpn, RouteKind.mullvad];
+            auto fromDoc = NetworkRepository.docToConfig(NetworkRepository.persistedFields(cfg, owner));
+            auto cached = NetworkRepository.deserializeNetworkConfigs(
+                parseJsonString(NetworkRepository.serializeNetworkConfigs([fromDoc]).toString()));
+            assert(cached.length == 1);
+            foreach (saved; [fromDoc, cached[0]]) {
+                assert(saved.routing.valid);
+                assert(saved.routing.inherit == inherit);
+                assert(saved.routing.order == (inherit ? [] : cfg.routing.order));
+                assert(saved.routing.preferredExit == cfg.routing.preferredExit);
+                assert(saved.saslPassword == "secret" && saved.saslUsername == "account");
+                assert(saved.autoJoinChannels == ["#saved"]);
+                assert(saved.id == cfg.id);
+            }
+        }
+    }
+}
+
+@("Missing and malformed saved routing stay blocked through Mongo and Redis")
+unittest {
+    NetworkConfig cfg;
+    cfg.id = parseUUID("88888888-8888-8888-8888-888888888888");
+    cfg.name = "Blocked";
+    cfg.host = "irc.example.net";
+    const owner = parseUUID("99999999-9999-9999-9999-999999999999");
+    auto doc = Bson.emptyObject;
+    doc["id"] = Bson(cfg.id.toString());
+    doc["host"] = Bson(cfg.host);
+    auto cacheRow = cfg.toJson();
+    cacheRow.remove("routing");
+    assert(!NetworkRepository.docToConfig(doc).routing.valid);
+    assert(!NetworkRepository.deserializeNetworkConfigs(Json([cacheRow]))[0].routing.valid);
+    foreach (raw; [
+        `null`,
+        `{}`,
+        `{"order":null}`,
+        `{"order":["unknown"],"preferredExit":""}`,
+        `{"order":["direct","direct"],"preferredExit":""}`,
+        `{"order":[],"preferredExit":"direct"}`,
+        `{"order":[],"preferredExit":"","extra":true}`
+    ]) {
+        const bad = parseJsonString(raw);
+        doc["routing"] = Bson.fromJson(bad);
+        cacheRow["routing"] = bad;
+        auto fromDoc = NetworkRepository.docToConfig(doc);
+        auto fromCache = NetworkRepository.deserializeNetworkConfigs(Json([cacheRow]))[0];
+        foreach (saved; [fromDoc, fromCache]) {
+            assert(!saved.routing.valid);
+            assert(saved.toJson()["routing"].type == Json.Type.null_);
+            auto rewritten = NetworkRepository.docToConfig(NetworkRepository.persistedFields(saved, owner));
+            assert(!rewritten.routing.valid);
+        }
+    }
 }

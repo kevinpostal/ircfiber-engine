@@ -100,8 +100,13 @@ The Redis round trip checks reply targets and ordered reaction add/remove rows t
 
 ### VPN egress reliability
 
-The `nordvpn` network pin uses **static SOCKS exits only**; if none can dial,
-the engine retries with backoff rather than connecting directly or via Mullvad.
+Saved networks use `routing: {order: null | [...], preferredExit: ""}`.
+An explicit order is the complete permitted route list; `["nordvpn"]` uses
+only configured NordVPN SOCKS exits, without Mullvad or shared-direct fallback.
+`null` currently inherits `["mullvad","nordvpn","direct"]` (the first-party
+network remains direct-only). An empty order or malformed stored preferences
+starts no dial. `preferredExit` biases an eligible exit within its provider
+tier and cannot enable an omitted provider.
 After a registered session survives 60 seconds, an upstream socket loss makes
 that client prefer another exit for five minutes. Correlated losses on two
 distinct IRC hostnames within 90 seconds exclude their shared static exit
@@ -110,9 +115,9 @@ the VPN provider caused the losses. Existing sockets stay open.
 
 Admission lives in Redis at `irc:egress:admission:<label>`, bound to the
 configured proxy endpoint. Quarantine survives engine hot swaps and applies
-to every engine; neither an exact-label pin nor route memory bypasses it.
+to every engine; neither a preferred exit nor route memory bypasses it.
 After the minimum five-minute cooldown, one atomically claimed recovery
-session may try the exit, after healthy permitted alternatives. It must stay
+session may try the exit after healthy candidates within its permitted tier. It must stay
 registered for at least 60 seconds and answer a matching keepalive sent
 after that window before the exit admits ordinary connections again.
 Failed or expired trials double the cooldown up to one hour. Fresh
@@ -140,16 +145,22 @@ On a quarantine transition the engine queues one `notice` in
 `irc:logs:outbox`; FiberEye delivers it to `#staff`. Notice delivery is
 best-effort; it is not the source of the admission decision.
 
-### Automatic route selection and IPv6
+### Ordered route selection and IPv6
 
-Automatic routing remembers completed TCP+TLS/STARTTLS dials per host, port,
-and TLS mode: successful routes lead for 30 minutes, failed routes go last
-for five minutes but remain last resorts. Memory is process-local and bounded
-to 512 endpoints with 32 concrete routes each; retargeting an exit starts fresh.
-Host-specific TLS failures do not trip an exit's global circuit breaker.
-Host bans, SASL gates, and client avoidance still take precedence. Direct pins
-stay direct; NordVPN pins stay on NordVPN; location pins may use another VPN
-exit but never fall back to direct.
+Routing remembers completed TCP+TLS/STARTTLS dials per host, port, and TLS mode:
+successful exits lead within their configured provider tier for 30 minutes,
+and failed exits go last in that tier for five minutes. Neither remembered
+success nor a preferred exit can change the saved provider order. Memory is
+process-local and bounded to 512 endpoints with 32 concrete routes each;
+retargeting an exit starts fresh. Host-specific TLS failures do not trip an
+exit's global circuit breaker. Host bans, SASL gates, client avoidance and
+durable admission still apply.
+
+The `ipv6` route token is accepted by the shared contract but is not yet a
+supported engine transport tier: it is skipped, never replaced with a
+dual-stack direct dial. Native source-bound IPv6 requires the later holder
+family-capability implementation. The existing shared direct path below is
+not proof that a native routed address was used.
 
 Direct TLS/STARTTLS tries the remaining vetted DNS addresses if the first
 TCP winner fails negotiation. Each address gets at most one protocol attempt,

@@ -40,6 +40,7 @@ import ircfiber.db.user : UserRepository;
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.redis.protocol : RedisKeys, ControlMessage;
 import ircfiber.irc.registry : ServerRegistry;
+import ircfiber.irc.routing_policy : RouteKind;
 
 /// Hostname of the platform-provided IRC server. Overridable via
 /// `IRCFIBER_DEFAULT_NETWORK_HOST` — see the module doc.
@@ -146,6 +147,8 @@ NetworkConfig buildDefaultFiberNetwork(User user) @safe {
     cfg.autoJoinChannels = DEFAULT_FIBER_CHANNELS.dup;
     cfg.disabled = false;
     cfg.systemManaged = true;
+    cfg.routing.inherit = false;
+    cfg.routing.order = [RouteKind.direct];
     return cfg;
 }
 
@@ -318,6 +321,9 @@ unittest {
     assert(cfg.tls == TLSMode.required);
     assert(cfg.sasl == SASLMechanism.none);
     assert(cfg.systemManaged == true);
+    assert(cfg.routing.valid && !cfg.routing.inherit);
+    assert(cfg.routing.order == [RouteKind.direct]);
+    assert(cfg.routing.preferredExit == "");
     assert(cfg.disabled == false);
     assert(cfg.autoJoinChannels == ["#support", "#ircfiber"]);
     assert(cfg.realName == "alice");

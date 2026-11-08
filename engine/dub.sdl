@@ -14,7 +14,7 @@ importPaths "source"
 // embedded by ircfiber.irc.services_grammar via string imports.
 stringImportPaths "catalogs"
 
-dependency "irc-fiber-common" path="../common" version="~>0.4.1"
+dependency "irc-fiber-common" path="../common" version="~>0.5.0"
 dependency "vibe-d" version="~>0.10.0"
 dependency "vibe-d:redis" version="~>0.10.0"
 dependency "vibe-d:mongodb" version="~>0.10.0"

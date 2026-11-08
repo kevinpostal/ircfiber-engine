@@ -143,7 +143,7 @@ api GET /api/networks | jq -e 'type == "array"' >/dev/null || fail "login failed
 
 LOG_MARK=$(engine_log_lines)
 say "creating network $NET_NAME → $MOCK_HOST:16668 (plain TCP)"
-RESP=$(api POST /api/networks "{\"name\":\"$NET_NAME\",\"host\":\"$MOCK_HOST\",\"port\":16668,\"tls\":\"disabled\",\"nick\":\"hotswap\",\"realName\":\"Hot Swap\",\"egressNodeId\":\"direct\",\"autoJoinChannels\":[]}")
+RESP=$(api POST /api/networks "{\"name\":\"$NET_NAME\",\"host\":\"$MOCK_HOST\",\"port\":16668,\"tls\":\"disabled\",\"nick\":\"hotswap\",\"realName\":\"Hot Swap\",\"routing\":{\"order\":[\"direct\"],\"preferredExit\":\"\"},\"autoJoinChannels\":[]}")
 NET_ID=$(printf '%s' "$RESP" | jq -r '.id // .networkId // empty')
 [[ -n "$NET_ID" ]] || fail "create network failed: $RESP"
 ok "network $NET_ID"

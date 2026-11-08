@@ -18,6 +18,7 @@ import ircfiber.logging : logJsonMap;
 import ircfiber.storage.buffer : BufferManager;
 import std.datetime.systime : Clock;
 import core.time : seconds, Duration, msecs;
+import ircfiber.irc.routing_policy : routingPreferencesFromJson, RoutingValidationException;
 
 // ─────────────────────────────────────────────────────────────────────────
 // Reconnect-in-flight dedup
@@ -791,14 +792,14 @@ private NetworkConfig parseNetworkConfig(Json j) {
     if (j["serverPass"].type != Json.Type.undefined) cfg.serverPass = j["serverPass"].get!string;
     if (j["operUsername"].type != Json.Type.undefined) cfg.operUsername = j["operUsername"].get!string;
     if (j["operPassword"].type != Json.Type.undefined) cfg.operPassword = j["operPassword"].get!string;
-    // Fields the gateway ships in NetworkConfig.toJson() that were silently
-    // dropped here, so a pin/delay set via the API only took effect after a
-    // restart re-read Mongo (db/network.d honours both).
+    // Full control configs carry routing just like the canonical Mongo/cache
+    // representation. Missing or malformed preferences must never mean auto.
     if (j["autoJoinDelaySeconds"].type == Json.Type.int_) {
         const v = j["autoJoinDelaySeconds"].get!int;
         if (v > 0) cfg.autoJoinDelaySeconds = cast(uint) v;
     }
-    if (j["egressNodeId"].type == Json.Type.string) cfg.egressNodeId = j["egressNodeId"].get!string;
+    try cfg.routing = routingPreferencesFromJson(j["routing"]);
+    catch (RoutingValidationException) cfg.routing.valid = false;
     if (j["avatarUrl"].type == Json.Type.string) cfg.avatarUrl = j["avatarUrl"].get!string;
     if (j["defaultAvatarUrl"].type == Json.Type.string) cfg.defaultAvatarUrl = j["defaultAvatarUrl"].get!string;
     if (j["profileMetadata"].type == Json.Type.object)
@@ -815,4 +816,34 @@ private NetworkConfig parseNetworkConfig(Json j) {
     cfg.services = decodeStoredServicesConfig(j["services"], servicesError);
     if (servicesError.length) logWarn("Invalid services config in engine control; trust cleared");
     return cfg;
+}
+
+@("engine control: routing round trips complete orders and malformed saved preferences stay blocked")
+unittest {
+    import ircfiber.irc.routing_policy : RouteKind;
+    NetworkConfig original;
+    original.host = "irc.example.org";
+    original.nick = "fixture";
+    auto j = original.toJson();
+    j["routing"] = parseJsonString(`{"order":["nordvpn","mullvad"],"preferredExit":"unavailable-exit"}`);
+    auto cfg = parseNetworkConfig(j);
+    assert(cfg.routing.valid && !cfg.routing.inherit);
+    assert(cfg.routing.order == [RouteKind.nordvpn, RouteKind.mullvad]);
+    assert(cfg.routing.preferredExit == "unavailable-exit");
+    j["routing"] = parseJsonString(`{"order":[],"preferredExit":""}`);
+    cfg = parseNetworkConfig(j);
+    assert(cfg.routing.valid && !cfg.routing.inherit && cfg.routing.order.length == 0);
+    foreach (raw; [
+        `null`,
+        `{"order":["unknown"],"preferredExit":""}`,
+        `{"order":["direct","direct"],"preferredExit":""}`,
+        `{"order":null,"preferredExit":"","extra":true}`,
+        `{"order":null}`
+    ]) {
+        j["routing"] = parseJsonString(raw);
+        assert(!parseNetworkConfig(j).routing.valid);
+    }
+    // Undefined is the missing stored/control field, not inheritance.
+    j["routing"] = Json.init;
+    assert(!parseNetworkConfig(j).routing.valid);
 }

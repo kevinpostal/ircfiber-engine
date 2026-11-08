@@ -8,6 +8,7 @@ import std.uni : toLower;
 import vibe.data.json;
 import std.conv;
 import ircfiber.services.config : ServicesConfig;
+import ircfiber.irc.routing_policy : RoutingPreferences;
 /// TLS mode options
 enum TLSMode {
     /// TLS disabled
@@ -170,21 +171,9 @@ struct NetworkConfig {
     /// IRC Fiber network is provisioned this way so every user has a working
     /// connection to the hosted IRC server out of the box.
     bool systemManaged = false;
-    /// Mullvad egress selection ("pin"). Grammar:
-    ///   ""            automatic — any healthy exit slot, host-ban aware, direct last
-    ///   "direct"      the host's own address, no SOCKS hop
-    ///   "de"          country pin — any city in that country (2 letters, lower-case)
-    ///   "de-ber"      city pin — `<countryCode>-<cityCode>`, lower-case
-    ///   "de"          also the label of a *static* slot (see below)
-    /// The engine resolves a country/city pin against its Mullvad location
-    /// catalog and retargets a free exit slot to that location; a slot that is
-    /// already serving live connections is never retargeted.
-    ///
-    /// A slot whose tailscaled the engine cannot reach (sidecars on another
-    /// host — no control socket) has no readable location, so it is addressed
-    /// by its IRCFIBER_MULLVAD_POOL label instead. Only such slots answer to
-    /// a label, so a retargetable pool never has two names for one exit.
-    string egressNodeId = "";
+    /// Saved route order and optional eligible VPN exit preference.
+    /// Invalid stored values remain blocked rather than inheriting defaults.
+    RoutingPreferences routing;
     /// Per-network avatar override; empty defers to `defaultAvatarUrl`.
     string avatarUrl = "";
     /// Denormalized copy of the owner's account default avatar, kept in
@@ -232,7 +221,7 @@ struct NetworkConfig {
             "serverPass": Json(serverPass),
             "systemManaged": Json(systemManaged),
             "autoJoinDelaySeconds": Json(autoJoinDelaySeconds),
-            "egressNodeId": Json(egressNodeId),
+            "routing": routing.valid ? routing.toJson() : Json(null),
             "avatarUrl": Json(avatarUrl),
             "defaultAvatarUrl": Json(defaultAvatarUrl),
             "profileMetadata": serializeToJson(profileMetadata),

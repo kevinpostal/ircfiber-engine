@@ -33,8 +33,6 @@ struct EngineConfigOverride {
     int maxConnections;
     /// Admin flag: only assign when no other healthy server exists.
     bool fallbackOnly;
-    /// Optional per-engine Mullvad egress override — label like "de"/"se" or "" for random.
-    string egressNodeId;
 }
 
 /// How long (ms) an engine that detached from its IRC sessions for a hot
@@ -946,38 +944,12 @@ final class ServerRegistry {
      * Set engine config overrides (stored in Redis).
      */
     void setEngineConfig(string serverId, int priority, int maxConns, bool fallbackOnly) {
-        // Preserve egressNodeId if already set — callers of legacy 3-arg form
-        // shouldn't wipe the per-engine Mullvad override.
-        string existing = "";
-        try {
-            auto cur = getEngineConfig(serverId);
-            existing = cur.egressNodeId;
-        } catch (Exception) {}
         auto key = RedisKeys.engineConfig(serverId);
         auto config = Json.emptyObject;
         config["priority"] = Json(priority);
         config["maxConnections"] = Json(maxConns);
         config["fallbackOnly"] = Json(fallbackOnly);
-        if (existing.length > 0) config["egressNodeId"] = Json(existing);
         db.set(key, config.toString());
-    }
-
-    /// Set per-engine Mullvad egress override ("" = clear → random).
-    void setEngineEgress(string serverId, string egressNodeId) {
-        auto cur = getEngineConfig(serverId);
-        cur.egressNodeId = egressNodeId;
-        auto key = RedisKeys.engineConfig(serverId);
-        auto config = Json.emptyObject;
-        config["priority"] = Json(cur.priority);
-        config["maxConnections"] = Json(cur.maxConnections);
-        config["fallbackOnly"] = Json(cur.fallbackOnly);
-        if (cur.egressNodeId.length > 0) config["egressNodeId"] = Json(cur.egressNodeId);
-        db.set(key, config.toString());
-    }
-
-    /// Get per-engine Mullvad egress override ("" = none).
-    string getEngineEgress(string serverId) {
-        return getEngineConfig(serverId).egressNodeId;
     }
 
     /**
@@ -1000,10 +972,6 @@ final class ServerRegistry {
                 cfg.maxConnections = j["maxConnections"].get!int;
             if (j["fallbackOnly"].type != Json.Type.undefined)
                 cfg.fallbackOnly = j["fallbackOnly"].get!bool;
-            if (j["egressNodeId"].type != Json.Type.undefined)
-                try { cfg.egressNodeId = j["egressNodeId"].get!string; } catch (Exception) {}
-            else if (j["egress"].type != Json.Type.undefined)
-                try { cfg.egressNodeId = j["egress"].get!string; } catch (Exception) {}
             return cfg;
         } catch (Exception e) {
             logWarn("Failed to parse engine config for %s: %s", serverId, e.msg);

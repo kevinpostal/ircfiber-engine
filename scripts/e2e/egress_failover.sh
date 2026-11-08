@@ -73,7 +73,7 @@ START_MS=$(date +%s000)
 START=$(mark)
 create() {
     local response
-    response=$(api POST /api/networks "{\"name\":\"$1\",\"host\":\"$2\",\"port\":16668,\"tls\":\"disabled\",\"nick\":\"egresstest\",\"realName\":\"Egress test\",\"egressNodeId\":\"nordvpn\",\"autoJoinChannels\":[]}")
+    response=$(api POST /api/networks "{\"name\":\"$1\",\"host\":\"$2\",\"port\":16668,\"tls\":\"disabled\",\"nick\":\"egresstest\",\"realName\":\"Egress test\",\"routing\":{\"order\":[\"nordvpn\"],\"preferredExit\":\"\"},\"autoJoinChannels\":[]}")
     jq -er '.id // .networkId' <<<"$response" || fail "create failed: $response"
 }
 ID_A=$(create "$NAME_A" alpha.example.org)
