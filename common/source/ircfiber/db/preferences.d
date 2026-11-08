@@ -166,7 +166,7 @@ struct ClientPrefSpec {
 
 /// Per-device web client prefs, in wire order (the frontend keeps the identical list).
 immutable ClientPrefSpec[] CLIENT_PREFS = [
-    ClientPrefSpec("theme", ClientPrefKind.enum_, ["dark", "light", "gruvbox", "monokai"]),
+    ClientPrefSpec("theme", ClientPrefKind.enum_, ["dark", "light", "gruvbox", "monokai", "dracula"]),
     ClientPrefSpec("textSize", ClientPrefKind.enum_, TEXT_SIZE_VALUES),
     ClientPrefSpec("compactMode", ClientPrefKind.bool_),
     ClientPrefSpec("sidebarLeft", ClientPrefKind.bool_),
@@ -2595,7 +2595,7 @@ unittest {
     assert(err("compactMode", Json(true)) == "");
     assert(err("compactMode", Json(1)) == "compactMode must be boolean");
     // enum
-    foreach (theme; ["dark", "light", "gruvbox", "monokai"])
+    foreach (theme; ["dark", "light", "gruvbox", "monokai", "dracula"])
         assert(err("theme", Json(theme)) == "");
     foreach (theme; ["midnight", "dusk", "tropic", "emerald", "sand", "orchid"])
         assert(err("theme", Json(theme)).length);
@@ -2650,7 +2650,7 @@ unittest {
     enum id = "11111111-2222-4333-8444-555555555555";
     UserPreferences p;
     auto cp = Json.emptyObject;
-    cp["theme"] = Json("light");
+    cp["theme"] = Json("dracula");
     cp["awayAfterMinutes"] = Json(60);
     p.clientPrefs = cp;
     DeviceProfile d;
@@ -2659,6 +2659,7 @@ unittest {
     d.autoName = "Chrome on macOS";
     auto dcp = Json.emptyObject;
     dcp["compactMode"] = Json(true);
+    dcp["theme"] = Json("dracula");
     d.clientPrefs = dcp;
     d.clientPrefsSet = true;
     p.devices[id] = d;
