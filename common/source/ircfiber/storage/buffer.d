@@ -655,6 +655,18 @@ final class BufferManager {
             // Include nick + text to distinguish distinct PRIVMSGs that
             // share channel/params/timestamp (fast bot replies).
             hashInput ~= "|" ~ event.nick ~ "|" ~ event.text;
+            if (event.command == "TAGMSG") {
+                // Client-only tags are the payload. Transport tags (batch/time)
+                // must not change identity, but react/unreact/typing must.
+                auto tags = parseJsonString(event.tagsJson);
+                auto keys = tags.get!(Json[string]).keys;
+                keys.sort();
+                foreach (name; keys) if (name.length && name[0] == '+') {
+                    const value = tags[name].get!string;
+                    hashInput ~= "|" ~ name.length.to!string ~ ":" ~ name
+                        ~ value.length.to!string ~ ":" ~ value;
+                }
+            }
             key = "h:" ~ contentHash(hashInput, channel, event.timestampMs, params);
         }
         return key;
@@ -1067,5 +1079,17 @@ void historyAtomicStorageRegressionChecks(RedisStorage redis) {
         assert(rejected && !db.exists(rowKey), "Invalid dedup storage must not append a row");
         db.del(dedupKey);
         assert(append() && !append(), "Retry after storage repair accepts the row only once");
+        event.command = "TAGMSG";
+        event.nick = "tag-peer";
+        event.text = "";
+        event.setParams(["me"]);
+        foreach (tags; [
+                `{"+typing":"active"}`, `{"+typing":"done"}`,
+                `{"+draft/react":"ok","+draft/reply":"ref"}`,
+                `{"+draft/unreact":"ok","+draft/reply":"ref"}`]) {
+            event.tagsJson = tags;
+            assert(append(), "Distinct same-timestamp tag state must not collide");
+            assert(!append(), "The same accepted tag state must remain deduplicated");
+        }
     }
 }

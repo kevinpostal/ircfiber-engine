@@ -604,7 +604,9 @@ final class MessageRepository {
         FindOptions options;
         options.sort = indexKeys(["t", "eid", "_id"]);
         options.limit = 1;
-        Bson doc;
+        // Bson.init is undefined, not null; an empty cursor must leave
+        // an explicit null sentinel for the unknown-reference result.
+        Bson doc = Bson(null);
         foreach (candidate; collection.find(filter, options)) { doc = candidate; break; }
         if (doc.isNull) return false;
         boundary.timestampMs = readBsonTimestamp(doc["t"]);

@@ -131,7 +131,8 @@ final class BncEngineState {
             return;
         }
         auto j = envelope(op, "line"); auto l = Json.emptyObject;
-        l["prefix"] = e.prefix; l["command"] = e.command;
+        if (e.prefix.length) l["prefix"] = e.prefix;
+        l["command"] = e.command;
         l["params"] = parseJsonString(e.paramsJson);
         l["tags"] = publicTags(e.tagsJson); j["line"] = l; publish(j);
     }
@@ -558,7 +559,7 @@ final class BncEngineState {
         j["nicks"] = strings(l.nicks); j["rejected"] = strings(rejected); return j;
     }
     private void numeric(ref Operation op, string code, string[] params) {
-        auto e = IRCRawEvent(network, code); e.prefix = network;
+        auto e = IRCRawEvent(network, code);
         e.setParams(params); line(op, e);
     }
     private void full(ref Operation op, string[] rejected) {

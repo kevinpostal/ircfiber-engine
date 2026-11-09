@@ -55,6 +55,21 @@ mixin template HistoryRecoveryMixin() {
     private long historyNowMs() { return Clock.currTime.toUnixTime!long * 1000; }
     private string historyKey(string target) { return target.length == 0 || target == "*targets" ? "*targets" : historyFold(target); }
 
+    private void mergeCommittedHistoryCoverage(string key, HistoryRecovery recovery) {
+        if (historyKey(recovery.target) != key) throw new Exception("History target mismatch");
+        if (auto pending = key in historyRecovery) {
+            // META carries gap intent, while Redis owns accepted page cursors.
+            // A failed first page can leave only the pre-gap complete seed in
+            // Redis after the closed request has disappeared from META.
+            if ((pending.state == "recovering" || pending.state == "stalled")
+                && (recovery.state == "complete" || recovery.state == "retention_exhausted")) {
+                recovery.state = pending.state;
+                recovery.reasonCode = pending.reasonCode;
+            }
+        }
+        historyRecovery[key] = recovery;
+    }
+
     private void restoreHistoryCoverage() {
         if (redis is null) return;
         try {
@@ -65,8 +80,7 @@ mixin template HistoryRecoveryMixin() {
                 if (field) key = value;
                 else {
                     auto recovery = historyRecoveryFromJSON(parseJsonString(value));
-                    if (historyKey(recovery.target) != key) throw new Exception("History target mismatch");
-                    historyRecovery[key] = recovery;
+                    mergeCommittedHistoryCoverage(key, recovery);
                 }
                 field = !field;
             }
@@ -219,6 +233,13 @@ mixin template HistoryRecoveryMixin() {
             if (auto parent = batch.parent in openBatches) batch.requestId = parent.requestId;
             if (!batch.requestId.length) batch.requestId = historyRequestForLabel(batch.label);
             if (batch.historical && !batch.requestId.length) batch.requestId = matchHistoryBatch(target, batch.label);
+            if (batch.historical && batch.quarantined && !batch.requestId.length) {
+                // Broken ancestry cannot prove that a concurrent empty root is
+                // complete. Keep its target's coverage at the committed bound.
+                foreach (id, ref page; historyPages)
+                    if (historyKey(page.request.target) == historyKey(batch.target))
+                        stallHistory(id, "batch_ancestry");
+            }
             openBatches[reference] = batch;
             if (auto page = batch.requestId in historyPages) {
                 page.request.lastActivityMs = historyNowMs();
@@ -474,7 +495,7 @@ mixin template HistoryRecoveryMixin() {
         if (!target.length || target == "*targets") return;
         const key = historyKey(target);
         auto recovery = historyRecovery.get(key, HistoryRecovery.init);
-        if (recovery.state == "recovering" || recovery.state == "unavailable") return;
+        if (recovery.state == "recovering" || recovery.state == "stalled" || recovery.state == "unavailable") return;
         recovery.target = target;
         // Freeze completed coverage before any newly accepted live row may advance it.
         recovery.nextBefore = HistoryCursor.init;

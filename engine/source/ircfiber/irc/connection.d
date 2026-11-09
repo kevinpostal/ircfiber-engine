@@ -15144,6 +15144,136 @@ Ircv3Check[] ircv3ProtocolChecks(out string[] wire) {
         while (ch.tryConsumeOne(event, Duration.zero)) {}
         ch.close();
     }
+    {
+        import ircfiber.engine.session_snapshot : HistoryCursor, HistoryRecovery;
+        NetworkConfig cfg;
+        cfg.nick = "me";
+        auto ch = createChannel!IRCRawEvent();
+        auto client = new PersistentIRCClient(cfg, ch);
+        HistoryRecovery seed;
+        seed.target = "history-peer";
+        seed.lowerBound = HistoryCursor("seed", 1_700_000_000_000, true);
+        seed.upperBound = seed.lowerBound;
+        seed.state = "complete";
+        auto pending = seed;
+        pending.state = "stalled";
+        pending.reasonCode = "storage_failure";
+        pending.nextBefore = HistoryCursor("uncommitted-first", 1_700_000_020_000, true);
+        pending.upperBound = HistoryCursor("uncommitted-last", 1_700_000_040_000, true);
+        // Rehydrate META, then merge the older dedicated hash just as adoption
+        // does after a failed page has closed and vanished from pending requests.
+        client.historyRecovery["history-peer"] = pending;
+        client.mergeCommittedHistoryCoverage("history-peer", seed);
+        auto snapshot = client.snapshotSession();
+        auto next = new PersistentIRCClient(cfg, ch);
+        next.connectionEpoch = "failed-storage-adoption";
+        next.ackedCaps["draft/chathistory"] = true;
+        next.isupportMap["CHATHISTORY"] = "20";
+        next.restoreHistoryState(snapshot);
+        IRCRawEvent live;
+        live.command = "PRIVMSG";
+        live.channel = "history-peer";
+        live.tagsJson = `{"msgid":"new-live","time":"2023-11-14T22:14:00.000Z"}`;
+        next.noteAcceptedLiveHistory(live);
+        results ~= Ircv3Check("complete Redis seed preserves closed failed-page DM intent and frozen coverage on adoption",
+            next.historyRecovery["history-peer"].state == "stalled"
+            && next.historyRecovery["history-peer"].reasonCode == "storage_failure"
+            && next.historyRecovery["history-peer"].lowerBound.msgid == "seed"
+            && !next.historyRecovery["history-peer"].nextBefore.msgid.length
+            && ("history-peer" in next.historyRetryAt) !is null
+            && next.historyPages.length == 0 && next.channelState.length == 0
+            && next.queryBuffers.length == 0);
+        next.beginTargetRecovery("history-peer");
+        results ~= Ircv3Check("TARGETS rediscovery leaves adopted stalled retry scheduled without a duplicate request",
+            next.historyAutomaticQueue.length == 0
+            && ("history-peer" in next.historyRetryAt) !is null);
+        next.historyRetryAt["history-peer"] = 0;
+        next.tickHistoryRecovery();
+        results ~= Ircv3Check("adopted failed first page retries DM LATEST without current channel or query membership",
+            next.outboundQueue.length == 1
+            && next.outboundQueue[0] == "CHATHISTORY LATEST history-peer * 20");
+        const requestId = next.historyPages.keys[0];
+        next.processLine("BATCH +retry chathistory history-peer");
+        next.processLine("@batch=retry;time=2023-11-14T22:13:40.000Z;msgid=retry-first :history-peer!u@h PRIVMSG me :one");
+        next.processLine("@batch=retry;time=2023-11-14T22:14:00.000Z;msgid=retry-last :history-peer!u@h PRIVMSG me :two");
+        next.processLine("BATCH -retry");
+        next.confirmHistoryPage(requestId, true);
+        results ~= Ircv3Check("retried LATEST refreshes seed upper bound and continues the frozen gap with BEFORE",
+            next.historyRecovery["history-peer"].lowerBound.msgid == "seed"
+            && next.historyRecovery["history-peer"].upperBound.msgid == "retry-last"
+            && next.outboundQueue[$ - 1] == "CHATHISTORY BEFORE history-peer msgid=retry-first 20");
+        auto committed = pending;
+        committed.state = "recovering";
+        committed.reasonCode = "";
+        committed.nextBefore = HistoryCursor("accepted-first", 1_700_000_030_000, true);
+        committed.upperBound = HistoryCursor("accepted-last", 1_700_000_050_000, true);
+        client.historyRecovery["history-peer"] = pending;
+        client.mergeCommittedHistoryCoverage("history-peer", committed);
+        results ~= Ircv3Check("newer committed page cursors win over stale META recovery cursors",
+            client.historyRecovery["history-peer"].state == "recovering"
+            && client.historyRecovery["history-peer"].nextBefore.msgid == "accepted-first"
+            && client.historyRecovery["history-peer"].upperBound.msgid == "accepted-last");
+        committed.state = "complete";
+        committed.lowerBound = committed.upperBound;
+        committed.nextBefore = HistoryCursor.init;
+        client.mergeCommittedHistoryCoverage("history-peer", committed);
+        results ~= Ircv3Check("conservative retry does not regress a newer committed completed bound",
+            client.historyRecovery["history-peer"].state == "recovering"
+            && client.historyRecovery["history-peer"].lowerBound.msgid == "accepted-last"
+            && client.historyRecovery["history-peer"].upperBound.msgid == "accepted-last"
+            && !client.historyRecovery["history-peer"].nextBefore.msgid.length);
+        client.historyRecovery["history-peer"] = seed;
+        client.mergeCommittedHistoryCoverage("history-peer", committed);
+        snapshot = client.snapshotSession();
+        auto complete = new PersistentIRCClient(cfg, ch);
+        complete.restoreHistoryState(snapshot);
+        results ~= Ircv3Check("complete META with complete committed coverage does not create an adoption retry",
+            complete.historyRecovery["history-peer"].state == "complete"
+            && complete.historyRetryAt.length == 0);
+        IRCRawEvent event;
+        while (ch.tryConsumeOne(event, Duration.zero)) {}
+        ch.close();
+    }
+    {
+        import ircfiber.engine.session_snapshot : HistoryCursor, HistoryRecovery;
+        NetworkConfig cfg;
+        cfg.nick = "me";
+        auto ch = createChannel!IRCRawEvent();
+        auto client = new PersistentIRCClient(cfg, ch);
+        client.connectionEpoch = "orphan-page-check";
+        client.ackedCaps["draft/chathistory"] = true;
+        client.ackedCaps["labeled-response"] = true;
+        client.isupportMap["CHATHISTORY"] = "20";
+        HistoryRecovery coverage;
+        coverage.target = "#gap";
+        coverage.lowerBound = HistoryCursor("covered", 1_700_000_000_000, true);
+        coverage.state = "complete";
+        client.historyRecovery["#gap"] = coverage;
+        client.beginTargetRecovery("#gap");
+        client.drainHistoryQueue();
+        const request = client.historyPages.keys[0];
+        const label = client.historyPages[request].label;
+        client.processLine("@label=" ~ label ~ " :server BATCH +root labeled-response");
+        client.processLine("@batch=root :server BATCH +page chathistory #gap");
+        client.processLine("@batch=absent :server BATCH +orphan chathistory #gap");
+        client.processLine("@batch=orphan;time=2023-11-14T22:13:40.000Z;msgid=untrusted :a!u@h PRIVMSG #gap :not coverage");
+        client.processLine(":server BATCH -orphan");
+        client.processLine(":server BATCH -page");
+        client.processLine(":server BATCH -root");
+        results ~= Ircv3Check("orphan history cannot turn its correlated empty root into completed coverage",
+            client.historyRecovery["#gap"].state == "stalled"
+            && client.historyRecovery["#gap"].lowerBound.msgid == "covered"
+            && client.historyPages.length == 0);
+        const writes = client.outboundQueue.length;
+        client.beginTargetRecovery("#gap");
+        client.drainHistoryQueue();
+        results ~= Ircv3Check("TARGETS rediscovery cannot bypass a stalled page's scheduled retry",
+            client.historyRecovery["#gap"].state == "stalled"
+            && client.outboundQueue.length == writes && client.historyPages.length == 0);
+        IRCRawEvent event;
+        while (ch.tryConsumeOne(event, Duration.zero)) {}
+        ch.close();
+    }
     foreach (failure; ["INVALID_PARAMS", "INVALID_MSGID", "MSGID_EXPIRED"]) {
         import ircfiber.engine.session_snapshot : HistoryCursor, HistoryRecovery;
         NetworkConfig cfg;

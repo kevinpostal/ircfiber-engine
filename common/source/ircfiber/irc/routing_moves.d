@@ -125,7 +125,7 @@ bool enqueueRoutingCommand(RedisDatabase db, string networkId, string commandJso
         auto reply = db.eval!string(q"LUA
 local owner = redis.call('HGET', KEYS[1], ARGV[1])
 if not owner or owner == '' then return '0' end
-redis.call('LPUSH', ARGV[2] .. owner .. ':' .. ARGV[1], ARGV[3])
+redis.call('RPUSH', ARGV[2] .. owner .. ':' .. ARGV[1], ARGV[3])
 return '1'
 LUA", [RedisKeys.networkAssignments()], [networkId, "irc:cmd:", commandJson]);
         if (reply.empty) throw new RoutingMoveUnavailableException();
@@ -385,9 +385,9 @@ if (queueType ~= 'none' and queueType ~= 'list') or (mirrorType ~= 'none' and mi
 end
 redis.call('HSET', KEYS[3], s.networkId, s.targetServerId)
 redis.call('SET', KEYS[4], s.targetServerId, 'EX', ARGV[9])
--- LPUSH producers / BLPOP consumers use the list head. Moving from the old
--- tail to the new head preserves the source's entire existing head order,
--- as well as the relative order of any pre-existing target backlog.
+-- RPUSH producers / BLPOP consumers dispatch accepted commands FIFO.
+-- Moving from the old tail to the new head preserves source dispatch order
+-- before any pre-existing target backlog.
 local pending = redis.call('LLEN', KEYS[11])
 for i = 1, pending do redis.call('RPOPLPUSH', KEYS[11], KEYS[12]) end
 redis.call('DEL', KEYS[11])

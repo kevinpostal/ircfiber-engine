@@ -604,7 +604,7 @@ def paused_move(ident, target):
         assert duplicate["moveId"] == request["moveId"], (request, duplicate)
         endpoint(body={"moveWitness": {"moveId": request["moveId"], "fromServerId": source}})
         queued_ping = "fenced-backlog-" + str(time.monotonic_ns())
-        redis("lpush", f"irc:cmd:{source}:{ident}", json.dumps(
+        redis("rpush", f"irc:cmd:{source}:{ident}", json.dumps(
             {"cmd": "raw", "text": "PING :" + queued_ping, "timestampMs": int(time.time() * 1000)}))
         request["_queuedPing"] = queued_ping
         return request, source_service

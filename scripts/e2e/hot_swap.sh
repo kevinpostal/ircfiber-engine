@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Socket-preserving engine hot-swap proof in an owned disposable fixture.
-# Direct invocation enters routing_regression.sh, which builds and starts
-# isolated services and supplies the explicit Docker context/project.
+# Direct invocation enters routing_regression.sh. An existing services
+# integration fixture may enter with the same explicit ready/run contract.
 #
 # Only the fixture engine is restarted/killed. Holder, gateway, storage and
 # mock keep their containers and start times throughout both swaps. Physical
@@ -16,19 +16,21 @@ if [[ "${ROUTING_REGRESSION_READY:-0}" != 1 ]]; then
     exec bash "$SCRIPT_DIR/routing_regression.sh" hot_swap "$@"
 fi
 
-: "${COMPOSE_FILE:?routing regression wrapper must supply COMPOSE_FILE}"
-: "${COMPOSE_PROJECT_NAME:?routing regression wrapper must supply COMPOSE_PROJECT_NAME}"
-: "${DOCKER_CONTEXT:?routing regression wrapper must supply DOCKER_CONTEXT}"
-: "${ROUTING_REGRESSION_RUN:?routing regression wrapper must supply ROUTING_REGRESSION_RUN}"
-: "${GATEWAY_URL:?routing regression wrapper must supply GATEWAY_URL}"
+: "${COMPOSE_FILE:?fixture launcher must supply COMPOSE_FILE}"
+: "${COMPOSE_PROJECT_NAME:?fixture launcher must supply COMPOSE_PROJECT_NAME}"
+: "${DOCKER_CONTEXT:?fixture launcher must supply DOCKER_CONTEXT}"
+: "${ROUTING_REGRESSION_RUN:?fixture launcher must supply ROUTING_REGRESSION_RUN}"
+: "${GATEWAY_URL:?fixture launcher must supply GATEWAY_URL}"
 GATEWAY=${GATEWAY_URL%/}
 USERNAME=${HOTSWAP_USER:-hotswap}
 PASSWORD=${HOTSWAP_PASS:-hotswap123}
 EMAIL=${HOTSWAP_EMAIL:-hotswap@local.test}
-ENGINE_SERVICE=ircfiber-engine
-HOLDER_SERVICE=ircfiber-holder
-MOCK_SERVICE=mock-irc
-MOCK_HOST=mock-irc
+FIXTURE_KIND=${HOTSWAP_FIXTURE_KIND:-routing-regression}
+ENGINE_SERVICE=${HOTSWAP_ENGINE_SERVICE:-ircfiber-engine}
+HOLDER_SERVICE=${HOTSWAP_HOLDER_SERVICE:-ircfiber-holder}
+GATEWAY_SERVICE=${HOTSWAP_GATEWAY_SERVICE:-ircfiber-gateway}
+MOCK_SERVICE=${HOTSWAP_MOCK_SERVICE:-mock-irc}
+MOCK_HOST=$MOCK_SERVICE
 MOCK_LINES=/tmp/mock-irc.lines
 MOCK_RESULT=/tmp/holder-mock-irc.result
 MOCK_INJECT=/tmp/mock-irc.inject
@@ -97,27 +99,37 @@ join_channel() {
     api POST "/api/networks/$NET_ID/join" "{\"channel\":\"$chan\"}" >/dev/null
 }
 
+case "$FIXTURE_KIND" in
+    routing-regression) EXPECTED_ENGINE_SERVER_ID=fixture-regression ;;
+    services-integration) EXPECTED_ENGINE_SERVER_ID=svcfixture1 ;;
+    *) fail "unsupported hot-swap fixture kind: $FIXTURE_KIND" ;;
+esac
+for service in "$ENGINE_SERVICE" "$HOLDER_SERVICE" "$GATEWAY_SERVICE" "$MOCK_SERVICE"; do
+    [[ "$service" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]] ||
+        fail "invalid fixture service name: $service"
+done
 [[ "$GATEWAY" =~ ^http://127\.0\.0\.1:[0-9]+$ ]] ||
-    fail 'routing regression requires the wrapper loopback HTTP gateway'
+    fail 'hot swap requires the fixture launcher loopback HTTP gateway'
 [[ "$COMPOSE_FILE" == /* && -f "$COMPOSE_FILE" ]] ||
-    fail 'routing regression requires an absolute fixture Compose file'
+    fail 'hot swap requires an absolute fixture Compose file'
 [[ "$COMPOSE_PROJECT_NAME" =~ ^[a-z0-9][a-z0-9_-]+$ ]] ||
     fail 'invalid fixture project name'
 [[ "$ROUTING_REGRESSION_RUN" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]] ||
     fail 'invalid fixture run identity'
 [[ -z "${HOTSWAP_MOCK_COMPOSE:-}" && "${HOTSWAP_USE_RUNNING_STACK:-0}" == 1 ]] ||
-    fail 'routing regression must use the wrapper running fixture without overlays'
+    fail 'hot swap must use the launcher running fixture without overlays'
 
-# Resolve every identity from the explicit project, then require both fixture
-# labels before any exec, restart, kill or API mutation. Supplied container
-# overrides, if present, must resolve to that very same Compose container.
+# Resolve every identity from the explicit project, then require all four
+# ownership labels before any exec, restart, kill or API mutation. Supplied
+# container overrides must resolve to that very same Compose container.
 owned_container() {
     local service=$1 id labels
     id=$(dc ps -q "$service")
     [[ -n "$id" && "$id" != *$'\n'* ]] || fail "expected one running fixture $service"
     labels=$(dk inspect --format '{{json .Config.Labels}}' "$id")
-    jq -e --arg run "$ROUTING_REGRESSION_RUN" --arg project "$COMPOSE_PROJECT_NAME" --arg service "$service" \
-        '."ircfiber.fixture" == "routing-regression"
+    jq -e --arg kind "$FIXTURE_KIND" --arg run "$ROUTING_REGRESSION_RUN" \
+        --arg project "$COMPOSE_PROJECT_NAME" --arg service "$service" \
+        '."ircfiber.fixture" == $kind
          and ."ircfiber.fixture.run" == $run
          and ."com.docker.compose.project" == $project
          and ."com.docker.compose.service" == $service' <<<"$labels" >/dev/null ||
@@ -136,7 +148,7 @@ for override in HOTSWAP_ENGINE_CONTAINER HOTSWAP_HOLDER_CONTAINER HOTSWAP_MOCK_C
     [[ -z "${!override:-}" || "${!override}" == "$expected" ]] ||
         fail "$override does not match the owned Compose container"
 done
-UNCHANGED_SERVICES=(redis mongo ircfiber-gateway "$HOLDER_SERVICE" "$MOCK_SERVICE")
+UNCHANGED_SERVICES=(redis mongo "$GATEWAY_SERVICE" "$HOLDER_SERVICE" "$MOCK_SERVICE")
 UNCHANGED_IDS=()
 UNCHANGED_STARTS=()
 for service in "${UNCHANGED_SERVICES[@]}"; do
@@ -160,7 +172,7 @@ JAR=$(mktemp /tmp/hot-swap-XXXXXX.cookies)
 wait_for 90 "gateway /health" 'curl -fsS "$GATEWAY/health"'
 wait_for 60 "holder --status" 'holder_status'
 ENGINE_SERVER_ID=$(dk exec "$ENGINE" printenv IRCFIBER_SERVER_ID)
-[[ "$ENGINE_SERVER_ID" == fixture-regression ]] || fail 'unexpected fixture engine identity'
+[[ "$ENGINE_SERVER_ID" == "$EXPECTED_ENGINE_SERVER_ID" ]] || fail 'unexpected fixture engine identity'
 wait_for 60 'policy-aware direct-capable engine registration' \
     "dc exec -T redis redis-cli --raw hget 'irc:server:$ENGINE_SERVER_ID' data | jq -e '.routingPolicyVersion == 1 and (.supportedRoutes | index(\"direct\") != null)'"
 wait_for 30 "mock-irc listening" 'dk exec "$MOCK" test -f "$MOCK_RESULT"'

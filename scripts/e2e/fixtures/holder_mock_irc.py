@@ -676,7 +676,7 @@ def handle(conn, addr, ino):
                         with history.send_lock:
                             send(conn, f":{SERVER} 001 {nick} :Welcome to the holder mock IRC {nick}!u@mock")
                             send(conn, f":{SERVER} 002 {nick} :Your host is {SERVER}, running version mock-history-1")
-                            send(conn, f":{SERVER} 005 {nick} CHATHISTORY=20 MSGREFTYPES=msgid,timestamp CASEMAPPING=rfc1459 CHANTYPES=# :are supported by this server")
+                            send(conn, f":{SERVER} 005 {nick} CHATHISTORY=20 MSGREFTYPES=msgid,timestamp CASEMAPPING=rfc1459 CHANTYPES=# MONITOR=100 :are supported by this server")
                             send(conn, f":{SERVER} 376 {nick} :End of MOTD")
                     else:
                         welcome(conn, nick)

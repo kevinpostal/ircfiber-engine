@@ -43,6 +43,8 @@ not imply completion. TARGETS discovery also finds missed conversations.
 `*targets` discovery state without a TTL. Ordered processor acknowledgement
 advances a page only after Redis append/dedup acceptance under current ownership.
 This preserves, rather than strengthens, existing asynchronous MongoDB durability.
+Crash adoption merges committed Redis cursors with unresolved holder-META intent:
+a complete pre-gap seed must not erase a stalled failed-storage page's retry.
 Unresolvable timestamp-only boundaries remain explicitly stalled.
 
 Part of [kevinpostal/irc-fiber](https://github.com/kevinpostal/irc-fiber) superproject.
