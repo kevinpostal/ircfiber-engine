@@ -147,6 +147,8 @@ final class MessageRepository {
             // eid index: the network-wide replay (`getAfterEidForNetwork`) walks
             // eid in order and stops at its limit; eid cursor lookups are one key.
             collection.createIndex(indexKeys(["networkId", "-eid", "channel", "serverId"]));
+            // Exact identities must not scan an entire network's eid range during attach replay.
+            collection.createIndex(indexKeys(["networkId", "channel", "msgid", "serverId", "eid"]));
         } catch (Exception e) {
             logWarn("Failed to create messages compound index: %s", e.msg);
         }
