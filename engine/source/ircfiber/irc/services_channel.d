@@ -28,6 +28,10 @@
  *    LEVELS (or a non-founder's rank) cannot confirm is `service_checked`:
  *    the reviewed write may be sent and ChanServ/BotServ authorizes it;
  *    without positive evidence it stays `unknown` and disables the write;
+ *  - candidate Anope families may parse fixed reads, but every requestable
+ *    mutation also needs its complete command-specific HELP syntax. This
+ *    intersection includes founders/admins and is repeated at native send;
+ *    HELP frames remain private and transaction/endpoint-bound;
  *  - every write re-reads state, re-checks the browser's revision, the
  *    capability and (for nick-menu targets) a fresh WHOIS account, sends
  *    exactly one mutating body, then reads back. Success requires the
@@ -48,7 +52,7 @@ import std.uni : icmp, sicmp;
 import vibe.data.json : Json;
 
 import ircfiber.irc.services;
-import ircfiber.irc.services_grammar : AnopeGrammar;
+import ircfiber.irc.services_grammar : AnopeGrammar, candidateAnopeGrammar, anopeRelease, AnopeRelease;
 import ircfiber.irc.services_operation;
 import ircfiber.services.config : ServiceId;
 import ircfiber.services.protocol : ServiceAction, ServiceStatus, AccessProvider, LockChange;
@@ -266,7 +270,7 @@ private AnopeGrammar[string] gGrammars;
 
 private AnopeGrammar grammarFor(string versionText) {
     if (auto g = versionText in gGrammars) return *g;
-    auto g = new AnopeGrammar(versionText);
+    auto g = candidateAnopeGrammar(versionText);
     gGrammars[versionText] = g;
     return g;
 }
@@ -581,7 +585,8 @@ private struct SnapshotBody {
 
 /// `tiers`: XOP command names proven by their own HELP to be XOP tiers
 /// (only those are ever invoked with `<tier> #c LIST`).
-private SnapshotBody[] snapshotBodies(AnopeGrammar g, string channel, uint parts, const string[] tiers) {
+private SnapshotBody[] snapshotBodies(AnopeGrammar g, string channel, uint parts, const string[] tiers,
+        bool includeAccess = true) {
     SnapshotBody[] b;
     if (parts & Part.info) b ~= SnapshotBody(BodyKind.info, "INFO " ~ channel);
     if (parts & Part.status) b ~= SnapshotBody(BodyKind.status, "STATUS " ~ channel);
@@ -589,7 +594,8 @@ private SnapshotBody[] snapshotBodies(AnopeGrammar g, string channel, uint parts
     if (parts & Part.access) {
         // 2.1 hides other providers' entries without ALL (cs_access.cpp
         // ProcessList); 2.0 lists every provider and has no ALL.
-        b ~= SnapshotBody(BodyKind.access, g.v21 ? "ACCESS " ~ channel ~ " LIST * ALL" : "ACCESS " ~ channel ~ " LIST");
+        if (includeAccess)
+            b ~= SnapshotBody(BodyKind.access, g.v21 ? "ACCESS " ~ channel ~ " LIST * ALL" : "ACCESS " ~ channel ~ " LIST");
         b ~= SnapshotBody(BodyKind.flags, "FLAGS " ~ channel ~ " LIST");
         foreach (t; tiers) b ~= SnapshotBody(BodyKind.xop, t ~ " " ~ channel ~ " LIST", t);
     }
@@ -1311,8 +1317,8 @@ private void runHelpSteps(ServicesTransaction txn, AnopeGrammar g, bool viaPeer,
         return;
     }
     auto step = steps[i];
-    string body = step.startsWith("tier:") ? "HELP " ~ step[5 .. $] : step == "flags" ? "HELP FLAGS" : "HELP LEVELS DESC";
-    chanFrame(txn, viaPeer, readSpec([body]), (ServiceFrame f) {
+    string command = step.startsWith("tier:") ? step[5 .. $] : step == "flags" ? "FLAGS" : "LEVELS DESC";
+    channelHelpFrame(txn, g, viaPeer, command, (ServicesEndpoint endpoint, ServiceFrame f) {
         if (frameComplete(f)) {
             if (step.startsWith("tier:")) {
                 foreach (p; parseTierHelp(g, f, step[5 .. $])) a.allowed[p] = true;
@@ -1355,46 +1361,58 @@ private void helpPhase(ServicesTransaction txn, AnopeGrammar g, bool viaPeer, Au
 
 // ── Readers ───────────────────────────────────────────────────────────────
 
-/// `HELP <name>` proofs remembered only inside ONE request (its snapshot and
-/// read-back) and only while nothing it depends on changed: the key binds
-/// the request id, connection epoch, verified primary endpoint (nick, ident,
-/// host, server, version), peer/primary route, observed actor and the
-/// transaction's capability generation (own authority, pins, config, epoch
-/// and channel state). No other request ever reads an entry; the map only
-/// holds booleans and is cleared when it grows past its bound.
-private bool[string] gTierProof;
-
-private string tierProofKey(ServicesTransaction txn, bool viaPeer, string name) {
-    auto ep = txn.endpoint;
-    auto actor = txn.actor;
-    return txn.request.requestId ~ "|" ~ txn.epoch ~ "|" ~ ep.nick ~ "!" ~ ep.ident ~ "@" ~ ep.host ~ "/" ~ ep.server
-        ~ "/" ~ ep.version_ ~ "|" ~ (viaPeer ? "peer" : "primary") ~ "|" ~ actor.state.to!string ~ ":"
-        ~ actor.account ~ "|" ~ txn.capabilityGeneration().to!string ~ "|" ~ name.toUpper;
+/// Semantic HELP and syntax classification share transaction-owned frames.
+/// Resolve the actual ChanServ endpoint before using or seeding its evidence;
+/// a BotServ primary must never lend its identity or VERSION to this proof.
+private void channelHelpFrame(ServicesTransaction txn, AnopeGrammar g, bool viaPeer, string command,
+        void delegate(ServicesEndpoint, ServiceFrame) done) {
+    txn.resolveService(viaPeer ? ServiceId.chanServ : txn.endpoint.service,
+        (bool resolved, string reason, ServicesEndpoint endpoint) {
+            auto peerGrammar = grammarFor(endpoint.version_);
+            if (!resolved || !peerGrammar.supported || peerGrammar.v21 != g.v21) {
+                ServiceFrame unavailable;
+                unavailable.outcome = ServiceFrameOutcome.unavailable;
+                unavailable.reason = resolved ? "adapter_unavailable" : reason;
+                done(endpoint, unavailable);
+                return;
+            }
+            ServiceFrame cached;
+            if (txn.cachedServicesHelp(endpoint, command, cached)) {
+                done(endpoint, cached);
+                return;
+            }
+            const generation = txn.capabilityGeneration();
+            chanFrame(txn, viaPeer, readSpec(["HELP " ~ command]), (ServiceFrame frame) {
+                txn.resolveService(endpoint.service,
+                    (bool current, string currentReason, ServicesEndpoint actual) {
+                        if (!current || actual != endpoint || generation != txn.capabilityGeneration()) {
+                            ServiceFrame unavailable;
+                            unavailable.outcome = ServiceFrameOutcome.unavailable;
+                            unavailable.reason = current ? "capabilities_changed" : currentReason;
+                            done(endpoint, unavailable);
+                            return;
+                        }
+                        if (frameComplete(frame)) txn.cacheServicesHelp(endpoint, command, frame);
+                        done(endpoint, frame);
+                    });
+            });
+        });
 }
 
-/// Proves (or recalls) whether `name` is an XOP tier by its own HELP. A
-/// name is only ever sent as `<name> #c LIST` after this proof: an
-/// unproven name may be a renamed or custom command that changes state.
+/// An unproven name may be a custom command that changes state. Require both
+/// its semantic XOP identity and, on candidates, the exact LIST syntax before
+/// it can appear in any state-read body.
 private void proveTierHelp(ServicesTransaction txn, AnopeGrammar g, bool viaPeer, string name,
         void delegate(bool proven) done) {
-    const key = tierProofKey(txn, viaPeer, name);
-    if (auto known = key in gTierProof) {
-        done(*known);
-        return;
-    }
-    chanFrame(txn, viaPeer, readSpec(["HELP " ~ name]), (ServiceFrame hf) {
+    channelHelpFrame(txn, g, viaPeer, name, (ServicesEndpoint endpoint, ServiceFrame hf) {
         if (!frameComplete(hf)) { done(false); return; }
         string[] caps;
         bool proven = g.matches(g.v21 ? M_XOP_HELP_21 : M_XOP_HELP_20, hf, caps) && caps.length
             && icmp(caps[0].strip, name) == 0;
-        // A proof whose context moved meanwhile (actor, pins, config,
-        // generation) is neither used nor remembered.
-        if (tierProofKey(txn, viaPeer, name) != key) {
-            done(false);
-            return;
+        if (proven && anopeRelease(endpoint.version_) == AnopeRelease.unknown) {
+            auto specs = servicesReadSyntax(ServiceReadSyntax.xopList, g.v21, name);
+            proven = specs.length && classifyServicesCommandHelp(g, specs[0], hf).state == "allowed";
         }
-        if (gTierProof.length >= 256) gTierProof = null;
-        gTierProof[key] = proven;
         done(proven);
     });
 }
@@ -1424,29 +1442,51 @@ private void readSnapshot(ServicesTransaction txn, AnopeGrammar g, string channe
 
 private void readSnapshotWith(ServicesTransaction txn, AnopeGrammar g, string channel, uint parts, bool viaPeer,
         string[] tiers, void delegate(ChannelSnapshot s, ServiceFrame f) done) {
-    auto bodies = snapshotBodies(g, channel, parts, tiers);
-    string[] texts;
-    foreach (b; bodies) texts ~= b.text;
-    chanFrame(txn, viaPeer, readSpec(texts), (ServiceFrame f) {
-        ChannelSnapshot s;
-        s.channel = channel;
-        s.parts = parts;
-        if (frameComplete(f)) parseSnapshot(g, txn, f, bodies, s);
-        else s.problems ~= f.reason.length ? f.reason : "frame_incomplete";
-        if (!(parts & Part.access) || s.problems.length || !s.registered && s.infoRead) {
-            done(s, f);
-            return;
-        }
-        auto candidates = tierCandidates(s);
-        if (!candidates.length) {
-            done(s, f);
-            return;
-        }
-        proveTiers(txn, g, viaPeer, s, candidates, 0, (ChannelSnapshot proven) {
-            resolveProviders(g, proven);
-            done(proven, f);
+    void send(bool includeAccess) {
+        auto bodies = snapshotBodies(g, channel, parts, tiers, includeAccess);
+        string[] texts;
+        foreach (b; bodies) texts ~= b.text;
+        chanFrame(txn, viaPeer, readSpec(texts), (ServiceFrame f) {
+            ChannelSnapshot s;
+            s.channel = channel;
+            s.parts = parts;
+            if (frameComplete(f)) parseSnapshot(g, txn, f, bodies, s);
+            else s.problems ~= f.reason.length ? f.reason : "frame_incomplete";
+            if (!includeAccess) s.problems ~= "access_syntax_unverified";
+            if (!(parts & Part.access) || s.problems.length || !s.registered && s.infoRead) {
+                done(s, f);
+                return;
+            }
+            auto candidates = tierCandidates(s);
+            if (!candidates.length) {
+                done(s, f);
+                return;
+            }
+            proveTiers(txn, g, viaPeer, s, candidates, 0, (ChannelSnapshot proven) {
+                resolveProviders(g, proven);
+                done(proven, f);
+            });
         });
-    });
+    }
+    if (!(parts & Part.access) || !g.v21) { send(true); return; }
+    // ALL is essential: a provider-only listing cannot represent completeness.
+    txn.resolveService(viaPeer ? ServiceId.chanServ : txn.endpoint.service,
+        (bool resolved, string reason, ServicesEndpoint endpoint) {
+            if (!resolved) {
+                ServiceFrame f;
+                f.outcome = ServiceFrameOutcome.unavailable;
+                f.reason = reason;
+                ChannelSnapshot s;
+                s.channel = channel;
+                s.parts = parts;
+                s.problems ~= reason;
+                done(s, f);
+                return;
+            }
+            if (anopeRelease(endpoint.version_) != AnopeRelease.unknown) { send(true); return; }
+            readServicesReadHelp(txn, endpoint.service, ServiceReadSyntax.accessList,
+                (HelpEvidence h) { send(h.state == "allowed"); });
+        });
 }
 
 /// Upper-case letter values nothing else explained: they may be configured
@@ -1589,6 +1629,7 @@ private Json accessView(const ref ChannelSnapshot s, const ref Authority a, cons
         }
     }
     j["levels"] = levels;
+    j["providerCapabilities"] = providerCapabilities(s, a);
     j["actorPrivileges"] = jsonStrings(actorPrivileges(a, levelsSource));
     if (a.founder) j["actorIsFounder"] = Json(true);
     return j;
@@ -1757,6 +1798,178 @@ private void completeCap(ServicesTransaction txn, Cap c) {
         c.reason.length ? c.reason : "permission_" ~ c.state);
 }
 
+/// Compatibility is an intersection, never a new source of authority.
+private Cap syntaxIntersection(Cap authority, HelpEvidence help) {
+    return !channelCapRequestable(authority) || help.state == "allowed"
+        ? authority : Cap(help.state, help.reasonCode);
+}
+
+private Cap editingIntersection(Cap editing, Cap set, Cap remove) {
+    if (channelCapRequestable(editing) && !channelCapRequestable(set)) return set;
+    if (channelCapRequestable(editing) && !channelCapRequestable(remove)) return remove;
+    return editing;
+}
+
+private Cap jsonCap(Json value) {
+    return Cap(value["state"].get!string,
+        value["reasonCode"].type == Json.Type.undefined ? "" : value["reasonCode"].get!string);
+}
+
+private Cap preferCap(Cap current, Cap candidate) {
+    if (!current.state.length) return candidate;
+    if (current.state == "allowed") return current;
+    if (candidate.state == "allowed") return candidate;
+    if (current.state == "service_checked") return current;
+    if (candidate.state == "service_checked") return candidate;
+    // An unverified alternative prevents a claim that every form is
+    // incompatible or denied. Preserve the actual unknown HELP reason.
+    if (current.state == "unknown") return current;
+    if (candidate.state == "unknown") return candidate;
+    if (current.state == "denied") return current;
+    if (candidate.state == "denied") return candidate;
+    if (current.state == "unsupported") return current;
+    return candidate;
+}
+
+private void filterActions(ServicesTransaction txn, Json caps, const ServiceAction[] actions, size_t i,
+        void delegate(Json) done) {
+    if (i == actions.length) { done(caps); return; }
+    const action = actions[i];
+    auto value = caps[action.to!string];
+    if (value.type == Json.Type.undefined || !channelCapRequestable(jsonCap(value))) {
+        filterActions(txn, caps, actions, i + 1, done);
+        return;
+    }
+    auto authority = jsonCap(value);
+    readServicesActionHelp(txn, txn.endpoint.service, action, (HelpEvidence help) {
+        putCap(caps, action, syntaxIntersection(authority, help));
+        filterActions(txn, caps, actions, i + 1, done);
+    });
+}
+
+/// Each offered XOP tier gets independent ADD/DEL evidence. Aggregates need
+/// one usable form; the shared provider editor needs BOTH forms for EVERY tier.
+private void filterAccessTiers(ServicesTransaction txn, string provider, string[] tiers, size_t i, Cap authority,
+        Cap bestSet, Cap bestRemove, Cap editing,
+        void delegate(Cap, Cap, Cap) done) {
+    if (i == tiers.length) { done(bestSet, bestRemove, editing); return; }
+    const tier = tiers[i];
+    readServicesActionHelp(txn, txn.endpoint.service, ServiceAction.channelAccessSet, (HelpEvidence setHelp) {
+        auto set = syntaxIntersection(authority, setHelp);
+        readServicesActionHelp(txn, txn.endpoint.service, ServiceAction.channelAccessRemove, (HelpEvidence removeHelp) {
+            auto remove = syntaxIntersection(authority, removeHelp);
+            auto sharedEditing = editingIntersection(editing, set, remove);
+            filterAccessTiers(txn, provider, tiers, i + 1, authority,
+                preferCap(bestSet, set), preferCap(bestRemove, remove), sharedEditing, done);
+        }, provider, tier);
+    }, provider, tier);
+}
+
+private void filterAccessProviders(ServicesTransaction txn, Json view, Json caps, size_t i,
+        Cap bestSet, Cap bestRemove, void delegate(Json, Json) done) {
+    static immutable string[] providers = ["xop", "access", "flags"];
+    if (i == providers.length) {
+        putCap(caps, ServiceAction.channelAccessSet, bestSet);
+        putCap(caps, ServiceAction.channelAccessRemove, bestRemove);
+        done(view, caps);
+        return;
+    }
+    const provider = providers[i];
+    auto authority = jsonCap(view["providerCapabilities"][provider]);
+    if (!channelCapRequestable(authority)) {
+        filterAccessProviders(txn, view, caps, i + 1,
+            preferCap(bestSet, authority), preferCap(bestRemove, authority), done);
+        return;
+    }
+    string[] tiers;
+    if (provider == "xop") {
+        foreach (tier; view["xopTiers"]) tiers ~= tier.get!string;
+    } else tiers = [""];
+    auto unavailable = Cap("unsupported", "adapter_unavailable");
+    filterAccessTiers(txn, provider, tiers, 0, authority,
+        tiers.length ? Cap.init : unavailable, tiers.length ? Cap.init : unavailable,
+        tiers.length ? authority : unavailable, (Cap set, Cap remove, Cap editing) {
+            view["providerCapabilities"][provider] = capJson(editing);
+            filterAccessProviders(txn, view, caps, i + 1,
+                preferCap(bestSet, set), preferCap(bestRemove, remove), done);
+        });
+}
+
+/// All returned controls pass through this asynchronous phase AFTER the
+/// existing state/authority reads. Exact releases retain their old behavior.
+/// Read-only entries and independent read capabilities are never removed.
+private void completeChannel(ServicesTransaction txn, ServiceStatus status, string reason,
+        Json view, string revision, Json caps, string[] details = null) {
+    if (anopeRelease(txn.endpoint.version_) != AnopeRelease.unknown) {
+        txn.complete(status, reason, view, revision, caps, details);
+        return;
+    }
+    static immutable ServiceAction[] actions = [
+        ServiceAction.channelRegister, ServiceAction.channelTopicSet,
+        ServiceAction.channelTopicLock, ServiceAction.channelKeepTopic,
+        ServiceAction.channelModeLockChange, ServiceAction.channelAkickAdd,
+        ServiceAction.channelAkickRemove, ServiceAction.botAssign,
+        ServiceAction.botUnassign, ServiceAction.botGreet, ServiceAction.botFantasy,
+    ];
+    const generation = txn.capabilityGeneration();
+    void finish(Json resultView, Json resultCaps) {
+        // A multi-command intersection must not mix proof generations.
+        if (generation != txn.capabilityGeneration()) {
+            void invalidate(ServiceAction action) {
+                auto value = resultCaps[action.to!string];
+                if (value.type != Json.Type.undefined && channelCapRequestable(jsonCap(value)))
+                    putCap(resultCaps, action, Cap("unknown", "capabilities_changed"));
+            }
+            foreach (action; actions) invalidate(action);
+            invalidate(ServiceAction.channelAccessSet);
+            invalidate(ServiceAction.channelAccessRemove);
+            if (resultView.type == Json.Type.object
+                    && resultView["providerCapabilities"].type == Json.Type.object) {
+                foreach (provider; ["xop", "access", "flags"]) {
+                    auto value = resultView["providerCapabilities"][provider];
+                    if (value.type != Json.Type.undefined && channelCapRequestable(jsonCap(value)))
+                        resultView["providerCapabilities"][provider] = serviceCapability("unknown", "capabilities_changed");
+                }
+            }
+        }
+        txn.complete(status, reason, resultView, revision, resultCaps, details);
+    }
+    filterActions(txn, caps, actions, 0, (Json filtered) {
+        if (filtered[ServiceAction.channelAccessSet.to!string].type == Json.Type.undefined) {
+            finish(view, filtered);
+            return;
+        }
+        filterAccessProviders(txn, view, filtered, 0, Cap.init,
+            Cap.init, (Json accessView, Json accessCaps) {
+                finish(accessView, accessCaps);
+            });
+    });
+}
+
+/// UI filtering is not authorization: repeat the particular typed action's
+/// strict proof immediately before constructing its mutating frame. No HELP
+/// query is inferred from the outgoing (potentially secret-bearing) body.
+private void channelWrite(ServicesTransaction txn, ServiceAction action, string provider, string tier,
+        string body, ServiceFrameKind kind, ServiceFrameDone done, ServiceFrameTerminal terminal = null) {
+    void send() { txn.frame(writeSpec(txn, body, kind, terminal), done); }
+    if (anopeRelease(txn.endpoint.version_) != AnopeRelease.unknown) { send(); return; }
+    const generation = txn.capabilityGeneration();
+    readServicesActionHelp(txn, txn.endpoint.service, action, (HelpEvidence help) {
+        if (help.state != "allowed") { completeCap(txn, Cap(help.state, help.reasonCode)); return; }
+        if (generation != txn.capabilityGeneration()) {
+            completeCap(txn, Cap("unknown", "capabilities_changed"));
+            return;
+        }
+        send();
+    }, provider, tier);
+}
+
+private bool requireChannelRevision(ServicesTransaction txn, string revision, Json view, Json caps) {
+    if (revisionMatches(txn.request.expectedRevision, revision)) return true;
+    completeChannel(txn, ServiceStatus.stale, "revision_changed", view, revision, caps);
+    return false;
+}
+
 // ── Acknowledgement classification ────────────────────────────────────────
 
 private enum AckKind { accepted, rejected, info }
@@ -1850,7 +2063,7 @@ private void completeWrite(ServicesTransaction txn, Ack ack, bool readbackOk, bo
             reason = expected ? "observed_without_ack" : "no_recognized_reply";
             break;
     }
-    txn.complete(status, reason, data, revision, caps, details);
+    completeChannel(txn, status, reason, data, revision, caps, details);
 }
 
 // ── Operation plumbing ────────────────────────────────────────────────────
@@ -1986,7 +2199,7 @@ private final class ChannelInfoOperation : ChannelOperation {
         readAuthorized(txn, g, channel, 0, false, (ChannelSnapshot s, Authority a, ServiceFrame f) {
             if (!frameComplete(f) || !s.infoRead) { readFailed(txn, s, f); return; }
             auto view = channelInfoView(s);
-            txn.complete(ServiceStatus.confirmed, "", view, servicesRevision(txn, view), infoCapabilities(txn, s, a));
+            completeChannel(txn, ServiceStatus.confirmed, "", view, servicesRevision(txn, view), infoCapabilities(txn, s, a));
         });
     }
 }
@@ -2004,7 +2217,7 @@ private final class ChannelRegisterOperation : ChannelOperation {
             auto desc = serviceParam(txn, "description");
             auto body = "REGISTER " ~ channel ~ (desc.length ? " " ~ desc : "");
             if (!txn.fits(body)) { txn.complete(ServiceStatus.rejected, "line_too_long"); return; }
-            txn.frame(writeSpec(txn, body, ServiceFrameKind.ordinary), (ServiceFrame w) {
+            channelWrite(txn, ServiceAction.channelRegister, "", "", body, ServiceFrameKind.ordinary, (ServiceFrame w) {
                 if (!frameComplete(w)) { completeIncomplete(txn, w); return; }
                 auto ack = classify(g, servicePlainLines(w), [
                     AckRule(M_REGISTERED, AckKind.accepted, ""),
@@ -2051,7 +2264,8 @@ private final class ChannelOptionOperation : ChannelOperation {
                 : "SET KEEPTOPIC " ~ channel ~ (enabled ? " ON" : " OFF");
             string okId = topicLock ? (enabled ? M_TOPICLOCK_ON : M_TOPICLOCK_OFF)
                 : (enabled ? M_KEEPTOPIC_ON : M_KEEPTOPIC_OFF);
-            txn.frame(writeSpec(txn, body, ServiceFrameKind.ordinary), (ServiceFrame w) {
+            channelWrite(txn, topicLock ? ServiceAction.channelTopicLock : ServiceAction.channelKeepTopic,
+                "", "", body, ServiceFrameKind.ordinary, (ServiceFrame w) {
                 if (!frameComplete(w)) { completeIncomplete(txn, w); return; }
                 auto ack = classify(g, servicePlainLines(w), [AckRule(okId, AckKind.accepted, "")]);
                 auto details = safeDetails(txn, w.lines, null);
@@ -2105,7 +2319,7 @@ private final class ChannelTopicSetOperation : ChannelOperation {
                     return topicObserved(txn, fr, channel, topic, botPrefix)
                         || classify(g, servicePlainLines(fr), rules.dup).state == "rejected";
                 };
-                txn.frame(writeSpec(txn, body, ServiceFrameKind.observe, terminal), (ServiceFrame w) {
+                channelWrite(txn, ServiceAction.channelTopicSet, "", "", body, ServiceFrameKind.observe, (ServiceFrame w) {
                     if (!frameComplete(w)) {
                         txn.complete(ServiceStatus.unconfirmed,
                             w.outcome == ServiceFrameOutcome.deadline && txn.dispatched ? "no_effect_observed"
@@ -2127,7 +2341,7 @@ private final class ChannelTopicSetOperation : ChannelOperation {
                         completeWrite(txn, ack, ok, expected, false, view, servicesRevision(txn, view),
                             infoCapabilities(txn, rb, ra), details);
                     });
-                });
+                }, terminal);
             }
 
             // Which client will send the TOPIC: BotServ INFO #c (CS→BS peer
@@ -2245,10 +2459,9 @@ private final class ChannelAccessListOperation : ChannelOperation {
         readAuthorized(txn, g, channel, 0, false, (ChannelSnapshot s, Authority a, ServiceFrame f) {
             if (!frameComplete(f) || !s.infoRead) { readFailed(txn, s, f); return; }
             auto view = accessView(s, a, s);
-            view["providerCapabilities"] = providerCapabilities(s, a);
             bool complete = !s.registered || (s.accessRead && s.problems.length == 0);
             void finish() {
-                txn.complete(complete ? ServiceStatus.confirmed : ServiceStatus.unconfirmed,
+                completeChannel(txn, complete ? ServiceStatus.confirmed : ServiceStatus.unconfirmed,
                     complete ? "" : (s.accessDenied ? "denied" : s.problems.length ? s.problems[0] : "access_list_unavailable"),
                     view, servicesRevision(txn, accessBasis(s)), accessCapabilities(s, a),
                     null);
@@ -2256,7 +2469,7 @@ private final class ChannelAccessListOperation : ChannelOperation {
             if (!s.registered || !s.flagsAvailable) { finish(); return; }
             // The flag letters this network actually configures, for the
             // native FLAGS editor (cs_flags.cpp OnHelp, translated texts).
-            txn.frame(readSpec(["HELP FLAGS"]), (ServiceFrame hf) {
+            channelHelpFrame(txn, g, false, "FLAGS", (ServicesEndpoint endpoint, ServiceFrame hf) {
                 auto defs = Json.emptyArray;
                 if (frameComplete(hf)) {
                     auto parsed = parseFlagsHelp(g, hf);
@@ -2287,7 +2500,7 @@ private final class ChannelAccessSetOperation : ChannelOperation {
         auto value = serviceParam(txn, "value");
         readAuthorized(txn, g, channel, 0, false, (ChannelSnapshot s, Authority a, ServiceFrame f) {
             if (!frameComplete(f) || !s.infoRead) { readFailed(txn, s, f); return; }
-            if (!requireServicesRevision(txn, servicesRevision(txn, accessBasis(s)), accessView(s, a, s),
+            if (!requireChannelRevision(txn, servicesRevision(txn, accessBasis(s)), accessView(s, a, s),
                     accessCapabilities(s, a)))
                 return;
             auto cap = accessWriteCap(s, a, provider);
@@ -2317,7 +2530,8 @@ private final class ChannelAccessSetOperation : ChannelOperation {
                 if (!txn.fits(body)) { txn.complete(ServiceStatus.rejected, "line_too_long"); return; }
                 verifyServicesTarget(txn, account, targetNick, (bool targetOk) {
                     if (!targetOk) return;
-                    txn.frame(writeSpec(txn, body, ServiceFrameKind.ordinary), (ServiceFrame w) {
+                    channelWrite(txn, ServiceAction.channelAccessSet, provider, provider == "xop" ? value : "",
+                        body, ServiceFrameKind.ordinary, (ServiceFrame w) {
                         if (!frameComplete(w)) { completeIncomplete(txn, w); return; }
                         auto ack = classify(g, servicePlainLines(w), accessAddRules(provider));
                         auto details = safeDetails(txn, w.lines, null);
@@ -2357,7 +2571,7 @@ private final class ChannelAccessSetOperation : ChannelOperation {
                     // Every letter must be one this network actually defines
                     // (HELP FLAGS) — founders included, since cs_flags
                     // ignores unknown letters yet still acknowledges.
-                    txn.frame(readSpec(["HELP FLAGS"]), (ServiceFrame hf) {
+                    channelHelpFrame(txn, g, false, "FLAGS", (ServicesEndpoint endpoint, ServiceFrame hf) {
                         if (!frameComplete(hf)) {
                             txn.complete(ServiceStatus.unavailable, "flag_definitions_unavailable");
                             return;
@@ -2428,7 +2642,7 @@ private final class ChannelAccessRemoveOperation : ChannelOperation {
         auto tier = serviceParam(txn, "value");
         readAuthorized(txn, g, channel, 0, false, (ChannelSnapshot s, Authority a, ServiceFrame f) {
             if (!frameComplete(f) || !s.infoRead) { readFailed(txn, s, f); return; }
-            if (!requireServicesRevision(txn, servicesRevision(txn, accessBasis(s)), accessView(s, a, s),
+            if (!requireChannelRevision(txn, servicesRevision(txn, accessBasis(s)), accessView(s, a, s),
                     accessCapabilities(s, a)))
                 return;
             AccessRow before;
@@ -2454,7 +2668,8 @@ private final class ChannelAccessRemoveOperation : ChannelOperation {
             if (!txn.fits(body)) { txn.complete(ServiceStatus.rejected, "line_too_long"); return; }
             verifyServicesTarget(txn, account, targetNick, (bool targetOk) {
                 if (!targetOk) return;
-                txn.frame(writeSpec(txn, body, ServiceFrameKind.ordinary), (ServiceFrame w) {
+                channelWrite(txn, ServiceAction.channelAccessRemove, provider, provider == "xop" ? before.value : "",
+                    body, ServiceFrameKind.ordinary, (ServiceFrame w) {
                     if (!frameComplete(w)) { completeIncomplete(txn, w); return; }
                     auto ack = classify(g, servicePlainLines(w), accessDelRules(provider));
                     auto details = safeDetails(txn, w.lines, null);
@@ -2617,14 +2832,14 @@ private final class ChannelModeLockListOperation : ChannelOperation {
                 return;
             }
             if (s.registered && s.locksDenied) {
-                txn.complete(ServiceStatus.rejected, "denied", Json.undefined, "", modeLockCapabilities(s, a));
+                completeChannel(txn, ServiceStatus.rejected, "denied", Json.undefined, "", modeLockCapabilities(s, a));
                 return;
             }
             if (s.registered && !s.locksRead) { readFailed(txn, s, f); return; }
             auto view = registeredView(modeLocksView(s), s.registered);
             // Private, session-only view: the key parameter is present but
             // marked sensitive; details are never attached.
-            txn.complete(ServiceStatus.confirmed, "", view, servicesRevision(txn, view), modeLockCapabilities(s, a));
+            completeChannel(txn, ServiceStatus.confirmed, "", view, servicesRevision(txn, view), modeLockCapabilities(s, a));
         });
     }
 }
@@ -2656,7 +2871,7 @@ private final class ChannelModeLockChangeOperation : ChannelOperation {
             if (!txn.fits(body)) { txn.complete(ServiceStatus.rejected, "line_too_long"); return; }
             // MODE LOCK replies echo lock parameters (keys), possibly wrapped
             // by 2.1 LineWrapper: no raw details at all, structured view only.
-            txn.frame(writeSpec(txn, body, ServiceFrameKind.ordinary), (ServiceFrame w) {
+            channelWrite(txn, ServiceAction.channelModeLockChange, "", "", body, ServiceFrameKind.ordinary, (ServiceFrame w) {
                 if (!frameComplete(w)) {
                     txn.complete(w.outcome == ServiceFrameOutcome.unavailable && !txn.dispatched
                         ? ServiceStatus.unavailable : ServiceStatus.unconfirmed,
@@ -2710,12 +2925,12 @@ private final class ChannelAkickListOperation : ChannelOperation {
                 return;
             }
             if (s.registered && s.akicksDenied) {
-                txn.complete(ServiceStatus.rejected, "denied", Json.undefined, "", akickCapabilities(s, a));
+                completeChannel(txn, ServiceStatus.rejected, "denied", Json.undefined, "", akickCapabilities(s, a));
                 return;
             }
             if (s.registered && !s.akicksRead) { readFailed(txn, s, f); return; }
             auto view = registeredView(akickView(s), s.registered);
-            txn.complete(ServiceStatus.confirmed, "", view, servicesRevision(txn, view), akickCapabilities(s, a));
+            completeChannel(txn, ServiceStatus.confirmed, "", view, servicesRevision(txn, view), akickCapabilities(s, a));
         });
     }
 }
@@ -2765,7 +2980,8 @@ private final class ChannelAkickChangeOperation : ChannelOperation {
                 : [AckRule(M_AKICK_DELETED, AckKind.accepted, ""),
                     AckRule(M_AKICK_NOT_FOUND, AckKind.rejected, "not_found"),
                     AckRule(M_AKICK_EMPTY, AckKind.rejected, "not_found")];
-            txn.frame(writeSpec(txn, body, ServiceFrameKind.ordinary), (ServiceFrame w) {
+            channelWrite(txn, adding ? ServiceAction.channelAkickAdd : ServiceAction.channelAkickRemove,
+                "", "", body, ServiceFrameKind.ordinary, (ServiceFrame w) {
                 if (!frameComplete(w)) { completeIncomplete(txn, w); return; }
                 auto ack = classify(g, servicePlainLines(w), rules);
                 auto details = safeDetails(txn, w.lines, null);
@@ -3017,7 +3233,7 @@ private final class BotInfoOperation : ChannelOperation {
             readBot(txn, g, channel, false, (BotState b, BotEntry[] bots, bool listOk, ServiceFrame f) {
                 if (!frameComplete(f)) { completeIncomplete(txn, f); return; }
                 if (b.denied) {
-                    txn.complete(ServiceStatus.rejected, "denied", Json.undefined, "", botCapabilities(s, a, b));
+                    completeChannel(txn, ServiceStatus.rejected, "denied", Json.undefined, "", botCapabilities(s, a, b));
                     return;
                 }
                 if (!b.read) {
@@ -3026,7 +3242,7 @@ private final class BotInfoOperation : ChannelOperation {
                     return;
                 }
                 auto view = botView(channel, b);
-                txn.complete(ServiceStatus.confirmed, "", view, servicesRevision(txn, view), botCapabilities(s, a, b));
+                completeChannel(txn, ServiceStatus.confirmed, "", view, servicesRevision(txn, view), botCapabilities(s, a, b));
             });
         });
     }
@@ -3102,7 +3318,10 @@ private final class BotChangeOperation : ChannelOperation {
                     }
                 }
                 if (!txn.fits(body)) { txn.complete(ServiceStatus.rejected, "line_too_long"); return; }
-                txn.frame(writeSpec(txn, body, ServiceFrameKind.ordinary), (ServiceFrame w) {
+                const action = change == BotChange.assign ? ServiceAction.botAssign
+                    : change == BotChange.unassign ? ServiceAction.botUnassign
+                    : change == BotChange.greet ? ServiceAction.botGreet : ServiceAction.botFantasy;
+                channelWrite(txn, action, "", "", body, ServiceFrameKind.ordinary, (ServiceFrame w) {
                     if (!frameComplete(w)) { completeIncomplete(txn, w); return; }
                     auto ack = classify(g, servicePlainLines(w), rules);
                     auto details = safeDetails(txn, w.lines, null);
@@ -3704,6 +3923,58 @@ void channelServicesChecks(void delegate(string name, bool cond) ok) {
         ok("flags access: the base state carries through an empty letter set",
             flagChangeCap(proven, "", provenCap).state == "allowed"
             && flagChangeCap(fl, "", flagsCap).state == "service_checked");
+    }
+
+    // Real HELP classification intersects even founder authority; a numeric
+    // ADD response cannot authorize another form/provider or the shared editor.
+    {
+        auto candidate = grammarFor("Anope-2.1.27-git (1947276) build #1");
+        ServiceFrame helpFrame(string[] lines) {
+            ServiceFrame frame;
+            frame.outcome = ServiceFrameOutcome.completed;
+            frame.startFenced = frame.endFenced = true;
+            foreach (text; lines) {
+                ServiceReplyLine line;
+                line.text = line.plain = text;
+                frame.lines ~= line;
+            }
+            return frame;
+        }
+        auto addFrame = helpFrame(["Syntax: ACCESS channel ADD mask level [description]"]);
+        HelpEvidence evidence(ServiceAction action, string provider, ServiceFrame frame) {
+            auto specs = servicesSyntax(action, true, provider);
+            return classifyServicesCommandHelp(candidate, specs[0], frame);
+        }
+        ChannelSnapshot s;
+        s.registered = s.accessAvailable = s.flagsAvailable = s.accessRead = s.tiersRead = true;
+        Authority founder;
+        founder.identified = founder.founder = true;
+        auto authority = accessWriteCap(s, founder, "access");
+        auto set = syntaxIntersection(authority, evidence(ServiceAction.channelAccessSet, "access", addFrame));
+        auto remove = syntaxIntersection(authority, evidence(ServiceAction.channelAccessRemove, "access", addFrame));
+        auto flags = syntaxIntersection(accessWriteCap(s, founder, "flags"),
+            evidence(ServiceAction.channelAccessSet, "flags", addFrame));
+        auto caps = Json.emptyObject;
+        putCap(caps, ServiceAction.channelAccessSet, set);
+        putCap(caps, ServiceAction.channelAccessRemove, remove);
+        ok("compatibility: founder ACCESS ADD leaves DEL and FLAGS unrequestable",
+            caps["channelAccessSet"]["state"].get!string == "allowed"
+            && !channelCapRequestable(remove) && !channelCapRequestable(flags));
+        auto editing = editingIntersection(authority, set, remove);
+        ok("compatibility: shared provider editor requires both forms, aggregate ADD stays usable",
+            !channelCapRequestable(editing) && channelCapRequestable(preferCap(remove, set)));
+        ok("compatibility: one incompatible tier keeps the whole shared XOP editor read-only",
+            !channelCapRequestable(editingIntersection(editingIntersection(authority, set, set), set, remove)));
+        auto permission = helpFrame([
+            "Access to this command requires the permission chanserv/access to be present in your opertype.",
+        ]);
+        auto permissionOnly = syntaxIntersection(authority,
+            evidence(ServiceAction.channelAccessSet, "access", permission));
+        ok("compatibility: permission-only HELP cannot enable founder mutation",
+            !channelCapRequestable(permissionOnly));
+        auto denied = Cap("denied", "service_denied");
+        ok("compatibility: compatible HELP never elevates denied authority",
+            syntaxIntersection(denied, evidence(ServiceAction.channelAccessSet, "access", addFrame)) == denied);
     }
 
     ok("topic: Anope-normalised spacing refused before sending",

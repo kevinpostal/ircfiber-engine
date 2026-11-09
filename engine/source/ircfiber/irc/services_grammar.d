@@ -16,8 +16,8 @@
  * The catalogs are the releases' own `language/anope.*.po`, compiled
  * unmodified with `msgfmt -c` exactly like Anope's build (fuzzy and
  * untranslated entries dropped, every plural form kept) and embedded as data
- * (catalogs/anope, GPL-2, see catalogs/anope/SOURCE.txt). Any other release
- * is unsupported: no structured parse, no guessed grammar.
+ * (catalogs/anope, GPL-2, see catalogs/anope/SOURCE.txt). Runtime candidates
+ * use these as decoders only; recognized replies and HELP establish compatibility.
  *
  * Matching rules (all fail closed — a false/absent result is never success):
  *  - Text is compared after IRC formatting is removed (`\x1B`, Anope's
@@ -91,6 +91,48 @@ AnopeRelease anopeRelease(string versionText) @safe pure nothrow @nogc {
     if (releaseHead(s, ANOPE_21_VERSION, ANOPE_21_GIT)) return AnopeRelease.v2_1_pinned;
     if (releaseHead(s, ANOPE_20_VERSION, ANOPE_20_GIT)) return AnopeRelease.v2_0_20;
     return AnopeRelease.unknown;
+}
+
+/// Selects a decoder family, not an exact source identity or capability.
+AnopeRelease anopeCandidateRelease(string versionText) @safe pure nothrow @nogc {
+    string s = trimVersionWhitespace(versionText);
+    enum head = "VERSION ";
+    if (startsWithBytes(s, head)) s = trimVersionWhitespace(s[head.length .. $]);
+    enum prefix = "Anope-2.";
+    if (!startsWithBytes(s, prefix) || s.length <= prefix.length + 2) return AnopeRelease.unknown;
+    const minor = s[prefix.length];
+    if ((minor != '0' && minor != '1') || s[prefix.length + 1] != '.') return AnopeRelease.unknown;
+    size_t i = prefix.length + 2;
+    const patchStart = i;
+    while (i < s.length && s[i] >= '0' && s[i] <= '9') ++i;
+    if (i == patchStart) return AnopeRelease.unknown;
+    if (i < s.length && s[i] == '-') {
+        const suffixStart = ++i;
+        while (i < s.length) {
+            const c = s[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                    || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '+' || c == '-')) break;
+            ++i;
+        }
+        if (i == suffixStart) return AnopeRelease.unknown;
+    }
+    if (i != s.length && s[i] != ' ') return AnopeRelease.unknown;
+    return minor == '0' ? AnopeRelease.v2_0_20 : AnopeRelease.v2_1_pinned;
+}
+
+/// Constructs the advertised family's decoder without inventing a VERSION.
+AnopeGrammar candidateAnopeGrammar(string versionText) {
+    return new AnopeGrammar(anopeCandidateRelease(versionText));
+}
+
+private string trimVersionWhitespace(string s) @safe pure nothrow @nogc {
+    bool whitespace(char c) @safe pure nothrow @nogc {
+        return c == ' ' || (c >= '\t' && c <= '\r');
+    }
+    size_t start, end = s.length;
+    while (start < end && whitespace(s[start])) ++start;
+    while (end > start && whitespace(s[end - 1])) --end;
+    return s[start .. end];
 }
 
 private bool releaseHead(string s, string version_, string git) @safe pure nothrow @nogc {
@@ -791,28 +833,31 @@ struct ServiceMatch {
 // ── Grammar ────────────────────────────────────────────────────────────────
 
 /**
- * Reply grammar of one verified pseudoclient's release. Construct from
- * `ServicesEndpoint.version_`; every method fails closed on an unsupported
- * release (no variants, no matches).
+ * Reply grammar from an exact release or explicitly selected decoder baseline.
+ * Candidate construction does not assert compatibility; every reply still
+ * requires the adapter's complete, target-bound recognition.
  */
 final class AnopeGrammar {
     private AnopeRelease release_;
     private AnopeCatalog cat;
 
     this(string versionText) {
-        const r = anopeRelease(versionText);
-        if (r == AnopeRelease.unknown) return;
+        this(anopeRelease(versionText));
+    }
+
+    this(AnopeRelease baseline) {
+        if (baseline == AnopeRelease.unknown) return;
         AnopeCatalog c;
-        try c = catalogFor(r);
+        try c = catalogFor(baseline);
         catch (Exception) c = null;
         if (c is null) return;
         cat = c;
-        release_ = r;
+        release_ = baseline;
     }
 
-    /// Exact supported release with its catalogs loaded.
+    /// Selected decoder baseline with its catalogs loaded.
     @property bool supported() const { return release_ != AnopeRelease.unknown; }
-    /// The pinned 2.1 fork (else 2.0.20 when supported).
+    /// The 2.1 decoder baseline (else 2.0.20 when supported).
     @property bool v21() const { return release_ == AnopeRelease.v2_1_pinned; }
     @property AnopeRelease release() const { return release_; }
 
@@ -1311,6 +1356,17 @@ version (ServicesWireHarness) {
             && anopeRelease("Anope-2.1.27 build #1") == AnopeRelease.unknown
             && anopeRelease("") == AnopeRelease.unknown
             && anopeRelease("Atheme 7.2.12") == AnopeRelease.unknown);
+        enum NETCRAVE = "Anope-2.1.27-git (1947276) build #1, compiled Mon Sep 28 2026 08:19:33 UTC, flags DG -- InspIRCd 4+ -- enc_sha2";
+        ok("candidate: Netcrave selects decoder without exact recognition",
+            anopeCandidateRelease(NETCRAVE) == AnopeRelease.v2_1_pinned
+            && anopeRelease(NETCRAVE) == AnopeRelease.unknown
+            && candidateAnopeGrammar(NETCRAVE).v21);
+        ok("candidate: other patches and ASCII build suffixes select families",
+            anopeCandidateRelease("\t VERSION Anope-2.0.99-dev.a_1+test-2 (1234567) build #3 \r\n") == AnopeRelease.v2_0_20
+            && anopeCandidateRelease("Anope-2.1.28") == AnopeRelease.v2_1_pinned);
+        foreach (bad; ["", "Atheme 7.2.12", "server Anope-2.1.27-git", "Anope-2.10.1",
+                "Anope-2.2.0", "Anope-3.0.0", "Anope-2.1.", "Anope-2.1.2-", "Anope-2.1.2/evil"])
+            ok("candidate: rejects " ~ bad, anopeCandidateRelease(bad) == AnopeRelease.unknown);
 
         auto g21 = new AnopeGrammar(V21);
         auto g20 = new AnopeGrammar(V20);

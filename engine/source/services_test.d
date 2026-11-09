@@ -914,6 +914,324 @@ void nativeIdentityChecks() {
     }
 }
 
+/// Candidate fingerprints must constrain real adapters, not just recognize a banner.
+void fingerprintChecks() {
+    import ircfiber.irc.services_identity : registerIdentityServicesOperations;
+    import ircfiber.irc.services_channel : registerChannelServicesOperations;
+    import ircfiber.irc.services_staff : registerStaffServicesOperations;
+    import ircfiber.irc.services_operation : servicesRevisionFor;
+
+    stderr.writeln("\n[services.fingerprint] real candidate adapters and command evidence");
+    enum netcrave = "Anope-2.1.27-git (1947276) build #1, compiled Mon Sep 28 2026 08:19:33 UTC, flags DG -- InspIRCd 4+ -- enc_sha2";
+    registerIdentityServicesOperations();
+    registerChannelServicesOperations();
+    registerStaffServicesOperations();
+    scope (exit) {
+        clearServicesOperations();
+        setLegacyAuthTerminalClassifier(null);
+    }
+
+    // Consume the actual Rig wire in order, including each real fence. A script
+    // supplies only service replies; it cannot bypass discovery or frame parsing.
+    void answer(ref Rig r, ref size_t cursor, string[] delegate(string, string) reply,
+            string peerVersion = netcrave, bool badNickServPin = false, string primaryVersion = netcrave) {
+        size_t guard;
+        while (cursor < r.host.written.length && guard++ < 500) {
+            const line = r.host.written[cursor++];
+            if (line.startsWith("WHOIS ")) {
+                const nick = line[6 .. $];
+                if (nick == "me") {
+                    r.feed(":s 311 me me user real.example * :Me");
+                    r.feed(":s 330 me me acct :is logged in as");
+                    r.feed(":s 318 me me :End of /WHOIS list.");
+                } else {
+                    r.verify(badNickServPin && nick == "NickServ" ? "evil.example" : "services.test",
+                        "services.test", nick, nick == "NickServ" ? peerVersion : primaryVersion);
+                }
+                continue;
+            }
+            if (!line.startsWith("PRIVMSG ")) continue;
+            const at = line.indexOf(" :");
+            if (at < 0) continue;
+            const target = line[8 .. at];
+            const serverAt = target.indexOf('@');
+            const nick = serverAt < 0 ? target : target[0 .. serverAt];
+            const body = line[at + 2 .. $];
+            const prefix = ":" ~ nick ~ "!services@services.test NOTICE me :";
+            if (body.startsWith("\x01PING ")) {
+                r.feed(prefix ~ body);
+            } else if (body != "\x01VERSION\x01") {
+                foreach (text; reply(nick, body)) r.feed(prefix ~ text);
+            }
+        }
+    }
+    size_t countBody(ref Rig r, string body) {
+        size_t n;
+        foreach (line; r.host.written) {
+            const at = line.indexOf(" :");
+            if (at >= 0 && line[at + 2 .. $] == body) ++n;
+        }
+        return n;
+    }
+    bool requestable(Json caps, ServiceAction action) {
+        if (caps.type != Json.Type.object) return false;
+        auto cap = caps[action.to!string];
+        if (cap.type != Json.Type.object) return false;
+        const state = cap["state"].get!string;
+        return state == "allowed" || state == "service_checked";
+    }
+    bool allProof = true;
+    bool numericAdd = true;
+    bool keepProof = true;
+    bool founder = true;
+    string[] channelReply(string service, string body) {
+        if (body == "HELP ACCESS") {
+            string[] rows = ["Syntax: ACCESS channel ADD mask level [description]"];
+            if (!numericAdd) rows = ["This command requires the permission chanserv/access."];
+            if (allProof) rows ~= "Syntax: ACCESS channel LIST [mask | list] [ALL]";
+            return rows;
+        }
+        if (body == "HELP SET KEEPTOPIC")
+            return keepProof ? ["Syntax: SET KEEPTOPIC channel {ON | OFF}"]
+                : ["This command requires the permission chanserv/set."];
+        if (body == "HELP TOPIC") return ["Syntax: TOPIC channel unexpected-argument"];
+        if (body == "INFO #c")
+            return ["Information about channel \x02#c\x02:", "Founder: " ~ (founder ? "acct" : "other"),
+                "Description: Candidate fixture"];
+        if (body == "STATUS #c") return ["Unknown command STATUS. Type /msg ChanServ HELP for help."];
+        if (body == "LEVELS #c LIST") return ["Unknown command LEVELS. Type /msg ChanServ HELP for help."];
+        if (body == "ACCESS #c LIST * ALL")
+            return ["Access list for #c:", "Number  Level  Mask", "1       10     bob", "End of access list"];
+        if (body == "FLAGS #c LIST") return ["Unknown command FLAGS. Type /msg ChanServ HELP for help."];
+        if (body.startsWith("HELP "))
+            return ["Unknown command " ~ body[5 .. $] ~ ". Type /msg ChanServ HELP for help."];
+        return ["Unexpected command"];
+    }
+    {
+        auto r = Rig.make();
+        size_t cursor;
+        r.run(r.request(ServiceAction.channelInfo, `{"channel":"#c"}`));
+        answer(r, cursor, &channelReply);
+        ok("Netcrave target-bound INFO survives absent optional STATUS/LEVELS/FLAGS",
+            r.last.status == ServiceStatus.confirmed && r.last.data["registered"].get!bool
+            && r.last.data["channel"].get!string == "#c" && r.last.data["founder"].get!string == "acct");
+        ok("founder authority intersects syntax, leaving unrelated verified KEEPTOPIC enabled",
+            requestable(r.last.capabilities, ServiceAction.channelKeepTopic)
+            && !requestable(r.last.capabilities, ServiceAction.channelTopicSet)
+            && !requestable(r.last.capabilities, ServiceAction.channelTopicLock));
+        const revision = r.last.revision;
+        auto mutation = r.request(ServiceAction.channelTopicLock, `{"channel":"#c","enabled":true}`);
+        mutation.expectedRevision = revision;
+        r.run(mutation);
+        answer(r, cursor, &channelReply);
+        ok("direct founder mutation with incompatible HELP never dispatches a write",
+            r.last.status != ServiceStatus.confirmed && countBody(r, "TOPIC #c LOCK") == 0);
+    }
+    {
+        auto r = Rig.make();
+        size_t cursor;
+        r.run(r.request(ServiceAction.channelAccessList, `{"channel":"#c"}`));
+        answer(r, cursor, &channelReply);
+        ok("optional missing modules preserve independently parsed numeric access",
+            r.last.status == ServiceStatus.confirmed && r.last.data["entries"].length == 1
+            && r.last.data["entries"][0]["provider"].get!string == "access"
+            && r.last.data["entries"][0]["account"].get!string == "bob");
+        ok("one cached ACCESS HELP proves ADD but not DEL or FLAGS",
+            requestable(r.last.capabilities, ServiceAction.channelAccessSet)
+            && !requestable(r.last.capabilities, ServiceAction.channelAccessRemove)
+            && countBody(r, "HELP ACCESS") == 1);
+        ok("shared provider editing requires removal proof as well as ADD",
+            !requestable(Json(["channelAccessSet": r.last.data["providerCapabilities"]["access"]]),
+                ServiceAction.channelAccessSet));
+        const accessRevision = r.last.revision;
+        auto removal = r.request(ServiceAction.channelAccessRemove,
+            `{"channel":"#c","account":"bob","provider":"access","value":""}`);
+        removal.expectedRevision = accessRevision;
+        r.run(removal);
+        answer(r, cursor, &channelReply);
+        ok("compatible numeric ADD cannot authorize a direct ACCESS DEL mutation",
+            r.last.status != ServiceStatus.confirmed && countBody(r, "ACCESS #c DEL bob") == 0);
+        const before = countBody(r, "HELP ACCESS");
+        r.run(r.request(ServiceAction.channelAccessList, `{"channel":"#c"}`));
+        answer(r, cursor, &channelReply);
+        ok("another transaction cannot reuse a completed transaction's HELP",
+            r.last.status == ServiceStatus.confirmed && countBody(r, "HELP ACCESS") == before + 1);
+    }
+    {
+        allProof = false;
+        scope (exit) allProof = true;
+        auto r = Rig.make();
+        size_t cursor;
+        r.run(r.request(ServiceAction.channelAccessList, `{"channel":"#c"}`));
+        answer(r, cursor, &channelReply);
+        ok("missing ALL syntax sends no provider-only substitute and never reports complete",
+            countBody(r, "ACCESS #c LIST * ALL") == 0 && countBody(r, "ACCESS #c LIST") == 0
+            && (r.last.data.type != Json.Type.object || !r.last.data["complete"].get!bool));
+    }
+    {
+        keepProof = numericAdd = false;
+        scope (exit) { keepProof = numericAdd = true; }
+        auto r = Rig.make();
+        size_t cursor;
+        r.run(r.request(ServiceAction.channelInfo, `{"channel":"#c"}`));
+        answer(r, cursor, &channelReply);
+        ok("permission-only HELP cannot turn founder authority into any requestable channel mutation",
+            r.last.status == ServiceStatus.confirmed
+            && !requestable(r.last.capabilities, ServiceAction.channelKeepTopic)
+            && !requestable(r.last.capabilities, ServiceAction.channelTopicSet)
+            && !requestable(r.last.capabilities, ServiceAction.channelTopicLock)
+            && !requestable(r.last.capabilities, ServiceAction.channelRegister));
+        auto write = r.request(ServiceAction.channelKeepTopic, `{"channel":"#c","enabled":true}`);
+        write.expectedRevision = r.last.revision;
+        r.run(write);
+        answer(r, cursor, &channelReply);
+        ok("direct founder KEEPTOPIC with permission prose sends no mutation body",
+            r.last.status != ServiceStatus.confirmed && countBody(r, "SET KEEPTOPIC #c ON") == 0);
+    }
+    {
+        founder = false;
+        scope (exit) founder = true;
+        auto r = Rig.make();
+        size_t cursor;
+        r.run(r.request(ServiceAction.channelInfo, `{"channel":"#c"}`));
+        answer(r, cursor, &channelReply);
+        ok("compatible HELP cannot elevate an actor with unverified channel authority",
+            r.last.status == ServiceStatus.confirmed
+            && !requestable(r.last.capabilities, ServiceAction.channelKeepTopic));
+    }
+    foreach (recognized; [true, false]) {
+        auto r = Rig.make();
+        size_t cursor;
+        string[] memoReply(string service, string body) {
+            if (body == "HELP SEND") return ["Syntax: SEND {nick | channel} memo-text"];
+            if (body == "SEND bob candidate-message")
+                return [recognized ? "Memo sent to \x02bob\x02." : "Your memo was probably queued."];
+            return ["Unknown command"];
+        }
+        r.run(r.request(ServiceAction.memoSend, `{"recipient":"bob","text":"candidate-message"}`));
+        answer(r, cursor, &memoReply);
+        ok(recognized ? "candidate memo mutation confirms its exact acknowledgement with one send"
+                : "unknown candidate mutation acknowledgement stays unconfirmed with no retry",
+            r.last.status == (recognized ? ServiceStatus.confirmed : ServiceStatus.unconfirmed)
+            && countBody(r, "SEND bob candidate-message") == 1 && countBody(r, "HELP SEND") == 1);
+    }
+    {
+        auto r = Rig.make();
+        size_t cursor;
+        bool compatibleRead;
+        bool readSent;
+        string[] memoReply(string service, string body) {
+            if (body == "LIST")
+                return ["Memos for acct:", "Number  Sender  Date/Time",
+                    (readSent ? "  1" : "* 1") ~ "     bob     Nov 06 2026"];
+            if (body == "HELP READ") return compatibleRead
+                ? ["Syntax: READ [channel] {num | list | LAST | NEW | ALL}"]
+                : ["This command requires the permission memoserv/read."];
+            if (body == "HELP SEND") return ["Syntax: SEND {nick | channel} memo-text"];
+            if (body == "HELP DEL") return ["Syntax: DEL [channel] {num | list | LAST | ALL}"];
+            if (body == "READ 1") {
+                readSent = true;
+                return ["Memo 1 from bob (Nov 06 2026).", "candidate memo body"];
+            }
+            return ["Unknown command"];
+        }
+        r.run(r.request(ServiceAction.memoList, `{}`));
+        answer(r, cursor, &memoReply);
+        ok("memo discovery lists without reading and cannot infer READ syntax from permission prose",
+            r.last.status == ServiceStatus.confirmed && countBody(r, "READ 1") == 0
+            && !requestable(r.last.capabilities, ServiceAction.memoRead)
+            && requestable(r.last.capabilities, ServiceAction.memoSend));
+        const reviewedInbox = r.last.revision;
+        auto read = r.request(ServiceAction.memoRead, `{"selection":"1"}`);
+        read.expectedRevision = r.last.revision;
+        r.run(read);
+        answer(r, cursor, &memoReply);
+        ok("explicit memo READ still needs its own strict mutation proof",
+            r.last.status != ServiceStatus.confirmed && countBody(r, "READ 1") == 0
+            && countBody(r, "HELP READ") == 2);
+        compatibleRead = true;
+        read = r.request(ServiceAction.memoRead, `{"selection":"1"}`);
+        read.expectedRevision = reviewedInbox;
+        r.run(read);
+        answer(r, cursor, &memoReply);
+        ok("explicit candidate READ makes one write and confirms only after the fresh LIST marks it read",
+            r.last.status == ServiceStatus.confirmed && countBody(r, "READ 1") == 1
+            && countBody(r, "LIST") == 3 && r.last.data["text"].get!string == "candidate memo body");
+        ok("memo body remains private rather than appearing in generic result details",
+            !r.last.details.canFind("candidate memo body"));
+    }
+    {
+        auto r = Rig.make();
+        size_t cursor;
+        string[] statsReply(string service, string body) {
+            if (body == "HELP STATS")
+                return ["Syntax: STATS [AKILL | HASH | PASSWORD | UPLINK | UPTIME | ALL | RESET]"];
+            if (body == "STATS") return ["Current users: \x0210\x02 (\x021\x02 ops)", "Services up 1 day."];
+            if (body == "STATS AKILL") return ["Current number of AKILLs: \x020\x02"];
+            return ["Unknown command"];
+        }
+        r.run(r.request(ServiceAction.operStats, `{}`));
+        answer(r, cursor, &statsReply);
+        ok("registered staff adapter consumes candidate literal STATS syntax and real statistics",
+            r.last.status == ServiceStatus.confirmed && r.last.data["fields"].length >= 3
+            && requestable(r.last.capabilities, ServiceAction.operStats));
+    }
+    foreach (peerVersion; ["Anope-2.1.28-git (differenthash)", "Anope-2.0.20", "Anope-9.0.0"]) {
+        auto r = Rig.make();
+        size_t cursor;
+        string[] hostReply(string service, string body) {
+            if (service == "NickServ" && body.startsWith("INFO "))
+                return ["Information about nick \x02me\x02:", "Account: acct (ID: 8)", "VHost: cloak.example"];
+            if (body == "HELP REQUEST") return ["Syntax: REQUEST vhost"];
+            if (body == "HELP ON") return ["Syntax: ON"];
+            if (body == "HELP OFF") return ["Syntax: OFF"];
+            return ["Unknown command"];
+        }
+        r.run(r.request(ServiceAction.hostInfo, `{}`));
+        answer(r, cursor, &hostReply, peerVersion);
+        const sameProfile = peerVersion.startsWith("Anope-2.1.");
+        ok("peer decoder baseline binding: " ~ peerVersion,
+            sameProfile ? r.last.status == ServiceStatus.confirmed && countBody(r, "INFO me") == 1
+                : r.last.status != ServiceStatus.confirmed && countBody(r, "INFO me") == 0);
+    }
+    {
+        auto r = Rig.make();
+        size_t cursor;
+        r.run(r.request(ServiceAction.accountIdentify, `{"account":"acct","password":"candidate-secret"}`));
+        // A mismatched pin must reject before even a sensitive HELP/write.
+        answer(r, cursor, &channelReply, netcrave, true);
+        ok("candidate syntax never bypasses an untrusted NickServ pin",
+            r.last.reasonCode == "pin_mismatch"
+            && !r.host.written.any!(l => l.canFind(" :IDENTIFY")));
+    }
+    {
+        ServicesEndpoint ep;
+        ep.service = ServiceId.chanServ;
+        ep.nick = "ChanServ"; ep.ident = "services"; ep.host = ep.server = "services.test";
+        ep.version_ = netcrave;
+        auto basis = Json(["kind": Json("channel"), "channel": Json("#c")]);
+        const revision = servicesRevisionFor(ep, ServicesActor(ServicesActorState.account, "acct"), NET, basis);
+        ep.version_ = "Anope-2.1.28-git (differenthash)";
+        ok("review revision binds the observed VERSION even within one candidate family",
+            revision != servicesRevisionFor(ep, ServicesActor(ServicesActorState.account, "acct"), NET, basis));
+    }
+    {
+        auto r = Rig.make();
+        size_t cursor;
+        r.run(r.request(ServiceAction.channelInfo, `{"channel":"#c"}`));
+        answer(r, cursor, &channelReply);
+        const reviewed = r.last.revision;
+        r.t.onConfigChanged(); // Force a fresh endpoint VERSION, retaining channel state.
+        auto write = r.request(ServiceAction.channelKeepTopic, `{"channel":"#c","enabled":true}`);
+        write.expectedRevision = reviewed;
+        r.run(write);
+        answer(r, cursor, &channelReply, netcrave, false, "Anope-2.1.28-git (changedbuild)");
+        ok("a changed observed VERSION rejects the stale review before any native write",
+            r.last.status == ServiceStatus.stale && r.last.reasonCode == "revision_changed"
+            && countBody(r, "SET KEEPTOPIC #c ON") == 0);
+    }
+}
+
 void nativeChecks() {
     stderr.writeln("\n[services.native] protected unlabelled socket lane");
     Rig nativeRig() {
@@ -1086,6 +1404,7 @@ int main() {
     mutationPreflightChecks();
     frameBoundsChecks();
     nativeIdentityChecks();
+    fingerprintChecks();
     foreach (c; servicesLegacyAuthChecks()) ok(c.name, c.passed);
     foreach (c; servicesLegacyMetaChecks()) ok(c.name, c.passed);
     servicesGrammarChecks((n, c) => ok(n, c));

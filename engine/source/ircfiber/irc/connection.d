@@ -16333,6 +16333,7 @@ ServicesWireCheck[] servicesTransportWireChecks(out string[] wire) {
     import vibe.stream.operations : readLine;
     import ircfiber.services.config : ServicePin, ServiceId, ServicesProvider;
     import ircfiber.services.protocol : ServiceAction, ServiceStatus;
+    import ircfiber.irc.services_channel : registerChannelServicesOperations;
 
     ServicesWireCheck[] results;
     void check(string name, bool passed) {
@@ -16343,9 +16344,15 @@ ServicesWireCheck[] servicesTransportWireChecks(out string[] wire) {
     enum to = "PRIVMSG NickServ@services.test :";
     string[] got;
     int pings;
+    bool candidateMode;
+    bool compatibleTopic;
+    enum netcraveVersion = "Anope-2.1.27-git (1947276) build #1, compiled Mon Sep 28 2026 08:19:33 UTC, flags DG -- InspIRCd 4+ -- enc_sha2";
     string respond(string line) {
         if (line.startsWith("WHOIS ")) {
             const nick = line[6 .. $];
+            if (candidateMode && nick == "ChanServ")
+                return ":s 311 me ChanServ services services.test * :Channel Services\r\n"
+                    ~ ":s 312 me ChanServ services.test :Anope\r\n:s 318 me ChanServ :End of /WHOIS list.\r\n";
             if (nick == "NickServ")
                 return ":s 311 me NickServ services services.test * :Nickname Services\r\n"
                     ~ ":s 312 me NickServ services.test :Anope\r\n:s 318 me NickServ :End of /WHOIS list.\r\n";
@@ -16353,6 +16360,25 @@ ServicesWireCheck[] servicesTransportWireChecks(out string[] wire) {
                 return ":s 311 me me ~m host.a * :Me\r\n:s 330 me me acct :is logged in as\r\n"
                     ~ ":s 318 me me :End of /WHOIS list.\r\n";
             return ":s 401 me " ~ nick ~ " :No such nick\r\n:s 318 me " ~ nick ~ " :End of /WHOIS list.\r\n";
+        }
+        if (candidateMode && line.startsWith("PRIVMSG ChanServ@services.test :")) {
+            enum prefix = ":ChanServ!services@services.test NOTICE me :";
+            const body = line["PRIVMSG ChanServ@services.test :".length .. $];
+            if (body == "\x01VERSION\x01") return prefix ~ "\x01VERSION " ~ netcraveVersion ~ "\x01\r\n";
+            if (body.startsWith("\x01PING ")) return prefix ~ body ~ "\r\n";
+            if (body == "INFO #c")
+                return prefix ~ "Information about channel \x02#c\x02:\r\n"
+                    ~ prefix ~ "Founder: acct\r\n" ~ prefix ~ "Description: Socket candidate fixture\r\n";
+            if (body == "HELP ACCESS")
+                return prefix ~ "Syntax: ACCESS channel LIST [mask | list] [ALL]\r\n";
+            if (body == "ACCESS #c LIST * ALL") return prefix ~ "#c access list is empty.\r\n";
+            if (body == "HELP TOPIC") return prefix ~ (compatibleTopic
+                ? "Syntax: TOPIC channel [SET] [topic]" : "Syntax: TOPIC channel wrong-arguments") ~ "\r\n";
+            if (body == "HELP SET KEEPTOPIC")
+                return prefix ~ "Syntax: SET KEEPTOPIC channel {ON | OFF}\r\n";
+            const command = body.startsWith("HELP ") ? body[5 .. $]
+                : body.startsWith("STATUS ") ? "STATUS" : body.startsWith("LEVELS ") ? "LEVELS" : "FLAGS";
+            return prefix ~ "Unknown command " ~ command ~ ". Type /msg ChanServ HELP for help.\r\n";
         }
         if (!line.startsWith(to)) return "";
         const body_ = line[to.length .. $];
@@ -16398,6 +16424,8 @@ ServicesWireCheck[] servicesTransportWireChecks(out string[] wire) {
     cfg.services.provider = ServicesProvider.anope;
     cfg.services.server = "services.test";
     cfg.services.pins[ServiceId.nickServ] = ServicePin("NickServ", "services", "services.test");
+    cfg.services.pins[ServiceId.chanServ] = ServicePin("ChanServ", "services", "services.test");
+    cfg.services.pins[ServiceId.botServ] = ServicePin("BotServ", "services", "services.test");
     auto c = new PersistentIRCClient(cfg, ch);
     auto op = new WireInfoOperation;
     registerServicesOperation(ServiceAction.accountInfo, op);
@@ -16569,6 +16597,43 @@ ServicesWireCheck[] servicesTransportWireChecks(out string[] wire) {
     c.executeServices(offline, collect());
     check("an offline connection answers unavailable",
         results_.length == 9 && results_[8].reasonCode == "offline");
+
+    // Use the same localhost peer and real client for grammar proof. The
+    // WireInfoOperation cases above deliberately remain transport-only.
+    candidateMode = true;
+    compatibleTopic = true;
+    registerChannelServicesOperations();
+    c.state = ConnectionState.connected;
+    c.connectedAtMs = unixMsNow();
+    c.beginServicesGeneration();
+    c.processLine(":s 900 me me!u@h acct :You are now logged in as acct");
+    auto candidate = request(ServiceAction.channelInfo, `{"channel":"#c"}`, "acct");
+    c.executeServices(candidate, collect());
+    const candidateDeadline = unixMsNow() + 20_000;
+    while (unixMsNow() < candidateDeadline
+            && !results_.any!(r => r.requestId == candidate.requestId)) pump(50);
+    const candidateReady = results_.length > 9 && results_[$ - 1].requestId == candidate.requestId
+        && results_[$ - 1].status == ServiceStatus.confirmed;
+    check("real candidate ChanServ socket replies yield a typed confirmed channel view",
+        candidateReady && results_[$ - 1].data["channel"].get!string == "#c"
+        && results_[$ - 1].data["registered"].get!bool
+        && results_[$ - 1].data["founder"].get!string == "acct");
+    check("real candidate HELP enables the corresponding authorized control",
+        candidateReady && results_[$ - 1].capabilities["channelTopicSet"]["state"].get!string == "allowed");
+    const candidateRevision = candidateReady ? results_[$ - 1].revision : "";
+    compatibleTopic = false;
+    auto incompatible = request(ServiceAction.channelTopicSet, `{"channel":"#c","topic":"candidate-forbidden"}`, "acct");
+    incompatible.expectedRevision = candidateRevision;
+    const incompatibleStart = got.length;
+    c.executeServices(incompatible, collect());
+    const incompatibleDeadline = unixMsNow() + 20_000;
+    while (unixMsNow() < incompatibleDeadline
+            && !results_.any!(r => r.requestId == incompatible.requestId)) pump(50);
+    check("incompatible real HELP blocks a direct founder mutation on the socket",
+        results_.length > 9 && results_[$ - 1].requestId == incompatible.requestId
+        && results_[$ - 1].status != ServiceStatus.confirmed
+        && got[incompatibleStart .. $].any!(l => l == "PRIVMSG ChanServ@services.test :HELP TOPIC")
+        && !got[incompatibleStart .. $].any!(l => l == "PRIVMSG ChanServ@services.test :TOPIC #c SET candidate-forbidden"));
 
     wire = got.dup;
     return results;

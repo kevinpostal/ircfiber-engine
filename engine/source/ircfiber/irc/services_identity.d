@@ -41,8 +41,8 @@ import std.uni : icmp;
 import vibe.data.json : Json;
 
 import ircfiber.irc.services;
-import ircfiber.irc.services_grammar : AnopeGrammar, ANOPE_20_VERSION, ANOPE_21_VERSION, normalizeServiceText;
-import ircfiber.irc.services_operation : HelpEvidence, readServicesHelp, servicesRevision,
+import ircfiber.irc.services_grammar : AnopeGrammar, candidateAnopeGrammar, ANOPE_20_VERSION, ANOPE_21_VERSION, normalizeServiceText;
+import ircfiber.irc.services_operation : HelpEvidence, readServicesActionHelp, servicesRevision,
     requireServicesRevision, verifyServicesTarget, putServiceCapability, serviceParam;
 static import ircfiber.irc.services_operation;
 import ircfiber.services.config : ServiceId;
@@ -84,9 +84,8 @@ private final class IdentityOperation : ServicesOperation {
         runner = runner_;
     }
 
-    /// Every action needs a certified grammar: an unknown release's raw
-    /// NickServ/MemoServ/HostServ text may carry private INFO or memo
-    /// metadata and cannot be parsed, so nothing is sent at all.
+    /// A candidate family supplies only a decoder. Complete parsed replies
+    /// and endpoint-bound command HELP establish usable capabilities.
     bool supports(const ref ServicesEndpoint endpoint) {
         return grammarFor(endpoint.version_).supported;
     }
@@ -101,7 +100,7 @@ private AnopeGrammar[string] gGrammars;
 private AnopeGrammar grammarFor(string versionText) {
     if (auto g = versionText in gGrammars) return *g;
     if (gGrammars.length >= 16) gGrammars = null;
-    auto g = new AnopeGrammar(versionText);
+    auto g = candidateAnopeGrammar(versionText);
     gGrammars[versionText] = g;
     return g;
 }
@@ -579,8 +578,8 @@ private string helpReason(HelpEvidence h) {
 
 /// Fresh capability for a write: the actual session's HELP for the exact
 /// command. Anything but `allowed` answers without sending the write.
-private void requireHelp(ServicesTransaction txn, string command, ServiceAction action, void delegate() proceed) {
-    readServicesHelp(txn, command, (HelpEvidence h) {
+private void requireHelp(ServicesTransaction txn, ServiceAction action, void delegate() proceed) {
+    readServicesActionHelp(txn, txn.endpoint.service, action, (HelpEvidence h) {
         if (h.state == "allowed") {
             proceed();
             return;
@@ -591,13 +590,8 @@ private void requireHelp(ServicesTransaction txn, string command, ServiceAction 
     });
 }
 
-private struct CapRead {
-    ServiceAction action;
-    string command;
-}
-
 /// Sequential HELP reads (one command per frame) into a capability map.
-private void readCapabilities(ServicesTransaction txn, CapRead[] reads, void delegate(Json) done) {
+private void readCapabilities(ServicesTransaction txn, ServiceAction[] reads, void delegate(Json) done) {
     auto caps = Json.emptyObject;
     void step(size_t i) {
         if (i >= reads.length) {
@@ -605,8 +599,8 @@ private void readCapabilities(ServicesTransaction txn, CapRead[] reads, void del
             return;
         }
         const read = reads[i];
-        readServicesHelp(txn, read.command, (HelpEvidence h) {
-            putServiceCapability(caps, read.action, h.state, h.reasonCode);
+        readServicesActionHelp(txn, txn.endpoint.service, read, (HelpEvidence h) {
+            putServiceCapability(caps, read, h.state, h.reasonCode);
             step(i + 1);
         });
     }
@@ -625,7 +619,6 @@ private void narrowCapability(ref Json caps, ServiceAction action, string state,
     if (capState(caps, action) == "allowed") putServiceCapability(caps, action, state, reason);
 }
 
-private string confirmCommand(AnopeGrammar g) { return g.v21 ? "CONFIRM REGISTER" : "CONFIRM"; }
 
 private string paramString(ServicesTransaction txn, string key) { return serviceParam(txn, key); }
 
@@ -933,10 +926,10 @@ private void runAccountInfo(ServicesTransaction txn, AnopeGrammar g) {
                 }
                 const revision = servicesRevision(txn, accountCanonical(info.account, true, !info.unconfirmed));
                 readCapabilities(txn, [
-                    CapRead(ServiceAction.accountPrivacy, "SET HIDE"),
-                    CapRead(ServiceAction.accountRecover, "RECOVER"),
-                    CapRead(ServiceAction.accountGroups, "GLIST"),
-                    CapRead(ServiceAction.accountGroup, "GROUP"),
+                    ServiceAction.accountPrivacy,
+                    ServiceAction.accountRecover,
+                    ServiceAction.accountGroups,
+                    ServiceAction.accountGroup,
                 ], (Json caps) {
                     txn.complete(ServiceStatus.confirmed, "", data, revision, caps);
                 });
@@ -944,11 +937,11 @@ private void runAccountInfo(ServicesTransaction txn, AnopeGrammar g) {
             }
             if (ownNickUnidentified) {
                 readCapabilities(txn, [
-                    CapRead(ServiceAction.accountIdentify, "IDENTIFY"),
-                    CapRead(ServiceAction.accountRegister, "REGISTER"),
-                    CapRead(ServiceAction.accountConfirm, confirmCommand(g)),
-                    CapRead(ServiceAction.accountGroup, "GROUP"),
-                    CapRead(ServiceAction.accountRecover, "RECOVER"),
+                    ServiceAction.accountIdentify,
+                    ServiceAction.accountRegister,
+                    ServiceAction.accountConfirm,
+                    ServiceAction.accountGroup,
+                    ServiceAction.accountRecover,
                 ], (Json caps) {
                     // ns_register: an existing alias answers "already registered".
                     if (info.registered || info.service)
@@ -1039,7 +1032,7 @@ private void runAccountIdentify(ServicesTransaction txn, AnopeGrammar g) {
         // Never close as a success while a refusal is also present.
         return e.refused || (e.ack && (e.observed.length || e.awaiting.length));
     };
-    requireHelp(txn, "IDENTIFY", ServiceAction.accountIdentify, () {
+    requireHelp(txn, ServiceAction.accountIdentify, () {
         txn.frame(writeSpec(txn, body_, ServiceFrameKind.asyncAuth, terminal), (ServiceFrame f) {
             if (ambiguousWrite(txn, f)) return;
             auto e = evaluateIdentify(g, f);
@@ -1145,7 +1138,7 @@ private void runAccountRegister(ServicesTransaction txn, AnopeGrammar g) {
         return txn.complete(ServiceStatus.rejected, "custom_account_name_unsupported");
     const body_ = "REGISTER " ~ password ~ (email.length ? " " ~ email : "");
     if (!fitsOrReject(txn, body_)) return;
-    requireHelp(txn, "REGISTER", ServiceAction.accountRegister, () {
+    requireHelp(txn, ServiceAction.accountRegister, () {
         // REGISTER is synchronous (no IdentifyRequest); its login and
         // confirmation prompts precede the end fence.
         txn.frame(writeSpec(txn, body_, ServiceFrameKind.ordinary), (ServiceFrame f) {
@@ -1174,7 +1167,7 @@ private void runAccountRegister(ServicesTransaction txn, AnopeGrammar g) {
                 txn.complete(ServiceStatus.confirmed, "", data, "", Json.undefined, details);
                 return;
             }
-            readCapabilities(txn, [CapRead(ServiceAction.accountConfirm, confirmCommand(g))], (Json caps) {
+            readCapabilities(txn, [ServiceAction.accountConfirm], (Json caps) {
                 txn.complete(ServiceStatus.confirmed, "", data, "", caps, details);
             });
         });
@@ -1208,7 +1201,7 @@ private void runAccountConfirm(ServicesTransaction txn, AnopeGrammar g) {
         return txn.complete(ServiceStatus.rejected, "custom_account_name_unsupported");
     const body_ = (g.v21 ? "CONFIRM REGISTER " : "CONFIRM ") ~ code;
     if (!fitsOrReject(txn, body_)) return;
-    requireHelp(txn, confirmCommand(g), ServiceAction.accountConfirm, () {
+    requireHelp(txn, ServiceAction.accountConfirm, () {
         txn.frame(writeSpec(txn, body_, ServiceFrameKind.ordinary), (ServiceFrame f) {
             if (ambiguousWrite(txn, f)) return;
             auto e = evaluateConfirm(g, f);
@@ -1373,7 +1366,7 @@ private void runAccountGroups(ServicesTransaction txn, AnopeGrammar g) {
             return;
         }
         const revision = servicesRevision(txn, groupsCanonical(account, groups.nicks));
-        readCapabilities(txn, [CapRead(ServiceAction.accountGroup, "GROUP")], (Json caps) {
+        readCapabilities(txn, [ServiceAction.accountGroup], (Json caps) {
             txn.complete(ServiceStatus.confirmed, "", groupsJson(account, groups.nicks), revision, caps);
         });
     });
@@ -1410,7 +1403,7 @@ private void runAccountGroup(ServicesTransaction txn, AnopeGrammar g) {
         auto e = evaluateGroup(g, f);
         return e.ack || e.refused;
     };
-    requireHelp(txn, "GROUP", ServiceAction.accountGroup, () {
+    requireHelp(txn, ServiceAction.accountGroup, () {
         txn.frame(writeSpec(txn, body_, ServiceFrameKind.asyncAuth, terminal), (ServiceFrame f) {
             if (ambiguousWrite(txn, f)) return;
             auto e = evaluateGroup(g, f);
@@ -1489,7 +1482,7 @@ private void runAccountRecover(ServicesTransaction txn, AnopeGrammar g) {
         auto e = evaluateRecover(g, f);
         return e.effect.length || e.refused;
     };
-    requireHelp(txn, "RECOVER", ServiceAction.accountRecover, () {
+    requireHelp(txn, ServiceAction.accountRecover, () {
         txn.frame(writeSpec(txn, body_, ServiceFrameKind.asyncAuth, terminal), (ServiceFrame f) {
             if (ambiguousWrite(txn, f)) return;
             auto e = evaluateRecover(g, f);
@@ -1575,7 +1568,7 @@ private void runAccountPrivacy(ServicesTransaction txn, AnopeGrammar g) {
     const body_ = "SET HIDE " ~ wire ~ (enabled ? " ON" : " OFF");
     const info = "INFO " ~ account;
     if (!fitsOrReject(txn, body_) || !fitsOrReject(txn, info)) return;
-    requireHelp(txn, "SET HIDE", ServiceAction.accountPrivacy, () {
+    requireHelp(txn, ServiceAction.accountPrivacy, () {
         txn.frame(readSpec(info), (ServiceFrame pre) {
             if (readFailed(txn, pre)) return;
             auto before = parseNickInfo(g, pre);
@@ -1741,9 +1734,9 @@ private Json hostView(const ref HostState s) {
 
 private void hostCapabilities(ServicesTransaction txn, const HostState s, void delegate(Json) done) {
     readCapabilities(txn, [
-        CapRead(ServiceAction.hostRequest, "REQUEST"),
-        CapRead(ServiceAction.hostOn, "ON"),
-        CapRead(ServiceAction.hostOff, "OFF"),
+        ServiceAction.hostRequest,
+        ServiceAction.hostOn,
+        ServiceAction.hostOff,
     ], (Json caps) {
         if (s.nickKnown && !s.nickInAccount)
             narrowCapability(caps, ServiceAction.hostRequest, "denied", "nick_not_in_account");
@@ -1795,7 +1788,7 @@ private void runHostRequest(ServicesTransaction txn, AnopeGrammar g) {
     const host = paramString(txn, "host");
     const body_ = "REQUEST " ~ host;
     if (!fitsOrReject(txn, body_)) return;
-    requireHelp(txn, "REQUEST", ServiceAction.hostRequest, () {
+    requireHelp(txn, ServiceAction.hostRequest, () {
         hostPrecheck(txn, g, (HostState s) {
             if (s.nickKnown && !s.nickInAccount) {
                 txn.complete(ServiceStatus.rejected, "nick_not_in_account");
@@ -1848,7 +1841,7 @@ bool hostOnAccepted(AnopeGrammar g, const ref ServiceFrame f, out string mask) {
 }
 
 private void runHostOn(ServicesTransaction txn, AnopeGrammar g) {
-    requireHelp(txn, "ON", ServiceAction.hostOn, () {
+    requireHelp(txn, ServiceAction.hostOn, () {
         hostPrecheck(txn, g, (HostState s) {
             txn.frame(writeSpec(txn, "ON", ServiceFrameKind.ordinary), (ServiceFrame f) {
                 if (ambiguousWrite(txn, f)) return;
@@ -1895,7 +1888,7 @@ private void runHostOn(ServicesTransaction txn, AnopeGrammar g) {
 }
 
 private void runHostOff(ServicesTransaction txn, AnopeGrammar g) {
-    requireHelp(txn, "OFF", ServiceAction.hostOff, () {
+    requireHelp(txn, ServiceAction.hostOff, () {
         hostPrecheck(txn, g, (HostState s) {
             txn.frame(writeSpec(txn, "OFF", ServiceFrameKind.ordinary), (ServiceFrame f) {
                 if (ambiguousWrite(txn, f)) return;
@@ -2108,9 +2101,9 @@ private void runMemoList(ServicesTransaction txn, AnopeGrammar g) {
         const revision = servicesRevision(txn, inboxCanonical(account, inbox.entries));
         auto data = inboxJson(account, inbox.entries);
         readCapabilities(txn, [
-            CapRead(ServiceAction.memoRead, "READ"),
-            CapRead(ServiceAction.memoDelete, "DEL"),
-            CapRead(ServiceAction.memoSend, "SEND"),
+            ServiceAction.memoRead,
+            ServiceAction.memoDelete,
+            ServiceAction.memoSend,
         ], (Json caps) {
             if (!inbox.entries.length) {
                 narrowCapability(caps, ServiceAction.memoRead, "denied", "no_memos");
@@ -2272,7 +2265,7 @@ private uint memoSelection(string selection, const MemoEntry[] entries, out stri
 private void runMemoRead(ServicesTransaction txn, AnopeGrammar g) {
     const selection = paramString(txn, "selection");
     const account = txn.actor.account;
-    requireHelp(txn, "READ", ServiceAction.memoRead, () {
+    requireHelp(txn, ServiceAction.memoRead, () {
         readInbox(txn, g, (MemoInbox before) {
             if (!requireServicesRevision(txn, servicesRevision(txn, inboxCanonical(account, before.entries)),
                     inboxJson(account, before.entries), Json.undefined)) return;
@@ -2331,7 +2324,7 @@ private void runMemoSend(ServicesTransaction txn, AnopeGrammar g) {
     const text = paramString(txn, "text");
     const body_ = "SEND " ~ recipient ~ " " ~ text;
     if (!fitsOrReject(txn, body_)) return;
-    requireHelp(txn, "SEND", ServiceAction.memoSend, () {
+    requireHelp(txn, ServiceAction.memoSend, () {
         // A nick shortcut must still be logged into the reviewed account.
         verifyServicesTarget(txn, recipient.startsWith("#") ? "" : recipient,
                 recipient.startsWith("#") ? "" : targetNick, (bool ok) {
@@ -2373,7 +2366,7 @@ private void runMemoDelete(ServicesTransaction txn, AnopeGrammar g) {
         return;
     }
     const n = cast(uint) number;
-    requireHelp(txn, "DEL", ServiceAction.memoDelete, () {
+    requireHelp(txn, ServiceAction.memoDelete, () {
         readInbox(txn, g, (MemoInbox before) {
             if (!requireServicesRevision(txn, servicesRevision(txn, inboxCanonical(account, before.entries)),
                     inboxJson(account, before.entries), Json.undefined)) return;

@@ -56,6 +56,7 @@ import ircfiber.services.config : ServiceId, ServicesConfig, ServicesProvider, S
 import ircfiber.services.protocol : ServicesRequest, ServicesResult, ServiceAction, ServiceStatus,
     ServicesKeys, serviceFor, isAuthentication, permitsUnauthenticated, enforceServiceWireLimit;
 import ircfiber.services.privacy : serviceTarget, sensitiveServiceMessage;
+import ircfiber.irc.services_grammar : AnopeRelease, anopeCandidateRelease;
 public import ircfiber.engine.session_snapshot : NativeQuietMarker;
 
 // ── Limits ─────────────────────────────────────────────────────────────────
@@ -338,7 +339,8 @@ struct ServicesWhois {
 
 /// One action's versioned adapter: command builder, parser, read-back.
 interface ServicesOperation {
-    /// Whether this adapter's grammar covers the endpoint's version.
+    /// Whether a candidate decoder is available for the observed version.
+    /// This alone does not establish any requestable operation capability.
     bool supports(const ref ServicesEndpoint endpoint);
     /// Runs the operation. Must end with exactly one `txn.complete`.
     /// An exception completes the request as unavailable/unconfirmed.
@@ -378,6 +380,16 @@ final class ServicesTransaction {
     private string[] secrets;
     private PendingFrame* frameState;
     private void delegate(ServicesResult) deliver;
+    private struct HelpKey {
+        ServiceId service;
+        string command;
+    }
+    private struct CachedHelp {
+        ServicesEndpoint endpoint;
+        ulong generation;
+        ServiceFrame frame;
+    }
+    private CachedHelp[HelpKey] servicesHelp;
 
     /// `capAt`: the request's absolute deadline, anchored at the gateway's
     /// issue time so a command can never reach services after the gateway
@@ -452,6 +464,72 @@ final class ServicesTransaction {
         enforce(frameState is null, "one frame at a time per transaction");
         if (peer == ep.service) return frame(spec, done);
         transport.startPeerFrame(this, peer, spec, done);
+    }
+
+    /// Resolves and locks an allowed service without sending a state command.
+    /// The primary endpoint is already resolved; peers retain the same trust,
+    /// no-wait lock and pin checks as `frameOn`.
+    void resolveService(ServiceId service,
+            void delegate(bool ok, string reason, ServicesEndpoint endpoint) done) {
+        enforce(!finished, "services transaction already finished");
+        enforce(frameState is null, "one frame at a time per transaction");
+        transport.resolveService(this, service, done);
+    }
+
+    /// HELP evidence is private to this request and its current authority.
+    /// Endpoint equality deliberately includes the raw observed VERSION.
+    private bool currentServicesHelp() {
+        const currentActor = transport.host.actor();
+        if (!live() || transport.host.nowMs() >= capAt
+                || currentActor.state != startActor.state
+                || !sameNick(currentActor.account, startActor.account)) {
+            servicesHelp = null;
+            return false;
+        }
+        const generation = capabilityGeneration();
+        foreach (key, ref entry; servicesHelp) {
+            auto slot = &transport.slots[key.service];
+            if (entry.generation != generation || slot.txn !is this
+                    || slot.pin != PinState.verified || slot.endpoint != entry.endpoint) {
+                servicesHelp = null;
+                break;
+            }
+        }
+        return true;
+    }
+
+    bool cachedServicesHelp(const ref ServicesEndpoint endpoint, string command,
+            out ServiceFrame frame) {
+        frame = ServiceFrame.init;
+        if (!currentServicesHelp()) return false;
+        auto entry = HelpKey(endpoint.service, command) in servicesHelp;
+        if (entry is null) return false;
+        if (entry.endpoint != endpoint) {
+            servicesHelp = null;
+            return false;
+        }
+        frame = entry.frame;
+        return true;
+    }
+
+    void cacheServicesHelp(const ref ServicesEndpoint endpoint, string command,
+            const ref ServiceFrame frame) {
+        if (!currentServicesHelp() || !command.length
+                || cast(size_t) endpoint.service >= SERVICE_COUNT) return;
+        auto slot = &transport.slots[endpoint.service];
+        if (slot.txn !is this || slot.pin != PinState.verified || slot.endpoint != endpoint
+                || frame.service != endpoint.service
+                || frame.target.length != endpoint.nick.length + endpoint.server.length + 1
+                || frame.target[0 .. endpoint.nick.length] != endpoint.nick
+                || frame.target[endpoint.nick.length] != '@'
+                || frame.target[endpoint.nick.length + 1 .. $] != endpoint.server
+                || frame.kind != ServiceFrameKind.ordinary
+                || frame.outcome != ServiceFrameOutcome.completed
+                || !frame.startFenced || !frame.endFenced || frame.truncated || frame.ambiguous) return;
+        const key = HelpKey(endpoint.service, command);
+        if (servicesHelp.length >= 64 && key !in servicesHelp) servicesHelp = null;
+        // Retain the completed frame's slices, not copies of private replies.
+        servicesHelp[key] = CachedHelp(endpoint, capabilityGeneration(), cast(ServiceFrame) frame);
     }
 
     /// Suppressed WHOIS for target resolution (nick → account).
@@ -1796,9 +1874,31 @@ final class ServicesTransport {
             && icmp(a.host, b.host) == 0 && icmp(a.server, b.server) == 0;
     }
 
-    /// Opens a frame on a secondary service for `txn` (see
-    /// `ServicesTransaction.frameOn`): acquires that service's lock for the
-    /// rest of the transaction, or answers the frame unavailable at once.
+    /// Acquires an allowed peer's lock for the rest of the transaction,
+    /// without waiting or bypassing endpoint verification.
+    private void resolveService(ServicesTransaction txn, ServiceId service,
+            void delegate(bool, string, ServicesEndpoint) done) {
+        if (!txn.live()) return;
+        if (host.nowMs() >= txn.capAt)
+            return done(false, "request_expired", ServicesEndpoint.init);
+        if (service == txn.ep.service) return done(true, "", txn.ep);
+        if (!peerAllowed(txn.ep.service, service))
+            return done(false, "peer_not_allowed", ServicesEndpoint.init);
+        const cfg = host.servicesConfig();
+        auto slot = &slots[service];
+        if (slot.txn !is null && slot.txn !is txn)
+            return done(false, "peer_busy", ServicesEndpoint.init);
+        if (slot.txn is null && host.manualLinePending(cfg.pins[service].nick))
+            return done(false, "peer_busy", ServicesEndpoint.init);
+        slot.txn = txn;
+        host.markerChanged();
+        resolveEndpoint(txn, service, cfg, (bool ok, string reason, ServicesEndpoint endpoint) {
+            if (txn.finished) return;
+            done(ok, reason, endpoint);
+        });
+    }
+
+    /// Opens an ordinary, nonsensitive frame on a secondary service.
     private void startPeerFrame(ServicesTransaction txn, ServiceId peer, ServiceFrameSpec spec,
             ServiceFrameDone done) {
         void refuse(string reason) {
@@ -1817,14 +1917,18 @@ final class ServicesTransport {
         foreach (b; spec.bodies)
             if (sensitiveServiceMessage(SERVICE_DEFAULT_NICKS[peer], b, cfg))
                 return refuse("peer_not_allowed");
-        auto slot = &slots[peer];
-        if (slot.txn !is null && slot.txn !is txn) return refuse("peer_busy");
-        if (slot.txn is null && host.manualLinePending(cfg.pins[peer].nick)) return refuse("peer_busy");
-        slot.txn = txn;
-        host.markerChanged();
-        resolveEndpoint(txn, peer, cfg, (bool ok, string reason, ServicesEndpoint ep) {
-            if (txn.finished) return;
+        resolveService(txn, peer, (bool ok, string reason, ServicesEndpoint ep) {
             if (!ok) return refuse(reason);
+            // HELP is decoded against this actual endpoint independently.
+            // State replies may use the primary parser only within its family.
+            bool helpOnly = !spec.mutating && spec.bodies.length > 0;
+            foreach (body; spec.bodies)
+                if (body != "HELP" && !(body.length > 5 && body[0 .. 5] == "HELP "))
+                    helpOnly = false;
+            const primary = anopeCandidateRelease(txn.ep.version_);
+            if (!helpOnly && (primary == AnopeRelease.unknown
+                    || anopeCandidateRelease(ep.version_) != primary))
+                return refuse("adapter_unavailable");
             startFrame(txn, ep, spec, done);
         });
     }
@@ -2412,6 +2516,7 @@ final class ServicesTransport {
     package void finishTransaction(ServicesTransaction txn, ServicesResult r) {
         if (txn.finished) return;
         txn.finished = true;
+        txn.servicesHelp = null;
         if (auto f = txn.frameState) {
             // Finished (cancelled, or answered by its adapter) mid-frame:
             // late replies of a command already sent stay private.
@@ -2756,6 +2861,7 @@ private final class LedgerHost : ServicesHost {
     string epoch = "11111111-1111-4111-8111-111111111111";
     ServicesActor who = ServicesActor(ServicesActorState.none, "");
     ServicesConfig cfg;
+    bool manualPending;
     string[] written;
     ServicesTransport t;
     long nowMs() { return now; }
@@ -2771,7 +2877,7 @@ private final class LedgerHost : ServicesHost {
     string isupport(string) { return ""; }
     size_t lineLimit() { return 512; }
     size_t ownPrefixBytes() { return 30; }
-    bool manualLinePending(string) { return false; }
+    bool manualLinePending(string) { return manualPending; }
     void wake() {
         for (;;) {
             auto l = t.nextWrite();
@@ -3016,6 +3122,141 @@ ServicesLedgerCheck[] servicesLegacyAuthChecks() {
             r.t.legacyAuthPending() == SERVICES_LEGACY_AUTH_MAX + 1);
         r.t.onDisconnect();
         check("and a new socket clears it", r.t.legacyAuthPending() == 0);
+    }
+    // ── transaction-private HELP evidence and peer decoder isolation ─────
+    {
+        auto r = new LedgerRig;
+        r.t.syncEpoch(r.host.epoch);
+        const id = ServiceId.chanServ;
+        auto q = r.request(ServiceAction.accountInfo, `{"account":"acct"}`, "");
+        auto txn = new ServicesTransaction(r.t, q, id, r.host.epoch, r.host.who,
+            (ServicesResult result) {}, r.host.now + 60_000);
+        txn.ep = ServicesEndpoint(id, "ChanServ", "services", "services.test", "services.test",
+            "Anope-2.1.27-git (1947276)");
+        r.t.slots[id].txn = txn;
+        r.t.slots[id].pin = PinState.verified;
+        r.t.slots[id].endpoint = txn.ep;
+        ServiceFrame help;
+        help.service = id;
+        help.target = txn.ep.target();
+        help.startFenced = help.endFenced = true;
+        help.lines = [ServiceReplyLine.init];
+        help.lines[0].plain = "Syntax: ACCESS channel ADD mask level [description]";
+        txn.cacheServicesHelp(txn.ep, "ACCESS", help);
+        ServiceFrame cached;
+        import ircfiber.irc.services_operation : servicesSyntax, classifyServicesCommandHelp;
+        import ircfiber.irc.services_grammar : candidateAnopeGrammar;
+        auto addSyntax = servicesSyntax(ServiceAction.channelAccessSet, true, "access")[0];
+        auto delSyntax = servicesSyntax(ServiceAction.channelAccessRemove, true, "access")[0];
+        const retained = txn.cachedServicesHelp(txn.ep, "ACCESS", cached);
+        auto decoder = candidateAnopeGrammar(txn.ep.version_);
+        check("one cached HELP frame proves ADD without authorizing DEL",
+            retained && classifyServicesCommandHelp(decoder, addSyntax, cached).state == "allowed"
+                && classifyServicesCommandHelp(decoder, delSyntax, cached).state == "unsupported");
+        check("HELP cache keys distinguish commands",
+            !txn.cachedServicesHelp(txn.ep, "FLAGS", cached));
+        auto otherService = txn.ep;
+        otherService.service = ServiceId.botServ;
+        check("HELP from another service is not reused even with the same VERSION",
+            !txn.cachedServicesHelp(otherService, "ACCESS", cached));
+        auto otherTxn = new ServicesTransaction(r.t, q, id, r.host.epoch, r.host.who,
+            (ServicesResult result) {}, r.host.now + 60_000);
+        check("HELP evidence never crosses transaction ownership",
+            !otherTxn.cachedServicesHelp(txn.ep, "ACCESS", cached));
+        r.t.onOwnAuthorityChanged();
+        check("authority generation invalidates cached HELP",
+            !txn.cachedServicesHelp(txn.ep, "ACCESS", cached) && txn.servicesHelp.length == 0);
+        txn.cacheServicesHelp(txn.ep, "ACCESS", help);
+        r.host.who = ServicesActor(ServicesActorState.account, "changed");
+        check("an actor change invalidates HELP even before its event is processed",
+            !txn.cachedServicesHelp(txn.ep, "ACCESS", cached) && txn.servicesHelp.length == 0);
+        r.host.who = txn.startActor;
+        txn.cacheServicesHelp(txn.ep, "ACCESS", help);
+        auto changedVersion = txn.ep;
+        changedVersion.version_ = "Anope-2.1.27-git (different)";
+        r.t.slots[id].endpoint = changedVersion;
+        check("raw VERSION changes invalidate HELP within the same decoder family",
+            !txn.cachedServicesHelp(txn.ep, "ACCESS", cached) && txn.servicesHelp.length == 0);
+        r.t.slots[id].endpoint = txn.ep;
+        foreach (bad; 0 .. 5) {
+            auto incomplete = help;
+            switch (bad) {
+                case 0: incomplete.outcome = ServiceFrameOutcome.deadline; break;
+                case 1: incomplete.startFenced = false; break;
+                case 2: incomplete.endFenced = false; break;
+                case 3: incomplete.truncated = true; break;
+                case 4: incomplete.ambiguous = true; break;
+                default: assert(0);
+            }
+            txn.cacheServicesHelp(txn.ep, "ACCESS", incomplete);
+        }
+        check("timeout, unfenced, truncated and ambiguous HELP are never cached",
+            !txn.cachedServicesHelp(txn.ep, "ACCESS", cached));
+        foreach (i; 0 .. 64) txn.cacheServicesHelp(txn.ep, "CMD" ~ i.to!string, help);
+        check("HELP cache is bounded at 64 structural keys", txn.servicesHelp.length == 64);
+        txn.cacheServicesHelp(txn.ep, "OVERFLOW", help);
+        check("overflow clears old HELP evidence before retaining a new frame",
+            txn.servicesHelp.length == 1 && !txn.cachedServicesHelp(txn.ep, "CMD0", cached)
+                && txn.cachedServicesHelp(txn.ep, "OVERFLOW", cached));
+        r.host.epoch = randomUUID().toString();
+        check("connection epoch changes invalidate all transaction HELP",
+            !txn.cachedServicesHelp(txn.ep, "OVERFLOW", cached) && txn.servicesHelp.length == 0);
+    }
+    {
+        auto r = new LedgerRig;
+        r.t.syncEpoch(r.host.epoch);
+        auto q = r.request(ServiceAction.accountInfo, `{"account":"acct"}`, "");
+        auto txn = new ServicesTransaction(r.t, q, ServiceId.hostServ, r.host.epoch, r.host.who,
+            (ServicesResult result) {}, r.host.now + 60_000);
+        txn.ep = ServicesEndpoint(ServiceId.hostServ, "HostServ", "services", "services.test",
+            "services.test", "Anope-2.1.27-git (1947276)");
+        const peer = ServiceId.nickServ;
+        r.t.slots[peer].pin = PinState.verified;
+        r.t.slots[peer].endpoint = ServicesEndpoint(peer, "NickServ", "services", "services.test",
+            "services.test", "Anope-2.1.28-git (another)");
+        string reason;
+        ServicesEndpoint resolved;
+        txn.resolveService(ServiceId.operServ, (bool ok, string why, ServicesEndpoint endpoint) {
+            reason = why;
+        });
+        check("HELP resolution cannot acquire a forbidden peer", reason == "peer_not_allowed");
+        r.host.manualPending = true;
+        txn.resolveService(peer, (bool ok, string why, ServicesEndpoint endpoint) { reason = why; });
+        check("HELP resolution never overtakes a pending manual service line", reason == "peer_busy");
+        r.host.manualPending = false;
+        txn.resolveService(peer, (bool ok, string why, ServicesEndpoint endpoint) {
+            reason = why;
+            if (ok) resolved = endpoint;
+        });
+        check("allowed peer resolution retains its own pinned endpoint and raw VERSION",
+            reason.length == 0 && resolved == r.t.slots[peer].endpoint && r.t.slots[peer].txn is txn);
+        ServiceFrameSpec spec;
+        spec.bodies = ["INFO me"];
+        txn.frameOn(peer, spec, (ServiceFrame f) {});
+        check("different build hashes within a candidate family permit peer state reads",
+            txn.frameState !is null && r.wrote("PING"));
+        r.t.cancelTransaction(txn, "test_complete");
+
+        foreach (version_; ["Anope-2.0.20", "unknown"]) {
+            auto isolated = new ServicesTransaction(r.t, q, ServiceId.hostServ, r.host.epoch, r.host.who,
+                (ServicesResult result) {}, r.host.now + 60_000);
+            isolated.ep = txn.ep;
+            r.t.slots[peer].endpoint.version_ = version_;
+            const before = r.host.written.length;
+            ServiceFrame refused;
+            isolated.frameOn(peer, spec, (ServiceFrame f) { refused = f; });
+            check("unknown or different candidate families cannot send peer state frames",
+                refused.outcome == ServiceFrameOutcome.unavailable
+                    && refused.reason == "adapter_unavailable" && r.host.written.length == before);
+            r.t.cancelTransaction(isolated, "test_complete");
+        }
+        auto untrusted = new ServicesTransaction(r.t, q, ServiceId.hostServ, r.host.epoch, r.host.who,
+            (ServicesResult result) {}, r.host.now + 60_000);
+        untrusted.ep = txn.ep;
+        r.t.slots[peer].pin = PinState.mismatch;
+        untrusted.resolveService(peer, (bool ok, string why, ServicesEndpoint endpoint) { reason = why; });
+        check("peer HELP resolution does not bypass a mismatched pin", reason == "pin_mismatch");
+        r.t.cancelTransaction(untrusted, "test_complete");
     }
     return results;
 }

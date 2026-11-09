@@ -35,3 +35,25 @@ make build-engine # engine binary only
 ## Notes
 - Diet templates are compiled via `stringImportPaths` resolved relative to `engine/` when built with `--root=engine`.
 - All `find source` / `find views` references in the top-level Makefile now point to `engine/source` and `engine/views`.
+
+## Anope services compatibility
+
+Anope 2.0/2.1 VERSION families select candidate reply decoders; an unknown
+build hash does not by itself disable integration. Complete, target-bound
+read replies establish readable state. Non-exact builds also need compatible,
+command-specific HELP syntax before a control becomes requestable or a
+mutation is sent. Missing or incompatible evidence disables only affected
+controls; it never grants authority or fabricates an empty list.
+
+Approved endpoint pins, account/channel authorization, reviewed revisions,
+paced-write guards and mutation-result verification remain independent.
+HELP evidence is private to one transaction and bound to the actual endpoint,
+raw VERSION and authority generation. Other products/version families remain
+unsupported. This does not change service identities or deploy an engine.
+
+Run the focused parser, real-adapter and localhost socket regressions from
+`engine/engine`:
+
+```sh
+dub run --config=services-test
+```

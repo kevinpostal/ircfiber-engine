@@ -24,9 +24,11 @@
  *    command is usable now; it is rechecked immediately before every
  *    mutation, and the paced write repeats the capability-generation check.
  *
- * Results are built from the exact source grammar of the two certified
+ * Results are decoded with the source grammar of the two supported
  * baselines (upstream 2.0.20 and the managed 2.1 fork) and every shipped
- * translation through `AnopeGrammar`. Tables follow `ListFormatter`
+ * translation through `AnopeGrammar`. Candidate builds additionally need
+ * command-specific HELP syntax before a control can be requested. Tables
+ * follow `ListFormatter`
  * (FIXED, 2.1 FLEXIBLE templates, 2.1 MONOSPACE prefix, column breaks) and
  * 2.1 `LineWrapper` continuation lines. Anything else is unrecognised and
  * answered `unconfirmed` with sanitised details, never as success.
@@ -51,8 +53,8 @@ import vibe.data.json : Json;
 import ircfiber.irc.services : ServicesOperation, ServicesTransaction, ServicesEndpoint, ServiceFrame,
     ServiceFrameSpec, ServiceFrameKind, ServiceFrameOutcome, ServiceFrameTerminal, ServiceEffect,
     registerServicesOperation;
-import ircfiber.irc.services_grammar : AnopeGrammar;
-import ircfiber.irc.services_operation : HelpEvidence, readServicesHelp, frameComplete, servicesRevision,
+import ircfiber.irc.services_grammar : AnopeGrammar, AnopeRelease, anopeRelease, candidateAnopeGrammar;
+import ircfiber.irc.services_operation : HelpEvidence, readServicesActionHelp, frameComplete, servicesRevision,
     putServiceCapability, serviceParam;
 import ircfiber.services.protocol : ServiceAction, ServiceStatus;
 
@@ -169,12 +171,11 @@ private enum GLOBAL_NO_MESSAGE = "You do not have any messages queued and did no
 
 private AnopeGrammar[string] grammarCache;
 
-/// The versioned grammar for an endpoint's CTCP VERSION text (null when the
-/// text is not a certified Anope baseline).
+/// Candidate decoder only; each command still needs independent evidence.
 private AnopeGrammar grammarFor(string versionText) {
     if (auto g = versionText in grammarCache) return *g;
     AnopeGrammar g;
-    try g = new AnopeGrammar(versionText);
+    try g = candidateAnopeGrammar(versionText);
     catch (Exception) g = null;
     if (grammarCache.length >= 8) grammarCache = null;
     grammarCache[versionText] = g;
@@ -262,6 +263,7 @@ private final class Staff {
     private ServiceAction action;
     private AnopeGrammar g;
     private bool v21;
+    private bool candidate;
     /// Capability generation when the request started. Every mutation is
     /// guarded by it at the paced write: an OPER/deOPER, login change, pin
     /// or epoch change after our HELP revalidation stops the command.
@@ -273,6 +275,7 @@ private final class Staff {
         action = a;
         g = grammar;
         v21 = grammar.v21;
+        candidate = anopeRelease(t.endpoint.version_) == AnopeRelease.unknown;
         reviewedGeneration = t.capabilityGeneration();
         caps = Json.emptyObject;
     }
@@ -319,9 +322,38 @@ private final class Staff {
         return false;
     }
 
-    private void help(string command, void delegate(HelpEvidence) next) {
+    private void help(ServiceAction a, void delegate(HelpEvidence) next) {
         if (!usable()) return;
-        readServicesHelp(txn, command, next);
+        readServicesActionHelp(txn, txn.endpoint.service, a, next);
+    }
+
+    private struct AkillHelp {
+        HelpEvidence view;
+        HelpEvidence add;
+        HelpEvidence remove;
+    }
+
+    /// One complete AKILL HELP frame, independently classified for each
+    /// form. Exact baselines keep their single generic HELP request.
+    private void akillHelp(void delegate(AkillHelp) next) {
+        help(ServiceAction.akillView, (HelpEvidence view) {
+            if (!candidate || view.state == "unknown" || view.state == "denied") {
+                next(AkillHelp(view, view, view));
+                return;
+            }
+            help(ServiceAction.akillAdd, (HelpEvidence add) {
+                help(ServiceAction.akillRemove, (HelpEvidence remove) {
+                    next(AkillHelp(view, add, remove));
+                });
+            });
+        });
+    }
+
+    private void akillCapabilities(AkillHelp h, ReadResult r) {
+        cap(ServiceAction.akillList, combine(h.view, r), capReason(h.view, r));
+        cap(ServiceAction.akillView, combine(h.view, r), capReason(h.view, r));
+        cap(ServiceAction.akillAdd, combine(h.add, r), capReason(h.add, r));
+        cap(ServiceAction.akillRemove, combine(h.remove, r), capReason(h.remove, r));
     }
 
     private void read(string[] bodies, void delegate(ServiceFrame) next) {
@@ -360,9 +392,12 @@ private final class Staff {
 
     /// Mutations need fresh HELP evidence that the command is usable now;
     /// otherwise the reviewed capability no longer holds and nothing is sent.
-    private bool requireUsable(HelpEvidence h, const ServiceAction[] related) {
+    private bool requireUsable(HelpEvidence h, ServiceAction a) {
         if (h.state == "allowed") return true;
-        foreach (a; related) cap(a, h.state, h.reasonCode);
+        if (!candidate && (a == ServiceAction.akillAdd || a == ServiceAction.akillRemove)) {
+            // Preserve the certified baseline's command-wide refusal.
+            foreach (related; AKILL_ACTIONS) cap(related, h.state, h.reasonCode);
+        } else cap(a, h.state, h.reasonCode);
         finish(ServiceStatus.stale, "capabilities_changed");
         return false;
     }
@@ -481,7 +516,7 @@ private final class Staff {
     // ── OperServ STATS ────────────────────────────────────────────────
 
     void operStats() {
-        help("STATS", (HelpEvidence h) {
+        help(ServiceAction.operStats, (HelpEvidence h) {
             read(["STATS", "STATS AKILL"], (ServiceFrame f) {
                 StatField[] fields;
                 const r = parseStats(f, fields);
@@ -569,11 +604,11 @@ private final class Staff {
     void akillRead(bool filtered) {
         const filter = filtered ? serviceParam(txn, "entry") : "";
         if (filtered && !akillSelectorValid(filter)) return finish(ServiceStatus.rejected, "invalid_entry");
-        help("AKILL", (HelpEvidence h) {
+        akillHelp((AkillHelp h) {
             read([filter.length ? "AKILL VIEW " ~ filter : "AKILL VIEW"], (ServiceFrame f) {
                 AkillEntry[] entries;
                 const r = parseAkillView(f, filtered, entries);
-                foreach (a; AKILL_ACTIONS) cap(a, combine(h, r), capReason(h, r));
+                akillCapabilities(h, r);
                 if (r.kind != ReadKind.ok) return finishRead(r, f);
                 finish(ServiceStatus.confirmed, "", akillData(entries, filter),
                     servicesRevision(txn, akillRevisionView(entries, filter)));
@@ -598,12 +633,12 @@ private final class Staff {
         const body_ = "AKILL ADD +" ~ expiry.to!string ~ "s " ~ mask ~ " " ~ reason;
         if (!txn.fits(body_)) return finish(ServiceStatus.rejected, "too_long");
 
-        help("AKILL", (HelpEvidence h) {
-            if (!requireUsable(h, AKILL_ACTIONS)) return;
+        akillHelp((AkillHelp h) {
+            if (!requireUsable(h.add, ServiceAction.akillAdd)) return;
             read(["AKILL VIEW"], (ServiceFrame pre) {
                 AkillEntry[] before;
                 const r = parseAkillView(pre, false, before);
-                foreach (a; AKILL_ACTIONS) cap(a, combine(h, r), capReason(h, r));
+                akillCapabilities(h, r);
                 if (r.kind != ReadKind.ok) return finishRead(r, pre);
                 if (!requireRevision(akillRevisionView(before, ""), akillData(before, ""))) return;
                 // Adding an existing mask would update its reason/expiry
@@ -629,12 +664,12 @@ private final class Staff {
     void akillRemove() {
         const entry = serviceParam(txn, "entry");
         if (!akillSelectorValid(entry)) return finish(ServiceStatus.rejected, "invalid_entry");
-        help("AKILL", (HelpEvidence h) {
-            if (!requireUsable(h, AKILL_ACTIONS)) return;
+        akillHelp((AkillHelp h) {
+            if (!requireUsable(h.remove, ServiceAction.akillRemove)) return;
             read(["AKILL VIEW"], (ServiceFrame pre) {
                 AkillEntry[] before;
                 const r = parseAkillView(pre, false, before);
-                foreach (a; AKILL_ACTIONS) cap(a, combine(h, r), capReason(h, r));
+                akillCapabilities(h, r);
                 if (r.kind != ReadKind.ok) return finishRead(r, pre);
                 if (!requireRevision(akillRevisionView(before, ""), akillData(before, ""))) return;
                 AkillEntry target;
@@ -888,9 +923,9 @@ private final class Staff {
     // ── HostServ request queue ────────────────────────────────────────
 
     void hostWaiting() {
-        help("WAITING", (HelpEvidence hw) {
-            help("ACTIVATE", (HelpEvidence ha) {
-                help("REJECT", (HelpEvidence hr) {
+        help(ServiceAction.hostWaiting, (HelpEvidence hw) {
+            help(ServiceAction.hostActivate, (HelpEvidence ha) {
+                help(ServiceAction.hostReject, (HelpEvidence hr) {
                     read(["WAITING"], (ServiceFrame f) {
                         HostRequest[] entries;
                         uint total;
@@ -916,14 +951,14 @@ private final class Staff {
         const command = activate ? "ACTIVATE" : "REJECT";
         const body_ = command ~ " " ~ nick ~ (why.length ? " " ~ why : "");
         if (!txn.fits(body_)) return finish(ServiceStatus.rejected, "too_long");
-        const related = activate ? [ServiceAction.hostActivate] : [ServiceAction.hostReject];
-        help(command, (HelpEvidence h) {
-            if (!requireUsable(h, related)) return;
+        const decisionAction = activate ? ServiceAction.hostActivate : ServiceAction.hostReject;
+        help(decisionAction, (HelpEvidence h) {
+            if (!requireUsable(h, decisionAction)) return;
             read(["WAITING"], (ServiceFrame pre) {
                 HostRequest[] before;
                 uint total;
                 const r = parseWaiting(pre, before, total);
-                cap(related[0], combine(h, r), capReason(h, r));
+                cap(decisionAction, combine(h, r), capReason(h, r));
                 if (r.kind != ReadKind.ok) return finishRead(r, pre);
                 if (!requireRevision(waitingData(before, total), waitingData(before, total))) return;
                 if (!before.any!(e => txn.sameNick(e.nick, nick)))
@@ -1028,7 +1063,7 @@ private final class Staff {
     // ── Global ────────────────────────────────────────────────────────
 
     void globalQueue() {
-        help("GLOBAL", (HelpEvidence hg) {
+        help(ServiceAction.globalSend, (HelpEvidence hg) {
             if (!v21) {
                 // 2.0.20 gl_global sends immediately; there is no queue.
                 cap(ServiceAction.globalQueue, "unsupported", "no_queue_in_version");
@@ -1036,12 +1071,12 @@ private final class Staff {
                 auto view = queueData(null, true, false);
                 return finish(ServiceStatus.confirmed, "", view, servicesRevision(txn, view));
             }
-            help("QUEUE", (HelpEvidence hq) {
+            help(ServiceAction.globalQueue, (HelpEvidence hq) {
                 read(["QUEUE LIST"], (ServiceFrame f) {
                     string[] messages;
                     const r = parseQueue(f, messages);
                     cap(ServiceAction.globalQueue, combine(hq, r), capReason(hq, r));
-                    putSendCapability(hg, r, messages);
+                    putSendCapability(hg, r, messages, hq);
                     // Queue text is private: never echoed into details.
                     if (r.kind != ReadKind.ok) return finishRead(r, f, false);
                     auto view = queueData(messages, !messages.length, true);
@@ -1051,8 +1086,10 @@ private final class Staff {
         });
     }
 
-    private void putSendCapability(HelpEvidence hg, ReadResult queue, const string[] messages) {
+    private void putSendCapability(HelpEvidence hg, ReadResult queue, const string[] messages,
+            HelpEvidence hq = HelpEvidence.init) {
         if (hg.state != "allowed") cap(ServiceAction.globalSend, hg.state, hg.reasonCode);
+        else if (candidate && hq.state != "allowed") cap(ServiceAction.globalSend, hq.state, hq.reasonCode);
         else if (queue.kind != ReadKind.ok) cap(ServiceAction.globalSend, "unknown", "queue_unverified");
         else if (messages.length) cap(ServiceAction.globalSend, "denied", "global_queue_nonempty");
         else cap(ServiceAction.globalSend, "allowed");
@@ -1075,29 +1112,39 @@ private final class Staff {
         if (!txn.fits(body_) || broadcastBytes > BROADCAST_LINE_LIMIT)
             return finish(ServiceStatus.rejected, "message_too_long");
 
-        help("GLOBAL", (HelpEvidence hg) {
-            if (!requireUsable(hg, [ServiceAction.globalSend])) return;
+        help(ServiceAction.globalSend, (HelpEvidence hg) {
+            if (!requireUsable(hg, ServiceAction.globalSend)) return;
             if (!v21) {
                 auto view = queueData(null, true, false);
                 if (!requireRevision(view, view)) return;
                 return sendGlobal(text);
             }
-            read(["QUEUE LIST"], (ServiceFrame f) {
-                string[] messages;
-                const r = parseQueue(f, messages);
-                cap(ServiceAction.globalQueue, r.kind == ReadKind.ok ? "allowed"
-                    : r.kind == ReadKind.refused ? refusalState(r.reason) : "unknown", r.reason);
-                putSendCapability(hg, r, messages);
-                if (r.kind != ReadKind.ok)
-                    return finish(ServiceStatus.stale, "queue_unverified");
-                auto view = queueData(messages, !messages.length, true);
-                if (!requireRevision(view, view)) return;
-                // Never clear or send another queue; a single message is
-                // only sent over a queue we just saw empty.
-                if (messages.length)
-                    return finish(ServiceStatus.rejected, "queue_conflict", view, servicesRevision(txn, view));
-                sendGlobal(text);
-            });
+            if (candidate) {
+                help(ServiceAction.globalQueue, (HelpEvidence hq) {
+                    readQueueForSend(text, hg, hq);
+                });
+            } else readQueueForSend(text, hg, HelpEvidence.init);
+        });
+    }
+
+    private void readQueueForSend(string text, HelpEvidence hg, HelpEvidence hq) {
+        read(["QUEUE LIST"], (ServiceFrame f) {
+            string[] messages;
+            const r = parseQueue(f, messages);
+            if (candidate) cap(ServiceAction.globalQueue, combine(hq, r), capReason(hq, r));
+            else cap(ServiceAction.globalQueue, r.kind == ReadKind.ok ? "allowed"
+                : r.kind == ReadKind.refused ? refusalState(r.reason) : "unknown", r.reason);
+            putSendCapability(hg, r, messages, hq);
+            if (r.kind != ReadKind.ok)
+                return finish(ServiceStatus.stale, "queue_unverified");
+            if (candidate && !requireUsable(hq, ServiceAction.globalSend)) return;
+            auto view = queueData(messages, !messages.length, true);
+            if (!requireRevision(view, view)) return;
+            // Never clear or send another queue; a single message is
+            // only sent over a queue we just saw empty.
+            if (messages.length)
+                return finish(ServiceStatus.rejected, "queue_conflict", view, servicesRevision(txn, view));
+            sendGlobal(text);
         });
     }
 
@@ -1940,6 +1987,93 @@ version (ServicesWireHarness) {
         ok("staff: 2.1 LineWrapper continuation is recognised only where the wrapper could split",
             wrapContinues("a".replicateStr(95), "bcdef rest") && !wrapContinues("a".replicateStr(95), "bc def")
             && !wrapContinues("short line", "next line"));
+
+        // Candidate compatibility is intersected per command, never per
+        // shared permission or HELP query. These exercise real adapters.
+        enum candidate21 = "Anope-2.1.27-git (1947276) build #1, compiled Mon Sep 28 2026 08:19:33 UTC, flags DG -- InspIRCd 4+ -- enc_sha2";
+        {
+            auto r = StaffRig.make(candidate21);
+            r.anope.reply("HELP AKILL",
+                helpOk("AKILL ADD [+expiry] mask reason", "operserv/akill")
+                    ~ ["Syntax: AKILL VIEW [mask | list | id]"]);
+            r.anope.reply("AKILL VIEW", ["AKILL list is empty."]);
+            auto list = r.run(ServiceAction.akillList, `{}`);
+            ok("staff: candidate AKILL ADD and VIEW do not prove DEL from the same HELP frame",
+                answered(list, ServiceStatus.confirmed) && list.data["entries"].length == 0
+                && capState(list, "akillList") == "allowed" && capState(list, "akillView") == "allowed"
+                && capState(list, "akillAdd") == "allowed" && capState(list, "akillRemove") == "unsupported"
+                && r.anope.bodies.count!(b => b == "HELP AKILL") == 1);
+            auto del = r.run(ServiceAction.akillRemove, `{"entry":"AB12CD34EF"}`, list.revision);
+            ok("staff: a candidate direct DEL cannot borrow compatible ADD permission or syntax",
+                answered(del, ServiceStatus.stale, "capabilities_changed")
+                && !r.anope.bodies.any!(b => b.startsWith("AKILL DEL")));
+            auto added = akillView21([["1", "*@198.51.100.9", "me", "Thu Nov  6 16:00:00 2026",
+                "expires in 59 minutes", "QW12ER34TY", "[me] drone"]]);
+            r.anope.reply("AKILL VIEW", ["AKILL list is empty."], added);
+            r.anope.reply("AKILL ADD +3600s *@198.51.100.9 drone", ["\x02*@198.51.100.9\x02 added to the AKILL list."]);
+            auto add = r.run(ServiceAction.akillAdd,
+                `{"mask":"*@198.51.100.9","expirySeconds":3600,"reason":"drone","broadMaskConfirmed":false}`,
+                list.revision);
+            ok("staff: candidate exact ADD syntax permits one reviewed write with acknowledgement and read-back",
+                answered(add, ServiceStatus.confirmed) && add.data["entries"].length == 1
+                && r.anope.bodies.count!(b => b == "AKILL ADD +3600s *@198.51.100.9 drone") == 1
+                && capState(add, "akillRemove") == "unsupported"
+                && r.anope.bodies.count!(b => b == "HELP AKILL") == 3);
+        }
+        {
+            auto r = StaffRig.make(candidate21);
+            r.anope.reply("HELP WAITING", helpOk("WAITING", "hostserv/set"));
+            r.anope.reply("HELP ACTIVATE", helpOk("ACTIVATE [nick]", "hostserv/set"));
+            r.anope.reply("HELP REJECT", helpOk("REJECT nick [reason]", "hostserv/set"));
+            r.anope.reply("WAITING", ["Displayed \x020\x02 records (\x020\x02 total)."]);
+            auto w = r.run(ServiceAction.hostWaiting, `{}`);
+            ok("staff: candidate WAITING and REJECT syntax do not prove incompatible ACTIVATE arguments",
+                answered(w, ServiceStatus.confirmed) && capState(w, "hostWaiting") == "allowed"
+                && capState(w, "hostReject") == "allowed" && capState(w, "hostActivate") == "unsupported");
+            auto a = r.run(ServiceAction.hostActivate, `{"nick":"alice"}`, w.revision);
+            ok("staff: a candidate direct ACTIVATE needs its exact nick syntax before any write",
+                answered(a, ServiceStatus.stale, "capabilities_changed")
+                && !r.anope.bodies.canFind("ACTIVATE alice"));
+        }
+        {
+            auto r = StaffRig.make(candidate21);
+            r.anope.reply("HELP GLOBAL", helpOk("GLOBAL [message]", "global/global"));
+            r.anope.reply("HELP QUEUE", helpOk("QUEUE LIST [message]", "global/queue"));
+            r.anope.reply("QUEUE LIST", ["You have no messages queued."]);
+            auto q = r.run(ServiceAction.globalQueue, `{}`);
+            ok("staff: candidate GLOBAL syntax alone cannot authorize sending over an incompatible QUEUE",
+                answered(q, ServiceStatus.confirmed) && q.data["empty"].get!bool
+                && capState(q, "globalQueue") == "unsupported" && capState(q, "globalSend") == "unsupported");
+            auto blocked = r.run(ServiceAction.globalSend, `{"text":"Never broadcast this"}`, q.revision);
+            ok("staff: a candidate direct GLOBAL with incompatible QUEUE HELP never broadcasts or changes the queue",
+                answered(blocked, ServiceStatus.stale, "capabilities_changed")
+                && !r.anope.bodies.any!(b => b.startsWith("GLOBAL ") || b == "GLOBAL"
+                    || b.startsWith("QUEUE ADD") || b.startsWith("QUEUE DEL") || b.startsWith("QUEUE CLEAR")));
+            r.anope.reply("HELP QUEUE", helpOk("QUEUE LIST", "global/queue"));
+            auto compatible = r.run(ServiceAction.globalQueue, `{}`);
+            ok("staff: candidate separate compatible GLOBAL and QUEUE syntax plus empty state enables sending",
+                answered(compatible, ServiceStatus.confirmed)
+                && capState(compatible, "globalQueue") == "allowed" && capState(compatible, "globalSend") == "allowed");
+            r.anope.reply("HELP GLOBAL", helpOk("GLOBAL message", "global/global"));
+            auto wrongGlobal = r.run(ServiceAction.globalQueue, `{}`);
+            ok("staff: candidate compatible QUEUE does not prove the wrong GLOBAL argument form",
+                answered(wrongGlobal, ServiceStatus.confirmed)
+                && capState(wrongGlobal, "globalQueue") == "allowed" && capState(wrongGlobal, "globalSend") == "unsupported");
+        }
+        {
+            auto r = StaffRig.make("Anope-2.0.21 services.test :inspircd3 - (enc_bcrypt) -- build #2");
+            r.anope.reply("HELP GLOBAL", helpOk("GLOBAL message", "global/global"));
+            auto q = r.run(ServiceAction.globalQueue, `{}`);
+            ok("staff: candidate 2.0 keeps the immediate-send model without any QUEUE probe",
+                answered(q, ServiceStatus.confirmed) && !q.data["queueSupported"].get!bool
+                && capState(q, "globalSend") == "allowed" && capState(q, "globalQueue") == "unsupported"
+                && !r.anope.bodies.any!(b => b.startsWith("HELP QUEUE") || b.startsWith("QUEUE")));
+            r.anope.reply("GLOBAL Hello all", [":Global!services@services.test PRIVMSG $*.test :[me] Hello all"]);
+            auto sent = r.run(ServiceAction.globalSend, `{"text":"Hello all"}`, q.revision);
+            ok("staff: compatible candidate 2.0 sends exactly the reviewed announcement once",
+                answered(sent, ServiceStatus.confirmed)
+                && r.anope.bodies.count!(b => b == "GLOBAL Hello all") == 1);
+        }
 
         // ── OperServ STATS, require_oper staff with +o (2.1) ──────────
         {
