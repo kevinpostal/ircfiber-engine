@@ -98,13 +98,14 @@ COPY engine/catalogs/ ./engine/catalogs/
 # Invalidate only workspace-package artifacts on an uncached compile layer.
 # The irc-fiber cache also contains its holder subpackage and migrate configs.
 # Keep all downloaded packages and compiled third-party dependencies cached.
+# Use DUB's serial compiler scheduling to bound peak memory on the shared build host.
 RUN --mount=type=cache,target=/build/.dub,sharing=locked \
     --mount=type=cache,target=/root/.dub,sharing=locked \
     rm -rf /root/.dub/cache/irc-fiber-common /root/.dub/cache/irc-fiber && \
-    dub build --root=engine --compiler=ldc2 --build=release --parallel && \
-    dub build --root=engine :holder --compiler=ldc2 --build=release --parallel && \
-    dub build --root=engine --config=janitor-migrate --compiler=ldc2 --build=release --parallel && \
-    dub build --root=engine --config=ircfiber-default-migrate --compiler=ldc2 --build=release --parallel && \
+    dub build --root=engine --compiler=ldc2 --build=release && \
+    dub build --root=engine :holder --compiler=ldc2 --build=release && \
+    dub build --root=engine --config=janitor-migrate --compiler=ldc2 --build=release && \
+    dub build --root=engine --config=ircfiber-default-migrate --compiler=ldc2 --build=release && \
     cp engine/irc-fiber-engine ./irc-fiber-engine && \
     cp engine/irc-fiber-holder ./irc-fiber-holder && \
     cp engine/janitor-migrate ./janitor-migrate && \

@@ -95,6 +95,8 @@ make -C .. ship-engine        # from ircfiber-infra: build on the prod host, dep
 # hot-swaps the engine container only (IRC sockets held by the holder; gateway untouched)
 ```
 
+Release container builds schedule compiler instances serially to bound peak memory on the shared production build host. The BuildKit memory cap stays enabled; engine, holder and migration binaries are still built with the release configuration.
+
 ## Testing
 
 ```bash
