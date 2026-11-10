@@ -419,11 +419,10 @@ def completed(network, ident, cutoff, buffer="#proof"):
     evidence = {}
     for server in ENGINES:
         found = operation(server, ident)
-        if not found:
-            return None
+        assert found, ("HTTP reported completed but the journal operation is missing", server, ident)
         snap, retained = found
-        if retained["state"] != 2:
-            return None
+        assert retained["state"] == 2, ("HTTP reported completed before the journal operation completed",
+                                         server, retained)
         assert retained["cutoffEid"] == cutoff and retained["redisApplied"], retained
         assert retained["sequence"] > 0 and snap["state"]["checkpoint"] >= retained["sequence"], retained
         frozen = group(ident)
@@ -453,6 +452,16 @@ def admitted_everywhere(ident):
         assert lookup["lookupToken"] == group(ident)["lookupToken"], "admission used stale historical lookup"
         assert lookup["serverId"] == server and lookup["operationId"] == ident, lookup
         evidence[server] = retained["sequence"]
+    return evidence
+
+
+def redis_applied_everywhere(ident):
+    evidence = admitted_everywhere(ident)
+    if not evidence:
+        return None
+    for server in ENGINES:
+        found = operation(server, ident)
+        assert found and found[1]["redisApplied"], (server, "Redis purge not durably applied", found)
     return evidence
 
 
@@ -674,6 +683,86 @@ def run():
     assert group(operation_id).get("cutoffEid", 0) in (0, cutoff), "new cutoff after lost coordination"
     assert len(marker_rows(network, "post-cutoff-reused-name")) == 1
     assert socket_identity(network, nick) == archive_socket, "coordination loss changed physical socket"
+    case("status-GET-cannot-admit-requested-clear")
+    status_id = str(uuid.uuid4())
+    with pause("native-engine"), pause("old-engine"):
+        code, requested = clear(network, status_id)
+        not_cleared((code, requested))
+        initial_group = group(status_id)
+        assert initial_group.get("state") == "requested" and initial_group.get("cutoffEid", 0) == 0, initial_group
+    marker = "status-get-must-preserve-new-message"
+    queued = message(network, nick, marker)
+    before_backends = backend_snapshot(network)
+    before_journals = {server: journal(server) for server in ENGINES}
+    code, response = status(network, status_id)
+    not_cleared((code, response), status_query=True)
+    after_group = group(status_id)
+    assert after_group.get("state") == "requested" and after_group.get("cutoffEid", 0) == 0, after_group
+    assert backend_snapshot(network) == before_backends, "status GET admitted and applied a purge"
+    for server in ENGINES:
+        after = journal(server)
+        before = before_journals[server]
+        assert not operation(server, status_id), "status GET admitted a purge journal operation"
+        assert after["state"]["checkpoint"] == before["state"]["checkpoint"]
+        assert after["state"]["operations"] == before["state"]["operations"] and after["frames"] == before["frames"]
+    code, accepted = clear(network, status_id)
+    assert code in (200, 503), (code, accepted)
+    if code == 200:
+        assert accepted.get("status") == "cleared" and accepted.get("state") == "completed", accepted
+    else:
+        not_cleared((code, accepted))
+    frozen = wait("explicit POST freezes status-polled operation", lambda:
+                  group(status_id) if group(status_id).get("cutoffEid", 0) > 0 else None)
+    assert queued["eid"] < frozen["cutoffEid"], (queued, frozen)
+    proof = wait("explicit POST completes both status-polled journals",
+                 lambda: completed(network, status_id, frozen["cutoffEid"]), 120)
+    assert not marker_rows(network, marker) and not live_rows(network, marker), "explicit POST did not clear the queued message"
+    case("status-GET-lookup-only-evidence", operationId=status_id, messageEid=queued["eid"],
+         cutoffEid=frozen["cutoffEid"], journals=proof, postOnlyInitiatedClear=True)
+    case("purge-replay-after-engine-SIGKILL-before-Mongo-ack")
+    crash_id = str(uuid.uuid4())
+    crash_marker = "purge-replay-after-engine-crash"
+    crash_message = message(network, nick, crash_marker, "#proof")
+    mongo_fault("delete", True)
+    not_cleared(clear(network, crash_id))
+    crash_group = wait("crash-test cutoff frozen", lambda:
+                       group(crash_id) if group(crash_id).get("cutoffEid", 0) > 0 else None)
+    assert crash_message["eid"] < crash_group["cutoffEid"], (crash_message, crash_group)
+    crash_admission = wait("purge Redis-applied on both durable journals",
+                           lambda: redis_applied_everywhere(crash_id), 90)
+    crash_socket = socket_identity(network, nick)
+    old_row = next(row for row in containers()
+                   if row["Config"]["Labels"]["com.docker.compose.service"] == "old-engine")
+    old_generation = (old_row["Id"], old_row["State"]["StartedAt"])
+    STARTED.pop("old-engine")
+    dc("kill", "old-engine")
+    wait("old engine process exited for SIGKILL recovery",
+         lambda: next(row for row in containers()
+                      if row["Config"]["Labels"]["com.docker.compose.service"] == "old-engine")["State"]["Status"]
+         == "exited", 30)
+    dc("start", "old-engine")
+    wait("restarted old engine archive capability",
+         lambda: json.loads(routed.redis("hget", "irc:server:fixture-old", "data")).get("archiveVersion") == 1,
+         90)
+    restarted = next(row for row in containers()
+                     if row["Config"]["Labels"]["com.docker.compose.service"] == "old-engine")
+    assert restarted["Id"] == old_generation[0] and restarted["State"]["StartedAt"] != old_generation[1], restarted
+    STARTED["old-engine"] = (restarted["Id"], restarted["State"]["StartedAt"])
+    wait("holder-owned physical socket survived engine SIGKILL", lambda: socket_identity(network, nick) == crash_socket, 60)
+    assert routed.owner(network) == "fixture-old", "engine SIGKILL changed archive producer ownership"
+    routed.command_ping(network, nick)
+    assert operation("fixture-old", crash_id)[1]["state"] == 1
+    assert operation("fixture-old", crash_id)[1]["redisApplied"]
+    mongo_fault("delete", False)
+    crash_proof = wait("recovered purge reaches strict Mongo/checkpoint completion",
+                       lambda: completed(network, crash_id, crash_group["cutoffEid"]), 120)
+    assert not marker_rows(network, crash_marker) and not live_rows(network, crash_marker)
+    assert socket_identity(network, nick) == crash_socket
+    routed.command_ping(network, nick)
+    baseline()
+    case("purge-recovery-evidence", operationId=crash_id, cutoffEid=crash_group["cutoffEid"],
+         admittedSequences=crash_admission, journals=crash_proof, mongoRowsRemoved=True,
+         holderSocketPreserved=True)
     case("offline-unreachable-and-uncatalogued-legacy-Mongo-discovery")
     routed.api("POST", f"/api/networks/{network}/disconnect", {})
     wait("explicit offline network has no upstream", lambda: not routed.held(network) and not routed.physical_registered(nick))
