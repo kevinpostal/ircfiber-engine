@@ -103,15 +103,16 @@ T runNetworkWrite(T)(RedisStorage redis, scope T delegate(ref NetworkWriter) bod
 /// Reuse an already connected database without allocating another connection.
 T runNetworkWrite(T)(RedisDatabase db, scope T delegate(ref NetworkWriter) body) {
     auto writer = NetworkWriter(db);
+    // A domain/read failure is not an in-flight mutation. Only tracked,
+    // unacknowledged effects retain evidence, including on exceptional exits.
+    scope (exit) writer.confirmed = writer.unconfirmed == 0;
     version (RoutingPolicyTest) {
         if (networkMutationAdmittedForTest !is null) networkMutationAdmittedForTest(writer.token);
     }
     static if (is(T == void)) {
         body(writer);
-        writer.confirmed = writer.unconfirmed == 0;
     } else {
         auto result = body(writer);
-        writer.confirmed = writer.unconfirmed == 0;
         return result;
     }
 }

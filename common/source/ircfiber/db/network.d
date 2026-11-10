@@ -100,6 +100,25 @@ version (RoutingPolicyTest) {
         enforce(db.scard(NETWORK_WRITERS_KEY) == 0 && collect() == 1,
             "Confirmed outer operation did not release its sole writer");
         unlock();
+        bool refusedBeforeEffect;
+        try runNetworkWrite!void(redis, (ref NetworkWriter writer) {
+            throw new Exception("Known domain refusal before dispatch");
+        });
+        catch (Exception) { refusedBeforeEffect = true; }
+        enforce(refusedBeforeEffect && db.scard(NETWORK_WRITERS_KEY) == 0 && collect() == 1,
+            "A domain refusal without dispatched work must release its admitted scope");
+        unlock();
+        bool refusedAfterAcknowledgement;
+        try runNetworkWrite!void(redis, (ref NetworkWriter writer) {
+            repository.setDisabled(id, false, writer);
+            throw new Exception("Known domain refusal after acknowledged mutation");
+        });
+        catch (Exception) { refusedAfterAcknowledgement = true; }
+        enforce(refusedAfterAcknowledgement
+                && !collection.findOne(["id": id.toString()])["disabled"].get!bool
+                && db.scard(NETWORK_WRITERS_KEY) == 0 && collect() == 1,
+            "A later domain refusal cannot make a confirmed mutation appear in flight");
+        unlock();
         // Constructor swallows migration failures for compatibility, but it
         // cannot clear a real Mongo command's lost completion acknowledgement.
         networkMutationRepliedForTest = { throw new Exception("Lost migration acknowledgement"); };
@@ -155,18 +174,17 @@ final class NetworkRepository {
         void delegate(UUID, string) beforeIpv6IidWriteForTest;
     }
 
-    /// Global Redis instance, set at boot from app.d / bootstrap.d.
-    __gshared RedisStorage g_redis;
+    /// Default for this thread only: Redis sockets belong to its event loop.
+    private static RedisStorage defaultRedis;
 
-    /// Initializes the global Redis reference for cache operations.
-    /// Must be called once at boot after Redis is connected.
+    /// Initializes the current thread's fallback after its Redis is connected.
     static void initRedis(RedisStorage redis) {
-        g_redis = redis;
+        defaultRedis = redis;
     }
 
-    /// Creates a repository with the caller's cache connection, or the boot default.
+    /// Creates a repository with the caller's connection, or this thread's default.
     this(RedisStorage cacheRedis = null) {
-        cache = cacheRedis is null ? g_redis : cacheRedis;
+        cache = cacheRedis is null ? defaultRedis : cacheRedis;
         collection = AppMongoConnection.getDb()["networks"];
         // Boot migration stays best-effort, but refusal never dispatches DDL
         // or a document mutation.

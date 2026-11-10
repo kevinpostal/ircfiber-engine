@@ -835,7 +835,11 @@ LUA";
     private enum LEASE_SCRIPT = q"LUA
 if redis.call('HGET', KEYS[1], ARGV[1]) ~= ARGV[2] then return '0' end
 if redis.call('GET', KEYS[2]) == ARGV[2] then
-  redis.call('EXPIRE', KEYS[2], ARGV[3])
+  if redis.call('EXISTS', 'irc:holder:maintenance:write-exclusion') ~= 0 then
+    redis.call('PERSIST', KEYS[2])
+  else
+    redis.call('EXPIRE', KEYS[2], ARGV[3])
+  end
   return '1'
 end
 if ARGV[4] == 'check' then return 'changed' end
