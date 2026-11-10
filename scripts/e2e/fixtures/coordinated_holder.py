@@ -24,7 +24,8 @@ from holder_engine_qualification import EngineQualification, require, wait, numb
 OLD = 'sha256:8e7447fa51f9b2fa88fb4b88de8687af6483d8e078c147181469125bc0d82f09'
 OLD_ENGINE = 'sha256:f9a5a59d2ba3ae99c002a1a6666007ecbe5bd36e032f8277622de7fbdbb06c89'
 SERVICES = ('redis', 'mongo', 'ircfiber-gateway', 'ircfiber-holder', 'mock-irc', 'egress-a', 'egress-b', 'ircfiber-engine', 'ircfiber-sysagent')
-TOOLS = ('ircfiber-holder-maintenance.py', 'ircfiber-holder-coordinated.py', 'legacy-holder-barrier.py')
+TOOLS = ('ircfiber-holder-maintenance.py', 'ircfiber-holder-coordinated.py',
+         'legacy-holder-barrier.py', 'ircfiber-coordination-domain.py')
 
 
 class CoordinatedQualification(EngineQualification):
@@ -113,11 +114,13 @@ class CoordinatedQualification(EngineQualification):
             target.write_bytes(path.read_bytes())
             target.chmod(0o600)
         qualification = json.loads(Path(os.environ['COORDINATED_QUALIFICATION_FILE']).read_text())
-        require(qualification.get('qualified') is True and qualification.get('mode') == 'coordinated' and
+        require(qualification.get('qualified') is False and qualification.get('checks') == [] and
+                qualification.get('purpose') == 'isolatedqualification' and
+                qualification.get('mode') == 'coordinated' and
                 qualification.get('imageId') == self.new_holder and qualification.get('sourceImageId') == OLD and
                 qualification.get('engineImageId') == self.new_engine and
                 qualification.get('oldEngineImageId') == os.environ['ROUTING_REGRESSION_ENGINE_IMAGE'],
-                'actual completed review/test/build qualification for these exact images required')
+                'actual image-bound build/source/consumer scratch receipt required; no claimed physical checks')
         bindings = qualification.get('writerArtifactBindings')
         require(isinstance(bindings, dict) and bindings, 'truthful image-keyed writer receipts required')
         require(bindings.get(self.new_engine, {}).get('roles') == ['engine'] and
@@ -126,8 +129,12 @@ class CoordinatedQualification(EngineQualification):
         receipts = Path(os.environ['COORDINATED_RECEIPT_DIR'])
         retained = self.root_base / 'receipts'
         retained.mkdir(mode=0o700)
+        artifacts = qualification.get('artifactBindings')
+        require(isinstance(artifacts, dict) and self.new_holder in artifacts and
+                all(artifacts.get(image) == binding for image, binding in bindings.items()),
+                'actual holder and writer artifact evidence required')
         digests = {qualification.get('evidenceSha256')}
-        for binding in bindings.values():
+        for binding in artifacts.values():
             digests.update(binding.get(key) for key in
                            ('buildManifestSha256', 'sourceReviewSha256', 'behavioralEvidenceSha256'))
         lifecycle = json.loads(Path(os.environ['COORDINATED_LIFECYCLE_FILE']).read_text())
@@ -148,7 +155,7 @@ class CoordinatedQualification(EngineQualification):
             short = {'ircfiber-holder': 'holder', 'ircfiber-engine': 'engine', 'ircfiber-gateway': 'gateway',
                      'ircfiber-sysagent': 'sysagent'}.get(service, service)
             info = self.owned(service)
-            entries[short] = dict(id=info['Id'], name=info['Name'].lstrip('/'))
+            entries[short] = dict(id=info['Id'], name=info['Name'].lstrip('/'), image=info['Image'])
         source_revision = os.environ['COORDINATED_SOURCE_REVISION']
         require(source_revision == '7fef6294312dd4495ac2413710baf8f57bac214f',
                 'retained archival old-engine source reconstruction required; no clean historical-checkout claim')
@@ -156,6 +163,10 @@ class CoordinatedQualification(EngineQualification):
                         sourceImageId=OLD, candidateImageId=self.new_holder, engineImageId=self.new_engine,
                         oldEngineImageId=os.environ['ROUTING_REGRESSION_ENGINE_IMAGE'], sourceRevision=source_revision,
                         toolHashes=hashes, containers=entries, qualification=qualification,
+                        bootstrapQualification=True, dockerId=daemon['ID'],
+                        volumes=self.command('volume', 'ls', '--quiet').split(),
+                        networks=self.command('network', 'ls', '--quiet', '--no-trunc',
+                            '--filter', 'label=com.docker.compose.project=' + self.project).split(),
                         writerArtifactBindings=bindings, startedAt=self.started_at,
                         fixtureRootSha256=hashlib.sha256(self.root_script.read_bytes()).hexdigest(),
                         retainedOldEngineBinarySha256='44bd1b4b292e12a8c9ff63e127a9ecc64f59734f754836ff67f2b0f642c41861',
@@ -164,6 +175,7 @@ class CoordinatedQualification(EngineQualification):
         (self.root_base / 'run.json').chmod(0o600)
         self.save('run-manifest.json', manifest)
         self.root('verify', 'host')
+        self.save('domain-native.json', self.root('domain', 'physical', timeout=300))
         wait(lambda: self.rpc('status')['subscribed'], 'real IRC event subscriber')
         user = 'coordinated' + secrets.token_hex(6)
         credentials = dict(username=user, password=secrets.token_urlsafe(24), email=user + '@fixture.invalid')
@@ -239,8 +251,16 @@ class CoordinatedQualification(EngineQualification):
         for case in ('writer-inflight', 'route-drain', 'missing-meta', 'stale-meta', 'owner-meta'):
             self.root('fault', case)
             process, operation, paths = self.invoke(case)
-            code, _, _ = self.finish(process, case)
-            require(code != 0, 'invalid/missing fresh evidence was accepted')
+            code, _, error = self.finish(process, case)
+            reasons = {
+                'writer-inflight': b'continuous control exclusion unavailable or a writer is in flight',
+                'route-drain': b'current exit admission blocks frozen route',
+                'missing-meta': b'missing/nonregistered/owner-mismatched legacy META',
+                'stale-meta': b'stale or wrong-generation legacy META',
+                'owner-meta': b'missing/nonregistered/owner-mismatched legacy META',
+            }
+            require(code != 0 and reasons[case] in error,
+                    'invalid fresh evidence did not reach its intended refusal: ' + error.decode(errors='replace')[:2000])
             # No permanent fence and no engine/holder lifecycle action.
             state = (Path(paths['root']) / 'fence.json').exists()
             require(not state and self.identity(self.owned('ircfiber-engine')) == before and

@@ -1,10 +1,13 @@
 # Disposable native-Linux fixture. No privileged collector container exists.
 services:
   ircfiber-gateway:
+    environment:
+      IRCFIBER_REDIS_URL: redis://coordinated-redis:6379/0
     labels:
       com.ircfiber.component: gateway
   ircfiber-engine:
     environment:
+      IRCFIBER_REDIS_URL: redis://coordinated-redis:6379/0
       IRCFIBER_MULLVAD_POOL: socks5://dynamic@192.0.2.30:1081
       IRCFIBER_EGRESS_CONTROL_DIR: /egress
     volumes:
@@ -34,6 +37,11 @@ services:
   mock-irc:
     # No second IPC producer: bounded LIST/STATUS uses the host-root child.
     volumes: !override [fixture-certs:/fixture-certs]
+  redis:
+    networks:
+      fixture:
+        ipv4_address: 192.0.2.2
+        aliases: [coordinated-redis]
 volumes:
   egress-control:
     labels:

@@ -184,12 +184,12 @@ private Bson runAdmittedNetworkMutation(ref NetworkWriter writer, Bson command, 
     // A typed duplicate-key rejection is authoritative command completion:
     // no operation remains in flight. Preserve the allocator's retry protocol.
     if (kind == MutationKind.reserve && cleanErrors
-            && numeric(reply["ok"]) && reply["ok"].get!double == 0
-            && numeric(reply["code"]) && reply["code"].get!double == 11000) {
+            && numeric(reply["ok"]) && reply["ok"].to!double == 0
+            && numeric(reply["code"]) && reply["code"].to!double == 11000) {
         --writer.unconfirmed;
         return reply;
     }
-    if (!cleanErrors || !numeric(reply["ok"]) || reply["ok"].get!double != 1.0)
+    if (!cleanErrors || !numeric(reply["ok"]) || reply["ok"].to!double != 1.0)
         throw new NetworkMutationException("Network mutation did not receive a confirmed Mongo acknowledgement", reply);
     if ((kind == MutationKind.update && (!nonnegativeCount(reply["n"]) || !nonnegativeCount(reply["nModified"])))
             || (kind == MutationKind.delete_ && !nonnegativeCount(reply["n"]))

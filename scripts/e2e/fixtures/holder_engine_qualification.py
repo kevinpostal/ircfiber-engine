@@ -8,9 +8,11 @@ unavailable evidence is an exception, never an implicit passing default.
 """
 import asyncio
 from collections import Counter
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import socket
 import ssl
@@ -882,12 +884,45 @@ class EngineQualification(Qualification):
         endpoint = context["Endpoints"]["docker"]["Host"]
         require(endpoint.startswith("unix:///"), "fixture helper requires local Unix Docker context")
         aliases = {"holder": "ircfiber-holder", "engine": "ircfiber-engine", "gateway": "ircfiber-gateway",
-                   "redis": "redis", "mock-irc": "mock-irc", "egress-a": "egress-a", "egress-b": "egress-b"}
+                   "redis": "redis", "mongo": "mongo", "mock-irc": "mock-irc",
+                   "egress-a": "egress-a", "egress-b": "egress-b"}
+        qualification = json.loads(Path(os.environ["HOLDER_QUALIFICATION_FILE"]).read_text())
+        require(qualification.get("qualified") is False and qualification.get("checks") == [] and
+                qualification.get("purpose") == "isolatedqualification" and
+                qualification.get("mode", "online") == "online",
+                "actual build/source/consumer scratch receipt required, never claimed physical qualification")
+        artifacts = qualification.get("artifactBindings")
+        require(isinstance(artifacts, dict) and os.environ["ROUTING_REGRESSION_HOLDER_IMAGE"] in artifacts,
+                "actual candidate holder artifact evidence required")
+        digests = {qualification.get("evidenceSha256")}
+        for binding in artifacts.values():
+            digests.update(binding.get(key) for key in
+                           ("buildManifestSha256", "sourceReviewSha256", "behavioralEvidenceSha256"))
+        receipts = root / "receipts"
+        receipts.mkdir(mode=0o700)
+        for digest in digests:
+            require(isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest) and len(set(digest)) > 1,
+                    "actual nonconstant image artifact evidence hash required")
+            source = Path(os.environ["HOLDER_RECEIPT_DIR"]) / digest
+            require(source.is_file() and hashlib.sha256(source.read_bytes()).hexdigest() == digest,
+                    "actual build/source/consumer receipt absent or mismatched")
+            target = receipts / digest
+            target.write_bytes(source.read_bytes())
+            target.chmod(0o600)
+        tool_names = ("ircfiber-holder-maintenance.py", "ircfiber-holder-coordinated.py",
+                      "legacy-holder-barrier.py", "ircfiber-coordination-domain.py")
         spec = dict(serverId="fixture-regression", dockerSocket=endpoint[7:], project=self.project,
                     run=self.run_id, root=str(root.resolve()), sourceImageId=old["Image"],
                     candidateImageId=os.environ["ROUTING_REGRESSION_HOLDER_IMAGE"],
-                    containers={key: dict(id=self.ids[service], name=self.inspect(self.ids[service])["Name"].lstrip("/"))
-                                for key, service in aliases.items()})
+                    qualification=qualification, bootstrapQualification=True,
+                    dockerId=json.loads(self.command("info", "--format", "{{json .}}"))["ID"],
+                    volumes=self.command("volume", "ls", "--quiet").split(),
+                    networks=self.command("network", "ls", "--quiet", "--no-trunc",
+                        "--filter", "label=com.docker.compose.project=" + self.project).split(),
+                    toolHashes={name: hashlib.sha256(Path(self.helper).with_name(name).read_bytes()).hexdigest()
+                                for name in tool_names},
+                    containers={key: dict(id=self.ids[service], image=self.inspect(self.ids[service])["Image"],
+                        name=self.inspect(self.ids[service])["Name"].lstrip("/")) for key, service in aliases.items()})
         spec_path = root / "fixture-spec.json"
         fd = os.open(spec_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as stream:

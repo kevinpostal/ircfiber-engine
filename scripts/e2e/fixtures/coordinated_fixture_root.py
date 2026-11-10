@@ -69,12 +69,13 @@ def manifest():
             spec.get('serverId') == 'fixture-regression' and
             re.fullmatch(r'regression-[a-zA-Z0-9_.-]+', spec.get('project', '')) and
             spec['run'] == spec['project'], 'fixture manifest scope mismatch')
-    require(set(spec['toolHashes']) == {'ircfiber-holder-maintenance.py', 'ircfiber-holder-coordinated.py', 'legacy-holder-barrier.py'} and
+    names = {'ircfiber-holder-maintenance.py', 'ircfiber-holder-coordinated.py',
+             'legacy-holder-barrier.py', 'ircfiber-coordination-domain.py'}
+    require(set(spec['toolHashes']) == names and
             spec.get('fixtureRootSha256') == hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             'complete actual tool/host-root fixture source hashes required')
     for name, digest in spec['toolHashes'].items():
-        require(name in ('ircfiber-holder-maintenance.py', 'ircfiber-holder-coordinated.py', 'legacy-holder-barrier.py') and
-                hashlib.sha256((TOOLS / name).read_bytes()).hexdigest() == digest,
+        require(name in names and hashlib.sha256((TOOLS / name).read_bytes()).hexdigest() == digest,
                 'actual collector source differs from recorded source')
     docker = m.Docker()
     info = docker.request('GET', '/info')
@@ -170,6 +171,15 @@ def initialize(case):
     root = BASE / case
     require(not root.exists(), 'fixture case/evidence directory is single-use')
     root.mkdir(mode=0o700)
+    receipts = root / 'receipts'
+    receipts.mkdir(mode=0o700)
+    for source in (BASE / 'receipts').iterdir():
+        require(source.is_file() and re.fullmatch(r'[0-9a-f]{64}', source.name) and
+                hashlib.sha256(source.read_bytes()).hexdigest() == source.name,
+                'retained actual qualification evidence bytes changed')
+        target = receipts / source.name
+        target.write_bytes(source.read_bytes())
+        target.chmod(0o600)
     holder = docker.inspect(spec['containers']['holder']['id'])
     engine = docker.inspect(spec['containers']['engine']['id'])
     require(holder['Image'] == OLD and engine['Image'] == spec['oldEngineImageId'] and
@@ -510,6 +520,186 @@ def guard_audit(kind):
 
 
 
+def domain_cases():
+    """Actual owner executables/netns/RESP and changed live Docker endpoints."""
+    spec, docker = manifest()
+    m.REDIS = spec['containers']['redis']['name']
+    module = c.load_coordination_domain(m)
+    gateway = docker.inspect(spec['containers']['gateway']['id'])
+    binding = spec['writerArtifactBindings'][gateway['Image']]
+    require(binding['executable'] == '/app/irc-fiber' and 'gateway' in binding['roles'],
+            'actual source-qualified gateway required for domain physical cases')
+    network = next(iter(gateway['NetworkSettings']['Networks']))
+    require(len(gateway['NetworkSettings']['Networks']) == 1, 'single exact owned fixture network required')
+    network_id = gateway['NetworkSettings']['Networks'][network]['NetworkID']
+    ledger = {'scope': 'actual native coordination-domain physical proof only; not coordinated/load qualification',
+              'qualified': False, 'toolHashes': spec['toolHashes'], 'observations': []}
+    ledger_path = BASE / 'domain-native.json'
+    created = []
+
+    def retain(case, **values):
+        snapshot = {'containers': inventory(), 'atMs': m.now_ms(), 'case': case}
+        snapshot_path = BASE / ('domain-inventory-%02d.json' % len(ledger['observations']))
+        m.durable(snapshot_path, snapshot, exclusive=True)
+        values['inventorySha256'] = hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
+        ledger['observations'].append(dict(case=case, atMs=m.now_ms(), **values))
+        m.durable(ledger_path, ledger)
+
+    def inventory():
+        return [docker.inspect(row['Id']) for row in docker.request('GET', '/containers/json?all=true')]
+
+    def owner(item):
+        current = docker.inspect(item['Id'])
+        require(current['Image'] == gateway['Image'] and current['State']['Running'],
+                'domain owner is not the actual running Site artifact')
+        image = docker.image(current['Image'])
+        require((image['Config'].get('Labels') or {}).get('org.opencontainers.image.revision') == binding['runtimeSource'],
+                'domain owner image/source binding mismatch')
+        group = Path('/sys/fs/cgroup' + k.proc_cgroups(current['State']['Pid']))
+        members = {int(pid) for path in group.rglob('cgroup.procs') for pid in path.read_text().split()}
+        candidates = []
+        for pid in members:
+            try:
+                if os.readlink('/proc/%d/exe' % pid) == binding['executable']:
+                    candidates.append(pid)
+            except FileNotFoundError:
+                pass
+        require(len(candidates) == 1, 'domain actual application executable is not unique')
+        pid = candidates[0]
+        require(k.executable_sha256(pid) == binding['executableSha256'] and
+                Path('/proc/%d/cmdline' % pid).read_bytes() == binding['executable'].encode() + b'\0',
+                'domain actual source/binary/argv binding mismatch')
+        env = m.env_map([entry.decode() for entry in Path('/proc/%d/environ' % pid).read_bytes().split(b'\0') if entry])
+        require(env.get('IRCFIBER_REDIS_URL') == m.env_map(current['Config']['Env']).get('IRCFIBER_REDIS_URL'),
+                'domain configured/actual application Redis environment differs')
+        generation = k.proc_generation(pid)
+        ledger.setdefault('ownerEvidence', {})[current['Id']] = {
+            'image': current['Image'], 'runtimeSource': binding['runtimeSource'],
+            'executable': binding['executable'], 'executableSha256': binding['executableSha256'],
+            'generation': generation, 'actualEnvironmentSha256': c.sha(env)}
+        return current, generation, env
+
+    def proof(checker, item):
+        current, generation, env = owner(item)
+        return checker.check(current, generation, env, 'gateway', 'inline', inventory())
+
+    def checker():
+        return module.CoordinationDomain(docker, m.REDIS, k, str(uuid.uuid4()), time.monotonic() + 120, require)
+
+    def refused(case, checker, item, reason):
+        try:
+            proof(checker, item)
+        except m.Refused as error:
+            require(reason in str(error), 'domain negative reached a different refusal: ' + str(error))
+            retain(case, refused=True, reason=str(error), containerId=item['Id'])
+        else:
+            raise m.Refused('unsafe actual domain was accepted: ' + case)
+
+    def create(role, image, env, command, aliases):
+        name = spec['project'] + '-domain-' + role
+        labels = {'ircfiber.fixture': 'routing-regression', 'ircfiber.fixture.run': spec['run'],
+                  'com.docker.compose.project': spec['project'], 'com.docker.compose.service': 'domain-' + role}
+        body = {'Image': image, 'Cmd': command, 'Env': env, 'Labels': labels,
+                'HostConfig': {'RestartPolicy': {'Name': 'no'}, 'NetworkMode': network,
+                    'Memory': 512 * 1024**2, 'NanoCpus': 500000000,
+                    'Tmpfs': {'/data': 'rw,noexec,nosuid,size=16777216'} if role == 'other' else {}},
+                'NetworkingConfig': {'EndpointsConfig': {network: {'Aliases': aliases}}}}
+        result = docker.request('POST', '/containers/create?name=' + name, body)
+        item = docker.inspect(result['Id'])
+        created.append({'id': item['Id'], 'name': name, 'image': image, 'labels': labels})
+        docker.request('POST', '/containers/' + item['Id'] + '/start')
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            current = docker.inspect(item['Id'])
+            require(current['State']['Running'], 'actual domain fixture application exited before proof')
+            if role == 'other':
+                response = subprocess.run(['docker', '--host', 'unix:///var/run/docker.sock', 'exec',
+                                           item['Id'], 'redis-cli', 'PING'], capture_output=True, timeout=5)
+                ready = response.returncode == 0 and response.stdout.strip() == b'PONG'
+            else:
+                try:
+                    owner(current)
+                    ready = True
+                except m.Refused:
+                    ready = False
+            if ready:
+                retain('created-actual-' + role, containerId=item['Id'], image=image)
+                return current
+            time.sleep(0.2)
+        raise m.Refused('actual domain fixture application did not become ready')
+
+    baseline = checker()
+    try:
+        positive = proof(baseline, gateway)
+        require(positive['database'] == 0 and positive['targetId'] == spec['containers']['redis']['id'],
+                'actual alias/owner-netns proof did not select the exact DB0 server')
+        retain('unique-alias-positive', proof=positive)
+        other = create('other', docker.inspect(spec['containers']['redis']['id'])['Image'], [],
+                       ['redis-server', '--save', '', '--appendonly', 'no'], ['domain-other'])
+        different = create('different', gateway['Image'],
+            [entry for entry in gateway['Config']['Env'] if not entry.startswith('IRCFIBER_REDIS_URL=')] +
+            ['IRCFIBER_REDIS_URL=redis://domain-other:6379/0'], ['/app/irc-fiber'], ['domain-different'])
+        negative = checker()
+        try:
+            refused('different-real-redis-domain', negative, different,
+                    'Configured Redis endpoint is external, ambiguous or not the exact selected container')
+        finally:
+            negative.close()
+        db_one = create('db-one', gateway['Image'],
+            [entry for entry in gateway['Config']['Env'] if not entry.startswith('IRCFIBER_REDIS_URL=')] +
+            ['IRCFIBER_REDIS_URL=redis://coordinated-redis:6379/1'], ['/app/irc-fiber'], ['domain-db-one'])
+        negative = checker()
+        try:
+            refused('actual-db1-url-refused', negative, db_one,
+                    'Redis configuration is outside the reviewed DB0 parser subset')
+        finally:
+            negative.close()
+        # Change actual Docker DNS, not an adapter or supplied environment.
+        docker.request('POST', '/networks/' + network_id + '/disconnect', {'Container': other['Id'], 'Force': False})
+        docker.request('POST', '/networks/' + network_id + '/connect',
+                       {'Container': other['Id'], 'EndpointConfig': {'Aliases': ['domain-other', 'coordinated-redis']}})
+        refused('continuous-alias-collision-refused', baseline, gateway,
+                'Configured Redis endpoint is external, ambiguous or not the exact selected container')
+        docker.request('POST', '/networks/' + network_id + '/disconnect', {'Container': other['Id'], 'Force': False})
+        docker.request('POST', '/networks/' + network_id + '/connect',
+                       {'Container': other['Id'], 'EndpointConfig': {'Aliases': ['domain-other']}})
+        restored = proof(baseline, gateway)
+        require(restored['runId'] == positive['runId'] and restored['nonceSha256'] == positive['nonceSha256'],
+                'continuous proof silently replaced its selected server or operation nonce')
+        retain('continuous-fresh-inventory-restored', proof=restored)
+        docker.redis('SET', baseline.key, 'changed-owned-domain-nonce', 'PX', '60000')
+        refused('continuous-nonce-change-refused', baseline, gateway, 'Coordinator Redis operation nonce changed')
+        docker.redis('SET', baseline.key, baseline.nonce, 'PX', '60000')
+        retain('domain-physical-cases-complete', physicalCasesPassed=True, coordinatedQualified=False)
+    except BaseException as error:
+        retain('failure-before-owned-cleanup', exceptionClass=type(error).__name__, reason=str(error)[:2000])
+        raise
+    finally:
+        # The refusal ledger is already durable before any run-owned cleanup.
+        logs = []
+        for item in created:
+            result = subprocess.run(['docker', '--host', 'unix:///var/run/docker.sock', 'logs',
+                                     '--timestamps', '--tail', '100', item['id']],
+                                    capture_output=True, timeout=15)
+            require(len(result.stdout) + len(result.stderr) <= 1024**2, 'domain private log bound exceeded')
+            logs.append({'container': item, 'returncode': result.returncode,
+                         'stdout': result.stdout.decode(errors='replace'),
+                         'stderr': result.stderr.decode(errors='replace')})
+        m.durable(BASE / 'domain-logs-before-cleanup.json', {'logs': logs}, exclusive=True)
+        baseline.close()
+        for item in reversed(created):
+            current = docker.inspect(item['id'])
+            require(current['Name'] == '/' + item['name'] and current['Image'] == item['image'] and
+                    all((current['Config'].get('Labels') or {}).get(key) == value for key, value in item['labels'].items()),
+                    'domain cleanup refused an unowned/replaced container')
+            if current['State']['Running']:
+                docker.request('POST', '/containers/' + item['id'] + '/stop?t=5')
+            require(not docker.inspect(item['id'])['State']['Running'], 'domain cleanup source still running')
+            docker.request('DELETE', '/containers/' + item['id'] + '?v=true')
+        retain('owned-domain-cleanup-complete', removedContainerIds=[item['id'] for item in created])
+    return ledger
+
+
 def main():
     require(len(sys.argv) == 3, 'expected exact host-root action and argument')
     action, value = sys.argv[1:]
@@ -529,6 +719,9 @@ def main():
         require(value == 'host', 'exact host proof required')
         spec, docker = manifest()
         result = {'nativeHostRoot': True, 'toolHashes': spec['toolHashes']}
+    elif action == 'domain':
+        require(value == 'physical', 'exact physical domain proof required')
+        result = domain_cases()
     elif action == 'audit':
         result = audit(value)
     elif action == 'authority-fault':

@@ -5,11 +5,11 @@
 # HOLDER_MAINTENANCE_HELPER points to the final Site maintenance source beside
 # its coordinated/kernel tools. COORDINATED_SOURCE_REVISION is the retained
 # archival reconstruction, not a claim that the old binary is reproducible.
-# COORDINATED_QUALIFICATION_FILE is an actual completed production-schema JSON
-# receipt; COORDINATED_LIFECYCLE_FILE is the actual schema-1 holder review.
-# COORDINATED_RECEIPT_DIR/<sha256> must contain original qualification evidence
-# and each build-manifest/source-review/behavioral/lifecycle receipt's bytes.
-# Missing receipts fail closed: this launcher never manufactures qualification.
+# COORDINATED_QUALIFICATION_FILE is an actual image-bound build/source/consumer
+# bootstrap receipt: qualified=false, purpose=isolatedqualification, checks=[].
+# COORDINATED_LIFECYCLE_FILE is the actual schema-1 old-holder review.
+# COORDINATED_RECEIPT_DIR/<sha256> contains the original artifact and lifecycle
+# receipt bytes. No physical qualification is claimed before the fixture runs.
 # Each fresh run uses COORDINATED_CASE=complete|already-stopped|ambiguous|
 # unknown-authority|replacement|restart-inflight|term-refusal|continuous-restart.
 # All containers and root-private artifacts survive EVERY outcome; isolate each
@@ -25,7 +25,7 @@ fi
 : "${COORDINATED_ENGINE_IMAGE:?immutable A image required}"
 : "${COORDINATED_HOLDER_IMAGE:?immutable corrected holder required}"
 : "${COORDINATED_ROOT_DIR:?fresh root-private native host evidence path required}"
-: "${COORDINATED_QUALIFICATION_FILE:?actual completed qualification receipt required}"
+: "${COORDINATED_QUALIFICATION_FILE:?actual image-bound scratch bootstrap receipt required}"
 : "${COORDINATED_LIFECYCLE_FILE:?actual old-holder lifecycle review receipt required}"
 : "${COORDINATED_RECEIPT_DIR:?actual hash-named receipt bytes required}"
 exec python3 "$SCRIPT_DIR/fixtures/coordinated_holder.py" "$@"
