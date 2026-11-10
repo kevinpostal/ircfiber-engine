@@ -534,19 +534,23 @@ void loadNetworks(ref EngineContext ctx) {
         }
         auto assignedServer = ctx.serverRegistry.getServerForNetwork(nidForAssignment);
         if (!assignedServer.length) {
+            import ircfiber.network_write_gate : NetworkWriter, runNetworkWrite;
+            assignedServer = runNetworkWrite!string(ctx.redis, (ref NetworkWriter writer) {
             // Restore unique prior ownership first; arbitrary saved rows are
             // not new provisioning and must not be assigned opportunistically.
-            assignedServer = ctx.serverRegistry.assignNetwork(nidForAssignment);
-            if (!assignedServer.length) {
+            auto recovered = ctx.serverRegistry.assignNetwork(nidForAssignment, writer);
+            if (!recovered.length) {
                 if (auto entry = nidForAssignment in held) {
                     if (entry.state == "open") {
-                        assignedServer = ctx.serverRegistry.claimNetwork(nidForAssignment, serverId);
+                        recovered = ctx.serverRegistry.claimNetwork(nidForAssignment, serverId, writer);
                         // An empty/unavailable plan cannot turn missing
                         // assignment storage into permission to close a socket.
-                        if (!assignedServer.length) consumed[entry.id] = true;
+                        if (!recovered.length) consumed[entry.id] = true;
                     }
                 }
             }
+            return recovered;
+            });
         }
         const shouldLoad = assignedServer == serverId
             && !networkMoveFenced(ctx.redis.getDb(), nidForAssignment);
@@ -1107,18 +1111,23 @@ void startOrphanReaperTask(ref EngineContext ctx) {
                         net.config.nick,
                         ownerId);
 
+                    import ircfiber.network_write_gate : NetworkWriter, runNetworkWrite,
+                        NetworkWriteUnavailableException, retainNetworkWriteUncertainty;
+                    try runNetworkWrite!void(ctx.redis, (ref NetworkWriter writer) {
                     // Closure must precede cleanup; a stale cached tenant may
                     // not disable a row transferred while the close was waiting.
-                    if (!ctx.connManager.stopNetworkForMove(net.config.id, 60.seconds)) continue;
+                    if (!ctx.connManager.stopNetworkForMove(net.config.id, 60.seconds)) {
+                        retainNetworkWriteUncertainty(writer);
+                        return;
+                    }
                     auto latest = ctx.networkRepo.findByIdWithUser(net.config.id);
                     if (latest.userId != persisted.userId
                             || ctx.serverRegistry.getServerForNetwork(netId) != ctx.localServer.serverId
-                            || networkMoveFenced(ctx.redis.getDb(), netId)) continue;
+                            || networkMoveFenced(ctx.redis.getDb(), netId)) return;
 
                     // 2. Persist disabled flag in MongoDB
                     try {
-                        auto netRepo = new NetworkRepository();
-                        netRepo.setDisabled(net.config.id, true);
+                        ctx.networkRepo.setDisabled(net.config.id, true, writer);
                         logInfo("Orphan reaper: set disabled=true for network %s", netId);
                     } catch (Exception e) {
                         logWarn("Orphan reaper: failed to set disabled flag for %s: %s", netId, e.msg);
@@ -1133,6 +1142,11 @@ void startOrphanReaperTask(ref EngineContext ctx) {
                         logInfo("Orphan reaper: cleaned Redis state for network %s", netId);
                     } catch (Exception e) {
                         logWarn("Orphan reaper: failed to clean Redis for %s: %s", netId, e.msg);
+                    }
+                    });
+                    catch (NetworkWriteUnavailableException e) {
+                        logJsonMap("warn", "engine", "Orphan cleanup refused",
+                            ["networkId": netId, "reason": e.code, "event": "network_control_refused"]);
                     }
                 }
             } catch (Exception e) {

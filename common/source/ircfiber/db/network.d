@@ -16,7 +16,132 @@ import ircfiber.db.mongo;
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.redis.protocol : RedisKeys;
 import ircfiber.db.user : idInFilters;
-import ircfiber.network_write_gate : runNetworkMutation, NetworkWriteUnavailableException;
+import ircfiber.network_write_gate : NetworkWriter, runNetworkWrite, runNetworkMutation,
+    retainNetworkWriteUncertainty, NetworkWriteUnavailableException;
+
+version (RoutingPolicyTest) {
+    /// Called by the guarded real-Mongo/Redis runner with its explicit URI.
+    /// Constructor cleanup is collection-wide, so never run it in the runner's
+    /// populated namespace (or in any ambient application database).
+    void networkRepositoryWriterGateCases(RedisStorage redis, string mongoUri) {
+        import std.exception : enforce;
+        import std.string : endsWith, replace;
+        import ircfiber.network_write_gate : NETWORK_WRITE_EXCLUSION_KEY, NETWORK_WRITERS_KEY,
+            networkMutationAdmittedForTest, networkMutationRepliedForTest;
+        enforce(mongoUri.length && AppMongoConnection.name().endsWith("_test"),
+            "Repository proof requires an explicitly admitted test Mongo URI");
+        const originalDatabase = AppMongoConnection.name();
+        const database = "repository_gate_" ~ randomUUID().toString().replace("-", "") ~ "_test";
+        AppMongoConnection.connect(mongoUri, database);
+        scope (exit) AppMongoConnection.connect(mongoUri, originalDatabase);
+        auto collection = AppMongoConnection.getDb()["networks"];
+        enforce(collection.findOne(Bson.emptyObject).isNull, "Random migration namespace must be empty");
+        auto db = redis.getDb();
+        enforce(!db.exists(NETWORK_WRITE_EXCLUSION_KEY) && db.scard(NETWORK_WRITERS_KEY) == 0,
+            "Repository proof requires dedicated quiescent Redis");
+        const operation = randomUUID().toString();
+        string[] tokens;
+        UUID[] ids;
+        scope (exit) {
+            networkMutationAdmittedForTest = null;
+            networkMutationRepliedForTest = null;
+            db.eval!long("if redis.call('GET',KEYS[1]) == ARGV[1] then return redis.call('DEL',KEYS[1]) end return 0",
+                [NETWORK_WRITE_EXCLUSION_KEY], operation);
+            // Only this test's captured tokens, after synchronous DB completion.
+            foreach (token; tokens) db.srem(NETWORK_WRITERS_KEY, token);
+            foreach (id; ids) collection.deleteOne(Bson(["id": Bson(id.toString())]));
+        }
+        long collect() {
+            auto reply = db.eval!long(
+                "if redis.call('EXISTS',KEYS[1]) ~= 0 or redis.call('SCARD',KEYS[2]) ~= 0 then return 0 end redis.call('SET',KEYS[1],ARGV[1]); return 1",
+                [NETWORK_WRITE_EXCLUSION_KEY, NETWORK_WRITERS_KEY], operation);
+            enforce(!reply.empty, "Collector oracle returned no result");
+            return reply.front;
+        }
+        void unlock() {
+            db.eval!long("if redis.call('GET',KEYS[1]) == ARGV[1] then return redis.call('DEL',KEYS[1]) end return 0",
+                [NETWORK_WRITE_EXCLUSION_KEY], operation);
+        }
+        bool hasIndex(string name) {
+            foreach (index; collection.listIndexes()) if (index["name"].get!string == name) return true;
+            return false;
+        }
+        const id = randomUUID();
+        ids ~= id;
+        collection.insertOne(Bson(["id": Bson(id.toString()), "bncToken": Bson("legacy-fixture")]));
+        collection.createIndex(Bson(["bncToken": Bson(1)]));
+        enforce(collect() == 1, "Closed fixture gate could not be acquired");
+        auto repository = new NetworkRepository(redis);
+        enforce(collection.findOne(["id": id.toString()])["bncToken"].get!string == "legacy-fixture"
+            && hasIndex("bncToken_1"), "Closed constructor dispatched purge or legacy DDL");
+        bool refused;
+        try repository.ensureIpv6Iid(id);
+        catch (NetworkWriteUnavailableException) { refused = true; }
+        enforce(refused && !hasIndex("ipv6Iid_unique_v1")
+            && collection.findOne(["id": id.toString()]).tryIndex("ipv6Iid").isNull,
+            "Closed allocator dispatched index creation or reservation");
+        unlock();
+        size_t admissions;
+        networkMutationAdmittedForTest = (string token) { tokens ~= token; ++admissions; };
+        runNetworkWrite!void(redis, (ref NetworkWriter writer) {
+            auto admitted = new NetworkRepository(redis, writer);
+            enforce(collect() == 0 && admissions == 1, "Constructor readmitted or lost outer ownership");
+            enforce(collection.findOne(["id": id.toString()]).tryIndex("bncToken").isNull
+                && !hasIndex("bncToken_1"), "Open constructor did not perform real migration");
+            admitted.beforeIpv6IidWriteForTest = (UUID row, string iid) {
+                enforce(hasIndex("ipv6Iid_unique_v1") && collect() == 0
+                    && admissions == 1 && db.scard(NETWORK_WRITERS_KEY) == 1,
+                    "Collector closed between real index creation and reservation");
+            };
+            enforce(validIpv6Iid(admitted.ensureIpv6Iid(id, writer)), "Open allocator did not persist an IID");
+            admitted.setDisabled(id, true, writer);
+            enforce(admissions == 1 && collect() == 0, "Trailing overload readmitted or released outer owner");
+        });
+        enforce(db.scard(NETWORK_WRITERS_KEY) == 0 && collect() == 1,
+            "Confirmed outer operation did not release its sole writer");
+        unlock();
+        // Constructor swallows migration failures for compatibility, but it
+        // cannot clear a real Mongo command's lost completion acknowledgement.
+        networkMutationRepliedForTest = { throw new Exception("Lost migration acknowledgement"); };
+        runNetworkWrite!void(redis, (ref NetworkWriter writer) {
+            auto ignored = new NetworkRepository(redis, writer);
+        });
+        networkMutationRepliedForTest = null;
+        enforce(db.scard(NETWORK_WRITERS_KEY) == 1 && collect() == 0
+            && db.ttl(NETWORK_WRITERS_KEY) == -1, "Swallowed migration lost-ack cleared writer evidence");
+        foreach (token; tokens) db.srem(NETWORK_WRITERS_KEY, token);
+        const second = randomUUID();
+        ids ~= second;
+        collection.insertOne(Bson(["id": Bson(second.toString())]));
+        networkMutationRepliedForTest = { throw new Exception("Lost reservation acknowledgement"); };
+        runNetworkWrite!void(redis, (ref NetworkWriter writer) {
+            try repository.ensureIpv6Iid(second, writer);
+            catch (Exception) {}
+        });
+        networkMutationRepliedForTest = null;
+        enforce(validIpv6Iid(collection.findOne(["id": second.toString()])["ipv6Iid"].get!string)
+            && db.scard(NETWORK_WRITERS_KEY) == 1 && collect() == 0,
+            "Committed reservation with swallowed lost-ack did not retain exclusion evidence");
+        foreach (token; tokens) db.srem(NETWORK_WRITERS_KEY, token);
+        // Real createIndexes failure after dispatch must also stay sticky when
+        // an admitted consumer catches the synchronous DDL exception.
+        collection.dropIndex("ipv6Iid_unique_v1");
+        const duplicate = randomUUID();
+        ids ~= duplicate;
+        collection.insertOne(Bson(["id": Bson(duplicate.toString()),
+            "ipv6Iid": collection.findOne(["id": id.toString()])["ipv6Iid"]]));
+        collection.updateOne(Bson(["id": Bson(second.toString())]),
+            Bson(["$unset": Bson(["ipv6Iid": Bson("")])]));
+        auto failedDdl = new NetworkRepository(redis);
+        runNetworkWrite!void(redis, (ref NetworkWriter writer) {
+            try failedDdl.ensureIpv6Iid(second, writer);
+            catch (Exception) {}
+        });
+        enforce(db.scard(NETWORK_WRITERS_KEY) == 1 && collect() == 0
+            && collection.findOne(["id": second.toString()]).tryIndex("ipv6Iid").isNull,
+            "Caught real uniqueness-index failure released its writer or dispatched a reservation");
+    }
+}
 
 /// Repository for network configurations.
 final class NetworkRepository {
@@ -43,21 +168,43 @@ final class NetworkRepository {
     this(RedisStorage cacheRedis = null) {
         cache = cacheRedis is null ? g_redis : cacheRedis;
         collection = AppMongoConnection.getDb()["networks"];
-        purgeLegacyBncTokens();
+        // Boot migration stays best-effort, but refusal never dispatches DDL
+        // or a document mutation.
+        try runNetworkWrite!void(cache, (ref NetworkWriter writer) {
+            purgeLegacyBncTokens(writer);
+        });
+        catch (Exception e) logWarn("networks legacy cleanup unavailable: %s", e.msg);
+    }
+
+    /// Reuse a logical operation's already admitted owner.
+    this(RedisStorage cacheRedis, ref NetworkWriter writer) {
+        cache = cacheRedis;
+        collection = AppMongoConnection.getDb()["networks"];
+        purgeLegacyBncTokens(writer);
     }
 
     /// Bouncer passwords moved from networks to users; drop the old index
-    /// and strip stale tokens. Idempotent and best-effort.
-    private void purgeLegacyBncTokens() @trusted {
+    /// and strip stale tokens. Idempotent and best-effort within one owner.
+    private void purgeLegacyBncTokens(ref NetworkWriter writer) @trusted {
         try {
             bool present;
             foreach (idx; collection.listIndexes())
                 if (idx["name"].get!string == "bncToken_1") present = true;
-            if (present) collection.dropIndex("bncToken_1");
+            if (present) {
+                try collection.dropIndex("bncToken_1");
+                catch (Exception e) {
+                    retainNetworkWriteUncertainty(writer);
+                    throw e;
+                }
+            }
         } catch (Exception e) logWarn("networks bncToken_1 index drop: %s", e.msg);
-        try collection.updateMany(
-            Bson(["bncToken": Bson(["$exists": Bson(true)])]),
-            Bson(["$unset": Bson(["bncToken": Bson("")])]));
+        auto command = Bson.emptyObject;
+        command["update"] = Bson("networks");
+        command["updates"] = Bson([Bson([
+            "q": Bson(["bncToken": Bson(["$exists": Bson(true)])]),
+            "u": Bson(["$unset": Bson(["bncToken": Bson("")])]),
+            "multi": Bson(true), "upsert": Bson(false)])]);
+        try runNetworkMutation(writer, command);
         catch (Exception e) logWarn("networks bncToken purge: %s", e.msg);
     }
 
@@ -213,7 +360,26 @@ final class NetworkRepository {
     /// Reserve only an absent identity. A corrupt or existing identity is
     /// never overwritten, including by stale ordinary saves.
     string ensureIpv6Iid(UUID networkId) {
-        try return reserveIpv6Iid(networkId);
+        try {
+            auto current = collection.findOne(["id": networkId.toString()]);
+            if (current.isNull) throw new Ipv6IdentityException("Network does not exist");
+            const existing = storedIpv6Iid(current);
+            if (existing.length) {
+                invalidateIpv6OwnerCache(current);
+                return existing;
+            }
+            return runNetworkWrite!string(cache, (ref NetworkWriter writer) {
+                return ensureIpv6Iid(networkId, writer);
+            });
+        }
+        catch (NetworkWriteUnavailableException e) throw e;
+        catch (Ipv6IdentityException e) throw e;
+        catch (Exception e)
+            throw new Ipv6IdentityException("IPv6 identity reservation unavailable: " ~ e.msg);
+    }
+
+    string ensureIpv6Iid(UUID networkId, ref NetworkWriter writer) {
+        try return reserveIpv6Iid(networkId, writer);
         catch (NetworkWriteUnavailableException e) throw e;
         catch (Ipv6IdentityException e) throw e;
         catch (Exception e)
@@ -223,6 +389,15 @@ final class NetworkRepository {
     /// Canonical config for assignment/control, never the caller's stale copy.
     NetworkConfig findByIdWithIpv6Iid(UUID networkId) {
         const iid = ensureIpv6Iid(networkId);
+        return reloadWithIpv6Iid(networkId, iid);
+    }
+
+    NetworkConfig findByIdWithIpv6Iid(UUID networkId, ref NetworkWriter writer) {
+        const iid = ensureIpv6Iid(networkId, writer);
+        return reloadWithIpv6Iid(networkId, iid);
+    }
+
+    private NetworkConfig reloadWithIpv6Iid(UUID networkId, string iid) {
         try {
             auto cfg = findById(networkId);
             if (cfg.id == UUID.init || cfg.ipv6Iid != iid)
@@ -234,7 +409,7 @@ final class NetworkRepository {
         }
     }
 
-    private string reserveIpv6Iid(UUID networkId) {
+    private string reserveIpv6Iid(UUID networkId, ref NetworkWriter writer) {
         foreach (attempt; 0 .. 8) {
             auto current = collection.findOne(["id": networkId.toString()]);
             if (current.isNull) throw new Ipv6IdentityException("Network does not exist");
@@ -243,7 +418,7 @@ final class NetworkRepository {
                 invalidateIpv6OwnerCache(current);
                 return existing;
             }
-            ensureIpv6IidIndex();
+            ensureIpv6IidIndex(writer);
 
             string candidate;
             bool generated;
@@ -267,7 +442,7 @@ final class NetworkRepository {
                 "ipv6Iid": Bson(["$exists": Bson(false)])]);
             command["update"] = Bson(["$set": Bson(["ipv6Iid": Bson(candidate)])]);
             command["new"] = Bson(true);
-            const reply = runNetworkMutation(cache, command);
+            const reply = runNetworkMutation(writer, command);
             if (reply["ok"].get!double != 1.0) {
                 if (reply["code"].type == Bson.Type.undefined || reply["code"].get!int != 11000)
                     throw new Ipv6IdentityException("Mongo rejected IPv6 identity reservation");
@@ -291,7 +466,7 @@ final class NetworkRepository {
         throw new Ipv6IdentityException("IPv6 identity collision retries exhausted");
     }
 
-    private void ensureIpv6IidIndex() {
+    private void ensureIpv6IidIndex(ref NetworkWriter writer) {
         if (ipv6IidIndexReady) return;
         // Mongo commands require the verb to be the first BSON field. An
         // associative-array constructor can reorder it and is not safe here.
@@ -304,7 +479,11 @@ final class NetworkRepository {
             "partialFilterExpression": Bson(["ipv6Iid": Bson(["$type": Bson("string")])])
         ])]);
         // Failure is fatal: reservations without this index are not unique.
-        AppMongoConnection.getDb().runCommandChecked(command);
+        try AppMongoConnection.getDb().runCommandChecked(command);
+        catch (Exception e) {
+            retainNetworkWriteUncertainty(writer);
+            throw e;
+        }
         ipv6IidIndexReady = true;
     }
 
@@ -324,14 +503,29 @@ final class NetworkRepository {
 
     /// Saves or updates a network configuration.
     void save(NetworkConfig config, UUID userId) {
+        auto update = saveUpdate(config, userId);
         auto selector = Bson(["id": Bson(config.id.toString())]);
-        auto update = Bson([
+        runNetworkWrite!void(cache, (ref NetworkWriter writer) {
+            savePrepared(selector, update, userId, writer);
+        });
+    }
+
+    void save(NetworkConfig config, UUID userId, ref NetworkWriter writer) {
+        savePrepared(Bson(["id": Bson(config.id.toString())]),
+            saveUpdate(config, userId), userId, writer);
+    }
+
+    private static Bson saveUpdate(NetworkConfig config, UUID userId) {
+        return Bson([
             "$set": persistedFields(config, userId),
             "$setOnInsert": Bson([
                 "servicesProvisioningPending": Bson(config.servicesProvisioningPending)
             ])
         ]);
-        updateConfig(selector, update, true);
+    }
+
+    private void savePrepared(Bson selector, Bson update, UUID userId, ref NetworkWriter writer) {
+        updateConfig(selector, update, writer, true);
         // Invalidate per-user cache so findByUserId doesn't return stale [] for 60s
         // after a new network is provisioned (e.g. ensureDefaultFiberNetwork on register).
         if (cache !is null) {
@@ -342,12 +536,12 @@ final class NetworkRepository {
 
     /// All document changes use a strict acknowledged command under the
     /// shared writer registration. Construct/validate BSON before admission.
-    private Bson updateConfig(Bson selector, Bson update, bool upsert = false) {
+    private Bson updateConfig(Bson selector, Bson update, ref NetworkWriter writer, bool upsert = false) {
         auto command = Bson.emptyObject;
         command["update"] = Bson("networks");
         command["updates"] = Bson([Bson(["q": selector, "u": update,
             "multi": Bson(false), "upsert": Bson(upsert)])]);
-        return runNetworkMutation(cache, command);
+        return runNetworkMutation(writer, command);
     }
 
     /// The `$set` document `save` writes: every user/admin-editable field.
@@ -412,6 +606,13 @@ final class NetworkRepository {
     /// Complete an initial signup exactly once; never create or re-arm a row.
     /// A verified credential is committed in the same atomic transition.
     bool completeSignupProvisioning(UUID id, UUID ownerId, string account = "", string password = "") {
+        return runNetworkWrite!bool(cache, (ref NetworkWriter writer) {
+            return completeSignupProvisioning(id, ownerId, account, password, writer);
+        });
+    }
+
+    bool completeSignupProvisioning(UUID id, UUID ownerId, string account, string password,
+            ref NetworkWriter writer) {
         auto fields = Bson(["servicesProvisioningPending": Bson(false)]);
         if (account.length) {
             fields["sasl"] = Bson(SASLMechanism.plain.to!string);
@@ -426,7 +627,7 @@ final class NetworkRepository {
                 "userId": Bson(ownerId.toString()),
                 "servicesProvisioningPending": Bson(true)
             ]),
-            Bson(["$set": fields]));
+            Bson(["$set": fields]), writer);
         if (result["nModified"].get!long != 1) return false;
         if (cache !is null) {
             try cache.del(RedisKeys.userNetworks(ownerId.toString()));
@@ -440,24 +641,44 @@ final class NetworkRepository {
         auto validated = routingPreferencesFromJson(routing.toJson());
         auto selector = Bson(["id": Bson(id.toString())]);
         auto update = Bson(["$set": Bson(["routing": Bson.fromJson(validated.toJson())])]);
-        updateConfig(selector, update);
+        runNetworkWrite!void(cache, (ref NetworkWriter writer) {
+            updateConfig(selector, update, writer);
+        });
+    }
+
+    void setRouting(UUID id, RoutingPreferences routing, ref NetworkWriter writer) {
+        auto validated = routingPreferencesFromJson(routing.toJson());
+        updateConfig(Bson(["id": Bson(id.toString())]),
+            Bson(["$set": Bson(["routing": Bson.fromJson(validated.toJson())])]), writer);
     }
 
 
     /// Sets the disabled flag on a network without rewriting the full record.
     /// Used by admin disconnect/reconnect to persist the disabled state.
     void setDisabled(UUID id, bool disabled) {
+        runNetworkWrite!void(cache, (ref NetworkWriter writer) {
+            setDisabled(id, disabled, writer);
+        });
+    }
+
+    void setDisabled(UUID id, bool disabled, ref NetworkWriter writer) {
         auto selector = Bson(["id": Bson(id.toString())]);
         auto update = Bson(["$set": Bson(["disabled": Bson(disabled)])]);
-        updateConfig(selector, update);
+        updateConfig(selector, update, writer);
     }
 
     /// Deletes a network by its ID.
     void deleteById(UUID id) {
+        runNetworkWrite!void(cache, (ref NetworkWriter writer) {
+            deleteById(id, writer);
+        });
+    }
+
+    void deleteById(UUID id, ref NetworkWriter writer) {
         auto command = Bson.emptyObject;
         command["delete"] = Bson("networks");
         command["deletes"] = Bson([Bson(["q": Bson(["id": Bson(id.toString())]), "limit": Bson(1)])]);
-        runNetworkMutation(cache, command);
+        runNetworkMutation(writer, command);
     }
 
     /// Serializes a NetworkConfig array to a JSON array.

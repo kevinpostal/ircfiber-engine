@@ -17,6 +17,124 @@ import ircfiber.models.irc_event : IRCRawEvent;
 import ircfiber.models.network : normalizeChannelName;
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.storage.buffer : sanitizeUtf8;
+import ircfiber.network_write_gate : NetworkWriter, runNetworkWrite, runNetworkMutation,
+    NetworkMutationException;
+import ircfiber.network_write_gate : retainNetworkWriteUncertainty;
+
+version (RoutingPolicyTest) {
+    /// Real storage regression, invoked with the runner's explicitly guarded URI.
+    void archiveCatalogWriterGateCases(RedisStorage redis, string mongoUri) {
+        import std.exception : enforce;
+        import std.string : endsWith, replace;
+        import ircfiber.network_write_gate : NETWORK_WRITE_EXCLUSION_KEY, NETWORK_WRITERS_KEY,
+            networkMutationAdmittedForTest, networkMutationRepliedForTest,
+            networkMutationReplyObservedForTest, runNetworkRedisMutation;
+        import vibe.db.redis.redis : RedisDatabase;
+        enforce(mongoUri.length && AppMongoConnection.name().endsWith("_test"),
+            "Archive catalog proof requires an explicitly admitted test Mongo URI");
+        const originalDatabase = AppMongoConnection.name();
+        const database = "archive_gate_" ~ randomUUID().toString().replace("-", "") ~ "_test";
+        AppMongoConnection.connect(mongoUri, database);
+        scope (exit) AppMongoConnection.connect(mongoUri, originalDatabase);
+        auto networks = AppMongoConnection.getDb()["networks"];
+        auto messages = AppMongoConnection.getDb()["messages"];
+        enforce(networks.findOne(Bson.emptyObject).isNull && messages.findOne(Bson.emptyObject).isNull,
+            "Archive proof requires a fresh random namespace");
+        auto db = redis.getDb();
+        enforce(!db.exists(NETWORK_WRITE_EXCLUSION_KEY) && db.scard(NETWORK_WRITERS_KEY) == 0,
+            "Archive proof requires dedicated quiescent Redis");
+        const operation = randomUUID().toString();
+        const id = randomUUID().toString();
+        const owner = randomUUID().toString();
+        const afterCatch = "archive-gate:after-caught:" ~ operation;
+        string[] tokens;
+        scope (exit) {
+            networkMutationAdmittedForTest = null;
+            networkMutationRepliedForTest = null;
+            networkMutationReplyObservedForTest = null;
+            db.del(afterCatch);
+            db.eval!long("if redis.call('GET',KEYS[1]) == ARGV[1] then return redis.call('DEL',KEYS[1]) end return 0",
+                [NETWORK_WRITE_EXCLUSION_KEY], operation);
+            foreach (token; tokens) db.srem(NETWORK_WRITERS_KEY, token);
+            messages.deleteMany(Bson(["networkId": Bson(id)]));
+            networks.deleteOne(Bson(["id": Bson(id)]));
+        }
+        networks.insertOne(Bson(["id": Bson(id), "userId": Bson(owner), "nick": Bson("Preserve")]));
+        auto repository = new MessageRepository();
+        const timestamp = Clock.currTime().toUnixTime!long * 1000;
+        const payload = `{"eid":1,"t":` ~ timestamp.to!string ~ `,"text":"preserved"}`;
+        repository.appendArchivedCompactMessage("archive-gate-original", id, "#proof", payload);
+        auto before = networks.findOne(["id": id]).toString();
+        auto historyBefore = messages.findOne(["networkId": id]).toString();
+        auto closed = db.eval!long(
+            "if redis.call('EXISTS',KEYS[1]) ~= 0 or redis.call('SCARD',KEYS[2]) ~= 0 then return 0 end redis.call('SET',KEYS[1],ARGV[1]); return 1",
+            [NETWORK_WRITE_EXCLUSION_KEY, NETWORK_WRITERS_KEY], operation);
+        enforce(!closed.empty && closed.front == 1, "Archive fixture could not close writer gate");
+        foreach (discovery; [false, true]) {
+            bool refused;
+            try {
+                if (discovery) repository.archivedServerScopes(redis, id);
+                else repository.registerArchiveScopes(redis, id, ["archive-gate-new"], owner);
+            } catch (ArchiveWriteException e) { refused = e.failure == ArchiveWriteFailure.unavailable; }
+            enforce(refused && networks.findOne(["id": id]).toString() == before
+                && messages.findOne(["networkId": id]).toString() == historyBefore,
+                "Closed catalog CAS changed canonical metadata/history or violated archive failure contract");
+        }
+        enforce(repository.appendArchivedCompactMessage("archive-gate-original", id, "#proof", payload)
+            == ArchiveWriteResult.alreadyPersisted,
+            "Canonical exclusion incorrectly blocked independent message/history writes");
+        db.eval!long("if redis.call('GET',KEYS[1]) == ARGV[1] then return redis.call('DEL',KEYS[1]) end return 0",
+            [NETWORK_WRITE_EXCLUSION_KEY], operation);
+        networkMutationAdmittedForTest = (string token) { tokens ~= token; };
+        auto scopes = repository.registerArchiveScopes(redis, id, ["archive-gate-new"], owner);
+        enforce(scopes.length == 2 && scopes.canFind("archive-gate-original")
+            && scopes.canFind("archive-gate-new") && db.scard(NETWORK_WRITERS_KEY) == 0,
+            "Open catalog did not majority-CAS complete legacy provenance and release ownership");
+        enforce(networks.findOne(["id": id])["nick"].get!string == "Preserve"
+            && messages.findOne(["networkId": id]).toString() == historyBefore,
+            "Catalog CAS damaged unrelated canonical fields or archive rows");
+        networkMutationRepliedForTest = { throw new Exception("Lost catalog acknowledgement"); };
+        bool uncertain;
+        try repository.registerArchiveScopes(redis, id, ["archive-gate-lost"], owner);
+        catch (ArchiveWriteException e) { uncertain = e.failure == ArchiveWriteFailure.unavailable; }
+        networkMutationRepliedForTest = null;
+        enforce(uncertain && networks.findOne(["id": id])["archiveServers"].length == 3
+            && db.scard(NETWORK_WRITERS_KEY) == 1 && db.ttl(NETWORK_WRITERS_KEY) == -1,
+            "Real catalog commit with lost acknowledgement did not retain writer evidence");
+        foreach (token; tokens) db.srem(NETWORK_WRITERS_KEY, token);
+        foreach (variant; 0 .. 5) {
+            const server = "archive-gate-malformed-" ~ variant.to!string;
+            networkMutationReplyObservedForTest = (ref Bson reply) {
+                final switch (variant) {
+                    case 0: reply["writeConcernError"] = Bson(null); break;
+                    case 1: reply["writeErrors"] = Bson(null); break;
+                    case 2: reply["n"] = Bson(-1); break;
+                    case 3: reply["n"] = Bson(0.5); break;
+                    case 4: reply["n"] = Bson(2); break;
+                }
+            };
+            bool rejected;
+            runNetworkWrite!void(redis, (ref NetworkWriter writer) {
+                try repository.registerArchiveScopes(redis, id, [server], owner, writer);
+                catch (ArchiveWriteException) { rejected = true; }
+                // The real engine can catch a failed catalog handoff and
+                // successfully record a later Redis failure transition.
+                runNetworkRedisMutation!void(writer, (RedisDatabase commandDb) {
+                    commandDb.set(afterCatch, "acknowledged");
+                });
+            });
+            networkMutationReplyObservedForTest = null;
+            auto collected = db.eval!long(
+                "if redis.call('SCARD',KEYS[2]) ~= 0 then return 0 end redis.call('SET',KEYS[1],ARGV[1]); return 1",
+                [NETWORK_WRITE_EXCLUSION_KEY, NETWORK_WRITERS_KEY], operation);
+            enforce(rejected && networks.findOne(["id": id])["archiveServers"].length == 4 + variant
+                && db.get(afterCatch) == "acknowledged" && db.scard(NETWORK_WRITERS_KEY) == 1
+                && db.ttl(NETWORK_WRITERS_KEY) == -1 && !collected.empty && collected.front == 0,
+                "Caught malformed catalog ACK plus a later acknowledged effect released writer evidence");
+            foreach (token; tokens) db.srem(NETWORK_WRITERS_KEY, token);
+        }
+    }
+}
 
 /// Exact references follow Mongo's (t, eid, _id) order, never opaque msgid order.
 /// A non-exact zero timestamp is unbounded.
@@ -447,14 +565,30 @@ final class MessageRepository {
     /// Fresh producers pass their canonical owner: the same majority read and
     /// catalog CAS must match it. Offline historical discovery has no producer
     /// owner and deliberately leaves that expectation empty.
-    string[] registerArchiveScopes(string networkId, string[] servers, string expectedOwner = "") @trusted {
+    string[] registerArchiveScopes(RedisStorage redis, string networkId, string[] servers,
+            string expectedOwner = "") @trusted {
         if (!servers.length) throw new ArchiveWriteException(ArchiveWriteFailure.invalidInput);
-        return synchronizeArchiveScopes(networkId, servers, false, expectedOwner);
+        return synchronizeArchiveScopes(redis, networkId, servers, false, expectedOwner);
+    }
+
+    string[] registerArchiveScopes(RedisStorage redis, string networkId, string[] servers,
+            string expectedOwner, ref NetworkWriter writer) @trusted {
+        import ircfiber.archive_protocol : isCanonicalArchiveOperationId;
+        if (redis is null || !servers.length || servers.length > 66
+                || !isCanonicalArchiveOperationId(networkId)
+                || (expectedOwner.length && !isCanonicalArchiveOperationId(expectedOwner)))
+            throw new ArchiveWriteException(ArchiveWriteFailure.invalidInput);
+        foreach (server; servers) if (!server.length || server.length > 128)
+            throw new ArchiveWriteException(ArchiveWriteFailure.invalidInput);
+        try return synchronizeAdmittedArchiveScopes(networkId, servers, false, expectedOwner, writer);
+        catch (ArchiveWriteException e) { throw e; }
+        catch (Exception) { throw new ArchiveWriteException(ArchiveWriteFailure.unavailable); }
     }
 
     /// Includes pre-journal rows before any clear. Never truncate a 65th scope.
-    string[] archivedServerScopes(string networkId, string[] retainedProjection = null) @trusted {
-        auto scopes = synchronizeArchiveScopes(networkId, retainedProjection, true);
+    string[] archivedServerScopes(RedisStorage redis, string networkId,
+            string[] retainedProjection = null) @trusted {
+        auto scopes = synchronizeArchiveScopes(redis, networkId, retainedProjection, true);
         if (!scopes.length) throw new ArchiveWriteException(ArchiveWriteFailure.unavailable);
         return scopes;
     }
@@ -547,8 +681,8 @@ final class MessageRepository {
         }
     }
 
-    private static string[] synchronizeArchiveScopes(string networkId, string[] additions,
-            bool includeLegacy, string expectedOwner = "") @trusted {
+    private static string[] synchronizeArchiveScopes(RedisStorage redis, string networkId,
+            string[] additions, bool includeLegacy, string expectedOwner = "") @trusted {
         import ircfiber.archive_protocol : isCanonicalArchiveOperationId;
         if (!isCanonicalArchiveOperationId(networkId) || additions.length > 66)
             throw new ArchiveWriteException(ArchiveWriteFailure.invalidInput);
@@ -556,6 +690,16 @@ final class MessageRepository {
             throw new ArchiveWriteException(ArchiveWriteFailure.invalidInput);
         foreach (server; additions) if (!server.length || server.length > 128)
             throw new ArchiveWriteException(ArchiveWriteFailure.invalidInput);
+        try {
+            return runNetworkWrite!(string[])(redis, (ref NetworkWriter writer) {
+                return synchronizeAdmittedArchiveScopes(networkId, additions, includeLegacy, expectedOwner, writer);
+            });
+        } catch (ArchiveWriteException e) { throw e; }
+        catch (Exception) { throw new ArchiveWriteException(ArchiveWriteFailure.unavailable); }
+    }
+
+    private static string[] synchronizeAdmittedArchiveScopes(string networkId, string[] additions,
+            bool includeLegacy, string expectedOwner, ref NetworkWriter writer) @trusted {
         // Exact-array CAS prevents concurrent registrations overflowing 64.
         // Contention is a retry, never a weakened write concern or subset read.
         foreach (_; 0 .. 4) {
@@ -608,11 +752,28 @@ final class MessageRepository {
                 "archiveScopeVersion": Bson(1), "archiveServers": Bson(encodedScopes[0 .. count])])]),
                 "multi": Bson(false), "upsert": Bson(false)])]);
             command["ordered"] = Bson(true); command["writeConcern"] = archiveWriteConcern();
-            auto reply = runArchiveCommand(command);
-            checkArchiveReply(reply); checkArchiveWriteErrors(reply);
-            const matched = archiveReplyCount(reply, "n");
+            Bson reply;
+            try reply = runNetworkMutation(writer, command);
+            catch (NetworkMutationException e) {
+                // Keep the archive failure/code contract without exposing raw
+                // driver text. The gate has already retained uncertain ownership.
+                checkArchiveReply(e.reply);
+                checkArchiveWriteErrors(e.reply);
+                throw new ArchiveWriteException(ArchiveWriteFailure.invalidReply);
+            }
+            long matched;
+            try {
+                checkArchiveReply(reply); checkArchiveWriteErrors(reply);
+                matched = archiveReplyCount(reply, "n");
+                if (matched != 0 && matched != 1)
+                    throw new ArchiveWriteException(ArchiveWriteFailure.invalidReply);
+            } catch (ArchiveWriteException e) {
+                // A caller may catch a typed catalog failure and continue its
+                // logical operation. That must not confirm a malformed ACK.
+                retainNetworkWriteUncertainty(writer);
+                throw e;
+            }
             if (matched == 1) return scopes[0 .. count].dup;
-            if (matched != 0) throw new ArchiveWriteException(ArchiveWriteFailure.invalidReply);
         }
         throw new ArchiveWriteException(ArchiveWriteFailure.unavailable);
     }

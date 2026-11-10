@@ -64,6 +64,7 @@ struct ArchiveRecord {
     long cutoffEid, legacyCutoffMs;
     string scopedLineageId, legacyLineageId;
     bool durableRedisApplied; // Derived from synced state, not the immutable frame.
+    bool pendingCatalog; // Raw durable ingress; worker must prove owner/catalog before applying.
 }
 
 struct ArchiveOperationStatus {
@@ -220,8 +221,10 @@ final class ArchiveSpool {
     }
 
     ArchiveAdmission tryAppend(string serverId, string networkId, string normalizedChannel,
-            long eid, string compactJson) {
+            long eid, string compactJson, string pendingCatalogOwner = "") {
         if (eid <= 0 || !validScope(serverId, networkId, normalizedChannel)) return reject(ArchiveAdmission.unavailable);
+        if (pendingCatalogOwner.length && !validCanonicalUuid(pendingCatalogOwner))
+            return reject(ArchiveAdmission.unavailable);
         if (compactJson.length > archiveMaxRecordBytes) return reject(ArchiveAdmission.oversized);
         try {
             auto event = parseJsonString(compactJson);
@@ -234,19 +237,23 @@ final class ArchiveSpool {
             require(event["t"].get!long > 0, "invalid_event_timestamp");
             j["timestampMs"] = event["t"].get!long;
             j["payload"] = compactJson;
+            if (pendingCatalogOwner.length) j["pendingCatalogOwner"] = pendingCatalogOwner;
             return enqueue(j.toString(), ArchiveKind.append, serverId, networkId, j["queuedAtMs"].get!long);
         } catch (Exception) { return reject(ArchiveAdmission.unavailable); }
     }
 
     ArchiveAdmission tryRename(string serverId, string networkId, string fromChannel,
-            string toChannel, long cutoffEid, long legacyCutoffMs) {
+            string toChannel, long cutoffEid, long legacyCutoffMs, string pendingCatalogOwner = "") {
         if (!validScope(serverId, networkId, fromChannel) || !toChannel.length
                 || toChannel.length > 512 || cutoffEid <= 0 || legacyCutoffMs <= 0)
+            return reject(ArchiveAdmission.unavailable);
+        if (pendingCatalogOwner.length && !validCanonicalUuid(pendingCatalogOwner))
             return reject(ArchiveAdmission.unavailable);
         auto j = baseRecord("rename", serverId, networkId, fromChannel);
         j["newChannel"] = toChannel;
         j["cutoffEid"] = cutoffEid;
         j["legacyCutoffMs"] = legacyCutoffMs;
+        if (pendingCatalogOwner.length) j["pendingCatalogOwner"] = pendingCatalogOwner;
         return enqueue(j.toString(), ArchiveKind.rename, serverId, networkId, j["queuedAtMs"].get!long);
     }
 
@@ -1561,6 +1568,11 @@ ArchiveRecord decodeArchiveRecord(string encoded, ulong sequence) {
     r.queuedAtMs = j["queuedAtMs"].get!long;
     require(r.queuedAtMs > 0, "invalid_record_queued_time");
     r.timestampMs = r.queuedAtMs;
+    if (auto pending = "pendingCatalogOwner" in j) {
+        r.ownerId = pending.get!string;
+        require(validCanonicalUuid(r.ownerId) && r.kind != ArchiveKind.purge, "invalid_pending_catalog_owner");
+        r.pendingCatalog = true;
+    }
     if (r.kind == ArchiveKind.append) {
         r.eid = j["eid"].get!long; r.timestampMs = j["timestampMs"].get!long; r.compactJson = j["payload"].get!string;
         require(r.eid > 0 && r.timestampMs > 0 && r.compactJson.length, "invalid_append_identity");

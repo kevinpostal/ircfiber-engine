@@ -34,11 +34,16 @@ private void archiveRename(ref EngineContext ctx, string serverId, string networ
         string from, string toChannel, long cutoffEid) {
     auto admission = ArchiveAdmission.unavailable;
     if (ctx.archiveSpool !is null) {
-        if (ctx.archiveControl !is null && ctx.archiveControl.scopeReady(networkId)
+        string pendingOwner;
+        if (ctx.archiveControl !is null && ctx.connManager !is null)
+            pendingOwner = ctx.archiveControl.pendingScopeOwner(networkId,
+                ctx.connManager.getOwnerId(parseUUID(networkId[])));
+        if (ctx.archiveControl !is null
+                && (ctx.archiveControl.scopeReady(networkId) || pendingOwner.length)
                 && ctx.archiveControl.orderFrozenControls(ctx, networkId, cutoffEid))
             admission = ctx.archiveSpool.tryRename(serverId, networkId,
                 normalizeChannelName(from), normalizeChannelName(toChannel), cutoffEid,
-                Clock.currTime.stdTime / 10_000 - 62_135_596_800_000L);
+                Clock.currTime.stdTime / 10_000 - 62_135_596_800_000L, pendingOwner);
         else ctx.archiveSpool.reportAdmissionUnavailable();
     }
     noteArchiveAdmission(admission);
@@ -107,6 +112,7 @@ private void consumeHistoryCheckpoint(ref EngineContext ctx, ref IRCRawEvent eve
                 && !row.config.disabled && !row.config.servicesProvisioningPending
                 && ownsNetworkForDial(ctx.redis, serverId, event.networkId)
                 && failureKey !in failedStorage
+                && ctx.archiveControl !is null && ctx.archiveControl.scopeReady(event.networkId)
                 && ctx.connManager.getClient(nid) is client
                 && client.ownsHistoryRequest(checkpoint.requestId, checkpoint.connectionEpoch)) {
             const field = historyCheckpointField(checkpoint.target, client.getIsupport());
@@ -374,10 +380,14 @@ void startEventProcessor(ref EngineContext ctx) {
                         && !isTransientServerLogPhase(event) && event.getTag("archive_gap").length == 0) {
                     auto admission = ArchiveAdmission.unavailable;
                     if (ctx.archiveSpool !is null) {
-                        if (ctx.archiveControl !is null && ctx.archiveControl.scopeReady(event.networkId))
+                        string pendingOwner;
+                        if (ctx.archiveControl !is null)
+                            pendingOwner = ctx.archiveControl.pendingScopeOwner(event.networkId, userIdStr);
+                        if (ctx.archiveControl !is null
+                                && (ctx.archiveControl.scopeReady(event.networkId) || pendingOwner.length))
                             admission = ctx.archiveSpool.tryAppend(serverId, event.networkId,
                                 event.channel.length ? normalizeChannelName(event.channel) : "_server",
-                                event.eid, json.toString());
+                                event.eid, json.toString(), pendingOwner);
                         else ctx.archiveSpool.reportAdmissionUnavailable();
                     }
                     noteArchiveAdmission(admission);

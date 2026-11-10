@@ -6,11 +6,14 @@ module ircfiber.irc.routing_moves;
 import std.conv : to;
 import std.datetime : Clock;
 import std.uuid : UUID, parseUUID;
+import std.ascii : isWhite;
+import std.string : strip, lineSplitter, icmp;
 import vibe.data.json : Json, parseJsonString;
 import vibe.db.redis.redis : RedisDatabase;
 import ircfiber.irc.server : ConnectionServer;
 import ircfiber.redis.protocol : RedisKeys;
-import ircfiber.network_write_gate : NetworkWriteUnavailableException;
+import ircfiber.network_write_gate : NetworkWriteUnavailableException, NetworkWriter,
+    runNetworkWrite, runNetworkRedisMutation;
 
 public enum NETWORK_ROUTING_LEASE_TTL_SECONDS = 90;
 private enum MOVE_FENCE_SECONDS = 120;
@@ -100,14 +103,25 @@ private RoutingMove decodeMove(string raw) {
 
 RoutingMove loadRoutingMove(RedisDatabase db, string moveId) {
     if (!isRoutingMoveId(moveId)) throw new RoutingMoveConflictException("Invalid routing move ID");
+    return runNetworkWrite!RoutingMove(db, (ref NetworkWriter writer) {
+        return loadRoutingMove(db, moveId, writer);
+    });
+}
+
+RoutingMove loadRoutingMove(RedisDatabase db, string moveId, ref NetworkWriter writer) {
+    if (!isRoutingMoveId(moveId)) throw new RoutingMoveConflictException("Invalid routing move ID");
     try {
-        auto reply = db.eval!string(LOAD_SCRIPT, [RedisKeys.routingMoveStatus(moveId)],
-            [moveId, RedisKeys.routingMove(""), MOVE_RESULT_SECONDS.to!string]);
-        if (reply.empty) throw new RoutingMoveUnavailableException();
-        auto move = decodeMove(reply.front.idup);
+        const raw = runNetworkRedisMutation!string(writer, (RedisDatabase actualDb) {
+            auto reply = actualDb.eval!string(LOAD_SCRIPT, [RedisKeys.routingMoveStatus(moveId)],
+                [moveId, RedisKeys.routingMove(""), MOVE_RESULT_SECONDS.to!string]);
+            if (reply.empty) throw new RoutingMoveUnavailableException();
+            return reply.front.idup;
+        });
+        auto move = decodeMove(raw);
         if (move.moveId.length && move.moveId != moveId) throw new RoutingMoveUnavailableException();
         return move;
-    } catch (RoutingMoveUnavailableException e) { throw e; }
+    } catch (NetworkWriteUnavailableException e) { throw e; }
+    catch (RoutingMoveUnavailableException e) { throw e; }
     catch (Exception) { throw new RoutingMoveUnavailableException(); }
 }
 
@@ -122,20 +136,80 @@ bool networkMoveFenced(RedisDatabase db, string networkId) {
 /// atomic commit transfers them; no legacy queue guesses an unknown owner.
 bool enqueueRoutingCommand(RedisDatabase db, string networkId, string commandJson) {
     if (!validNetworkId(networkId)) throw new RoutingMoveConflictException("Invalid network ID");
+    const connectionEffect = routingCommandChangesConnection(commandJson);
+    if (connectionEffect)
+        return runNetworkWrite!bool(db, (ref NetworkWriter writer) {
+            return enqueueRoutingCommand(db, networkId, commandJson, writer);
+        });
+    return enqueueRoutingCommandUnchecked(db, networkId, commandJson, false);
+}
+
+bool enqueueRoutingCommand(RedisDatabase db, string networkId, string commandJson,
+        ref NetworkWriter writer) {
+    if (!validNetworkId(networkId)) throw new RoutingMoveConflictException("Invalid network ID");
+    const connectionEffect = routingCommandChangesConnection(commandJson);
+    return runNetworkRedisMutation!bool(writer, (RedisDatabase actualDb) {
+        return enqueueRoutingCommandUnchecked(actualDb, networkId, commandJson, connectionEffect);
+    });
+}
+
+// Message/PONG/history/channel traffic is runtime, not connection ownership.
+// Raw QUIT (including a later line) is different: it can close the socket.
+private bool routingCommandChangesConnection(string commandJson) {
+    const command = parseJsonString(commandJson);
+    const kind = command["cmd"].get!string;
+    if (kind == "connect" || kind == "disconnect" || kind == "reconnect") return true;
+    if (kind != "raw") return false;
+    foreach (line; command["text"].get!string.lineSplitter) {
+        auto text = line.strip;
+        // IRCv3 tags and an optional prefix precede, not replace, the verb.
+        foreach (prefix; ['@', ':']) {
+            if (!text.length || text[0] != prefix) continue;
+            size_t end;
+            while (end < text.length && !isWhite(text[end])) ++end;
+            text = text[end .. $].strip;
+        }
+        size_t end;
+        while (end < text.length && !isWhite(text[end])) ++end;
+        const verb = text[0 .. end];
+        foreach (effect; ["QUIT", "CONNECT", "RECONNECT", "KILL", "SQUIT", "DIE", "RESTART"])
+            if (icmp(verb, effect) == 0) return true;
+    }
+    return false;
+}
+
+private bool enqueueRoutingCommandUnchecked(RedisDatabase db, string networkId,
+        string commandJson, bool connectionEffect) {
     try {
         auto reply = db.eval!string(q"LUA
+if ARGV[4] == '1' and redis.call('EXISTS', 'irc:holder:maintenance:write-exclusion') ~= 0 then return 'maintenance' end
 local owner = redis.call('HGET', KEYS[1], ARGV[1])
 if not owner or owner == '' then return '0' end
 redis.call('RPUSH', ARGV[2] .. owner .. ':' .. ARGV[1], ARGV[3])
 return '1'
-LUA", [RedisKeys.networkAssignments()], [networkId, "irc:cmd:", commandJson]);
+LUA", [RedisKeys.networkAssignments()], [networkId, "irc:cmd:", commandJson, connectionEffect ? "1" : "0"]);
         if (reply.empty) throw new RoutingMoveUnavailableException();
+        if (reply.front == "maintenance") throw new NetworkWriteUnavailableException();
         return reply.front == "1";
-    } catch (RoutingMoveUnavailableException e) { throw e; }
+    } catch (NetworkWriteUnavailableException e) { throw e; }
+    catch (RoutingMoveUnavailableException e) { throw e; }
     catch (Exception) { throw new RoutingMoveUnavailableException(); }
 }
 
 RoutingMove requestNetworkMove(RedisDatabase db, string networkId, string targetServerId) {
+    if (!validNetworkId(networkId) || !validServerId(targetServerId))
+        throw new RoutingMoveConflictException("Invalid routing move placement");
+    RoutingMoveConflictException conflict;
+    auto move = runNetworkWrite!RoutingMove(db, (ref NetworkWriter writer) {
+        try return requestNetworkMove(db, networkId, targetServerId, writer);
+        catch (RoutingMoveConflictException e) { conflict = e; return RoutingMove.init; }
+    });
+    if (conflict !is null) throw conflict;
+    return move;
+}
+
+RoutingMove requestNetworkMove(RedisDatabase db, string networkId, string targetServerId,
+        ref NetworkWriter writer) {
     if (!validNetworkId(networkId) || !validServerId(targetServerId))
         throw new RoutingMoveConflictException("Invalid routing move placement");
     try {
@@ -143,7 +217,7 @@ RoutingMove requestNetworkMove(RedisDatabase db, string networkId, string target
         // disappeared. The create script repeats this check against races.
         const existing = db.get(RedisKeys.routingMove(networkId));
         if (existing.length) {
-            auto move = loadRoutingMove(db, existing);
+            auto move = loadRoutingMove(db, existing, writer);
             if (!move.moveId.length || move.networkId != networkId)
                 throw new RoutingMoveUnavailableException("Malformed routing move fence");
             return move;
@@ -156,18 +230,20 @@ RoutingMove requestNetworkMove(RedisDatabase db, string networkId, string target
             throw new RoutingMoveConflictException("Target has no routing capabilities");
         const token = operationToken();
         const now = Clock.currTime.toUnixTime!long * 1000;
-        auto reply = db.eval!string(CREATE_SCRIPT,
-            [RedisKeys.routingMove(networkId), RedisKeys.routingMoveStatus(token), RedisKeys.routingMoves(),
-             RedisKeys.networkAssignments(), RedisKeys.server(targetServerId), RedisKeys.draining(targetServerId),
-             RedisKeys.routingSchemaVersion()],
-            [token, networkId, targetServerId, now.to!string, targetRaw,
-             MOVE_FENCE_SECONDS.to!string, MOVE_RESULT_SECONDS.to!string]);
-        if (reply.empty) throw new RoutingMoveUnavailableException();
-        const result = reply.front.idup;
+        const result = runNetworkRedisMutation!string(writer, (RedisDatabase actualDb) {
+            auto reply = actualDb.eval!string(CREATE_SCRIPT,
+                [RedisKeys.routingMove(networkId), RedisKeys.routingMoveStatus(token), RedisKeys.routingMoves(),
+                 RedisKeys.networkAssignments(), RedisKeys.server(targetServerId), RedisKeys.draining(targetServerId),
+                 RedisKeys.routingSchemaVersion()],
+                [token, networkId, targetServerId, now.to!string, targetRaw,
+                 MOVE_FENCE_SECONDS.to!string, MOVE_RESULT_SECONDS.to!string]);
+            if (reply.empty) throw new RoutingMoveUnavailableException();
+            return reply.front.idup;
+        });
         if (result == "conflict") throw new RoutingMoveConflictException();
         if (result == "maintenance") throw new NetworkWriteUnavailableException();
         if (!isRoutingMoveId(result)) throw new RoutingMoveUnavailableException();
-        auto move = loadRoutingMove(db, result);
+        auto move = loadRoutingMove(db, result, writer);
         if (!move.moveId.length || move.networkId != networkId) throw new RoutingMoveUnavailableException();
         return move;
     } catch (NetworkWriteUnavailableException e) { throw e;
@@ -181,31 +257,73 @@ private bool transition(RedisDatabase db, const RoutingMove move, string script,
             || !validServerId(move.fromServerId) || !validServerId(move.targetServerId)
             || move.fromServerId == move.targetServerId)
         throw new RoutingMoveConflictException("Invalid routing move identity");
+    return runNetworkWrite!bool(db, (ref NetworkWriter writer) {
+        return transition(db, move, script, extra, writer);
+    });
+}
+
+private bool transition(RedisDatabase db, const RoutingMove move, string script,
+        string[] extra, ref NetworkWriter writer) {
+    if (!isRoutingMoveId(move.moveId) || !validNetworkId(move.networkId)
+            || !validServerId(move.fromServerId) || !validServerId(move.targetServerId)
+            || move.fromServerId == move.targetServerId)
+        throw new RoutingMoveConflictException("Invalid routing move identity");
     try {
-        auto reply = db.eval!string(script,
+        return runNetworkRedisMutation!bool(writer, (RedisDatabase actualDb) {
+        auto reply = actualDb.eval!string(script,
             [RedisKeys.routingMove(move.networkId), RedisKeys.routingMoveStatus(move.moveId),
              RedisKeys.networkAssignments()],
             [move.moveId, move.networkId, move.fromServerId, move.targetServerId,
              MOVE_RESULT_SECONDS.to!string] ~ extra);
         if (reply.empty) throw new RoutingMoveUnavailableException();
         return reply.front == "1";
-    } catch (RoutingMoveUnavailableException e) { throw e; }
+        });
+    } catch (NetworkWriteUnavailableException e) { throw e; }
+    catch (RoutingMoveUnavailableException e) { throw e; }
     catch (Exception) { throw new RoutingMoveUnavailableException(); }
 }
 
 bool beginRoutingMove(RedisDatabase db, const RoutingMove move) {
     return transition(db, move, BEGIN_SCRIPT);
 }
+bool beginRoutingMove(RedisDatabase db, const RoutingMove move, ref NetworkWriter writer) {
+    return transition(db, move, BEGIN_SCRIPT, [], writer);
+}
 bool acknowledgeNetworkMoveClosed(RedisDatabase db, const RoutingMove move) {
     return transition(db, move, ACK_SCRIPT);
+}
+bool acknowledgeNetworkMoveClosed(RedisDatabase db, const RoutingMove move, ref NetworkWriter writer) {
+    return transition(db, move, ACK_SCRIPT, [], writer);
 }
 bool failRoutingMove(RedisDatabase db, const RoutingMove move, string reason, string state = "failed") {
     if (state != "failed" && state != "expired") throw new RoutingMoveConflictException("Invalid failure state");
     return transition(db, move, FAIL_SCRIPT, [reason, state]);
 }
+bool failRoutingMove(RedisDatabase db, const RoutingMove move, string reason,
+        ref NetworkWriter writer, string state = "failed") {
+    if (state != "failed" && state != "expired") throw new RoutingMoveConflictException("Invalid failure state");
+    return transition(db, move, FAIL_SCRIPT, [reason, state], writer);
+}
 bool commitRoutingMove(RedisDatabase db, const RoutingMove move,
     string destinationControlJson, string expectedPolicyRaw, string expectedTargetData,
     const string[string] expectedAssignments) {
+    auto args = prepareRoutingCommit(move, destinationControlJson, expectedPolicyRaw,
+        expectedTargetData, expectedAssignments);
+    return runNetworkWrite!bool(db, (ref NetworkWriter writer) {
+        return commitPreparedRoutingMove(move, args, writer);
+    });
+}
+
+bool commitRoutingMove(RedisDatabase db, const RoutingMove move,
+        string destinationControlJson, string expectedPolicyRaw, string expectedTargetData,
+        const string[string] expectedAssignments, ref NetworkWriter writer) {
+    auto args = prepareRoutingCommit(move, destinationControlJson, expectedPolicyRaw,
+        expectedTargetData, expectedAssignments);
+    return commitPreparedRoutingMove(move, args, writer);
+}
+
+private string[] prepareRoutingCommit(const RoutingMove move, string destinationControlJson,
+        string expectedPolicyRaw, string expectedTargetData, const string[string] expectedAssignments) {
     if (!isRoutingMoveId(move.moveId) || !validNetworkId(move.networkId)
             || !validServerId(move.fromServerId) || !validServerId(move.targetServerId)
             || move.fromServerId == move.targetServerId)
@@ -229,16 +347,26 @@ bool commitRoutingMove(RedisDatabase db, const RoutingMove move,
             args[next++] = id;
             args[next++] = owner;
         }
-        auto reply = db.eval!string(COMMIT_SCRIPT,
-            [RedisKeys.routingMove(move.networkId), RedisKeys.routingMoveStatus(move.moveId),
-             RedisKeys.networkAssignments(), RedisKeys.lease(move.networkId), RedisKeys.control(move.targetServerId),
-             RedisKeys.egressRoutingPolicy(), RedisKeys.server(move.targetServerId), RedisKeys.draining(move.targetServerId),
-             RedisKeys.routingSchemaVersion(), RedisKeys.serverAssignments(move.fromServerId),
-             RedisKeys.cmd(move.fromServerId, move.networkId), RedisKeys.cmd(move.targetServerId, move.networkId)],
-            args);
-        if (reply.empty) throw new RoutingMoveUnavailableException();
-        return reply.front == "1";
+        return args;
     } catch (RoutingMoveConflictException e) { throw e; }
+    catch (Exception) { throw new RoutingMoveUnavailableException(); }
+}
+
+private bool commitPreparedRoutingMove(const RoutingMove move, string[] args, ref NetworkWriter writer) {
+    try {
+        return runNetworkRedisMutation!bool(writer, (RedisDatabase actualDb) {
+                auto reply = actualDb.eval!string(COMMIT_SCRIPT,
+                    [RedisKeys.routingMove(move.networkId), RedisKeys.routingMoveStatus(move.moveId),
+                     RedisKeys.networkAssignments(), RedisKeys.lease(move.networkId), RedisKeys.control(move.targetServerId),
+                     RedisKeys.egressRoutingPolicy(), RedisKeys.server(move.targetServerId), RedisKeys.draining(move.targetServerId),
+                     RedisKeys.routingSchemaVersion(), RedisKeys.serverAssignments(move.fromServerId),
+                     RedisKeys.cmd(move.fromServerId, move.networkId), RedisKeys.cmd(move.targetServerId, move.networkId)],
+                    args);
+                if (reply.empty) throw new RoutingMoveUnavailableException();
+                return reply.front == "1";
+            });
+    } catch (NetworkWriteUnavailableException e) { throw e; }
+    catch (RoutingMoveConflictException e) { throw e; }
     catch (RoutingMoveUnavailableException e) { throw e; }
     catch (Exception) { throw new RoutingMoveUnavailableException(); }
 }
@@ -322,6 +450,7 @@ return s.moveId
 LUA";
 
 private enum LOAD_SCRIPT = STATUS_FUNCTIONS ~ q"LUA
+if redis.call('EXISTS', 'irc:holder:maintenance:write-exclusion') ~= 0 then error('network maintenance') end
 local s = readStatus(KEYS[1])
 if not s then return '' end
 if s.moveId ~= ARGV[1] then error('routing move status identity mismatch') end

@@ -45,7 +45,7 @@ services:
   mongo:
     <<: *runtime
     image: mongo:7
-    volumes: [mongo-data:/data/db]
+    volumes: [mongo-data:/data/db, mongo-config:/data/configdb]
     networks:
       fixture: {ipv4_address: 192.0.2.3}
     healthcheck:
@@ -154,5 +154,6 @@ networks:
 volumes:
   redis-data: {labels: *labels}
   mongo-data: {labels: *labels}
+  mongo-config: {labels: *labels}
   holder-ipc: {labels: *labels}
   fixture-certs: {labels: *labels}

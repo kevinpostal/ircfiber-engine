@@ -13,6 +13,13 @@ context=${ROUTING_REGRESSION_DOCKER_CONTEXT:-$(docker context show)}
 dock() { command docker --context "$context" "$@"; }
 endpoint=$(dock context inspect "$context" --format '{{.Endpoints.docker.Host}}')
 [[ $endpoint == unix:///* ]] || fail 'only a local Unix-socket Docker context is permitted'
+if [[ $mode == coordinated_holder ]]; then
+    [[ $(uname -s) == Linux && $(uname -m) == x86_64 && $EUID == 0 && ! -e /.dockerenv &&
+       -f /sys/fs/cgroup/cgroup.controllers && $endpoint == unix:///var/run/docker.sock ]] ||
+        fail 'coordinated requires native Colima Linux x86_64 HOST ROOT, cgroup v2 and /var/run/docker.sock; no helper/macOS fallback'
+    [[ $(readlink /proc/self/ns/pid) == "$(readlink /proc/1/ns/pid)" ]] ||
+        fail 'coordinated requires the actual host PID namespace'
+fi
 export ROUTING_REGRESSION_RUN="regression-$(date +%s)-$$"
 export ROUTING_REGRESSION_PORT=${ROUTING_REGRESSION_PORT:-18091}
 [[ $ROUTING_REGRESSION_PORT =~ ^[0-9]+$ && $ROUTING_REGRESSION_PORT -gt 1024 && $ROUTING_REGRESSION_PORT -lt 65536 ]] || fail 'invalid fixture gateway port'
@@ -97,14 +104,34 @@ if [[ $mode == coordinated_holder ]]; then
     export ROUTING_REGRESSION_HOLDER_SWAP=3145728000
     export ROUTING_REGRESSION_MOCK_COMMAND='python3 -u /fixture/holder_engine_qualification.py serve'
     export ROUTING_REGRESSION_SOCKS_COMMAND='python3 -u /fixture/holder_engine_qualification.py socks'
-    export HOLDER_MAINTENANCE_HELPER="$SCRIPT_DIR/../../../site/scripts/ircfiber-holder-maintenance.py"
-    export HOLDER_ENGINE_EVIDENCE_DIR=${HOLDER_ENGINE_EVIDENCE_DIR:-${TMPDIR:-/tmp}/$ROUTING_REGRESSION_RUN-coordinated}
-    [[ ! -e $HOLDER_ENGINE_EVIDENCE_DIR ]] || fail 'coordinated evidence directory must be fresh'
+    : "${HOLDER_MAINTENANCE_HELPER:?explicit final Site scripts/ircfiber-holder-maintenance.py required}"
+    [[ -f $HOLDER_MAINTENANCE_HELPER ]] || fail 'final Site collector helper source missing'
+    export HOLDER_MAINTENANCE_HELPER
+    for variable in COORDINATED_QUALIFICATION_FILE COORDINATED_LIFECYCLE_FILE; do
+        supplied=${!variable:-}
+        [[ $supplied == /* && -f $supplied ]] || fail "$variable requires actual supplied qualification/review JSON"
+        export "$variable=$supplied"
+    done
+    : "${COORDINATED_RECEIPT_DIR:?directory of actual SHA256-named build/review/behavior receipts required}"
+    [[ $COORDINATED_RECEIPT_DIR == /* && -d $COORDINATED_RECEIPT_DIR ]] || fail 'actual receipt directory missing'
+    export COORDINATED_RECEIPT_DIR
+    mkdir -p -m 700 /var/lib/ircfiber-coordinated
+    export COORDINATED_ROOT_DIR=${COORDINATED_ROOT_DIR:-/var/lib/ircfiber-coordinated/$ROUTING_REGRESSION_RUN}
+    [[ $COORDINATED_ROOT_DIR == /var/lib/ircfiber-coordinated/* && ! -e $COORDINATED_ROOT_DIR ]] ||
+        fail 'fresh root-private native host evidence path required'
+    export HOLDER_ENGINE_EVIDENCE_DIR=${HOLDER_ENGINE_EVIDENCE_DIR:-/var/lib/ircfiber-coordinated/$ROUTING_REGRESSION_RUN-public}
+    [[ ! -e $HOLDER_ENGINE_EVIDENCE_DIR ]] || fail 'coordinated public evidence directory must be fresh'
     mkdir -m 700 "$HOLDER_ENGINE_EVIDENCE_DIR"
+    export COORDINATED_SYSAGENT_TOKEN
+    COORDINATED_SYSAGENT_TOKEN=$(python3 -c 'import secrets;print(secrets.token_urlsafe(48))')
+    printf 'Private native host evidence (retained on all outcomes): %s\n' "$COORDINATED_ROOT_DIR"
     export COORDINATED_SESSIONS=${COORDINATED_SESSIONS:-16} COORDINATED_CASE=${COORDINATED_CASE:-complete}
     [[ $COORDINATED_SESSIONS =~ ^[0-9]+$ ]] && (( COORDINATED_SESSIONS >= 16 && COORDINATED_SESSIONS <= 250 )) ||
         fail 'coordinated physical fixture requires 16..250 sessions; separate full-load gate remains mandatory'
-    [[ $COORDINATED_CASE == complete || $COORDINATED_CASE == ambiguous ]] || fail 'unsupported coordinated case'
+    case "$COORDINATED_CASE" in
+        complete|ambiguous|already-stopped|unknown-authority|replacement|restart-inflight|term-refusal|continuous-restart) ;;
+        *) fail 'unsupported coordinated physical case';;
+    esac
     [[ ${COORDINATED_SOURCE_REVISION:-} == fea67fb48f891791a443367f9169ed32bc5a923e ]] ||
         fail 'COORDINATED_SOURCE_REVISION must be the reviewed old-holder IPC lifecycle commit, not engine base provenance'
     for variable in COORDINATED_ENGINE_IMAGE COORDINATED_HOLDER_IMAGE; do
@@ -167,6 +194,13 @@ fi
 cleanup() {
     local status=$? kind ids id template key
     trap - EXIT
+    if [[ $mode == coordinated_holder ]]; then
+        # No broad stop/prune/down on success OR failure: ambiguous actors must
+        # stay exactly as observed and all private/failure artifacts survive.
+        printf 'Retaining exact coordinated stack %s and host evidence %s (status %s)\n' \
+            "$COMPOSE_PROJECT_NAME" "$COORDINATED_ROOT_DIR" "$status" >&2
+        exit "$status"
+    fi
     for kind in container network volume; do
         case "$kind" in
             container)
@@ -235,6 +269,7 @@ dc exec -T redis redis-cli SET irc:config:routingSchemaVersion 1 NX >/dev/null
 [[ $(dc exec -T redis redis-cli --raw GET irc:config:routingSchemaVersion) == 1 ]] || fail 'fixture schema seed failed'
 services=(mock-irc ircfiber-holder ircfiber-gateway egress-a ircfiber-engine)
 [[ $mode != holder_engine_qualification && $mode != coordinated_holder ]] || services+=(egress-b)
+[[ $mode != coordinated_holder ]] || services+=(ircfiber-sysagent)
 dc up -d --no-build --wait --wait-timeout 120 "${services[@]}"
 export DOCKER_CONTEXT="$context" ROUTING_REGRESSION_READY=1
 export HOTSWAP_MOCK_COMPOSE="" HOTSWAP_USE_RUNNING_STACK=1

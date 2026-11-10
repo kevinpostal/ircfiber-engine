@@ -246,6 +246,64 @@ independent prerequisites.
 Its in-flight DIAL fixture sends a real LF delimiter and requires an actual
 `CONNECTED` reply before claiming admission; a literal backslash-n is not framing.
 
+Queued configuration, connection lifecycle, migration and provider retarget
+effects acquire the existing Common logical writer at execution, not merely at
+queue insertion. One admission spans canonical Mongo writes, Redis assignment/
+lease evidence, commands and external retarget completion. Ambiguous replies
+retain non-expiring writer evidence; maintenance refuses a cut while it remains.
+Ordinary IRC, heartbeats, matching-owner lease renewal and held-session restoration
+remain available. Restoration validates the canonical owner and held claim before
+starting its reader; it does not bypass the canonical write exclusion.
+
+During exclusion, validated existing owners may durably journal RAW records with
+pending catalog provenance. Replay must prove the current canonical owner and
+catalog before history persistence or checkpoint advancement. Transferred/deleted
+owners are quarantined visibly rather than silently discarded or replayed under
+an unverified owner.
+
+`dub build --config=consumer-write-test` builds the real logical-writer regression
+driver. Run it with `IRCFIBER_CONSUMER_TEST_ISOLATED=1`, explicit loopback
+`IRCFIBER_HISTORY_TEST_REDIS_URL` (initially empty) and
+`IRCFIBER_HISTORY_TEST_MONGO_URL`, plus a run-owned holder endpoint/token in
+`IRCFIBER_CONSUMER_TEST_HOLDER_ADDR`/`IRCFIBER_CONSUMER_TEST_HOLDER_TOKEN`.
+`IRCFIBER_CONSUMER_TEST_EGRESS_LABEL` and
+`IRCFIBER_CONSUMER_TEST_EGRESS_LOCATION` must identify a disposable real
+controllable tailscaled slot configured through the usual pool/control-directory
+settings. Missing fixtures fail, never skip. This executes queued effects,
+held-reader journal restart/replay and real provider completion/lost-ACK races.
+
+The coordinated regression collector runs as a native Linux x86_64 host-root
+child, not a privileged Docker helper. Its full owned-daemon inventory, actual
+kernel process/cgroup/executable evidence and immutable receipt inputs remain
+mandatory. Failed fixtures retain evidence and owned containers for diagnosis;
+remove only that fixture's exact containers and volumes before another run.
+Scratch maintenance admission is explicitly `qualified=false`,
+`purpose=isolatedqualification`, `checks=[]`. It is available only on the
+native root-owned disposable Colima host after complete container/image,
+volume/network and exact tool-byte checks, with retained hash-named real
+build/source/consumer receipts (`artifactBindings`, including the holder, plus
+the writer receipt subset). It never authorizes production maintenance.
+Supply `COORDINATED_QUALIFICATION_FILE`/`COORDINATED_RECEIPT_DIR` to the coordinated
+fixture, or `HOLDER_QUALIFICATION_FILE`/`HOLDER_RECEIPT_DIR` to online maintenance
+qualification. Production still requires a completed `qualified=true` receipt
+containing every physical check. Mongo's config volume is explicitly owned;
+unlabelled anonymous volumes are not exempted from the fixture denominator.
+The coordinated native domain cases exercise the actual Site executable and
+owner network namespace against real Redis: unique alias/DB0/nonce success,
+another real Redis domain, an actual owner `/1` configuration, live Docker alias
+collision, fresh inventory after restoration, and nonce replacement. Each
+specific refusal and source/binary identity is retained before deleting only
+the exact temporary domain containers. These cases are not a coordinated cut
+or a full-load qualification receipt.
+
+The selected rollout is the atomic old `f9a5` engine + `8e7447` holder to the
+new engine + new holder. No interim or fallback new-engine/old-holder start is
+authorized. `legacy_holder_continuity` is therefore inapplicable to this order,
+not waived or passed. Exact old-source/kernel provenance, snapshot compatibility,
+positive producer absence and the physical paired cut remain mandatory.
+
+
+
 
 ## Links
 

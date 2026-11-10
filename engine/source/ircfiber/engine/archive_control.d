@@ -4,7 +4,7 @@ import core.time : msecs, seconds, MonoTime;
 import std.datetime : Clock;
 import std.array : empty;
 import std.conv : to;
-import std.uuid : parseUUID, randomUUID;
+import std.uuid : UUID, parseUUID, randomUUID;
 import vibe.core.core : runTask, sleep, setTimer;
 import vibe.core.task : Task;
 import vibe.data.json : Json, parseJsonString, serializeToJson;
@@ -19,9 +19,12 @@ import ircfiber.archive_protocol : archiveProtocolVersion, archiveOwnerKey,
 import ircfiber.redis.protocol : ControlMessage, RedisKeys;
 import ircfiber.models.irc_event : IRCRawEvent;
 import ircfiber.storage.buffer : archiveBufferLineageLua;
-import ircfiber.models.network : normalizeChannelName;
+import ircfiber.models.network : NetworkConfig, normalizeChannelName;
 import ircfiber.logging : logJsonMap;
 import ircfiber.irc.routing_moves : isRoutingMoveId;
+import ircfiber.network_write_gate : NetworkWriter, runNetworkWrite, runNetworkRedisMutation;
+import vibe.db.redis.redis : RedisDatabase;
+import ircfiber.holder_client : HolderEntry;
 
 private long nowMs() { return Clock.currTime.stdTime / 10_000 - 62_135_596_800_000L; }
 private bool canonicalId(string id) { return isCanonicalArchiveOperationId(id); }
@@ -49,7 +52,7 @@ final class ArchiveControl {
     private long[1_024] gapNoticeTimes;
     private size_t nextGapNoticeSlot;
     private struct ScopeRegistration {
-        string networkId, preparedOwnerId;
+        string networkId, preparedOwnerId, validatedOwnerId;
         bool ready;
         long retryAtMs;
         string moveId, moveOwnerId, barrierNonce;
@@ -90,6 +93,45 @@ final class ArchiveControl {
         return index != size_t.max && registrations[index].ready;
     }
 
+    /// A canonical existing producer may retain bounded raw journal records
+    /// while catalog mutation is temporarily excluded. This is not Mongo or
+    /// checkpoint admission; the durable record carries its exact owner.
+    string pendingScopeOwner(string network, string owner) {
+        if (stopping || !started || !canonicalId(owner)) return "";
+        const index = scopeRegistration(network);
+        if (index == size_t.max || registrations[index].ready
+                || registrations[index].validatedOwnerId != owner) return "";
+        return owner;
+    }
+
+    /// cfg/user came from the caller's canonical network read, never META or
+    /// a holder tag. Bind it to both the current manager and the concrete held
+    /// claim before ATTACH can start producing. No I/O or catalog admission.
+    bool admitHeldScope(ref EngineContext ctx, const ref NetworkConfig config,
+            UUID userId, const ref HolderEntry entry) {
+        if (stopping || shutdownRequested || config.id == UUID.init
+                || config.disabled || config.servicesProvisioningPending
+                || ctx.connManager is null || !entry.id.length
+                || !entry.instance.length || entry.connectedAtMs <= 0 || entry.state != "open")
+            return false;
+        const network = config.id.toString();
+        const owner = userId.toString();
+        auto client = ctx.connManager.getClient(config.id);
+        if (!canonicalId(owner) || entry.tag.networkId != network || entry.tag.userId != owner
+                || client is null || client.getStopping || client.getOwnerId != userId
+                || ctx.connManager.getOwnerId(config.id) != owner)
+            return false;
+        const current = client.getConfig();
+        if (current.id != config.id || current.host != config.host || current.port != config.port
+                || current.tls != config.tls || current.routing != config.routing)
+            return false;
+        const index = scopeRegistration(network);
+        if (index == size_t.max) return false;
+        if (registrations[index].preparedOwnerId != owner) registrations[index].ready = false;
+        registrations[index].validatedOwnerId = owner;
+        return true;
+    }
+
     /// Prepare before starting a fresh producer, not on the event processor or
     /// a held relay's ATTACH/read path. This also works before start(): starting
     /// the controller must not discard a positively acknowledged preparation.
@@ -101,6 +143,18 @@ final class ArchiveControl {
         if (registrations[index].ready && registrations[index].preparedOwnerId == expectedOwner) return true;
         registrations[index].ready = false;
         registrations[index].preparedOwnerId = null;
+        registrations[index].validatedOwnerId = null;
+        try {
+            const id = parseUUID(network);
+            auto row = ctx.networkRepo.findByIdWithUser(id);
+            if (row.config.id != id || row.config.disabled || row.config.servicesProvisioningPending
+                    || row.userId.toString() != expectedOwner || ctx.connManager is null
+                    || ctx.connManager.getClient(id) is null
+                    || ctx.connManager.getOwnerId(id) != expectedOwner
+                    || ctx.redis.getDb().hget(RedisKeys.networkAssignments(), network) != ctx.localServer.serverId)
+                return false;
+            registrations[index].validatedOwnerId = expectedOwner;
+        } catch (Exception) { return false; }
         const deadline = MonoTime.currTime + 5.seconds;
         auto waitingTask = Task.getThis();
         auto timer = setTimer(5.seconds, { waitingTask.interrupt(); });
@@ -263,6 +317,19 @@ final class ArchiveControl {
     private string[] registerCatalog(ref EngineContext ctx, string network, string target = "",
             string expectedOwner = "") {
         string[66] additions;
+        const count = catalogAdditions(ctx, network, target, additions);
+        return ctx.messageRepo.registerArchiveScopes(ctx.redis, network, additions[0 .. count], expectedOwner);
+    }
+
+    private string[] registerCatalog(ref EngineContext ctx, string network, string target,
+            string expectedOwner, ref NetworkWriter writer) {
+        string[66] additions;
+        const count = catalogAdditions(ctx, network, target, additions);
+        return ctx.messageRepo.registerArchiveScopes(ctx.redis, network, additions[0 .. count], expectedOwner, writer);
+    }
+
+    private size_t catalogAdditions(ref EngineContext ctx, string network, string target,
+            ref string[66] additions) {
         size_t count;
         const raw = ctx.redis.getDb().get(archiveOwnerKey(network));
         if (raw.length) {
@@ -273,13 +340,22 @@ final class ArchiveControl {
         }
         additions[count++] = ctx.localServer.serverId;
         if (target.length) additions[count++] = target;
-        return ctx.messageRepo.registerArchiveScopes(network, additions[0 .. count], expectedOwner);
+        return count;
     }
 
     private void installCatalog(ref EngineContext ctx, string network, string[] scopes) {
         auto result = ctx.redis.getDb().eval!string(archiveInstallCatalogLua,
             [archiveOwnerKey(network)], [network, serializeToJson(scopes).toString(), nowMs().to!string]);
         if (result.empty || result.front != "1") throw new Exception("archive_scope_catalog_unavailable");
+    }
+
+    private void installCatalog(ref EngineContext ctx, string network, string[] scopes,
+            ref NetworkWriter writer) {
+        runNetworkRedisMutation!void(writer, (RedisDatabase db) {
+            auto result = db.eval!string(archiveInstallCatalogLua,
+                [archiveOwnerKey(network)], [network, serializeToJson(scopes).toString(), nowMs().to!string]);
+            if (result.empty || result.front != "1") throw new Exception("archive_scope_catalog_unavailable");
+        });
     }
 
     void stop() { acceptingControls = false; stopping = true; }
@@ -333,15 +409,21 @@ final class ArchiveControl {
     /// Register both sides before allowing a quiescent source to close. History
     /// provenance never follows live routing and never expires with a heartbeat.
     bool prepareHandoff(ref EngineContext ctx, string network, string target) {
+        return runNetworkWrite!bool(ctx.redis, (ref NetworkWriter writer) {
+            return prepareHandoff(ctx, network, target, writer);
+        });
+    }
+
+    bool prepareHandoff(ref EngineContext ctx, string network, string target, ref NetworkWriter writer) {
         if (stopping || shutdownRequested || !target.length || target.length > 128) return false;
         const index = scopeRegistration(network);
         if (index == size_t.max) return false;
         try {
             const owner = localScopeOwner(ctx, network);
             if (!canonicalId(owner)) return false;
-            auto scopes = registerCatalog(ctx, network, target, owner);
+            auto scopes = registerCatalog(ctx, network, target, owner, writer);
             if (!scopes.length) return false;
-            installCatalog(ctx, network, scopes);
+            installCatalog(ctx, network, scopes, writer);
             if (stopping || shutdownRequested) return false;
             registrations[index].preparedOwnerId = owner;
             registrations[index].ready = true;

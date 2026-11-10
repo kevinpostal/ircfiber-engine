@@ -198,6 +198,10 @@ ENV IRCFIBER_VERSION=0.3.0 \
     IRCFIBER_BUILD_COMMIT_URL=https://github.com/kevinpostal/ircfiber-engine/commit/$GIT_HASH
 LABEL org.opencontainers.image.revision=$GIT_HASH
 LABEL com.ircfiber.routing-policy-version="1"
+# Canonical/control writers use the shared logical exclusion through all effects.
+# Qualification additionally binds this exact image to reviewed source, behavior
+# receipts and the actual kernel executable; this label alone is not authority.
+LABEL com.ircfiber.coordinated-exclusion-version="1"
 
 # ============================================================================
 # Stage: runtime-holder — slim Ubuntu + the connection holder only.
