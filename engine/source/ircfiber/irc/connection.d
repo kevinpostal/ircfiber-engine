@@ -19616,15 +19616,17 @@ Ircv3Check[] maintenanceAdmissionRegressionChecks() {
     {
         auto starting = new PersistentIRCClient(config, channel);
         size_t preparations;
-        bool releasePreparation, preparationFinished;
+        bool releasePreparation, preparationFinished, preparationFailed;
         scope(exit) releasePreparation = true;
-        runTask({
+        runTask(() nothrow {
             scope(exit) preparationFinished = true;
-            starting.start(() {
-                preparations++;
-                while (!releasePreparation) sleep(1.msecs);
-                return true;
-            });
+            try {
+                starting.start(() {
+                    preparations++;
+                    while (!releasePreparation) sleep(1.msecs);
+                    return true;
+                });
+            } catch (Throwable) { preparationFailed = true; }
         });
         const admissionDeadline = unixMsNow() + 1000;
         while (!preparations && unixMsNow() < admissionDeadline) sleep(1.msecs);
@@ -19635,7 +19637,7 @@ Ircv3Check[] maintenanceAdmissionRegressionChecks() {
         const completionDeadline = unixMsNow() + 1000;
         while (!preparationFinished && unixMsNow() < completionDeadline) sleep(1.msecs);
         checks ~= Ircv3Check("fresh producer preparation is single-flight and shutdown reclaims it without starting a stale loop",
-            preparations == 1 && pendingRetained && preparationFinished
+            preparations == 1 && pendingRetained && preparationFinished && !preparationFailed
             && starting.getMoveQuiescent() && !starting.loopRunning && !starting.holderConnId.length);
         auto held = new PersistentIRCClient(config, channel);
         held.state = ConnectionState.connected;

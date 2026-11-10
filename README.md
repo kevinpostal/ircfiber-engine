@@ -233,6 +233,8 @@ credential-free loopback Mongo isolation and failpoint opt-in. Shell launchers i
 `legacy_holder_continuity.sh` covers old-holder engine transfer;
 `holder_engine_qualification.sh` and `holder_memory_reliability.sh` cover the
 candidate holder. `archive_reliability.sh` is the candidate-only archive proof.
+The memory harness treats asynchronous producer-preparation exceptions as a
+failed check, while satisfying vibe's non-throwing task callback contract.
 Smoke-duration runs are not the full warm-up/soak qualification receipts.
 
 
