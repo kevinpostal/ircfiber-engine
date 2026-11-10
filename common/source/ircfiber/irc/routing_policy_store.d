@@ -8,7 +8,8 @@ import vibe.data.json : Json, parseJsonString;
 import vibe.db.redis.redis : RedisDatabase;
 import ircfiber.irc.routing_policy;
 import ircfiber.redis.protocol : RedisKeys;
-import ircfiber.network_write_gate : NetworkWriteUnavailableException;
+import ircfiber.network_write_gate : NetworkWriteUnavailableException, NetworkWriter,
+    runNetworkWrite, runNetworkRedisMutation;
 
 class RoutingPolicyUnavailableException : Exception {
     this(string message = "Routing policy unavailable") { super(message); }
@@ -88,10 +89,38 @@ bool routingEnginesPolicyAware(RedisDatabase db) {
 /// Revision and rollback activation are committed together, with no TTL.
 RoutingPolicyDocument saveRoutingPolicy(RedisDatabase db, long expectedRevision,
                                         const RoutingPolicyDocument proposed) {
+    auto validated = validatePolicySave(expectedRevision, proposed);
+    Exception refusal;
+    auto saved = runNetworkWrite!RoutingPolicyDocument(db, (ref NetworkWriter writer) {
+        // Surface authoritative domain refusals after the owner returns.
+        // An uncertain Redis callback still leaves its tracked step sticky.
+        try return saveValidatedRoutingPolicy(db, expectedRevision, validated, writer);
+        catch (RoutingPolicyConflictException e) { refusal = e; }
+        catch (RoutingUpgradeException e) { refusal = e; }
+        catch (RoutingPolicyUnavailableException e) { refusal = e; }
+        return RoutingPolicyDocument.init;
+    });
+    if (refusal !is null) throw refusal;
+    return saved;
+}
+
+RoutingPolicyDocument saveRoutingPolicy(RedisDatabase db, long expectedRevision,
+        const RoutingPolicyDocument proposed, ref NetworkWriter writer) {
+    auto validated = validatePolicySave(expectedRevision, proposed);
+    return saveValidatedRoutingPolicy(db, expectedRevision, validated, writer);
+}
+
+private RoutingPolicyDocument validatePolicySave(long expectedRevision,
+        const RoutingPolicyDocument proposed) {
     auto validated = routingPolicyFromJson(proposed.toJson());
     if (expectedRevision < 0 || expectedRevision >= MAX_ROUTING_POLICY_REVISION
             || validated.revision != expectedRevision)
         throw new RoutingValidationException("expectedRevision must match policy.revision and permit an exact increment");
+    return validated;
+}
+
+private RoutingPolicyDocument saveValidatedRoutingPolicy(RedisDatabase db, long expectedRevision,
+        const RoutingPolicyDocument validated, ref NetworkWriter writer) {
     requireRoutingUpgrade(db);
     string raw;
     auto current = readPolicy(db, raw);
@@ -101,13 +130,16 @@ RoutingPolicyDocument saveRoutingPolicy(RedisDatabase db, long expectedRevision,
     auto next = validated.toJson();
     next["revision"] = Json("__ircfiber_revision__");
     try {
-        auto reply = db.eval!string(SAVE_SCRIPT,
-            [RedisKeys.egressRoutingPolicy(), RedisKeys.routingHardBlocksActivated(),
-             RedisKeys.routingSchemaVersion(), RedisKeys.serverList()],
-            [raw, expectedRevision.to!string, next.toString(), hasAdministrativeBlocks(validated) ? "1" : "0",
-             RedisKeys.server("")]);
-        if (reply.empty) throw new RoutingPolicyUnavailableException();
-        auto result = parseJsonString(reply.front.idup);
+        const replyRaw = runNetworkRedisMutation!string(writer, (RedisDatabase actualDb) {
+            auto reply = actualDb.eval!string(SAVE_SCRIPT,
+                [RedisKeys.egressRoutingPolicy(), RedisKeys.routingHardBlocksActivated(),
+                 RedisKeys.routingSchemaVersion(), RedisKeys.serverList()],
+                [raw, expectedRevision.to!string, next.toString(), hasAdministrativeBlocks(validated) ? "1" : "0",
+                 RedisKeys.server("")]);
+            if (reply.empty) throw new RoutingPolicyUnavailableException();
+            return reply.front.idup;
+        });
+        auto result = parseJsonString(replyRaw);
         if (result["state"].type != Json.Type.string) throw new RoutingPolicyUnavailableException();
         switch (result["state"].get!string) {
             case "ok":

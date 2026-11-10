@@ -37,6 +37,9 @@ import ircfiber.engine.archive_worker : ArchiveWorker;
 import ircfiber.engine.archive_control : applyArchiveRedisPurge, stopArchive;
 import ircfiber.runtime_memory : compactRuntimeMemorySample;
 import ircfiber.runtime_diagnostic : DiagnosticStatus;
+import std.uuid : UUID;
+import ircfiber.models.network : NetworkConfig;
+import ircfiber.holder_client : HolderEntry;
 /// Global engine context shared across the process.
 __gshared EngineContext g_ctx;
 
@@ -167,6 +170,10 @@ void main() {
         ctx.connManager.prepareFreshArchiveScope = (string network, string owner) {
             return ctx.archiveControl.prepareScope(ctx, network, owner);
         };
+        ctx.connManager.prepareHeldArchiveScope =
+            (const ref NetworkConfig config, UUID owner, const ref HolderEntry entry) {
+                ctx.archiveControl.admitHeldScope(ctx, config, owner, entry);
+            };
     }
 
     // Register this server in the Redis registry. Must happen after
@@ -197,7 +204,7 @@ void main() {
             ctx.archiveWorker = new ArchiveWorker(ctx.archiveSpool, ctx.messageRepo,
                 (ref const ArchiveRecord record) {
                     return applyArchiveRedisPurge(ctx, record);
-                });
+                }, ctx.redis);
             ctx.archiveWorker.start();
             ctx.archiveControl.start(ctx);
         } catch (Throwable e) {

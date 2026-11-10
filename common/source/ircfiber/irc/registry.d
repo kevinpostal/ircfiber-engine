@@ -16,11 +16,12 @@ import ircfiber.db.network : NetworkRepository;
 import ircfiber.irc.routing_policy : EffectiveRoutingPolicy, resolveRoutingPolicy,
     routingPolicyFromJson, routeToken;
 import ircfiber.irc.routing_policy_store : loadRoutingPolicy, requireRoutingUpgrade,
-    RoutingPolicyUnavailableException;
+    RoutingPolicyUnavailableException, RoutingUpgradeException;
 import ircfiber.irc.routing_moves : requestNetworkMove, networkMoveFenced,
     RoutingMoveConflictException, NETWORK_ROUTING_LEASE_TTL_SECONDS;
 import ircfiber.netaddr : canonicalHost;
-import ircfiber.network_write_gate : NetworkWriteUnavailableException;
+import ircfiber.network_write_gate : NetworkWriteUnavailableException, NetworkWriter,
+    runNetworkWrite, runNetworkRedisMutation;
 
 /// Summary of connections per IRC host for the admin dashboard.
 struct HostConnectionSummary {
@@ -92,6 +93,19 @@ final class ServerRegistry {
         if (server.serverId.length == 0) {
             throw new Exception("Server ID must be non-empty");
         }
+        runNetworkWrite!void(redis, (ref NetworkWriter writer) {
+            registerServer(server, writer);
+        });
+    }
+
+    void registerServer(ConnectionServer server, ref NetworkWriter writer) {
+        if (!server.serverId.length) throw new Exception("Server ID must be non-empty");
+        runNetworkRedisMutation!void(writer, (RedisDatabase actualDb) {
+            registerServerAdmitted(server, actualDb);
+        });
+    }
+
+    private void registerServerAdmitted(ConnectionServer server, RedisDatabase db) {
 
         // Registration refreshes capabilities too; heartbeat alone must not
         // retain an older process's transport advertisement.
@@ -105,7 +119,9 @@ final class ServerRegistry {
             db.hset(RedisKeys.server(server.serverId), "isHealthy", "true");
             db.hdel(RedisKeys.server(server.serverId), "draining");
             db.del(RedisKeys.draining(server.serverId));
-            updateHeartbeat(server.serverId);
+            db.hset(RedisKeys.server(server.serverId), "lastHeartbeat", server.lastHeartbeat.to!string);
+            db.hdel(RedisKeys.server(server.serverId), "hotswapAt");
+            db.sadd(RedisKeys.serverList(), server.serverId);
             return;
         }
 
@@ -127,7 +143,7 @@ final class ServerRegistry {
         db.hset(key, "data", server.toJson().toString());
         // A fresh registration ends any hot-swap grace window left by the
         // previous process (see markHotSwap).
-        try { db.hdel(key, "hotswapAt"); } catch (Exception) {}
+        db.hdel(key, "hotswapAt");
 
         // Add to server list
         db.sadd(RedisKeys.serverList(), server.serverId);
@@ -150,25 +166,62 @@ final class ServerRegistry {
     /// source cannot republish an assigned-away row after a completed move.
     void publishServerAssignments(string serverId, string[] networkIds) {
         if (!serverId.length) return;
-        string[] args = [serverId];
+        string[] args = [serverId, "check"];
         foreach (id; networkIds) {
             try { if (id.length && parseUUID(id[]) != UUID.init) args ~= id; }
             catch (Exception) {}
         }
-        db.eval!string(q"LUA
+        auto reply = db.eval!string(PUBLISH_ASSIGNMENTS_SCRIPT,
+            [RedisKeys.serverAssignments(serverId), RedisKeys.networkAssignments()], args);
+        if (reply.empty) throw new Exception("Missing assignment evidence acknowledgement");
+        if (reply.front == "1") return; // unchanged evidence: ordinary heartbeat
+        args[1] = "write";
+        runNetworkWrite!void(redis, (ref NetworkWriter writer) {
+            publishAssignmentsAdmitted(serverId, args, writer);
+        });
+    }
+
+    void publishServerAssignments(string serverId, string[] networkIds, ref NetworkWriter writer) {
+        if (!serverId.length) return;
+        string[] args = [serverId, "write"];
+        foreach (id; networkIds) {
+            try { if (id.length && parseUUID(id[]) != UUID.init) args ~= id; }
+            catch (Exception) {}
+        }
+        publishAssignmentsAdmitted(serverId, args, writer);
+    }
+
+    private void publishAssignmentsAdmitted(string serverId, string[] args, ref NetworkWriter writer) {
+        runNetworkRedisMutation!void(writer, (RedisDatabase actualDb) {
+            auto written = actualDb.eval!string(PUBLISH_ASSIGNMENTS_SCRIPT,
+                [RedisKeys.serverAssignments(serverId), RedisKeys.networkAssignments()], args);
+            if (written.empty) throw new Exception("Missing assignment evidence acknowledgement");
+            if (written.front == "maintenance") throw new NetworkWriteUnavailableException();
+            if (written.front != "1") throw new Exception("Unconfirmed assignment evidence write");
+        });
+    }
+
+    private enum PUBLISH_ASSIGNMENTS_SCRIPT = q"LUA
 local mirrorType = redis.call('TYPE', KEYS[1]).ok
 if mirrorType ~= 'none' and mirrorType ~= 'hash' then error('invalid assignment mirror') end
--- Read/validate the canonical hash before replacing any evidence.
-local keep = {}
-for i = 2, #ARGV do
+local keep, count = {}, 0
+for i = 3, #ARGV do
   local owner = redis.call('HGET', KEYS[2], ARGV[i])
-  if not owner or owner == ARGV[1] then keep[#keep + 1] = ARGV[i] end
+  if (not owner or owner == ARGV[1]) and not keep[ARGV[i]] then
+    keep[ARGV[i]], count = true, count + 1
+  end
 end
+local same = redis.call('HLEN', KEYS[1]) == count
+for id, _ in pairs(keep) do
+  if redis.call('HGET', KEYS[1], id) ~= ARGV[1] then same = false end
+end
+if same then return '1' end
+if ARGV[2] == 'check' then return 'changed' end
+if redis.call('EXISTS', 'irc:holder:maintenance:write-exclusion') ~= 0 then return 'maintenance' end
 redis.call('DEL', KEYS[1])
-for _, id in ipairs(keep) do redis.call('HSET', KEYS[1], id, ARGV[1]) end
+for id, _ in pairs(keep) do redis.call('HSET', KEYS[1], id, ARGV[1]) end
 return '1'
-LUA", [RedisKeys.serverAssignments(serverId), RedisKeys.networkAssignments()], args);
-    }
+LUA";
 
     /**
      * Update server heartbeat.
@@ -224,9 +277,44 @@ LUA", [RedisKeys.serverAssignments(serverId), RedisKeys.networkAssignments()], a
     /// sees config overrides that take effect via the engine's heartbeat
     /// cycle. Called once per heartbeat, after updateHeartbeat().
     void syncServerState(string serverId, ref ConnectionServer server) {
-        auto key = RedisKeys.server(serverId);
-        db.hset(key, "data", server.toJson().toString());
+        const data = server.toJson().toString();
+        auto reply = db.eval!string(SYNC_SERVER_SCRIPT, [RedisKeys.server(serverId)], [data, "check"]);
+        if (reply.empty) throw new Exception("Missing server-state acknowledgement");
+        if (reply.front == "1") return; // runtime-only snapshot, unchanged placement
+        runNetworkWrite!void(redis, (ref NetworkWriter writer) {
+            syncServerState(serverId, server, writer);
+        });
     }
+
+    void syncServerState(string serverId, ref ConnectionServer server, ref NetworkWriter writer) {
+        const data = server.toJson().toString();
+        runNetworkRedisMutation!void(writer, (RedisDatabase actualDb) {
+            auto reply = actualDb.eval!string(SYNC_SERVER_SCRIPT,
+                [RedisKeys.server(serverId)], [data, "write"]);
+            if (reply.empty) throw new Exception("Missing server-state acknowledgement");
+            if (reply.front == "maintenance") throw new NetworkWriteUnavailableException();
+            if (reply.front != "1") throw new Exception("Unconfirmed server-state write");
+        });
+    }
+
+    // Full heartbeat snapshots may update runtime telemetry freely. A changed
+    // placement/configuration field is an operator effect, not a heartbeat.
+    private enum SYNC_SERVER_SCRIPT = q"LUA
+local raw = redis.call('HGET', KEYS[1], 'data')
+local old = raw and cjson.decode(raw) or {}
+local proposed = cjson.decode(ARGV[1])
+local same = raw ~= false
+for _, field in ipairs({'serverId','priority','maxConnections','fallbackOnly','bindAddress','port',
+    'routingPolicyVersion','supportedRoutes','ipv6Prefix','draining'}) do
+  if cjson.encode(old[field]) ~= cjson.encode(proposed[field]) then same = false end
+end
+if not same then
+  if ARGV[2] == 'check' then return 'changed' end
+  if redis.call('EXISTS', 'irc:holder:maintenance:write-exclusion') ~= 0 then return 'maintenance' end
+end
+redis.call('HSET', KEYS[1], 'data', ARGV[1])
+return '1'
+LUA";
 
     /// Check whether a server's draining flag is set in Redis.
     /// Returns true if the server has the draining flag, false if not found
@@ -263,17 +351,25 @@ LUA", [RedisKeys.serverAssignments(serverId), RedisKeys.networkAssignments()], a
     /// draining hash field, the TTL key, and re-persists clean server data
     /// so the gateway sees the server as available for new assignments.
     void clearDraining(string serverId) {
+        runNetworkWrite!void(redis, (ref NetworkWriter writer) {
+            clearDraining(serverId, writer);
+        });
+    }
+
+    void clearDraining(string serverId, ref NetworkWriter writer) {
+        runNetworkRedisMutation!void(writer, (RedisDatabase actualDb) {
         auto key = RedisKeys.server(serverId);
-        db.hdel(key, "draining");
-        try { db.del(RedisKeys.draining(serverId)); } catch (Exception) {}
+        actualDb.hdel(key, "draining");
+        actualDb.del(RedisKeys.draining(serverId));
         // Re-persist clean server data (without draining flag)
         auto existing = getServer(serverId);
         if (existing.serverId.length > 0) {
             existing.draining = false;
             existing.isHealthy = true;
-            db.hset(key, "isHealthy", "true");
-            syncServerState(serverId, existing);
+            actualDb.hset(key, "isHealthy", "true");
+            actualDb.hset(key, "data", existing.toJson().toString());
         }
+        });
     }
 
     /**
@@ -412,10 +508,11 @@ LUA", [RedisKeys.serverAssignments(serverId), RedisKeys.networkAssignments()], a
         size_t[string] hostLoads;
     }
 
-    private CapacityContext capacityContext(string networkId, string host = "") {
+    private CapacityContext capacityContext(string networkId, string host = "",
+            NetworkRepository repo = null) {
         CapacityContext ctx;
         ctx.networkId = networkId;
-        auto repo = new NetworkRepository(redis);
+        if (repo is null) repo = new NetworkRepository(redis);
         string savedHost;
         if (networkId.length) {
             const cfg = repo.findById(parseUUID(networkId[]));
@@ -476,8 +573,9 @@ LUA", [RedisKeys.serverAssignments(serverId), RedisKeys.networkAssignments()], a
     /// Omitted host uses saved context; explicit host is a prospective edit.
     bool routingServerEligible(const ConnectionServer server, const EffectiveRoutingPolicy effective,
                                string networkId = "", string host = "",
-                               string[string]* validatedAssignments = null) {
-        auto ctx = capacityContext(networkId, host);
+                               string[string]* validatedAssignments = null,
+                               NetworkRepository contextRepo = null) {
+        auto ctx = capacityContext(networkId, host, contextRepo);
         if (validatedAssignments !is null) *validatedAssignments = ctx.assignments;
         return eligible(server, effective, ctx);
     }
@@ -486,9 +584,9 @@ LUA", [RedisKeys.serverAssignments(serverId), RedisKeys.networkAssignments()], a
     /// and finally server ID. There is no registered-but-unhealthy fallback.
     ConnectionServer selectRoutingServer(const EffectiveRoutingPolicy effective,
                                         string excludeServerId = "", string networkId = "",
-                                        string host = "") {
+                                        string host = "", NetworkRepository contextRepo = null) {
         if (!effective.available || !effective.order.length) return ConnectionServer.init;
-        auto ctx = capacityContext(networkId, host);
+        auto ctx = capacityContext(networkId, host, contextRepo);
         ConnectionServer best;
         size_t bestTier = size_t.max;
         size_t bestLoad;
@@ -516,11 +614,26 @@ LUA", [RedisKeys.serverAssignments(serverId), RedisKeys.networkAssignments()], a
 
     string claimNetwork(string networkId, string targetServerId) {
         if (!networkId.length || !targetServerId.length) return "";
+        parseUUID(networkId[]);
+        Exception refusal;
+        auto owner = runNetworkWrite!string(redis, (ref NetworkWriter writer) {
+            try return claimNetwork(networkId, targetServerId, writer);
+            catch (RoutingUpgradeException e) { refusal = e; }
+            catch (RoutingPolicyUnavailableException e) { refusal = e; }
+            return "";
+        });
+        if (refusal !is null) throw refusal;
+        return owner;
+    }
+
+    string claimNetwork(string networkId, string targetServerId, ref NetworkWriter writer) {
+        if (!networkId.length || !targetServerId.length) return "";
+        auto repo = new NetworkRepository(redis, writer);
         // A heartbeat rewrites `data` while capacity is being read. Retry only
         // an explicitly rejected CAS, never an unavailable/ambiguous Redis call.
         // Each retry revalidates policy, target health and canonical capacity.
         foreach (attempt; 0 .. 3) {
-            const cfg = (new NetworkRepository(redis)).findById(parseUUID(networkId[]));
+            const cfg = repo.findById(parseUUID(networkId[]));
             if (cfg.id == UUID.init || cfg.disabled || cfg.servicesProvisioningPending) return "";
             requireRoutingUpgrade(db, targetServerId);
             const policyRaw = db.get(RedisKeys.egressRoutingPolicy());
@@ -536,7 +649,7 @@ LUA", [RedisKeys.serverAssignments(serverId), RedisKeys.networkAssignments()], a
             server.lastHeartbeat = live.lastHeartbeat;
             server.hotswapAt = live.hotswapAt;
             server.isHealthy = live.isHealthy;
-            auto ctx = capacityContext(networkId);
+            auto ctx = capacityContext(networkId, "", repo);
             const current = networkId in ctx.assignments;
             if (current !is null && (*current).length) return *current;
             if (!eligible(server, effective, ctx)) return "";
@@ -546,17 +659,18 @@ LUA", [RedisKeys.serverAssignments(serverId), RedisKeys.networkAssignments()], a
             version (RoutingPolicyTest) {
                 if (beforeClaimCommit !is null) beforeClaimCommit();
             }
-            auto reply = db.eval!string(CLAIM_SCRIPT,
-                [RedisKeys.networkAssignments(), RedisKeys.lease(networkId), RedisKeys.routingMove(networkId),
-                 RedisKeys.egressRoutingPolicy(), RedisKeys.server(targetServerId), RedisKeys.draining(targetServerId),
-                 RedisKeys.routingSchemaVersion()], args);
-            if (reply.empty) return "";
-            const result = reply.front;
+            auto reply = runNetworkRedisMutation!(string[])(writer, (RedisDatabase actualDb) {
+                return actualDb.eval!string(CLAIM_SCRIPT,
+                    [RedisKeys.networkAssignments(), RedisKeys.lease(networkId), RedisKeys.routingMove(networkId),
+                     RedisKeys.egressRoutingPolicy(), RedisKeys.server(targetServerId), RedisKeys.draining(targetServerId),
+                     RedisKeys.routingSchemaVersion()], args).array;
+            });
+            if (!reply.length) throw new Exception("Missing claim acknowledgement");
+            const result = reply[0];
             if (result == "conflict") continue;
             if (result == "maintenance") throw new NetworkWriteUnavailableException();
             if (result != "owner") return "";
-            reply.popFront();
-            return reply.empty ? "" : reply.front.idup;
+            return reply.length < 2 ? "" : reply[1];
         }
         return "";
     }
@@ -565,14 +679,30 @@ LUA", [RedisKeys.serverAssignments(serverId), RedisKeys.networkAssignments()], a
     /// the selector to replace an otherwise healthy capable owner.
     string assignNetwork(string networkId) {
         if (!networkId.length) return "";
-        const cfg = (new NetworkRepository(redis)).findById(parseUUID(networkId[]));
+        parseUUID(networkId[]);
+        Exception refusal;
+        auto owner = runNetworkWrite!string(redis, (ref NetworkWriter writer) {
+            try return assignNetwork(networkId, writer);
+            catch (RoutingUpgradeException e) { refusal = e; }
+            catch (RoutingPolicyUnavailableException e) { refusal = e; }
+            catch (RoutingMoveConflictException e) { refusal = e; }
+            return "";
+        });
+        if (refusal !is null) throw refusal;
+        return owner;
+    }
+
+    string assignNetwork(string networkId, ref NetworkWriter writer) {
+        if (!networkId.length) return "";
+        auto repo = new NetworkRepository(redis, writer);
+        const cfg = repo.findById(parseUUID(networkId[]));
         if (cfg.id == UUID.init || cfg.disabled || cfg.servicesProvisioningPending) return "";
         requireRoutingUpgrade(db);
         auto owner = getServerForNetwork(networkId);
         if (!owner.length) {
             // Bootstrap is not new provisioning. With no uniquely evidenced
             // previous owner it cannot know that a holder has no old socket.
-            getAllAssignments();
+            getAllAssignments(writer);
             owner = getServerForNetwork(networkId);
             if (!owner.length) return "";
         }
@@ -581,9 +711,9 @@ LUA", [RedisKeys.serverAssignments(serverId), RedisKeys.networkAssignments()], a
         if (!effective.available) throw new RoutingPolicyUnavailableException();
         if (!effective.order.length) return owner; // parked, never moved/dialed
         const currentServer = getServer(owner);
-        if (routingServerEligible(currentServer, effective, networkId)) return owner;
-        auto target = selectRoutingServer(effective, owner, networkId);
-        if (target.serverId.length) requestNetworkMove(db, networkId, target.serverId);
+        if (routingServerEligible(currentServer, effective, networkId, "", null, repo)) return owner;
+        auto target = selectRoutingServer(effective, owner, networkId, "", repo);
+        if (target.serverId.length) requestNetworkMove(db, networkId, target.serverId, writer);
         return owner; // destination becomes owner only after close acknowledgement
     }
 
@@ -677,16 +807,42 @@ LUA";
      *
      * Creates (or refreshes) a TTL-backed lease key so the gateway
      * can detect orphaned assignments when an engine stops heartbeating.
+     * Only a matching existing owner is an ordinary TTL renewal. Creating or
+     * replacing evidence requires the scoped writer, just like a claim.
      * Called by assignNetwork() and the engine's heartbeat loop.
      */
     void setLease(string networkId, string serverId) {
-        db.eval!string(q"LUA
+        auto reply = db.eval!string(LEASE_SCRIPT,
+            [RedisKeys.networkAssignments(), RedisKeys.lease(networkId)],
+            [networkId, serverId, NETWORK_ROUTING_LEASE_TTL_SECONDS.to!string, "check"]);
+        if (reply.empty) throw new Exception("Missing lease acknowledgement");
+        if (reply.front != "changed") return; // matching-owner TTL renewal only
+        runNetworkWrite!void(redis, (ref NetworkWriter writer) {
+            setLease(networkId, serverId, writer);
+        });
+    }
+
+    void setLease(string networkId, string serverId, ref NetworkWriter writer) {
+        runNetworkRedisMutation!void(writer, (RedisDatabase actualDb) {
+            auto reply = actualDb.eval!string(LEASE_SCRIPT,
+                [RedisKeys.networkAssignments(), RedisKeys.lease(networkId)],
+                [networkId, serverId, NETWORK_ROUTING_LEASE_TTL_SECONDS.to!string, "write"]);
+            if (reply.empty) throw new Exception("Missing lease acknowledgement");
+            if (reply.front == "maintenance") throw new NetworkWriteUnavailableException();
+        });
+    }
+
+    private enum LEASE_SCRIPT = q"LUA
 if redis.call('HGET', KEYS[1], ARGV[1]) ~= ARGV[2] then return '0' end
+if redis.call('GET', KEYS[2]) == ARGV[2] then
+  redis.call('EXPIRE', KEYS[2], ARGV[3])
+  return '1'
+end
+if ARGV[4] == 'check' then return 'changed' end
+if redis.call('EXISTS', 'irc:holder:maintenance:write-exclusion') ~= 0 then return 'maintenance' end
 redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3])
 return '1'
-LUA", [RedisKeys.networkAssignments(), RedisKeys.lease(networkId)],
-            [networkId, serverId, NETWORK_ROUTING_LEASE_TTL_SECONDS.to!string]);
-    }
+LUA";
 
     /// Refresh a canonical lease without replacing another operation's owner.
     void renewLease(string networkId) {
@@ -871,7 +1027,15 @@ LUA", [RedisKeys.server(server.serverId)],
      * Used by admin UI to control routing capacity.
      */
     void setMaxConnsPerHost(int maxConns) {
-        db.set(RedisKeys.routingConfig(), "maxConnsPerHost:" ~ maxConns.to!string);
+        runNetworkWrite!void(redis, (ref NetworkWriter writer) {
+            setMaxConnsPerHost(maxConns, writer);
+        });
+    }
+
+    void setMaxConnsPerHost(int maxConns, ref NetworkWriter writer) {
+        runNetworkRedisMutation!void(writer, (RedisDatabase actualDb) {
+            actualDb.set(RedisKeys.routingConfig(), "maxConnsPerHost:" ~ maxConns.to!string);
+        });
     }
 
     /**
@@ -894,12 +1058,21 @@ LUA", [RedisKeys.server(server.serverId)],
      * Set engine config overrides (stored in Redis).
      */
     void setEngineConfig(string serverId, int priority, int maxConns, bool fallbackOnly) {
+        runNetworkWrite!void(redis, (ref NetworkWriter writer) {
+            setEngineConfig(serverId, priority, maxConns, fallbackOnly, writer);
+        });
+    }
+
+    void setEngineConfig(string serverId, int priority, int maxConns, bool fallbackOnly,
+            ref NetworkWriter writer) {
         auto key = RedisKeys.engineConfig(serverId);
         auto config = Json.emptyObject;
         config["priority"] = Json(priority);
         config["maxConnections"] = Json(maxConns);
         config["fallbackOnly"] = Json(fallbackOnly);
-        db.set(key, config.toString());
+        runNetworkRedisMutation!void(writer, (RedisDatabase actualDb) {
+            actualDb.set(key, config.toString());
+        });
     }
 
     /**
@@ -981,12 +1154,40 @@ LUA", [RedisKeys.server(server.serverId)],
     /// have an open socket. Contradictory mirrors fail closed, including
     /// during partial canonical eviction.
     NetworkAssignment[] getAllAssignments() {
-        db.eval!string(RECOVER_ASSIGNMENTS_SCRIPT,
-            [RedisKeys.networkAssignments()],
-            [RedisKeys.serverAssignments(""), RedisKeys.routingMove(""),
-             RedisKeys.lease(""), NETWORK_ROUTING_LEASE_TTL_SECONDS.to!string]);
+        // Recovery is optional when admission is excluded or saturated. Status
+        // reads still use the canonical hash, never inferred mirror owners.
+        try {
+            return runNetworkWrite!(NetworkAssignment[])(redis, (ref NetworkWriter writer) {
+                return getAllAssignments(writer);
+            });
+        } catch (NetworkWriteUnavailableException e) {
+            return readCanonicalAssignments();
+        }
+    }
+
+    NetworkAssignment[] getAllAssignments(ref NetworkWriter writer) {
+        runNetworkRedisMutation!void(writer, (RedisDatabase actualDb) {
+            auto reply = actualDb.eval!string(RECOVER_ASSIGNMENTS_SCRIPT,
+                [RedisKeys.networkAssignments()],
+                [RedisKeys.serverAssignments(""), RedisKeys.routingMove(""),
+                 RedisKeys.lease(""), NETWORK_ROUTING_LEASE_TTL_SECONDS.to!string]);
+            if (reply.empty) throw new Exception("Missing assignment recovery acknowledgement");
+            if (reply.front == "0") throw new NetworkWriteUnavailableException();
+        });
+        return readCanonicalAssignments();
+    }
+
+    private NetworkAssignment[] readCanonicalAssignments() {
         NetworkAssignment[] result;
-        foreach (networkId, serverId; redis.hgetAll(RedisKeys.networkAssignments())) {
+        // Do not use RedisStorage.hgetAll: it swallows transport/protocol
+        // failures and would turn an unavailable authority into an empty view.
+        auto fields = db.hgetAll!string(RedisKeys.networkAssignments());
+        while (!fields.empty) {
+            const networkId = fields.front.idup;
+            fields.popFront();
+            if (fields.empty) throw new Exception("Malformed canonical assignment acknowledgement");
+            const serverId = fields.front.idup;
+            fields.popFront();
             if (!networkId.length || !serverId.length) continue;
             try { if (parseUUID(networkId[]) == UUID.init) continue; }
             catch (Exception) { continue; }

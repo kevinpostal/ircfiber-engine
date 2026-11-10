@@ -20,6 +20,9 @@ import std.datetime.systime : Clock;
 import core.time : seconds, Duration, msecs;
 import ircfiber.irc.routing_policy : routingPreferencesFromJson, RoutingValidationException;
 import ircfiber.engine.state : writeStateSnapshotForNetwork;
+import ircfiber.network_write_gate : NetworkWriter, runNetworkWrite,
+    NetworkWriteUnavailableException, retainNetworkWriteUncertainty;
+import ircfiber.db.network : NetworkRepository;
 
 // ─────────────────────────────────────────────────────────────────────────
 // Reconnect-in-flight dedup
@@ -92,10 +95,185 @@ unittest {
     assert(!isReconnectInFlight(id, "saved-config"));
 }
 
+version (RoutingPolicyTest)
+void runConsumerRetargetNetworkWriteRegressionChecks(ref EngineContext ctx, string label, string pin) {
+    import std.exception : enforce;
+    import std.uuid : randomUUID;
+    import ircfiber.irc.connection : retargetExternalAcknowledgedForTest, refreshEgressState;
+    import ircfiber.network_write_gate : NETWORK_WRITE_EXCLUSION_KEY, NETWORK_WRITERS_KEY,
+        networkMutationAdmittedForTest;
+    // The caller must provision an isolated REAL controllable tailscaled slot
+    // and relay catalog. No substitute process/status or scripted provider.
+    enforce(label.length && pin.length && ctx.connManager !is null, "Real retarget fixture is required");
+    auto db = ctx.redis.getDb();
+    enforce(!db.exists(NETWORK_WRITE_EXCLUSION_KEY) && db.scard(NETWORK_WRITERS_KEY) == 0,
+        "Retarget proof requires dedicated quiescent Redis");
+    refreshEgressState();
+    const operation = randomUUID().toString();
+    string[] tokens;
+    scope(exit) {
+        networkMutationAdmittedForTest = null;
+        retargetExternalAcknowledgedForTest = null;
+        db.eval!long("if redis.call('GET',KEYS[1]) == ARGV[1] then return redis.call('DEL',KEYS[1]) end return 0",
+            [NETWORK_WRITE_EXCLUSION_KEY], operation);
+        // The real SET and status calls completed synchronously before cleanup.
+        foreach (token; tokens) db.srem(NETWORK_WRITERS_KEY, token);
+    }
+    long collect() {
+        auto result = db.eval!long(
+            "if redis.call('EXISTS',KEYS[1]) ~= 0 or redis.call('SCARD',KEYS[2]) ~= 0 then return 0 end redis.call('SET',KEYS[1],ARGV[1]); return 1",
+            [NETWORK_WRITE_EXCLUSION_KEY, NETWORK_WRITERS_KEY], operation);
+        enforce(!result.empty, "Retarget collector oracle returned no result");
+        return result.front;
+    }
+    auto control = ControlMessage("retargetEgress", "", "", Json([
+        "label": Json(label), "locationId": Json(pin), "force": Json(true)]));
+    size_t completions;
+    retargetExternalAcknowledgedForTest = {
+        ++completions;
+        enforce(collect() == 0 && db.scard(NETWORK_WRITERS_KEY) == 1,
+            "Collector cut through real retarget completion before forced bounce");
+        sleep(1.msecs);
+        enforce(collect() == 0, "Yielding provider completion released the outer writer");
+    };
+    enforce(collect() == 1, "Could not close retarget collector gate");
+    bool refused;
+    try handleControlMessage(ctx, control);
+    catch (NetworkWriteUnavailableException e) { refused = e.code == "network_maintenance"; }
+    enforce(refused && completions == 0, "Closed queued retarget reached real provider completion");
+    db.eval!long("if redis.call('GET',KEYS[1]) == ARGV[1] then return redis.call('DEL',KEYS[1]) end return 0",
+        [NETWORK_WRITE_EXCLUSION_KEY], operation);
+    networkMutationAdmittedForTest = (string token) { tokens ~= token; };
+    handleControlMessage(ctx, control);
+    enforce(completions == 1 && tokens.length == 1 && db.scard(NETWORK_WRITERS_KEY) == 0,
+        "Real open provider retarget did not complete within one acknowledged consumer writer");
+    retargetExternalAcknowledgedForTest = {
+        ++completions;
+        throw new Exception("Lost actual retarget completion acknowledgement");
+    };
+    bool lost;
+    try handleControlMessage(ctx, control);
+    catch (Exception) { lost = true; }
+    enforce(lost && completions == 2 && db.scard(NETWORK_WRITERS_KEY) == 1
+        && db.ttl(NETWORK_WRITERS_KEY) == -1 && collect() == 0,
+        "Lost real retarget acknowledgement permitted a collector cut");
+}
+
+version (RoutingPolicyTest)
+void runConsumerNetworkWriteRegressionChecks(RedisStorage redis,
+        NetworkRepository repository) {
+    import std.exception : enforce;
+    import std.string : endsWith;
+    import std.uuid : randomUUID;
+    import vibe.data.bson : Bson;
+    import ircfiber.db.mongo : AppMongoConnection;
+    import ircfiber.engine.event_channel : EngineEventChannel;
+    import ircfiber.irc.manager : ConnectionManager;
+    import ircfiber.network_write_gate : NETWORK_WRITE_EXCLUSION_KEY, NETWORK_WRITERS_KEY,
+        networkMutationAdmittedForTest, networkMutationRepliedForTest;
+    enforce(AppMongoConnection.name().endsWith("_test"),
+        "Consumer proof requires an explicitly admitted test Mongo database");
+    auto db = redis.getDb();
+    enforce(!db.exists(NETWORK_WRITE_EXCLUSION_KEY) && db.scard(NETWORK_WRITERS_KEY) == 0,
+        "Consumer proof requires dedicated quiescent Redis");
+    const operation = randomUUID().toString();
+    const id = randomUUID();
+    const owner = randomUUID();
+    const server = "consumer-gate-" ~ randomUUID().toString();
+    auto collection = AppMongoConnection.getDb()["networks"];
+    auto channel = EngineEventChannel.create();
+    scope(exit) channel.close();
+    auto manager = new ConnectionManager(channel, redis, server);
+    NetworkConfig original;
+    original.id = id;
+    original.name = "before-control";
+    original.host = "consumer-gate.invalid";
+    original.nick = "consumer-gate";
+    original.port = 6667;
+    repository.save(original, owner);
+    original = repository.findByIdWithIpv6Iid(id);
+    manager.addNetwork(original, owner); // no start(), holder, or upstream dial
+    db.hset(RedisKeys.networkAssignments(), id.toString(), server);
+    string[] tokens;
+    scope(exit) {
+        networkMutationAdmittedForTest = null;
+        networkMutationRepliedForTest = null;
+        db.eval!long("if redis.call('GET',KEYS[1]) == ARGV[1] then return redis.call('DEL',KEYS[1]) end return 0",
+            [NETWORK_WRITE_EXCLUSION_KEY], operation);
+        foreach (token; tokens) db.srem(NETWORK_WRITERS_KEY, token);
+        db.hdel(RedisKeys.networkAssignments(), id.toString());
+        collection.deleteOne(Bson(["id": Bson(id.toString())]));
+    }
+    EngineContext ctx;
+    ctx.redis = redis;
+    ctx.networkRepo = repository;
+    ctx.connManager = manager;
+    ctx.eventChannel = channel;
+    ctx.localServer.serverId = server;
+    auto changed = original;
+    changed.name = "canonical-control";
+    repository.save(changed, owner);
+    auto control = ControlMessage("updateConfig", id.toString(), owner.toString(), Json.emptyObject);
+    long collect() {
+        auto reply = db.eval!long(
+            "if redis.call('EXISTS',KEYS[1]) ~= 0 or redis.call('SCARD',KEYS[2]) ~= 0 then return 0 end redis.call('SET',KEYS[1],ARGV[1]); return 1",
+            [NETWORK_WRITE_EXCLUSION_KEY, NETWORK_WRITERS_KEY], operation);
+        enforce(!reply.empty, "Collector oracle returned no result");
+        return reply.front;
+    }
+    void unlock() {
+        db.eval!long("if redis.call('GET',KEYS[1]) == ARGV[1] then return redis.call('DEL',KEYS[1]) end return 0",
+            [NETWORK_WRITE_EXCLUSION_KEY], operation);
+    }
+    enforce(collect() == 1, "Could not close collector gate");
+    bool refused;
+    try handleControlMessage(ctx, control);
+    catch (NetworkWriteUnavailableException e) { refused = e.code == "network_maintenance"; }
+    enforce(refused && manager.getClient(id).getConfig.name == original.name,
+        "Previously queued config applied through closed gate");
+    auto retarget = ControlMessage("retargetEgress", "", "", Json([
+        "label": Json("consumer-gate-nonexistent"), "locationId": Json("se-sto"), "force": Json(true)]));
+    refused = false;
+    try handleControlMessage(ctx, retarget);
+    catch (NetworkWriteUnavailableException e) { refused = e.code == "network_maintenance"; }
+    enforce(refused, "Queued retarget did not expose typed maintenance refusal");
+    unlock();
+    size_t admissions;
+    networkMutationAdmittedForTest = (string token) {
+        tokens ~= token;
+        ++admissions;
+        enforce(collect() == 0 && db.scard(NETWORK_WRITERS_KEY) == 1,
+            "Collector acquired exclusion during actual consumer execution");
+        sleep(1.msecs);
+        enforce(collect() == 0 && manager.getClient(id).getConfig.name == original.name,
+            "Consumer scope released before yielding configuration effect");
+    };
+    handleControlMessage(ctx, control);
+    enforce(admissions == 1 && manager.getClient(id).getConfig.name == changed.name
+        && db.scard(NETWORK_WRITERS_KEY) == 0,
+        "Open queued config did not apply canonical configuration with one scoped writer");
+    networkMutationAdmittedForTest = (string token) { tokens ~= token; };
+    // A missing IID causes a real Mongo findAndModify during the same
+    // production consumer path. Lose its reply after Mongo acknowledged.
+    collection.updateOne(Bson(["id": Bson(id.toString())]),
+        Bson(["$unset": Bson(["ipv6Iid": Bson("")])]));
+    networkMutationRepliedForTest = { throw new Exception("Lost consumer reservation acknowledgement"); };
+    bool lost;
+    try handleControlMessage(ctx, control);
+    catch (Exception) { lost = true; }
+    networkMutationRepliedForTest = null;
+    enforce(lost && collection.findOne(["id": id.toString()])["ipv6Iid"].get!string.length == 16
+        && db.scard(NETWORK_WRITERS_KEY) == 1 && db.ttl(NETWORK_WRITERS_KEY) == -1
+        && collect() == 0,
+        "Committed consumer reservation with lost acknowledgement released exclusion evidence");
+}
+
 private void runSafeTask(void delegate() dg) {
     runTask(() nothrow {
         try {
             dg();
+        } catch (NetworkWriteUnavailableException) {
+            // executeNetworkControl already emitted the typed refusal.
         } catch (Exception e) {
             logError("Task crashed: %s", e.msg);
         }
@@ -123,6 +301,8 @@ void startControlConsumer(ref EngineContext ctx) {
                         auto json = parseJsonString(raw);
                         auto msg = ControlMessage.fromJson(json);
                         handleControlMessage(ctx, msg);
+                    } catch (NetworkWriteUnavailableException) {
+                        // A valid queued control was refused, not malformed.
                     } catch (Exception e) {
                         logWarn("Failed to parse control message: %s", e.msg);
                     }
@@ -227,6 +407,14 @@ auto loadCanonicalNetwork(ref EngineContext ctx, UUID id) {
     return row;
 }
 
+private auto loadCanonicalNetwork(ref EngineContext ctx, UUID id, ref NetworkWriter writer) {
+    auto config = ctx.networkRepo.findByIdWithIpv6Iid(id, writer);
+    auto row = ctx.networkRepo.findByIdWithUser(id);
+    if (row.config.id != id || row.config.ipv6Iid != config.ipv6Iid)
+        throw new Exception("canonical network changed during identity reload");
+    return row;
+}
+
 bool canonicalRoutingParked(ref EngineContext ctx, const NetworkConfig config) {
     import ircfiber.irc.routing_policy_store : loadEffectiveRoutingPolicy;
     auto effective = loadEffectiveRoutingPolicy(ctx.redis.getDb(), config.host, config.routing);
@@ -257,6 +445,52 @@ private void publishStoppedNetwork(ref EngineContext ctx, NetworkConfig config,
 }
 
 private void handleControlMessage(ref EngineContext ctx, ControlMessage msg) {
+    // Infrastructure maintenance is deliberately not an ordinary writer:
+    // first-A restoration must operate while the coordinated gate is closed.
+    if (msg.action == "archiveClear") {
+        if (ctx.archiveControl !is null) ctx.archiveControl.accept(ctx, msg);
+        return;
+    }
+    if (msg.action == "holderMaintenance") {
+        if (msg.networkId.length || msg.userId.length || msg.config.type != Json.Type.object)
+            throw new Exception("holder maintenance requires engine-scoped infrastructure control");
+        ctx.connManager.holderMaintenance(
+            msg.config["operationId"].get!string, msg.config["phase"].get!string,
+            msg.config["deadlineMs"].get!long, msg.config["serverId"].get!string);
+        return;
+    }
+    if (msg.action == "migrateNetwork") {
+        // Admission belongs to the task that actually waits for CLOSE, not
+        // the queue consumer that merely schedules it.
+        runSafeTask({ executeNetworkControl(ctx, msg); });
+        return;
+    }
+    executeNetworkControl(ctx, msg);
+}
+
+private void executeNetworkControl(ref EngineContext ctx, ControlMessage msg) {
+    switch (msg.action) {
+        case "addNetwork": case "removeNetwork": case "disconnectNetwork":
+        case "reconnectNetwork": case "updateConfig": case "retargetEgress":
+        case "migrateNetwork":
+            break;
+        default:
+            logWarn("Unknown control action: %s", msg.action);
+            return;
+    }
+    try runNetworkWrite!void(ctx.redis, (ref NetworkWriter writer) {
+        handleAdmittedControlMessage(ctx, msg, writer);
+    });
+    catch (NetworkWriteUnavailableException e) {
+        logJsonMap("warn", "consumer", "Network control refused",
+            ["networkId": msg.networkId, "action": msg.action,
+             "reason": e.code, "event": "network_control_refused"]);
+        throw e;
+    }
+}
+
+private void handleAdmittedControlMessage(ref EngineContext ctx, ControlMessage msg,
+        ref NetworkWriter writer) {
     import std.uuid : UUID;
     logInfo("Control message [server=%s]: %s network=%s", ctx.localServer.serverId, msg.action, msg.networkId);
     // Deletion may remove canonical ownership first, but stale controls
@@ -269,21 +503,9 @@ private void handleControlMessage(ref EngineContext ctx, ControlMessage msg) {
     }
 
     switch (msg.action) {
-        case "archiveClear":
-            if (ctx.archiveControl !is null) ctx.archiveControl.accept(ctx, msg);
-            break;
-        case "holderMaintenance":
-            if (msg.networkId.length || msg.userId.length || msg.config.type != Json.Type.object)
-                throw new Exception("holder maintenance requires engine-scoped infrastructure control");
-            ctx.connManager.holderMaintenance(
-                msg.config["operationId"].get!string,
-                msg.config["phase"].get!string,
-                msg.config["deadlineMs"].get!long,
-                msg.config["serverId"].get!string);
-            break;
         case "addNetwork":
             if (msg.networkId.length) {
-                auto row = loadCanonicalNetwork(ctx, parseUUID(msg.networkId[]));
+                auto row = loadCanonicalNetwork(ctx, parseUUID(msg.networkId[]), writer);
                 auto cfg = row.config;
                 import ircfiber.irc.dial_guard : ownsNetworkForDial;
                 if (cfg.disabled || cfg.servicesProvisioningPending
@@ -329,15 +551,17 @@ private void handleControlMessage(ref EngineContext ctx, ControlMessage msg) {
                 auto id = parseUUID(msg.networkId[]);
                 auto row = ctx.networkRepo.findByIdWithUser(id);
                 const hadLocalHistory = ctx.connManager.hasNetworkHistory(id);
-                if (hadLocalHistory && !ctx.connManager.stopNetworkForMove(id, 60.seconds))
+                if (hadLocalHistory && !ctx.connManager.stopNetworkForMove(id, 60.seconds)) {
+                    retainNetworkWriteUncertainty(writer);
                     throw new Exception("disconnect source quiescence unproven; inspect holder and irc:routing:dials");
+                }
                 if (hadLocalHistory)
                     publishStoppedNetwork(ctx, row.config, row.userId, msg.reason);
             }
             break;
         case "reconnectNetwork":
             if (msg.networkId.length) {
-                auto row = loadCanonicalNetwork(ctx, parseUUID(msg.networkId[]));
+                auto row = loadCanonicalNetwork(ctx, parseUUID(msg.networkId[]), writer);
                 auto cfg = row.config;
                 import ircfiber.irc.dial_guard : ownsNetworkForDial;
                 if (cfg.disabled || cfg.servicesProvisioningPending
@@ -390,13 +614,14 @@ private void handleControlMessage(ref EngineContext ctx, ControlMessage msg) {
                 }
                 const hadLocalHistory = ctx.connManager.hasNetworkHistory(id);
                 if (hadLocalHistory && !ctx.connManager.stopNetworkForMove(id, 60.seconds)) {
+                    retainNetworkWriteUncertainty(writer);
                     finishReconnect(msg.networkId, pendingGeneration);
                     throw new Exception("reconnect source quiescence unproven; inspect holder and irc:routing:dials");
                 }
                 if (!ownsNetworkForDial(ctx.redis, ctx.localServer.serverId, msg.networkId)) break;
                 // Waiting for a previous loop may have yielded across an edit
                 // or tenant transfer. Reload again before creating its successor.
-                row = loadCanonicalNetwork(ctx, id);
+                row = loadCanonicalNetwork(ctx, id, writer);
                 if (!ownsNetworkForDial(ctx.redis, ctx.localServer.serverId, msg.networkId)) break;
                 if (row.config.disabled || row.config.servicesProvisioningPending) break;
                 if (canonicalRoutingParked(ctx, row.config)) {
@@ -428,13 +653,15 @@ private void handleControlMessage(ref EngineContext ctx, ControlMessage msg) {
             if (msg.networkId.length) {
                 import ircfiber.irc.dial_guard : ownsNetworkForDial;
                 if (!ownsNetworkForDial(ctx.redis, ctx.localServer.serverId, msg.networkId)) break;
-                auto row = loadCanonicalNetwork(ctx, parseUUID(msg.networkId[]));
+                auto row = loadCanonicalNetwork(ctx, parseUUID(msg.networkId[]), writer);
                 auto id = row.config.id;
                 if (ctx.connManager.getOwnerId(id) != row.userId.toString()) {
                     if (ctx.connManager.hasNetwork(id)
-                            && !ctx.connManager.stopNetworkForMove(id, 60.seconds))
+                            && !ctx.connManager.stopNetworkForMove(id, 60.seconds)) {
+                        retainNetworkWriteUncertainty(writer);
                         throw new Exception("tenant update source quiescence unproven");
-                    row = loadCanonicalNetwork(ctx, id);
+                    }
+                    row = loadCanonicalNetwork(ctx, id, writer);
                     if (!row.config.disabled && !row.config.servicesProvisioningPending
                             && ownsNetworkForDial(ctx.redis, ctx.localServer.serverId, msg.networkId))
                         ctx.connManager.addAndStartNetwork(row.config, row.userId);
@@ -443,12 +670,9 @@ private void handleControlMessage(ref EngineContext ctx, ControlMessage msg) {
             break;
         case "migrateNetwork":
             if (msg.networkId.length && msg.config.type == Json.Type.object) {
-                // Dedicated task: holder CLOSE/LIST must never block unrelated
-                // control traffic. The shared acknowledgement is token+owner CAS.
-                runSafeTask({
                     import ircfiber.irc.routing_moves : loadRoutingMove,
                         acknowledgeNetworkMoveClosed, failRoutingMove;
-                    auto move = loadRoutingMove(ctx.redis.getDb(), msg.config["moveId"].get!string);
+                    auto move = loadRoutingMove(ctx.redis.getDb(), msg.config["moveId"].get!string, writer);
                     if (move.moveId in activeMoves) return;
                     activeMoves[move.moveId] = true;
                     scope(exit) activeMoves.remove(move.moveId);
@@ -463,46 +687,48 @@ private void handleControlMessage(ref EngineContext ctx, ControlMessage msg) {
                             || !ctx.archiveSpool.tryNetworkPending(move.fromServerId,
                                 msg.networkId, pendingMutations)
                             || pendingMutations != 0) {
-                        failRoutingMove(ctx.redis.getDb(), move, "archive_pending");
+                        failRoutingMove(ctx.redis.getDb(), move, "archive_pending", writer);
                         return;
                     }
                     try {
                         // Publish destination provenance before it can receive
                         // appends. Repeated A->B->A moves retain both scopes.
                         if (ctx.archiveControl is null
-                                || !ctx.archiveControl.prepareHandoff(ctx, msg.networkId, move.targetServerId)) {
-                            failRoutingMove(ctx.redis.getDb(), move, "archive_scope_unavailable");
+                                || !ctx.archiveControl.prepareHandoff(ctx, msg.networkId, move.targetServerId, writer)) {
+                            failRoutingMove(ctx.redis.getDb(), move, "archive_scope_unavailable", writer);
                             return;
                         }
                         // Redis admission above yields; do not CLOSE if a
                         // source mutation arrived while registering scopes.
                         if (!ctx.archiveSpool.tryNetworkPending(move.fromServerId,
                                 msg.networkId, pendingMutations) || pendingMutations != 0) {
-                            failRoutingMove(ctx.redis.getDb(), move, "archive_pending");
+                            failRoutingMove(ctx.redis.getDb(), move, "archive_pending", writer);
                             return;
                         }
-                        auto source = loadCanonicalNetwork(ctx, parseUUID(msg.networkId[]));
+                        auto source = loadCanonicalNetwork(ctx, parseUUID(msg.networkId[]), writer);
                         scope(exit) ctx.archiveControl.endMove(msg.networkId, move.moveId);
                         if (!ctx.archiveControl.awaitMoveBarrier(ctx, msg.networkId, move.moveId,
                                 source.userId.toString(), false)) {
-                            failRoutingMove(ctx.redis.getDb(), move, "archive_pending");
+                            failRoutingMove(ctx.redis.getDb(), move, "archive_pending", writer);
                             return;
                         }
                         if (!ctx.connManager.stopNetworkForMove(parseUUID(msg.networkId[]), 60.seconds)) {
+                            retainNetworkWriteUncertainty(writer);
                             failRoutingMove(ctx.redis.getDb(), move,
-                                "source quiescence unproven; inspect holder and irc:routing:dials:" ~ move.fromServerId ~ ":" ~ move.networkId);
+                                "source quiescence unproven; inspect holder and irc:routing:dials:" ~ move.fromServerId ~ ":" ~ move.networkId,
+                                writer);
                             return;
                         }
                         if (!ctx.archiveControl.awaitMoveBarrier(ctx, msg.networkId, move.moveId,
                                 source.userId.toString(), true)) {
-                            failRoutingMove(ctx.redis.getDb(), move, "archive_pending");
+                            failRoutingMove(ctx.redis.getDb(), move, "archive_pending", writer);
                             return;
                         }
-                        acknowledgeNetworkMoveClosed(ctx.redis.getDb(), move);
+                        acknowledgeNetworkMoveClosed(ctx.redis.getDb(), move, writer);
                     } catch (Exception e) {
-                        failRoutingMove(ctx.redis.getDb(), move, "source holder closure failed: " ~ e.msg);
+                        retainNetworkWriteUncertainty(writer);
+                        failRoutingMove(ctx.redis.getDb(), move, "source holder closure failed: " ~ e.msg, writer);
                     }
-                });
             }
             break;
         case "retargetEgress":
@@ -527,7 +753,7 @@ private void handleControlMessage(ref EngineContext ctx, ControlMessage msg) {
                     if (auto f = "force" in msg.config)
                         if (f.type == Json.Type.bool_) force = f.get!bool;
                 }
-                const reason = retargetSlotByLabel(label, locationId, force);
+                const reason = retargetSlotByLabel(label, locationId, force, writer);
                 int bounced = 0;
                 // The slot now exits somewhere else, so the sockets riding it
                 // are pointing through a path the sidecar no longer uses.

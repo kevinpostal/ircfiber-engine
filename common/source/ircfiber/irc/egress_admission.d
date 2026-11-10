@@ -38,6 +38,8 @@ import vibe.data.json : Json, parseJsonString;
 import vibe.db.redis.redis : RedisDatabase;
 
 import ircfiber.redis.protocol : RedisKeys;
+import ircfiber.network_write_gate : NetworkWriter, NetworkWriteUnavailableException,
+    runNetworkWrite, runNetworkRedisMutation;
 
 /// First automatic cooldown after a quarantine or failed trial.
 enum long EGRESS_ADMISSION_BASE_COOLDOWN_MS = 5 * 60_000L;
@@ -148,9 +150,26 @@ EgressAdmission setEgressDraining(RedisDatabase db, string label, string host, u
     if (label.length == 0) throw new Exception("egress label required");
     auto args = commonArgs(nowMs) ~ [egressAdmissionEndpoint(host, port), draining ? "1" : "0",
                                      boundAdmissionReason(reason)];
-    auto reply = db.eval!string(DRAIN_SCRIPT, [RedisKeys.egressAdmission(label)], args);
-    if (reply.empty) throw new Exception("empty admission reply");
-    return viewFromJson(parseJsonString(reply.front.idup));
+    return runNetworkWrite!EgressAdmission(db, (ref NetworkWriter writer) {
+        return setEgressDrainingAdmitted(label, args, writer);
+    });
+}
+
+EgressAdmission setEgressDraining(RedisDatabase db, string label, string host, ushort port,
+        bool draining, string reason, long nowMs, ref NetworkWriter writer) {
+    if (label.length == 0) throw new Exception("egress label required");
+    auto args = commonArgs(nowMs) ~ [egressAdmissionEndpoint(host, port), draining ? "1" : "0",
+                                     boundAdmissionReason(reason)];
+    return setEgressDrainingAdmitted(label, args, writer);
+}
+
+private EgressAdmission setEgressDrainingAdmitted(string label, string[] args, ref NetworkWriter writer) {
+    return runNetworkRedisMutation!EgressAdmission(writer, (RedisDatabase db) {
+        auto reply = db.eval!string(DRAIN_SCRIPT, [RedisKeys.egressAdmission(label)], args);
+        if (reply.empty) throw new Exception("empty admission reply");
+        if (reply.front == "maintenance") throw new NetworkWriteUnavailableException();
+        return viewFromJson(parseJsonString(reply.front.idup));
+    });
 }
 
 /// Pre-dial admission decision.
@@ -438,6 +457,7 @@ LUA";
 
 // ARGV[4] endpoint, [5] '1' drain / '0' resume, [6] reason.
 private enum DRAIN_SCRIPT = PRELUDE ~ q"LUA
+if redis.call('EXISTS', 'irc:holder:maintenance:write-exclusion') ~= 0 then return 'maintenance' end
 local endpoint, drain, reason = ARGV[4], ARGV[5] == '1', ARGV[6]
 local r, bad = decode(redis.call('GET', KEYS[1]))
 if bad or (r and r.endpoint ~= endpoint) then

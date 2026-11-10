@@ -19,6 +19,8 @@ import vibe.db.mongo.mongo : MongoClientSettings, MongoDatabase, connectMongoDB,
 import ircfiber.db.messages : MessageRepository, ArchiveWriteResult,
     ArchiveWriteException, ArchiveWriteFailure;
 import ircfiber.db.mongo : AppMongoConnection;
+import ircfiber.storage.redis : RedisStorage;
+import ircfiber.network_write_gate : NETWORK_WRITE_EXCLUSION_KEY, NETWORK_WRITERS_KEY;
 
 // This executable never reads application Mongo environment variables. The
 // explicit opt-in grants failpoint control of a disposable Mongo 7 fixture;
@@ -105,6 +107,16 @@ private string admittedUrl() {
     return uri;
 }
 
+private ushort admittedRedisPort() {
+    require(environment.get(ISOLATION_VARIABLE, "") == "1", "isolated Redis opt-in is required");
+    const endpoint = environment.get("IRCFIBER_ARCHIVE_TEST_REDIS", "");
+    auto matched = endpoint.matchFirst(regex(`^127\.0\.0\.1:([0-9]+)$`));
+    require(!matched.empty, "IRCFIBER_ARCHIVE_TEST_REDIS requires explicit disposable 127.0.0.1:port");
+    const port = matched.captures[1].to!uint;
+    require(port > 0 && port <= ushort.max, "fixture Redis port is invalid");
+    return cast(ushort) port;
+}
+
 private struct CutoffFixture {
     string network;
     string otherNetwork;
@@ -115,6 +127,7 @@ private struct CutoffFixture {
 private final class StorageFixture {
     private MongoDatabase admin;
     private MessageRepository repository;
+    private RedisStorage redis;
     private string[] ownedNetworks;
     private string[] ownedMessageIds;
     private bool failpointOwned;
@@ -124,7 +137,12 @@ private final class StorageFixture {
     private Bson causalReadTimestamp;
     private bool causalReads;
 
-    this(string uri) {
+    this(string uri, ushort redisPort) {
+        redis = new RedisStorage("127.0.0.1", redisPort);
+        redis.connect();
+        require(!redis.getDb().exists(NETWORK_WRITE_EXCLUSION_KEY)
+            && redis.getDb().scard(NETWORK_WRITERS_KEY) == 0,
+            "fixture Redis must be dedicated and have no exclusion or unresolved writers");
         databaseName = "ircfiber_archive_test_" ~ randomUUID().toString().replace("-", "");
         timestamp = Clock.currTime().toUnixTime!long * 1000;
         MongoClientSettings settings;
@@ -543,20 +561,20 @@ private final class StorageFixture {
             const network = newNetwork(true);
             legacy(network, "#history", timestamp, "legacy-engine-a");
             legacy(network, "#history", timestamp, "legacy-engine-b");
-            auto scopes = repository.registerArchiveScopes(network, [SERVER]);
+            auto scopes = repository.registerArchiveScopes(redis, network, [SERVER]);
             require(scopes.length == 3 && scopes[0] == SERVER && scopes.canFind("legacy-engine-a")
                 && scopes.canFind("legacy-engine-b"), "first registration omitted a legacy server scope");
             auto doc = rowById("networks", network);
             require(integer(doc["archiveScopeVersion"]) == 1 && doc["archiveServers"].length == 3,
                 "scope registration was not durable in canonical network metadata");
             legacy(network, "#history", timestamp, "later-legacy-engine");
-            scopes = repository.archivedServerScopes(network); // No Redis retained projection supplied.
+            scopes = repository.archivedServerScopes(redis, network); // No Redis retained projection supplied.
             require(scopes.length == 4 && scopes[0] == SERVER && scopes.canFind("later-legacy-engine")
                 && scopes.canFind("legacy-engine-a") && scopes.canFind("legacy-engine-b"),
                 "Redis projection loss or later legacy discovery lost original attribution");
             doc = rowById("networks", network);
             require(doc["archiveServers"].length == 4, "legacy discovery was not durably cataloged");
-            require(repository.registerArchiveScopes(network, [SERVER, "legacy-engine-a"]).length == 4,
+            require(repository.registerArchiveScopes(redis, network, [SERVER, "legacy-engine-a"]).length == 4,
                 "duplicate catalog registration added another scope");
         });
 
@@ -564,18 +582,18 @@ private final class StorageFixture {
             const network = newNetwork();
             const owner = randomUUID().toString();
             insertRaw("networks", Bson(["_id": Bson(network), "id": Bson(network), "userId": Bson(owner)]));
-            expectFailure({ repository.registerArchiveScopes(network, [SERVER], randomUUID().toString()); },
+            expectFailure({ repository.registerArchiveScopes(redis, network, [SERVER], randomUUID().toString()); },
                 ArchiveWriteFailure.identityMismatch);
             require(!hasField(rowById("networks", network), "archiveScopeVersion"),
                 "owner mismatch installed archival provenance");
-            require(repository.registerArchiveScopes(network, [SERVER], owner) == [SERVER],
+            require(repository.registerArchiveScopes(redis, network, [SERVER], owner) == [SERVER],
                 "matching majority owner did not register the producer");
             uncertainWrite("update", {
-                repository.registerArchiveScopes(network, [OTHER_SERVER], owner);
+                repository.registerArchiveScopes(redis, network, [OTHER_SERVER], owner);
             });
             require(rowById("networks", network)["archiveServers"].length == 2,
                 "uncertain scope write did not exercise a committed catalog update");
-            const retried = repository.registerArchiveScopes(network, [OTHER_SERVER], owner);
+            const retried = repository.registerArchiveScopes(redis, network, [OTHER_SERVER], owner);
             require(retried.length == 2 && retried[0] == SERVER && retried.canFind(OTHER_SERVER),
                 "positive majority retry lost original provenance or duplicated its target");
         });
@@ -584,21 +602,21 @@ private final class StorageFixture {
             const network = newNetwork(true);
             string[] scopes;
             foreach (i; 0 .. 64) scopes ~= "bounded-engine-" ~ i.to!string;
-            auto registered = repository.registerArchiveScopes(network, scopes);
+            auto registered = repository.registerArchiveScopes(redis, network, scopes);
             require(registered.length == 64 && registered[0] == scopes[0], "64-scope catalog did not fit");
             auto before = rowById("networks", network)["archiveServers"].toString();
-            expectFailure({ repository.registerArchiveScopes(network, ["overflow-engine"]); },
+            expectFailure({ repository.registerArchiveScopes(redis, network, ["overflow-engine"]); },
                 ArchiveWriteFailure.unavailable);
             require(rowById("networks", network)["archiveServers"].toString() == before,
                 "65th scope partially mutated durable metadata");
-            require(repository.archivedServerScopes(network).length == 64,
+            require(repository.archivedServerScopes(redis, network).length == 64,
                 "bounded archive discovery truncated an accepted catalog");
         });
 
         recordCase("65 prejournal servers fail closed without cataloging a truncated subset", {
             const network = newNetwork(true);
             foreach (i; 0 .. 65) legacy(network, "#history", timestamp, "legacy-overflow-" ~ i.to!string);
-            expectFailure({ repository.archivedServerScopes(network); }, ArchiveWriteFailure.unavailable);
+            expectFailure({ repository.archivedServerScopes(redis, network); }, ArchiveWriteFailure.unavailable);
             auto doc = rowById("networks", network);
             require(!hasField(doc, "archiveScopeVersion") && !hasField(doc, "archiveServers"),
                 "overflow legacy discovery persisted an incomplete server catalog");
@@ -608,15 +626,18 @@ private final class StorageFixture {
 
         recordCase("deleted network cannot silently gain a new archival scope", {
             const missing = newNetwork();
-            require(repository.registerArchiveScopes(missing, [SERVER]).length == 0,
+            require(repository.registerArchiveScopes(redis, missing, [SERVER]).length == 0,
                 "register recreated explicitly absent network metadata");
-            expectFailure({ repository.archivedServerScopes(missing); }, ArchiveWriteFailure.unavailable);
+            expectFailure({ repository.archivedServerScopes(redis, missing); }, ArchiveWriteFailure.unavailable);
             require(countRows("networks", Bson(["id": Bson(missing)])) == 0,
                 "archival discovery recreated deleted network metadata");
         });
     }
 
     void cleanup() {
+        scope (exit) redis.close();
+        // Lost-ack writer evidence is deliberately not cleared: this executable
+        // requires disposable Redis, and cannot attest away an uncertain owner.
         // Never drop a database/collection and never disable somebody else's
         // failpoint. Every delete is restricted to UUIDs created by this run.
         disarmConcernError(false);
@@ -644,7 +665,11 @@ private final class StorageFixture {
 int main() {
     setLogLevel(LogLevel.warn);
     string uri;
-    try uri = admittedUrl();
+    ushort redisPort;
+    try {
+        uri = admittedUrl();
+        redisPort = admittedRedisPort();
+    }
     catch (Throwable error) {
         ++failed;
         stderr.writeln("  FAIL explicit isolated fixture admission");
@@ -655,7 +680,7 @@ int main() {
     runTask(() nothrow {
         StorageFixture fixture;
         try {
-            fixture = new StorageFixture(uri);
+            fixture = new StorageFixture(uri, redisPort);
             fixture.runCases();
         } catch (Throwable error) {
             ++failed;

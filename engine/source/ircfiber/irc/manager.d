@@ -284,6 +284,9 @@ final class ConnectionManager {
     /// Bounded (five seconds total) before a newly created fresh producer.
     /// False/unavailable records an archival gap but never disables live IRC.
     bool delegate(string networkId, string ownerId) prepareFreshArchiveScope;
+    /// Existing canonical cfg/user read plus a strictly bound held claim can
+    /// authorize raw journal ingress without awaiting a catalog mutation.
+    void delegate(const ref NetworkConfig, UUID, const ref HolderEntry) prepareHeldArchiveScope;
 
     private {
         PersistentIRCClient[string] clients;
@@ -1544,6 +1547,8 @@ final class ConnectionManager {
                         throw new HolderUnavailableException("held restoration snapshot no longer registered");
                     snapshot = latest;
                 }
+                if (prepareHeldArchiveScope !is null)
+                    prepareHeldArchiveScope(config, userId, entry);
                 r = holder.attachIdentity(entry.id);
                 // ATTACH's response describes the very relay now owned. This
                 // replaces a redundant INFO, which could race the attachment.

@@ -35,6 +35,8 @@ import ircfiber.metadata : USER_METADATA_KEYS, CHANNEL_METADATA_KEYS, PROFILE_KE
 import ircfiber.db.lastseen : LastSeenRepository, heartbeatEchoJson;
 import ircfiber.redis.protocol : RedisKeys, TlsInfo;
 import ircfiber.storage.redis : RedisStorage;
+import ircfiber.network_write_gate : NetworkWriter, runNetworkWrite,
+    NetworkWriteUnavailableException, retainNetworkWriteUncertainty;
 import ircfiber.irc.reconnect : ExponentialBackoff;
 import ircfiber.irc.sasl : buildSaslPlainPayload, ScramSha256Client;
 import ircfiber.irc.ban_classify : isBanError, isThrottleError;
@@ -2030,7 +2032,52 @@ private void refreshSlotFromStatus(size_t idx) nothrow {
 /// report the new exit online. Returns false (leaving the slot in `error`
 /// with its hold cleared, so it can be retried) on any failure.
 /// The caller must already have reserved the slot via `acquireSlotForPin`.
-private bool retargetSlot(size_t idx, string pin) nothrow {
+version (RoutingPolicyTest) {
+    /// Runs only after real tailscale SET and matching online status replies.
+    /// Throwing loses that external completion at the control-consumer seam.
+    void delegate() retargetExternalAcknowledgedForTest;
+}
+
+private bool retargetSlot(size_t idx, string pin, out string reason) nothrow {
+    reason = "";
+    try {
+        const ready = runNetworkWrite!bool(gEgressRedis, (ref NetworkWriter writer) {
+            return retargetSlot(idx, pin, writer);
+        });
+        if (!ready) reason = "retarget-failed";
+        return ready;
+    } catch (NetworkWriteUnavailableException e) {
+        reason = e.code;
+    } catch (Exception) {
+        reason = "retarget-failed";
+    }
+    withPoolLock({
+        if (idx >= mullvadPool.length) return;
+        mullvadPool[idx].state = "error";
+        mullvadPool[idx].lastError = reason;
+        mullvadPool[idx].heldUntilMs = 0;
+    });
+    return false;
+}
+
+private bool retargetSlot(size_t idx, string pin, ref NetworkWriter writer) {
+    // False may mean SET committed but its reply/status was lost. A successful
+    // status observation is the only positive external completion contract.
+    const ready = retargetSlotAdmitted(idx, pin);
+    if (!ready) retainNetworkWriteUncertainty(writer);
+    version (RoutingPolicyTest) {
+        if (ready && retargetExternalAcknowledgedForTest !is null) {
+            try retargetExternalAcknowledgedForTest();
+            catch (Exception e) {
+                retainNetworkWriteUncertainty(writer);
+                throw e;
+            }
+        }
+    }
+    return ready;
+}
+
+private bool retargetSlotAdmitted(size_t idx, string pin) nothrow {
     string socket, label;
     ExitRelay relay;
     withPoolLock({
@@ -2230,6 +2277,21 @@ ExitLocation[] egressLocations() nothrow {
 /// Shells out, so this runs on the control-consumer task, never on a
 /// connection fiber.
 string retargetSlotByLabel(string label, string pin, bool force = false) nothrow {
+    // Preserve the local freezer's refusal even when Redis is unavailable.
+    bool frozen;
+    withPoolLock({
+        if (auto until = label in maintenanceSlotUntilMs)
+            frozen = nowMsSafe() < *until;
+    });
+    if (frozen) return "maintenance-frozen";
+    try return runNetworkWrite!string(gEgressRedis, (ref NetworkWriter writer) {
+        return retargetSlotByLabel(label, pin, force, writer);
+    });
+    catch (NetworkWriteUnavailableException e) { return e.code; }
+    catch (Exception) { return "retarget-failed"; }
+}
+
+string retargetSlotByLabel(string label, string pin, bool force, ref NetworkWriter writer) {
     if (label.length == 0 || pin.length == 0) return "unknown-slot";
     loadMullvadPoolSafe();
     size_t idx = size_t.max;
@@ -2256,7 +2318,7 @@ string retargetSlotByLabel(string label, string pin, bool force = false) nothrow
         reason = "unknown-slot";
     });
     if (idx == size_t.max) return reason.length ? reason : "unknown-slot";
-    if (!retargetSlot(idx, pin)) return "retarget-failed";
+    if (!retargetSlot(idx, pin, writer)) return "retarget-failed";
     // The operator asked for this location, so hold the slot briefly: a
     // connect that arrives now should use it, not move it again.
     withPoolLock({
@@ -2349,8 +2411,7 @@ private MullvadProxy* acquireSlotForPin(string hostLower, string pin, out string
         reason = "no-catalog";
         return null;
     }
-    if (!retargetSlot(candidate, pin)) {
-        reason = "retarget-failed";
+    if (!retargetSlot(candidate, pin, reason)) {
         return null;
     }
     return &mullvadPool[candidate];
@@ -9241,7 +9302,7 @@ final class PersistentIRCClient {
     private void parkNetwork(string msg, string failType, string event, string reason = "") {
         import ircfiber.db.network : NetworkRepository;
         try {
-            (new NetworkRepository()).setDisabled(config.id, true);
+            (new NetworkRepository(redis)).setDisabled(config.id, true);
         } catch (Exception e) {
             logWarn("park[%s]: persisting disabled failed: %s", config.name, e.msg);
         }

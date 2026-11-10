@@ -124,6 +124,13 @@ configuration "consumer-test" {
     versions "VibeUseFibers"
 }
 
+configuration "consumer-write-test" {
+    targetType "executable"
+    targetName "consumer-write-test"
+    mainSourceFile "source/consumer_test.d"
+    versions "VibeUseFibers" "RoutingPolicyTest"
+}
+
 configuration "connection-registration-test" {
     targetType "executable"
     targetName "connection-registration-test"
