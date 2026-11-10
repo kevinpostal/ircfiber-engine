@@ -5395,6 +5395,8 @@ final class PersistentIRCClient {
         bool                joinThrottleRetryInFlight;
         /// Bumped per socket so a JOIN retry task of the old one stands down.
         uint                joinRetryEpoch;
+        /// Membership proven on this socket, unlike retained reconnect intent.
+        bool[string]        confirmedMembership;
         /// One-shot guard for `scheduleJoinConfirmSweep` — armed right after
         /// the auto-join burst, cleared when that sweep runs (or a newer
         /// socket takes over). Prevents stacking a sweep per JOIN batch.
@@ -5663,9 +5665,8 @@ final class PersistentIRCClient {
         /// Local model of the server's fake-lag accumulator. See
         /// ircfiber.irc.pacer.
         FakeLagPacer        pacer;
-        /// Message lines waiting for the pacer to admit them. Only user
-        /// traffic (PRIVMSG/NOTICE) is parked here; protocol-critical lines
-        /// (PING/PONG/CAP/NICK/registration) always go out immediately.
+        /// Noncritical commands share one ordered admission lane. Only
+        /// protocol liveness and registration bypass it.
         BncPendingWrite[]   pacedQueue;
         enum MAX_PACED_QUEUE = 2_000;
         /// Per-channel `+f` line-rate ceiling and its sliding window,
@@ -5691,6 +5692,21 @@ final class PersistentIRCClient {
         /// Unix ms of the last "still sending" server-log line, so a long
         /// paste reports progress instead of looking hung.
         long                lastPacedNoticeMs;
+        bool                pacingNoticeActive;
+        long                lastQueueFullNoticeMs;
+        long                lastReadCoalescedNoticeMs;
+        /// Only untagged, unowned optional reads may share an operation.
+        struct OptionalRead {
+            string command, target, terminator;
+            string[] remainingTargets;
+            bool fromClient;
+            long sentAtMs, sequence;
+        }
+        OptionalRead[string] optionalReads;
+        long nextReadSequence;
+        bool[string]        clientReadLines;
+        /// Automatic JOIN lines are revalidated at emission; true means a retry.
+        bool[string]        automaticJoinLines;
         /// Our own `nick!user@host` as other clients see it (396
         /// RPL_VISIBLEHOST, or the echo of our own JOIN). Drives the
         /// per-line payload budget; empty until known.
@@ -6218,6 +6234,14 @@ final class PersistentIRCClient {
             if (!isSensitiveServiceLine(entry.line)) s.bncPendingWrites ~= entry;
         s.bncOwnershipPayload = bncOwnership is null ? "" : bncOwnership.snapshot();
         s.channelState = channelState.dup;
+        foreach (channel; channelState.byKey)
+            if (foldNick(channel) in confirmedMembership) s.confirmedChannels ~= channel;
+        s.joinsAwaitingConfirm = joinsAwaitingConfirm.dup;
+        s.automaticJoins = automaticJoinLines.dup;
+        s.clientReadLines = clientReadLines.keys;
+        foreach (line, read; optionalReads)
+            s.optionalReads ~= SessionSnapshot.OptionalReadState(
+                line, read.fromClient, read.sentAtMs, read.sequence, read.remainingTargets.dup);
         s.channelTopics = channelTopics.dup;
         // The oversize retry must not copy rosters just to discard them.
         if (!dropMembers)
@@ -6406,6 +6430,11 @@ final class PersistentIRCClient {
         outboundQueue = null;
         foreach (l; s.outboundQueue) if (!isSensitiveServiceLine(l)) outboundQueue ~= l;
         channelState = s.channelState.dup;
+        confirmedMembership = null;
+        foreach (channel; s.confirmedChannels)
+            if (channel in channelState) confirmedMembership[foldNick(channel)] = true;
+        joinsAwaitingConfirm = s.joinsAwaitingConfirm.dup;
+        prunePendingJoins();
         channelTopics = null;
         channelUsers = null;
         namesBurst = null;
@@ -6472,6 +6501,26 @@ final class PersistentIRCClient {
         pacedQueue = s.bncPendingWrites.dup;
         foreach (entry; pacedQueue)
             if (entry.owner.request.length) bncState().restorePendingWrite(entry);
+        automaticJoinLines = s.automaticJoins.dup;
+        optionalReads = null;
+        nextReadSequence = 0;
+        clientReadLines = null;
+        foreach (line; s.clientReadLines) clientReadLines[line] = true;
+        foreach (saved; s.optionalReads) {
+            auto read = optionalRead(saved.line);
+            if (!read.command.length) continue;
+            read.fromClient = saved.fromClient;
+            read.sentAtMs = saved.sentAtMs;
+            read.sequence = saved.sequence > 0 ? saved.sequence : nextReadSequence + 1;
+            if (read.sequence > nextReadSequence) nextReadSequence = read.sequence;
+            if (saved.remainingTargets.length) read.remainingTargets = saved.remainingTargets.dup;
+            optionalReads[saved.line] = read;
+            if (saved.sentAtMs && read.command == "WHO") {
+                trackWho(saved.line, saved.fromClient);
+                pendingWhos[$ - 1].sentAt = saved.sentAtMs / 1000;
+            }
+        }
+        expireOptionalReads(unixMsNow());
         ServicesQuietMarker retainedQuiet;
         retainedQuiet.prefixes = s.servicesQuietPrefixes.dup;
         retainedQuiet.untilMs = s.servicesQuietUntilMs;
@@ -6722,7 +6771,6 @@ final class PersistentIRCClient {
             case "nordvpn": kind = RouteKind.nordvpn; break;
             default: blocked("invalid frozen maintenance provider"); return;
         }
-        requirePermittedRoute(config.host.toLower(), config.routing, kind);
         if (kind == RouteKind.ipv6 && (nativeIpv6.length == 0
                 || resolveIpv6BindForConfig(config) != nativeIpv6))
             blocked("maintenance IPv6 affinity is no longer available");
@@ -6735,23 +6783,17 @@ final class PersistentIRCClient {
         if (!slot.length || !exitId.length || nativeIpv6.length)
             blocked("incomplete frozen maintenance concrete route");
         loadMullvadPoolSafe();
-        EgressEndpointRef endpoint;
         bool matches;
         size_t found;
         withPoolLock({
             foreach (ref proxy; mullvadPool) if (proxy.label == slot) {
                 found++;
-                matches = proxy.state == "ready"
-                    && routeToken(proxy.provider) == provider
+                matches = routeToken(proxy.provider) == provider
                     && slotBanKey(&proxy) == exitId
                     && routeIdentityLocked(&proxy, "") == identity;
-                endpoint = exitRef(&proxy);
             }
         });
         if (found != 1 || !matches) blocked("maintenance concrete exit changed; no rotation permitted");
-        auto admission = readAdmissions([endpoint]);
-        if (admission.length != 1 || !admission[0].admitsDials)
-            blocked("maintenance exit is draining, quarantined or unavailable; no rotation permitted");
     }
 
     void freezeMaintenanceRoute(long deadlineMs) {
@@ -7071,6 +7113,7 @@ final class PersistentIRCClient {
     }
 
     private void invalidateHolderGapState() {
+        confirmedMembership = null;
         foreach (channel; channelState.byKey) gapNamesPending[channel] = true;
         channelState = null; // membership itself is unknown until authoritative evidence
         gapRefreshPending = true;
@@ -7408,9 +7451,35 @@ final class PersistentIRCClient {
         // A new socket gets a fresh throttle budget; pending JOINs from the
         // old one are meaningless (the reconnect re-sends the auto-joins).
         joinsAwaitingConfirm = [];
+        confirmedMembership = null;
+        optionalReads = null;
+        nextReadSequence = 0;
+        clientReadLines = null;
+        const oldAutomaticJoins = automaticJoinLines;
+        automaticJoinLines = null;
+        // Reads describe the dead socket. Private service work must never
+        // survive it either; ordinary intentional commands keep their order.
+        try {
+            BncPendingWrite[] retained;
+            foreach (entry; pacedQueue)
+                if (entry.line !in oldAutomaticJoins && !isSensitiveServiceLine(entry.line)
+                        && !optionalRead(entry.line, true).command.length)
+                    retained ~= entry;
+            pacedQueue = retained;
+            string[] retainedOutbound;
+            foreach (line; outboundQueue)
+                if (!isSensitiveServiceLine(line) && !optionalRead(line, true).command.length)
+                    retainedOutbound ~= line;
+            outboundQueue = retainedOutbound;
+        } catch (Exception) {
+            // Fail closed if the dead socket's private/read classification fails.
+            pacedQueue = null;
+            outboundQueue = null;
+        }
         joinThrottleRounds = 0;
         joinThrottleRetryInFlight = false;
         joinRetryEpoch++;
+        joinConfirmSweepArmed = false;
         // A fresh socket gets a fresh NAMES; nothing held is owed any more.
         memberFlaps = null;
         memberFlapEpoch++;
@@ -7561,6 +7630,7 @@ final class PersistentIRCClient {
             foreach (raw; targets.split(",")) {
                 auto chan = normalizeChannelName(raw.strip());
                 if (chan.length == 0) continue;
+                if (foldNick(chan) in confirmedMembership) continue;
                 if (joinsAwaitingConfirm.canFind(chan)) continue;
                 if (joinsAwaitingConfirm.length >= MAX_PENDING_JOINS) return;
                 joinsAwaitingConfirm ~= chan;
@@ -7576,6 +7646,44 @@ final class PersistentIRCClient {
             auto i = joinsAwaitingConfirm.countUntil(norm);
             if (i >= 0) joinsAwaitingConfirm = joinsAwaitingConfirm.remove(i);
         } catch (Exception) {}
+    }
+
+    private void prunePendingJoins() nothrow {
+        try {
+            size_t keep;
+            foreach (chan; joinsAwaitingConfirm)
+                if (foldNick(chan) !in confirmedMembership) joinsAwaitingConfirm[keep++] = chan;
+            joinsAwaitingConfirm.length = keep;
+        } catch (Exception) {}
+    }
+
+    /// Automatic work has no keys or owner. Recheck membership again when
+    /// the shared queue actually admits it, not merely after a retry sleep.
+    private void sendAutomaticJoins(string[] channels, bool retry = false) {
+        prunePendingJoins();
+        string[] targets;
+        foreach (chan; channels) {
+            if (foldNick(chan) in confirmedMembership) continue;
+            if (retry && !joinsAwaitingConfirm.canFind(chan)) continue;
+            targets ~= chan;
+        }
+        foreach (batch; joinBatches(targets)) {
+            const line = "JOIN " ~ batch;
+            if (line in automaticJoinLines) continue;
+            automaticJoinLines[line] = retry;
+            if (!enqueuePaced(line)) automaticJoinLines.remove(line);
+        }
+    }
+
+    private string currentAutomaticJoin(string line, bool retry) {
+        prunePendingJoins();
+        string[] targets;
+        foreach (chan; line[5 .. $].split(",")) {
+            if (foldNick(chan) in confirmedMembership) continue;
+            if (retry && !joinsAwaitingConfirm.canFind(chan)) continue;
+            targets ~= chan;
+        }
+        return targets.length ? "JOIN " ~ targets.join(",") : "";
     }
 
     /// Max throttle retry rounds per connection. A server that keeps saying
@@ -7596,6 +7704,7 @@ final class PersistentIRCClient {
     /// silently by the per-command rate limit. One command is one rate-limit
     /// hit, and `TARGMAX=…JOIN:` there is unlimited (`CHANLIMIT=#:10`).
     private void scheduleJoinThrottleRetry(uint windowSecs) nothrow {
+        prunePendingJoins();
         if (joinThrottleRetryInFlight) return;
         if (joinThrottleRounds >= MAX_JOIN_THROTTLE_ROUNDS) return;
         if (joinsAwaitingConfirm.length == 0) return;
@@ -7632,7 +7741,7 @@ final class PersistentIRCClient {
                     if (batches.length == 0) return;
                     logInfo("Re-sending throttled JOIN(s) for %s as one command: %s",
                         config.name, batches[0]);
-                    sendRaw("JOIN " ~ batches[0]);
+                    sendAutomaticJoins(joinsAwaitingConfirm, true);
                 } catch (Exception e) {
                     if (joinRetryEpoch == epoch) joinThrottleRetryInFlight = false;
                     logWarn("JOIN throttle retry failed for %s: %s", config.name, e.msg);
@@ -7666,6 +7775,7 @@ final class PersistentIRCClient {
     /// 405 and the old handler dropped it from joinsAwaitingConfirm with
     /// no retry — 8 of 9 channels landed, #superbowl never did.
     private void scheduleFloodJoinRetry() nothrow {
+        prunePendingJoins();
         if (joinThrottleRetryInFlight) return;
         if (joinThrottleRounds >= MAX_JOIN_THROTTLE_ROUNDS) return;
         if (joinsAwaitingConfirm.length == 0) return;
@@ -7704,7 +7814,7 @@ final class PersistentIRCClient {
                     if (batches.length == 0) return;
                     logInfo("Re-sending flood-complained JOIN(s) for %s as one command: %s",
                         config.name, batches[0]);
-                    sendRaw("JOIN " ~ batches[0]);
+                    sendAutomaticJoins(joinsAwaitingConfirm, true);
                 } catch (Exception e) {
                     if (joinRetryEpoch == epoch) joinThrottleRetryInFlight = false;
                     logWarn("Flood JOIN retry failed for %s: %s", config.name, e.msg);
@@ -7744,6 +7854,7 @@ final class PersistentIRCClient {
                     // A newer socket owns the retry state now.
                     if (joinRetryEpoch != epoch) return;
                     joinConfirmSweepArmed = false;
+                    prunePendingJoins();
                     if (joinsAwaitingConfirm.length == 0) return;
                     // A throttle/flood retry already in flight covers these
                     // same channels — don't send a second JOIN for them.
@@ -7766,7 +7877,7 @@ final class PersistentIRCClient {
                          "channels": joinsAwaitingConfirm.join(","),
                          "round": joinThrottleRounds.to!string,
                          "event": "join_confirm_timeout"]);
-                    sendRaw("JOIN " ~ batches[0]);
+                    sendAutomaticJoins(joinsAwaitingConfirm, true);
                 } catch (Exception e) {
                     if (joinRetryEpoch == epoch) joinConfirmSweepArmed = false;
                     logWarn("JOIN confirm sweep failed for %s: %s", config.name, e.msg);
@@ -9087,6 +9198,7 @@ final class PersistentIRCClient {
         // between attempts.
         cmdBucket.clear();
         lastPacedNoticeMs = 0;
+        pacingNoticeActive = false;
         applyFloodTrust();
         // A dropped connection can strand us inside a `BATCH +chathistory`
         // (the closing `BATCH -` never arrives — verified live: every row
@@ -10000,6 +10112,13 @@ final class PersistentIRCClient {
         }
 
         if (!welcomed) throw new Exception("Registration timeout: 001 not received before read limit");
+        // Authenticate before deferred JOINs/probes and connect-script work.
+        // This setup secret is written now, never retained in a pacing/META queue.
+        if (config.nspass.length > 0) {
+            const identify = "PRIVMSG NickServ :IDENTIFY " ~ config.nspass;
+            if (admitServiceLine(identify) && gateLegacyAuth(() { services.noteManualLine(identify); }))
+                writeRaw(identify);
+        }
         // Auto-OPER (if configured) — sent before the auto-join block below so
         // oper-only (+O) channels in the auto-join list are joinable. The IRCd
         // processes OPER then JOIN in receive order on this one connection, so +o
@@ -10066,17 +10185,9 @@ final class PersistentIRCClient {
             auto ch = normalizeChannelName(chan);
             if (!autoJoin.canFind(ch)) autoJoin ~= ch;
         }
-        foreach (batch; joinBatches(autoJoin))
-            sendRaw("JOIN " ~ batch);
-        if (autoJoin.length > 0) scheduleJoinConfirmSweep();
+        sendAutomaticJoins(autoJoin);
 
 
-        // ── Post-registration commands ─────────────────────────────────────
-        // NickServ IDENTIFY (if configured) — sent BEFORE user-supplied
-        // commands so the user's commands can rely on being identified.
-        if (config.nspass.length > 0) {
-            sendRaw("PRIVMSG NickServ :IDENTIFY " ~ config.nspass);
-        }
 
         // User-supplied commands to run on connect (one per line).
         // Supports WAIT N for delays (e.g. "WAIT 15" pauses 15 seconds).
@@ -10100,6 +10211,7 @@ final class PersistentIRCClient {
                 sendRaw(trimmed);
             }
         }
+        if (joinsAwaitingConfirm.length) scheduleJoinConfirmSweep();
     }
 
     /// Disconnect reason when the server hangs up during registration
@@ -10684,6 +10796,7 @@ private void processEvents() {
         const oldL = oldChan.toLower, newL = newChan.toLower;
         // normalized
         moveKey(channelState, oldN, newN);
+        moveKey(confirmedMembership, foldNick(oldN), foldNick(newN));
         moveKey(channelTopics, oldN, newN);
         moveKey(channelUsers, oldN, newN);
         moveKey(namesBurst, oldN, newN);
@@ -11007,6 +11120,7 @@ private void processEvents() {
             processHistoricalEvent(event, replay);
             return;
         }
+        finishOptionalReads(event);
         if (observeMonitorNumeric(event)) return;
         publishBncPresence(event);
         if (replay.label.length && !replay.label.startsWith("bnc-")
@@ -11073,6 +11187,7 @@ private void processEvents() {
                     auto chan = normalizeChannelName(params[0]);
                     if (sameNick(event.nick, sessionNick)) {
                         channelState[chan] = "";
+                        confirmedMembership[foldNick(chan)] = true;
                         // Confirmed: the throttle retry must not re-ask.
                         clearPendingJoin(chan);
                         markMetaDirty();
@@ -11180,7 +11295,7 @@ private void processEvents() {
                         // Rate-limit to 1/s so a 2000-user channel burst on
                         // SuperNets doesn't flood the server log with 354
                         // WHOX responses.
-                        if (memberNeedsRealname(event.nick, realnames, realnameProbed)) {
+                        if (!pacer.isArmed() && memberNeedsRealname(event.nick, realnames, realnameProbed)) {
                             import std.datetime : Clock;
                             const whoisNow = Clock.currTime.toUnixTime!long;
                             if (whoisNow - lastWhoisTime >= 1) {
@@ -11205,6 +11320,8 @@ private void processEvents() {
                     if (sameNick(event.nick, sessionNick)) {
                         forgetMemberFlaps(chan);
                         channelState.remove(chan);
+                        confirmedMembership.remove(foldNick(chan));
+                        clearPendingJoin(chan);
                         markMetaDirty();
                         channelUsers.remove(chan);
                         namesBurst.remove(chan);
@@ -11245,6 +11362,8 @@ private void processEvents() {
                     if (sameNick(targetNick, sessionNick)) {
                         forgetMemberFlaps(chan);
                         channelState.remove(chan);
+                        confirmedMembership.remove(foldNick(chan));
+                        clearPendingJoin(chan);
                         markMetaDirty();
                         channelUsers.remove(chan);
                         namesBurst.remove(chan);
@@ -11395,6 +11514,7 @@ private void processEvents() {
                     clearPendingJoin(chan);
                     forgetMemberFlaps(chan);
                     channelState.remove(chan);
+                    confirmedMembership.remove(foldNick(chan));
                     channelUsers.remove(chan);
                     namesBurst.remove(chan);
                     namesBurstAt.remove(chan);
@@ -11841,6 +11961,10 @@ private void processEvents() {
                                 containsSelf = true;
                                 break;
                             }
+                        if (containsSelf) {
+                            confirmedMembership[foldNick(chan)] = true;
+                            clearPendingJoin(chan);
+                        }
                         if ((wasJoined && !recoveringGap) || containsSelf) {
                             auto held = channelUsers.get(chan, null);
                             auto rebased = applyNamesBurst(held, *burst, casemapping());
@@ -13952,12 +14076,157 @@ private void processEvents() {
              "event":       "flood_trusted_host"]);
     }
 
-    /// Queues a user-originated message line behind the pacer.
-    ///
-    /// Protocol-critical traffic (PING/PONG, CAP, NICK, registration) must
-    /// never be delayed and is written by `sendRaw` directly; it is still
-    /// *charged* to the bucket so the model tracks the server's real view.
-    private void enqueuePaced(string line, BncCommandOwner owner = BncCommandOwner.init,
+    /// Read classification is deliberately positive. In particular, MODE
+    /// with arbitrary flags is a mutation, even when it has no argument.
+    private OptionalRead optionalRead(string line, bool includeTagged = false) {
+        if (!line.length) return OptionalRead.init;
+        if (line[0] == '@') {
+            if (!includeTagged) return OptionalRead.init;
+            const endTags = line.indexOf(' ');
+            if (endTags < 0) return OptionalRead.init;
+            line = line[endTags + 1 .. $].stripLeft();
+        }
+        const space = line.indexOf(' ');
+        const command = (space < 0 ? line : line[0 .. space]).toUpper();
+        string terminator;
+        switch (command) {
+            case "WHO": terminator = "315"; break;
+            case "WHOIS": terminator = "318"; break;
+            case "NAMES": terminator = "366"; break;
+            case "LIST": terminator = "323"; break;
+            case "MODE": break;
+            default: return OptionalRead.init;
+        }
+        const params = space < 0 ? null : line[space + 1 .. $].split();
+        if (command == "MODE") {
+            if (params.length == 1)
+                terminator = isupportMap.get("CHANTYPES", "#&+!").indexOf(params[0][0]) >= 0 ? "324" : "221";
+            else if (params.length == 2) {
+                string flag = params[1];
+                if (flag.startsWith("+")) flag = flag[1 .. $];
+                const advertised = isupportMap.get("CHANMODES", "").split(",");
+                if (flag.length != 1 || !advertised.length || advertised[0].indexOf(flag[0]) < 0)
+                    return OptionalRead.init;
+                switch (flag) {
+                    case "b": terminator = "368"; break;
+                    case "e": terminator = "349"; break;
+                    case "I": terminator = "347"; break;
+                    default: return OptionalRead.init;
+                }
+            } else return OptionalRead.init;
+        }
+        const target = params.length ? (command == "WHOIS" ? params[$ - 1] : params[0]) : "*";
+        auto result = OptionalRead(command, target, terminator);
+        if ((command == "NAMES" || command == "WHOIS") && target.indexOf(',') >= 0)
+            result.remainingTargets = target.split(",");
+        return result;
+    }
+
+    private void expireOptionalReads(long nowMs) {
+        string[] expired;
+        foreach (line, read; optionalReads)
+            if (read.sentAtMs > 0 && nowMs - read.sentAtMs >= 30_000) expired ~= line;
+        foreach (line; expired) {
+            optionalReads.remove(line);
+            clientReadLines.remove(line);
+        }
+    }
+
+    /// Complete only the query that the numeric actually answers. Command-only
+    /// failures name the oldest sent operation; unrelated mutation failures do not.
+    private void finishOptionalReads(const ref IRCRawEvent event) {
+        if (!optionalReads.length) return;
+        expireOptionalReads(unixMsNow());
+        const params = event.getParams();
+        string failedCommand;
+        if (event.command == "FAIL" && params.length)
+            failedCommand = params[0].toUpper();
+        else if (["263", "421", "461", "416"].canFind(event.command) && params.length > 1)
+            failedCommand = params[1].toUpper();
+        string oldest;
+        long oldestSequence = long.max;
+        string[] finished;
+        foreach (line, ref read; optionalReads) {
+            if (!read.sentAtMs) continue;
+            if (failedCommand.length && failedCommand == read.command) {
+                if (read.sequence < oldestSequence) {
+                    oldest = line;
+                    oldestSequence = read.sequence;
+                }
+                continue;
+            }
+            string target;
+            bool response;
+            if (event.command == read.terminator) {
+                if (read.command == "LIST") response = true;
+                else if (event.command == "221" && params.length) {
+                    target = params[0];
+                    response = true;
+                } else if (params.length > 1) {
+                    target = params[1];
+                    response = true;
+                }
+            } else if (params.length > 1 &&
+                    ((event.command == "401" && read.command == "WHOIS") ||
+                     (event.command == "403" && ["NAMES", "WHO", "MODE"].canFind(read.command)) ||
+                     (["442", "482"].canFind(event.command) && read.command == "MODE"))) {
+                target = params[1];
+                response = true;
+            }
+            if (!response) continue;
+            if (read.remainingTargets.length) {
+                size_t keep;
+                bool matched;
+                foreach (part; read.remainingTargets) {
+                    if (sameNick(part, target)) matched = true;
+                    else read.remainingTargets[keep++] = part;
+                }
+                read.remainingTargets.length = keep;
+                if (matched && !keep) finished ~= line;
+            } else if (read.command == "LIST" || sameNick(target, read.target)) {
+                finished ~= line;
+            }
+        }
+        if (oldest.length) finished ~= oldest;
+        foreach (line; finished) optionalReads.remove(line);
+    }
+
+    private static string rawCommand(string line) {
+        if (line.startsWith("@")) {
+            const space = line.indexOf(' ');
+            if (space < 0) return "";
+            line = line[space + 1 .. $].stripLeft();
+        }
+        const space = line.indexOf(' ');
+        return (space < 0 ? line : line[0 .. space]).toUpper();
+    }
+
+    private bool immediateProtocolLine(string line) {
+        const command = rawCommand(line);
+        if (["PING", "PONG", "QUIT", "CAP", "AUTHENTICATE"].canFind(command)) return true;
+        return state == ConnectionState.connecting
+            && ["WEBIRC", "PASS", "USER", "NICK"].canFind(command);
+    }
+
+    private bool noncriticalReadyNow(string line) {
+        const now = unixMsNow();
+        if (pacedQueue.length || pacer.waitMs(line.length + 2, now) > 0) return false;
+        if (floodTrusted && cmdBucket.waitMs(now, trustedRate, pacer.isImmune()) > 0) return false;
+        const target = messageTargetOf(line);
+        if (auto window = target.toLower() in chanFloodWindow)
+            if (window.waitMs(now, floodLimitFor(target)) > 0) return false;
+        return true;
+    }
+
+    private void reportQueueFull() {
+        const now = unixMsNow();
+        if (lastQueueFullNoticeMs && now - lastQueueFullNoticeMs < 5_000) return;
+        lastQueueFullNoticeMs = now;
+        emitLog("flood_pacing", "The outbound queue is full. Your new command was not queued; try again after it drains.");
+    }
+
+    /// Queues noncritical traffic, retaining each owned request separately.
+    private bool enqueuePaced(string line, BncCommandOwner owner = BncCommandOwner.init,
             string epoch = "", string wireLabel = "") {
         if (pacedQueue.length >= MAX_PACED_QUEUE) {
             logJsonMap("warn", "connection",
@@ -13966,14 +14235,22 @@ private void processEvents() {
                  "networkId": config.id.toString(),
                  "queued": pacedQueue.length.to!string,
                  "event": "flood_queue_full"]);
+            reportQueueFull();
             if (owner.request.length)
                 bncState().reject(owner, "TOO_MANY_PENDING", "Too many outstanding labeled requests", wireLabel, epoch);
-            return;
+            return false;
+        }
+        if (isSensitiveServiceLine(line) && !noncriticalReadyNow(line)) {
+            emitLog("flood_pacing", "A private services command was not sent while the network is pacing. It was not queued; try again later.");
+            if (owner.request.length)
+                bncState().reject(owner, "COMMAND_REJECTED", "Private command was not queued", wireLabel, epoch);
+            return false;
         }
         pacedQueue ~= BncPendingWrite(line, owner, epoch, wireLabel);
         // Give the first line a chance to leave immediately rather than
         // waiting for the next 50 ms event-loop tick.
         drainPacedQueue();
+        return true;
     }
 
     /// Channel `+f` ceiling for a target, if one is known AND it applies to
@@ -14142,10 +14419,16 @@ private void processEvents() {
     ///      assumed ceiling is what throttled a 500-line paste to ~7
     ///      lines/second on an InspIRCd network that has no such limit.
     private void drainPacedQueue() {
-        if (pacedQueue.length == 0) return;
-        if (state != ConnectionState.connected) return;
-
+        // 001 is registration proof even while MOTD/connect-script processing
+        // is finishing; preserve WAIT ordering without sending before welcome.
+        if (state != ConnectionState.connected
+                && !(state == ConnectionState.connecting && observed001AtMs > 0)) return;
         const now = unixMsNow();
+        expireOptionalReads(now);
+        if (!pacedQueue.length) {
+            finishPacing(now);
+            return;
+        }
         // Walk the tightening back once a minute has passed since the last
         // COMPLAINT, not since the last write. Keying it on write activity
         // meant a busy connection could never relax: one 707 pinned it at
@@ -14158,7 +14441,27 @@ private void processEvents() {
 
         while (pacedQueue.length > 0) {
             const entry = pacedQueue[0];
-            const line = entry.line;
+            string line = entry.line;
+            if (!entry.owner.request.length) {
+                if (auto retry = line in automaticJoinLines) {
+                    line = currentAutomaticJoin(line, *retry);
+                    if (!line.length) {
+                        automaticJoinLines.remove(entry.line);
+                        pacedQueue = pacedQueue[1 .. $];
+                        continue;
+                    }
+                }
+                // An enrichment admitted before the complaint must not
+                // become a delayed WHOIS storm after it.
+                if (auto read = line in optionalReads) {
+                    if (!read.fromClient && pacer.isArmed()
+                            && (read.command == "WHO" || read.command == "WHOIS")) {
+                        optionalReads.remove(line);
+                        pacedQueue = pacedQueue[1 .. $];
+                        continue;
+                    }
+                }
+            }
             // The server charges fake lag on the whole command it receives.
             const cmdBytes = line.length + 2;      // + CRLF
             if (floodTrusted && cmdBucket.waitMs(now, trustedRate, pacer.isImmune()) > 0) {
@@ -14198,36 +14501,42 @@ private void processEvents() {
                         reportPacing(now, startedWith);
                         return;
                     }
-                    w.record(now);
                 }
             }
 
             pacedQueue = pacedQueue[1 .. $];
-            lastPacedWriteMs = now;      // writeRaw charges the bucket
+            automaticJoinLines.remove(entry.line);
             try {
+                bool sent;
                 if (entry.owner.request.length)
-                    bncState().writeOwned(line, entry.owner, now, entry.epoch, entry.wireLabel);
-                else writeRaw(line);
+                    sent = bncState().writeOwned(line, entry.owner, now, entry.epoch, entry.wireLabel).length != 0;
+                else {
+                    writeRaw(line);
+                    sent = true;
+                }
+                if (sent) {
+                    lastPacedWriteMs = now;
+                    if (auto window = target.toLower() in chanFloodWindow)
+                        if (floodLimitFor(target).valid()
+                            || pacer.isArmed() && !floodTrusted && serverHasTargetFlood(ircdSoftwareFromVersion(serverSoftware)))
+                            window.record(now);
+                }
             }
             catch (Exception e) {
                 logInfo("Paced write failed for %s: %s", config.name, e.msg);
                 return;
             }
         }
+        finishPacing(now);
     }
 
-    /// Tells the user their paste is still going out, at most every 5 s.
-    ///
-    /// A queue that drains slowly is indistinguishable from a hung client:
-    /// the reported symptom was "it posted a chunk and then waited way too
-    /// long", with nothing anywhere saying why. Only fires for a backlog big
-    /// enough to be worth a line in the server log.
+    /// First/small queues are visible too; progress is limited to once per 5s.
     private void reportPacing(long nowMs, size_t startedWith) {
-        enum size_t PACED_NOTICE_MIN_QUEUE = 25;
         enum long PACED_NOTICE_INTERVAL_MS = 5_000;
-        if (pacedQueue.length < PACED_NOTICE_MIN_QUEUE) return;
+        if (!pacedQueue.length && !pacer.isArmed()) return;
         if (lastPacedNoticeMs > 0 && nowMs - lastPacedNoticeMs < PACED_NOTICE_INTERVAL_MS) return;
         lastPacedNoticeMs = nowMs;
+        pacingNoticeActive = true;
         const sent = startedWith > pacedQueue.length ? startedWith - pacedQueue.length : 0;
         const reason = floodTrusted && !pacer.isImmune()
             ? "the server accepts " ~ (trustedRate.commandRateMilli / 1000).to!string
@@ -14236,8 +14545,9 @@ private void processEvents() {
                 ? "the server asked us to slow down"
                 : "a channel rate limit (+f)";
         emitLog("flood_pacing",
-            "Sending queued lines: " ~ pacedQueue.length.to!string ~ " left ("
-            ~ sent.to!string ~ " sent this pass) — " ~ reason);
+            (pacedQueue.length ? "Sending queued lines: " ~ pacedQueue.length.to!string ~ " left ("
+                ~ sent.to!string ~ " sent this pass)" : "Cooling down before sending more commands")
+            ~ " — " ~ reason);
         logJsonMap("info", "connection",
             "Pacing outbound queue",
             ["network":   config.name,
@@ -14246,6 +14556,14 @@ private void processEvents() {
              "trusted":   floodTrusted.to!string,
              "armed":     pacer.isArmed().to!string,
              "event":     "flood_pacing"]);
+    }
+
+    private void finishPacing(long nowMs) {
+        if (!pacingNoticeActive || pacedQueue.length || pacer.waitMs(0, nowMs) > 0) return;
+        if (floodTrusted && cmdBucket.waitMs(nowMs, trustedRate, pacer.isImmune()) > 0) return;
+        pacingNoticeActive = false;
+        lastPacedNoticeMs = 0;
+        emitLog("flood_pacing_done", "Outbound pacing is complete; no queued commands remain.");
     }
 
     /// Server NOTICE texts that mean "you are sending too fast". Deliberately
@@ -14386,6 +14704,7 @@ private void processEvents() {
         const nowMs = unixMsNow();
         lastFloodComplaintMs = nowMs;
         pacer.tighten(nowMs);
+        reportPacing(nowMs, pacedQueue.length);
         logJsonMap("warn", "connection",
             "Server flood complaint — tightening outbound pacing",
             ["network":     config.name,
@@ -14405,16 +14724,70 @@ private void processEvents() {
     private void processOutboundQueue() {
         if (state != ConnectionState.connected) return;
 
-        // Reconnect buffer first: these lines were written while the
-        // transport was down and must not be reordered behind a paste.
+        // Legacy snapshots can still carry a reconnect buffer. Migrate it
+        // once into the same admission lane, never write it around the gates.
         if (outboundQueue.length > 0) {
-            auto queue = outboundQueue;
-            outboundQueue = [];
-            foreach (l; queue) writeRaw(l);
+            BncPendingWrite[] merged;
+            foreach (line; outboundQueue)
+                if (!isSensitiveServiceLine(line) && !optionalRead(line, true).command.length)
+                    merged ~= BncPendingWrite(line);
+            merged ~= pacedQueue;
+            pacedQueue = merged;
+            outboundQueue = null;
         }
 
         // Then whatever the flood pacer is holding back.
         drainPacedQueue();
+    }
+
+    /// Outgoing state changes start at admission to the actual transport,
+    /// never when a command merely enters a queue.
+    private void noteRawWrite(string line) {
+        auto commandLine = line;
+        bool privateLabel;
+        if (commandLine.startsWith("@")) {
+            const space = commandLine.indexOf(' ');
+            if (space < 0) return;
+            privateLabel = commandLine[0 .. space].canFind("label=bnc-");
+            commandLine = commandLine[space + 1 .. $];
+        }
+        const command = rawCommand(commandLine);
+        const space = commandLine.indexOf(' ');
+        const args = space < 0 ? "" : commandLine[space + 1 .. $].strip();
+        const fromClient = (line in clientReadLines) !is null;
+        clientReadLines.remove(line);
+        if (auto read = line in optionalReads) read.sentAtMs = unixMsNow();
+        switch (command) {
+            case "AWAY":
+                isAway = args.length != 0;
+                awayMessage = args.startsWith(":") ? args[1 .. $] : args;
+                break;
+            case "NICK":
+                if (args.length) {
+                    if (state == ConnectionState.connected || observed001AtMs > 0)
+                        optimisticNickOld = sessionNick;
+                    sessionNick = args;
+                }
+                break;
+            case "LIST":
+                if (!privateLabel) beginChannelList(args);
+                break;
+            case "JOIN":
+                recordPendingJoins(args);
+                if (state == ConnectionState.connected && joinsAwaitingConfirm.length)
+                    scheduleJoinConfirmSweep();
+                break;
+            case "WHO":
+                if (!privateLabel) trackWho(commandLine, fromClient);
+                break;
+            case "WHOIS":
+                if (fromClient && !privateLabel) {
+                    const lastSpace = args.lastIndexOf(' ');
+                    services.noteClientWhois(lastSpace < 0 ? args : args[lastSpace + 1 .. $]);
+                }
+                break;
+            default: break;
+        }
     }
 
     private void writeRaw(string line) {
@@ -14433,6 +14806,7 @@ private void processEvents() {
         // without de-opering us, and must restore both admission and charging.
         if (floodTrusted) cmdBucket.record(unixMsNow(), trustedRate, 1, pacer.isImmune());
         if (transportAlive) {
+            noteRawWrite(line);
             try transportWrite(line);
             catch (Exception e) {
                 logJsonMap("error", "connection",
@@ -14896,65 +15270,76 @@ private void processEvents() {
             return;
         }
         if (!admitServiceLine(line)) return;
-        // A NickServ auth command leaving now (manual, alias, bouncer,
-        // automatic IDENTIFY/GHOST) is remembered until its verdict.
-        if (state == ConnectionState.connected || (state == ConnectionState.connecting && transportAlive)) {
-            if (!gateLegacyAuth(() { services.noteManualLine(line); })) return;
+        const live = state == ConnectionState.connected
+            || (state == ConnectionState.connecting && transportAlive);
+        const sensitive = isSensitiveServiceLine(line);
+        // Private service commands may leave now, but never enter either
+        // replayable queue. Record their auth fence only after admission.
+        if (sensitive && !noncriticalReadyNow(line)) {
+            emitLog("flood_pacing", "A private services command was not sent while the network is pacing. It was not queued; try again later.");
+            return;
         }
-        if (fromClient && line.length > 6 && line[0 .. 6].toUpper() == "WHOIS ") {
-            auto args = line[6 .. $].strip();
-            const sp = args.lastIndexOf(' ');
-            services.noteClientWhois(sp < 0 ? args : args[sp + 1 .. $]);
-        }
-        // Track own away status
-        if (line == "AWAY" || line == "away") {
-            isAway = false;
-            awayMessage = "";
-        } else if (line.startsWith("AWAY :") || line.startsWith("away :")) {
-            isAway = true;
-            awayMessage = line[6 .. $].strip();
-        }
-        // Optimistic nick update — prevent sync from clobbering the UI
-        // before the server echoes back the NICK response. Save the
-        // previous sessionNick so the NICK handler can correlate the
-        // server's echo back to us even after this optimistic change.
-        if (line.startsWith("NICK ") || line.startsWith("nick ")) {
-            const newNick = line[5 .. $].strip();
-            if (newNick.length > 0) {
-                optimisticNickOld = sessionNick;
-                sessionNick = newNick;
+        if (live && !gateLegacyAuth(() { services.noteManualLine(line); })) return;
+
+        const wire = tagPrefix("", clientTags) ~ line;
+        if (!owned) {
+            auto read = optionalRead(wire);
+            if (!live && optionalRead(wire, true).command.length) {
+                if (fromClient) emitLog("flood_pacing", "This read query was not queued while the network is disconnected. Retry it after reconnecting.");
+                return;
             }
-        }
-        // /LIST from any client path (web slash command, bouncer client, /raw).
-        import std.uni : icmp;
-        if (line.length >= 4 && icmp(line[0 .. 4], "LIST") == 0
-            && (line.length == 4 || line[4] == ' ')) {
-            // Owned query output is streamed privately, never folded into shared LIST chunks.
-            if (!owned) beginChannelList(line.length > 5 ? line[5 .. $].strip() : "");
-        }
-        // Remember what we asked to join. Every JOIN — auto-join burst, a
-        // sidebar click, /raw, a bouncer client — funnels through here, so
-        // this is the one place that knows the target set the JOIN-throttle
-        // retry has to re-send (421 names the command, never the channel).
-        if (line.length >= 5 && icmp(line[0 .. 5], "JOIN ") == 0) {
-            recordPendingJoins(line[5 .. $]);
-        }
-        // Every WHO — the engine's sweep and a client's own — funnels
-        // through here too, in the order the server will answer them.
-        if (line.length >= 4 && icmp(line[0 .. 4], "WHO ") == 0) {
-            if (!owned) trackWho(line, fromClient);
+            if (read.command.length) {
+                // Automatic realname enrichment is optional, not user work.
+                if (!fromClient && pacer.isArmed() && (read.command == "WHOIS" || read.command == "WHO")) return;
+                expireOptionalReads(unixMsNow());
+                if (auto pending = wire in optionalReads) {
+                    if (fromClient) {
+                        pending.fromClient = true;
+                        if (!pending.sentAtMs) clientReadLines[wire] = true;
+                        else if (pending.command == "WHO") {
+                            foreach (ref who; pendingWhos)
+                                if (sameNick(who.mask, pending.target)) who.client = true;
+                        }
+                        else if (pending.command == "WHOIS") {
+                            services.noteClientWhois(pending.target);
+                        }
+                        const now = unixMsNow();
+                        if (!lastReadCoalescedNoticeMs || now - lastReadCoalescedNoticeMs >= 5_000) {
+                            lastReadCoalescedNoticeMs = now;
+                            emitLog("flood_pacing", "An identical read query is already pending. Waiting for its response instead of sending it again.");
+                        }
+                    }
+                    return;
+                }
+                // Both queued and in-flight state are bounded. At capacity,
+                // refuse explicitly rather than silently disabling coalescing.
+                if (optionalReads.length >= MAX_PACED_QUEUE) {
+                    reportQueueFull();
+                    return;
+                }
+                read.fromClient = fromClient;
+                read.sequence = ++nextReadSequence;
+                optionalReads[wire] = read;
+            }
+            if (fromClient && (read.command.length || ["WHO", "WHOIS"].canFind(rawCommand(wire))))
+                clientReadLines[wire] = true;
         }
         if (owned) {
             attemptedOwnedWrite = true;
-            bncState().writeOwned(tagPrefix("", clientTags) ~ line, owner, unixMsNow(), expectedEpoch, wireLabel);
+            if (sensitive || immediateProtocolLine(wire))
+                bncState().writeOwned(wire, owner, unixMsNow(), expectedEpoch, wireLabel);
+            else enqueuePaced(wire, owner, expectedEpoch, wireLabel);
             return;
         }
-        if (state == ConnectionState.disconnected ||
-            (state == ConnectionState.connecting && !transportAlive)) {
-            if (outboundQueue.length < MAX_OUTBOUND_QUEUE) outboundQueue ~= line;
+        if (!live) {
+            if (!enqueuePaced(wire)) clientReadLines.remove(wire);
             return;
         }
-        writeRaw(line);
+        if (sensitive || immediateProtocolLine(wire)) writeRaw(wire);
+        else if (!enqueuePaced(wire)) {
+            optionalReads.remove(wire);
+            clientReadLines.remove(wire);
+        }
     }
 
     /// Sends a PRIVMSG to a target, with optional client tags.
@@ -15027,10 +15412,14 @@ private void processEvents() {
             return;
         }
         if (!admitServiceMessage(target, text)) return;
+        const sensitive = sensitiveServiceMessage(target, text, effectiveServices());
+        if (sensitive && !noncriticalReadyNow(command ~ " " ~ target ~ " :" ~ text)) {
+            emitLog("flood_pacing", "A private services command was not sent while the network is pacing. It was not queued; try again later.");
+            return;
+        }
         if (command == "PRIVMSG" && !gateLegacyAuth(() { services.noteManualMessage(target, text); })) return;
         // A services credential or private memo is never echoed into chat
         // history by us; the server's own echo is intercepted on arrival.
-        const sensitive = sensitiveServiceMessage(target, text, effectiveServices());
         const budget = linePayloadBudget(target, command);
         bool[] concat;
         auto lines = splitMessage(text, budget, concat);
@@ -15056,12 +15445,23 @@ private void processEvents() {
             if (owned) {
                 size_t count;
                 foreach (line; lines) if (line.length) ++count;
-                if (pacedQueue.length + count > MAX_PACED_QUEUE) return;
+                if (pacedQueue.length + count > MAX_PACED_QUEUE) {
+                    reportQueueFull();
+                    return;
+                }
                 childLabels = new string[count];
                 if (count == 1) childLabels[0] = wireLabel;
                 else foreach (ref childLabel; childLabels) childLabel = "bnc-" ~ randomUUID().toString();
                 if (count > 1 && !bncState().prepareOwnedGroup(owner, wireLabel, childLabels, expectedEpoch, unixMsNow())) {
                     attemptedOwnedWrite = true;
+                    return;
+                }
+            } else {
+                size_t count;
+                foreach (line; lines) if (line.length) ++count;
+                if (pacedQueue.length + count > MAX_PACED_QUEUE) {
+                    reportQueueFull();
+                    if (label.length) pendingLabels.remove(label);
                     return;
                 }
             }
@@ -16180,6 +16580,214 @@ struct Ircv3Check {
     bool passed;
 }
 
+/// Socket-level regressions for early server JOINs, shared command admission,
+/// optional reads, and the progress users see while a connection is paced.
+Ircv3Check[] slowdownWireChecks(out string[] wire) {
+    import std.algorithm : count, filter;
+    import std.array : array;
+    import vibe.core.net : listenTCP;
+    import vibe.stream.operations : readLine;
+    import ircfiber.engine.session_snapshot : fromJSON;
+
+    Ircv3Check[] checks;
+    void check(string name, bool passed) { checks ~= Ircv3Check(name, passed); }
+    string[] received;
+    bool peerClosed;
+    auto listener = listenTCP(0, (TCPConnection peer) {
+        try {
+            peer.write(":s 001 me :Welcome\r\n"
+                ~ ":s 005 me CHANTYPES=# CHANMODES=b,k,l,imnst :supported\r\n"
+                ~ ":me!u@host JOIN #superbowl\r\n"
+                ~ ":s 353 me = #superbowl :me\r\n"
+                ~ ":s 366 me #superbowl :End of NAMES\r\n"
+                ~ ":s 376 me :End of MOTD\r\n");
+            peer.flush();
+            while (!peer.empty) {
+                const line = (cast(const(char)[]) peer.readLine()).idup;
+                received ~= line;
+                if (line.startsWith("JOIN ")) {
+                    foreach (target; line[5 .. $].split(",")) {
+                        if (target == "#superbowl") {
+                            peer.write(":s 405 me #superbowl :slow down nerd\r\n");
+                        } else {
+                            peer.write(":me!u@host JOIN " ~ target ~ "\r\n");
+                        }
+                    }
+                    peer.flush();
+                }
+            }
+        } catch (Exception) {}
+        try peer.close(); catch (Exception) {}
+        peerClosed = true;
+    }, "127.0.0.1");
+    auto events = EngineEventChannel.create();
+    NetworkConfig cfg;
+    cfg.nick = "me";
+    cfg.name = "Owned slowdown fixture";
+    cfg.autoJoinChannels = ["#superbowl", "#other"];
+    cfg.nspass = "fixture-only";
+    auto client = new PersistentIRCClient(cfg, events);
+    client.connection = connectTCP("127.0.0.1", listener.bindAddress.port);
+    client.state = ConnectionState.connecting;
+    void cleanup() {
+        ++client.joinRetryEpoch;
+        try client.connection.close(); catch (Exception) {}
+        foreach (_; 0 .. 200) {
+            if (peerClosed) break;
+            try sleep(5.msecs); catch (Exception) {}
+        }
+        try listener.stopListening(); catch (Exception) {}
+        events.close();
+    }
+    scope(exit) cleanup();
+    void pump(long milliseconds = 75) {
+        const until = unixMsNow() + milliseconds;
+        ubyte[4096] buffer;
+        while (unixMsNow() < until) {
+            const n = client.readFromStream(buffer[], 10.msecs);
+            if (!n) continue;
+            client.inboundPartial ~= cast(const(char)[]) buffer[0 .. n];
+            for (;;) {
+                const end = client.inboundPartial.indexOf("\r\n");
+                if (end < 0) break;
+                const line = client.inboundPartial[0 .. end].idup;
+                client.inboundPartial = client.inboundPartial[end + 2 .. $];
+                client.processLine(line);
+            }
+        }
+    }
+    size_t occurrences(string line) { return received.count(line); }
+    client.sendRaw("WEBIRC fixture ircfiber 192.0.2.1 192.0.2.1");
+    client.performRegistration();
+    client.state = ConnectionState.connected;
+    client.connectedAtMs = unixMsNow();
+    client.processOutboundQueue();
+    pump();
+    check("registration WEBIRC reaches the wire before CAP and deferred commands",
+        received.length > 0 && received[0] == "WEBIRC fixture ircfiber 192.0.2.1 192.0.2.1");
+    check("configured private authentication is written before deferred autojoins",
+        received.count("PRIVMSG NickServ :IDENTIFY fixture-only") == 1
+        && received.count("JOIN #other") == 1
+        && received.countUntil("PRIVMSG NickServ :IDENTIFY fixture-only") < received.countUntil("JOIN #other"));
+    check("a server-confirmed registration JOIN never enters the outgoing autojoin batch",
+        occurrences("JOIN #superbowl") == 0 && client.joinsAwaitingConfirm.length == 0);
+    sleep((PersistentIRCClient.JOIN_CONFIRM_SWEEP_MS + 75).msecs);
+    client.processOutboundQueue();
+    pump();
+    check("the confirmation watchdog does not retry an already joined channel",
+        occurrences("JOIN #superbowl") == 0 && client.joinThrottleRounds == 0);
+
+    client.sendRaw("WHO #one", true);
+    client.sendRaw("WHO #one", true);
+    client.sendRaw("WHO #two", true);
+    pump();
+    check("identical reads share one operation while distinct targets still reach the wire",
+        occurrences("WHO #one") == 1 && occurrences("WHO #two") == 1);
+    client.processLine(":s 263 me WHO :Try again later");
+    client.sendRaw("WHO #one", true);
+    client.sendRaw("WHO #two", true);
+    pump();
+    check("a command-only refusal releases only the oldest outstanding read",
+        occurrences("WHO #one") == 2 && occurrences("WHO #two") == 1);
+    client.processLine(":s 315 me #one :End of WHO");
+    client.processLine(":s 315 me #two :End of WHO");
+    client.sendRaw("NAMES #one,#two", true);
+    client.processLine(":s 366 me #one :End of NAMES");
+    client.sendRaw("NAMES #one,#two", true);
+    pump();
+    check("a multi-channel NAMES read remains pending until every channel completes",
+        occurrences("NAMES #one,#two") == 1);
+    client.processLine(":s 366 me #two :End of NAMES");
+    client.sendRaw("NAMES #one,#two", true);
+    pump();
+    check("a completed multi-channel read can be explicitly requested again",
+        occurrences("NAMES #one,#two") == 2);
+    client.sendRaw("MODE me", true);
+    client.processLine(":s 221 me +i");
+    client.sendRaw("MODE me", true);
+    pump();
+    check("user MODE queries finish on 221 rather than waiting for expiry", occurrences("MODE me") == 2);
+    client.sendRaw("NAMES #room", true);
+    client.processLine(":s 482 me #room :You are not a channel operator");
+    client.sendRaw("NAMES #room", true);
+    pump();
+    check("a mode-mutation error cannot release an unrelated pending NAMES read",
+        occurrences("NAMES #room") == 1);
+
+    client.pacer.tighten(unixMsNow());
+    const before = received.length;
+    client.sendRaw("MODE #room +m", true);
+    client.sendRaw("PRIVMSG #room :kept", true);
+    client.sendRaw("WHOIS optional-enrichment");
+    client.sendRaw("PONG :liveness");
+    pump();
+    check("an armed pacer delays raw mutations and messages but never PONG",
+        received[before .. $] == ["PONG :liveness"] && client.pacedQueue.length == 2);
+    sleep(2_100.msecs);
+    client.processOutboundQueue();
+    pump();
+    check("deferred raw work reaches the real socket in submission order",
+        occurrences("MODE #room +m") == 1 && occurrences("PRIVMSG #room :kept") == 0);
+    sleep(2_100.msecs);
+    client.processOutboundQueue();
+    pump();
+    check("the next raw message is released by the shared gate, not lost",
+        occurrences("PRIVMSG #room :kept") == 1 && occurrences("WHOIS optional-enrichment") == 0);
+
+    client.channelState["#retained"] = "";
+    client.resetConnectionTelemetry();
+    client.pacer = FakeLagPacer.init;
+    client.state = ConnectionState.connected;
+    client.sendAutomaticJoins(["#retained"]);
+    pump();
+    check("retained previous-socket membership is still rejoined on a fresh socket",
+        occurrences("JOIN #retained") == 1);
+    client.processLine(":me!u@host PART #retained :left");
+    client.sendAutomaticJoins(["#retained"]);
+    pump();
+    check("PART revokes current-socket proof and permits a real rejoin", occurrences("JOIN #retained") == 2);
+    client.channelState["#names"] = "";
+    client.joinsAwaitingConfirm ~= "#names";
+    client.processLine(":s 353 me = #names :me");
+    client.processLine(":s 366 me #names :End of NAMES");
+    check("fresh complete NAMES containing self clears pending membership even when retained",
+        !client.joinsAwaitingConfirm.canFind("#names") && ("#names" in client.confirmedMembership) !is null);
+    client.channelState["#unproven"] = "";
+    auto capturedSnapshot = client.snapshotSession();
+    const snapshot = fromJSON(toJSON(capturedSnapshot));
+    check("retained-socket metadata never promotes unproven membership into confirmed state",
+        snapshot.confirmedChannels.canFind("#names") && !snapshot.confirmedChannels.canFind("#unproven"));
+
+    client.pacer.tighten(unixMsNow());
+    const beforeReconnect = received.length;
+    client.outboundQueue = ["WHO #stale", "MODE #room +s", "PRIVMSG #room :after reconnect"];
+    client.processOutboundQueue();
+    pump();
+    check("reconnect-buffered traffic obeys pacing and stale optional reads are not replayed",
+        received.length == beforeReconnect && client.pacedQueue.length == 2 && !client.outboundQueue.length);
+    client.pacer.resetAccrual();
+    client.processOutboundQueue();
+    pump();
+    client.pacer.resetAccrual();
+    client.processOutboundQueue();
+    pump();
+    check("intentional reconnect-buffered writes survive in their original order",
+        received[beforeReconnect .. $] == ["MODE #room +s", "PRIVMSG #room :after reconnect"]);
+    client.pacer.resetAccrual();
+    client.processOutboundQueue();
+    bool pacing, done;
+    IRCRawEvent event;
+    while (events.tryConsumeOne(event, 0.msecs)) {
+        pacing = pacing || event.getTag("phase") == "flood_pacing";
+        done = done || event.getTag("phase") == "flood_pacing_done";
+    }
+    check("small queued operations report both cooldown and eventual completion", pacing && done);
+    foreach (line; received)
+        wire ~= line.startsWith("PRIVMSG NickServ :IDENTIFY ")
+            ? "PRIVMSG NickServ :IDENTIFY [fixture-redacted]" : line;
+    return checks;
+}
+
 version (MemoryReliabilityHarness)
 Ircv3Check[] memoryIdentityRegressionChecks() {
     import vibe.data.json : parseJsonString;
@@ -16708,6 +17316,41 @@ Ircv3Check[] metaPublicationRegressionChecks() {
 /// the socket reader. Called explicitly by connection-registration-test.
 Ircv3Check[] ircv3ProtocolChecks(out string[] wire) {
     Ircv3Check[] results;
+    import vibe.core.net : listenTCP;
+    import vibe.stream.operations : readLine;
+    class HistoryWire {
+        TCPConnection socket;
+        string[] lines;
+    }
+    HistoryWire[PersistentIRCClient] historyPeers;
+    HistoryWire accepting;
+    auto historyListener = listenTCP(0, (TCPConnection peer) {
+        auto capture = accepting;
+        try {
+            while (!peer.empty) capture.lines ~= (cast(const(char)[]) peer.readLine()).idup;
+        } catch (Exception) {}
+        try peer.close(); catch (Exception) {}
+    }, "127.0.0.1");
+    void closeHistoryPeers() {
+        foreach (capture; historyPeers.byValue) {
+            try capture.socket.close(); catch (Exception) {}
+        }
+        historyListener.stopListening();
+    }
+    scope (exit) closeHistoryPeers();
+    string[] historyWrites(PersistentIRCClient client) {
+        if (client !in historyPeers) {
+            accepting = new HistoryWire;
+            accepting.socket = connectTCP("127.0.0.1", historyListener.bindAddress.port);
+            client.connection = accepting.socket;
+            client.state = ConnectionState.connected;
+            historyPeers[client] = accepting;
+            sleep(10.msecs);
+        }
+        client.processOutboundQueue();
+        sleep(10.msecs);
+        return historyPeers[client].lines;
+    }
     {
         NetworkConfig cfg;
         cfg.nick = "me";
@@ -17149,12 +17792,11 @@ Ircv3Check[] ircv3ProtocolChecks(out string[] wire) {
         client.processLine("@batch=p;time=2023-11-14T22:13:40.000Z;msgid=a :a!u@h PRIVMSG #gap :two");
         client.processLine("BATCH -p");
         results ~= Ircv3Check("short nonempty history page awaits ordered storage checkpoint",
-            client.historyPages[firstId].awaitingCommit && client.outboundQueue.length == 1
+            client.historyPages[firstId].awaitingCommit
             && client.historyPages[firstId].proposed.state == "recovering");
         client.confirmHistoryPage(firstId, true);
         results ~= Ircv3Check("committed page continues BEFORE first opaque msgid across timestamp ties",
-            client.outboundQueue.length == 2
-            && client.outboundQueue[$ - 1] == "CHATHISTORY BEFORE #gap msgid=z 20"
+            historyWrites(client).canFind("CHATHISTORY BEFORE #gap msgid=z 20")
             && client.historyRecovery["#gap"].lowerBound.msgid == "old");
         const secondId = client.historyPages.keys[0];
         client.processLine("@draft/chathistory-end BATCH +p2 chathistory #gap");
@@ -17216,8 +17858,7 @@ Ircv3Check[] ircv3ProtocolChecks(out string[] wire) {
         next.historyRetryAt["history-peer"] = 0;
         next.tickHistoryRecovery();
         results ~= Ircv3Check("adopted failed first page retries DM LATEST without current channel or query membership",
-            next.outboundQueue.length == 1
-            && next.outboundQueue[0] == "CHATHISTORY LATEST history-peer * 20");
+            historyWrites(next) == ["CHATHISTORY LATEST history-peer * 20"]);
         const requestId = next.historyPages.keys[0];
         next.processLine("BATCH +retry chathistory history-peer");
         next.processLine("@batch=retry;time=2023-11-14T22:13:40.000Z;msgid=retry-first :history-peer!u@h PRIVMSG me :one");
@@ -17227,7 +17868,7 @@ Ircv3Check[] ircv3ProtocolChecks(out string[] wire) {
         results ~= Ircv3Check("retried LATEST refreshes seed upper bound and continues the frozen gap with BEFORE",
             next.historyRecovery["history-peer"].lowerBound.msgid == "seed"
             && next.historyRecovery["history-peer"].upperBound.msgid == "retry-last"
-            && next.outboundQueue[$ - 1] == "CHATHISTORY BEFORE history-peer msgid=retry-first 20");
+            && historyWrites(next).canFind("CHATHISTORY BEFORE history-peer msgid=retry-first 20"));
         auto committed = pending;
         committed.state = "recovering";
         committed.reasonCode = "";
@@ -17290,12 +17931,12 @@ Ircv3Check[] ircv3ProtocolChecks(out string[] wire) {
             client.historyRecovery["#gap"].state == "stalled"
             && client.historyRecovery["#gap"].lowerBound.msgid == "covered"
             && client.historyPages.length == 0);
-        const writes = client.outboundQueue.length;
+        const writes = historyWrites(client).length;
         client.beginTargetRecovery("#gap");
         client.drainHistoryQueue();
         results ~= Ircv3Check("TARGETS rediscovery cannot bypass a stalled page's scheduled retry",
             client.historyRecovery["#gap"].state == "stalled"
-            && client.outboundQueue.length == writes && client.historyPages.length == 0);
+            && historyWrites(client).length == writes && client.historyPages.length == 0);
         IRCRawEvent event;
         while (ch.tryConsumeOne(event, Duration.zero)) {}
         ch.close();
@@ -17319,8 +17960,7 @@ Ircv3Check[] ircv3ProtocolChecks(out string[] wire) {
         client.drainHistoryQueue();
         client.processLine(":s FAIL CHATHISTORY " ~ failure ~ " #gap :Reference is no longer available");
         results ~= Ircv3Check(failure ~ " retries the retained boundary using timestamp overlap",
-            client.outboundQueue.length == 2
-            && client.outboundQueue[$ - 1].startsWith("CHATHISTORY BEFORE #gap timestamp=")
+            historyWrites(client).canFind!(line => line.startsWith("CHATHISTORY BEFORE #gap timestamp="))
             && client.historyRecovery["#gap"].timestampFallback
             && client.historyRecovery["#gap"].lowerBound.msgid == "covered"
             && client.historyPages.length == 1);
@@ -17353,7 +17993,7 @@ Ircv3Check[] ircv3ProtocolChecks(out string[] wire) {
         client.processLine("BATCH -t");
         client.confirmHistoryPage(id, true);
         results ~= Ircv3Check("timestamp-only mixed pages overlap the boundary group toward newer time",
-            client.outboundQueue[$ - 1] == "CHATHISTORY BEFORE #ties timestamp=2023-11-14T22:13:21.000Z 3");
+            historyWrites(client).canFind("CHATHISTORY BEFORE #ties timestamp=2023-11-14T22:13:21.000Z 3"));
         client.processLine("BATCH +repeat chathistory #ties");
         foreach (_; 0 .. 3)
             client.processLine("@batch=repeat;time=2023-11-14T22:13:20.000Z :a!u@h PRIVMSG #ties :clipped tie");
@@ -17376,7 +18016,7 @@ Ircv3Check[] ircv3ProtocolChecks(out string[] wire) {
         next.historyRetryAt["*targets"] = 0;
         next.tickHistoryRecovery();
         results ~= Ircv3Check("discovery retry reconstructs bounded TARGETS rather than invalid channel history",
-            next.outboundQueue.length == 1 && next.outboundQueue[0].startsWith("CHATHISTORY TARGETS timestamp="));
+            historyWrites(next).canFind!(line => line.startsWith("CHATHISTORY TARGETS timestamp=")));
         IRCRawEvent event;
         while (ch.tryConsumeOne(event, Duration.zero)) {}
         ch.close();
@@ -19579,14 +20219,28 @@ Ircv3Check[] maintenanceAdmissionRegressionChecks() {
     row["routingPreferences"] = config.routing.toJson();
     row["route"] = route;
     row["routeIdentity"] = identity;
+    auto savedAdmission = registrationAdmission;
+    scope(exit) registrationAdmission = savedAdmission;
     foreach (admission; ["draining", "open", "unavailable"]) {
+        registrationAdmission = new RegistrationAdmission;
         fixture.admission.set("nord-se", admission);
         auto client = new PersistentIRCClient(config, channel);
+        client.restoreMaintenanceRoute(row, deadline);
+        DialRequest request;
+        request.host = config.host;
+        request.port = config.port;
+        request.tls = "none";
+        request.tag.egressLabel = "nord-se";
+        request.hasProxy = true;
+        request.proxy.host = proxy.host;
+        request.proxy.port = proxy.port;
         bool rejected;
-        try client.restoreMaintenanceRoute(row, deadline);
+        try client.admitRegistration(request, RouteKind.nordvpn, () => true);
         catch (RoutingPolicyBlockedException) rejected = true;
-        checks ~= Ircv3Check("restoration refuses " ~ admission ~ " concrete exits without acquiring a client hold",
-            rejected && proxy.activeConns == 3);
+        catch (HolderUnavailableException) rejected = true;
+        checks ~= Ircv3Check("restored " ~ admission ~ " affinity preserves attachment but refuses fresh DIAL",
+            rejected && client.maintenanceActive() && !client.registrationPermit
+            && !client.holderConnId.length && proxy.activeConns == 3);
     }
     fixture.admission.set("nord-se", "healthy");
     auto changed = config;

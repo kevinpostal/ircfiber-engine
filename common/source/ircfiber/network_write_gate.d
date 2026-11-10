@@ -24,13 +24,15 @@ final class NetworkWriteUnavailableException : Exception {
     this(string code = "network_maintenance") {
         super(code == "network_maintenance"
             ? "Network changes are temporarily excluded for holder maintenance"
-            : "Network write coordination is unavailable; no change was dispatched");
+            : code == "network_write_incomplete"
+                ? "Network change acknowledgment is uncertain; do not assume it completed"
+                : "Network write coordination is unavailable; a dispatched change may be incomplete");
         this.code = code;
     }
 }
 
-/// Stack ownership survives fiber yields. There is intentionally no public
-/// confirmation API: only the strict raw Mongo acknowledgement below releases.
+/// Stack ownership survives fiber yields. An admitted scope is released only
+/// after its coordination-critical work has positively completed.
 private struct NetworkWriter {
     private RedisStorage redis;
     private string token;
@@ -66,6 +68,38 @@ private struct NetworkWriter {
     }
 }
 
+/// Holds exclusion through an entire lifecycle operation, including gaps
+/// between Mongo writes. Mark unfenced critical dispatch before I/O and
+/// confirm its reply; known validation/read failures do not retain a token.
+struct NetworkWriteOperation {
+    private NetworkWriter writer;
+    @disable this();
+    @disable this(this);
+
+    this(RedisStorage redis) {
+        writer = NetworkWriter(redis);
+        writer.confirmed = true;
+        version (RoutingPolicyTest) {
+            if (networkOperationAdmittedForTest !is null)
+                networkOperationAdmittedForTest(writer.token);
+        }
+    }
+
+    void beginDispatch() @safe nothrow {
+        writer.confirmed = false;
+    }
+
+    void confirmCompletion() {
+        version (RoutingPolicyTest) {
+            if (networkOperationRepliedForTest !is null) {
+                writer.confirmed = false;
+                networkOperationRepliedForTest(writer.token);
+            }
+        }
+        writer.confirmed = true;
+    }
+}
+
 /// Execute one canonical mutation. The command must be completely constructed
 /// before admission. Every exception after dispatch retains the writer token,
 /// including a malformed acknowledgement or write-concern uncertainty.
@@ -80,38 +114,54 @@ Bson runNetworkMutation(RedisStorage redis, Bson command) {
     version (RoutingPolicyTest) {
         if (networkMutationAdmittedForTest !is null) networkMutationAdmittedForTest(writer.token);
     }
-    auto reply = AppMongoConnection.getDb().runCommandUnchecked(command);
-    version (RoutingPolicyTest) {
-        if (networkMutationRepliedForTest !is null) networkMutationRepliedForTest();
-    }
-    // A typed duplicate-key rejection is authoritative command completion:
-    // no operation remains in flight. Preserve the allocator's retry protocol.
-    if (command["findAndModify"].type == Bson.Type.string
-            && numeric(reply["ok"]) && reply["ok"].get!double == 0
-            && numeric(reply["code"]) && reply["code"].get!long == 11000
-            && (reply["writeConcernError"].isNull || reply["writeConcernError"].type == Bson.Type.undefined)) {
+    try {
+        auto reply = AppMongoConnection.getDb().runCommandUnchecked(command);
+        version (RoutingPolicyTest) {
+            if (networkMutationRepliedForTest !is null) networkMutationRepliedForTest();
+        }
+        // A duplicate-key rejection is authoritative command completion:
+        // no operation remains in flight. Preserve the allocator's retry protocol.
+        if (command["findAndModify"].type == Bson.Type.string
+                && numericEquals(reply["ok"], 0)
+                && numericEquals(reply["code"], 11000)
+                && (reply["writeConcernError"].isNull || reply["writeConcernError"].type == Bson.Type.undefined)) {
+            writer.confirmed = true;
+            return reply;
+        }
+        if (!numericEquals(reply["ok"], 1)
+                || (!reply["writeErrors"].isNull && reply["writeErrors"].type != Bson.Type.undefined
+                    && (reply["writeErrors"].type != Bson.Type.array || reply["writeErrors"].get!(Bson[]).length))
+                || (!reply["writeConcernError"].isNull && reply["writeConcernError"].type != Bson.Type.undefined))
+            throw new NetworkWriteUnavailableException("network_write_incomplete");
+        if ((updating && (!numeric(reply["n"]) || !numeric(reply["nModified"])))
+                || (deleting && !numeric(reply["n"]))
+                || (reserving && reply["value"].type == Bson.Type.undefined))
+            throw new NetworkWriteUnavailableException("network_write_incomplete");
         writer.confirmed = true;
         return reply;
+    } catch (NetworkWriteUnavailableException e) { throw e; }
+    catch (Exception) {
+        throw new NetworkWriteUnavailableException("network_write_incomplete");
     }
-    if (!numeric(reply["ok"]) || reply["ok"].get!double != 1.0
-            || (!reply["writeErrors"].isNull && reply["writeErrors"].type != Bson.Type.undefined
-                && (reply["writeErrors"].type != Bson.Type.array || reply["writeErrors"].get!(Bson[]).length))
-            || (!reply["writeConcernError"].isNull && reply["writeConcernError"].type != Bson.Type.undefined))
-        throw new Exception("Network mutation did not receive a confirmed Mongo acknowledgement");
-    if ((updating && (!numeric(reply["n"]) || !numeric(reply["nModified"])))
-            || (deleting && !numeric(reply["n"]))
-            || (reserving && reply["value"].type == Bson.Type.undefined))
-        throw new Exception("Malformed network mutation completion acknowledgement");
-    writer.confirmed = true;
-    return reply;
 }
 
 private bool numeric(Bson value) {
     return value.type == Bson.Type.int_ || value.type == Bson.Type.long_ || value.type == Bson.Type.double_;
 }
 
+private bool numericEquals(Bson value, long expected) {
+    switch (value.type) {
+        case Bson.Type.int_: return value.get!int == expected;
+        case Bson.Type.long_: return value.get!long == expected;
+        case Bson.Type.double_: return value.get!double == expected;
+        default: return false;
+    }
+}
+
 version (RoutingPolicyTest) {
     /// Deterministic fiber barrier after real Redis admission, before dispatch.
     void delegate(string token) networkMutationAdmittedForTest;
     void delegate() networkMutationRepliedForTest;
+    void delegate(string token) networkOperationAdmittedForTest;
+    void delegate(string token) networkOperationRepliedForTest;
 }

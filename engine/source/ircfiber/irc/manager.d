@@ -325,7 +325,7 @@ final class ConnectionManager {
         bool maintenanceWorkerRunning;
         bool maintenanceProbeRunning;
         bool maintenanceGenerationLost;
-        bool maintenanceRestorePending;
+        bool maintenanceRestorePending = true;
         Json maintenanceProvenance;
     }
 

@@ -156,6 +156,7 @@ final class ServerRegistry {
             catch (Exception) {}
         }
         db.eval!string(q"LUA
+if redis.call('EXISTS', 'irc:holder:maintenance:write-exclusion') ~= 0 then return '0' end
 local mirrorType = redis.call('TYPE', KEYS[1]).ok
 if mirrorType ~= 'none' and mirrorType ~= 'hash' then error('invalid assignment mirror') end
 -- Read/validate the canonical hash before replacing any evidence.
@@ -681,6 +682,7 @@ LUA";
      */
     void setLease(string networkId, string serverId) {
         db.eval!string(q"LUA
+if redis.call('EXISTS', 'irc:holder:maintenance:write-exclusion') ~= 0 then return '0' end
 if redis.call('HGET', KEYS[1], ARGV[1]) ~= ARGV[2] then return '0' end
 redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3])
 return '1'

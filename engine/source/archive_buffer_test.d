@@ -652,10 +652,11 @@ private void preparedDestinationAdmission(Fixture f, string redisUrl) {
         }
     }
     const ownership = randomUUID().toString();
-    auto cleanup = Bson(["delete": Bson("networks"),
-        "deletes": Bson([Bson(["q": Bson(["id": Bson(f.network), "archiveFixtureOwner": Bson(ownership)]),
-            "limit": Bson(1)])]),
-        "writeConcern": Bson(["w": Bson("majority"), "j": Bson(true), "wtimeout": Bson(5000)])]);
+    auto cleanup = Bson.emptyObject;
+    cleanup["delete"] = Bson("networks");
+    cleanup["deletes"] = Bson([Bson(["q": Bson(["id": Bson(f.network), "archiveFixtureOwner": Bson(ownership)]),
+        "limit": Bson(1)])]);
+    cleanup["writeConcern"] = Bson(["w": Bson("majority"), "j": Bson(true), "wtimeout": Bson(5000)]);
     bool inserted;
     scope(exit) if (inserted) command(cleanup);
     f.ensureContext();
@@ -666,10 +667,11 @@ private void preparedDestinationAdmission(Fixture f, string redisUrl) {
     check(!destination.prepareScope(f.context, f.network, f.user),
         "Redis-only witness manufactured destination admission");
     check(!destination.scopeReady(f.network), "missing canonical network became ready");
-    auto insert = Bson(["insert": Bson("networks"),
-        "documents": Bson([Bson(["_id": Bson(f.network), "id": Bson(f.network), "userId": Bson(f.user),
-            "archiveFixtureOwner": Bson(ownership)])]),
-        "writeConcern": Bson(["w": Bson("majority"), "j": Bson(true), "wtimeout": Bson(5000)])]);
+    auto insert = Bson.emptyObject;
+    insert["insert"] = Bson("networks");
+    insert["documents"] = Bson([Bson(["_id": Bson(f.network), "id": Bson(f.network), "userId": Bson(f.user),
+        "archiveFixtureOwner": Bson(ownership)])]);
+    insert["writeConcern"] = Bson(["w": Bson("majority"), "j": Bson(true), "wtimeout": Bson(5000)]);
     inserted = true; // An uncertain insertion still needs exact-owner cleanup.
     command(insert);
     check(!destination.prepareScope(f.context, f.network, randomUUID().toString()),

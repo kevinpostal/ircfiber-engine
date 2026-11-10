@@ -13,7 +13,7 @@ import ircfiber.irc.connection : parseJoinThrottleSeconds, remainingJoinDelayMs,
     memberNeedsRealname, channelNeedsRealnameWho, MAX_WHO_ENRICH_ATTEMPTS,
     upsertRosterEntry, applyNamesBurst, isSaslRequiredRefusal, extractServerReason,
     saslMechanismOffered, fiberMlsBackstopChecks, fiberMlsWireChecks, servicesIdentityWireChecks,
-    ircv3ProtocolChecks, silentTransportRouteChecks;
+    ircv3ProtocolChecks, silentTransportRouteChecks, slowdownWireChecks;
 import ircfiber.engine.session_snapshot : historySnapshotRegressionChecks;
 import ircfiber.engine.processor : historyCheckpointRegressionChecks;
 import ircfiber.irc.bnc_ownership : runBncOwnershipProtocolChecks;
@@ -267,6 +267,10 @@ void main() {
     foreach (check; ircv3ProtocolChecks(ircv3Wire)) ok(check.name, check.passed);
     foreach (line; ircv3Wire) stderr.writeln("    wire> ", line);
     foreach (check; silentTransportRouteChecks()) ok(check.name, check.passed);
+    stderr.writeln("\n[connection.slowdown] shared admission and confirmed JOINs");
+    string[] slowdownWire;
+    foreach (check; slowdownWireChecks(slowdownWire)) ok(check.name, check.passed);
+    foreach (line; slowdownWire) stderr.writeln("    wire> ", line);
     historySnapshotRegressionChecks();
     historyCheckpointRegressionChecks();
     runBncOwnershipProtocolChecks();

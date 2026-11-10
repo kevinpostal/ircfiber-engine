@@ -8,7 +8,6 @@ on macOS; only this helper performs kernel/proc/cgroup evidence collection.
 """
 import hashlib
 import importlib.util
-import io
 import json
 import os
 from pathlib import Path
@@ -17,7 +16,6 @@ import socket
 import sys
 import tarfile
 import time
-import types
 import uuid
 
 OLD = 'sha256:8e7447fa51f9b2fa88fb4b88de8687af6483d8e078c147181469125bc0d82f09'
@@ -55,6 +53,10 @@ def manifest():
             spec.get('serverId') == 'fixture-regression' and
             re.fullmatch(r'regression-[a-zA-Z0-9_.-]+', spec.get('project', '')) and
             spec['run'] == spec['project'], 'fixture manifest scope mismatch')
+    require(set(spec['toolHashes']) == {'ircfiber-holder-maintenance.py', 'ircfiber-holder-coordinated.py',
+                                      'legacy-holder-barrier.py'} and
+            hashlib.sha256(Path(__file__).read_bytes()).hexdigest() == spec['rootHelperSha256'],
+            'complete exact helper source manifest required')
     for name, digest in spec['toolHashes'].items():
         require(name in ('ircfiber-holder-maintenance.py', 'ircfiber-holder-coordinated.py', 'legacy-holder-barrier.py') and
                 hashlib.sha256((Path('/tools') / name).read_bytes()).hexdigest() == digest,
@@ -64,6 +66,7 @@ def manifest():
     require(re.fullmatch(r'colima(?:-[A-Za-z0-9_.-]+)?', info.get('Name', '')), 'only owned Colima Docker daemon permitted')
     own = docker.inspect(spec['helperId'])
     labels = own['Config'].get('Labels') or {}
+    require(own['Image'] == spec['helperImageId'], 'privileged helper immutable image changed')
     require(labels.get('ircfiber.fixture') == 'routing-regression' and
             labels.get('ircfiber.fixture.run') == spec['run'] and
             labels.get('com.docker.compose.project') == spec['project'] and
@@ -101,7 +104,7 @@ def image_binary_digest(docker, spec):
         require(docker.inspect(created['Id'])['State']['Status'] == 'created', 'binary inspector unexpectedly started')
         connection = m.UnixHTTP('localhost', timeout=20)
         try:
-            connection.request('GET', '/v1.41/containers/' + created['Id'] + '/archive?path=/app/irc-fiber-holder')
+            connection.request('GET', m.DOCKER_API + '/containers/' + created['Id'] + '/archive?path=/app/irc-fiber-holder')
             response = connection.getresponse()
             require(response.status == 200, 'immutable image executable archive unavailable')
             class BoundedReader:
@@ -193,16 +196,22 @@ def fault(kind):
                      'writer-release', 'route-drain', 'route-release'), 'unsupported fixture mutation')
     if kind.startswith('writer-'):
         token = 'f976b00b-3612-42f1-bb86-0699a4af1d94'
-        docker.REDIS = spec['containers']['redis']['name']
         m.REDIS = spec['containers']['redis']['name']
         return {'result': docker.redis('SADD' if kind == 'writer-inflight' else 'SREM', c.WRITERS, token)}
     if kind.startswith('route-'):
         m.REDIS = spec['containers']['redis']['name']
         key = 'irc:egress:admission:north'
+        backup = BASE / 'original-admission.json'
         if kind == 'route-release':
-            return {'result': docker.redis('DEL', key)}
-        return {'result': docker.redis('SET', key, json.dumps(dict(v=1, endpoint='192.0.2.30:1080', draining=True,
-            drainReason='owned fixture refusal', open=False, trialToken='', updatedAtMs=m.now_ms())))}
+            prior = m.private_json(backup)['value']
+            result = docker.redis('SET', key, prior) if prior else docker.redis('DEL', key)
+            backup.unlink()
+            return {'result': result}
+        m.durable(backup, {'value': docker.redis('GET', key)}, exclusive=True)
+        return {'result': docker.redis('SET', key, json.dumps(dict(v=1, endpoint='192.0.2.30:1080',
+            draining=True, drainReason='owned fixture refusal', open=False, retryAtMs=0, failures=0,
+            circuitReason='', trialToken='', trialUntilMs=0, trialRegisteredAtMs=0, gen=1,
+            updatedAtMs=m.now_ms())))}
     client = observer(spec, docker)
     try:
         backup = BASE / 'original-meta.json'

@@ -263,14 +263,14 @@ private final class StorageFixture {
             "fixture failCommand must be available and idle; enableTestCommands is required");
     }
 
-    private void armConcernError(string verb) {
+    private void armConcernError(string verb, string collection) {
         require(!failpointOwned, "fixture already owns a failpoint");
         verifyIdleFailpoint();
         auto command = Bson.emptyObject;
         command["configureFailPoint"] = Bson("failCommand");
         command["mode"] = Bson(["times": Bson(1)]);
         command["data"] = Bson(["failCommands": Bson([Bson(verb)]),
-            "namespace": Bson(databaseName ~ ".messages"),
+            "namespace": Bson(databaseName ~ "." ~ collection),
             "writeConcernError": Bson(["code": Bson(cast(int) CONCERN_CODE),
                 "errmsg": Bson("owned archive fixture uncertain write")])]);
         // Even an ambiguous configure response must trigger fixture cleanup.
@@ -289,8 +289,8 @@ private final class StorageFixture {
             require(count == failpointCount + 1, "real Mongo failCommand did not fire exactly once");
     }
 
-    private void uncertainWrite(string verb, void delegate() operation) {
-        armConcernError(verb);
+    private void uncertainWrite(string verb, void delegate() operation, string collection = "messages") {
+        armConcernError(verb, collection);
         scope(exit) disarmConcernError(false);
         expectFailure(operation, ArchiveWriteFailure.rejected, CONCERN_CODE);
         disarmConcernError(true);
@@ -572,7 +572,7 @@ private final class StorageFixture {
                 "matching majority owner did not register the producer");
             uncertainWrite("update", {
                 repository.registerArchiveScopes(network, [OTHER_SERVER], owner);
-            });
+            }, "networks");
             require(rowById("networks", network)["archiveServers"].length == 2,
                 "uncertain scope write did not exercise a committed catalog update");
             const retried = repository.registerArchiveScopes(network, [OTHER_SERVER], owner);

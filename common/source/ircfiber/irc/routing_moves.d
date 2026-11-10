@@ -325,7 +325,8 @@ private enum LOAD_SCRIPT = STATUS_FUNCTIONS ~ q"LUA
 local s = readStatus(KEYS[1])
 if not s then return '' end
 if s.moveId ~= ARGV[1] then error('routing move status identity mismatch') end
-if unfinished(s) and redis.call('GET', ARGV[2] .. s.networkId) ~= s.moveId then
+if unfinished(s) and redis.call('GET', ARGV[2] .. s.networkId) ~= s.moveId
+    and redis.call('EXISTS', 'irc:holder:maintenance:write-exclusion') == 0 then
   s.state = 'expired'
   s.error = 'Routing move fence expired'
   redis.call('HSET', KEYS[1], 'state', s.state, 'error', s.error)
@@ -355,6 +356,7 @@ return '1'
 LUA";
 
 private enum FAIL_SCRIPT = STATUS_FUNCTIONS ~ q"LUA
+if redis.call('EXISTS', 'irc:holder:maintenance:write-exclusion') ~= 0 then return '0' end
 local s = readStatus(KEYS[2])
 if not matching(s) or not unfinished(s) then return '0' end
 local fence = redis.call('GET', KEYS[1])

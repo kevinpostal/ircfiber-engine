@@ -105,7 +105,8 @@ if [[ $mode == coordinated_holder ]]; then
     [[ $COORDINATED_SESSIONS =~ ^[0-9]+$ ]] && (( COORDINATED_SESSIONS >= 16 && COORDINATED_SESSIONS <= 250 )) ||
         fail 'coordinated physical fixture requires 16..250 sessions; separate full-load gate remains mandatory'
     [[ $COORDINATED_CASE == complete || $COORDINATED_CASE == ambiguous ]] || fail 'unsupported coordinated case'
-    [[ ${COORDINATED_SOURCE_REVISION:-} =~ ^[0-9a-f]{40}$ ]] || fail 'exact retained old-engine source revision required'
+    [[ ${COORDINATED_SOURCE_REVISION:-} == fea67fb48f891791a443367f9169ed32bc5a923e ]] ||
+        fail 'COORDINATED_SOURCE_REVISION must be the reviewed old-holder IPC lifecycle commit, not engine base provenance'
     for variable in COORDINATED_ENGINE_IMAGE COORDINATED_HOLDER_IMAGE; do
         supplied=${!variable:-}
         [[ $supplied =~ ^sha256:[0-9a-f]{64}$ ]] || fail "$variable requires an immutable local image"
@@ -144,6 +145,8 @@ fi
 if [[ $mode == coordinated_holder ]]; then
     [[ $ROUTING_REGRESSION_HOLDER_IMAGE == sha256:8e7447fa51f9b2fa88fb4b88de8687af6483d8e078c147181469125bc0d82f09 ]] ||
         fail 'coordinated qualification requires the exact preserved old holder'
+    [[ $ROUTING_REGRESSION_ENGINE_IMAGE == sha256:f9a5a59d2ba3ae99c002a1a6666007ecbe5bd36e032f8277622de7fbdbb06c89 ]] ||
+        fail 'coordinated qualification requires the exact preserved old f9a5 engine'
     [[ $COORDINATED_HOLDER_IMAGE != "$ROUTING_REGRESSION_HOLDER_IMAGE" &&
        $COORDINATED_ENGINE_IMAGE != "$ROUTING_REGRESSION_ENGINE_IMAGE" ]] ||
         fail 'old and candidate application generations must be distinct'

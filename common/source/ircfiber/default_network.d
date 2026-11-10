@@ -45,7 +45,7 @@ import ircfiber.models.irc_event : IRCRawEvent;
 import ircfiber.irc.routing_policy : RouteKind, resolveRoutingPolicy;
 import ircfiber.irc.routing_policy_store : requireRoutingUpgrade, loadRoutingPolicy,
     RoutingPolicyUnavailableException;
-import ircfiber.network_write_gate : NetworkWriteUnavailableException;
+import ircfiber.network_write_gate : NetworkWriteOperation, NetworkWriteUnavailableException;
 
 class DefaultFiberPlacementException : Exception {
     this(string message) { super(message); }
@@ -205,6 +205,21 @@ NetworkConfig ensureDefaultFiberNetwork(
 ) {
     if (user.id == UUID.init || user.username.length == 0)
         return NetworkConfig.init;
+    auto operation = NetworkWriteOperation(redis);
+    return ensureDefaultFiberNetwork(user, networkRepo, redis, serverRegistry, operation, deferConnect);
+}
+
+/// Reuse the caller's admission through creation, deduplication and activation.
+NetworkConfig ensureDefaultFiberNetwork(
+    User user,
+    NetworkRepository networkRepo,
+    RedisStorage redis,
+    ServerRegistry serverRegistry,
+    ref NetworkWriteOperation operation,
+    bool deferConnect = false
+) {
+    if (user.id == UUID.init || user.username.length == 0)
+        return NetworkConfig.init;
 
     // Global kill-switch: when admin disables Fiber, don't provision
     // new networks. Existing networks are left as-is (admin bulk
@@ -238,8 +253,16 @@ NetworkConfig ensureDefaultFiberNetwork(
                     requireRoutingUpgrade(redis.getDb(), sid);
                     auto up = ControlMessage("updateConfig", cfg.id.toString(), "", cfg.toJson());
                     up.timestampMs = Clock.currTime.toUnixTime!long * 1000;
-                    redis.lpush(RedisKeys.control(sid), up.toJson().toString());
+                    const payload = up.toJson().toString();
+                    operation.beginDispatch();
+                    try {
+                        redis.getDb().lpush(RedisKeys.control(sid), payload);
+                        operation.confirmCompletion();
+                    } catch (Exception) {
+                        throw new NetworkWriteUnavailableException("network_write_incomplete");
+                    }
                 }
+            } catch (NetworkWriteUnavailableException e) { throw e;
             } catch (Exception e) {
                 logWarn("ensureDefaultFiberNetwork: failed to push updateConfig for %s: %s",
                         cfg.id.toString(), e.msg);
@@ -294,7 +317,7 @@ NetworkConfig ensureDefaultFiberNetwork(
     catch (Exception) {} // dedup best-effort
 
     if (!cfg.servicesProvisioningPending)
-        activateDefaultFiberNetwork(cfg, user.id, redis, serverRegistry);
+        activateDefaultFiberNetwork(cfg, user.id, redis, serverRegistry, operation);
     return cfg;
 }
 
@@ -319,6 +342,14 @@ private string requireDefaultFiberPlacement(const NetworkConfig cfg, RedisStorag
 void activateDefaultFiberNetwork(NetworkConfig cfg, UUID ownerId, RedisStorage redis,
                                  ServerRegistry serverRegistry) {
     if (cfg.id == UUID.init || ownerId == UUID.init) return;
+    auto operation = NetworkWriteOperation(redis);
+    activateDefaultFiberNetwork(cfg, ownerId, redis, serverRegistry, operation);
+}
+
+/// Retain the logical writer while preparing identity, claiming and dispatching.
+void activateDefaultFiberNetwork(NetworkConfig cfg, UUID ownerId, RedisStorage redis,
+                                 ServerRegistry serverRegistry, ref NetworkWriteOperation operation) {
+    if (cfg.id == UUID.init || ownerId == UUID.init) return;
     auto repo = new NetworkRepository(redis);
     repo.ensureIpv6Iid(cfg.id);
     auto canonical = repo.findByIdWithUser(cfg.id);
@@ -328,11 +359,26 @@ void activateDefaultFiberNetwork(NetworkConfig cfg, UUID ownerId, RedisStorage r
     const selected = requireDefaultFiberPlacement(cfg, redis, serverRegistry);
     if (!selected.length) return;
     auto serverId = serverRegistry.getServerForNetwork(cfg.id.toString());
-    if (!serverId.length) serverId = serverRegistry.claimNetwork(cfg.id.toString(), selected);
+    if (!serverId.length) {
+        operation.beginDispatch();
+        try {
+            serverId = serverRegistry.claimNetwork(cfg.id.toString(), selected);
+            operation.confirmCompletion();
+        } catch (Exception) {
+            throw new NetworkWriteUnavailableException("network_write_incomplete");
+        }
+    }
     if (!serverId.length)
         throw new DefaultFiberPlacementException("No capable healthy connection server is available");
     if (serverId != selected || networkMoveFenced(redis.getDb(), cfg.id.toString())) {
-        const move = requestNetworkMove(redis.getDb(), cfg.id.toString(), selected);
+        operation.beginDispatch();
+        typeof(requestNetworkMove(redis.getDb(), cfg.id.toString(), selected)) move;
+        try {
+            move = requestNetworkMove(redis.getDb(), cfg.id.toString(), selected);
+            operation.confirmCompletion();
+        } catch (Exception) {
+            throw new NetworkWriteUnavailableException("network_write_incomplete");
+        }
         auto event = IRCRawEvent.makeServerLog(cfg.name, cfg.id.toString(), "info",
             "Connection move pending: waiting for the current engine to close its upstream socket");
         auto json = event.toCompactJson();
@@ -347,7 +393,14 @@ void activateDefaultFiberNetwork(NetworkConfig cfg, UUID ownerId, RedisStorage r
     requireRoutingUpgrade(redis.getDb(), serverId);
     auto msg = ControlMessage("addNetwork", cfg.id.toString(), ownerId.toString(), cfg.toJson());
     msg.timestampMs = Clock.currTime.toUnixTime!long * 1000;
-    redis.lpush(RedisKeys.control(serverId), msg.toJson().toString());
+    const payload = msg.toJson().toString();
+    operation.beginDispatch();
+    try {
+        redis.getDb().lpush(RedisKeys.control(serverId), payload);
+        operation.confirmCompletion();
+    } catch (Exception) {
+        throw new NetworkWriteUnavailableException("network_write_incomplete");
+    }
 }
 
 @("buildDefaultFiberNetwork sets all required fields")

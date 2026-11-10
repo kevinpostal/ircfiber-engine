@@ -168,6 +168,20 @@ struct SessionSnapshot {
     string bncOwnershipPayload;
     /// Owned paced writes cannot become ordinary reconnect traffic.
     BncPendingWrite[] bncPendingWrites;
+    /// Admission/membership evidence belongs to this retained socket, not
+    /// to channelState's reconnect intent.
+    string[] confirmedChannels;
+    string[] joinsAwaitingConfirm;
+    bool[string] automaticJoins;
+    string[] clientReadLines;
+    struct OptionalReadState {
+        string line;
+        bool fromClient;
+        long sentAtMs;
+        long sequence;
+        string[] remainingTargets;
+    }
+    OptionalReadState[] optionalReads;
     /// Joined channels → "".
     string[string] channelState;
     /// Channel → topic.
@@ -335,6 +349,23 @@ Json toJSON(ref SessionSnapshot s) {
         ownedWrites ~= v;
     }
     j["bncPendingWrites"] = ownedWrites;
+    j["confirmedChannels"] = jsonArrayOf(s.confirmedChannels);
+    j["joinsAwaitingConfirm"] = jsonArrayOf(s.joinsAwaitingConfirm);
+    auto automaticJoins = Json.emptyObject;
+    foreach (line, retry; s.automaticJoins) automaticJoins[line] = retry;
+    j["automaticJoins"] = automaticJoins;
+    j["clientReadLines"] = jsonArrayOf(s.clientReadLines);
+    auto reads = Json.emptyArray;
+    foreach (read; s.optionalReads) {
+        auto v = Json.emptyObject;
+        v["line"] = read.line;
+        v["fromClient"] = read.fromClient;
+        v["sentAtMs"] = read.sentAtMs;
+        v["sequence"] = read.sequence;
+        v["remainingTargets"] = jsonArrayOf(read.remainingTargets);
+        reads ~= v;
+    }
+    j["optionalReads"] = reads;
     j["channelState"] = stringMapToJSON(s.channelState);
     j["channelTopics"] = stringMapToJSON(s.channelTopics);
     j["channelUsers"] = stringListMapToJSON(s.channelUsers);
@@ -809,6 +840,36 @@ SessionSnapshot fromJSON(Json j) {
             s.bncPendingWrites ~= w;
         }
     }
+    if (isArr(j["confirmedChannels"]))
+        foreach (v; j["confirmedChannels"]) s.confirmedChannels ~= str(v);
+    if (isArr(j["joinsAwaitingConfirm"]))
+        foreach (v; j["joinsAwaitingConfirm"]) s.joinsAwaitingConfirm ~= str(v);
+    if (isObj(j["automaticJoins"]))
+        foreach (string line, retry; j["automaticJoins"]) {
+            if (s.automaticJoins.length >= 2_000 || retry.type != Json.Type.bool_)
+                throw new Exception("Invalid automatic JOIN admission");
+            s.automaticJoins[line] = retry.get!bool;
+        }
+    if (isArr(j["clientReadLines"]))
+        foreach (v; j["clientReadLines"]) s.clientReadLines ~= str(v);
+    if (isArr(j["optionalReads"]))
+        foreach (v; j["optionalReads"]) {
+            if (s.optionalReads.length >= 2_000 || !isObj(v)
+                || v["line"].type != Json.Type.string || v["fromClient"].type != Json.Type.bool_
+                || v["sentAtMs"].type != Json.Type.int_)
+                throw new Exception("Invalid optional read admission");
+            auto saved = SessionSnapshot.OptionalReadState(
+                v["line"].get!string, v["fromClient"].get!bool, v["sentAtMs"].get!long,
+                integer(v["sequence"]));
+            if (isArr(v["remainingTargets"]))
+                foreach (part; v["remainingTargets"]) {
+                    if (saved.remainingTargets.length >= 64 || part.type != Json.Type.string
+                            || part.get!string.length > 512)
+                        throw new Exception("Invalid optional read targets");
+                    saved.remainingTargets ~= part.get!string;
+                }
+            s.optionalReads ~= saved;
+        }
 
     if (isObj(j["channelState"])) foreach (string k, v; j["channelState"]) s.channelState[k] = str(v);
     if (isObj(j["channelTopics"])) foreach (string k, v; j["channelTopics"]) s.channelTopics[k] = str(v);
