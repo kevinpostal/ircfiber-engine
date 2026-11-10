@@ -22,9 +22,11 @@ import uuid
 
 OLD = 'sha256:8e7447fa51f9b2fa88fb4b88de8687af6483d8e078c147181469125bc0d82f09'
 OLD_REVISION = 'fea67fb48f891791a443367f9169ed32bc5a923e'
+# OLD declares plain OLD_REVISION in its OCI revision and runtime build metadata.
+# This digest is that Git revision's source, not a reproducible-binary claim.
 # Reviewed source: HolderServer.onConnection -> handle -> dial -> dialUpstream
-# synchronously, with the accepted control FD retained through relay. Kernel
-# listener/accepted-FD/in-flight proof is still required independently.
+# synchronously, with the accepted control FD retained through relay. Actual
+# image/executable identity and kernel accepted-FD/in-flight proof remain required.
 OLD_IPC_SHA = '264822932e60e3c8200a8844a6cc21433be3c2e19635efe2ec0fca3e396b774f'
 BASE = Path('/evidence')
 
@@ -263,7 +265,7 @@ def hold_dial():
     try:
         with k.network_namespace(pid):
             sock.connect(str(path))
-        sock.sendall(('DIAL ' + json.dumps(request) + '\\n').encode())
+        sock.sendall(('DIAL ' + json.dumps(request) + '\n').encode())
         stream = sock.makefile('rb')
         for _ in range(64):
             line = stream.readline(65536)
@@ -272,6 +274,8 @@ def hold_dial():
             if line.startswith(b'CONNECTED '):
                 held_id = json.loads(line[len(b'CONNECTED '):])['id']
                 break
+        require(held_id is not None, 'in-flight DIAL never positively reached CONNECTED')
+        stream.close()
         return {'actualDialAdmitted': True, 'holderId': held_id}
     finally:
         sock.close()

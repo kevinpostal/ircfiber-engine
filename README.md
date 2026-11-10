@@ -237,6 +237,15 @@ The memory harness treats asynchronous producer-preparation exceptions as a
 failed check, while satisfying vibe's non-throwing task callback contract.
 Smoke-duration runs are not the full warm-up/soak qualification receipts.
 
+The coordinated fixture's legacy IPC source digest comes from the plain
+`fea67fb4` revision declared by the immutable `8e7447fa` holder image and its
+runtime build metadata. This associates reviewed synchronous accept/dispatch
+source with the declared revision; it does not assert a reproducible binary
+build. Exact image/executable and fresh kernel stream-lifetime checks remain
+independent prerequisites.
+Its in-flight DIAL fixture sends a real LF delimiter and requires an actual
+`CONNECTED` reply before claiming admission; a literal backslash-n is not framing.
+
 
 ## Links
 
