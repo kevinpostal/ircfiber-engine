@@ -125,6 +125,20 @@ version (RoutingPolicyTest) {
         enforce(db.scard(NETWORK_WRITERS_KEY) == 0 && collect() == 1,
             "Confirmed outer operation did not release its sole writer");
         unlock();
+        // Mongo may return nModified as BSON int32. A successful signup
+        // transition must still be reported as completed, exactly once.
+        const signupId = randomUUID();
+        const signupOwner = randomUUID();
+        ids ~= signupId;
+        collection.insertOne(Bson(["id": Bson(signupId.toString()),
+            "userId": Bson(signupOwner.toString()), "servicesProvisioningPending": Bson(true)]));
+        enforce(repository.completeSignupProvisioning(signupId, signupOwner),
+            "Acknowledged signup activation was not reported as completed");
+        enforce(!collection.findOne(["id": signupId.toString()])["servicesProvisioningPending"].get!bool,
+            "Signup activation did not persist");
+        enforce(!repository.completeSignupProvisioning(signupId, signupOwner),
+            "Completed signup was activated twice");
+
         // Constructor swallows migration failures for compatibility, but it
         // cannot clear a real Mongo command's lost completion acknowledgement.
         networkMutationRepliedForTest = { throw new Exception("Lost migration acknowledgement"); };
@@ -653,7 +667,7 @@ final class NetworkRepository {
                 "servicesProvisioningPending": Bson(true)
             ]),
             Bson(["$set": fields]), writer);
-        if (result["nModified"].get!long != 1) return false;
+        if (result["nModified"].to!double != 1) return false;
         if (cache !is null) {
             try cache.del(RedisKeys.userNetworks(ownerId.toString()));
             catch (Exception) {}
