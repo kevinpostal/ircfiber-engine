@@ -29,7 +29,7 @@ import std.process : environment;
 import std.stdio : stderr, stdout, writeln;
 import std.uuid : randomUUID;
 
-import vibe.core.channel : createChannel;
+import ircfiber.engine.event_channel : EngineEventChannel;
 import vibe.core.core : runApplication, runTask, sleep;
 import vibe.data.bson : Bson;
 import vibe.data.json : Json, parseJsonString;
@@ -211,7 +211,7 @@ int run() {
     cfg.nick = "me";
     const nid = cfg.id.toString();
 
-    auto events = createChannel!IRCRawEvent();
+    auto events = EngineEventChannel.create();
     // addNetwork only registers the client and its owner; nothing dials.
     auto mgr = new ConnectionManager(events, redis, SERVER_ID, null);
     mgr.addNetwork(cfg, userId);

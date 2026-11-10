@@ -6,7 +6,7 @@ import vibe.core.log;
 import std.uuid : parseUUID;
 
 import ircfiber.models.irc_event : IRCRawEvent;
-import ircfiber.models.network : Network;
+import ircfiber.models.network : Network, normalizeChannelName;
 import ircfiber.engine.bootstrap : EngineContext;
 import ircfiber.engine.state : writeStateSnapshotForNetwork;
 import ircfiber.redis.protocol : RedisKeys, StateTTL;
@@ -14,6 +14,35 @@ import ircfiber.engine.session_snapshot : HistoryRecovery, historyRecoveryFromJS
     historyRecoveryToJSON;
 import ircfiber.irc.mls_peer : normalizeFiberChannel;
 import vibe.data.json : Json, parseJsonString;
+
+import ircfiber.engine.archive_spool : ArchiveAdmission;
+import ircfiber.logging : logJsonMap;
+import std.datetime : Clock;
+import std.conv : to;
+
+private long lastArchiveRejectionNotice;
+private void noteArchiveAdmission(ArchiveAdmission admission) {
+    if (admission == ArchiveAdmission.queued) return;
+    const now = Clock.currTime.stdTime / 10_000 - 62_135_596_800_000L;
+    if (now - lastArchiveRejectionNotice < 60_000) return;
+    lastArchiveRejectionNotice = now;
+    logJsonMap("error", "engine", "Archive admission rejected; live delivery preserved",
+        ["event":"archive_gap", "admission":admission.to!string]);
+}
+
+private void archiveRename(ref EngineContext ctx, string serverId, string networkId,
+        string from, string toChannel, long cutoffEid) {
+    auto admission = ArchiveAdmission.unavailable;
+    if (ctx.archiveSpool !is null) {
+        if (ctx.archiveControl !is null && ctx.archiveControl.scopeReady(networkId)
+                && ctx.archiveControl.orderFrozenControls(ctx, networkId, cutoffEid))
+            admission = ctx.archiveSpool.tryRename(serverId, networkId,
+                normalizeChannelName(from), normalizeChannelName(toChannel), cutoffEid,
+                Clock.currTime.stdTime / 10_000 - 62_135_596_800_000L);
+        else ctx.archiveSpool.reportAdmissionUnavailable();
+    }
+    noteArchiveAdmission(admission);
+}
 
 private struct HistoryCheckpoint {
     string requestId;
@@ -56,7 +85,7 @@ private bool isHistorical(ref const IRCRawEvent event) {
 }
 
 /// Runs in the same ordered drain as the page rows, before assigning an eid.
-/// Redis scrollback/dedup is authoritative; asynchronous Mongo is unchanged.
+/// Redis scrollback/dedup remains authoritative, independent of archive replay.
 private void consumeHistoryCheckpoint(ref EngineContext ctx, ref IRCRawEvent event,
         ref bool[string] failedStorage) {
     auto checkpoint = parseHistoryCheckpoint(event.text);
@@ -172,9 +201,9 @@ private bool isTransientServerLogPhase(ref IRCRawEvent event) nothrow @safe {
  * with server ID attribution. This allows the gateway to track
  * which server manages each network.
  *
- * Every event is also persisted to MongoDB via MessageRepository for
- * infinite scrollback history (IRCCloud-style: Redis is the hot cache,
- * MongoDB is the permanent store).
+ * Accepted non-transient events enter the bounded durable journal for strict
+ * Mongo replay. Rejected archival admission is an explicit gap, never a reason
+ * to hold live IRC delivery or create waiting per-event fibers.
  */
 void startEventProcessor(ref EngineContext ctx) {
     auto serverId = ctx.localServer.serverId;
@@ -195,6 +224,25 @@ void startEventProcessor(ref EngineContext ctx) {
                 storageResolved = false;
                 if (!ctx.eventChannel.tryConsumeOne(event)) break;
                 processedAny = true;
+
+                if (event.command == "ARCHIVE_SHUTDOWN_BARRIER") {
+                    storageResolved = true;
+                    if (ctx.archiveControl !is null && ctx.archiveControl.consumeShutdownBarrier(event))
+                        return;
+                    continue;
+                }
+
+                if (event.command == "ARCHIVE_MOVE_BARRIER") {
+                    storageResolved = true;
+                    if (ctx.archiveControl !is null) ctx.archiveControl.consumeMoveBarrier(ctx, event);
+                    continue;
+                }
+
+                if (event.command == "ARCHIVE_CONTROL") {
+                    storageResolved = true;
+                    if (ctx.archiveControl !is null) ctx.archiveControl.consume(ctx, event);
+                    continue;
+                }
 
                 // A network removed on this engine keeps emitting for a
                 // moment: stopping the client produces the QUIT echo and
@@ -263,17 +311,16 @@ void startEventProcessor(ref EngineContext ctx) {
                     || event.command == "SERVICES_INVALIDATED"
                     || event.getTag("ctcp").length > 0;
 
-                // draft/channel-rename: move the channel's Redis scrollback
-                // and Mongo rows to the new name BEFORE this event is stored
-                // under it, so history follows the rename. Same best-effort
-                // shape as the NICK-follow rename below: storage must never
-                // break the loop.
+                // Rename Redis immediately and journal the cutoff mutation at
+                // this FIFO position before appending the renamed event.
+                // A frozen purge follows the physical Redis lineage across
+                // later successful renames, not the reusable channel spelling.
                 if (!historical && event.command == "RENAME") {
                     try {
                         auto rp = event.getParams();
                         if (rp.length >= 2 && rp[0].length > 0 && rp[1].length > 0) {
                             ctx.bufferManager.renameBuffer(serverId, event.networkId, rp[0], rp[1]);
-                            ctx.messageRepo.renameChannel(serverId, event.networkId, rp[0], rp[1]);
+                            archiveRename(ctx, serverId, event.networkId, rp[0], rp[1], event.eid);
                         }
                     } catch (Exception e) {
                         logWarn("RENAME storage rename failed: %s", e.msg);
@@ -281,9 +328,8 @@ void startEventProcessor(ref EngineContext ctx) {
                 }
 
                 // Store buffer with server namespace (prevents ID collision).
-                // The buffer is the source of truth for the _server
-                // channel scrollback; the MongoDB write below makes it
-                // durable across restarts and Redis flushes.
+                // Redis is the hot scrollback/checkpoint authority. Journal
+                // admission below is independent and reports gaps explicitly.
                 //
                 // The dedup verdict is authoritative for ALL THREE sinks.
                 // It used to gate only the Redis scrollback while Mongo and
@@ -305,36 +351,8 @@ void startEventProcessor(ref EngineContext ctx) {
                     continue;
                 }
 
-                // ── MongoDB persistence — async, AFTER publish ──
-                // The 2026-07-13 fix moves the Mongo write BACK to a
-                // fire-and-forget task (it was sync on the hot path from
-                // 2026-07-07 to 2026-07-13, but that added 1+ second of
-                // Mongo round-trip latency to every phase event —
-                // turning a real-time connection log stream into a
-                // 5-10 second "connected" surprise, since each phase
-                // (queued → connecting → tcp_open → tls → tls_done →
-                // registering → welcome) waited on a Mongo write before
-                // hitting the live stream).
-                //
-                // Durability story: Redis is the hot cache AND the
-                // scrollback source of truth (appendIRCEvent above has
-                // already written the event to `scrollback:<srv>:<net>:
-                // <buf>` and `dedup:<srv>:<net>:<buf>`). Mongo is only
-                // for OOB replay when a client connects to a cold
-                // buffer. A gateway crash between Redis publish and
-                // Mongo write means OOB replay misses a few seconds of
-                // events for that one client session — acceptable vs
-                // the alternative of making the live UI feel frozen
-                // during every connection attempt.
-                //
-                // Transient phase events (server-log phases like
-                // tcp_open / tls / tls_done) are SKIPPED entirely from
-                // Mongo. They never reach the OOB replay path because
-                // they're per-connection state that only exists in
-                // Redis's `_server` scrollback (with the eid-tied dedup
-                // set above already preventing duplicates). Skipping
-                // them cuts the Mongo write load for a single connect
-                // from ~7 writes to ~2 (welcome + the lifecycle events).
+                // Archive admission is bounded/nonblocking. Redis acceptance,
+                // checkpoints and live delivery do not wait for disk or Mongo.
                 Network matchedNet;
                 bool foundNet = false;
                 string userIdStr = "";
@@ -346,25 +364,26 @@ void startEventProcessor(ref EngineContext ctx) {
                         break;
                     }
                 }
-                if (foundNet && userIdStr.length > 0 && !publishOnly && !isTransientServerLogPhase(event)) {
-                    runTask(() nothrow {
-                        try {
-                            ctx.messageRepo.appendIRCEvent(event, serverId);
-                        } catch (Exception e) {
-                            try logWarn("MongoDB write failed for event %s/%s eid=%d: %s " ~
-                                "(event still in Redis scrollback)",
-                                event.network, event.command, event.eid, e.msg);
-                            catch (Exception) {}
-                        }
-                    });
+                // stopNetworkForMove removes the active client only after its
+                // producer loops stop. Preserve canonical attribution for the
+                // already-queued tail until the final processor barrier.
+                if (!userIdStr.length && ctx.archiveControl !is null)
+                    userIdStr = ctx.archiveControl.movingOwner(event.networkId);
+                auto json = event.toCompactJson();
+                if (userIdStr.length > 0 && !publishOnly
+                        && !isTransientServerLogPhase(event) && event.getTag("archive_gap").length == 0) {
+                    auto admission = ArchiveAdmission.unavailable;
+                    if (ctx.archiveSpool !is null) {
+                        if (ctx.archiveControl !is null && ctx.archiveControl.scopeReady(event.networkId))
+                            admission = ctx.archiveSpool.tryAppend(serverId, event.networkId,
+                                event.channel.length ? normalizeChannelName(event.channel) : "_server",
+                                event.eid, json.toString());
+                        else ctx.archiveSpool.reportAdmissionUnavailable();
+                    }
+                    noteArchiveAdmission(admission);
                 }
 
-                // ── Publish to live stream AFTER durability ──
-                // Order matters: the durable write is the source of
-                // truth. Only after it's committed do we notify the
-                // gateway, so a client that misses the frame can
-                // recover from Mongo via the next replay/oob.
-                auto json = event.toCompactJson();
+                // Only the live/user-stream envelope gets publication fields.
                 json["y"] = "irc_event";
                 json["serverId"] = serverId;
                 auto msg = json.toString();
@@ -425,8 +444,8 @@ void startEventProcessor(ref EngineContext ctx) {
                 }
 
                 // NICK-follow storage rename (IRCCloud rename model): when a
-                // DM counterparty changes nick, migrate the Redis
-                // scrollback keys + Mongo channel field so history follows
+                // DM counterparty changes nick, rename Redis and journal the
+                // ordered Mongo cutoff mutation so history follows
                 // the conversation across reloads/backfill. Only for the
                 // base event the connection tagged `query_follow`, i.e. the
                 // renamer is verifiably the person the DM was held with
@@ -436,7 +455,7 @@ void startEventProcessor(ref EngineContext ctx) {
                 // new nick must append after the rename, otherwise RENAMENX
                 // sees an existing destination and the history splits.
                 // Best-effort try/catch: storage must never break the loop.
-                if (!historical && foundNet && event.command == "NICK" && event.channel.length == 0
+                if (!historical && userIdStr.length > 0 && event.command == "NICK" && event.channel.length == 0
                     && event.getTag("query_follow").length > 0) {
                     try {
                         auto nickParams = event.getParams();
@@ -445,8 +464,7 @@ void startEventProcessor(ref EngineContext ctx) {
                             if (newNick.length > 0) {
                                 ctx.bufferManager.renameBuffer(
                                     serverId, event.networkId, event.nick, newNick);
-                                ctx.messageRepo.renameChannel(
-                                    serverId, event.networkId, event.nick, newNick);
+                                archiveRename(ctx, serverId, event.networkId, event.nick, newNick, event.eid);
                             }
                         }
                     } catch (Exception e) {

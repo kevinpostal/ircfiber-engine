@@ -17,7 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PREFIX = "2001:db8:1234:5678::/64"
 SERVER6 = "2001:db8:20::10"
-SERVER4 = "203.0.113.10"
+SERVER4 = "203.0.207.10"
 NATIVE6 = "2001:db8:20::20"
 HOSTS = {"dual.routed.test", "aonly.routed.test", "default.routed.test"}
 lock = threading.RLock()
@@ -48,7 +48,7 @@ def move_proof():
         data = arg.encode()
         wire += ("$%d\r\n" % len(data)).encode() + data + b"\r\n"
     try:
-        with socket.create_connection(("203.0.113.2", 6379), timeout=2) as redis:
+        with socket.create_connection(("203.0.207.2", 6379), timeout=2) as redis:
             redis.sendall(wire)
             stream = redis.makefile("rb")
             assert stream.readline() == b"*3\r\n"
@@ -96,7 +96,8 @@ def serve(server):
 
 
 def send(sock, text):
-    sock.sendall((text + "\r\n").encode())
+    with lock:
+        sock.sendall((text + "\r\n").encode())
 
 
 class IRC(socketserver.BaseRequestHandler):
@@ -107,6 +108,7 @@ class IRC(socketserver.BaseRequestHandler):
         with lock:
             index = len(state["accepts"])
             rec = {"id": index, "peer": peer, "port": self.server.server_address[1],
+                   "remotePort": self.client_address[1], "inode": os.fstat(sock.fileno()).st_ino,
                    "registered": False, "pongs": 0, "open": True, "clientPings": [],
                    "acceptedAt": time.monotonic(), "moveProof": proof}
             state["accepts"].append(rec)
@@ -286,6 +288,18 @@ class Control(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
         with lock:
+            if "deliver" in body:
+                delivery = body["deliver"]
+                lines = delivery["lines"]
+                assert isinstance(lines, list) and 1 <= len(lines) <= 32
+                assert all(isinstance(line, str) and 0 < len(line.encode()) <= 2048
+                           and "\r" not in line and "\n" not in line for line in lines)
+                matches = [sock for index, sock in active.items()
+                           if state["accepts"][index].get("nick") == delivery["nick"]
+                           and state["accepts"][index]["registered"]]
+                assert len(matches) == 1, "delivery requires one actually registered socket"
+                for line in lines:
+                    send(matches[0], line)
             if "nativeMode" in body:
                 assert body["nativeMode"] in ("healthy", "close", "hold-close")
                 state["nativeMode"] = body["nativeMode"]

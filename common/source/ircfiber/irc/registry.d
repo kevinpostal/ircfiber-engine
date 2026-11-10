@@ -20,6 +20,7 @@ import ircfiber.irc.routing_policy_store : loadRoutingPolicy, requireRoutingUpgr
 import ircfiber.irc.routing_moves : requestNetworkMove, networkMoveFenced,
     RoutingMoveConflictException, NETWORK_ROUTING_LEASE_TTL_SECONDS;
 import ircfiber.netaddr : canonicalHost;
+import ircfiber.network_write_gate : NetworkWriteUnavailableException;
 
 /// Summary of connections per IRC host for the admin dashboard.
 struct HostConnectionSummary {
@@ -511,39 +512,53 @@ LUA", [RedisKeys.serverAssignments(serverId), RedisKeys.networkAssignments()], a
     /// New provisioning, or local recovery with actual client/holder evidence,
     /// may claim an unowned row. A concurrent claimant is returned, not stolen.
     /// A reverse mirror is prior ownership evidence, not a disposable hint.
+    version (RoutingPolicyTest) void delegate() beforeClaimCommit;
+
     string claimNetwork(string networkId, string targetServerId) {
         if (!networkId.length || !targetServerId.length) return "";
-        const cfg = (new NetworkRepository(redis)).findById(parseUUID(networkId[]));
-        if (cfg.id == UUID.init || cfg.disabled || cfg.servicesProvisioningPending) return "";
-        requireRoutingUpgrade(db, targetServerId);
-        const policyRaw = db.get(RedisKeys.egressRoutingPolicy());
-        const effective = resolveRoutingPolicy(routingPolicyFromJson(parseJsonString(policyRaw)), cfg.host, cfg.routing);
-        if (!effective.available) throw new RoutingPolicyUnavailableException();
-        if (!effective.order.length) return "";
-        const targetRaw = db.hget(RedisKeys.server(targetServerId), "data");
-        auto server = ConnectionServer.fromJson(parseJsonString(targetRaw));
-        const live = getServer(targetServerId);
-        if (server.serverId != targetServerId || live.serverId != targetServerId) return "";
-        // Validate the exact capability/capacity bytes used by the CAS, with
-        // live liveness overlays rather than a second metadata snapshot.
-        server.lastHeartbeat = live.lastHeartbeat;
-        server.hotswapAt = live.hotswapAt;
-        server.isHealthy = live.isHealthy;
-        auto ctx = capacityContext(networkId);
-        const current = networkId in ctx.assignments;
-        if (current !is null && (*current).length) return *current;
-        if (!eligible(server, effective, ctx)) return "";
-        // The Lua claim verifies the complete canonical assignment snapshot.
-        // Concurrent claims on different rows therefore cannot oversubscribe
-        // a per-host cap computed above.
-        string[] args = [networkId, targetServerId, policyRaw, targetRaw,
-            NETWORK_ROUTING_LEASE_TTL_SECONDS.to!string, RedisKeys.serverAssignments("")];
-        foreach (id, owner; ctx.assignments) { args ~= id; args ~= owner; }
-        auto reply = db.eval!string(CLAIM_SCRIPT,
-            [RedisKeys.networkAssignments(), RedisKeys.lease(networkId), RedisKeys.routingMove(networkId),
-             RedisKeys.egressRoutingPolicy(), RedisKeys.server(targetServerId), RedisKeys.draining(targetServerId),
-             RedisKeys.routingSchemaVersion()], args);
-        return reply.empty ? "" : reply.front.idup;
+        // A heartbeat rewrites `data` while capacity is being read. Retry only
+        // an explicitly rejected CAS, never an unavailable/ambiguous Redis call.
+        // Each retry revalidates policy, target health and canonical capacity.
+        foreach (attempt; 0 .. 3) {
+            const cfg = (new NetworkRepository(redis)).findById(parseUUID(networkId[]));
+            if (cfg.id == UUID.init || cfg.disabled || cfg.servicesProvisioningPending) return "";
+            requireRoutingUpgrade(db, targetServerId);
+            const policyRaw = db.get(RedisKeys.egressRoutingPolicy());
+            const effective = resolveRoutingPolicy(routingPolicyFromJson(parseJsonString(policyRaw)), cfg.host, cfg.routing);
+            if (!effective.available) throw new RoutingPolicyUnavailableException();
+            if (!effective.order.length) return "";
+            const targetRaw = db.hget(RedisKeys.server(targetServerId), "data");
+            auto server = ConnectionServer.fromJson(parseJsonString(targetRaw));
+            const live = getServer(targetServerId);
+            if (server.serverId != targetServerId || live.serverId != targetServerId) return "";
+            // Validate the exact capability/capacity bytes used by the CAS,
+            // with live liveness overlays rather than another metadata snapshot.
+            server.lastHeartbeat = live.lastHeartbeat;
+            server.hotswapAt = live.hotswapAt;
+            server.isHealthy = live.isHealthy;
+            auto ctx = capacityContext(networkId);
+            const current = networkId in ctx.assignments;
+            if (current !is null && (*current).length) return *current;
+            if (!eligible(server, effective, ctx)) return "";
+            string[] args = [networkId, targetServerId, policyRaw, targetRaw,
+                NETWORK_ROUTING_LEASE_TTL_SECONDS.to!string, RedisKeys.serverAssignments("")];
+            foreach (id, owner; ctx.assignments) { args ~= id; args ~= owner; }
+            version (RoutingPolicyTest) {
+                if (beforeClaimCommit !is null) beforeClaimCommit();
+            }
+            auto reply = db.eval!string(CLAIM_SCRIPT,
+                [RedisKeys.networkAssignments(), RedisKeys.lease(networkId), RedisKeys.routingMove(networkId),
+                 RedisKeys.egressRoutingPolicy(), RedisKeys.server(targetServerId), RedisKeys.draining(targetServerId),
+                 RedisKeys.routingSchemaVersion()], args);
+            if (reply.empty) return "";
+            const result = reply.front;
+            if (result == "conflict") continue;
+            if (result == "maintenance") throw new NetworkWriteUnavailableException();
+            if (result != "owner") return "";
+            reply.popFront();
+            return reply.empty ? "" : reply.front.idup;
+        }
+        return "";
     }
 
     /// Reconciliation is sticky. Only explicit reconnect/routing callers run
@@ -573,28 +588,30 @@ LUA", [RedisKeys.serverAssignments(serverId), RedisKeys.networkAssignments()], a
     }
 
     private enum CLAIM_SCRIPT = q"LUA
+if redis.call('EXISTS', 'irc:holder:maintenance:write-exclusion') ~= 0 then return {'maintenance'} end
 local current = redis.call('HGET', KEYS[1], ARGV[1])
-if current and current ~= '' then return current end
+if current and current ~= '' then return {'owner', current} end
 -- A surviving lease is prior-holder evidence even when hashes were evicted.
 -- Only that same owner may self-heal; a different owner needs close proof.
 local previousLease = redis.call('GET', KEYS[2])
-if previousLease and previousLease ~= ARGV[2] then return '' end
+if previousLease and previousLease ~= ARGV[2] then return {'denied'} end
 if redis.call('EXISTS', KEYS[3]) ~= 0 or redis.call('GET', KEYS[7]) ~= '1'
-    or redis.call('GET', KEYS[4]) ~= ARGV[3] or redis.call('HGET', KEYS[5], 'data') ~= ARGV[4]
-    or redis.call('HGET', KEYS[5], 'draining') == 'true' or redis.call('EXISTS', KEYS[6]) ~= 0 then return '' end
+    or redis.call('HGET', KEYS[5], 'draining') == 'true' or redis.call('EXISTS', KEYS[6]) ~= 0 then return {'denied'} end
+if redis.call('GET', KEYS[4]) ~= ARGV[3]
+    or redis.call('HGET', KEYS[5], 'data') ~= ARGV[4] then return {'conflict'} end
 local ok, server = pcall(cjson.decode, ARGV[4])
-if not ok or server.draining == true or server.routingPolicyVersion ~= 1 then return '' end
+if not ok or server.draining == true or server.routingPolicyVersion ~= 1 then return {'denied'} end
 local health = redis.call('HGET', KEYS[5], 'isHealthy')
-if (health and health ~= 'true') or (not health and server.isHealthy ~= true) then return '' end
+if (health and health ~= 'true') or (not health and server.isHealthy ~= true) then return {'denied'} end
 local heartbeat = tonumber(redis.call('HGET', KEYS[5], 'lastHeartbeat') or server.lastHeartbeat)
 local swap = tonumber(redis.call('HGET', KEYS[5], 'hotswapAt') or '0')
 local time = redis.call('TIME')
 local now = tonumber(time[1]) * 1000 + math.floor(tonumber(time[2]) / 1000)
 if not heartbeat or heartbeat <= 0 or heartbeat > now + 1000
-    or (now - heartbeat >= 60000 and (swap <= 0 or swap > now + 1000 or now - swap >= 180000)) then return '' end
-if redis.call('HLEN', KEYS[1]) ~= (#ARGV - 6) / 2 then return '' end
+    or (now - heartbeat >= 60000 and (swap <= 0 or swap > now + 1000 or now - swap >= 180000)) then return {'denied'} end
+if redis.call('HLEN', KEYS[1]) ~= (#ARGV - 6) / 2 then return {'conflict'} end
 for i = 7, #ARGV, 2 do
-  if redis.call('HGET', KEYS[1], ARGV[i]) ~= ARGV[i + 1] then return '' end
+  if redis.call('HGET', KEYS[1], ARGV[i]) ~= ARGV[i + 1] then return {'conflict'} end
 end
 -- Scan all reverse evidence atomically. A conflicting or malformed mirror
 -- cannot be bypassed by choosing a different fresh owner.
@@ -604,14 +621,16 @@ repeat
   cursor = batch[1]
   for _, key in ipairs(batch[2]) do
     local previous = redis.call('HGET', key, ARGV[1])
-    if previous and (previous ~= ARGV[2] or key ~= ARGV[6] .. previous) then return '' end
+    if previous and (previous ~= ARGV[2] or key ~= ARGV[6] .. previous) then return {'denied'} end
   end
 until cursor == '0'
 if redis.call('HSETNX', KEYS[1], ARGV[1], ARGV[2]) ~= 1 then
-  return redis.call('HGET', KEYS[1], ARGV[1]) or ''
+  local winner = redis.call('HGET', KEYS[1], ARGV[1])
+  if winner and winner ~= '' then return {'owner', winner} end
+  return {'denied'}
 end
 redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[5])
-return ARGV[2]
+return {'owner', ARGV[2]}
 LUA";
 
     /**
@@ -980,6 +999,7 @@ LUA", [RedisKeys.server(server.serverId)],
     }
 
     private enum RECOVER_ASSIGNMENTS_SCRIPT = q"LUA
+if redis.call('EXISTS', 'irc:holder:maintenance:write-exclusion') ~= 0 then return '0' end
 local function validNetwork(id)
   if #id ~= 36 or string.sub(id, 9, 9) ~= '-' or string.sub(id, 14, 14) ~= '-'
       or string.sub(id, 19, 19) ~= '-' or string.sub(id, 24, 24) ~= '-' then return false end

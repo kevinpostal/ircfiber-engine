@@ -1,0 +1,25 @@
+# Only the disposable routing fixture uses this override. Application images
+# remain immutable inputs; the helper is created by the scoped physical driver.
+services:
+  ircfiber-gateway:
+    labels:
+      com.ircfiber.component: gateway
+  ircfiber-engine:
+    environment:
+      IRCFIBER_MULLVAD_POOL: socks5://dynamic@192.0.2.30:1081
+      IRCFIBER_EGRESS_CONTROL_DIR: /egress
+    volumes:
+      - egress-control:/egress:ro
+  egress-a:
+    command: [python3, -u, /fixture/coordinated_egress.py]
+    volumes:
+      - egress-control:/control
+  mock-irc:
+    # The oracle must NOT retain another holder IPC producer. Its bounded
+    # LIST/STATUS requests run through the root helper, never this container.
+    volumes: !override [fixture-certs:/fixture-certs]
+volumes:
+  egress-control:
+    labels:
+      ircfiber.fixture: routing-regression
+      ircfiber.fixture.run: ${ROUTING_REGRESSION_RUN}

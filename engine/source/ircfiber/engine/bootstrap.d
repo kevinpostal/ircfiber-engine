@@ -7,16 +7,17 @@ import std.string : lastIndexOf;
 import std.conv : to;
 import std.datetime : Clock;
 import std.algorithm : canFind, min;
-import std.uuid : UUID;
+import std.uuid : UUID, parseUUID;
 import core.sys.posix.unistd : getpid;
 import vibe.core.core : runTask, sleep, runApplication;
-import vibe.core.channel : Channel, createChannel;
+import ircfiber.engine.event_channel : EngineEventChannel;
 import ircfiber.logging : logJsonMap, logException, flushAndSendLogs;
+import vibe.data.json : Json;
 import ircfiber.tracing : withSpan, flushAndSendSpans, Span, isTracingEnabled;
 import ircfiber.observability : flushAndSendMetrics, recordGauge, isMetricsEnabled;
 import ircfiber.db.circuit_breaker : exportMongoCircuitMetrics;
 import vibe.core.log;
-import core.time : seconds;
+import core.time : seconds, msecs;
 import ircfiber.build_info : buildInfo;
 import ircfiber.models.irc_event : IRCRawEvent;
 import ircfiber.irc.manager : ConnectionManager;
@@ -24,6 +25,7 @@ import ircfiber.irc.server : ConnectionServer;
 import ircfiber.irc.registry : ServerRegistry;
 import ircfiber.irc.engine_janitor : EngineJanitor, purgeLocalServerNamespace, bumpServerStateTTLs;
 import ircfiber.irc.connection : setEgressRedis, supportedRoutingRoutes;
+version (MemoryReliabilityHarness) import ircfiber.irc.connection : Ircv3Check;
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.storage.buffer : BufferManager;
 import ircfiber.db.mongo : AppMongoConnection;
@@ -34,6 +36,10 @@ import ircfiber.redis.protocol : RedisKeys, StateTTL;
 import ircfiber.holder_client : HolderClient, HolderEntry, HolderUnavailableException;
 import ircfiber.engine.session_snapshot : SessionSnapshot, fromJSON;
 import ircfiber.irc.routing_moves : networkMoveFenced;
+import ircfiber.engine.archive_spool : ArchiveSpool, ArchiveSpoolConfig;
+import ircfiber.engine.archive_worker : ArchiveWorker;
+import ircfiber.engine.archive_control : ArchiveControl;
+import ircfiber.runtime_diagnostic : RuntimeDiagnosticMailbox;
 
 /// Context holding all engine dependencies.
 struct EngineContext {
@@ -48,13 +54,120 @@ struct EngineContext {
     /// Network repository.
     NetworkRepository networkRepo;
     /// Main event channel.
-    Channel!IRCRawEvent eventChannel;
+    EngineEventChannel eventChannel;
     /// Server registry.
     ServerRegistry serverRegistry;  // NEW
     /// This engine's server identity.
     ConnectionServer localServer;   // NEW: this engine's identity
     /// Client of this engine's connection holder (owns every IRC socket).
     HolderClient holder;
+    ArchiveSpool archiveSpool;
+    ArchiveWorker archiveWorker;
+    ArchiveControl archiveControl;
+    RuntimeDiagnosticMailbox runtimeDiagnostics;
+
+    // Only an in-flight physical LIST/INVENTORY scan is shareable. Completed
+    // observations are never a cache for a later heartbeat.
+    private HolderListObservation holderListInFlight;
+}
+
+/// One physical request and the callers already waiting for its result.
+/// Full restoration readers lease META; evidence readers receive an owned
+/// metadata-free projection which can safely outlive their callback.
+private class HolderListObservation {
+    import vibe.core.sync : TaskMutex;
+
+    TaskMutex completion;
+    HolderEntry[] entries;
+    HolderEntry[] identities;
+    bool requireMeta;
+    Throwable failure;
+    size_t readers;
+
+    this() {
+        completion = new TaskMutex;
+    }
+
+    HolderEntry[] identityEntries() {
+        if (!requireMeta) return entries;
+        if (identities is null) identities = ownedHolderIdentities(entries);
+        return identities;
+    }
+
+    void release() {
+        assert(readers > 0);
+        if (--readers == 0) {
+            entries = null;
+            identities = null;
+            failure = null;
+        }
+    }
+}
+
+/// Join only a still-running LIST, never a previously successful heartbeat.
+/// The returned lease must cover every restoration use of its META.
+private HolderListObservation acquireFreshHolderList(ref EngineContext ctx, bool requireMeta = false) {
+    auto observation = ctx.holderListInFlight;
+    const initiator = observation is null;
+    if (initiator) {
+        observation = new HolderListObservation;
+        observation.requireMeta = requireMeta;
+        observation.completion.lock();
+        ctx.holderListInFlight = observation;
+    }
+    observation.readers++;
+    scope(failure) observation.release();
+
+    if (initiator) {
+        try {
+            if (ctx.holder is null)
+                throw new Exception("Holder LIST unavailable: no holder client");
+            observation.entries = ctx.holder.scan(observation.requireMeta);
+        } catch (Throwable e) {
+            observation.failure = e;
+        } finally {
+            // Stop admission before releasing waiters: any later caller must
+            // obtain fresh physical evidence, even while restoration yields.
+            ctx.holderListInFlight = null;
+            observation.completion.unlock();
+        }
+    } else {
+        observation.completion.lock();
+        observation.completion.unlock();
+    }
+    if (observation.failure !is null) throw observation.failure;
+    return observation;
+}
+
+private void withFreshHolderList(ref EngineContext ctx,
+        scope void delegate(HolderEntry[]) consume) {
+    auto observation = acquireFreshHolderList(ctx);
+    scope(exit) {
+        consume = null;
+        observation.release();
+    }
+    consume(observation.identityEntries());
+}
+
+private HolderEntry[] ownedHolderIdentities(HolderEntry[] entries) {
+    auto identities = new HolderEntry[entries.length];
+    foreach (i, entry; entries) identities[i] = entry.ownedIdentity();
+    return identities;
+}
+
+/// Identity scans deliberately omit META. Absence alone says nothing about
+/// registration: fetch only the selected restoration entry and validate its
+/// claim before consuming snapshots or services/manual-auth markers.
+private HolderEntry restorationEntry(HolderClient holder, HolderEntry entry) {
+    if (entry.hasMeta) return entry;
+    auto detail = holder.info(entry.id);
+    if (detail.id != entry.id || detail.connectedAtMs != entry.connectedAtMs
+            || (entry.instance.length && detail.instance != entry.instance)
+            || detail.state != entry.state
+            || detail.tag.networkId != entry.tag.networkId
+            || detail.tag.userId != entry.tag.userId)
+        throw new HolderUnavailableException("holder entry changed before restoration");
+    return detail;
 }
 
 /// Refresh on initial/re-registration and heartbeat: an older or unavailable
@@ -170,11 +283,22 @@ EngineContext bootstrapEngine() {
         exit(78);
     }
     holder.connectControl();
-    size_t heldLive;
+    long heldLive;
+    bool heldStateKnown;
     try {
-        foreach (e; holder.list()) if (e.state == "open") heldLive++;
+        auto heldStatus = holder.status();
+        heldLive = heldStatus.open;
+        heldStateKnown = heldStatus.openAvailable;
     } catch (Exception e) {
-        logWarn("Holder LIST failed at boot (%s) — assuming no live sessions", e.msg);
+        logWarn("Holder STATUS failed at boot (%s) — preserving namespace until live state is known", e.msg);
+    }
+    bool maintenanceStateKnown;
+    bool maintenanceActive;
+    try {
+        maintenanceActive = redis.getDb().get("irc:holder:maintenance:active:" ~ serverId).length != 0;
+        maintenanceStateKnown = true;
+    } catch (Exception e) {
+        logWarn("Holder maintenance marker unavailable at boot — preserving namespace");
     }
 
     // ── Bootstrap-time namespace purge (Layer 3) ─────────────────
@@ -190,6 +314,13 @@ EngineContext bootstrapEngine() {
         const purgeEnv = environment.get("IRCFIBER_BOOTSTRAP_PURGE", "1");
         if (purgeEnv == "0" || purgeEnv == "false") {
             logInfo("Bootstrap purge: disabled by IRCFIBER_BOOTSTRAP_PURGE");
+        } else if (!maintenanceStateKnown || maintenanceActive) {
+            // A coordinated replacement intentionally starts with zero open
+            // sockets. Its frozen manifest/assignments must survive until
+            // pre-client restoration validates them; unknown is not absent.
+            logInfo("Bootstrap purge: skipped, holder maintenance is active or unavailable");
+        } else if (!heldStateKnown) {
+            logInfo("Bootstrap purge: skipped, holder live-session count unavailable");
         } else if (heldLive > 0) {
             logInfo("Bootstrap purge: skipped, holder holds %d live sessions", heldLive);
         } else {
@@ -207,7 +338,7 @@ EngineContext bootstrapEngine() {
 
     auto bufferManager = new BufferManager(redis);
     logInfo("Bootstrap: BufferManager created");
-    auto eventChannel = createChannel!IRCRawEvent();
+    auto eventChannel = EngineEventChannel.create();
     logInfo("Bootstrap: eventChannel created");
     auto connManager = new ConnectionManager(eventChannel, redis, serverId, holder);
     logInfo("Bootstrap: ConnectionManager created");
@@ -286,8 +417,22 @@ EngineContext bootstrapEngine() {
     // app_engine.d inside a runTask after runApplication().
     logInfo("Bootstrap: network loading deferred to event loop");
 
-    return EngineContext(connManager, redis, bufferManager, messageRepo, networkRepo,
-        eventChannel, serverRegistry, localServer, holder);
+    EngineContext ctx;
+    ctx.connManager = connManager; ctx.redis = redis; ctx.bufferManager = bufferManager;
+    ctx.messageRepo = messageRepo; ctx.networkRepo = networkRepo;
+    ctx.eventChannel = eventChannel; ctx.serverRegistry = serverRegistry;
+    ctx.localServer = localServer; ctx.holder = holder;
+    ctx.runtimeDiagnostics = new RuntimeDiagnosticMailbox;
+    // Recovery/fsync and latest diagnostic writes share one native disk owner.
+    // Holder attachment and event draining do not wait for journal recovery.
+    try {
+        ctx.archiveSpool = new ArchiveSpool(ArchiveSpoolConfig.fromEnvironment(), ctx.runtimeDiagnostics);
+        ctx.archiveControl = new ArchiveControl;
+    } catch (Exception e) {
+        logJsonMap("error", "engine", "Archive initialization unavailable; live sockets preserved",
+            ["event":"archive_gap", "reason":"initialization_failed"]);
+    }
+    return ctx;
 }
 
 private bool networksLoading;
@@ -299,6 +444,7 @@ private bool reconciliationRunning;
 void loadNetworks(ref EngineContext ctx) {
     networksLoading = true;
     scope(exit) networksLoading = false;
+    ctx.connManager.restoreHolderMaintenance();
     import ircfiber.db.user : UserRepository;
     logInfo("Network loading task: loading networks from MongoDB");
 
@@ -322,8 +468,17 @@ void loadNetworks(ref EngineContext ctx) {
     // ones; every entry not consumed below is cleaned up afterwards.
     HolderEntry[string] held;
     HolderEntry[] heldAll;
+    HolderListObservation heldObservation;
+    scope(exit) {
+        held = null;
+        heldAll = null;
+        if (heldObservation !is null) heldObservation.release();
+    }
     if (ctx.holder !is null) {
-        try heldAll = ctx.holder.list();
+        try {
+            heldObservation = acquireFreshHolderList(ctx, true);
+            heldAll = heldObservation.entries;
+        }
         catch (Exception e) throw new Exception("Holder LIST unavailable; ownership recovery cannot dial safely: " ~ e.msg);
     }
     foreach (e; heldAll) {
@@ -417,6 +572,10 @@ void loadNetworks(ref EngineContext ctx) {
             if (auto e = nid in held) {
                 consumed[e.id] = true;
                 if (e.state == "open") {
+                    // This may join an already streaming identity observation.
+                    // Resolve selected META without issuing a second LIST.
+                    *e = restorationEntry(ctx.holder, *e);
+                    scope(exit) e.meta = Json.undefined;
                     SessionSnapshot snap;
                     bool usable = false;
                     if (e.hasMeta) {
@@ -436,7 +595,7 @@ void loadNetworks(ref EngineContext ctx) {
                         // (or never wrote META): the socket is not a usable
                         // session. Close it and dial fresh.
                         logInfo("Held session %s for %s was never registered — closing and re-dialing", e.id, nw.config.name);
-                        try ctx.holder.close(e.id, "engine restarted"); catch (Exception ex) logWarn("holder CLOSE %s failed: %s", e.id, ex.msg);
+                        try ctx.holder.closeClaim(e.id, e.instance, e.connectedAtMs, "engine restarted"); catch (Exception ex) logWarn("holder CLOSE %s failed: %s", e.id, ex.msg);
                     }
                 }
             }
@@ -450,7 +609,7 @@ void loadNetworks(ref EngineContext ctx) {
                     if (auto client = ctx.connManager.getClient(nw.config.id))
                         client.emitLog("warn", "Connection dropped while the engine was down: "
                             ~ (e.closeReason.length ? e.closeReason : "unknown reason"));
-                    try ctx.holder.forget(e.id); catch (Exception ex) logWarn("holder FORGET %s failed: %s", e.id, ex.msg);
+                    try ctx.holder.forgetClaim(e.id, e.instance, e.connectedAtMs); catch (Exception ex) logWarn("holder FORGET %s failed: %s", e.id, ex.msg);
                 }
             }
             loadedCount++;
@@ -474,9 +633,9 @@ void loadNetworks(ref EngineContext ctx) {
         try {
             if (e.state == "open") {
                 logInfo("Closing held session %s (%s): network no longer assigned here", e.id, e.tag.name);
-                ctx.holder.close(e.id, "network no longer assigned");
+                ctx.holder.closeClaim(e.id, e.instance, e.connectedAtMs, "network no longer assigned");
             } else {
-                ctx.holder.forget(e.id);
+                ctx.holder.forgetClaim(e.id, e.instance, e.connectedAtMs);
             }
         } catch (Exception ex) {
             logWarn("Holder cleanup of %s failed: %s", e.id, ex.msg);
@@ -523,10 +682,15 @@ void loadNetworksWithRetry(ref EngineContext ctx) {
     }
 }
 
-private void startNetworkReconciliation(ref EngineContext ctx) {
+private void startNetworkReconciliation(ref EngineContext ctx, HolderEntry[] physicalEntries) {
     if (networksLoading || reconciliationRunning) return;
+    // withFreshHolderList hands us owned, metadata-free evidence. Retain that
+    // array, never the restoration observation, across asynchronous adoption.
+    auto identities = physicalEntries;
+    physicalEntries = null;
     reconciliationRunning = true;
     runTask(() nothrow {
+        scope(exit) identities = null;
         scope(exit) reconciliationRunning = false;
         try {
             import ircfiber.engine.consumer : loadCanonicalNetwork, spawnNetworkCommandConsumer;
@@ -556,6 +720,9 @@ private void startNetworkReconciliation(ref EngineContext ctx) {
                         logWarn("Reconciliation source closure unproven for %s; retaining stopped generation", nid);
                 }
             }
+            // Resolve eligibility against the heartbeat's one physical scan.
+            // Restore only selected entries via INFO, never another LIST.
+            string[] missing;
             foreach (nid; ctx.serverRegistry.getCanonicalNetworks(sid)) {
                 try {
                     if (networkMoveFenced(ctx.redis.getDb(), nid)) continue;
@@ -566,34 +733,62 @@ private void startNetworkReconciliation(ref EngineContext ctx) {
                     auto row = loadCanonicalNetwork(ctx, parseUUID(nid[]));
                     if (row.config.disabled || row.config.servicesProvisioningPending) continue;
                     if (!ownsNetworkForDial(ctx.redis, sid, nid)) continue;
-                    HolderEntry held;
-                    foreach (entry; ctx.holder.list())
-                        if (entry.tag.networkId == nid && entry.state == "open") { held = entry; break; }
-                    if (!ownsNetworkForDial(ctx.redis, sid, nid)) continue;
-                    bool adopted;
-                    if (held.id.length) {
-                        SessionSnapshot snapshot;
-                        bool usable;
-                        if (held.hasMeta) {
-                            try { snapshot = fromJSON(held.meta); usable = snapshot.wasConnected; }
-                            catch (Exception) {}
-                        }
-                        // Existing held sessions adopt even when new routes
-                        // are empty or durable policy is temporarily unreadable.
-                        if (usable) {
-                            ctx.connManager.attachNetwork(row.config, row.userId, held, snapshot);
-                            adopted = true;
-                        } else ctx.holder.close(held.id, "recovering incomplete registration");
-                    }
-                    if (!adopted) {
-                        auto policy = loadRoutingPolicy(ctx.redis.getDb());
-                        if (resolveRoutingPolicy(policy, row.config.host, row.config.routing).order.length == 0) continue;
-                        if (!ownsNetworkForDial(ctx.redis, sid, nid)) continue;
-                        ctx.connManager.addAndStartNetwork(row.config, row.userId);
-                    }
-                    spawnNetworkCommandConsumer(ctx, nid);
+                    missing ~= nid;
                 } catch (Exception e) {
                     logWarn("Network reconciliation deferred for %s: %s", nid, e.msg);
+                }
+            }
+            if (missing.length == 0) return;
+            {
+                auto entries = identities;
+                HolderEntry[string] heldByNetwork;
+                foreach (entry; entries)
+                    if (entry.state == "open" && entry.tag.networkId.length
+                            && entry.tag.networkId !in heldByNetwork)
+                        heldByNetwork[entry.tag.networkId] = entry;
+                scope(exit) heldByNetwork = null;
+
+                foreach (nid; missing) {
+                    try {
+                        // LIST admission and earlier restorations may yield:
+                        // reload tenant/config and ownership before adoption.
+                        if (networkMoveFenced(ctx.redis.getDb(), nid)) continue;
+                        if (ctx.connManager.hasNetwork(nid)) {
+                            spawnNetworkCommandConsumer(ctx, nid);
+                            continue;
+                        }
+                        auto row = loadCanonicalNetwork(ctx, parseUUID(nid[]));
+                        if (row.config.disabled || row.config.servicesProvisioningPending) continue;
+                        if (!ownsNetworkForDial(ctx.redis, sid, nid)) continue;
+                        HolderEntry held;
+                        if (auto entry = nid in heldByNetwork) held = *entry;
+                        bool adopted;
+                        if (held.id.length) {
+                            held = restorationEntry(ctx.holder, held);
+                            scope(exit) held.meta = Json.undefined;
+                            SessionSnapshot snapshot;
+                            bool usable;
+                            if (held.hasMeta) {
+                                try { snapshot = fromJSON(held.meta); usable = snapshot.wasConnected; }
+                                catch (Exception) {}
+                            }
+                            // Existing held sessions adopt even when new routes
+                            // are empty or durable policy is temporarily unreadable.
+                            if (usable) {
+                                ctx.connManager.attachNetwork(row.config, row.userId, held, snapshot);
+                                adopted = true;
+                            } else ctx.holder.closeClaim(held.id, held.instance, held.connectedAtMs, "recovering incomplete registration");
+                        }
+                        if (!adopted) {
+                            auto policy = loadRoutingPolicy(ctx.redis.getDb());
+                            if (resolveRoutingPolicy(policy, row.config.host, row.config.routing).order.length == 0) continue;
+                            if (!ownsNetworkForDial(ctx.redis, sid, nid)) continue;
+                            ctx.connManager.addAndStartNetwork(row.config, row.userId);
+                        }
+                        spawnNetworkCommandConsumer(ctx, nid);
+                    } catch (Exception e) {
+                        logWarn("Network reconciliation deferred for %s: %s", nid, e.msg);
+                    }
                 }
             }
         } catch (Exception e) {
@@ -700,7 +895,6 @@ void startHeartbeatTask(ref EngineContext ctx) {
 
                 // Actual canonical reconciliation runs separately so a bounded
                 // holder close cannot stall heartbeat/control traffic.
-                startNetworkReconciliation(ctx);
 
                 ctx.localServer.assignedNetworks = canonical;
 
@@ -716,12 +910,20 @@ void startHeartbeatTask(ref EngineContext ctx) {
                 // preserve evidence instead of declaring sockets gone.
                 try {
                     string[] evidence;
-                    foreach (network; ctx.connManager.getNetworks())
-                        evidence ~= network.config.id.toString();
-                    foreach (entry; ctx.holder.list())
-                        if (entry.state == "open" && entry.tag.networkId.length
-                                && !evidence.canFind(entry.tag.networkId))
-                            evidence ~= entry.tag.networkId;
+                    withFreshHolderList(ctx, (HolderEntry[] entries) {
+                        foreach (entry; entries) {
+                            if (!entry.tag.networkId.length) continue;
+                            auto client = ctx.connManager.getClient(parseUUID(entry.tag.networkId));
+                            if (client !is null) client.observeHolderEntry(entry);
+                        }
+                        foreach (network; ctx.connManager.getNetworks())
+                            evidence ~= network.config.id.toString();
+                        foreach (entry; entries)
+                            if (entry.state == "open" && entry.tag.networkId.length
+                                    && !evidence.canFind(entry.tag.networkId))
+                                evidence ~= entry.tag.networkId;
+                        startNetworkReconciliation(ctx, entries);
+                    });
                     ctx.serverRegistry.publishServerAssignments(ctx.localServer.serverId, evidence);
                 } catch (Throwable) {}
 
@@ -762,13 +964,6 @@ void startHeartbeatTask(ref EngineContext ctx) {
                     // enabled, but when beat%6!=0 the post-increment still fired;
                     // no extra increment needed here.
                 }
-                // Flush pending OTel spans / metrics / logs to the collector.
-                // All three are nothrow and internally catch Throwable, so the
-                // heartbeat fiber never dies on export failure.
-                try flushAndSendSpans(); catch (Throwable) {}
-                try exportMongoCircuitMetrics(); catch (Throwable) {}
-                try flushAndSendMetrics(); catch (Throwable) {}
-                try flushAndSendLogs(); catch (Throwable) {}
                 // Cycle succeeded — clear backoff so the next failure
                 // starts from the short end of the curve again.
                 backoffMs = 0;
@@ -800,6 +995,33 @@ void startHeartbeatTask(ref EngineContext ctx) {
             catch (Throwable) { /* nothrow lambda — swallow */ }
         }
     });
+}
+
+private bool telemetryFlushRunning;
+
+/// One periodic exporter owner, independent of Redis heartbeat success.
+/// Each queue enforces its own one-in-flight export and bounded HTTP deadline,
+/// including when an error-path/shutdown flush overlaps this fiber.
+void startTelemetryFlushTask() {
+    if (telemetryFlushRunning) return;
+    telemetryFlushRunning = true;
+    try {
+        runTask(() nothrow {
+            scope(exit) telemetryFlushRunning = false;
+            while (true) {
+                // Separate guards ensure one failing exporter cannot suppress
+                // the other queues or permanently terminate periodic export.
+                try exportMongoCircuitMetrics(); catch (Throwable) {}
+                try flushAndSendSpans(); catch (Throwable) {}
+                try flushAndSendMetrics(); catch (Throwable) {}
+                try flushAndSendLogs(); catch (Throwable) {}
+                try sleep(10.seconds); catch (Throwable) {}
+            }
+        });
+    } catch (Throwable e) {
+        telemetryFlushRunning = false;
+        throw e;
+    }
 }
 /// Read IRCFIBER_STATE_TTL env var with sensible bounds. Cached per-call
 /// (heartbeat runs at 10 s — cheap).
@@ -918,4 +1140,486 @@ void startOrphanReaperTask(ref EngineContext ctx) {
             }
         }
     });
+}
+
+version (MemoryReliabilityHarness)
+Ircv3Check[] holderScanObservationRegressionChecks() {
+    import ircfiber.irc.connection : Ircv3Check;
+    import vibe.core.net : listenTCP, TCPConnection;
+    import vibe.stream.operations : readLine;
+    import vibe.data.json : Json, parseJsonString;
+    import ircfiber.holder_client : HolderErrorException;
+    import ircfiber.engine.session_snapshot : toJSON;
+    import core.memory : GC;
+    import core.time : MonoTime;
+    import std.string : startsWith, strip;
+    Ircv3Check[] checks;
+    EngineContext context;
+    bool gate = true, failNext, legacy;
+    bool largeLegacy, legacyGate, infoGate, changedInfo, queueStatus, errorLegacy;
+    int invalidLegacy, sparseLegacy;
+    size_t scans, pages, lists, infos, legacyStarted;
+    auto rawChunk = new char[4096];
+    rawChunk[] = 'x';
+    auto numberChunk = new char[4096];
+    numberChunk[] = '0';
+    string escapedChunk;
+    foreach (_; 0 .. 682) escapedChunk ~= `\u0061`;
+    SessionSnapshot fixtureSnapshot;
+    fixtureSnapshot.wasConnected = true;
+    fixtureSnapshot.graceful = true;
+    fixtureSnapshot.connectedAtMs = 700;
+    fixtureSnapshot.sessionNick = "restored-nick";
+    fixtureSnapshot.servicesLegacyAuthPending = 2;
+    fixtureSnapshot.servicesQuietPrefixes = ["NickServ!services@fixture"];
+    fixtureSnapshot.servicesQuietUntilMs = 1700000030000;
+    Json legacyRow() {
+        auto row = Json.emptyObject;
+        row["id"] = "legacy";
+        row["instance"] = "legacy-instance";
+        row["ordinal"] = 42;
+        row["state"] = "open";
+        row["attached"] = true;
+        row["host"] = "irc.fixture";
+        row["port"] = 6697;
+        row["peerIp"] = "2001:db8::1";
+        row["localIp"] = "2001:db8::2";
+        row["connectedAtMs"] = 700;
+        row["detachedSinceMs"] = 800;
+        row["bufferedBytes"] = 901;
+        row["closeReason"] = "prior reason";
+        row["closedAtMs"] = 902;
+        row["gapGeneration"] = 9;
+        row["gapAckGeneration"] = 8;
+        row["droppedBytes"] = 903;
+        row["droppedLines"] = 904;
+        row["gapStartedAtMs"] = 905;
+        row["deliveryAmbiguous"] = true;
+        auto tag = Json.emptyObject;
+        tag["networkId"] = "e655e477-7d91-4000-8000-000000000001";
+        tag["userId"] = "owner";
+        tag["name"] = "é雪🌲";
+        tag["egressLabel"] = "route";
+        row["tag"] = tag;
+        auto tls = Json.emptyObject;
+        tls["ok"] = true;
+        tls["version"] = "TLSv1.3";
+        tls["cipher"] = "fixture-cipher";
+        tls["certCn"] = "fixture-cn";
+        tls["certIssuer"] = "fixture-issuer";
+        tls["certNotAfterMs"] = 1700000000000L;
+        row["tls"] = tls;
+        return row;
+    }
+    TCPConnection[] peers;
+    auto listener = listenTCP(0, (TCPConnection peer) {
+        peers ~= peer;
+        bool statusQueued;
+        try {
+            while (!peer.empty) {
+                const line = (cast(const(char)[]) peer.readLine(65536, "\n")).idup.strip;
+                auto response = Json.emptyObject;
+                if (line.startsWith("HELLO ")) {
+                    response["proto"] = 1;
+                    if (!legacy) {
+                        response["instance"] = "00000000-0000-4000-8000-000000000001";
+                        auto capabilities = Json.emptyArray;
+                        capabilities ~= Json("inventory_v1");
+                        response["capabilities"] = capabilities;
+                    }
+                } else if (line.startsWith("INVENTORY ")) {
+                    const request = parseJsonString(line["INVENTORY ".length .. $]);
+                    const after = request["after"].type == Json.Type.int_ ? request["after"].get!int : 0;
+                    if (after == 0) scans++;
+                    pages++;
+                    while (gate) sleep(1.msecs);
+                    if (failNext) { failNext = false; peer.close(); return; }
+                    response["instance"] = "00000000-0000-4000-8000-000000000001";
+                    response["through"] = 2;
+                    response["after"] = after;
+                    response["nextAfter"] = after + 1;
+                    response["more"] = after == 0;
+                    auto rows = Json.emptyArray;
+                    foreach (i; after + 1 .. after + 2) {
+                        auto row = Json.emptyObject;
+                        row["ordinal"] = i;
+                        row["id"] = "held-" ~ i.to!string;
+                        row["state"] = "open";
+                        row["connectedAtMs"] = i * 100;
+                        rows ~= row;
+                    }
+                    response["connections"] = rows;
+                } else if (line.startsWith("INFO ") || line.startsWith("ATTACH ")) {
+                    const attaching = line.startsWith("ATTACH ");
+                    if (!attaching) infos++;
+                    while (infoGate) sleep(1.msecs);
+                    const offset = attaching ? "ATTACH ".length : "INFO ".length;
+                    const id = parseJsonString(line[offset .. $])["id"].get!string;
+                    if (id == "legacy") {
+                        response = legacyRow();
+                        if (changedInfo) response["connectedAtMs"] = 701;
+                        if (largeLegacy) {
+                            const row = response.toString();
+                            peer.write("OK " ~ row[0 .. $ - 1] ~ ",\"meta\":{\"escaped\":\"");
+                            foreach (_; 0 .. 512) peer.write(escapedChunk);
+                            peer.write("\",\"nested\":[null,true,{\"large\":\"");
+                            foreach (_; 0 .. 512) peer.write(cast(const(ubyte)[]) rawChunk);
+                            peer.write("\"}]}}\r\n");
+                        } else {
+                            response["meta"] = toJSON(fixtureSnapshot);
+                            peer.write("OK " ~ response.toString() ~ "\r\n");
+                        }
+                        if (attaching) peer.write(":fixture NOTICE nick :first replay line\r\n");
+                        peer.flush();
+                        continue;
+                    }
+                    response["state"] = "open";
+                    response["id"] = id;
+                    response["instance"] = "00000000-0000-4000-8000-000000000001";
+                    response["connectedAtMs"] = id == "held-1" ? 100 : 200;
+                    auto tag = Json.emptyObject;
+                    tag["networkId"] = id == "held-1"
+                        ? "e655e477-7d91-4000-8000-000000000001"
+                        : "e655e477-7d91-4000-8000-000000000002";
+                    response["tag"] = tag;
+                    auto metadata = Json.emptyObject;
+                    metadata["fixture"] = id;
+                    response["meta"] = metadata;
+                } else if (line == "LIST") {
+                    lists++;
+                    if (errorLegacy) {
+                        errorLegacy = false;
+                        peer.write("ERR {\"code\":\"busy\",\"msg\":\"already attached\",\"unknown\":{\"ignored\":\"");
+                        foreach (_; 0 .. 512) peer.write(escapedChunk);
+                        peer.write("\"}}\r\n");
+                        peer.flush();
+                        continue;
+                    }
+                    if (sparseLegacy) {
+                        auto sparse = Json.emptyObject;
+                        sparse["id"] = "sparse";
+                        sparse["state"] = "open";
+                        sparse["tag"] = Json(null);
+                        sparse["tls"] = Json(null);
+                        if (sparseLegacy == 2) sparse["meta"] = Json(null);
+                        if (sparseLegacy == 3) sparse["meta"] = Json.emptyObject;
+                        peer.write("OK {\"connections\":[" ~ sparse.toString() ~ "]}\r\n");
+                        peer.flush();
+                        continue;
+                    }
+                    const mode = invalidLegacy;
+                    invalidLegacy = 0;
+                    auto row = legacyRow().toString();
+                    // Pause inside the response, after the range has begun
+                    // consuming it, to exercise both observation join orders.
+                    peer.write("OK {\"connections\":[" ~ row[0 .. $ - 1] ~ ",\"meta\":");
+                    peer.flush();
+                    legacyStarted = lists;
+                    while (legacyGate) sleep(1.msecs);
+                    if (mode == 1) {
+                        peer.write("{\"bad\":[1,]}}]}\n");
+                    } else if (mode == 2) {
+                        peer.write("{\"bad\":\"truncated");
+                        peer.flush();
+                        peer.close();
+                        return;
+                    } else if (mode == 3) {
+                        peer.write("{} }]} trailing\n");
+                    } else if (mode == 4) {
+                        peer.write("{\"oversized\":\"");
+                        foreach (_; 0 .. 16385) peer.write(cast(const(ubyte)[]) rawChunk);
+                        peer.write("\"}}]}\n");
+                    } else if (mode == 5) {
+                        foreach (_; 0 .. 12) { peer.write(" "); peer.flush(); sleep(1.seconds); }
+                        peer.write("{} }]}\n");
+                    } else if (mode == 6) {
+                        foreach (_; 0 .. 129) peer.write("[");
+                        peer.write("0");
+                        foreach (_; 0 .. 129) peer.write("]");
+                        peer.write("}]}\n");
+                    } else if (mode == 7) {
+                        // This outer key is decoded to select a DTO field,
+                        // unlike arbitrarily long keys in discarded META.
+                        peer.write("{} }],\"");
+                        foreach (_; 0 .. 17) peer.write(cast(const(ubyte)[]) rawChunk);
+                        peer.write("\":0}\n");
+                    } else if (largeLegacy) {
+                        peer.write("{\"plain\":\"");
+                        foreach (_; 0 .. 512) peer.write(cast(const(ubyte)[]) rawChunk);
+                        peer.write("\",\"escaped\":\"");
+                        foreach (_; 0 .. 512) peer.write(escapedChunk);
+                        peer.write("\",\"nested\":[{\"");
+                        foreach (_; 0 .. 256) peer.write(cast(const(ubyte)[]) rawChunk);
+                        peer.write("\":{\"number\":1");
+                        foreach (_; 0 .. 64) peer.write(cast(const(ubyte)[]) numberChunk);
+                        peer.write(".01e+2,\"values\":[null,true,false,{\"escaped\":\"\\ud83c\\udf32\"}]}}]}}]}\r\n");
+                    } else {
+                        const metadata = toJSON(fixtureSnapshot).toString();
+                        // Force fragmentation across escaped strings/scalars.
+                        foreach (i; 0 .. metadata.length) {
+                            peer.write(metadata[i .. i + 1]);
+                            if (i % 31 == 0) peer.flush();
+                        }
+                        peer.write("}]}\r\n");
+                    }
+                    if (queueStatus) {
+                        peer.write("OK {\"proto\":1,\"open\":1}\r\n");
+                        statusQueued = true;
+                        queueStatus = false;
+                    }
+                    peer.flush();
+                    continue;
+                } else if (line == "STATUS") {
+                    if (statusQueued) { statusQueued = false; continue; }
+                    response["proto"] = 1;
+                    response["open"] = 1;
+                } else throw new Exception("unexpected scan fixture verb");
+                peer.write("OK " ~ response.toString() ~ "\n");
+                peer.flush();
+            }
+        } catch (Exception) {}
+        try peer.close(); catch (Exception) {}
+    }, "127.0.0.1");
+    void cleanup() {
+        gate = false;
+        legacyGate = false;
+        infoGate = false;
+        foreach (peer; peers) try peer.close(); catch (Exception) {}
+        try listener.stopListening(); catch (Exception) {}
+        sleep(25.msecs);
+    }
+    scope(exit) cleanup();
+    const address = "tcp://127.0.0.1:" ~ listener.bindAddress.port.to!string;
+    context.holder = new HolderClient("fixture", address);
+    context.holder.connectControl();
+    HolderListObservation first, second;
+    Throwable failure;
+    runTask({
+        try first = acquireFreshHolderList(context);
+        catch (Throwable e) failure = e;
+    });
+    foreach (_; 0 .. 1000) { if (scans) break; sleep(1.msecs); }
+    runTask({
+        try second = acquireFreshHolderList(context);
+        catch (Throwable e) failure = e;
+    });
+    foreach (_; 0 .. 1000) {
+        if (context.holderListInFlight !is null && context.holderListInFlight.readers == 2) break;
+        sleep(1.msecs);
+    }
+    gate = false;
+    foreach (_; 0 .. 1000) { if (first !is null && second !is null || failure !is null) break; sleep(1.msecs); }
+    if (failure !is null) throw failure;
+    assert(first !is null && second !is null);
+    checks ~= Ircv3Check("only physically overlapping holder scans share one observation",
+        first is second && scans == 1 && pages == 2 && infos == 2 && first.readers == 2);
+    bool metadataFree = first.entries.length == 2;
+    bool[string] indexed;
+    foreach (entry; first.entries) {
+        metadataFree = metadataFree && !entry.hasMeta;
+        indexed[entry.tag.networkId] = true;
+    }
+    checks ~= Ircv3Check("inventory resolves multiple missing-network identities one INFO at a time without retaining META",
+        metadataFree && indexed.length == 2 && lists == 0);
+    auto later = acquireFreshHolderList(context);
+    checks ~= Ircv3Check("later heartbeat stays fresh even while earlier restoration leases remain held",
+        later !is first && scans == 2 && pages == 4 && infos == 2);
+    first.release();
+    checks ~= Ircv3Check("an observation remains owned until its last waiting consumer releases",
+        first.entries.length == 2 && first.readers == 1);
+    second.release();
+    checks ~= Ircv3Check("last consumer releases the observation graph", first.entries.length == 0);
+    later.release();
+    string[] reverseEvidence = ["prior-physical-network"];
+    failNext = true;
+    bool rejected;
+    try withFreshHolderList(context, (HolderEntry[] entries) { reverseEvidence = null; });
+    catch (Exception) rejected = true;
+    checks ~= Ircv3Check("failed physical scan never invokes mirror replacement with fabricated emptiness",
+        rejected && reverseEvidence == ["prior-physical-network"]);
+    foreach (_; 0 .. 1000) { if (context.holder.controlAlive) break; sleep(1.msecs); }
+    legacy = true;
+    auto old = new HolderClient("fixture", address);
+    old.connectControl();
+    largeLegacy = true;
+    queueStatus = true;
+    auto oldEntries = old.scan();
+    bool identityFields = oldEntries.length == 1;
+    if (identityFields) {
+        auto e = oldEntries[0];
+        identityFields = !e.hasMeta && e.id == "legacy" && e.instance == "legacy-instance"
+            && e.ordinal == 42 && e.tag.networkId == "e655e477-7d91-4000-8000-000000000001"
+            && e.tag.userId == "owner" && e.tag.name == "é雪🌲" && e.tag.egressLabel == "route"
+            && e.state == "open" && e.attached && e.host == "irc.fixture" && e.port == 6697
+            && e.peerIp == "2001:db8::1" && e.localIp == "2001:db8::2"
+            && e.connectedAtMs == 700 && e.detachedSinceMs == 800 && e.bufferedBytes == 901
+            && e.closeReason == "prior reason" && e.closedAtMs == 902
+            && e.gapGeneration == 9 && e.gapAckGeneration == 8 && e.droppedBytes == 903
+            && e.droppedLines == 904 && e.gapStartedAtMs == 905 && e.deliveryAmbiguous
+            && e.tlsOk && e.tls.version_ == "TLSv1.3" && e.tls.cipher == "fixture-cipher"
+            && e.tls.certCn == "fixture-cn" && e.tls.certIssuer == "fixture-issuer"
+            && e.tls.certNotAfterMs == 1700000000000L;
+    }
+    checks ~= Ircv3Check("fragmented genuine legacy LIST skips multi-megabyte META and long discarded numbers while preserving claims TLS UTF8 and gap fields",
+        lists == 1 && identityFields);
+    bool boundedStrings = identityFields;
+    if (boundedStrings) {
+        foreach (value; [oldEntries[0].id, oldEntries[0].instance, oldEntries[0].tag.networkId,
+                oldEntries[0].tag.userId, oldEntries[0].tag.name, oldEntries[0].tag.egressLabel,
+                oldEntries[0].state, oldEntries[0].host, oldEntries[0].peerIp, oldEntries[0].localIp,
+                oldEntries[0].closeReason, oldEntries[0].tls.version_, oldEntries[0].tls.cipher,
+                oldEntries[0].tls.certCn, oldEntries[0].tls.certIssuer])
+            boundedStrings = boundedStrings && GC.query(value.ptr).size <= 65536;
+    }
+    checks ~= Ircv3Check("legacy identity scalar backing allocations do not retain the large response",
+        boundedStrings);
+    checks ~= Ircv3Check("a pipelined next STATUS survives LF CRLF frame disposal on the same control",
+        old.status().open == 1 && old.controlAlive);
+    auto infoIdentity = old.infoIdentity("legacy");
+    checks ~= Ircv3Check("streaming INFO skips multi-megabyte META while preserving identity and unacknowledged gaps",
+        !infoIdentity.hasMeta && infoIdentity.id == oldEntries[0].id
+            && infoIdentity.instance == oldEntries[0].instance
+            && infoIdentity.connectedAtMs == 700 && infoIdentity.state == "open"
+            && infoIdentity.tag.networkId == oldEntries[0].tag.networkId
+            && infoIdentity.tag.userId == oldEntries[0].tag.userId
+            && infoIdentity.gapGeneration == 9 && infoIdentity.gapAckGeneration == 8
+            && infoIdentity.deliveryAmbiguous && old.status().open == 1);
+    auto attachedIdentity = old.attachIdentity("legacy");
+    const firstReplay = (cast(const(char)[]) attachedIdentity.stream.readLine(65536, "\n")).idup.strip;
+    checks ~= Ircv3Check("streaming ATTACH preserves replay TLS and gap facts without consuming replay bytes or rebuilding META",
+        !attachedIdentity.entry.hasMeta && attachedIdentity.entry.id == "legacy"
+            && attachedIdentity.entry.instance == "legacy-instance"
+            && attachedIdentity.entry.connectedAtMs == 700 && attachedIdentity.entry.state == "open"
+            && attachedIdentity.entry.tag.networkId == oldEntries[0].tag.networkId
+            && attachedIdentity.entry.tag.userId == oldEntries[0].tag.userId
+            && attachedIdentity.entry.bufferedBytes == 901
+            && attachedIdentity.entry.tlsOk && attachedIdentity.entry.tls.version_ == "TLSv1.3"
+            && attachedIdentity.entry.gapGeneration == 9 && attachedIdentity.entry.gapAckGeneration == 8
+            && attachedIdentity.entry.droppedBytes == 903 && attachedIdentity.entry.droppedLines == 904
+            && attachedIdentity.entry.gapStartedAtMs == 905 && attachedIdentity.entry.deliveryAmbiguous
+            && firstReplay == ":fixture NOTICE nick :first replay line");
+    attachedIdentity.stream.close();
+    largeLegacy = false;
+    auto attachedCheckpoint = old.attach("legacy");
+    const checkpointReplay = (cast(const(char)[]) attachedCheckpoint.stream.readLine(65536, "\n")).idup.strip;
+    const checkpoint = fromJSON(attachedCheckpoint.entry.meta);
+    checks ~= Ircv3Check("full ATTACH retains checkpoint META and strict markers for direct restoration consumers",
+        attachedCheckpoint.entry.hasMeta && checkpoint.wasConnected && checkpoint.graceful
+            && checkpoint.connectedAtMs == 700 && checkpoint.sessionNick == "restored-nick"
+            && checkpoint.servicesLegacyAuthPending == 2
+            && checkpoint.servicesQuietPrefixes == fixtureSnapshot.servicesQuietPrefixes
+            && checkpoint.servicesQuietUntilMs == fixtureSnapshot.servicesQuietUntilMs
+            && checkpointReplay == ":fixture NOTICE nick :first replay line");
+    attachedCheckpoint.stream.close();
+    auto complete = old.list();
+    bool restored;
+    if (complete.length == 1 && complete[0].hasMeta) {
+        auto snapshot = fromJSON(complete[0].meta);
+        restored = snapshot.wasConnected && snapshot.graceful && snapshot.connectedAtMs == 700
+            && snapshot.sessionNick == "restored-nick" && snapshot.servicesLegacyAuthPending == 2
+            && snapshot.servicesQuietPrefixes == fixtureSnapshot.servicesQuietPrefixes
+            && snapshot.servicesQuietUntilMs == fixtureSnapshot.servicesQuietUntilMs;
+    }
+    checks ~= Ircv3Check("explicit full legacy LIST preserves restoration and strict services markers",
+        lists == 2 && restored);
+    complete = null;
+    errorLegacy = true;
+    bool errorDecoded;
+    try old.scan();
+    catch (HolderErrorException e) { errorDecoded = e.code == "busy" && e.msg == "already attached"; }
+    checks ~= Ircv3Check("streamed ERR consumes unknown large subtrees and its terminator before throwing",
+        errorDecoded && old.controlAlive && old.status().open == 1);
+    foreach (kind; 1 .. 4) {
+        sparseLegacy = kind;
+        auto sparse = old.scan();
+        checks ~= Ircv3Check("legacy identity scan consumes missing null and empty META with nullable wire fields "
+                ~ kind.to!string,
+            sparse.length == 1 && !sparse[0].hasMeta && sparse[0].id == "sparse"
+                && sparse[0].tag.networkId.length == 0 && !sparse[0].tlsOk);
+    }
+    sparseLegacy = 0;
+
+    EngineContext oldContext;
+    oldContext.holder = old;
+    foreach (firstFull; [false, true]) foreach (secondFull; [false, true]) {
+        HolderListObservation a, b;
+        failure = null;
+        const before = lists;
+        legacyGate = true;
+        runTask({
+            try a = acquireFreshHolderList(oldContext, firstFull);
+            catch (Throwable e) failure = e;
+        });
+        foreach (_; 0 .. 1000) { if (legacyStarted > before) break; sleep(1.msecs); }
+        runTask({
+            try b = acquireFreshHolderList(oldContext, secondFull);
+            catch (Throwable e) failure = e;
+        });
+        foreach (_; 0 .. 1000) {
+            if (oldContext.holderListInFlight !is null && oldContext.holderListInFlight.readers == 2) break;
+            sleep(1.msecs);
+        }
+        legacyGate = false;
+        foreach (_; 0 .. 1000) { if (a !is null && b !is null || failure !is null) break; sleep(1.msecs); }
+        if (failure !is null) throw failure;
+        assert(a !is null && b !is null);
+        auto evidence = a.identityEntries();
+        const separate = !firstFull || (evidence[0].id.ptr != a.entries[0].id.ptr
+            && evidence[0].tag.networkId.ptr != a.entries[0].tag.networkId.ptr
+            && evidence[0].tls.cipher.ptr != a.entries[0].tls.cipher.ptr);
+        checks ~= Ircv3Check("overlap retains first scan requirement and projects independent identity backing "
+                ~ firstFull.to!string ~ "/" ~ secondFull.to!string,
+            a is b && a.requireMeta == firstFull && lists == before + 1
+                && a.entries[0].hasMeta == firstFull && !evidence[0].hasMeta && separate);
+        // The captured identities intentionally outlive both observation leases.
+        auto captured = ownedHolderIdentities(evidence);
+        a.release();
+        b.release();
+        const beforeInfo = infos;
+        HolderEntry recovered;
+        infoGate = true;
+        bool infoDone;
+        runTask({
+            try recovered = restorationEntry(old, captured[0]);
+            catch (Throwable e) failure = e;
+            infoDone = true;
+        });
+        foreach (_; 0 .. 1000) { if (infos > beforeInfo) break; sleep(1.msecs); }
+        const graphReleased = a.entries.length == 0 && a.identities.length == 0;
+        infoGate = false;
+        foreach (_; 0 .. 1000) { if (infoDone) break; sleep(1.msecs); }
+        if (failure !is null) throw failure;
+        checks ~= Ircv3Check("delayed selected INFO after callback lease release preserves markers without another LIST "
+                ~ firstFull.to!string ~ "/" ~ secondFull.to!string,
+            graphReleased && infoDone && recovered.hasMeta && !captured[0].hasMeta
+                && fromJSON(recovered.meta).servicesLegacyAuthPending == 2
+                && lists == before + 1 && infos == beforeInfo + 1);
+        recovered = HolderEntry.init;
+        captured = null;
+        evidence = null;
+    }
+    changedInfo = true;
+    rejected = false;
+    try restorationEntry(old, oldEntries[0]);
+    catch (HolderUnavailableException) rejected = true;
+    changedInfo = false;
+    checks ~= Ircv3Check("selected INFO rejects a changed physical claim rather than adopting its META", rejected);
+
+    foreach (mode; 1 .. 8) {
+        invalidLegacy = mode;
+        rejected = false;
+        reverseEvidence = ["prior-physical-network"];
+        string reason;
+        const started = MonoTime.currTime;
+        try withFreshHolderList(oldContext, (HolderEntry[] entries) { reverseEvidence = null; });
+        catch (HolderUnavailableException e) { rejected = true; reason = e.msg; }
+        const elapsed = MonoTime.currTime - started;
+        checks ~= Ircv3Check("invalid framed legacy response preserves mirrors and invalidates control "
+                ~ mode.to!string,
+            rejected && !old.controlAlive && reverseEvidence == ["prior-physical-network"]
+                && (mode != 4 || reason.canFind("exceeds receive limit"))
+                && (mode != 5 || elapsed >= 9.seconds && elapsed < 12.seconds));
+        foreach (_; 0 .. 2000) { if (old.controlAlive) break; sleep(1.msecs); }
+    }
+    return checks;
 }

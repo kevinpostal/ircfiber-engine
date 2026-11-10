@@ -50,6 +50,7 @@ private string makeActor() {
 long purgeLocalServerNamespace(RedisDatabase db, string serverId) @trusted {
     if (serverId.length == 0) return 0;
     immutable string script =
+        "if redis.call('EXISTS', 'irc:holder:maintenance:write-exclusion') ~= 0 then return 0 end\n" ~
         "local sid = ARGV[1]\n" ~
         "local deleted = 0\n" ~
         "local cursor = '0'\n" ~
@@ -264,6 +265,7 @@ final class EngineJanitor {
 
             // SCAN+UNLINK in batches. Returns "cursor|deleted" joined string.
             immutable string reapBatchScript =
+                "if redis.call('EXISTS', 'irc:holder:maintenance:write-exclusion') ~= 0 then return '0|0' end\n" ~
                 "local sid = ARGV[1]\n" ~
                 "local cursor = ARGV[2]\n" ~
                 "local batch = tonumber(ARGV[3])\n" ~
@@ -303,6 +305,7 @@ final class EngineJanitor {
             // Finalize: race-guard, registry cleanup, audit log.
             // Returns 1 if reap completed, 0 if engine revived mid-cycle.
             immutable string reapFinalizeScript =
+                "if redis.call('EXISTS', 'irc:holder:maintenance:write-exclusion') ~= 0 then return 0 end\n" ~
                 "local sid = ARGV[1]\n" ~
                 "local actor = ARGV[2]\n" ~
                 "local now = ARGV[3]\n" ~
@@ -391,6 +394,7 @@ final class EngineJanitor {
     long manualReap(string serverId) {
         if (serverId.length == 0) return 0;
         immutable string reapBatchScript =
+            "if redis.call('EXISTS', 'irc:holder:maintenance:write-exclusion') ~= 0 then return '0|0' end\n" ~
             "local sid = ARGV[1]\n" ~
             "local cursor = ARGV[2]\n" ~
             "local batch = tonumber(ARGV[3])\n" ~
@@ -423,6 +427,7 @@ final class EngineJanitor {
             }
         }
         immutable string reapFinalizeScript =
+            "if redis.call('EXISTS', 'irc:holder:maintenance:write-exclusion') ~= 0 then return 0 end\n" ~
             "local sid = ARGV[1]\n" ~
             "local actor = ARGV[2]\n" ~
             "local now = ARGV[3]\n" ~

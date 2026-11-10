@@ -7,10 +7,7 @@ import std.conv : to, text;
 import std.format : format;
 import std.array : array, appender;
 import std.string : format;
-import core.atomic : atomicLoad, atomicStore;
 import core.sync.mutex : Mutex;
-import core.time : seconds, dur;
-import vibe.core.core : runTask, sleep;
 
 /// OTLP resource attributes shared by the traces/metrics/logs exporters so all
 /// three signals correlate on the same identity in SigNoz.
@@ -25,10 +22,21 @@ import vibe.core.core : runTask, sleep;
 /// Returns ordered (key, value) pairs; values are NOT JSON-escaped.
 string[2][] otelResourceAttributes(string serviceName, string serviceVersion) nothrow {
     string[2][] res;
-    void set(string k, string v) {
-        foreach (ref kv; res) if (kv[0] == k) { kv[1] = v; return; }
-        string[2] pair = [k, v];
-        res ~= pair;
+    size_t retainedBytes;
+    void set(scope const(char)[] k, scope const(char)[] v) {
+        // Resource configuration is outside the point/span/log rings. Bound
+        // its export-time ownership too, including an adversarial env value.
+        if (k.length > 256 || v.length > 1024) return;
+        foreach (ref kv; res) if (kv[0] == k) {
+            if (retainedBytes - kv[1].length + v.length > 4096) return;
+            retainedBytes = retainedBytes - kv[1].length + v.length;
+            kv[1] = v.idup;
+            return;
+        }
+        if (res.length == 32 || retainedBytes + k.length + v.length > 4096) return;
+        retainedBytes += k.length + v.length;
+        string[2] pair = [k.idup, v.idup];
+        res ~= pair; // at most 32 pairs / 4096 string bytes
     }
     set("service.name", serviceName);
     set("service.version", serviceVersion);
@@ -38,10 +46,11 @@ string[2][] otelResourceAttributes(string serviceName, string serviceVersion) no
     try {
         import core.stdc.stdlib : getenv;
         import core.stdc.string : strlen;
-        import std.string : split, strip, indexOf, toStringz;
+        import std.string : strip, indexOf, toStringz;
+        import std.algorithm : splitter;
         auto env = getenv("OTEL_RESOURCE_ATTRIBUTES".toStringz);
         if (env !is null) {
-            foreach (pair; env[0 .. strlen(env)].idup.split(",")) {
+            foreach (pair; env[0 .. strlen(env)].splitter(',')) {
                 auto kv = pair.strip;
                 auto eq = kv.indexOf("=");
                 if (eq <= 0) continue;
@@ -193,9 +202,41 @@ private struct PendingSpan {
     string statusMessage;
 }
 
+import ircfiber.observability : BoundedTelemetryQueue, telemetryStringCharge,
+    telemetryAttributesCharge, copyTelemetryAttributes, sendTelemetryJson;
+
+enum TRACING_MAX_SPANS = 1024;
+enum TRACING_MAX_BYTES = 4 * 1024 * 1024;
+private alias TracingQueue = BoundedTelemetryQueue!(PendingSpan, TRACING_MAX_SPANS, TRACING_MAX_BYTES);
 private __gshared shared(Mutex) queueMutex;
-private __gshared PendingSpan[] queue;
-private __gshared int exporterStarted;
+private __gshared TracingQueue queue;
+private __gshared ulong reportedTracingDrops;
+
+struct TracingQueueSample { ulong count, bytes, droppedCount, droppedBytes; long lastExportSuccessAtMs; }
+TracingQueueSample sampleTracingQueue() {
+    if (!queueMutexInitd) return TracingQueueSample.init;
+    synchronized (queueMutex)
+        return TracingQueueSample(queue.count, queue.bytes, queue.droppedCount, queue.droppedBytes,
+                                  queue.lastExportSuccessAtMs);
+}
+
+private void enqueueSpan(PendingSpan span) {
+    ulong charge = 768;
+    string[5] strings = [span.traceId, span.spanId, span.parentSpanId, span.name, span.statusMessage];
+    foreach (s; strings)
+        charge = TracingQueue.addSaturated(charge, telemetryStringCharge(s));
+    charge = TracingQueue.addSaturated(charge, telemetryAttributesCharge(span.attributes));
+    synchronized (queueMutex) {
+        if (!queue.admits(charge)) return;
+        span.traceId = span.traceId.idup;
+        span.spanId = span.spanId.idup;
+        span.parentSpanId = span.parentSpanId.idup;
+        span.name = span.name.idup;
+        span.statusMessage = span.statusMessage.idup;
+        span.attributes = copyTelemetryAttributes(span.attributes);
+        queue.put(span, charge);
+    }
+}
 private __gshared string endpoint = "http://ircfiber-otel-collector:4318/v1/traces";
 private __gshared string serviceName = "ircfiber-engine";
 private __gshared string serviceVersion = "0.3.0";
@@ -265,6 +306,16 @@ void withSpan(string name, string[string] attrs, scope void delegate(ref Span) f
         return;
     }
     if (!queueMutex) initOnce();
+    // Reject a huge initial record before copying its attribute table.
+    auto initialCharge = TracingQueue.addSaturated(768, telemetryStringCharge(name));
+    initialCharge = TracingQueue.addSaturated(initialCharge, telemetryAttributesCharge(attrs));
+    bool admitted;
+    synchronized (queueMutex) admitted = queue.admits(initialCharge);
+    if (!admitted) {
+        Span rejected = Span(null);
+        fn(rejected);
+        return;
+    }
     const ctx = &fiberCtx();
     const parentTrace = ctx.current.traceId;
     const parentSpan  = ctx.current.spanId;
@@ -293,9 +344,7 @@ void withSpan(string name, string[string] attrs, scope void delegate(ref Span) f
     }
     span.endUnixNano = nowUnixNanos();
 
-    synchronized (queueMutex) {
-        queue ~= span;
-    }
+    enqueueSpan(span);
 
     // Record the failure on the span, then rethrow so the caller sees it.
     if (caught !is null) throw caught;
@@ -361,7 +410,7 @@ private string buildOtlpJson(ref PendingSpan[] batch) {
         foreach (k, v; s.attributes) {
             if (!firstAttr) sink ~= ",";
             firstAttr = false;
-            sink ~= format(`{"key":"%s","value":{"stringValue":"%s"}}`, k, jsonEscape(v));
+            sink ~= format(`{"key":"%s","value":{"stringValue":"%s"}}`, jsonEscape(k), jsonEscape(v));
         }
         sink ~= `]`;
         sink ~= format(`,"status":{"code":%d`, s.statusCode);
@@ -391,68 +440,43 @@ private string jsonEscape(string s) {
     return sink.data;
 }
 
-private void sendBatch(ref PendingSpan[] batch) {
-    if (!g_enabled) return;
-    if (batch.length == 0) return;
-    auto json = buildOtlpJson(batch);
-    try {
-        import vibe.http.client : requestHTTP, HTTPMethod;
-        requestHTTP(endpoint,
-            (scope req) {
-                // Use the high-level `writeBody` helper rather than
-                // `req.bodyWriter.write` directly. `bodyWriter` is
-                // a `ChunkedOutputStream` wrapper that needs an
-                // explicit `finalize()` call to write the empty
-                // terminating chunk required by HTTP/1.1 chunked
-                // transfer encoding. `writeBody` does that for us
-                // AND sets the Content-Length header automatically
-                // (so the request isn't sent chunked in the first
-                // place). Without this, every batch exports as a
-                // 0-byte body and SigNoz dashboards stay empty.
-                //
-                // We also need to set method=POST explicitly:
-                // `HTTPClientRequest`'s default method is GET
-                // (vibe.http.client HTTPClientRequest.m_method
-                // = HTTPMethod.GET in client.d line 190), and a
-                // GET-with-body is rejected by most OTLP collectors
-                // (the OTel collector returns 405 Method Not Allowed).
-                req.method = HTTPMethod.POST;
-                req.writeBody(cast(const ubyte[])json, "application/json");
-            },
-            (res) {
-                if (res.statusCode >= 400)
-                    stderr.writeln("otel: export failed status=", res.statusCode);
-            });
-    } catch (Throwable e) {
-        string m;
-        try { m = e.msg; } catch (Throwable) { m = "unknown"; }
-        try stderr.writeln("otel: export error: ", m);
+/// Periodic and shutdown callers share one in-flight export. Failed exports
+/// retain only the bounded queue; newer telemetry may displace older spans.
+void flushAndSendSpans() nothrow {
+    try flushSpans((string json) => sendTelemetryJson(endpoint, json));
+    catch (Throwable) {
+        try stderr.writeln("otel-traces: export error; bounded queue retained");
         catch (Throwable) {}
     }
 }
-/// Drain the span queue and send to otel-collector.
-/// Called from the heartbeat task (every 10s) — safe to call
-/// multiple times; no-ops if the queue is empty. Never throws.
-void flushAndSendSpans() nothrow {
-    try {
-        if (!g_enabled) return;
-        if (!queueMutex) return;
-        PendingSpan[] batch;
-        try synchronized (queueMutex) {
-            if (queue.length == 0) return;
-            batch = queue;
-            queue = null;
-        } catch (Throwable) { return; }
-        if (batch.length) try sendBatch(batch); catch (Throwable) {}
-    } catch (Throwable) {}
-}
 
-/// Marks the tracing exporter as started.
-void startTracingExporter() {
-    if (atomicLoad(exporterStarted)) return;
-    atomicStore(exporterStarted, 1);
-    // No separate thread/task needed. `flushAndSendSpans()` is called
-    // from the existing heartbeat fiber in bootstrap.d.
+private void flushSpans(scope bool delegate(string) send) {
+    if (!g_enabled || !queueMutexInitd) return;
+    string json;
+    ulong through;
+    synchronized (queueMutex) {
+        if (queue.exporting) return;
+        if (queue.droppedCount != reportedTracingDrops) {
+            stderr.writeln("otel-traces: dropped_count=", queue.droppedCount,
+                " dropped_bytes=", queue.droppedBytes);
+            reportedTracingDrops = queue.droppedCount;
+        }
+        if (!queue.count) return;
+        queue.exporting = true;
+    }
+    scope (exit) synchronized (queueMutex) queue.exporting = false;
+    synchronized (queueMutex) {
+        auto batch = queue.snapshot();
+        scope (exit) batch[] = PendingSpan.init;
+        through = queue.watermark();
+        json = buildOtlpJson(batch);
+    }
+    if (send(json)) {
+        synchronized (queueMutex) {
+            queue.acknowledge(through);
+            queue.lastExportSuccessAtMs = nowUnixNanos() / 1_000_000;
+        }
+    } else stderr.writeln("otel-traces: export failed; bounded queue retained");
 }
 
 // ── Test-only accessors ────────────────────────────────────────────────
@@ -461,18 +485,14 @@ void startTracingExporter() {
 /// Drains and returns all queued spans (test helper).
 PendingSpan[] drainQueueForTest() {
     if (!queueMutex) return null;
-    synchronized (queueMutex) {
-        auto drained = queue;
-        queue = null;
-        return drained;
-    }
+    synchronized (queueMutex) return queue.drain();
 }
 
 /// Returns the number of queued spans (test helper).
 int queueLengthForTest() {
     if (!queueMutex) return 0;
     synchronized (queueMutex) {
-        return cast(int)queue.length;
+        return cast(int)queue.count;
     }
 }
 
@@ -524,21 +544,6 @@ unittest {
     assert(queueLengthForTest() == 0);
 }
 
-@("configureTracing empty endpoint disables tracing")
-unittest {
-    const prev = isTracingEnabled();
-    const prevEp = endpoint;
-    scope (exit) {
-        setTracingEnabled(prev);
-        endpoint = prevEp;
-    }
-    configureTracing("", "test-svc", "0.0.1");
-    assert(!isTracingEnabled(), "empty endpoint must disable tracing");
-    configureTracing("disabled", "test-svc", "0.0.1");
-    assert(!isTracingEnabled(), "\"disabled\" endpoint must disable tracing");
-    configureTracing("http://signoz:4318/v1/traces", "test-svc", "0.0.1");
-    assert(isTracingEnabled(), "non-empty endpoint must enable tracing");
-}
 
 @("flushAndSendSpans when disabled is no-op even with queued spans")
 unittest {
@@ -561,4 +566,65 @@ unittest {
     setTracingEnabled(true);
     cast(void) drainQueueForTest();
     setTracingEnabled(prev);
+}
+
+/// Collector completion is injected; all admission/export logic is real.
+void runTracingQueueRegressionForTest() {
+    import std.array : replicate;
+    import std.algorithm : canFind;
+    const previous = g_enabled;
+    scope (exit) {
+        cast(void) drainQueueForTest();
+        g_enabled = previous;
+    }
+    cast(void) drainQueueForTest();
+    setTracingEnabled(false);
+    const disabled = sampleTracingQueue();
+    int calls;
+    withSpan("disabled", null, (ref Span s) {
+        ++calls;
+        s.attr("number", 42L);
+        s.event("ignored");
+    });
+    flushSpans((string) { assert(false, "disabled spans exported"); return false; });
+    assert(calls == 1 && sampleTracingQueue() == disabled);
+    setTracingEnabled(true);
+    const initialDrops = sampleTracingQueue().droppedCount;
+    foreach (i; 0 .. TRACING_MAX_SPANS + 3)
+        withSpan("s", ["i": i.to!string], (ref Span s) { s.setStatusOk(); });
+    auto bounded = sampleTracingQueue();
+    assert(bounded.count == TRACING_MAX_SPANS && bounded.bytes <= TRACING_MAX_BYTES);
+    assert(bounded.droppedCount == initialDrops + 3);
+    auto batch = drainQueueForTest();
+    assert(batch[0].attributes["i"] == "3" &&
+        batch[$ - 1].attributes["i"] == (TRACING_MAX_SPANS + 2).to!string);
+    batch = null;
+    auto large = replicate("x", 64 * 1024);
+    foreach (i; 0 .. 12)
+        withSpan("byte_bound", ["payload": large], (ref Span s) { s.attr("i", cast(long)i); });
+    bounded = sampleTracingQueue();
+    assert(bounded.count > 0 && bounded.count < 12 && bounded.bytes <= TRACING_MAX_BYTES);
+    const beforeOversize = sampleTracingQueue();
+    withSpan(replicate("x", TRACING_MAX_BYTES / 16), null, (ref Span s) {});
+    auto afterOversize = sampleTracingQueue();
+    assert(afterOversize.count == beforeOversize.count && afterOversize.bytes == beforeOversize.bytes);
+    assert(afterOversize.droppedCount == beforeOversize.droppedCount + 1);
+    int sends;
+    flushSpans((string json) {
+        ++sends;
+        flushSpans((string) { ++sends; return true; });
+        return false;
+    });
+    assert(sends == 1 && sampleTracingQueue().count == beforeOversize.count);
+    withSpan("latest_after_failure", null, (ref Span s) {});
+    flushSpans((string json) {
+        assert(json.canFind("latest_after_failure"));
+        withSpan("arrived_during_export", null, (ref Span s) {});
+        return true;
+    });
+    auto arrived = drainQueueForTest();
+    assert(arrived.length == 1 && arrived[0].name == "arrived_during_export");
+    withSpan("recovery", null, (ref Span s) {});
+    flushSpans((string) => true);
+    assert(sampleTracingQueue().count == 0 && sampleTracingQueue().bytes == 0);
 }

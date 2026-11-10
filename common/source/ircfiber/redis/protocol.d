@@ -377,17 +377,29 @@ struct RedisKeys {
     /// Quiet-hours summary schedule: ZSET uid → window end (unix ms).
     static string notifySummaryDue() { return "irc:notify:summary:due"; }
 
+    /// Durable push job: HASH @meta plus m:<eventId> raw members; 8-day retention.
+    static string notifyPending(string userId, string jobId) { return "irc:notify:pending:" ~ userId ~ ":" ~ jobId; }
+
+    /// Durable push schedule: ZSET JSON [uid,jobId] → next execution time.
+    static string notifyPendingDue() { return "irc:notify:pending:due"; }
+
+    /// Owner-fenced push lease: JSON owner/expiry with a 60-second safety TTL.
+    static string notifyPendingLease(string userId, string jobId) { return "irc:notify:pending:lease:" ~ userId ~ ":" ~ jobId; }
+
+    /// Audience-qualified quiet constituents, separate from the legacy held ZSET.
+    static string notifyHeldMembers(string userId) { return "irc:notify:held:members:" ~ userId; }
+
+    /// Quiet constituent field → quiet-end time; same lifetime as held members.
+    static string notifyHeldIndex(string userId) { return "irc:notify:held:index:" ~ userId; }
+
     /// Repeated-DM tracking per sender: ZSET msgid → t; 1 h. `senderLower` is the lower-cased nick.
     static string notifyDmTimes(string userId, string networkId, string senderLower) {
         return "irc:notify:dm:" ~ userId ~ ":" ~ networkId ~ ":" ~ senderLower;
     }
 
-    /// Burst grouping window for one thread: string holding the window start (ms), PX = window.
-    static string notifyCoalesce(string userId, string threadHash) { return "irc:notify:co:" ~ userId ~ ":" ~ threadHash; }
-
-    /// Messages coalesced into the current `notifyCoalesce` window (INCR).
-    static string notifyCoalesceCount(string userId, string threadHash) {
-        return "irc:notify:co:" ~ userId ~ ":" ~ threadHash ~ ":n";
+    /// Fixed-window delivery/order ledger, scoped by account, audience and conversation.
+    static string notifyWindow(string userId, string scopeHash) {
+        return "irc:notify:window:" ~ userId ~ ":" ~ scopeHash;
     }
 
     /// Notification email schedule: ZSET uid → due (unix ms).
@@ -406,8 +418,12 @@ struct RedisKeys {
     /// (an email cell on, or quiet hours with the summary on).
     static string notifyServerUsers() { return "irc:notify:server-users"; }
 
-    /// Browser presence for Web Push: HASH sessionRef → expiry ms; key EXPIRE 120 s.
-    static string notifyLive(string userId) { return "irc:notify:live:" ~ userId; }
+    /// Browser attention: HASH handshake connection id → JSON
+    /// {loginRef,visible,focused,expiresAtMs}; 60 s lease, key EXPIRE 120 s.
+    static string notifyAttention(string userId) { return "irc:notify:attention:" ~ userId; }
+
+    /// Account-wide MAX visible+focused interaction (server unix ms); EXPIRE 660 s.
+    static string notifyLastInteraction(string userId) { return "irc:notify:interaction:" ~ userId; }
 
     /// Delivery health: HASH `<target>:lastOkAt` / `<target>:lastErrAt` / `<target>:lastErr`.
     static string notifyHealth(string userId) { return "irc:notify:health:" ~ userId; }
@@ -1192,14 +1208,14 @@ unittest {
     assert(RedisKeys.notifyHeld("u1") == "irc:notify:held:u1");
     assert(RedisKeys.notifySummaryDue() == "irc:notify:summary:due");
     assert(RedisKeys.notifyDmTimes("u1", "n1", "bob") == "irc:notify:dm:u1:n1:bob");
-    assert(RedisKeys.notifyCoalesce("u1", "h") == "irc:notify:co:u1:h");
-    assert(RedisKeys.notifyCoalesceCount("u1", "h") == "irc:notify:co:u1:h:n");
+    assert(RedisKeys.notifyWindow("u1", "h") == "irc:notify:window:u1:h");
     assert(RedisKeys.notifyEmailDue() == "irc:notify:email:due");
     assert(RedisKeys.notifyEmailItems("u1") == "irc:notify:email:items:u1");
     assert(RedisKeys.notifyEmailLast("u1") == "irc:notify:email:last:u1");
     assert(RedisKeys.notifyUnsub("tok") == "notify:unsub:tok");
     assert(RedisKeys.notifyServerUsers() == "irc:notify:server-users");
-    assert(RedisKeys.notifyLive("u1") == "irc:notify:live:u1");
+    assert(RedisKeys.notifyAttention("u1") == "irc:notify:attention:u1");
+    assert(RedisKeys.notifyLastInteraction("u1") == "irc:notify:interaction:u1");
     assert(RedisKeys.notifyHealth("u1") == "irc:notify:health:u1");
     assert(RedisKeys.notifyRate("patch", "u1") == "irc:notify:rl:patch:u1");
     assert(RedisKeys.notifyEmailSwitch() == "irc:config:notifyEmail");

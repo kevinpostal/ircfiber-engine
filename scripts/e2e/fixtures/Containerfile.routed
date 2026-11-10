@@ -3,4 +3,5 @@ RUN apk add --no-cache iproute2 openssl
 WORKDIR /fixture
 COPY routed_fixture.py /fixture/routed_fixture.py
 COPY routed_holder_client.py /fixture/routed_holder_client.py
+COPY archive_routing_driver.py /fixture/archive_routing_driver.py
 ENTRYPOINT ["python3", "-u", "/fixture/routed_fixture.py"]

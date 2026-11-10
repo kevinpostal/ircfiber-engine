@@ -38,6 +38,23 @@ int compareHistoryBoundaries(const ref HistoryBoundary a, const ref HistoryBound
     return cmp(a.storageId, b.storageId);
 }
 
+/// Success means the raw archival command met majority+journal write concern.
+enum ArchiveWriteResult { inserted, alreadyPersisted }
+
+enum ArchiveWriteFailure { invalidInput, unavailable, rejected, identityMismatch, invalidReply }
+
+/// Deliberately excludes Mongo error text, payloads, IDs and connection details.
+final class ArchiveWriteException : Exception {
+    immutable ArchiveWriteFailure failure;
+    immutable long mongoCode;
+
+    this(ArchiveWriteFailure failure, long mongoCode = 0) {
+        super("Archival Mongo operation failed: " ~ to!string(failure));
+        this.failure = failure;
+        this.mongoCode = mongoCode;
+    }
+}
+
 /// Days a `messages` row stays in Mongo before the TTL monitor deletes it.
 /// Read once per process by `MessageRepository.ensureIndexes`.
 enum MESSAGE_RETENTION_DAYS_DEFAULT = 30;
@@ -290,25 +307,433 @@ final class MessageRepository {
             if (e.type == Json.Type.int_) eid = e.get!long;
         }
 
-        auto jdoc = Json([
-            "_id": Json(serverId ~ ":" ~ networkId ~ ":" ~ channel ~ ":" ~
-                (eid > 0 ? to!string(eid) : (msgid.length > 0 ? msgid : to!string(ts)))),
-            "serverId": Json(serverId),
-            "networkId": Json(networkId),
-            "channel": Json(channel),
-            "t": Json(ts),
-            "payload": Json(payloadStr)
-        ]);
-        if (msgid.length > 0) jdoc["msgid"] = Json(msgid);
-        if (eid > 0) jdoc["eid"] = Json(eid);
-
         try {
-            auto doc = Bson(jdoc);
-            doc["tsAt"] = Bson(BsonDate(ts));
-            collection.insertOne(doc);
+            collection.insertOne(messageDocument(serverId, networkId, channel,
+                payloadStr, ts, eid, msgid));
         } catch (Exception e) {
             logDebug("Mongo insert (probably duplicate): %s", e.msg);
         }
+    }
+
+    private static Bson messageDocument(string serverId, string networkId, string channel,
+            string payload, long timestampMs, long eid, string msgid) @trusted {
+        auto jdoc = Json([
+            "_id": Json(serverId ~ ":" ~ networkId ~ ":" ~ channel ~ ":" ~
+                (eid > 0 ? to!string(eid) : (msgid.length > 0 ? msgid : to!string(timestampMs)))),
+            "serverId": Json(serverId),
+            "networkId": Json(networkId),
+            "channel": Json(channel),
+            "t": Json(timestampMs),
+            "payload": Json(payload)
+        ]);
+        if (msgid.length > 0) jdoc["msgid"] = Json(msgid);
+        if (eid > 0) jdoc["eid"] = Json(eid);
+        auto doc = Bson(jdoc);
+        doc["tsAt"] = Bson(BsonDate(timestampMs));
+        return doc;
+    }
+
+    /// Replay the original compact event, never assigning an eid or wall-clock
+    /// timestamp here. A duplicate must be the same immutable event; its current
+    /// channel is intentionally ignored because ordered renames can change it.
+    ArchiveWriteResult appendArchivedMessage(string serverId, string networkId,
+            string channel, Json message) @trusted {
+        return appendArchivedPayload(serverId, networkId, channel, message, message.toString());
+    }
+
+    /// Journal replay keeps the admitted compact bytes verbatim. Do not
+    /// serialize a parsed object again on every uncertain-write retry.
+    ArchiveWriteResult appendArchivedCompactMessage(string serverId, string networkId,
+            string channel, string compactJson) @trusted {
+        Json message;
+        try message = parseJsonString(compactJson);
+        catch (Exception) { throw new ArchiveWriteException(ArchiveWriteFailure.invalidInput); }
+        return appendArchivedPayload(serverId, networkId, channel, message, compactJson);
+    }
+
+    private ArchiveWriteResult appendArchivedPayload(string serverId, string networkId,
+            string channel, Json message, string payload) @trusted {
+        channel = normalizeChannel(channel);
+        if (!serverId.length || !networkId.length || !channel.length
+                || message.type != Json.Type.object)
+            throw new ArchiveWriteException(ArchiveWriteFailure.invalidInput);
+        const eidValue = "eid" in message;
+        const timestampValue = "t" in message;
+        if (eidValue is null || eidValue.type != Json.Type.int_ || eidValue.get!long <= 0
+                || timestampValue is null || timestampValue.type != Json.Type.int_
+                || timestampValue.get!long <= 0)
+            throw new ArchiveWriteException(ArchiveWriteFailure.invalidInput);
+        const eid = eidValue.get!long;
+        const timestampMs = timestampValue.get!long;
+        string msgid;
+        if (auto m = "m" in message)
+            if (m.type == Json.Type.string) msgid = m.get!string;
+        const doc = messageDocument(serverId, networkId, channel, payload, timestampMs, eid, msgid);
+        auto command = Bson.emptyObject; // Mongo requires the verb first.
+        command["insert"] = Bson("messages");
+        command["documents"] = Bson([doc]);
+        command["ordered"] = Bson(true);
+        command["writeConcern"] = archiveWriteConcern();
+        const reply = runArchiveCommand(command);
+        checkArchiveReply(reply);
+        const errors = reply["writeErrors"];
+        if (errors.type == Bson.Type.array && errors.length == 1) {
+            const error = errors[0];
+            if (error.type != Bson.Type.object || !archiveIntegerEquals(error["code"], 11000)
+                    || !archiveIntegerEquals(error["index"], 0)
+                    || !archiveIntegerEquals(reply["n"], 0))
+                throw new ArchiveWriteException(ArchiveWriteFailure.rejected,
+                    archiveErrorCode(error));
+            verifyArchivedDuplicate(doc);
+            return ArchiveWriteResult.alreadyPersisted;
+        }
+        checkArchiveWriteErrors(reply);
+        if (!archiveIntegerEquals(reply["n"], 1))
+            throw new ArchiveWriteException(ArchiveWriteFailure.invalidReply);
+        return ArchiveWriteResult.inserted;
+    }
+
+    /// Returns the acknowledged modified count, including zero on replay.
+    /// Only pre-cutoff eids and eid-absent legacy rows can move; reuse of the
+    /// old buffer after the barrier must not be renamed by a retry.
+    long renameArchivedChannel(string serverId, string networkId, string oldChannel,
+            string newChannel, long cutoffEid, long legacyTimestampCutoffMs) @trusted {
+        auto filter = archiveCutoffFilter(serverId, networkId, oldChannel,
+            cutoffEid, legacyTimestampCutoffMs);
+        newChannel = normalizeChannel(newChannel);
+        if (!newChannel.length)
+            throw new ArchiveWriteException(ArchiveWriteFailure.invalidInput);
+        auto command = Bson.emptyObject;
+        command["update"] = Bson("messages");
+        command["updates"] = Bson([Bson([
+            "q": filter,
+            "u": Bson(["$set": Bson(["channel": Bson(newChannel)])]),
+            "multi": Bson(true),
+            "upsert": Bson(false)
+        ])]);
+        command["ordered"] = Bson(true);
+        command["writeConcern"] = archiveWriteConcern();
+        const reply = runArchiveCommand(command);
+        checkArchiveReply(reply);
+        checkArchiveWriteErrors(reply);
+        const matched = archiveReplyCount(reply, "n");
+        const modified = archiveReplyCount(reply, "nModified");
+        if (modified > matched)
+            throw new ArchiveWriteException(ArchiveWriteFailure.invalidReply);
+        return modified;
+    }
+
+    /// Idempotent purge of the frozen buffer prefix, never unconditional DEL.
+    /// The caller retains the same cutoffs for every retry of the operation.
+    long deleteArchivedChannel(string serverId, string networkId, string channel,
+            long cutoffEid, long legacyTimestampCutoffMs) @trusted {
+        auto filter = archiveCutoffFilter(serverId, networkId, channel,
+            cutoffEid, legacyTimestampCutoffMs);
+        auto command = Bson.emptyObject;
+        command["delete"] = Bson("messages");
+        command["deletes"] = Bson([Bson(["q": filter, "limit": Bson(0)])]);
+        command["ordered"] = Bson(true);
+        command["writeConcern"] = archiveWriteConcern();
+        const reply = runArchiveCommand(command);
+        checkArchiveReply(reply);
+        checkArchiveWriteErrors(reply);
+        return archiveReplyCount(reply, "n");
+    }
+
+    /// Canonical network metadata survives Redis eviction and ordinary config
+    /// $set saves. At most 64 distinct engines per existing network; deletion
+    /// still deletes the network, not its Mongo message history.
+    /// Empty means a majority read found no canonical network; never recreate it.
+    /// Fresh producers pass their canonical owner: the same majority read and
+    /// catalog CAS must match it. Offline historical discovery has no producer
+    /// owner and deliberately leaves that expectation empty.
+    string[] registerArchiveScopes(string networkId, string[] servers, string expectedOwner = "") @trusted {
+        if (!servers.length) throw new ArchiveWriteException(ArchiveWriteFailure.invalidInput);
+        return synchronizeArchiveScopes(networkId, servers, false, expectedOwner);
+    }
+
+    /// Includes pre-journal rows before any clear. Never truncate a 65th scope.
+    string[] archivedServerScopes(string networkId, string[] retainedProjection = null) @trusted {
+        auto scopes = synchronizeArchiveScopes(networkId, retainedProjection, true);
+        if (!scopes.length) throw new ArchiveWriteException(ArchiveWriteFailure.unavailable);
+        return scopes;
+    }
+
+    private static void addArchiveScope(ref string[64] scopes, ref size_t count, string server) @trusted {
+        if (!server.length || server.length > 128)
+            throw new ArchiveWriteException(ArchiveWriteFailure.invalidReply);
+        foreach (known; scopes[0 .. count]) if (known == server) return;
+        if (count == scopes.length)
+            throw new ArchiveWriteException(ArchiveWriteFailure.unavailable);
+        scopes[count++] = server;
+    }
+
+    private static Bson archiveNetworkCatalog(string networkId) @trusted {
+        auto command = Bson.emptyObject;
+        command["find"] = Bson("networks");
+        command["filter"] = Bson(["id": Bson(networkId)]);
+        command["projection"] = Bson(["_id": Bson(0), "id": Bson(1),
+            "userId": Bson(1), "archiveScopeVersion": Bson(1), "archiveServers": Bson(1)]);
+        command["limit"] = Bson(1L); command["singleBatch"] = Bson(true);
+        command["maxTimeMS"] = Bson(5000);
+        command["readConcern"] = Bson(["level": Bson("majority")]);
+        auto reply = runArchiveCommand(command);
+        checkArchiveReply(reply); checkArchiveWriteErrors(reply);
+        auto cursor = reply["cursor"];
+        if (cursor.type != Bson.Type.object || cursor["firstBatch"].type != Bson.Type.array
+                || cursor["firstBatch"].length > 1)
+            throw new ArchiveWriteException(ArchiveWriteFailure.invalidReply);
+        if (!cursor["firstBatch"].length) return Bson(null);
+        auto doc = cursor["firstBatch"][0];
+        if (doc.type != Bson.Type.object || doc["id"].type != Bson.Type.string
+                || doc["id"].get!string != networkId)
+            throw new ArchiveWriteException(ArchiveWriteFailure.invalidReply);
+        return doc;
+    }
+
+    private static void killArchiveCursor(long cursorId) @trusted {
+        if (!cursorId) return;
+        try {
+            auto kill = Bson.emptyObject; kill["killCursors"] = Bson("messages");
+            kill["cursors"] = Bson([Bson(cursorId)]);
+            runArchiveCommand(kill);
+        } catch (Exception) {}
+    }
+
+    private static void legacyArchiveScopes(string networkId, ref string[64] scopes,
+            ref size_t count) @trusted {
+        // Limit on the server, stream batches, and bound each returned scalar.
+        // Missing/non-string attribution fails rather than dropping a scope.
+        auto command = Bson.emptyObject;
+        command["aggregate"] = Bson("messages");
+        command["pipeline"] = Bson([
+            Bson(["$match": Bson(["networkId": Bson(networkId)])]),
+            Bson(["$group": Bson(["_id": Bson("$serverId")])]),
+            Bson(["$limit": Bson(65)]),
+            Bson(["$project": Bson(["_id": Bson(["$substrBytes":
+                Bson([Bson("$_id"), Bson(0), Bson(129)])])])])
+        ]);
+        command["cursor"] = Bson(["batchSize": Bson(65)]);
+        command["maxTimeMS"] = Bson(5000);
+        command["readConcern"] = Bson(["level": Bson("majority")]);
+        long cursorId;
+        scope(exit) killArchiveCursor(cursorId);
+        size_t rows;
+        bool first = true;
+        while (true) {
+            auto reply = runArchiveCommand(command);
+            checkArchiveReply(reply); checkArchiveWriteErrors(reply);
+            auto cursor = reply["cursor"];
+            const field = first ? "firstBatch" : "nextBatch";
+            if (cursor.type != Bson.Type.object || !archiveInteger(cursor["id"], cursorId)
+                    || cursor["ns"].type != Bson.Type.string
+                    || cursor[field].type != Bson.Type.array || cursor[field].length > 65 - rows)
+                throw new ArchiveWriteException(ArchiveWriteFailure.invalidReply);
+            foreach (row; cursor[field].byValue) {
+                if (row.type != Bson.Type.object || row["_id"].type != Bson.Type.string)
+                    throw new ArchiveWriteException(ArchiveWriteFailure.invalidReply);
+                ++rows;
+                if (rows > 64) throw new ArchiveWriteException(ArchiveWriteFailure.unavailable);
+                addArchiveScope(scopes, count, row["_id"].get!string);
+            }
+            if (!cursorId) break;
+            if (rows == 65 || cursor[field].length == 0)
+                throw new ArchiveWriteException(ArchiveWriteFailure.unavailable);
+            command = Bson.emptyObject; command["getMore"] = Bson(cursorId);
+            command["collection"] = Bson("messages");
+            command["batchSize"] = Bson(cast(int)(65 - rows));
+            command["maxTimeMS"] = Bson(5000);
+            first = false;
+        }
+    }
+
+    private static string[] synchronizeArchiveScopes(string networkId, string[] additions,
+            bool includeLegacy, string expectedOwner = "") @trusted {
+        import ircfiber.archive_protocol : isCanonicalArchiveOperationId;
+        if (!isCanonicalArchiveOperationId(networkId) || additions.length > 66)
+            throw new ArchiveWriteException(ArchiveWriteFailure.invalidInput);
+        if (expectedOwner.length && !isCanonicalArchiveOperationId(expectedOwner))
+            throw new ArchiveWriteException(ArchiveWriteFailure.invalidInput);
+        foreach (server; additions) if (!server.length || server.length > 128)
+            throw new ArchiveWriteException(ArchiveWriteFailure.invalidInput);
+        // Exact-array CAS prevents concurrent registrations overflowing 64.
+        // Contention is a retry, never a weakened write concern or subset read.
+        foreach (_; 0 .. 4) {
+            auto doc = archiveNetworkCatalog(networkId);
+            if (doc.isNull) return null;
+            if (expectedOwner.length && (doc["userId"].type != Bson.Type.string
+                    || doc["userId"].get!string != expectedOwner))
+                throw new ArchiveWriteException(ArchiveWriteFailure.identityMismatch);
+            bool initialized;
+            foreach (key, value; doc.byKeyValue) if (key == "archiveScopeVersion") {
+                if (!archiveIntegerEquals(value, 1))
+                    throw new ArchiveWriteException(ArchiveWriteFailure.invalidReply);
+                initialized = true;
+            }
+            string[64] scopes;
+            size_t count, originalCount;
+            if (initialized) {
+                if (doc["archiveServers"].type != Bson.Type.array || doc["archiveServers"].length > scopes.length)
+                    throw new ArchiveWriteException(ArchiveWriteFailure.invalidReply);
+                foreach (scopeId; doc["archiveServers"].byValue) {
+                    if (scopeId.type != Bson.Type.string)
+                        throw new ArchiveWriteException(ArchiveWriteFailure.invalidReply);
+                    addArchiveScope(scopes, count, scopeId.get!string);
+                }
+                if (count != doc["archiveServers"].length)
+                    throw new ArchiveWriteException(ArchiveWriteFailure.invalidReply);
+                originalCount = count;
+            } else {
+                foreach (key, value; doc.byKeyValue) if (key == "archiveServers")
+                    throw new ArchiveWriteException(ArchiveWriteFailure.invalidReply);
+            }
+            // The first registered engine remains the immutable response
+            // coordinator even after Redis projection loss and later moves.
+            foreach (server; additions) addArchiveScope(scopes, count, server);
+            if (includeLegacy || !initialized) legacyArchiveScopes(networkId, scopes, count);
+            if (initialized && count == originalCount) return scopes[0 .. count].dup;
+            auto query = Bson(["id": Bson(networkId)]);
+            if (expectedOwner.length) query["userId"] = Bson(expectedOwner);
+            if (initialized) {
+                query["archiveScopeVersion"] = Bson(1);
+                query["archiveServers"] = doc["archiveServers"];
+            } else {
+                query["archiveScopeVersion"] = Bson(["$exists": Bson(false)]);
+                query["archiveServers"] = Bson(["$exists": Bson(false)]);
+            }
+            Bson[64] encodedScopes;
+            foreach (i; 0 .. count) encodedScopes[i] = Bson(scopes[i]);
+            auto command = Bson.emptyObject; command["update"] = Bson("networks");
+            command["updates"] = Bson([Bson(["q": query, "u": Bson(["$set": Bson([
+                "archiveScopeVersion": Bson(1), "archiveServers": Bson(encodedScopes[0 .. count])])]),
+                "multi": Bson(false), "upsert": Bson(false)])]);
+            command["ordered"] = Bson(true); command["writeConcern"] = archiveWriteConcern();
+            auto reply = runArchiveCommand(command);
+            checkArchiveReply(reply); checkArchiveWriteErrors(reply);
+            const matched = archiveReplyCount(reply, "n");
+            if (matched == 1) return scopes[0 .. count].dup;
+            if (matched != 0) throw new ArchiveWriteException(ArchiveWriteFailure.invalidReply);
+        }
+        throw new ArchiveWriteException(ArchiveWriteFailure.unavailable);
+    }
+
+    private static Bson archiveCutoffFilter(string serverId, string networkId,
+            string channel, long cutoffEid, long legacyTimestampCutoffMs) @trusted {
+        channel = normalizeChannel(channel);
+        if (!serverId.length || !networkId.length || !channel.length
+                || cutoffEid <= 0 || legacyTimestampCutoffMs <= 0)
+            throw new ArchiveWriteException(ArchiveWriteFailure.invalidInput);
+        return Bson([
+            "serverId": Bson(serverId), "networkId": Bson(networkId), "channel": Bson(channel),
+            "$or": Bson([
+                Bson(["eid": Bson(["$gt": Bson(0L), "$lte": Bson(cutoffEid)])]),
+                Bson(["eid": Bson(["$exists": Bson(false)]),
+                    "t": Bson(["$lte": Bson(legacyTimestampCutoffMs)])])
+            ])
+        ]);
+    }
+
+    private static Bson archiveWriteConcern() @trusted {
+        return Bson(["w": Bson("majority"), "j": Bson(true), "wtimeout": Bson(5000)]);
+    }
+
+    private static Bson runArchiveCommand(Bson command) @trusted {
+        if (!AppMongoConnection.isConnected())
+            throw new ArchiveWriteException(ArchiveWriteFailure.unavailable);
+        try {
+            return AppMongoConnection.getDb().runCommandUnchecked(command);
+        } catch (Exception) {
+            // Driver exceptions can embed a command/document or connection URI.
+            throw new ArchiveWriteException(ArchiveWriteFailure.unavailable);
+        }
+    }
+
+    private static bool archiveInteger(const Bson value, out long number) @trusted {
+        switch (value.type) {
+            case Bson.Type.int_: number = value.get!int; return true;
+            case Bson.Type.long_: number = value.get!long; return true;
+            case Bson.Type.double_:
+                const n = value.get!double;
+                // Only exactly representable integers are accepted from doubles.
+                if (!(n >= -9_007_199_254_740_991.0 && n <= 9_007_199_254_740_991.0))
+                    return false;
+                number = cast(long)n;
+                return n == cast(double)number;
+            default: return false;
+        }
+    }
+
+    private static bool archiveIntegerEquals(const Bson value, long expected) @trusted {
+        long actual;
+        return archiveInteger(value, actual) && actual == expected;
+    }
+
+    private static long archiveErrorCode(const Bson error) @trusted {
+        long code;
+        if (error.type == Bson.Type.object) archiveInteger(error["code"], code);
+        return code;
+    }
+
+    private static long archiveReplyCount(const Bson reply, string field) @trusted {
+        long count;
+        if (!archiveInteger(reply[field], count) || count < 0)
+            throw new ArchiveWriteException(ArchiveWriteFailure.invalidReply);
+        return count;
+    }
+
+    private static void checkArchiveReply(const Bson reply) @trusted {
+        if (reply.type != Bson.Type.object)
+            throw new ArchiveWriteException(ArchiveWriteFailure.invalidReply);
+        // Check presence, not truthiness: even a malformed/null concern error
+        // must not turn an uncertain write into a checkpoint acknowledgment.
+        foreach (key, value; reply.byKeyValue)
+            if (key == "writeConcernError")
+                throw new ArchiveWriteException(ArchiveWriteFailure.rejected,
+                    archiveErrorCode(value));
+        if (!archiveIntegerEquals(reply["ok"], 1))
+            throw new ArchiveWriteException(ArchiveWriteFailure.rejected, archiveErrorCode(reply));
+    }
+
+    private static void checkArchiveWriteErrors(const Bson reply) @trusted {
+        foreach (key, value; reply.byKeyValue) {
+            if (key != "writeErrors") continue;
+            if (value.type != Bson.Type.array)
+                throw new ArchiveWriteException(ArchiveWriteFailure.invalidReply);
+            foreach (error; value.byValue)
+                throw new ArchiveWriteException(ArchiveWriteFailure.rejected, archiveErrorCode(error));
+        }
+    }
+
+    private static void verifyArchivedDuplicate(const Bson expected) @trusted {
+        auto command = Bson.emptyObject;
+        command["find"] = Bson("messages");
+        command["filter"] = Bson(["_id": expected["_id"]]);
+        command["limit"] = Bson(1L);
+        command["singleBatch"] = Bson(true);
+        command["maxTimeMS"] = Bson(5000);
+        // A local read could mistake an earlier uncertain/uncommitted insert
+        // for durable archival success after a duplicate-key response.
+        command["readConcern"] = Bson(["level": Bson("majority")]);
+        const reply = runArchiveCommand(command);
+        checkArchiveReply(reply);
+        checkArchiveWriteErrors(reply);
+        const cursor = reply["cursor"];
+        if (cursor.type != Bson.Type.object || cursor["firstBatch"].type != Bson.Type.array)
+            throw new ArchiveWriteException(ArchiveWriteFailure.invalidReply);
+        const batch = cursor["firstBatch"];
+        if (batch.length == 0)
+            throw new ArchiveWriteException(ArchiveWriteFailure.unavailable);
+        if (batch.length != 1 || batch[0].type != Bson.Type.object)
+            throw new ArchiveWriteException(ArchiveWriteFailure.invalidReply);
+        const stored = batch[0];
+        foreach (field; ["_id", "serverId", "networkId", "payload"]) {
+            if (stored[field].type != Bson.Type.string
+                    || stored[field].get!string != expected[field].get!string)
+                throw new ArchiveWriteException(ArchiveWriteFailure.identityMismatch);
+        }
+        foreach (field; ["eid", "t"])
+            if (!archiveIntegerEquals(stored[field], expected[field].get!long))
+                throw new ArchiveWriteException(ArchiveWriteFailure.identityMismatch);
     }
 
     /// Rename a buffer's channel field after a NICK-follow, so Mongo

@@ -48,7 +48,7 @@ RedisStorage isolatedTestRedis(string testName) {
     return redis;
 }
 
-bool connectIsolatedTestMongo(string testName) {
+bool connectIsolatedTestMongo(string testName, string databaseName = "ircfiber_common_test") {
     enum variable = "IRCFIBER_HISTORY_TEST_MONGO_URL";
     const uri = environment.get(variable, "");
     if (!uri.length) {
@@ -58,7 +58,7 @@ bool connectIsolatedTestMongo(string testName) {
     fixtureEndpoint(uri, "mongodb");
     // Never inherit the production/default database or an earlier global
     // connection. These module regressions own only their test database.
-    AppMongoConnection.connect(uri, "ircfiber_common_test");
+    AppMongoConnection.connect(uri, databaseName);
     AppMongoConnection.getDb()["uploads"].countDocuments(Bson.emptyObject);
     return true;
 }

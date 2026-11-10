@@ -13,7 +13,7 @@ import std.array : array, replace;
 import std.string : indexOf, strip, toLower, toUpper;
 
 /// Account `language` values besides `""` (automatic).
-immutable string[] SUPPORTED_LANGUAGES = ["en", "es", "pt-BR", "fr", "de", "it", "ru", "tr"];
+immutable string[] SUPPORTED_LANGUAGES = ["en", "es", "pt-BR", "fr", "de", "it", "ru", "tr", "id"];
 
 /// Exact, case-sensitive membership in `SUPPORTED_LANGUAGES`.
 bool isSupportedLanguage(string code) @safe pure nothrow {
@@ -85,6 +85,8 @@ string languageForCountry(string iso2) @safe pure {
         return "ru";
     case "TR":
         return "tr";
+    case "ID":
+        return "id";
     default:
         return "";
     }
@@ -303,6 +305,28 @@ shared static this() {
         "notify.email.footer": "Bu e-postayı, Ayarlar → Bildirimler bölümünde bildirim e-postası açık olduğu için alıyorsunuz.",
         "notify.email.unsubscribe": "Bu e-postaları kapat",
     ];
+    t["id"] = [
+        "email.greeting": "Halo {username},",
+        "email.verify.subject": "Konfirmasi akun IRC Fiber Anda",
+        "email.verify.intro": "Konfirmasikan alamat email Anda untuk menyelesaikan pembuatan akun IRC Fiber Anda:",
+        "email.verify.expiry": "Tautan ini kedaluwarsa dalam 24 jam. Jika Anda tidak mendaftar, abaikan email ini: akun tidak akan dibuat hingga tautan digunakan.",
+        "email.reset.subject": "Atur ulang kata sandi IRC Fiber Anda",
+        "email.reset.intro": "Ikuti tautan di bawah ini untuk menetapkan kata sandi IRC Fiber yang baru:",
+        "email.reset.expiry": "Tautan ini kedaluwarsa dalam 1 jam. Jika Anda tidak meminta pengaturan ulang, abaikan email ini: kata sandi Anda tidak berubah.",
+        "push.invite.body": "{nick} mengundang Anda ke {channel}",
+        "notify.preview.hidden": "Pesan baru",
+        "notify.summary.title": "Selama Anda pergi",
+        "notify.summary.body": "{dms} pesan pribadi, {mentions} sebutan di {channels} kanal",
+        "notify.coalesce.body": "{nick} dan {n} orang lainnya di {buffer}",
+        "notify.test.title": "Notifikasi uji IRC Fiber",
+        "notify.test.body": "Notifikasi berfungsi di perangkat ini.",
+        "notify.email.subject.one": "Pesan baru dari {nick}",
+        "notify.email.subject.many": "{n} pesan belum dibaca di IRC Fiber",
+        "notify.email.intro": "Anda memiliki pesan yang belum dibaca di IRC Fiber:",
+        "notify.email.cta": "Buka IRC Fiber",
+        "notify.email.footer": "Anda menerima email ini karena email notifikasi diaktifkan di Pengaturan → Notifikasi.",
+        "notify.email.unsubscribe": "Nonaktifkan email ini",
+    ];
     TEXT = cast(immutable) t;
 }
 
@@ -314,20 +338,32 @@ unittest {
     assert(matchLanguageTag("pt-br") == "pt-BR");
     assert(matchLanguageTag("en_GB") == "en");
     assert(matchLanguageTag("de-AT") == "de");
+    assert(matchLanguageTag("id") == "id");
+    assert(matchLanguageTag("ID") == "id");
+    assert(matchLanguageTag("id-ID") == "id");
+    assert(matchLanguageTag("id_ID") == "id");
     assert(matchLanguageTag("ja") == "");
     assert(languageForCountry("br") == "pt-BR");
+    assert(languageForCountry("ID") == "id");
 
     assert(negotiateSignupLanguage("fr-CA,en", "de", "BR") == "fr");
     assert(negotiateSignupLanguage("ja", "ja, de;q=0.8", "BR") == "de");
     assert(negotiateSignupLanguage("", "ja", "BR") == "pt-BR");
     assert(negotiateSignupLanguage("", "", "JP") == "en");
     assert(negotiateSignupLanguage("pt-PT", "", "") == "pt-BR");
+    assert(negotiateSignupLanguage("ja,id-ID", "en", "BR") == "id");
+    assert(negotiateSignupLanguage("en,id-ID", "id", "ID") == "en");
+    assert(negotiateSignupLanguage("ja", "en;q=0.5,id_ID;q=0.9", "BR") == "id");
+    assert(negotiateSignupLanguage("", "en;q=0.9,id;q=0.5", "ID") == "en");
+    assert(negotiateSignupLanguage("", "ja", "ID") == "id");
 
     assert(isSupportedLanguage("pt-BR") && !isSupportedLanguage("pt-br") && !isSupportedLanguage(""));
+    assert(isSupportedLanguage("id") && !isSupportedLanguage("id-ID") && !isSupportedLanguage("ID"));
 }
 
 unittest {
     assert(serverText("de", "push.invite.body", ["nick": "al", "channel": "#x"]) == "al hat dich in #x eingeladen");
+    assert(serverText("id", "push.invite.body", ["nick": "al", "channel": "#x"]) == "al mengundang Anda ke #x");
     assert(serverText("", "push.invite.body", ["nick": "al", "channel": "#x"]) == "al invited you to #x");
     assert(serverText("xx", "email.verify.subject") == "Confirm your IRC Fiber account");
 }

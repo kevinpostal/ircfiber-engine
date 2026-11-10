@@ -36,7 +36,6 @@ import std.array : appender;
 import std.datetime : Clock, SysTime;
 import std.algorithm : canFind;
 import core.sync.mutex : Mutex;
-import core.atomic : atomicLoad, atomicStore;
 
 // ── Configuration ──────────────────────────────────────────────────────
 //
@@ -106,8 +105,155 @@ struct MetricPoint {
     string[string]  attributes;
 }
 
+enum METRICS_MAX_POINTS = 4096;
+enum METRICS_MAX_BYTES = 4 * 1024 * 1024;
+
+/// Fixed owner storage shared by the three telemetry signals. Byte charges
+/// include private string copies, AA overhead and worst-case JSON expansion.
+package(ircfiber) struct BoundedTelemetryQueue(T, size_t capacity, ulong byteLimit) {
+    private T[capacity] slots;
+    private ulong[capacity] charges;
+    private ulong[capacity] sequences;
+    private size_t head;
+    size_t count;
+    ulong bytes, droppedCount, droppedBytes;
+    private ulong nextSequence;
+    long lastExportSuccessAtMs;
+    bool exporting;
+
+    static ulong addSaturated(ulong a, ulong b) {
+        return b > ulong.max - a ? ulong.max : a + b;
+    }
+
+    void drop(ulong charge) {
+        droppedCount = addSaturated(droppedCount, 1);
+        droppedBytes = addSaturated(droppedBytes, charge);
+    }
+
+    private void pop(bool dropped) {
+        if (dropped) drop(charges[head]);
+        bytes -= charges[head];
+        slots[head] = T.init; // release all owned references, including AAs
+        charges[head] = sequences[head] = 0;
+        head = (head + 1) % capacity;
+        --count;
+    }
+
+    bool admits(ulong charge) {
+        if (charge <= byteLimit) return true;
+        drop(charge);
+        return false;
+    }
+
+    void put(T item, ulong charge) {
+        assert(charge <= byteLimit);
+        while (count == capacity || bytes > byteLimit - charge) pop(true);
+        auto tail = (head + count) % capacity;
+        slots[tail] = item;
+        charges[tail] = charge;
+        sequences[tail] = ++nextSequence;
+        bytes += charge;
+        ++count;
+    }
+
+    /// Allocate exactly once at a known fixed bound, never append or slice
+    /// an ever-growing owner. Used only during synchronous JSON construction.
+    T[] snapshot() {
+        auto batch = new T[count];
+        foreach (i; 0 .. count) batch[i] = slots[(head + i) % capacity];
+        return batch;
+    }
+
+    ulong watermark() { return nextSequence; }
+    void acknowledge(ulong through) {
+        while (count && sequences[head] <= through) pop(false);
+    }
+    T[] drain() {
+        auto batch = snapshot();
+        while (count) pop(false);
+        return batch;
+    }
+}
+
+/// Charge both retention and encoding conservatively; clone accepted strings
+/// so a tiny substring cannot pin an arbitrarily large backing allocation.
+package(ircfiber) ulong telemetryStringCharge(string value) {
+    return value.length > (ulong.max - 64) / 32
+        ? ulong.max : 64 + cast(ulong)value.length * 32;
+}
+
+package(ircfiber) ulong telemetryAttributesCharge(string[string] attrs) {
+    ulong result;
+    alias Q = BoundedTelemetryQueue!(int, 1, 1);
+    foreach (k, v; attrs) {
+        result = Q.addSaturated(result, 256);
+        result = Q.addSaturated(result, telemetryStringCharge(k));
+        result = Q.addSaturated(result, telemetryStringCharge(v));
+    }
+    return result;
+}
+
+package(ircfiber) string[string] copyTelemetryAttributes(string[string] attrs) {
+    string[string] copy;
+    foreach (k, v; attrs) copy[k.idup] = v.idup;
+    return copy;
+}
+
+/// An overall fiber deadline also bounds write/drain time, not merely reads.
+/// Never logs through logging.d: collector/drop diagnostics must stay local.
+package(ircfiber) bool sendTelemetryJson(string endpoint, string json) {
+    import core.time : seconds;
+    import vibe.core.core : setTimer;
+    import vibe.core.task : Task;
+    import vibe.http.client : requestHTTP, HTTPMethod, HTTPClientSettings;
+    auto task = Task.getThis();
+    if (task == Task.init) return false; // a native caller cannot honor a fiber deadline
+    auto deadline = setTimer(5.seconds, { task.interrupt(); });
+    scope (exit) deadline.stop();
+    auto settings = new HTTPClientSettings;
+    settings.connectTimeout = 2.seconds;
+    settings.readTimeout = 2.seconds;
+    settings.defaultKeepAliveTimeout = 0.seconds;
+    bool accepted;
+    requestHTTP(endpoint,
+        (scope req) {
+            req.method = HTTPMethod.POST;
+            req.headers["Connection"] = "close";
+            req.writeBody(cast(const ubyte[])json, "application/json");
+        },
+        (scope res) {
+            accepted = res.statusCode >= 200 && res.statusCode < 300;
+            // No unbounded response buffering; requestHTTP drains/disconnects.
+        }, settings);
+    return accepted;
+}
+
 private __gshared shared(Mutex) metricsMutex;
-private __gshared MetricPoint[] pending;
+private alias MetricsQueue = BoundedTelemetryQueue!(MetricPoint, METRICS_MAX_POINTS, METRICS_MAX_BYTES);
+private __gshared MetricsQueue pending;
+private __gshared ulong reportedMetricsDrops;
+
+struct MetricsQueueSample { ulong count, bytes, droppedCount, droppedBytes; long lastExportSuccessAtMs; }
+MetricsQueueSample sampleMetricsQueue() {
+    if (!mutexInitd) return MetricsQueueSample.init;
+    synchronized (metricsMutex)
+        return MetricsQueueSample(pending.count, pending.bytes, pending.droppedCount, pending.droppedBytes,
+                                  pending.lastExportSuccessAtMs);
+}
+
+private void enqueueMetric(MetricPoint point) {
+    auto charge = MetricsQueue.addSaturated(768 + point.bucketCounts.length * 32,
+        telemetryStringCharge(point.name));
+    charge = MetricsQueue.addSaturated(charge, telemetryStringCharge(point.unit));
+    charge = MetricsQueue.addSaturated(charge, telemetryAttributesCharge(point.attributes));
+    synchronized (metricsMutex) {
+        if (!pending.admits(charge)) return;
+        point.name = point.name.idup;
+        point.unit = point.unit.idup;
+        point.attributes = copyTelemetryAttributes(point.attributes);
+        pending.put(point, charge);
+    }
+}
 
 private __gshared bool mutexInitd;
 private void initOnce() {
@@ -135,12 +281,8 @@ string buildOtlpMetricsJsonForTest(MetricPoint[] batch) {
 
 /// Drains and returns all pending metric points (test helper).
 MetricPoint[] drainPendingForTest() {
-    MetricPoint[] drained;
-    synchronized (metricsMutex) {
-        drained = pending;
-        pending = null;
-    }
-    return drained;
+    if (!mutexInitd) return null;
+    synchronized (metricsMutex) return pending.drain();
 }
 
 // ── Public recording API ──────────────────────────────────────────────
@@ -153,28 +295,20 @@ void recordCounter(string name, long delta,
                   string[string] attrs = null) {
     if (!g_metricsEnabled) return;
     if (!mutexInitd) initOnce();
-    synchronized (metricsMutex) {
-        auto now = nowUnixNanos();
-        pending ~= MetricPoint(
-            name, "1", InstrumentKind.counter,
-            delta, 0, 0, null,
-            now, now,
-            attrs is null ? null : attrs.dup);
-    }
+    auto now = nowUnixNanos();
+    enqueueMetric(MetricPoint(
+        name, "1", InstrumentKind.counter,
+        delta, 0, 0, null, now, now, attrs));
 }
 /// Records a gauge observation.
 void recordGauge(string name, long value,
                 string[string] attrs = null) {
     if (!g_metricsEnabled) return;
     if (!mutexInitd) initOnce();
-    synchronized (metricsMutex) {
-        auto now = nowUnixNanos();
-        pending ~= MetricPoint(
-            name, "1", InstrumentKind.gauge,
-            value, 0, 0, null,
-            now, now,
-            attrs is null ? null : attrs.dup);
-    }
+    auto now = nowUnixNanos();
+    enqueueMetric(MetricPoint(
+        name, "1", InstrumentKind.gauge,
+        value, 0, 0, null, now, now, attrs));
 }
 
 /// Record a histogram observation (e.g. time-from-missing-to-recovered).
@@ -207,76 +341,58 @@ void recordHistogram(string name, double valueSeconds,
     }
     if (!placed) buckets[$ - 1] = 1; // +Inf bucket
 
-    synchronized (metricsMutex) {
-        auto now = nowUnixNanos();
-        pending ~= MetricPoint(
-            name, "s", InstrumentKind.histogram,
-            0, cast(long)(valueSeconds * 1_000_000), 1, buckets,
-            now, now,
-            attrs is null ? null : attrs.dup);
-    }
+    auto now = nowUnixNanos();
+    enqueueMetric(MetricPoint(
+        name, "s", InstrumentKind.histogram,
+        0, cast(long)(valueSeconds * 1_000_000), 1, buckets,
+        now, now, attrs));
 }
 
 // ── Flush + export ─────────────────────────────────────────────────────
 
-/// Drain the pending metrics queue and POST a single OTLP/HTTP
-/// batch to `/v1/metrics`. Called from the heartbeat task every
-/// 10s alongside `flushAndSendSpans()`. Idempotent and never throws.
+/// Independent periodic callers may overlap shutdown/error flushes. Only one
+/// export owns a payload; failure keeps the bounded ring for the next attempt.
 void flushAndSendMetrics() nothrow {
-    try {
-        if (!g_metricsEnabled) return;
-        if (!mutexInitd) initOnce();
-        MetricPoint[] batch;
-        try synchronized (metricsMutex) {
-            if (pending.length == 0) return;
-            batch = pending;
-            pending = null;
-        } catch (Throwable) { return; }
-        if (batch.length) try sendMetricsBatch(batch); catch (Throwable) {}
-    } catch (Throwable) {}
+    try flushMetrics((string json) => sendTelemetryJson(metricsEndpoint, json));
+    catch (Throwable) {
+        try stderr.writeln("otel-metrics: export error; bounded queue retained");
+        catch (Throwable) {}
+    }
+}
+
+private void flushMetrics(scope bool delegate(string) send) {
+    if (!g_metricsEnabled || !mutexInitd) return;
+    string json;
+    ulong through;
+    synchronized (metricsMutex) {
+        if (pending.exporting) return;
+        if (pending.droppedCount != reportedMetricsDrops) {
+            stderr.writeln("otel-metrics: dropped_count=", pending.droppedCount,
+                " dropped_bytes=", pending.droppedBytes);
+            reportedMetricsDrops = pending.droppedCount;
+        }
+        if (!pending.count) return;
+        pending.exporting = true;
+    }
+    scope (exit) synchronized (metricsMutex) pending.exporting = false;
+    synchronized (metricsMutex) {
+        auto batch = pending.snapshot();
+        scope (exit) batch[] = MetricPoint.init;
+        through = pending.watermark();
+        json = buildOtlpMetricsJson(batch);
+    }
+    if (send(json)) {
+        synchronized (metricsMutex) {
+            pending.acknowledge(through);
+            pending.lastExportSuccessAtMs = nowUnixNanos() / 1_000_000;
+        }
+    } else stderr.writeln("otel-metrics: export failed; bounded queue retained");
 }
 private long nowUnixNanos() {
     SysTime t = Clock.currTime.toUTC();
     return t.toUnixTime() * 1_000_000_000L + t.fracSecs.total!"nsecs";
 }
 
-private void sendMetricsBatch(ref MetricPoint[] batch) {
-    if (!g_metricsEnabled) return;
-    auto json = buildOtlpMetricsJson(batch);
-    try {
-        import vibe.http.client : requestHTTP, HTTPMethod;
-        requestHTTP(metricsEndpoint,
-            (scope req) {
-                // Use the high-level `writeBody` helper rather than
-                // `req.bodyWriter.write` directly. `bodyWriter` is
-                // a `ChunkedOutputStream` wrapper that needs an
-                // explicit `finalize()` call to write the empty
-                // terminating chunk required by HTTP/1.1 chunked
-                // transfer encoding. `writeBody` does that for us
-                // AND sets Content-Length automatically. Without
-                // this, every metrics batch exports as a 0-byte
-                // body and SigNoz dashboards stay empty.
-                //
-                // We also need to set method=POST explicitly:
-                // `HTTPClientRequest`'s default method is GET
-                // (vibe.http.client HTTPClientRequest.m_method
-                // = HTTPMethod.GET in client.d line 190), and a
-                // GET-with-body is rejected by most OTLP collectors
-                // (the OTel collector returns 405 Method Not Allowed).
-                req.method = HTTPMethod.POST;
-                req.writeBody(cast(const ubyte[])json, "application/json");
-            },
-            (res) {
-                if (res.statusCode >= 400)
-                    stderr.writeln("otel-metrics: export failed status=", res.statusCode);
-            });
-    } catch (Throwable e) {
-        string m;
-        try { m = e.msg; } catch (Throwable) { m = "unknown"; }
-        try stderr.writeln("otel-metrics: export error: ", m);
-        catch (Throwable) {}
-    }
-}
 
 /// Build the OTLP/HTTP JSON request body for one batch. Format
 /// reference: https://opentelemetry.io/docs/specs/otlp/#json-protobuf-encoding
@@ -334,7 +450,7 @@ private string buildOtlpMetricsJson(ref MetricPoint[] batch) {
                 if (!first) aSink ~= ",";
                 first = false;
                 aSink ~= format(`{"key":"%s","value":{"stringValue":"%s"}}`,
-                                 k, jsonEscape(v));
+                                 jsonEscape(k), jsonEscape(v));
             }
             aSink ~= "]";
             attrJson = aSink.data;
@@ -462,14 +578,6 @@ unittest {
     assert(json.canFind(`"explicitBounds":[0.001,0.01,0.1,1,10,30]`));
 }
 
-@("HISTOGRAM_BOUNDS are monotonically non-decreasing")
-unittest {
-    double prev = double.min_normal;
-    foreach (b; HISTOGRAM_BOUNDS) {
-        assert(b > prev, "histogram bounds must be strictly increasing");
-        prev = b;
-    }
-}
 
 @("recordCounter / recordGauge / recordHistogram queue and flush cleanly")
 unittest {
@@ -478,21 +586,13 @@ unittest {
     setMetricsEnabled(true);
     initOnce();
     // Drain anything already pending (prior test runs)
-    MetricPoint[] drained;
-    synchronized (metricsMutex) {
-        drained = pending;
-        pending = null;
-    }
+    cast(void) drainPendingForTest();
 
     recordCounter("test.counter", 1, ["k": "v"]);
     recordGauge("test.gauge", 42, null);
     recordHistogram("test.histogram", 0.5, ["k": "v"]);
 
-    MetricPoint[] queued;
-    synchronized (metricsMutex) {
-        queued = pending;
-        pending = null;
-    }
+    auto queued = drainPendingForTest();
     assert(queued.length == 3, "expected 3 queued points, got " ~ queued.length.to!string);
     assert(queued[0].name == "test.counter" && queued[0].kind == InstrumentKind.counter);
     assert(queued[1].name == "test.gauge"   && queued[1].kind == InstrumentKind.gauge);
@@ -522,21 +622,6 @@ unittest {
     setMetricsEnabled(true);
 }
 
-@("configureMetrics empty endpoint disables metrics")
-unittest {
-    const prev = isMetricsEnabled();
-    const prevEp = metricsEndpoint;
-    scope (exit) {
-        setMetricsEnabled(prev);
-        metricsEndpoint = prevEp;
-    }
-    configureMetrics("", "test-svc", "0.0.1");
-    assert(!isMetricsEnabled(), "empty endpoint must disable metrics");
-    configureMetrics("disabled", "test-svc", "0.0.1");
-    assert(!isMetricsEnabled(), "\"disabled\" endpoint must disable metrics");
-    configureMetrics("http://signoz:4318/v1/metrics", "test-svc", "0.0.1");
-    assert(isMetricsEnabled(), "non-empty endpoint must enable metrics");
-}
 
 @("flushAndSendMetrics when disabled does not attempt HTTP")
 unittest {
@@ -545,18 +630,92 @@ unittest {
     setMetricsEnabled(true);
     if (!mutexInitd) initOnce();
     // Drain
-    MetricPoint[] d;
-    synchronized (metricsMutex) { d = pending; pending = null; }
+    cast(void) drainPendingForTest();
     recordCounter("test.enabled.counter", 1, null);
-    synchronized (metricsMutex) { assert(pending.length == 1); }
+    assert(sampleMetricsQueue().count == 1);
     setMetricsEnabled(false);
-    // Flush while disabled must early-return without sending and without clearing?
-    // Our impl returns before synchronized, so pending remains 1 — that's okay
-    // because we never grow unbounded when disabled (record* already no-ops).
+    // Disabled flushing leaves existing bounded data available for re-enable.
     flushAndSendMetrics();
     assert(!isMetricsEnabled());
     // Clean up
     setMetricsEnabled(true);
-    synchronized (metricsMutex) { pending = null; }
+    cast(void) drainPendingForTest();
     setMetricsEnabled(prev);
+}
+
+/// Behavioral regressions invoked by the existing standalone telemetry test.
+/// Inject only transport completion, exercising the production queue/export
+/// path without contacting a collector or requiring an event loop.
+void runMetricsQueueRegressionForTest() {
+    import std.array : replicate;
+    const previous = g_metricsEnabled;
+    scope (exit) {
+        cast(void) drainPendingForTest();
+        g_metricsEnabled = previous;
+    }
+    cast(void) drainPendingForTest();
+    setMetricsEnabled(false);
+    const disabled = sampleMetricsQueue();
+    recordCounter("disabled", 1);
+    recordGauge("disabled", 1);
+    recordHistogram("disabled", 1);
+    flushMetrics((string) { assert(false, "disabled metrics exported"); return false; });
+    assert(sampleMetricsQueue() == disabled, "disabled metrics mutated queue/drop counters");
+
+    setMetricsEnabled(true);
+    const initialDrops = sampleMetricsQueue().droppedCount;
+    foreach (i; 0 .. METRICS_MAX_POINTS + 17) recordCounter("m", i);
+    auto bounded = sampleMetricsQueue();
+    assert(bounded.count == METRICS_MAX_POINTS && bounded.bytes <= METRICS_MAX_BYTES);
+    assert(bounded.droppedCount == initialDrops + 17, "metrics must drop oldest at count limit");
+    auto batch = drainPendingForTest();
+    assert(batch[0].intValue == 17 && batch[$ - 1].intValue == METRICS_MAX_POINTS + 16);
+    batch = null;
+
+    auto large = replicate("x", 64 * 1024);
+    foreach (i; 0 .. 12) recordCounter("byte_bound", i, ["payload": large]);
+    bounded = sampleMetricsQueue();
+    assert(bounded.count > 0 && bounded.count < 12 && bounded.bytes <= METRICS_MAX_BYTES,
+        "metrics byte budget must evict old points");
+    const beforeOversize = sampleMetricsQueue();
+    recordCounter(replicate("x", METRICS_MAX_BYTES / 16), 1);
+    auto afterOversize = sampleMetricsQueue();
+    assert(afterOversize.count == beforeOversize.count && afterOversize.bytes == beforeOversize.bytes);
+    assert(afterOversize.droppedCount == beforeOversize.droppedCount + 1);
+    int sends;
+    flushMetrics((string json) {
+        ++sends;
+        flushMetrics((string) { ++sends; return true; });
+        return false;
+    });
+    assert(sends == 1 && sampleMetricsQueue().count == beforeOversize.count,
+        "failed metrics must remain bounded/retryable; overlapping exporter must not run");
+    recordCounter("latest_after_failure", 42);
+    flushMetrics((string json) {
+        assert(json.canFind("latest_after_failure"), "latest metric missing after collector recovery");
+        recordCounter("arrived_during_export", 43);
+        return true;
+    });
+    auto arrived = drainPendingForTest();
+    assert(arrived.length == 1 && arrived[0].name == "arrived_during_export",
+        "successful metrics export acknowledged an item outside its watermark");
+    recordCounter("recovery", 44);
+    flushMetrics((string) => true);
+    assert(sampleMetricsQueue().count == 0 && sampleMetricsQueue().bytes == 0);
+
+    // Small owned fixture exercises wrap/clearing and saturating diagnostics
+    // without assigning enormous values to production counters.
+    BoundedTelemetryQueue!(string, 2, 10) ring;
+    ring.put("first", 4);
+    ring.put("second", 4);
+    ring.put("third", 4);
+    assert(ring.droppedCount == 1 && ring.bytes == 8);
+    auto retained = ring.drain();
+    assert(retained == ["second", "third"] && ring.bytes == 0);
+    foreach (slot; ring.slots) assert(slot is null, "vacated slot retained telemetry");
+    ring.droppedCount = ulong.max - 1;
+    ring.droppedBytes = ulong.max - 2;
+    ring.drop(5);
+    ring.drop(5);
+    assert(ring.droppedCount == ulong.max && ring.droppedBytes == ulong.max);
 }

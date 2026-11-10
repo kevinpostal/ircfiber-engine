@@ -20,7 +20,8 @@ import ircfiber.async : safeFiberRun;
 import ircfiber.logging : logJsonMap;
 import ircfiber.irc.ipv6 : ipv6InRoutedPrefix;
 import holder.dial : DialFailed, DialOutcome, dialUpstream, unixMsNow;
-import holder.held : Held;
+import holder.held : Held, HeldMemoryCounters, HeldAdmissionException,
+    sampleHeldMemory, heldAdmissionAvailable, HeldQueueCounters, sampleHeldQueues, mergeHeldQueueProgress;
 import holder.protocol;
 
 // ── Addresses ───────────────────────────────────────────────────────────────
@@ -171,7 +172,7 @@ HolderConfig configFromEnv() {
     c.buildShort = environment.get(ENV_BUILD_SHORT, "dev");
     c.quitMsg = environment.get(ENV_QUIT_MSG, DEFAULT_QUIT_MSG);
     c.detachBufferBytes = cast(size_t) envLong(ENV_DETACH_BUFFER_BYTES, DETACH_BUFFER_BYTES);
-    c.detachMaxSecs = envLong(ENV_DETACH_MAX_SECS, DETACH_MAX_SECS);
+    c.detachMaxSecs = parseDetachMaxSecs(environment.get(ENV_DETACH_MAX_SECS, DETACH_MAX_SECS.to!string));
     c.closedRetainSecs = envLong(ENV_CLOSED_RETAIN_SECS, CLOSED_RETAIN_SECS);
     c.routedIpv6Prefix = environment.get("IRCFIBER_IPV6_PREFIX", "");
     return c;
@@ -215,15 +216,34 @@ private void writeLine(ref TCPConnection c, string line) {
 /// The holder daemon: listener + registry of `Held` connections.
 final class HolderServer {
     HolderConfig cfg;
-    private Held[string] helds;
+    private static final class Record {
+        string id;
+        ulong ordinal;
+        Held owner;
+        Entry tombstone;
+        bool visible = true;
+        Record previous, next, closedPrevious, closedNext;
+
+        Entry entry(bool includeMeta = true) {
+            return owner !is null ? owner.entry(includeMeta) : tombstone;
+        }
+    }
+    private Record[string] records;
+    private Record[ulong] ordinals;
+    private Record first, last, firstClosed, lastClosed;
+    private size_t tombstoneCount;
+    private long nextTombstoneExpiryMs = long.max;
     private ulong nextId;
     private immutable long startedAtMs;
+    immutable string instance;
     private TCPListener listener;
     private bool shuttingDown;
 
     this(HolderConfig cfg) {
         this.cfg = cfg;
         this.startedAtMs = unixMsNow();
+        import std.uuid : randomUUID;
+        this.instance = randomUUID().toString();
     }
 
     /// Binds the listen address and starts the closed-entry sweeper.
@@ -245,21 +265,25 @@ final class HolderServer {
         safeFiberRun("holder_sweeper", "", &sweepClosed);
     }
 
-    /// `STATUS` payload.
+    /// No snapshots or META trees are constructed to report ownership.
     Json statusJson() {
-        long open, attached, detached, closed, buffered;
-        foreach (h; helds) {
-            if (h.isOpen) {
-                open++;
-                if (h.attached) attached++; else detached++;
-                buffered += h.entry().bufferedBytes;
-            } else {
-                closed++;
-            }
+        pruneTombstones(unixMsNow());
+        long open, attached, detached, closed;
+        ulong buffered;
+        for (auto record = first; record !is null; record = record.next) {
+            if (!record.visible) continue;
+            auto h = record.owner;
+            if (h !is null && h.isOpen) {
+                ++open;
+                if (h.attached) ++attached; else ++detached;
+                buffered += h.bufferedBytes;
+            } else ++closed;
         }
         auto j = Json.emptyObject;
         j["proto"] = PROTO_VERSION;
         j["serverId"] = cfg.serverId;
+        j["instance"] = instance;
+        j["capabilities"] = capabilitiesJson();
         j["dialFamilies"] = Json([Json("any"), Json("ipv6")]);
         j["holder"] = cfg.buildShort;
         j["pid"] = cast(long) thisProcessID;
@@ -268,14 +292,185 @@ final class HolderServer {
         j["attached"] = attached;
         j["detached"] = detached;
         j["closed"] = closed;
-        j["bufferedBytes"] = buffered;
+        j["bufferedBytes"] = counterJson(buffered);
+        auto counters = sampleHeldMemory();
+        static foreach (i; 0 .. HeldMemoryCounters.tupleof.length)
+            j[__traits(identifier, HeldMemoryCounters.tupleof[i])] = counterJson(counters.tupleof[i]);
+        j["tombstones"] = cast(long) tombstoneCount;
+        j["retiringEntries"] = counterJson(counters.tombstones);
         return j;
+    }
+
+    /// Used by the independent runtime sampler; no metadata or identity text.
+    size_t tinyTombstones() const { return tombstoneCount; }
+
+    HeldQueueCounters[3] runtimeQueues() {
+        auto result = sampleHeldQueues();
+        for (auto record = first; record !is null; record = record.next)
+            if (record.owner !is null) mergeHeldQueueProgress(record.owner, result);
+        return result;
+    }
+
+    private Json capabilitiesJson() {
+        auto values = Json.emptyArray;
+        foreach (capability; HOLDER_CAPABILITIES) values ~= Json(capability);
+        return values;
+    }
+
+    private Record registerHeld(Held held) {
+        auto record = new Record;
+        record.id = held.id;
+        record.ordinal = held.ordinal;
+        record.owner = held;
+        appendRecord(record);
+        held.onRetireQuiescent = { retire(record); };
+        return record;
+    }
+
+    private void appendRecord(Record record) {
+        record.previous = last;
+        if (last !is null) last.next = record; else first = record;
+        last = record;
+        records[record.id] = record;
+        ordinals[record.ordinal] = record;
+    }
+
+    /// Called only after every reader/writer/timer relinquishes ownership.
+    /// Keep no tags, TLS certificates, request strings, META or payload backing.
+    private void retire(Record record) {
+        auto h = record.owner;
+        if (h is null || !h.getRetireQuiescent()) return;
+        auto e = h.entry(false);
+        auto tiny = Entry.init;
+        tiny.id = record.id;
+        tiny.instance = instance;
+        tiny.ordinal = record.ordinal;
+        tiny.state = "closed";
+        tiny.connectedAtMs = e.connectedAtMs;
+        tiny.closedAtMs = e.closedAtMs;
+        tiny.closeReason = boundedCloseReason(e.closeReason);
+        tiny.gapGeneration = e.gapGeneration;
+        tiny.gapAckGeneration = e.gapAckGeneration;
+        tiny.droppedBytes = e.droppedBytes;
+        tiny.droppedLines = e.droppedLines;
+        tiny.gapStartedAtMs = e.gapStartedAtMs;
+        tiny.deliveryAmbiguous = e.deliveryAmbiguous;
+        tiny.attachmentGeneration = e.attachmentGeneration;
+        tiny.attachmentWriterCompletions = e.attachmentWriterCompletions;
+        tiny.upstreamWriterDone = e.upstreamWriterDone;
+        tiny.tlsFinalized = e.tlsFinalized;
+        record.tombstone = tiny;
+        h.onRetireQuiescent = null;
+        record.owner = null;
+        if (!record.visible) { removeRecord(record); return; }
+        retainClosedRecord(record, unixMsNow());
+    }
+
+    private void retainClosedRecord(Record record, long nowMs) {
+        record.closedPrevious = lastClosed;
+        if (lastClosed !is null) lastClosed.closedNext = record; else firstClosed = record;
+        lastClosed = record;
+        ++tombstoneCount;
+        const expires = record.tombstone.closedAtMs + tombstoneRetentionMs();
+        if (expires < nextTombstoneExpiryMs) nextTombstoneExpiryMs = expires;
+        pruneTombstones(nowMs);
+    }
+
+    private void removeRecord(Record record) {
+        if (record.previous !is null) record.previous.next = record.next; else first = record.next;
+        if (record.next !is null) record.next.previous = record.previous; else last = record.previous;
+        if (record.owner is null) {
+            if (record.closedPrevious !is null) record.closedPrevious.closedNext = record.closedNext;
+            else if (firstClosed is record) firstClosed = record.closedNext;
+            if (record.closedNext !is null) record.closedNext.closedPrevious = record.closedPrevious;
+            else if (lastClosed is record) lastClosed = record.closedPrevious;
+            if (record.visible) --tombstoneCount;
+        }
+        records.remove(record.id);
+        ordinals.remove(record.ordinal);
+        record.previous = record.next = record.closedPrevious = record.closedNext = null;
+    }
+
+    private long tombstoneRetentionMs() const {
+        // Configuration may request less retention, never more than one hour.
+        const retain = cfg.closedRetainSecs < CLOSED_RETAIN_SECS ? cfg.closedRetainSecs : CLOSED_RETAIN_SECS;
+        return retain * 1000;
+    }
+
+    private void pruneTombstones(long nowMs) {
+        while (tombstoneCount > MAX_TOMBSTONES) removeRecord(firstClosed);
+        // Constant-time ordinary close/admission. Only scan bounded tombstones
+        // when the next known expiry is due, not on every completed session.
+        if (nowMs < nextTombstoneExpiryMs) return;
+        nextTombstoneExpiryMs = long.max;
+        auto record = firstClosed;
+        while (record !is null) {
+            auto next = record.closedNext;
+            const expires = record.tombstone.closedAtMs + tombstoneRetentionMs();
+            if (expires <= nowMs) removeRecord(record);
+            else if (expires < nextTombstoneExpiryMs) nextTombstoneExpiryMs = expires;
+            record = next;
+        }
+    }
+
+    private Json inventory(Json request) {
+        const after = jsonUnsigned(request, "after");
+        const hasThrough = request["through"].type != Json.Type.undefined;
+        const through = hasThrough ? jsonUnsigned(request, "through", true) : nextId;
+        auto requestedInstance = request["instance"];
+        if ((hasThrough || after) && (requestedInstance.type != Json.Type.string
+            || requestedInstance.get!string != instance))
+            throw new RequestError(ERR_BAD_REQUEST, "inventory instance mismatch");
+        if (!hasThrough && after) throw new RequestError(ERR_BAD_REQUEST, "through required after page one");
+        if (requestedInstance.type != Json.Type.undefined && (requestedInstance.type != Json.Type.string
+            || requestedInstance.get!string != instance))
+            throw new RequestError(ERR_BAD_REQUEST, "inventory instance mismatch");
+        if (after > through || through > nextId)
+            throw new RequestError(ERR_BAD_REQUEST, "invalid inventory cursor");
+
+        auto rows = Json.emptyArray;
+        size_t rowBytes, rowCount;
+        ulong cursor = after;
+        Record record;
+        if (auto previous = after in ordinals) record = (*previous).next;
+        else {
+            record = first;
+            while (record !is null && record.ordinal <= after) record = record.next;
+        }
+        bool more;
+        while (record !is null && record.ordinal <= through) {
+            if (record.visible) {
+                auto row = record.entry(false).inventoryJson();
+                const bytes = row.toString().length + (rowCount ? 1 : 0);
+                // The bounded instance, cursors, flags and OK/newline envelope
+                // occupy <512 bytes even with maximum-width integer cursors.
+                if (rowCount == MAX_INVENTORY_ROWS || rowBytes + bytes + 512 > MAX_INVENTORY_BYTES) {
+                    more = true;
+                    break;
+                }
+                rows ~= row;
+                rowBytes += bytes;
+                ++rowCount;
+            }
+            cursor = record.ordinal;
+            record = record.next;
+        }
+        if (!more) cursor = through;
+        auto page = Json.emptyObject;
+        page["instance"] = instance;
+        page["through"] = cast(long) through;
+        page["after"] = cast(long) after;
+        page["nextAfter"] = cast(long) cursor;
+        page["more"] = more;
+        page["connections"] = rows;
+        return page;
     }
 
     /// Holder SIGTERM: QUIT every open session (full reconnect event).
     void quitAll() {
         shuttingDown = true;
-        foreach (h; helds) h.sendQuit(cfg.quitMsg, CLOSE_HOLDER_SHUTDOWN);
+        for (auto record = first; record !is null; record = record.next)
+            if (record.owner !is null) record.owner.sendQuit(cfg.quitMsg, CLOSE_HOLDER_SHUTDOWN);
     }
 
     /// Stops listening and removes the unix socket file.
@@ -289,11 +484,11 @@ final class HolderServer {
 
     private void sweepClosed() {
         while (!shuttingDown) {
-            sleep(30.seconds);
-            const cutoff = unixMsNow() - cfg.closedRetainSecs * 1000;
-            string[] gone;
-            foreach (id, h; helds) if (!h.isOpen && h.closedAtMs > 0 && h.closedAtMs < cutoff) gone ~= id;
-            foreach (id; gone) helds.remove(id);
+            const now = unixMsNow();
+            pruneTombstones(now);
+            auto delayMs = nextTombstoneExpiryMs > now ? nextTombstoneExpiryMs - now : 1;
+            if (delayMs > 30_000) delayMs = 30_000;
+            sleep(delayMs.msecs);
         }
     }
 
@@ -336,13 +531,23 @@ final class HolderServer {
         return checkToken(presented, cfg.token, cfg.tokenRequired);
     }
 
-    private Held lookup(Json payload) {
+    private Record lookupRecord(Json payload, bool allowMissing = false) {
         auto id = payload.type == Json.Type.object && payload["id"].type == Json.Type.string
             ? payload["id"].get!string : "";
-        if (id.length == 0) throw new RequestError(ERR_BAD_REQUEST, "id required");
-        auto h = id in helds;
-        if (h is null) throw new RequestError(ERR_NOT_FOUND, "unknown connection " ~ id);
-        return *h;
+        if (id.length == 0 || id.length > 128) throw new RequestError(ERR_BAD_REQUEST, "bounded id required");
+        auto record = id in records;
+        if (record is null || !(*record).visible) {
+            if (allowMissing) return null;
+            throw new RequestError(ERR_NOT_FOUND, "unknown connection");
+        }
+        return *record;
+    }
+
+    private Held lookup(Json payload) {
+        auto record = lookupRecord(payload);
+        if (record.owner is null || !record.owner.isOpen)
+            throw new RequestError(ERR_CLOSED, "upstream closed");
+        return record.owner;
     }
 
     // ── HELLO → control session ─────────────────────────────────────────
@@ -360,15 +565,18 @@ final class HolderServer {
         ok["holder"] = cfg.buildShort;
         ok["pid"] = cast(long) thisProcessID;
         ok["uptimeMs"] = unixMsNow() - startedAtMs;
+        ok["instance"] = instance;
+        ok["capabilities"] = capabilitiesJson();
         writeLine(c, okLine(ok));
         logJsonMap("info", "holder", "Control session opened",
             ["engine": hello.engine, "event": "hello"]);
         while (true) {
             string verb;
             Json req;
+            string rawLine;
             try {
-                auto line = readRequestLine(c, MAX_META + 4096);
-                parseFirstLine(line, verb, req);
+                rawLine = readRequestLine(c, MAX_META + 4096);
+                parseFirstLine(rawLine, verb, req);
             } catch (RequestError e) {
                 writeLine(c, errLine(e.code, e.msg));
                 continue;
@@ -377,7 +585,10 @@ final class HolderServer {
             }
             string reply;
             try {
-                reply = okLine(controlRequest(verb, req));
+                if (verb != "META" && rawLine.length > MAX_LINE)
+                    throw new RequestError(ERR_TOO_LARGE, "request exceeds 1 MiB");
+                const metaBytes = verb == "META" ? rawMetaEncodedBytes(rawLine) : 0;
+                reply = okLine(controlRequest(verb, req, metaBytes));
             } catch (RequestError e) {
                 reply = errLine(e.code, e.msg);
             } catch (Exception e) {
@@ -388,44 +599,56 @@ final class HolderServer {
         logJsonMap("info", "holder", "Control session closed", ["engine": hello.engine, "event": "hello_closed"]);
     }
 
-    private Json controlRequest(string verb, Json req) {
+    private Json controlRequest(string verb, Json req, size_t metaBytes = 0) {
+        pruneTombstones(unixMsNow());
         switch (verb) {
             case "LIST": {
                 auto arr = Json.emptyArray;
-                foreach (h; helds) arr ~= h.entry().toJson();
+                for (auto record = first; record !is null; record = record.next)
+                    if (record.visible) arr ~= record.entry().toJson();
                 auto j = Json.emptyObject;
                 j["connections"] = arr;
                 return j;
             }
+            case "INVENTORY":
+                return inventory(req);
             case "STATUS":
                 return statusJson();
             case "INFO":
-                return lookup(req).entry().toJson();
+                return lookupRecord(req).entry().toJson();
             case "META": {
+                if (!metaBytes) throw new RequestError(ERR_BAD_REQUEST, "META wire size required");
                 auto h = lookup(req);
                 auto meta = req["meta"];
                 if (meta.type == Json.Type.undefined) throw new RequestError(ERR_BAD_REQUEST, "meta required");
-                if (meta.toString().length > MAX_META) throw new RequestError(ERR_TOO_LARGE, "meta exceeds 8 MiB");
-                h.meta = meta;
+                if (!h.replaceMeta(meta, metaBytes))
+                    throw new RequestError(ERR_TOO_LARGE, "META entry or aggregate byte budget exceeded");
                 return Json.emptyObject;
             }
+            case "GAP_ACK": {
+                auto h = lookup(req);
+                const generation = jsonUnsigned(req, "generation", true);
+                if (!h.acknowledgeGap(generation))
+                    throw new RequestError(ERR_BAD_REQUEST, "future gap generation");
+                return h.entry(false).inventoryJson();
+            }
             case "CLOSE": {
-                auto id = req.type == Json.Type.object && req["id"].type == Json.Type.string ? req["id"].get!string : "";
-                if (id.length == 0) throw new RequestError(ERR_BAD_REQUEST, "id required");
-                if (auto h = id in helds) {
+                auto record = lookupRecord(req, true);
+                if (record is null) return Json.emptyObject;
+                if (record.owner !is null && record.owner.isOpen) {
                     auto quit = req["quit"].type == Json.Type.string ? req["quit"].get!string : "";
-                    (*h).close(quit);
-                    helds.remove(id);
+                    if (quit.length > 512) throw new RequestError(ERR_BAD_REQUEST, "quit exceeds 512 bytes");
+                    record.owner.close(quit);
                 }
                 return Json.emptyObject;
             }
             case "FORGET": {
-                auto id = req.type == Json.Type.object && req["id"].type == Json.Type.string ? req["id"].get!string : "";
-                if (id.length == 0) throw new RequestError(ERR_BAD_REQUEST, "id required");
-                if (auto h = id in helds) {
-                    if ((*h).isOpen) throw new RequestError(ERR_BUSY, "connection is open; use CLOSE");
-                    helds.remove(id);
-                }
+                auto record = lookupRecord(req, true);
+                if (record is null) return Json.emptyObject;
+                if (record.owner !is null && record.owner.isOpen)
+                    throw new RequestError(ERR_BUSY, "connection is open; use CLOSE");
+                if (record.owner is null) removeRecord(record);
+                else record.visible = false; // owner remains until explicit completion
                 return Json.emptyObject;
             }
             default:
@@ -443,6 +666,10 @@ final class HolderServer {
             validateSourcePool(req, cfg.routedIpv6Prefix);
         }
         catch (Exception e) { writeLine(c, errLine(ERR_BAD_REQUEST, e.msg)); return; }
+        if (!heldAdmissionAvailable() || nextId == long.max) {
+            writeLine(c, "FAILED " ~ FailedLine("capacity", "holder admission capacity exhausted").toJson().toString());
+            return;
+        }
 
         auto fields = ["network": req.tag.name, "networkId": req.tag.networkId,
                        "host": req.host, "port": req.port.to!string, "tls": req.tls,
@@ -468,22 +695,39 @@ final class HolderServer {
             writeLine(c, "FAILED " ~ FailedLine("tcp", e.msg).toJson().toString());
             return;
         }
-        auto id = "c-" ~ (++nextId).to!string;
-        auto held = new Held(id, req, outcome, cfg.detachBufferBytes, cfg.detachMaxSecs);
-        helds[id] = held;
+        if (nextId == long.max) {
+            // Exhaustion is unreachable in practice, but never reuse an ID.
+            if (outcome.tls !is null) outcome.tls.finalize();
+            outcome.conn.close();
+            writeLine(c, errLine(ERR_CLOSED, "holder ordinal exhausted"));
+            return;
+        }
+        const ordinal = ++nextId;
+        auto id = "c-" ~ instance ~ "-" ~ ordinal.to!string;
+        Held held;
+        try held = new Held(id, req, outcome, cfg.detachBufferBytes, cfg.detachMaxSecs, ordinal, instance);
+        catch (HeldAdmissionException) {
+            // Constructor admission failed before any owner was started.
+            // No existing held connection is disturbed by capacity pressure.
+            try { if (outcome.tls !is null) outcome.tls.finalize(); } catch (Exception) {}
+            try outcome.conn.close(); catch (Exception) {}
+            writeLine(c, "FAILED " ~ FailedLine("capacity", "holder admission capacity exhausted").toJson().toString());
+            return;
+        }
+        catch (Exception e) {
+            try { if (outcome.tls !is null) outcome.tls.finalize(); } catch (Exception) {}
+            try outcome.conn.close(); catch (Exception) {}
+            throw e;
+        }
+        registerHeld(held);
         fields["event"] = "dial_ok";
         fields["id"] = id;
         fields["peerIp"] = held.peerIp;
         fields["tookMs"] = (unixMsNow() - startMs).to!string;
         logJsonMap("info", "holder", "Dial succeeded", fields);
         auto connected = ConnectedLine(id, held.peerIp, held.localIp, held.peerPort, held.localPort,
-            held.connectedAtMs, held.tlsInfo);
-        try {
-            writeLine(c, "CONNECTED " ~ connected.toJson().toString());
-        } catch (Exception) {
-            return; // engine vanished: the session stays held for ATTACH
-        }
-        held.attach(c);
+            held.connectedAtMs, held.tlsInfo, instance);
+        held.attach(c, "CONNECTED " ~ connected.toJson().toString());
     }
 
     // ── ATTACH → relay ──────────────────────────────────────────────────
@@ -495,7 +739,101 @@ final class HolderServer {
         catch (RequestError e) { writeLine(c, errLine(e.code, e.msg)); return; }
         if (!held.isOpen) { writeLine(c, errLine(ERR_CLOSED, "upstream closed: " ~ held.closeReason)); return; }
         if (held.attached) { writeLine(c, errLine(ERR_BUSY, "already attached")); return; }
-        writeLine(c, okLine(held.entry().toJson()));
         held.attach(c);
     }
+}
+
+version (unittest) {
+    // Exercise the actual ordered registry/page/prune implementation without
+    // opening a listener, dialing a server, or inventing transport stand-ins.
+    private HolderServer.Record inventoryFixture(HolderServer server, long nowMs) {
+        auto record = new HolderServer.Record;
+        record.ordinal = ++server.nextId;
+        record.id = "c-" ~ server.instance ~ "-" ~ record.ordinal.to!string;
+        record.tombstone.id = record.id;
+        record.tombstone.instance = server.instance;
+        record.tombstone.ordinal = record.ordinal;
+        record.tombstone.state = "closed";
+        record.tombstone.closedAtMs = nowMs;
+        record.tombstone.connectedAtMs = nowMs - 1;
+        record.tombstone.gapGeneration = long.max;
+        record.tombstone.gapAckGeneration = long.max - 1;
+        record.tombstone.droppedBytes = ulong.max;
+        record.tombstone.droppedLines = ulong.max;
+        record.tombstone.gapStartedAtMs = long.max;
+        record.tombstone.deliveryAmbiguous = true;
+        server.appendRecord(record);
+        server.retainClosedRecord(record, nowMs);
+        return record;
+    }
+}
+
+@("Inventory freezes its high-water and survives deletion of its cursor")
+unittest {
+    import std.exception : assertThrown;
+    HolderConfig cfg;
+    cfg.closedRetainSecs = CLOSED_RETAIN_SECS;
+    auto server = new HolderServer(cfg);
+    auto other = new HolderServer(cfg);
+    assert(server.instance != other.instance);
+    const now = unixMsNow();
+    foreach (_; 0 .. 260) inventoryFixture(server, now);
+    auto first = server.controlRequest("INVENTORY", Json.emptyObject);
+    assert(first["through"].get!long == 260);
+    assert(first["connections"].length == MAX_INVENTORY_ROWS && first["more"].get!bool);
+    assert(okLine(first).length + 1 <= MAX_INVENTORY_BYTES);
+    auto cursor = first["nextAfter"].get!long;
+    assert(cursor == 128);
+    auto oldCursor = server.ordinals[cast(ulong) cursor];
+    server.removeRecord(oldCursor);
+    inventoryFixture(server, now); // excluded until the next scan
+    auto request = Json.emptyObject;
+    request["instance"] = server.instance;
+    request["through"] = first["through"];
+    request["after"] = cursor;
+    auto second = server.controlRequest("INVENTORY", request);
+    assert(second["connections"].length == MAX_INVENTORY_ROWS);
+    assert(second["connections"][0]["ordinal"].get!long == 129);
+    assert(okLine(second).length + 1 <= MAX_INVENTORY_BYTES);
+    request["after"] = second["nextAfter"];
+    auto finalPage = server.controlRequest("INVENTORY", request);
+    assert(!finalPage["more"].get!bool && finalPage["nextAfter"].get!long == 260);
+    assert(finalPage["connections"].length == 4);
+    foreach (row; finalPage["connections"].get!(Json[])) {
+        assert(row["ordinal"].get!long <= 260);
+        assert(row["meta"].type == Json.Type.undefined && row["tag"].type == Json.Type.undefined);
+    }
+    request["instance"] = other.instance;
+    assertThrown(server.controlRequest("INVENTORY", request));
+    request["instance"] = server.instance;
+    request["after"] = 261;
+    assertThrown(server.controlRequest("INVENTORY", request));
+    request["after"] = 0;
+    request["through"] = 262;
+    assertThrown(server.controlRequest("INVENTORY", request));
+    request["through"] = 260;
+    request["after"] = 1.5;
+    assertThrown(server.controlRequest("INVENTORY", request));
+}
+
+@("Terminal registry remains count bounded and expires independently of lookups")
+unittest {
+    HolderConfig cfg;
+    cfg.closedRetainSecs = long.max; // cannot extend the hard one-hour ceiling
+    auto server = new HolderServer(cfg);
+    const now = unixMsNow();
+    foreach (_; 0 .. MAX_TOMBSTONES + 10) {
+        inventoryFixture(server, now);
+        assert(server.tinyTombstones() <= MAX_TOMBSTONES);
+    }
+    assert(server.records.length == MAX_TOMBSTONES);
+    assert(server.ordinals.length == MAX_TOMBSTONES);
+    assert(server.first.ordinal == 11 && server.last.ordinal == MAX_TOMBSTONES + 10);
+    auto missing = Json.emptyObject;
+    missing["id"] = "already-forgotten";
+    server.controlRequest("CLOSE", missing);
+    server.controlRequest("FORGET", missing);
+    server.pruneTombstones(now + CLOSED_RETAIN_SECS * 1000);
+    assert(server.tinyTombstones() == 0 && server.records.length == 0 && server.ordinals.length == 0);
+    assert(server.first is null && server.last is null && server.firstClosed is null && server.lastClosed is null);
 }

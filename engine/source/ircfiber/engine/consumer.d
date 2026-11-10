@@ -269,6 +269,18 @@ private void handleControlMessage(ref EngineContext ctx, ControlMessage msg) {
     }
 
     switch (msg.action) {
+        case "archiveClear":
+            if (ctx.archiveControl !is null) ctx.archiveControl.accept(ctx, msg);
+            break;
+        case "holderMaintenance":
+            if (msg.networkId.length || msg.userId.length || msg.config.type != Json.Type.object)
+                throw new Exception("holder maintenance requires engine-scoped infrastructure control");
+            ctx.connManager.holderMaintenance(
+                msg.config["operationId"].get!string,
+                msg.config["phase"].get!string,
+                msg.config["deadlineMs"].get!long,
+                msg.config["serverId"].get!string);
+            break;
         case "addNetwork":
             if (msg.networkId.length) {
                 auto row = loadCanonicalNetwork(ctx, parseUUID(msg.networkId[]));
@@ -444,10 +456,46 @@ private void handleControlMessage(ref EngineContext ctx, ControlMessage msg) {
                             || move.state != "processing"
                             || ctx.redis.getDb().get(RedisKeys.routingMove(msg.networkId)) != move.moveId
                             || ctx.serverRegistry.getServerForNetwork(msg.networkId) != move.fromServerId) return;
+                    // No source CLOSE or routing reassignment until all local
+                    // mutations (RAM, durable FIFO and in-flight) checkpoint.
+                    ulong pendingMutations;
+                    if (ctx.archiveSpool is null
+                            || !ctx.archiveSpool.tryNetworkPending(move.fromServerId,
+                                msg.networkId, pendingMutations)
+                            || pendingMutations != 0) {
+                        failRoutingMove(ctx.redis.getDb(), move, "archive_pending");
+                        return;
+                    }
                     try {
+                        // Publish destination provenance before it can receive
+                        // appends. Repeated A->B->A moves retain both scopes.
+                        if (ctx.archiveControl is null
+                                || !ctx.archiveControl.prepareHandoff(ctx, msg.networkId, move.targetServerId)) {
+                            failRoutingMove(ctx.redis.getDb(), move, "archive_scope_unavailable");
+                            return;
+                        }
+                        // Redis admission above yields; do not CLOSE if a
+                        // source mutation arrived while registering scopes.
+                        if (!ctx.archiveSpool.tryNetworkPending(move.fromServerId,
+                                msg.networkId, pendingMutations) || pendingMutations != 0) {
+                            failRoutingMove(ctx.redis.getDb(), move, "archive_pending");
+                            return;
+                        }
+                        auto source = loadCanonicalNetwork(ctx, parseUUID(msg.networkId[]));
+                        scope(exit) ctx.archiveControl.endMove(msg.networkId, move.moveId);
+                        if (!ctx.archiveControl.awaitMoveBarrier(ctx, msg.networkId, move.moveId,
+                                source.userId.toString(), false)) {
+                            failRoutingMove(ctx.redis.getDb(), move, "archive_pending");
+                            return;
+                        }
                         if (!ctx.connManager.stopNetworkForMove(parseUUID(msg.networkId[]), 60.seconds)) {
                             failRoutingMove(ctx.redis.getDb(), move,
                                 "source quiescence unproven; inspect holder and irc:routing:dials:" ~ move.fromServerId ~ ":" ~ move.networkId);
+                            return;
+                        }
+                        if (!ctx.archiveControl.awaitMoveBarrier(ctx, msg.networkId, move.moveId,
+                                source.userId.toString(), true)) {
+                            failRoutingMove(ctx.redis.getDb(), move, "archive_pending");
                             return;
                         }
                         acknowledgeNetworkMoveClosed(ctx.redis.getDb(), move);

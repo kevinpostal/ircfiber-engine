@@ -16,6 +16,7 @@ import ircfiber.db.mongo;
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.redis.protocol : RedisKeys;
 import ircfiber.db.user : idInFilters;
+import ircfiber.network_write_gate : runNetworkMutation, NetworkWriteUnavailableException;
 
 /// Repository for network configurations.
 final class NetworkRepository {
@@ -213,6 +214,7 @@ final class NetworkRepository {
     /// never overwritten, including by stale ordinary saves.
     string ensureIpv6Iid(UUID networkId) {
         try return reserveIpv6Iid(networkId);
+        catch (NetworkWriteUnavailableException e) throw e;
         catch (Ipv6IdentityException e) throw e;
         catch (Exception e)
             throw new Ipv6IdentityException("IPv6 identity reservation unavailable: " ~ e.msg);
@@ -233,7 +235,6 @@ final class NetworkRepository {
     }
 
     private string reserveIpv6Iid(UUID networkId) {
-        ensureIpv6IidIndex();
         foreach (attempt; 0 .. 8) {
             auto current = collection.findOne(["id": networkId.toString()]);
             if (current.isNull) throw new Ipv6IdentityException("Network does not exist");
@@ -242,6 +243,7 @@ final class NetworkRepository {
                 invalidateIpv6OwnerCache(current);
                 return existing;
             }
+            ensureIpv6IidIndex();
 
             string candidate;
             bool generated;
@@ -265,7 +267,7 @@ final class NetworkRepository {
                 "ipv6Iid": Bson(["$exists": Bson(false)])]);
             command["update"] = Bson(["$set": Bson(["ipv6Iid": Bson(candidate)])]);
             command["new"] = Bson(true);
-            const reply = AppMongoConnection.getDb().runCommandUnchecked(command);
+            const reply = runNetworkMutation(cache, command);
             if (reply["ok"].get!double != 1.0) {
                 if (reply["code"].type == Bson.Type.undefined || reply["code"].get!int != 11000)
                     throw new Ipv6IdentityException("Mongo rejected IPv6 identity reservation");
@@ -329,15 +331,23 @@ final class NetworkRepository {
                 "servicesProvisioningPending": Bson(config.servicesProvisioningPending)
             ])
         ]);
-        UpdateOptions options;
-        options.upsert = true;
-        collection.updateOne(selector, update, options);
+        updateConfig(selector, update, true);
         // Invalidate per-user cache so findByUserId doesn't return stale [] for 60s
         // after a new network is provisioned (e.g. ensureDefaultFiberNetwork on register).
         if (cache !is null) {
             try cache.del(RedisKeys.userNetworks(userId.toString()));
             catch (Exception) {}
         }
+    }
+
+    /// All document changes use a strict acknowledged command under the
+    /// shared writer registration. Construct/validate BSON before admission.
+    private Bson updateConfig(Bson selector, Bson update, bool upsert = false) {
+        auto command = Bson.emptyObject;
+        command["update"] = Bson("networks");
+        command["updates"] = Bson([Bson(["q": selector, "u": update,
+            "multi": Bson(false), "upsert": Bson(upsert)])]);
+        return runNetworkMutation(cache, command);
     }
 
     /// The `$set` document `save` writes: every user/admin-editable field.
@@ -410,14 +420,14 @@ final class NetworkRepository {
             fields["nick"] = Bson(account);
             fields["realName"] = Bson(account);
         }
-        auto result = collection.updateOne(
+        auto result = updateConfig(
             Bson([
                 "id": Bson(id.toString()),
                 "userId": Bson(ownerId.toString()),
                 "servicesProvisioningPending": Bson(true)
             ]),
             Bson(["$set": fields]));
-        if (result.modifiedCount != 1) return false;
+        if (result["nModified"].get!long != 1) return false;
         if (cache !is null) {
             try cache.del(RedisKeys.userNetworks(ownerId.toString()));
             catch (Exception) {}
@@ -430,7 +440,7 @@ final class NetworkRepository {
         auto validated = routingPreferencesFromJson(routing.toJson());
         auto selector = Bson(["id": Bson(id.toString())]);
         auto update = Bson(["$set": Bson(["routing": Bson.fromJson(validated.toJson())])]);
-        collection.updateOne(selector, update);
+        updateConfig(selector, update);
     }
 
 
@@ -439,12 +449,15 @@ final class NetworkRepository {
     void setDisabled(UUID id, bool disabled) {
         auto selector = Bson(["id": Bson(id.toString())]);
         auto update = Bson(["$set": Bson(["disabled": Bson(disabled)])]);
-        collection.updateOne(selector, update);
+        updateConfig(selector, update);
     }
 
     /// Deletes a network by its ID.
     void deleteById(UUID id) {
-        collection.deleteOne(["id": id.toString()]);
+        auto command = Bson.emptyObject;
+        command["delete"] = Bson("networks");
+        command["deletes"] = Bson([Bson(["q": Bson(["id": Bson(id.toString())]), "limit": Bson(1)])]);
+        runNetworkMutation(cache, command);
     }
 
     /// Serializes a NetworkConfig array to a JSON array.

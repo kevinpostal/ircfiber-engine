@@ -2242,10 +2242,12 @@ unittest {
 
 @("language round-trips; legacy blobs follow the browser; unknown codes repair to automatic")
 unittest {
-    UserPreferences p;
-    p.language = "de";
-    const r = UserPreferences.fromJson(p.toJson());
-    assert(!r.needsRepair && r.prefs.language == "de");
+    foreach (language; ["de", "id"]) {
+        UserPreferences p;
+        p.language = language;
+        const r = UserPreferences.fromJson(p.toJson());
+        assert(!r.needsRepair && r.prefs.language == language);
+    }
 
     auto legacy = Json.emptyObject;
     legacy["pinnedChannels"] = serializeToJson(["net1:#a"]);

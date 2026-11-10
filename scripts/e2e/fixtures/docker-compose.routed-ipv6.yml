@@ -7,23 +7,23 @@ x-runtime: &runtime
   labels: *labels
   restart: "no"
 x-env: &env
-  IRCFIBER_REDIS_URL: redis://203.0.113.2:6379/0
-  IRCFIBER_MONGO_URL: mongodb://203.0.113.3:27017/ircfiber_routed_fixture
+  IRCFIBER_REDIS_URL: redis://203.0.207.2:6379/0
+  IRCFIBER_MONGO_URL: mongodb://203.0.207.3:27017/ircfiber_routed_fixture
   IRCFIBER_DEFAULT_NETWORK_HOST: default.routed.test
   IRCFIBER_DEFAULT_NETWORK_PORT: "16668"
   IRCFIBER_DEFAULT_NETWORK_TLS: disabled
   IRCFIBER_OTEL_ENABLED: "0"
   IRCFIBER_BUGSINK_ENABLED: "0"
   IRCFIBER_LOG_LEVEL: debug
-  IRCFIBER_MULLVAD_POOL: socks5://fixture-mull@203.0.113.31:1080
-  IRCFIBER_NORDVPN_POOL: socks5://fixture-nord:test:test@203.0.113.30:1080
+  IRCFIBER_MULLVAD_POOL: socks5://fixture-mull@203.0.207.31:1080
+  IRCFIBER_NORDVPN_POOL: socks5://fixture-nord:test:test@203.0.207.30:1080
 x-engine: &engine
   <<: *runtime
   build:
     context: ../../..
     dockerfile: Containerfile.engine
     target: runtime-engine
-  image: ${ROUTED_RUN}-engine:fresh
+  image: ${ROUTED_ENGINE_IMAGE:-${ROUTED_RUN}-engine:fresh}
   command: ["/app/irc-fiber-engine"]
   stop_grace_period: 35s
 x-holder: &holder
@@ -32,7 +32,7 @@ x-holder: &holder
     context: ../../..
     dockerfile: Containerfile.engine
     target: runtime-holder
-  image: ${ROUTED_RUN}-holder:fresh
+  image: ${ROUTED_HOLDER_IMAGE:-${ROUTED_RUN}-holder:fresh}
   healthcheck:
     test: [CMD, /app/irc-fiber-holder, --check]
     interval: 2s
@@ -51,23 +51,24 @@ services:
     image: redis:7-alpine
     command: [redis-server, --save, "", --appendonly, "no"]
     networks:
-      fixture: {ipv4_address: 203.0.113.2}
+      fixture: {ipv4_address: 203.0.207.2}
   mongo:
     <<: *runtime
     image: mongo:7
+    command: [mongod, --bind_ip_all, --setParameter, "enableTestCommands=${ROUTED_MONGO_TEST_COMMANDS:-false}"]
     networks:
-      fixture: {ipv4_address: 203.0.113.3}
+      fixture: {ipv4_address: 203.0.207.3}
   gateway:
     <<: *runtime
     build:
       context: ../../../../site
       dockerfile: Containerfile
       target: runtime-gateway
-    image: ${ROUTED_RUN}-gateway:fresh
+    image: ${ROUTED_GATEWAY_IMAGE:-${ROUTED_RUN}-gateway:fresh}
     command: [/app/irc-fiber]
     environment: *env
     networks:
-      fixture: {ipv4_address: 203.0.113.4}
+      fixture: {ipv4_address: 203.0.207.4}
   endpoint:
     <<: *fixture
     command: [server]
@@ -76,10 +77,10 @@ services:
       net.ipv6.conf.all.disable_ipv6: "0"
       net.ipv6.conf.default.disable_ipv6: "0"
     environment: {ROUTED_FIXTURE: "1"}
-    volumes: ["certs:/certs"]
+    volumes: ["certs:/certs", "native-archive:/archive/native:ro", "old-archive:/archive/old:ro"]
     networks:
       fixture:
-        ipv4_address: 203.0.113.10
+        ipv4_address: 203.0.207.10
         driver_opts:
           com.docker.network.endpoint.sysctls: net.ipv6.conf.IFNAME.disable_ipv6=0
   native-net:
@@ -92,10 +93,10 @@ services:
       net.ipv6.ip_nonlocal_bind: "1"
     environment: {ROUTED_FIXTURE: "1"}
     volumes: ["certs:/certs:ro", "native-ipc:/run/ircfiber:ro", "old-ipc:/run/oldholder:ro"]
-    dns: [203.0.113.10]
+    dns: [203.0.207.10]
     networks:
       fixture:
-        ipv4_address: 203.0.113.20
+        ipv4_address: 203.0.207.20
         driver_opts:
           com.docker.network.endpoint.sysctls: net.ipv6.conf.IFNAME.disable_ipv6=0
     healthcheck:
@@ -122,11 +123,14 @@ services:
       IRCFIBER_HOLDER_ADDR: unix:///run/ircfiber/holder.sock
       IRCFIBER_IPV6_PREFIX: 2001:db8:1234:5678::/64
       IRCFIBER_IPV6_ROUTING_VERIFIED: "${ROUTED_VERIFIED:-0}"
-    volumes: ["native-ipc:/run/ircfiber:ro"]
+      IRCFIBER_ARCHIVE_DIR: /var/lib/ircfiber/archive
+      IRCFIBER_ARCHIVE_MAX_BYTES: "536870912"
+      IRCFIBER_ARCHIVE_MIN_FREE_BYTES: "2147483648"
+    volumes: ["native-ipc:/run/ircfiber:ro", "native-archive:/var/lib/ircfiber/archive"]
     networks: [fixture]
   old-holder:
     <<: *holder
-    dns: [203.0.113.10]
+    dns: [203.0.207.10]
     environment:
       <<: *env
       IRCFIBER_SERVER_ID: fixture-old
@@ -138,26 +142,30 @@ services:
     networks: [fixture]
   old-engine:
     <<: *engine
+    image: ${ROUTED_OLD_ENGINE_IMAGE:-${ROUTED_ENGINE_IMAGE:-${ROUTED_RUN}-engine:fresh}}
     environment:
       <<: *env
       IRCFIBER_SERVER_ID: fixture-old
       IRCFIBER_HOLDER_ADDR: unix:///run/ircfiber/holder.sock
       IRCFIBER_IPV6_PREFIX: ""
       IRCFIBER_IPV6_ROUTING_VERIFIED: "0"
-    volumes: ["old-ipc:/run/ircfiber:ro"]
+      IRCFIBER_ARCHIVE_DIR: /var/lib/ircfiber/archive
+      IRCFIBER_ARCHIVE_MAX_BYTES: "536870912"
+      IRCFIBER_ARCHIVE_MIN_FREE_BYTES: "2147483648"
+    volumes: ["old-ipc:/run/ircfiber:ro", "old-archive:/var/lib/ircfiber/archive"]
     networks: [fixture]
   nord:
     <<: *fixture
     command: [socks]
     environment: {PROVIDER: nordvpn}
     networks:
-      fixture: {ipv4_address: 203.0.113.30}
+      fixture: {ipv4_address: 203.0.207.30}
   mull:
     <<: *fixture
     command: [socks]
     environment: {PROVIDER: mullvad}
     networks:
-      fixture: {ipv4_address: 203.0.113.31}
+      fixture: {ipv4_address: 203.0.207.31}
 
 networks:
   fixture:
@@ -165,9 +173,11 @@ networks:
     internal: true
     ipam:
       config:
-        - subnet: 203.0.113.0/24
-          ip_range: 203.0.113.128/25
+        - subnet: 203.0.207.0/24
+          ip_range: 203.0.207.128/25
 volumes:
   certs: {labels: *labels}
   native-ipc: {labels: *labels}
   old-ipc: {labels: *labels}
+  native-archive: {labels: *labels}
+  old-archive: {labels: *labels}

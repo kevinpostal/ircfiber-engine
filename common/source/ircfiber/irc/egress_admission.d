@@ -195,6 +195,17 @@ EgressDialAdmit admitEgressDial(RedisDatabase db, string label, string host, ush
     return a;
 }
 
+/// Revalidates an already selected dial after admission waits. A recovery
+/// token must still own its unexpired claim; this does not mark it registered,
+/// renew it, claim another trial, or settle an outcome.
+bool validateEgressDial(RedisDatabase db, string label, string host, ushort port,
+                       string token, long nowMs) {
+    auto args = commonArgs(nowMs) ~ [egressAdmissionEndpoint(host, port), token];
+    auto reply = db.eval!string(VALIDATE_DIAL_SCRIPT, [RedisKeys.egressAdmission(label)], args);
+    if (reply.empty) throw new Exception("empty admission validation reply");
+    return reply.front == "ok";
+}
+
 /// Marks the trial's IRC session registered (first call only) and extends
 /// its lock to `untilMs`. False when the token is stale or the lock already
 /// expired (the expiry is then settled as a failure).
@@ -479,6 +490,20 @@ else
 end
 if changed then save(KEYS[1], r) end
 return result
+LUA";
+
+// ARGV[4] endpoint, [5] previously admitted trial token (empty for healthy).
+private enum VALIDATE_DIAL_SCRIPT = PRELUDE ~ q"LUA
+local endpoint, token = ARGV[4], ARGV[5]
+local r, bad = decode(redis.call('GET', KEYS[1]))
+if bad then return 'blocked' end
+if not r then return token == '' and 'ok' or 'blocked' end
+if r.endpoint ~= endpoint then return 'blocked' end
+if settleExpired(r) then save(KEYS[1], r) end
+if r.draining then return 'blocked' end
+if token == '' then return not r.open and 'ok' or 'blocked' end
+if not r.open or r.trialToken ~= token or r.trialUntilMs <= now then return 'blocked' end
+return 'ok'
 LUA";
 
 // ARGV[4] endpoint, [5] token, [6] lock until ms.

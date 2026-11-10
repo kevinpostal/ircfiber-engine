@@ -10,6 +10,7 @@ import vibe.data.json : Json, parseJsonString;
 import vibe.db.redis.redis : RedisDatabase;
 import ircfiber.irc.server : ConnectionServer;
 import ircfiber.redis.protocol : RedisKeys;
+import ircfiber.network_write_gate : NetworkWriteUnavailableException;
 
 public enum NETWORK_ROUTING_LEASE_TTL_SECONDS = 90;
 private enum MOVE_FENCE_SECONDS = 120;
@@ -43,7 +44,7 @@ struct RoutingMove {
     }
 }
 
-private bool validToken(string value) pure @safe nothrow @nogc {
+package(ircfiber) bool isRoutingMoveId(string value) pure @safe nothrow @nogc {
     if (value.length != 32) return false;
     foreach (c; value) if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
     return true;
@@ -86,7 +87,7 @@ private RoutingMove decodeMove(string raw) {
     m.sourceClosed = j["sourceClosed"].get!bool;
     m.ackServerId = j["ackServerId"].get!string;
     m.createdAtMs = j["createdAtMs"].get!long;
-    if (!validToken(m.moveId) || !validNetworkId(m.networkId)
+    if (!isRoutingMoveId(m.moveId) || !validNetworkId(m.networkId)
             || !validServerId(m.fromServerId) || !validServerId(m.targetServerId)
             || m.fromServerId == m.targetServerId || m.createdAtMs <= 0
             || (m.state != "queued" && m.state != "processing" && m.state != "completed"
@@ -98,7 +99,7 @@ private RoutingMove decodeMove(string raw) {
 }
 
 RoutingMove loadRoutingMove(RedisDatabase db, string moveId) {
-    if (!validToken(moveId)) throw new RoutingMoveConflictException("Invalid routing move ID");
+    if (!isRoutingMoveId(moveId)) throw new RoutingMoveConflictException("Invalid routing move ID");
     try {
         auto reply = db.eval!string(LOAD_SCRIPT, [RedisKeys.routingMoveStatus(moveId)],
             [moveId, RedisKeys.routingMove(""), MOVE_RESULT_SECONDS.to!string]);
@@ -164,17 +165,19 @@ RoutingMove requestNetworkMove(RedisDatabase db, string networkId, string target
         if (reply.empty) throw new RoutingMoveUnavailableException();
         const result = reply.front.idup;
         if (result == "conflict") throw new RoutingMoveConflictException();
-        if (!validToken(result)) throw new RoutingMoveUnavailableException();
+        if (result == "maintenance") throw new NetworkWriteUnavailableException();
+        if (!isRoutingMoveId(result)) throw new RoutingMoveUnavailableException();
         auto move = loadRoutingMove(db, result);
         if (!move.moveId.length || move.networkId != networkId) throw new RoutingMoveUnavailableException();
         return move;
+    } catch (NetworkWriteUnavailableException e) { throw e;
     } catch (RoutingMoveConflictException e) { throw e; }
     catch (RoutingMoveUnavailableException e) { throw e; }
     catch (Exception) { throw new RoutingMoveUnavailableException(); }
 }
 
 private bool transition(RedisDatabase db, const RoutingMove move, string script, string[] extra = []) {
-    if (!validToken(move.moveId) || !validNetworkId(move.networkId)
+    if (!isRoutingMoveId(move.moveId) || !validNetworkId(move.networkId)
             || !validServerId(move.fromServerId) || !validServerId(move.targetServerId)
             || move.fromServerId == move.targetServerId)
         throw new RoutingMoveConflictException("Invalid routing move identity");
@@ -203,7 +206,7 @@ bool failRoutingMove(RedisDatabase db, const RoutingMove move, string reason, st
 bool commitRoutingMove(RedisDatabase db, const RoutingMove move,
     string destinationControlJson, string expectedPolicyRaw, string expectedTargetData,
     const string[string] expectedAssignments) {
-    if (!validToken(move.moveId) || !validNetworkId(move.networkId)
+    if (!isRoutingMoveId(move.moveId) || !validNetworkId(move.networkId)
             || !validServerId(move.fromServerId) || !validServerId(move.targetServerId)
             || move.fromServerId == move.targetServerId)
         throw new RoutingMoveConflictException("Invalid routing move identity");
@@ -300,6 +303,7 @@ end
 LUA";
 
 private enum CREATE_SCRIPT = STATUS_FUNCTIONS ~ q"LUA
+if redis.call('EXISTS', 'irc:holder:maintenance:write-exclusion') ~= 0 then return 'maintenance' end
 local existing = redis.call('GET', KEYS[1])
 if existing then return existing end
 if redis.call('GET', KEYS[7]) ~= '1' or not targetLive(KEYS[5], KEYS[6], ARGV[5]) then return 'conflict' end
@@ -333,6 +337,7 @@ return cjson.encode(s)
 LUA";
 
 private enum BEGIN_SCRIPT = STATUS_FUNCTIONS ~ q"LUA
+if redis.call('EXISTS', 'irc:holder:maintenance:write-exclusion') ~= 0 then return '0' end
 local s = readStatus(KEYS[2])
 if not matching(s) or s.state ~= 'queued' or not owns(s) then return '0' end
 redis.call('HSET', KEYS[2], 'state', 'processing')
@@ -341,6 +346,7 @@ return '1'
 LUA";
 
 private enum ACK_SCRIPT = STATUS_FUNCTIONS ~ q"LUA
+if redis.call('EXISTS', 'irc:holder:maintenance:write-exclusion') ~= 0 then return '0' end
 local s = readStatus(KEYS[2])
 if not matching(s) or s.state ~= 'processing' or not owns(s) then return '0' end
 redis.call('HSET', KEYS[2], 'sourceClosed', '1', 'ackServerId', s.fromServerId)
@@ -361,6 +367,7 @@ return '1'
 LUA";
 
 private enum COMMIT_SCRIPT = STATUS_FUNCTIONS ~ q"LUA
+if redis.call('EXISTS', 'irc:holder:maintenance:write-exclusion') ~= 0 then return '0' end
 local s = readStatus(KEYS[2])
 if not matching(s) or s.state ~= 'processing' or not owns(s)
     or s.sourceClosed ~= '1' or s.ackServerId ~= s.fromServerId then return '0' end

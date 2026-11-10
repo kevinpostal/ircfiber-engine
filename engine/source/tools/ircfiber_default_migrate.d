@@ -293,7 +293,7 @@ private int runMain(string[] args) {
     redis.connectFromUrl(redisUrl);
 
     auto userRepo = new UserRepository();
-    auto netRepo = new NetworkRepository();
+    auto netRepo = new NetworkRepository(redis);
     auto registry = new ServerRegistry(redis);
 
     if (fixNicks) {

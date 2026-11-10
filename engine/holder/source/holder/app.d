@@ -10,6 +10,10 @@
  */
 module holder.app;
 
+// META replacement creates short-lived JSON trees; do not wait for the
+// runtime's default 2x live-heap growth before collecting in a capped process.
+extern(C) __gshared string[] rt_options = ["gcopt=heapSizeFactor:1.2"];
+
 import core.stdc.stdlib : exit;
 import core.time : msecs, seconds;
 import std.stdio : stderr, stdout, writeln;
@@ -21,6 +25,10 @@ import ircfiber.logging : logJsonMap;
 import ircfiber.term_signal : installTermSignalFlag, termSignal;
 import holder.ipc : HolderConfig, HolderServer, configFromEnv, connectHolderAddr;
 import holder.protocol;
+import holder.held : HeldMemoryCounters, HeldQueueCounters, sampleHeldMemory;
+import ircfiber.runtime_memory : sampleRuntimeMemory, runtimeMemorySampleJson, compactRuntimeDiagnosticJson;
+import ircfiber.runtime_diagnostic : RuntimeDiagnosticWriter, DiagnosticStatus, DiagnosticAdmission,
+    runtimeDiagnosticDefaultPath;
 
 /// EX_CONFIG: misconfiguration the operator must fix.
 private enum EXIT_CONFIG = 78;
@@ -65,6 +73,17 @@ private int runDaemon() {
         return EXIT_CONFIG;
     }
     auto server = new HolderServer(cfg);
+    RuntimeDiagnosticWriter diagnosticWriter;
+    try {
+        import std.process : environment;
+        diagnosticWriter = new RuntimeDiagnosticWriter(
+            environment.get("IRCFIBER_RUNTIME_MEMORY_PATH", runtimeDiagnosticDefaultPath));
+    } catch (Exception) {
+        logJsonMap("warn", "holder", "Runtime diagnostic writer unavailable",
+            ["event": "memory_diagnostic_unavailable", "reason": "worker_start_failed"]);
+    }
+    // A stuck disk call must not delay holder exit or trigger a second owner.
+    scope(exit) if (diagnosticWriter !is null) diagnosticWriter.mailbox.stop(0.msecs);
     installTermSignalFlag();
     int rc = 0;
     safeFiberRun("holder_main", "", {
@@ -75,6 +94,64 @@ private int runDaemon() {
             exitEventLoop();
             return;
         }
+        // Independent of IPC, Redis and exporters. The shared sampler reads
+        // bounded procfs/GC diagnostics only; it never initializes large pools.
+        safeFiberRun("holder_memory_sampler", "", {
+            while (termSignal() == 0) {
+                try {
+                    import std.json : JSONValue;
+                    auto sample = sampleRuntimeMemory();
+                    auto diagnostic = runtimeMemorySampleJson(sample);
+                    auto counters = sampleHeldMemory();
+                    auto owners = JSONValue.emptyObject;
+                    static foreach (i; 0 .. HeldMemoryCounters.tupleof.length)
+                        owners[__traits(identifier, HeldMemoryCounters.tupleof[i])] =
+                            JSONValue(counters.tupleof[i]);
+                    owners["retiringEntries"] = JSONValue(counters.tombstones);
+                    owners["tombstones"] = JSONValue(cast(ulong) server.tinyTombstones());
+                    owners["members"] = counters.openMembersKnown == counters.liveEntries
+                        ? JSONValue(counters.metaMembersKnown) : JSONValue(null);
+                    owners["membersAvailable"] = JSONValue(counters.openMembersKnown == counters.liveEntries);
+                    owners["memberAccounting"] = JSONValue("stored_meta_memberships");
+                    diagnostic["holderOwners"] = owners;
+                    auto queues = JSONValue.emptyObject;
+                    auto lanes = server.runtimeQueues();
+                    foreach (lane; 0 .. 3) {
+                        auto queue = JSONValue.emptyObject;
+                        static foreach (i; 0 .. HeldQueueCounters.tupleof.length)
+                            queue[__traits(identifier, HeldQueueCounters.tupleof[i])] = JSONValue(lanes[lane].tupleof[i]);
+                        queue["oldestUnprogressedBacklogAtMs"] = lanes[lane].oldestUnprogressedBacklogAtMs > 0
+                            ? JSONValue(lanes[lane].oldestUnprogressedBacklogAtMs) : JSONValue(null);
+                        queues[["relay", "outbound", "pong"][lane]] = queue;
+                    }
+                    diagnostic["holderQueues"] = queues;
+                    DiagnosticStatus writerStatus;
+                    if (diagnosticWriter !is null && diagnosticWriter.mailbox.tryStatus(writerStatus)) {
+                        import std.conv : to;
+                        import ircfiber.runtime_diagnostic : DiagnosticWriteResult;
+                        auto file = JSONValue.emptyObject;
+                        file["state"] = JSONValue(!writerStatus.written ? "unavailable" :
+                            writerStatus.lastResult == DiagnosticWriteResult.written
+                                ? "observed_write" : "stale");
+                        file["lastResult"] = JSONValue(writerStatus.lastResult.to!string);
+                        file["lastWrittenAtMs"] = writerStatus.written ? JSONValue(writerStatus.lastWrittenAtMs) : JSONValue(null);
+                        static foreach (name; ["accepted", "coalesced", "written", "failures", "pendingBytes", "inFlightBytes"])
+                            file[name] = JSONValue(__traits(getMember, writerStatus, name));
+                        diagnostic["diagnosticFile"] = file;
+                    }
+                    auto encoded = compactRuntimeDiagnosticJson(diagnostic);
+                    if (diagnosticWriter !is null &&
+                        diagnosticWriter.mailbox.tryPublish(encoded) != DiagnosticAdmission.queued)
+                        logJsonMap("warn", "holder", "Runtime diagnostic not admitted",
+                            ["event": "memory_diagnostic_unavailable", "reason": "mailbox_not_admitted"]);
+                    logJsonMap("info", "holder", "Runtime memory sample", diagnostic, true);
+                } catch (Exception) {
+                    logJsonMap("warn", "holder", "Runtime memory sample unavailable",
+                        ["event": "memory_sample_unavailable", "reason": "sampling_error"]);
+                }
+                sleep(30.seconds);
+            }
+        });
         while (termSignal() == 0) sleep(100.msecs);
         // In-loop shutdown: QUIT every open session, give the servers a
         // moment to close, then leave. This is a full reconnect event for

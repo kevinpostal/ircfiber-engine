@@ -1,0 +1,19 @@
+# Only archive_reliability composes this overlay; existing A/holder modes are unchanged.
+services:
+  mongo:
+    command: [mongod, --bind_ip_all, --setParameter, enableTestCommands=1]
+  ircfiber-engine:
+    environment:
+      IRCFIBER_ARCHIVE_DIR: /var/lib/ircfiber/archive
+      IRCFIBER_ARCHIVE_MAX_BYTES: ${ROUTING_REGRESSION_ARCHIVE_MAX_BYTES:?archive launcher supplies the bound}
+      IRCFIBER_ARCHIVE_MIN_FREE_BYTES: "2147483648"
+    volumes:
+      - engine-archive:/var/lib/ircfiber/archive
+  mock-irc:
+    volumes:
+      - engine-archive:/var/lib/ircfiber/archive:ro
+volumes:
+  engine-archive:
+    labels:
+      ircfiber.fixture: routing-regression
+      ircfiber.fixture.run: ${ROUTING_REGRESSION_RUN:?archive launcher supplies run id}

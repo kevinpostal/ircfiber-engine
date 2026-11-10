@@ -56,6 +56,12 @@ enum size_t MAX_META               = 8 << 20;
 /// sessions — which failed `--list` outright, and with it the engine
 /// deploy gate that compares the session list either side of a swap.
 enum size_t MAX_RESPONSE           = 64 << 20;
+/// Complete INVENTORY response, including OK prefix and newline.
+enum size_t MAX_INVENTORY_BYTES = 64 << 10;
+enum size_t MAX_INVENTORY_ROWS = 128;
+enum size_t MAX_TOMBSTONES = 4096;
+enum string[] HOLDER_CAPABILITIES =
+    ["inventory_v1", "gap_ack_v1", "bounded_meta_v1", "independent_pong_v1"];
 /// Wire message the holder sends upstream when the engine never came back.
 enum string QUIT_ENGINE_UNAVAILABLE          = "engine unavailable";
 enum string QUIT_ENGINE_UNAVAILABLE_OVERFLOW = "engine unavailable (buffer overflow)";
@@ -274,6 +280,16 @@ struct TlsInfoJson {
 /// One held connection as reported by `LIST` / `INFO` / `ATTACH`.
 struct Entry {
     string id;
+    string instance;
+    ulong ordinal;
+    ulong gapGeneration, gapAckGeneration, droppedBytes, droppedLines;
+    long gapStartedAtMs;
+    bool deliveryAmbiguous;
+    /// Numeric I/O ownership evidence, available via INFO/ATTACH only.
+    size_t relayBytes, outboundBytes, pongBytes, relayWriterFlightBytes;
+    long relayWriteInFlightMs, upstreamWriteInFlightMs;
+    ulong attachmentGeneration, attachmentWriterCompletions;
+    bool upstreamWriterDone, tlsFinalized;
     Tag tag;
     /// "open" | "closed"
     string state;
@@ -297,6 +313,18 @@ struct Entry {
     Json toJson() const {
         auto j = Json.emptyObject;
         j["id"] = id;
+        j["instance"] = instance;
+        writeGapFields(j);
+        j["relayBytes"] = counterJson(relayBytes);
+        j["outboundBytes"] = counterJson(outboundBytes);
+        j["pongBytes"] = counterJson(pongBytes);
+        j["relayWriterFlightBytes"] = counterJson(relayWriterFlightBytes);
+        j["relayWriteInFlightMs"] = relayWriteInFlightMs;
+        j["upstreamWriteInFlightMs"] = upstreamWriteInFlightMs;
+        j["attachmentGeneration"] = counterJson(attachmentGeneration);
+        j["attachmentWriterCompletions"] = counterJson(attachmentWriterCompletions);
+        j["upstreamWriterDone"] = upstreamWriterDone;
+        j["tlsFinalized"] = tlsFinalized;
         j["tag"] = tag.toJson();
         j["state"] = state;
         j["attached"] = attached;
@@ -314,9 +342,50 @@ struct Entry {
         return j;
     }
 
+    /// Deliberately excludes routing tags, TLS and META. All strings originate
+    /// from holder-controlled bounded identifiers/state, never user payload.
+    Json inventoryJson() const {
+        auto j = Json.emptyObject;
+        j["id"] = id;
+        j["state"] = state;
+        j["attached"] = attached;
+        j["connectedAtMs"] = connectedAtMs;
+        j["bufferedBytes"] = cast(long) bufferedBytes;
+        writeGapFields(j);
+        return j;
+    }
+
+    private void writeGapFields(ref Json j) const {
+        j["ordinal"] = cast(long) ordinal;
+        j["gapGeneration"] = counterJson(gapGeneration);
+        j["gapAckGeneration"] = counterJson(gapAckGeneration);
+        j["droppedBytes"] = counterJson(droppedBytes);
+        j["droppedLines"] = counterJson(droppedLines);
+        j["gapStartedAtMs"] = gapStartedAtMs;
+        j["deliveryAmbiguous"] = deliveryAmbiguous;
+    }
+
     static Entry fromJson(Json j) {
         Entry e;
         e.id = jstr(j, "id");
+        e.instance = jstr(j, "instance");
+        e.ordinal = jsonUnsigned(j, "ordinal");
+        e.gapGeneration = jsonUnsigned(j, "gapGeneration");
+        e.gapAckGeneration = jsonUnsigned(j, "gapAckGeneration");
+        e.droppedBytes = jsonUnsigned(j, "droppedBytes");
+        e.droppedLines = jsonUnsigned(j, "droppedLines");
+        e.gapStartedAtMs = jlong(j, "gapStartedAtMs");
+        e.deliveryAmbiguous = jbool(j, "deliveryAmbiguous");
+        e.relayBytes = cast(size_t) jsonUnsigned(j, "relayBytes");
+        e.outboundBytes = cast(size_t) jsonUnsigned(j, "outboundBytes");
+        e.pongBytes = cast(size_t) jsonUnsigned(j, "pongBytes");
+        e.relayWriterFlightBytes = cast(size_t) jsonUnsigned(j, "relayWriterFlightBytes");
+        e.relayWriteInFlightMs = jlong(j, "relayWriteInFlightMs");
+        e.upstreamWriteInFlightMs = jlong(j, "upstreamWriteInFlightMs");
+        e.attachmentGeneration = jsonUnsigned(j, "attachmentGeneration");
+        e.attachmentWriterCompletions = jsonUnsigned(j, "attachmentWriterCompletions");
+        e.upstreamWriterDone = jbool(j, "upstreamWriterDone");
+        e.tlsFinalized = jbool(j, "tlsFinalized");
         e.tag = Tag.fromJson(j["tag"]);
         e.state = jstr(j, "state");
         e.attached = jbool(j, "attached");
@@ -378,10 +447,12 @@ struct ConnectedLine {
     ushort localPort;
     long connectedAtMs;
     TlsInfoJson tls;
+    string instance;
 
     Json toJson() const {
         auto j = Json.emptyObject;
         j["id"] = id;
+        j["instance"] = instance;
         j["peerIp"] = peerIp;
         j["localIp"] = localIp;
         j["peerPort"] = cast(int) peerPort;
@@ -400,6 +471,7 @@ struct ConnectedLine {
         c.localPort = cast(ushort) jlong(j, "localPort");
         c.connectedAtMs = jlong(j, "connectedAtMs");
         c.tls = TlsInfoJson.fromJson(j["tls"]);
+        c.instance = jstr(j, "instance");
         return c;
     }
 }
@@ -478,6 +550,126 @@ void parseFirstLine(string line, out string verb, out Json payload) {
     verb = line[0 .. sp];
     auto rest = line[sp + 1 .. $].strip();
     payload = rest.length ? parseJsonString(rest) : Json.emptyObject;
+}
+
+/// Strict unsigned wire counters/cursors. Missing values default only when
+/// explicitly permitted, never coerce floats, signs or decimal strings.
+ulong jsonUnsigned(Json j, string key, bool required = false) {
+    auto value = j[key];
+    if (value.type == Json.Type.undefined && !required) return 0;
+    if (value.type == Json.Type.int_ && value.get!long >= 0)
+        return cast(ulong) value.get!long;
+    throw new Exception(key ~ " must be an unsigned integer");
+}
+
+/// Vibe JSON has signed 64-bit integers. Saturate diagnostics rather than
+/// wrap a long-running counter negative.
+Json counterJson(ulong value) {
+    return Json(cast(long) (value > long.max ? long.max : value));
+}
+
+/// Tombstones preserve a reason category, not an exception message (which may
+/// own a large backing allocation or contain arbitrary/non-UTF8 peer bytes).
+string boundedCloseReason(string reason) {
+    const colon = reason.indexOf(':');
+    if (colon >= 0) reason = reason[0 .. colon];
+    char[128] text;
+    const length = reason.length < text.length ? reason.length : text.length;
+    foreach (i; 0 .. length)
+        text[i] = reason[i] >= ' ' && reason[i] <= '~' ? reason[i] : '?';
+    return text[0 .. length].idup;
+}
+
+/// Parse startup timeout without the legacy positive-only fallback. Zero is
+/// unlimited; an explicitly empty, signed, overflowing or malformed knob fails.
+long parseDetachMaxSecs(string value) {
+    if (!value.length) throw new Exception(ENV_DETACH_MAX_SECS ~ " must be nonnegative");
+    ulong result;
+    foreach (c; value) {
+        if (c < '0' || c > '9' || result > (long.max - (c - '0')) / 10)
+            throw new Exception(ENV_DETACH_MAX_SECS ~ " must be a nonnegative integer");
+        result = result * 10 + c - '0';
+    }
+    return cast(long) result;
+}
+
+/// Locate a top-level META value in the original validated request. Count wire
+/// bytes, including internal whitespace/escapes, without serializing its tree.
+/// Duplicate (including escaped) meta keys are refused rather than measured
+/// differently from the parser's winning key. Scanning uses constant storage.
+size_t rawMetaEncodedBytes(string line) {
+    line = line.strip;
+    const space = line.indexOf(' ');
+    if (space < 0) throw new Exception("META payload required");
+    auto text = line[space + 1 .. $].strip;
+    if (!text.length || text[0] != '{') throw new Exception("META payload must be an object");
+    size_t i = 1, bytes;
+    bool found;
+    while (true) {
+        skipJsonSpace(text, i);
+        if (i == text.length) throw new Exception("unterminated META object");
+        if (text[i] == '}') break;
+        const keyStart = i;
+        skipJsonString(text, i);
+        if (i - keyStart > 128) throw new Exception("META field name too long");
+        auto key = parseJsonString(text[keyStart .. i]).get!string;
+        skipJsonSpace(text, i);
+        if (i == text.length || text[i++] != ':') throw new Exception("META colon required");
+        skipJsonSpace(text, i);
+        const start = i;
+        skipJsonValue(text, i);
+        if (key == "meta") {
+            if (found) throw new Exception("duplicate meta field");
+            found = true;
+            bytes = i - start;
+        }
+        skipJsonSpace(text, i);
+        if (i == text.length) throw new Exception("unterminated META object");
+        if (text[i] == '}') break;
+        if (text[i++] != ',') throw new Exception("META comma required");
+    }
+    if (!found) throw new Exception("meta required");
+    return bytes;
+}
+
+private void skipJsonSpace(string text, ref size_t i) {
+    while (i < text.length && (text[i] == ' ' || text[i] == '\t'
+        || text[i] == '\r' || text[i] == '\n')) ++i;
+}
+
+private void skipJsonString(string text, ref size_t i) {
+    if (i == text.length || text[i++] != '"') throw new Exception("JSON string required");
+    while (i < text.length) {
+        auto c = text[i++];
+        if (c == '"') return;
+        if (c == '\\') {
+            if (i == text.length) break;
+            ++i;
+        }
+    }
+    throw new Exception("unterminated JSON string");
+}
+
+private void skipJsonValue(string text, ref size_t i) {
+    if (i == text.length) throw new Exception("JSON value required");
+    if (text[i] == '"') { skipJsonString(text, i); return; }
+    if (text[i] == '{' || text[i] == '[') {
+        size_t depth;
+        do {
+            auto c = text[i];
+            if (c == '"') { skipJsonString(text, i); continue; }
+            ++i;
+            if (c == '{' || c == '[') ++depth;
+            if (c == '}' || c == ']') --depth;
+            if (depth > 256) throw new Exception("META nesting exceeds 256");
+        } while (i < text.length && depth);
+        if (depth) throw new Exception("unterminated JSON value");
+        return;
+    }
+    const start = i;
+    while (i < text.length && text[i] != ',' && text[i] != '}'
+        && text[i] != ' ' && text[i] != '\t' && text[i] != '\r' && text[i] != '\n') ++i;
+    if (i == start) throw new Exception("JSON value required");
 }
 
 /// `OK <json>` response line (no trailing newline).
@@ -703,4 +895,93 @@ unittest {
     ]) assertThrown(DialRequest.fromJson(parseJsonString(bad)));
     nativeReq.hasProxy = true;
     assertThrown(nativeReq.toJson());
+}
+
+@("META wire accounting honors escapes, nested values and duplicate keys")
+unittest {
+    import std.exception : assertThrown;
+    auto value = `{ "text" : "escaped \" } ],", "nested" : [null, {"x":true}] }`;
+    auto line = `META {"id":"c-test","meta": ` ~ value ~ ` , "extra":[{},1]}`;
+    assert(rawMetaEncodedBytes(line) == value.length);
+    assert(rawMetaEncodedBytes(`META {"meta":null}`) == 4);
+    assert(rawMetaEncodedBytes(`META {"m\u0065ta":"\u00e9"}`) == `"\u00e9"`.length);
+    assert(rawMetaEncodedBytes("META {\"meta\":\"é\"}") == "\"é\"".length);
+    assertThrown(rawMetaEncodedBytes(`META {"meta":{},"m\u0065ta":[]}`));
+    assertThrown(rawMetaEncodedBytes(`META {"id":"none"}`));
+    string deep = "META {\"meta\":";
+    foreach (_; 0 .. 257) deep ~= "[";
+    deep ~= "0";
+    foreach (_; 0 .. 257) deep ~= "]";
+    deep ~= "}";
+    assertThrown(rawMetaEncodedBytes(deep));
+}
+
+@("Zero detach timeout is unlimited and invalid configuration is rejected")
+unittest {
+    import std.exception : assertThrown;
+    assert(parseDetachMaxSecs("0") == 0);
+    assert(parseDetachMaxSecs("600") == 600);
+    foreach (bad; ["", "-1", "+1", "1x", " 0", "9223372036854775808"])
+        assertThrown(parseDetachMaxSecs(bad));
+}
+
+@("Entry gap fields round trip while inventory excludes restoration payloads")
+unittest {
+    Entry entry;
+    entry.id = "c-instance-42";
+    entry.ordinal = 42;
+    entry.state = "open";
+    entry.attached = true;
+    entry.gapGeneration = 3;
+    entry.gapAckGeneration = 2;
+    entry.droppedBytes = 12345;
+    entry.droppedLines = 67;
+    entry.gapStartedAtMs = 9988;
+    entry.deliveryAmbiguous = true;
+    entry.relayBytes = 4096;
+    entry.outboundBytes = 128;
+    entry.pongBytes = 64;
+    entry.relayWriterFlightBytes = 1024;
+    entry.relayWriteInFlightMs = 100;
+    entry.upstreamWriteInFlightMs = 200;
+    entry.attachmentGeneration = 4;
+    entry.attachmentWriterCompletions = 3;
+    entry.upstreamWriterDone = true;
+    entry.tlsFinalized = true;
+    entry.meta = parseJsonString(`{"private":"not-in-inventory"}`);
+    entry.tag.name = "not-in-inventory-either";
+    auto full = Entry.fromJson(entry.toJson());
+    assert(full.ordinal == 42 && full.gapGeneration == 3 && full.gapAckGeneration == 2);
+    assert(full.droppedBytes == 12345 && full.droppedLines == 67);
+    assert(full.gapStartedAtMs == 9988 && full.deliveryAmbiguous);
+    assert(full.relayBytes == 4096 && full.outboundBytes == 128 && full.pongBytes == 64);
+    assert(full.relayWriterFlightBytes == 1024 && full.relayWriteInFlightMs == 100);
+    assert(full.upstreamWriteInFlightMs == 200 && full.attachmentGeneration == 4);
+    assert(full.attachmentWriterCompletions == 3 && full.upstreamWriterDone && full.tlsFinalized);
+    auto row = entry.inventoryJson();
+    assert(row["meta"].type == Json.Type.undefined && row["tag"].type == Json.Type.undefined);
+    assert(row["gapGeneration"].get!long == 3 && row["deliveryAmbiguous"].get!bool);
+    assert(counterJson(ulong.max).get!long == long.max);
+}
+
+@("Tombstone reasons retain only bounded printable categories")
+unittest {
+    assert(boundedCloseReason("tls_read_error: large private exception") == "tls_read_error");
+    assert(boundedCloseReason("closed_by_engine") == "closed_by_engine");
+    assert(boundedCloseReason("bad\nreason") == "bad?reason");
+    string longReason;
+    foreach (_; 0 .. 1000) longReason ~= "x";
+    assert(boundedCloseReason(longReason).length == 128);
+}
+
+@("Incarnation is explicit on restoration and fresh-DIAL responses")
+unittest {
+    Entry entry;
+    entry.id = "c-example-1";
+    entry.instance = "00000000-0000-4000-8000-000000000000";
+    assert(Entry.fromJson(entry.toJson()).instance == entry.instance);
+    ConnectedLine connected;
+    connected.id = entry.id;
+    connected.instance = entry.instance;
+    assert(ConnectedLine.fromJson(connected.toJson()).instance == entry.instance);
 }

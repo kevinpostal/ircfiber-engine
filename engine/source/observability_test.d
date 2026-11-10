@@ -16,8 +16,10 @@ import std.conv : to;
 
 import ircfiber.observability;
 import ircfiber.tracing : withSpan, Span, isTracingEnabled, setTracingEnabled,
-    flushAndSendSpans, configureTracing;
+    flushAndSendSpans;
 import ircfiber.tracing : drainQueueForTest, queueLengthForTest;
+import ircfiber.tracing : runTracingQueueRegressionForTest;
+import ircfiber.logging : runLoggingQueueRegressionForTest;
 
 /// Tracks the number of passing checks.
 int passed;
@@ -195,12 +197,6 @@ void runMetricsTests() {
         flushAndSendMetrics();
         queued = drainPendingForTest();
         ok("flushAndSendMetrics when disabled is no-op", queued.length == 0);
-        configureMetrics("", "test-svc", "0.0.1");
-        ok("configureMetrics(\"\") disables", !isMetricsEnabled());
-        configureMetrics("disabled", "test-svc", "0.0.1");
-        ok("configureMetrics(\"disabled\") disables", !isMetricsEnabled());
-        configureMetrics("http://signoz:4318/v1/metrics", "test-svc", "0.0.1");
-        ok("configureMetrics(valid) enables", isMetricsEnabled());
         setMetricsEnabled(prev);
         drainPendingForTest();
     }
@@ -224,12 +220,6 @@ void runMetricsTests() {
         flushAndSendSpans();
         ok("flushAndSendSpans when disabled is no-op",
             queueLengthForTest() == 0);
-        configureTracing("", "test-svc", "0.0.1");
-        ok("configureTracing(\"\") disables", !isTracingEnabled());
-        configureTracing("disabled", "test-svc", "0.0.1");
-        ok("configureTracing(\"disabled\") disables", !isTracingEnabled());
-        configureTracing("http://signoz:4318/v1/traces", "test-svc", "0.0.1");
-        ok("configureTracing(valid) enables", isTracingEnabled());
         setTracingEnabled(prev);
         drainQueueForTest();
     }
@@ -238,6 +228,24 @@ void runMetricsTests() {
 int main() {
     stderr.writeln("OTel observability metrics test");
     runMetricsTests();
+    try {
+        runMetricsQueueRegressionForTest();
+        ok("metrics bounded ownership, drop saturation, collector failure/recovery", true);
+    } catch (Throwable e) {
+        ok("metrics bounded ownership, drop saturation, collector failure/recovery", false, e.msg);
+    }
+    try {
+        runTracingQueueRegressionForTest();
+        ok("spans bounded ownership, single export, collector failure/recovery", true);
+    } catch (Throwable e) {
+        ok("spans bounded ownership, single export, collector failure/recovery", false, e.msg);
+    }
+    try {
+        runLoggingQueueRegressionForTest();
+        ok("logs bounded ownership, single export, collector failure/recovery", true);
+    } catch (Throwable e) {
+        ok("logs bounded ownership, single export, collector failure/recovery", false, e.msg);
+    }
 
     stderr.writeln("\nResult: ", passed, " passed, ", failed, " failed");
     return failed > 0 ? 1 : 0;

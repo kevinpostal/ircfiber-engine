@@ -95,7 +95,11 @@ make -C .. ship-engine        # from ircfiber-infra: build on the prod host, dep
 # hot-swaps the engine container only (IRC sockets held by the holder; gateway untouched)
 ```
 
-Release container builds schedule compiler instances serially to bound peak memory on the shared production build host. The BuildKit memory cap stays enabled; engine, holder and migration binaries are still built with the release configuration.
+Release container builds schedule compiler instances serially to bound peak memory. Build on a healthy non-production Linux builder when production lacks headroom; transfer immutable images rather than compiling on the live host. Engine, holder and migration binaries are all built from the same committed checkout with hash-checked pinned dependency patches.
+
+The engine can hot-attach to legacy protocol-v1 holders through genuine streaming `LIST`; newer holders advertise bounded `INVENTORY` and gap-acknowledgement capabilities. A holder replacement cannot preserve its TCP/TLS sockets. `make ship-holder` deliberately refuses: use only the directly scoped `site/deploy/playbooks/holder-deploy.yml` with an immutable qualified image, preserved live configuration, maintenance UUID and fresh collector evidence. This is a single-attempt fenced operation, not a retry/rollback loop.
+
+Durable archive ingress uses `/var/lib/ircfiber/archive` by default. Mount persistent per-engine storage across swaps; the defaults cap spool storage at 512 MiB and require 2 GiB free disk. `IRCFIBER_ARCHIVE_DIR`, `IRCFIBER_ARCHIVE_MAX_BYTES` and `IRCFIBER_ARCHIVE_MIN_FREE_BYTES` configure that storage. Unknown/failed archival acknowledgement remains pending or explicitly degraded; it is not reported as a successful archive.
 
 ## Testing
 
@@ -176,11 +180,11 @@ retargeting an exit starts fresh. Host-specific TLS failures do not trip an
 exit's global circuit breaker. Host bans, SASL gates, client avoidance and
 durable admission still apply.
 
-The `ipv6` route token is accepted by the shared contract but is not yet a
-supported engine transport tier: it is skipped, never replaced with a
-dual-stack direct dial. Native source-bound IPv6 requires the later holder
-family-capability implementation. The existing shared direct path below is
-not proof that a native routed address was used.
+The `ipv6` route tier requires a valid routed pool prefix, the saved immutable
+IID and a holder advertising IPv6-only dial capability. It binds the reserved
+source address and never substitutes shared-direct or a dual-stack dial.
+Legacy holders withdraw this capability; missing prerequisites skip the tier
+within the existing saved provider order.
 
 Direct TLS/STARTTLS tries the remaining vetted DNS addresses if the first
 TCP winner fails negotiation. Each address gets at most one protocol attempt,
@@ -200,10 +204,10 @@ Missing/invalid IIDs or prefixes produce no reservation; the engine never
 generates a transient replacement. Different saved connections have different
 IIDs; reconnects and hot swaps retain them.
 
-A reservation is not evidence of an active source. Until the IPv6-only native
-transport tier is available, shared-direct uses no pool bind, including its
-plaintext fallback. Holder-observed `localIp`/`peerIp` remain the transport
-evidence; active-route status belongs to the native transport integration.
+A reservation alone is not evidence of an active source. Native route status
+uses the holder-observed `localIp`/`peerIp`; shared-direct retains no pool bind,
+including its plaintext fallback. Restoring a legacy shared IPv6 socket does
+not relabel it as a native reservation.
 The obsolete per-owner rDNS pool setting has been removed.
 An assigned IPv6 route does not override a remote server's access policy.
 
@@ -216,8 +220,20 @@ dub run :holder --config=dial-fallback-test --compiler=ldc2
 The real-socket harness requires IPv6 loopback and `openssl`; it checks TLS
 fallback, bounded silent-peer timeouts with scheduler progress, cleanup,
 STARTTLS, unchanged plaintext behavior, original SNI, and destination policy.
-Deploying the holder (`make ship-holder`) disconnects **every IRC session**;
-an engine hot swap alone cannot install holder-side address fallback.
+Installing holder-side functionality disconnects every socket that holder owns;
+an engine hot swap alone cannot install it. Use the qualified, guarded maintenance
+entry described above, not an unqualified holder recreation.
+
+### Bounded memory and archive qualification
+
+The engine exposes `memory-reliability-test`, `archive-buffer-test` and
+`archive-storage-test` DUB configurations; the storage fixture requires explicit
+credential-free loopback Mongo isolation and failpoint opt-in. Shell launchers in
+`scripts/e2e/` enforce disposable Docker fixtures and immutable candidate images.
+`legacy_holder_continuity.sh` covers old-holder engine transfer;
+`holder_engine_qualification.sh` and `holder_memory_reliability.sh` cover the
+candidate holder. `archive_reliability.sh` is the candidate-only archive proof.
+Smoke-duration runs are not the full warm-up/soak qualification receipts.
 
 
 ## Links

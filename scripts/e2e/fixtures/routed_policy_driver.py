@@ -54,7 +54,7 @@ def mongo(script):
 def gateway_access():
     return fixture_gateway_access(
         os.environ["ROUTED_DOCKER_CONTEXT"], PROJECT, COMPOSE, "gateway",
-        "203.0.113.4", int(os.environ["ROUTED_PORT"]),
+        "203.0.207.4", int(os.environ["ROUTED_PORT"]),
         os.environ.get("ROUTED_EXTERNAL_FORWARD", "0") == "1")
 
 
@@ -240,7 +240,7 @@ def transport_edges():
         (dict(request, bindIp6=""), False),
         (dict(request, bindIp6="2001:db8:9999::12345"), False),
         (dict(request, bindIp6="2001:db8:9999::1234"), False),
-        (dict(request, proxy={"host": "203.0.113.30", "port": 1080}), False),
+        (dict(request, proxy={"host": "203.0.207.30", "port": 1080}), False),
         (request, True),  # old/shared holder has no authorized source pool
     ]
     before = counts()
@@ -386,7 +386,7 @@ def run():
     time.sleep(4)
     assert held(main)[0][1]["id"] == entry
     # Eligible expired recovery records must not bypass the provider block.
-    recovery = {"v": 1, "endpoint": "203.0.113.30:1080", "draining": False,
+    recovery = {"v": 1, "endpoint": "203.0.207.30:1080", "draining": False,
                 "drainReason": "", "open": True, "retryAtMs": int(time.time() * 1000) - 1000,
                 "failures": 1, "circuitReason": "fixture recovery", "trialToken": "",
                 "trialUntilMs": 0, "trialRegisteredAtMs": 0, "gen": 1,
@@ -407,7 +407,7 @@ def run():
     update(main, ["mullvad", "nordvpn"], "fixture-mull")
     wait("remembered pinned Mullvad", lambda: connected(main, "mullvad"))
     policy(blocked=["mullvad", "nordvpn"])
-    recovery = dict(recovery, endpoint="203.0.113.31:1080",
+    recovery = dict(recovery, endpoint="203.0.207.31:1080",
                     retryAtMs=int(time.time() * 1000) - 1000,
                     updatedAtMs=int(time.time() * 1000))
     redis("set", "irc:egress:admission:fixture-mull", json.dumps(recovery))

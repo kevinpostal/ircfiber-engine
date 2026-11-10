@@ -46,6 +46,7 @@ enum TARGET_ACCOUNT = "account";
 immutable string[] TZ_MODES = ["account", "device"];
 immutable string[] PREVIEW_LEVELS = ["full", "sender", "none"];
 immutable long[] COALESCE_SECONDS = [0, 30, 120];
+immutable long[] MOBILE_IDLE_SECONDS = [0, 60, 300, 600];
 immutable string[] EMAIL_MODES = ["delay15", "delay60", "daily"];
 immutable long[] REPEAT_SECONDS = [0, 180];
 /// `networks` values; an absent key is the default ("mentions").
@@ -114,6 +115,11 @@ struct Presentation {
     int coalesceSec = 30;
 }
 
+/// Push delivery timing after visible, focused browser interaction.
+struct MobileSettings {
+    int idleSec = 60;
+}
+
 /// Email cadence.
 struct EmailSettings {
     string mode = "delay15";
@@ -168,6 +174,7 @@ struct NotificationPolicy {
     QuietHours quiet;
     HighlightSettings highlight;
     Presentation presentation;
+    MobileSettings mobile;
     EmailSettings email;
     /// networkId → `all` or `muted`.
     string[string] networks;
@@ -214,6 +221,9 @@ struct NotificationPolicy {
         pr["preview"] = Json(presentation.preview);
         pr["coalesceSec"] = Json(presentation.coalesceSec);
         j["presentation"] = pr;
+        auto mo = Json.emptyObject;
+        mo["idleSec"] = Json(mobile.idleSec);
+        j["mobile"] = mo;
         auto em = Json.emptyObject;
         em["mode"] = Json(email.mode);
         em["dailyHour"] = Json(email.dailyHour);
@@ -350,6 +360,13 @@ struct NotificationPolicy {
             } else {
                 readEnum(*pr, "preview", PREVIEW_LEVELS, p.presentation.preview, repair);
                 readIntIn(*pr, "coalesceSec", COALESCE_SECONDS, p.presentation.coalesceSec, repair);
+            }
+        }
+        if (auto mo = "mobile" in j) {
+            if (mo.type != Json.Type.object) {
+                repair = true;
+            } else {
+                readIntIn(*mo, "idleSec", MOBILE_IDLE_SECONDS, p.mobile.idleSec, repair);
             }
         }
         if (auto em = "email" in j) {
@@ -706,6 +723,14 @@ string validatePatch(Json patch, out string field) {
                     }
                 }
                 break;
+            case "mobile":
+                if (v.type != Json.Type.object) return "invalid_value";
+                foreach (string k, x; v) {
+                    field = "mobile." ~ k;
+                    if (k != "idleSec") return "unknown_field";
+                    if (x.type != Json.Type.int_ || !MOBILE_IDLE_SECONDS.canFind(x.get!long)) return "invalid_value";
+                }
+                break;
             case "email":
                 if (v.type != Json.Type.object) return "invalid_value";
                 foreach (string k, x; v) {
@@ -808,6 +833,8 @@ void applyPatch(ref NotificationPolicy p, Json patch) {
         if (auto v = "preview" in *pr) p.presentation.preview = v.get!string;
         if (auto v = "coalesceSec" in *pr) p.presentation.coalesceSec = cast(int) v.get!long;
     }
+    if (auto mo = "mobile" in patch)
+        if (auto v = "idleSec" in *mo) p.mobile.idleSec = cast(int) v.get!long;
     if (auto em = "email" in patch) {
         if (auto v = "mode" in *em) p.email.mode = v.get!string;
         if (auto v = "dailyHour" in *em) p.email.dailyHour = cast(int) v.get!long;

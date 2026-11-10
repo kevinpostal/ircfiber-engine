@@ -1,5 +1,7 @@
 FROM python:3.12-alpine
+RUN apk add --no-cache openssl
 WORKDIR /fixture
 # Copy the existing protocol servers: no workstation bind mounts or substitutes.
-COPY holder_mock_irc.py socks_exit.py /fixture/
+COPY holder_mock_irc.py socks_exit.py memory_fixture.py holder_pressure.py holder_engine_qualification.py holder_memory_qualification.py memory_qualification.py legacy_holder_continuity.py archive_qualification.py fixture_http.py /fixture/
+COPY coordinated_holder.py coordinated_fixture_root.py coordinated_egress.py /fixture/
 ENV PYTHONUNBUFFERED=1

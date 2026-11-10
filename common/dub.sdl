@@ -28,6 +28,12 @@ configuration "routing-policy-test" {
     targetType "library"
     versions "VibeUseFibers" "RoutingPolicyTest"
 }
+
+// Native contract harnesses do not start Linux host diagnostic endpoints.
+configuration "contract-test" {
+    targetType "library"
+    excludedSourceFiles "source/ircfiber/runtime_diagnostic.d"
+}
 configuration "unittest" {
     targetType "library"
     versions "VibeUseFibers"

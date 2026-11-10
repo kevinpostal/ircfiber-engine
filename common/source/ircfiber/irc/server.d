@@ -85,6 +85,8 @@ struct ConnectionServer {
     string[] supportedRoutes;
     /// Verified native pool only; empty unless IPv6 capability is usable.
     string ipv6Prefix;
+    /// Durable archival control capability; absent/old engines are unsupported.
+    int archiveVersion;
     /// Serializes to JSON.
     Json toJson() const {
         auto j = Json.emptyObject;
@@ -102,6 +104,7 @@ struct ConnectionServer {
         j["routingPolicyVersion"] = Json(routingPolicyVersion);
         j["supportedRoutes"] = serializeToJson(supportedRoutes);
         j["ipv6Prefix"] = Json(ipv6Prefix);
+        j["archiveVersion"] = Json(archiveVersion);
         j["registrationUnavailableFor"] = serializeToJson(registrationUnavailableFor);
         if (gitHash.length) j["gitHash"] = Json(gitHash);
         if (gitShort.length) j["gitShort"] = Json(gitShort);
@@ -138,6 +141,8 @@ struct ConnectionServer {
         if (j["draining"].type != Json.Type.undefined) s.draining = j["draining"].get!bool;
         if (j["routingPolicyVersion"].type == Json.Type.int_)
             s.routingPolicyVersion = j["routingPolicyVersion"].get!int;
+        if (j["archiveVersion"].type == Json.Type.int_)
+            s.archiveVersion = j["archiveVersion"].get!int;
         if (j["ipv6Prefix"].type == Json.Type.string) {
             import ircfiber.irc.ipv6 : parseRoutedIpv6Prefix;
             ubyte[16] prefix;

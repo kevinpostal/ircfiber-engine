@@ -8,6 +8,7 @@ import vibe.data.json : Json, parseJsonString;
 import vibe.db.redis.redis : RedisDatabase;
 import ircfiber.irc.routing_policy;
 import ircfiber.redis.protocol : RedisKeys;
+import ircfiber.network_write_gate : NetworkWriteUnavailableException;
 
 class RoutingPolicyUnavailableException : Exception {
     this(string message = "Routing policy unavailable") { super(message); }
@@ -118,8 +119,10 @@ RoutingPolicyDocument saveRoutingPolicy(RedisDatabase db, long expectedRevision,
                 throw new RoutingPolicyConflictException(newer.revision);
             }
             case "upgrade": throw new RoutingUpgradeException();
+            case "maintenance": throw new NetworkWriteUnavailableException();
             default: throw new RoutingPolicyUnavailableException();
         }
+    } catch (NetworkWriteUnavailableException e) { throw e;
     } catch (RoutingPolicyConflictException e) { throw e; }
     catch (RoutingUpgradeException e) { throw e; }
     catch (RoutingPolicyUnavailableException e) { throw e; }
@@ -151,6 +154,7 @@ if enginesAware(KEYS[1], ARGV[1]) then return '1' else return '0' end
 LUA";
 
 private enum SAVE_SCRIPT = ENGINE_GATE_FUNCTION ~ q"LUA
+if redis.call('EXISTS', 'irc:holder:maintenance:write-exclusion') ~= 0 then return cjson.encode({state='maintenance'}) end
 if redis.call('GET', KEYS[3]) ~= '1' then return cjson.encode({state='upgrade'}) end
 local current = redis.call('GET', KEYS[1])
 if not current then return cjson.encode({state='unavailable'}) end

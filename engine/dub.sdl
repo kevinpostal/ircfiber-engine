@@ -150,6 +150,27 @@ configuration "observability-test" {
     versions "VibeUseFibers"
 }
 
+configuration "memory-reliability-test" {
+    targetType "executable"
+    targetName "memory-reliability-test"
+    mainSourceFile "source/memory_reliability_test.d"
+    versions "VibeUseFibers" "FiberMlsWireHarness" "ServicesWireHarness" "MemoryReliabilityHarness"
+}
+
+configuration "archive-storage-test" {
+    targetType "executable"
+    targetName "archive-storage-test"
+    mainSourceFile "source/archive_storage_test.d"
+    versions "VibeUseFibers"
+}
+
+configuration "archive-buffer-test" {
+    targetType "executable"
+    targetName "archive-buffer-test"
+    mainSourceFile "source/archive_buffer_test.d"
+    versions "VibeUseFibers" "MemoryReliabilityHarness"
+}
+
 configuration "parser-fuzz-test" {
     targetType "executable"
     targetName "parser-fuzz-test"

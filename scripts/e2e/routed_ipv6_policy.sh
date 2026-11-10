@@ -20,7 +20,7 @@ export ROUTED_EXTERNAL_FORWARD=${ROUTED_EXTERNAL_FORWARD:-0}
 # Docker internal networks intentionally have no published gateway port.
 # Linux uses the driver's loopback TCP relay. VM contexts require an existing,
 # operator-owned SSH forward into that local VM, never a public listener.
-printf 'Gateway access: Linux loopback relay, or ROUTED_EXTERNAL_FORWARD=1 with an operator-owned local-VM SSH forward: -L 127.0.0.1:%s:203.0.113.4:8090\n' "$ROUTED_PORT"
+printf 'Gateway access: Linux loopback relay, or ROUTED_EXTERNAL_FORWARD=1 with an operator-owned local-VM SSH forward: -L 127.0.0.1:%s:203.0.207.4:8090\n' "$ROUTED_PORT"
 if [[ $(uname -s) != Linux && $ROUTED_EXTERNAL_FORWARD != 1 ]]; then
     fail 'VM context prerequisite: establish the printed loopback SSH forward using your existing VM SSH configuration, then set ROUTED_EXTERNAL_FORWARD=1'
 fi
@@ -57,7 +57,23 @@ cleanup() {
     exit "$status"
 }
 trap cleanup EXIT
-# Unique image tags + a mandatory build from the current tree prevent a stale
-# :local image from impersonating newly implemented transport behavior.
-dc build --pull endpoint native-engine native-holder gateway
-python3 "$SCRIPT_DIR/fixtures/routed_policy_driver.py" "$COMPOSE"
+# Default routing qualification still builds from source. Archival qualification
+# supplies already-built immutable application candidates; only endpoint tools
+# are built here, never an application implicitly.
+export ROUTED_IMMUTABLE_IMAGES=${ROUTED_IMMUTABLE_IMAGES:-0}
+driver=${ROUTED_DRIVER:-routed_policy_driver.py}
+case "$driver" in routed_policy_driver.py|archive_routing_driver.py) ;; *) fail 'unsupported fixture driver';; esac
+if [[ $ROUTED_IMMUTABLE_IMAGES == 1 ]]; then
+    for variable in ROUTED_ENGINE_IMAGE ROUTED_OLD_ENGINE_IMAGE ROUTED_GATEWAY_IMAGE ROUTED_HOLDER_IMAGE; do
+        value=${!variable:-}
+        [[ $value =~ ^sha256:[0-9a-f]{64}$ ]] || fail "$variable must be a local immutable sha256 image ID"
+        [[ $(dock image inspect --format '{{.Id}}' "$value") == "$value" ]] || fail "$variable image is not present in this context"
+        export "$variable"
+    done
+    dc build endpoint
+elif [[ $ROUTED_IMMUTABLE_IMAGES == 0 && $driver == routed_policy_driver.py ]]; then
+    dc build --pull endpoint native-engine native-holder gateway
+else
+    fail 'archive qualification requires ROUTED_IMMUTABLE_IMAGES=1'
+fi
+python3 "$SCRIPT_DIR/fixtures/$driver" "$COMPOSE"

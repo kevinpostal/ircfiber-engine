@@ -1,0 +1,411 @@
+--- a/source/vibe/data/json.d
++++ b/source/vibe/data/json.d
+@@ -1992,9 +1992,14 @@
+ /**
+ 	Serializer for a range based plain JSON string representation.
+ 
++	`maxReadDepth` and `maxReadKeyBytes` are opt-in resource bounds for typed
++	dictionary/array deserialization and unknown-value skipping. Zero preserves
++	the original unbounded behavior. Key bounds count decoded UTF-8 bytes; keys
++	inside discarded subtrees are validated without retaining their contents.
++
+ 	See_Also: vibe.data.serialization.serialize, vibe.data.serialization.deserialize, serializeToJson, deserializeJson
+ */
+-struct JsonStringSerializer(R, bool pretty = false)
++struct JsonStringSerializer(R, bool pretty = false, size_t maxReadDepth = 0, size_t maxReadKeyBytes = 0)
+ 	if (isInputRange!R || isOutputRange!(R, char))
+ {
+ 	private {
+@@ -2126,12 +2131,29 @@
+ 	static if (isInputRange!(R)) {
+ 		private {
+ 			int m_line = 0;
++			enum boundedRead = maxReadDepth != 0 || maxReadKeyBytes != 0;
++			static if (maxReadDepth) size_t m_readDepth;
+ 		}
+ 
++		private void enterReadComposite() @safe
++		{
++			static if (maxReadDepth) {
++				enforceJson(m_readDepth < maxReadDepth, "JSON nesting limit exceeded.");
++				++m_readDepth;
++			}
++		}
++
++		private void leaveReadComposite() @safe
++		{
++			static if (maxReadDepth) --m_readDepth;
++		}
++
+ 		void readDictionary(Traits)(scope void delegate(string) @safe entry_callback)
+ 		{
+ 			m_range.skipWhitespace(&m_line);
+ 			enforceJson(!m_range.empty && m_range.front == '{', "Expecting object.");
++			enterReadComposite();
++			scope(exit) leaveReadComposite();
+ 			m_range.popFront();
+ 			bool first = true;
+ 			while(true) {
+@@ -2146,7 +2168,7 @@
+ 					m_range.skipWhitespace(&m_line);
+ 				} else first = false;
+ 
+-				auto name = m_range.skipJsonString(&m_line);
++				auto name = skipJsonString!(R, maxReadKeyBytes, boundedRead)(m_range, &m_line);
+ 
+ 				m_range.skipWhitespace(&m_line);
+ 				enforceJson(!m_range.empty && m_range.front == ':', "Expecting ':', not '"~m_range.front.to!string~"'.");
+@@ -2163,6 +2185,8 @@
+ 		{
+ 			m_range.skipWhitespace(&m_line);
+ 			enforceJson(!m_range.empty && m_range.front == '[', "Expecting array.");
++			enterReadComposite();
++			scope(exit) leaveReadComposite();
+ 			m_range.popFront();
+ 			bool first = true;
+ 			while(true) {
+@@ -2195,6 +2219,8 @@
+ 					m_range.popFront();
+ 				}
+ 				return ret;
++			} else static if (!isForwardRange!R && (is(T : long) || is(T : BigInt) || is(T : real))) {
++				return readInputJsonNumber!(T, R, boundedRead)(m_range);
+ 			} else static if (is(T : long)) {
+ 				bool is_float;
+ 				bool is_long_overflow;
+@@ -2219,11 +2245,11 @@
+ 					return () @trusted { // appender
+ 						auto ret = appender!string();
+ 						readArray!Traits((sz) {}, () @trusted {
+-							ret.put(m_range.skipJsonString(&m_line));
++							ret.put(skipJsonString!(R, 0, boundedRead)(m_range, &m_line));
+ 						});
+ 						return ret.data;
+ 					} ();
+-				} else return m_range.skipJsonString(&m_line);
++				} else return skipJsonString!(R, 0, boundedRead)(m_range, &m_line);
+ 			}
+ 			else static if (isSomeString!T) return readValue!(Traits, string).to!T;
+ 			else static if (is(T == UUID)) return UUID(readValue!(Traits, string)());
+@@ -2251,6 +2277,10 @@
+ 		void skipValue() @safe
+ 		{
+ 			m_range.skipWhitespace(&m_line);
++			enforceJson(!m_range.empty, "Expected JSON value.");
++			bool composite = m_range.front == '[' || m_range.front == '{';
++			if (composite) enterReadComposite();
++			scope(exit) if (composite) leaveReadComposite();
+ 			switch(m_range.front) {
+ 			case '[':
+ 				m_range.popFront();
+@@ -2264,6 +2294,8 @@
+ 					} else if (!first) {
+ 						enforceJson(m_range.front == ',', "Expecting ',' or ']'.");
+ 						m_range.popFront();
++						m_range.skipWhitespace(&m_line);
++						enforceJson(!m_range.empty && m_range.front != ']', "Expected array value after ','.");
+ 					} else first = false;
+ 					skipValue();
+ 				}
+@@ -2281,40 +2313,42 @@
+ 						enforceJson(m_range.front == ',', "Expecting ',' or '}', not '"~m_range.front.to!string~"'.");
+ 						m_range.popFront();
+ 						m_range.skipWhitespace(&m_line);
++						enforceJson(!m_range.empty && m_range.front != '}', "Expected object key after ','.");
+ 					} else first = false;
+ 
+-					m_range.skipJsonString(&m_line);
++					discardJsonString!(R, boundedRead)(m_range, &m_line);
+ 
+ 					m_range.skipWhitespace(&m_line);
+-					enforceJson(!m_range.empty && m_range.front == ':', "Expecting ':', not '"~m_range.front.to!string~"'.");
++					enforceJson(!m_range.empty && m_range.front == ':', "Expecting ':'.");
+ 					m_range.popFront();
+ 
+ 					skipValue();
+ 				}
+ 				break;
+ 			case '"':
+-				m_range.skipJsonString(&m_line);
++				discardJsonString!(R, boundedRead)(m_range, &m_line);
+ 				break;
+ 			case '-':
+ 			case '0': .. case '9':
+-				bool dummy; // ignore
+-				m_range.skipNumber(dummy, dummy);
++				bool is_float, is_long_overflow;
++				JsonDiscardSink sink;
++				consumeJsonNumber!(R, JsonDiscardSink, boundedRead)(m_range, sink, is_float, is_long_overflow);
+ 				break;
+ 			case 't':
+ 				foreach (ch; "true") {
+-					enforceJson(m_range.front == ch, "Expecting 'true'.");
++					enforceJson(!m_range.empty && m_range.front == ch, "Expecting 'true'.");
+ 					m_range.popFront();
+ 				}
+ 				break;
+ 			case 'f':
+ 				foreach (ch; "false") {
+-					enforceJson(m_range.front == ch, "Expecting 'false'.");
++					enforceJson(!m_range.empty && m_range.front == ch, "Expecting 'false'.");
+ 					m_range.popFront();
+ 				}
+ 				break;
+ 			case 'n':
+ 				foreach (ch; "null") {
+-					enforceJson(m_range.front == ch, "Expecting 'null'.");
++					enforceJson(!m_range.empty && m_range.front == ch, "Expecting 'null'.");
+ 					m_range.popFront();
+ 				}
+ 				break;
+@@ -2629,10 +2663,10 @@
+ }
+ 
+ /// private
+-private string jsonUnescape(R)(ref R range)
++private string jsonUnescape(R, bool discard = false, size_t maxDecodedBytes = 0, bool strict = false)(ref R range)
+ {
+ 	// avoid memory allocations if there are no escape sequences present
+-	static if (isSomeString!R) {
++	static if (isSomeString!R && !discard && !maxDecodedBytes && !strict) {
+ 		auto idx = range.representation.countUntil!(ch => ch == '\\' || ch == '\"');
+ 		if (idx < 0) return range.to!string;
+ 
+@@ -2644,6 +2678,10 @@
+ 
+ 		auto ret = appender!string;
+ 		ret.put(str);
++	} else static if (discard) {
++		JsonDiscardSink ret;
++	} else static if (maxDecodedBytes) {
++		JsonBoundedStringSink!maxDecodedBytes ret;
+ 	} else {
+ 		auto ret = appender!string;
+ 	}
+@@ -2668,7 +2706,7 @@
+ 					case 'u':
+ 
+ 						dchar decode_unicode_escape() {
+-							enforceJson(range.front == 'u');
++							enforceJson(!range.empty && range.front == 'u', "Expected Unicode escape.");
+ 							range.popFront();
+ 							dchar uch = 0;
+ 							foreach( i; 0 .. 4 ){
+@@ -2689,6 +2727,8 @@
+ 
+ 						if(0xD800 <= uch && uch <= 0xDBFF) {
+ 							/* surrogate pair */
++							static if (strict)
++								enforceJson(!range.empty && range.front == '\\', "Expected low surrogate escape.");
+ 							range.popFront(); // backslash '\'
+ 							auto uch2 = decode_unicode_escape();
+ 							enforceJson(0xDC00 <= uch2 && uch2 <= 0xDFFF, "invalid Unicode");
+@@ -2699,12 +2739,16 @@
+ 										(uch2 - 0xDC00) +
+ 										0x10000;
+ 							}
++						} else {
++							static if (strict)
++								enforceJson(uch < 0xDC00 || uch > 0xDFFF, "Unexpected low surrogate.");
+ 						}
+ 						ret.put(uch);
+ 						break;
+ 				}
+ 				break;
+ 			default:
++				static if (strict) enforceJson(ch >= 0x20, "Unescaped control character in string.");
+ 				ret.put(ch);
+ 				range.popFront();
+ 				break;
+@@ -2724,62 +2768,120 @@
+ 	return res.assumeUTF();
+ }
+ 
+-/// private
++// Shared lexical scanner: forward ranges retain their original token view,
++// input ranges use bounded scalar scratch, and discarded tokens store nothing.
++private struct JsonDiscardSink {
++	void put(T)(T value) @safe {}
++	@property string data() @safe { return null; }
++}
++
++// Count the encoded UTF-8 result, not source escape length. In particular a
++// custom char input range supplies octets: append them unchanged, not as dchar.
++private struct JsonBoundedStringSink(size_t limit) {
++	Appender!string value;
++	size_t length;
++
++	void put(C)(C ch) {
++		static if (is(C == char)) enum bytes = 1;
++		else {
++			import std.utf : codeLength;
++			auto bytes = codeLength!char(ch);
++		}
++		enforceJson(bytes <= limit - length, "JSON decoded object key limit exceeded.");
++		value.put(ch);
++		length += bytes;
++	}
++
++	@property string data() { return value.data; }
++}
++
++private struct JsonNumberLength {
++	size_t length;
++	void put(char value) @safe { ++length; }
++}
++
++private struct JsonNumberScratch {
++	char[128] buffer;
++	size_t length;
++	void put(char value) @safe {
++		enforceJson(length < buffer.length, "JSON numeric scalar exceeds conversion scratch.");
++		buffer[length++] = value;
++	}
++}
++
++private T readInputJsonNumber(T, R, bool strict = false)(ref R s)
++{
++	bool is_float, is_long_overflow;
++	static if (is(T : BigInt)) {
++		auto sink = appender!string;
++		consumeJsonNumber!(R, typeof(sink), strict)(s, sink, is_float, is_long_overflow);
++		enforceJson(!is_float, "Expecting integer number.");
++		return BigInt(sink.data);
++	} else {
++		JsonNumberScratch sink;
++		consumeJsonNumber!(R, JsonNumberScratch, strict)(s, sink, is_float, is_long_overflow);
++		static if (is(T : long))
++			enforceJson(!is_float, "Expecting integer number.");
++		auto result = to!T(sink.buffer[0 .. sink.length]);
++		static if (isFloatingPoint!T) {
++			import std.math : isFinite;
++			enforceJson(isFinite(result), "JSON numeric scalar overflow.");
++		}
++		return result;
++	}
++}
++
+ private auto skipNumber(R)(ref R s, out bool is_float, out bool is_long_overflow)
+ 	if (!isNarrowString!R && isForwardRange!R)
+ {
+-	auto sOrig = s.save;
+-	size_t idx = 0;
++	auto original = s.save;
++	JsonNumberLength sink;
++	consumeJsonNumber(s, sink, is_float, is_long_overflow);
++	return original.takeExactly(sink.length);
++}
++
++private void consumeJsonNumber(R, Sink, bool strict = false)(ref R s, ref Sink sink,
++	out bool is_float, out bool is_long_overflow)
++{
++	bool digit() { return !s.empty && s.front >= '0' && s.front <= '9'; }
++	void consume() {
++		sink.put(cast(char)s.front);
++		s.popFront();
++	}
+ 	is_float = false;
+ 	is_long_overflow = false;
+-	ulong int_part = 0;
+-	if (s.front == '-') {
+-		s.popFront(); ++idx;
+-	}
++	ulong int_part;
++	enforceJson(!s.empty, "Expected number.");
++	if (s.front == '-') consume();
++	enforceJson(digit(), "Digit expected at beginning of number.");
+ 	if (s.front == '0') {
+-		s.popFront(); ++idx;
+-	}
+-	else {
+-		enforceJson(isDigit(s.front), "Digit expected at beginning of number.");
+-		int_part = s.front - '0';
+-		s.popFront(); ++idx;
+-		while( !s.empty && isDigit(s.front) ) {
++		consume();
++		static if (strict) enforceJson(!digit(), "Leading zero in number.");
++	} else {
++		while (digit()) {
++			auto dig = s.front - '0';
+ 			if (!is_long_overflow) {
+-				auto dig = s.front - '0';
+-				if ((long.max / 10) > int_part || ((long.max / 10) == int_part && (long.max % 10) >= dig)) {
+-					int_part *= 10;
+-					int_part += dig;
+-				}
+-				else {
+-					is_long_overflow = true;
+-				}
++				if (int_part < long.max / 10 ||
++					(int_part == long.max / 10 && dig <= long.max % 10))
++					int_part = int_part * 10 + dig;
++				else is_long_overflow = true;
+ 			}
+-			s.popFront(); ++idx;
++			consume();
+ 		}
+ 	}
+-
+-	if( !s.empty && s.front == '.' ) {
+-		s.popFront(); ++idx;
++	if (!s.empty && s.front == '.') {
+ 		is_float = true;
+-		while( !s.empty && isDigit(s.front) ) {
+-			s.popFront(); ++idx;
+-		}
++		consume();
++		static if (strict) enforceJson(digit(), "Expected fraction.");
++		while (digit()) consume();
+ 	}
+-
+-	if( !s.empty && (s.front == 'e' || s.front == 'E') ) {
+-		s.popFront(); ++idx;
++	if (!s.empty && (s.front == 'e' || s.front == 'E')) {
+ 		is_float = true;
+-		if( !s.empty && (s.front == '+' || s.front == '-') ) {
+-			s.popFront(); ++idx;
+-		}
+-		enforceJson( !s.empty && isDigit(s.front), "Expected exponent." ~ sOrig.takeExactly(idx).to!string);
+-		s.popFront(); ++idx;
+-		while( !s.empty && isDigit(s.front) ) {
+-			s.popFront(); ++idx;
+-		}
++		consume();
++		if (!s.empty && (s.front == '+' || s.front == '-')) consume();
++		enforceJson(digit(), "Expected exponent.");
++		while (digit()) consume();
+ 	}
+-
+-	return sOrig.takeExactly(idx);
+ }
+ 
+ unittest
+@@ -2802,17 +2904,26 @@
+ }
+ 
+ /// private
+-private string skipJsonString(R)(ref R s, int* line = null)
++private string skipJsonString(R, size_t maxDecodedBytes = 0, bool strict = false)(ref R s, int* line = null)
+ {
+ 	// TODO: count or disallow any newlines inside of the string
+ 	enforceJson(!s.empty && s.front == '"', "Expected '\"' to start string.");
+ 	s.popFront();
+-	string ret = jsonUnescape(s);
++	string ret = jsonUnescape!(R, false, maxDecodedBytes, strict)(s);
+ 	enforceJson(!s.empty && s.front == '"', "Expected '\"' to terminate string.");
+ 	s.popFront();
+ 	return ret;
+ }
+ 
++private void discardJsonString(R, bool strict = false)(ref R s, int* line = null)
++{
++	enforceJson(!s.empty && s.front == '"', "Expected '\"' to start string.");
++	s.popFront();
++	jsonUnescape!(R, true, 0, strict)(s);
++	enforceJson(!s.empty && s.front == '"', "Expected '\"' to terminate string.");
++	s.popFront();
++}
++
+ /// private
+ private void skipWhitespace(R)(ref R s, int* line = null)
+ {

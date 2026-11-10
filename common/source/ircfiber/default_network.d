@@ -45,6 +45,7 @@ import ircfiber.models.irc_event : IRCRawEvent;
 import ircfiber.irc.routing_policy : RouteKind, resolveRoutingPolicy;
 import ircfiber.irc.routing_policy_store : requireRoutingUpgrade, loadRoutingPolicy,
     RoutingPolicyUnavailableException;
+import ircfiber.network_write_gate : NetworkWriteUnavailableException;
 
 class DefaultFiberPlacementException : Exception {
     this(string message) { super(message); }
@@ -270,7 +271,9 @@ NetworkConfig ensureDefaultFiberNetwork(
             sort!((a,b)=> a.id.toString() < b.id.toString())(dups);
             auto keep = dups[0];
             foreach (i; 1 .. dups.length) {
-                try { networkRepo.deleteById(dups[i].id); } catch (Exception) {}
+                try { networkRepo.deleteById(dups[i].id); }
+                catch (NetworkWriteUnavailableException e) { throw e; }
+                catch (Exception) {}
                 // Clean up Redis assignment for the deleted duplicate if it was ever assigned
                 try {
                     const sid = serverRegistry.getServerForNetwork(dups[i].id.toString());
@@ -286,7 +289,8 @@ NetworkConfig ensureDefaultFiberNetwork(
                 return networkRepo.findByIdWithIpv6Iid(keep.id);
             }
         }
-    } catch (Ipv6IdentityException e) { throw e; }
+    } catch (NetworkWriteUnavailableException e) { throw e; }
+    catch (Ipv6IdentityException e) { throw e; }
     catch (Exception) {} // dedup best-effort
 
     if (!cfg.servicesProvisioningPending)

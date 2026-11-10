@@ -1,5 +1,9 @@
 module app_engine;
 
+// Collect before transient roster/snapshot allocations consume the container
+// ceiling. Embed this: vibe.d reparses raw argv and rejects --DRT-gcopt.
+extern(C) __gshared string[] rt_options = ["gcopt=heapSizeFactor:1.2"];
+
 import std.algorithm : canFind;
 import std.conv : to;
 import std.process : environment;
@@ -13,8 +17,8 @@ import vibe.core.log;
 
 import ircfiber.logging : logException, configureLogging, setLoggingEnabled, isLoggingEnabled;
 import ircfiber.engine.bootstrap : bootstrapEngine, startHeartbeatTask,
-    startOrphanReaperTask, loadNetworksWithRetry, refreshRoutingCapabilities, EngineContext;
-import ircfiber.tracing : configureTracing, startTracingExporter,
+    startOrphanReaperTask, startTelemetryFlushTask, loadNetworksWithRetry, refreshRoutingCapabilities, EngineContext;
+import ircfiber.tracing : configureTracing,
     isEnvEnabled, setTracingEnabled, isTracingEnabled;
 import ircfiber.observability : configureMetrics, setMetricsEnabled, isMetricsEnabled;
 import ircfiber.engine.consumer : startControlConsumer, startCommandConsumers;
@@ -24,9 +28,15 @@ import ircfiber.irc.connection : startDailyReachabilityRefresh;
 import ircfiber.irc.services_registry : initializeServicesOperations;
 import ircfiber.redis.protocol : RedisKeys;
 import ircfiber.logging : logJsonMap;
+import ircfiber.runtime_memory : RuntimeTelemetryCounters, sampleRuntimeMemory, logRuntimeMemorySample;
 import ircfiber.term_signal : installTermSignalFlag, termSignal;
 import vibe.core.core : exitEventLoop;
 import core.sys.posix.signal : SIGTERM;
+import ircfiber.engine.archive_spool : ArchiveSpoolStatus, ArchiveRecord;
+import ircfiber.engine.archive_worker : ArchiveWorker;
+import ircfiber.engine.archive_control : applyArchiveRedisPurge, stopArchive;
+import ircfiber.runtime_memory : compactRuntimeMemorySample;
+import ircfiber.runtime_diagnostic : DiagnosticStatus;
 /// Global engine context shared across the process.
 __gshared EngineContext g_ctx;
 
@@ -82,7 +92,6 @@ private bool setupOtel(string svcName) {
     setTracingEnabled(true);
     setMetricsEnabled(true);
     setLoggingEnabled(true);
-    startTracingExporter();
     logInfo("OTel enabled for %s: traces=%s metrics=%s logs=%s", svcName, tracesEp, metricsEp, logsEp);
     return true;
 }
@@ -152,6 +161,14 @@ void main() {
     // actively reconnecting.
     cast(void) writeStateSnapshots(ctx);
 
+    // The main context outlives every client task. Prepare only fresh
+    // producers; held ATTACH/readers never wait on archival Mongo I/O.
+    if (ctx.archiveControl !is null) {
+        ctx.connManager.prepareFreshArchiveScope = (string network, string owner) {
+            return ctx.archiveControl.prepareScope(ctx, network, owner);
+        };
+    }
+
     // Register this server in the Redis registry. Must happen after
     // runApplication() starts the vibe.d event loop because Redis
     // hset/hget/sadd/smembers need the event loop to process I/O.
@@ -175,8 +192,25 @@ void main() {
             logException("registration", e, "Registration task failed");
         }
     });
+    if (ctx.archiveSpool !is null && ctx.archiveControl !is null) {
+        try {
+            ctx.archiveWorker = new ArchiveWorker(ctx.archiveSpool, ctx.messageRepo,
+                (ref const ArchiveRecord record) {
+                    return applyArchiveRedisPurge(ctx, record);
+                });
+            ctx.archiveWorker.start();
+            ctx.archiveControl.start(ctx);
+        } catch (Throwable e) {
+            ctx.localServer.archiveVersion = 0;
+            logJsonMap("error", "engine", "Archive consumer unavailable; live sockets preserved",
+                ["event":"archive_gap", "reason":"consumer_initialization_failed"]);
+        }
+    }
     startHeartbeatTask(ctx);
     startOrphanReaperTask(ctx);
+    startTelemetryFlushTask();
+    startRuntimeMemorySampler(ctx);
+    startRetiredClientMaintenance(ctx);
 
     // Start the distributed EngineJanitor in the engine process too.
     // Each engine elects itself as janitor for ~lockTtl seconds; if the
@@ -252,6 +286,11 @@ void main() {
             }
             decommissioned = true;
         }
+        try stopArchive(ctx);
+        catch (Throwable) {
+            try logJsonMap("error", "engine", "Archive shutdown unavailable",
+                ["event":"archive_shutdown_unclean"]); catch (Throwable) {}
+        }
         exitEventLoop();
     });
 
@@ -270,6 +309,127 @@ void main() {
     // without the loop — the holder's detach timeout covers the rest).
     if (!decommissioned) decommission(ctx);
     logInfo("IRC Fiber Engine shutdown complete");
+}
+
+private bool retiredMaintenanceRunning;
+
+/// Reclamation must progress even when Redis heartbeat/export tasks fail.
+private void startRetiredClientMaintenance(ref EngineContext ctx) {
+    if (retiredMaintenanceRunning) return;
+    retiredMaintenanceRunning = true;
+    try {
+        runTask(() nothrow {
+            scope(exit) retiredMaintenanceRunning = false;
+            while (termSignal() == 0) {
+                try {
+                    ctx.connManager.reapRetiredClients(Clock.currTime.toUnixTime!long * 1000);
+                } catch (Throwable) {
+                    try logJsonMap("warn", "engine", "Retired ownership maintenance unavailable",
+                        ["event": "retired_maintenance_failed"]);
+                    catch (Throwable) {}
+                }
+                try sleep(10.seconds); catch (Throwable) {}
+            }
+        });
+    } catch (Throwable error) {
+        retiredMaintenanceRunning = false;
+        throw error;
+    }
+}
+
+private bool memorySamplerRunning;
+
+/// One local sampler, independent of Redis, collector health and OTLP enablement.
+/// No snapshot serialization, forced collection, disk writes or gateway pools.
+private void startRuntimeMemorySampler(ref EngineContext ctx) {
+    if (memorySamplerRunning) return;
+    memorySamplerRunning = true;
+    try {
+        runTask(() nothrow {
+            scope(exit) memorySamplerRunning = false;
+            while (true) {
+                try {
+                    auto sample = sampleRuntimeMemory();
+                    if (ctx.connManager !is null) {
+                        const counters = ctx.connManager.memoryCounters();
+                        sample.ownersAvailable = true;
+                        static foreach (i; 0 .. typeof(sample.owners).tupleof.length) {
+                            sample.owners.tupleof[i] = __traits(getMember, counters,
+                                __traits(identifier, typeof(sample.owners).tupleof[i]));
+                        }
+                        sample.largestNetworkCount = counters.largestNetworkCount < 5 ? counters.largestNetworkCount : 5;
+                        foreach (i; 0 .. sample.largestNetworkCount) {
+                            sample.largestNetworks[i].networkId = counters.largestNetworks[i].networkId;
+                            sample.largestNetworks[i].identities = counters.largestNetworks[i].identities;
+                            sample.largestNetworks[i].members = counters.largestNetworks[i].members;
+                        }
+                    }
+                    ArchiveSpoolStatus archive;
+                    if (ctx.archiveSpool !is null && ctx.archiveSpool.tryStatus(archive)) {
+                        sample.archive.available = true;
+                        sample.archive.ready = archive.ready;
+                        sample.archive.failed = archive.failed;
+                        sample.archive.stopping = archive.stopping;
+                        sample.archive.replayInFlight = archive.replayInFlight;
+                        sample.archive.ingressCommands = archive.ingressCommands;
+                        sample.archive.ingressBytes = archive.ingressBytes;
+                        sample.archive.pendingOperations = archive.pendingOperations;
+                        sample.archive.pendingBytes = archive.pendingBytes;
+                        sample.archive.checkpoint = archive.checkpoint;
+                        sample.archive.durableSequence = archive.durableSequence;
+                        sample.archive.gapCount = archive.gapCount;
+                        sample.archive.sampledAtMs = archive.sampledAtMs;
+                        sample.archive.diskBytesKnown = archive.diskBytesKnown;
+                        sample.archive.freeBytesKnown = archive.freeBytesKnown;
+                        sample.archive.diskBytes = archive.diskBytes;
+                        sample.archive.maxBytes = archive.maxBytes;
+                        sample.archive.minFreeBytes = archive.minFreeBytes;
+                        sample.archive.freeBytes = archive.freeBytes;
+                        sample.archive.controlReserveBytes = archive.controlReserveBytes;
+                        sample.archive.stateReserveBytes = archive.stateReserveBytes;
+                        sample.archive.diskSampledAtMs = archive.diskSampledAtMs;
+                        sample.archive.diskThreads = archive.diskThreads;
+                        sample.archive.consumerFibers = ctx.archiveWorker is null
+                            ? 0 : ctx.archiveWorker.activeConsumerFibers();
+                    }
+                    DiagnosticStatus diagnostic;
+                    if (ctx.runtimeDiagnostics !is null && ctx.runtimeDiagnostics.tryStatus(diagnostic)) {
+                        sample.diagnosticFile.available = true;
+                        sample.diagnosticFile.lastWrittenAtMs = diagnostic.lastWrittenAtMs;
+                        sample.diagnosticFile.pendingBytes = diagnostic.pendingBytes;
+                        sample.diagnosticFile.inFlightBytes = diagnostic.inFlightBytes;
+                        sample.diagnosticFile.failures = diagnostic.failures;
+                        sample.diagnosticFile.lastResult = diagnostic.lastResult.to!string;
+                    }
+                    import ircfiber.observability : sampleMetricsQueue, METRICS_MAX_POINTS, METRICS_MAX_BYTES;
+                    import ircfiber.tracing : sampleTracingQueue, TRACING_MAX_SPANS, TRACING_MAX_BYTES;
+                    import ircfiber.logging : sampleLoggingQueue, LOGGING_MAX_ENTRIES, LOGGING_MAX_BYTES;
+                    sample.metrics = runtimeQueueCounters(sampleMetricsQueue(), METRICS_MAX_POINTS, METRICS_MAX_BYTES);
+                    sample.tracing = runtimeQueueCounters(sampleTracingQueue(), TRACING_MAX_SPANS, TRACING_MAX_BYTES);
+                    sample.logging = runtimeQueueCounters(sampleLoggingQueue(), LOGGING_MAX_ENTRIES, LOGGING_MAX_BYTES);
+                    logRuntimeMemorySample(sample, "engine");
+                    if (ctx.runtimeDiagnostics !is null)
+                        ctx.runtimeDiagnostics.tryPublish(compactRuntimeMemorySample(sample));
+                } catch (Throwable e) {
+                    // A bad sample must not terminate future observation. Do not
+                    // use logException: its immediate network export can stall
+                    // local sampling behind a failed collector.
+                    try logJsonMap("warn", "engine", "Runtime memory sample unavailable",
+                        ["event": "memory_sample_failed"]);
+                    catch (Throwable) {}
+                }
+                try sleep(30.seconds); catch (Throwable) {}
+            }
+        });
+    } catch (Throwable e) {
+        memorySamplerRunning = false;
+        throw e;
+    }
+}
+
+private RuntimeTelemetryCounters runtimeQueueCounters(T)(const T queue, ulong maxCount, ulong maxBytes) {
+    return RuntimeTelemetryCounters(queue.count, queue.bytes, queue.droppedCount,
+        queue.droppedBytes, maxCount, maxBytes, true, queue.lastExportSuccessAtMs);
 }
 
 /// QUIT every network (closing their upstream sockets in the holder),

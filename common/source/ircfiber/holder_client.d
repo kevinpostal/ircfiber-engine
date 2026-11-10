@@ -18,19 +18,19 @@
  */
 module ircfiber.holder_client;
 
-import core.time : Duration, msecs, seconds;
+import core.time : Duration, MonoTime, msecs, seconds;
 import std.conv : to;
 import std.datetime : Clock;
 import std.process : environment;
 import std.socket : AddressFamily;
 import std.string : startsWith, lastIndexOf, strip;
 
-import vibe.core.core : runTask, sleep;
+import vibe.core.core : runTask, sleep, setTimer;
 import vibe.core.log;
 import vibe.core.net : TCPConnection, NetworkAddress, resolveHost, connectTCP;
 import vibe.core.sync : TaskMutex;
-import vibe.data.json : Json, parseJsonString;
-import vibe.stream.operations : readLine;
+import vibe.data.json : Json, JsonStringSerializer, parseJsonString;
+import vibe.data.serialization : deserialize, optional, name;
 
 import ircfiber.logging : logJsonMap;
 import ircfiber.redis.protocol : TlsInfo;
@@ -45,9 +45,9 @@ enum HOLDER_PROTO = 1;
 /// already tens of MiB, far past the 1 MiB request cap this used to
 /// share. Reading a response with the request cap made `list()` — and so
 /// every engine hot swap — fail once the network had enough users.
-/// The real fix is for `LIST` to stop carrying `META` and for callers to
-/// fetch it per session with `INFO`; that is a protocol change for the
-/// holder and both its clients, so until then the read is bounded here.
+/// New holders use bounded metadata-free INVENTORY pages and per-entry INFO.
+/// This larger limit remains necessary for the genuine legacy LIST fallback;
+/// INVENTORY responses have their own 64 KiB receive limit.
 enum HOLDER_MAX_RESPONSE = 64 * 1024 * 1024;
 /// Default holder address (docker: shared named volume).
 enum HOLDER_DEFAULT_ADDR = "unix:///run/ircfiber/holder.sock";
@@ -205,6 +205,7 @@ alias DialProgress = void delegate(ref DialEvent) nothrow;
 /// `CONNECTED` payload plus the relay stream.
 struct DialResult {
     TCPConnection stream;
+    string instance;
     string id;
     string peerIp;
     string localIp;
@@ -218,6 +219,14 @@ struct DialResult {
 /// One `LIST`/`INFO`/`ATTACH` entry.
 struct HolderEntry {
     string id;
+    string instance;
+    ulong ordinal;
+    long gapGeneration;
+    long gapAckGeneration;
+    long droppedBytes;
+    long droppedLines;
+    long gapStartedAtMs;
+    bool deliveryAmbiguous;
     DialTag tag;
     /// `open` | `closed`.
     string state;
@@ -240,6 +249,14 @@ struct HolderEntry {
     static HolderEntry fromJson(Json j) {
         HolderEntry e;
         e.id = jsonStr(j, "id");
+        e.instance = jsonStr(j, "instance");
+        e.ordinal = cast(ulong) jsonLong(j, "ordinal");
+        e.gapGeneration = jsonLong(j, "gapGeneration");
+        e.gapAckGeneration = jsonLong(j, "gapAckGeneration");
+        e.droppedBytes = jsonLong(j, "droppedBytes");
+        e.droppedLines = jsonLong(j, "droppedLines");
+        e.gapStartedAtMs = jsonLong(j, "gapStartedAtMs");
+        e.deliveryAmbiguous = jsonBool(j, "deliveryAmbiguous");
         e.tag = DialTag.fromJson(j["tag"]);
         e.state = jsonStr(j, "state");
         e.attached = jsonBool(j, "attached");
@@ -260,16 +277,54 @@ struct HolderEntry {
 
     /// True when the entry carries an engine META object.
     bool hasMeta() const { return meta.type == Json.Type.object; }
+
+    /// Independent small backing allocations, suitable for asynchronous evidence
+    /// consumers even when this entry came from a full legacy restoration LIST.
+    HolderEntry ownedIdentity() const {
+        HolderEntry e;
+        e.id = id.idup;
+        e.instance = instance.idup;
+        e.state = state.idup;
+        e.host = host.idup;
+        e.peerIp = peerIp.idup;
+        e.localIp = localIp.idup;
+        e.closeReason = closeReason.idup;
+        e.ordinal = ordinal;
+        e.gapGeneration = gapGeneration;
+        e.gapAckGeneration = gapAckGeneration;
+        e.droppedBytes = droppedBytes;
+        e.droppedLines = droppedLines;
+        e.gapStartedAtMs = gapStartedAtMs;
+        e.deliveryAmbiguous = deliveryAmbiguous;
+        e.tag = DialTag(tag.networkId.idup, tag.userId.idup, tag.name.idup, tag.egressLabel.idup);
+        e.attached = attached;
+        e.port = port;
+        e.tlsOk = tlsOk;
+        e.tls.version_ = tls.version_.idup;
+        e.tls.cipher = tls.cipher.idup;
+        e.tls.certCn = tls.certCn.idup;
+        e.tls.certIssuer = tls.certIssuer.idup;
+        e.tls.certNotAfterMs = tls.certNotAfterMs;
+        e.connectedAtMs = connectedAtMs;
+        e.detachedSinceMs = detachedSinceMs;
+        e.bufferedBytes = bufferedBytes;
+        e.closedAtMs = closedAtMs;
+        return e;
+    }
 }
 
 /// `STATUS` payload.
 struct HolderStatus {
     int proto;
+    string instance;
+    string[] capabilities;
     string serverId;
     string holder;
     long pid;
     long uptimeMs;
     long open;
+    /// False for missing/malformed counts: unknown is not an empty holder.
+    bool openAvailable;
     long attached;
     long detached;
     long closed;
@@ -287,11 +342,17 @@ struct HolderStatus {
     static HolderStatus fromJson(Json j) {
         HolderStatus s;
         s.proto = cast(int) jsonLong(j, "proto");
+        s.instance = jsonStr(j, "instance");
+        if (j["capabilities"].type == Json.Type.array)
+            foreach (value; j["capabilities"])
+                if (value.type == Json.Type.string) s.capabilities ~= value.get!string;
         s.serverId = jsonStr(j, "serverId");
         s.holder = jsonStr(j, "holder");
         s.pid = jsonLong(j, "pid");
         s.uptimeMs = jsonLong(j, "uptimeMs");
         s.open = jsonLong(j, "open");
+        if (j.type == Json.Type.object && j["open"].type == Json.Type.int_)
+            s.openAvailable = j["open"].get!long >= 0;
         s.attached = jsonLong(j, "attached");
         s.detached = jsonLong(j, "detached");
         s.closed = jsonLong(j, "closed");
@@ -354,10 +415,189 @@ private long unixMsNow() {
     return Clock.currTime.toUnixTime!long * 1000;
 }
 
-/// Reads one `\n`-terminated IPC line (CR stripped). Throws on EOF/timeout.
-private string readIpcLine(TCPConnection c) {
-    auto raw = readLine(c, HOLDER_MAX_RESPONSE, "\n");
-    auto line = cast(string) raw.idup;
+/// A consuming input range for exactly one LF-terminated response. Like
+/// readUntilSmall, peek first and consume only through this delimiter: a
+/// disposable range must never hide bytes belonging to the next response.
+/// char front is a UTF-8 octet, not a ubyte promoted to a Unicode codepoint.
+private final class FrameInputRange {
+    @safe:
+    private TCPConnection stream;
+    private MonoTime deadline;
+    private size_t limit, received, position, available, consumed;
+    private bool terminated;
+    private ubyte[] storage;
+
+    this(TCPConnection stream, MonoTime deadline, size_t limit) {
+        this.stream = stream;
+        this.deadline = deadline;
+        this.limit = limit;
+        // Byte-array storage is not a conservatively scanned class payload.
+        storage = new ubyte[65536];
+    }
+
+    private void checkDeadline() {
+        const remaining = deadline - MonoTime.currTime;
+        if (remaining <= 0.seconds) throw new Exception("holder response deadline exceeded");
+        stream.readTimeout = remaining;
+    }
+
+    @property bool empty() {
+        if (position < available) return false;
+        if (terminated) return true;
+        checkDeadline();
+        if (stream.empty) throw new Exception("truncated holder response");
+        checkDeadline();
+        auto bytes = stream.peek();
+        size_t count = bytes.length < storage.length ? bytes.length : storage.length;
+        // No peek support: one octet cannot cross the response boundary.
+        if (!count) count = 1;
+        else foreach (i; 0 .. count)
+            if (bytes[i] == '\n') { count = i + 1; break; }
+        if (count > limit - received)
+            throw new Exception("holder response exceeds receive limit");
+        stream.read(storage[0 .. count]);
+        received += count;
+        position = 0;
+        available = count;
+        if (storage[count - 1] == '\n') {
+            terminated = true;
+            available--;
+        }
+        return available == 0;
+    }
+
+    @property char front() {
+        if (empty) throw new Exception("truncated holder response value");
+        return cast(char) storage[position];
+    }
+
+    void popFront() {
+        if (empty) throw new Exception("truncated holder response value");
+        position++;
+        if ((++consumed & 4095) == 0) checkDeadline();
+    }
+
+    void finish() {
+        while (!empty) {
+            const c = front;
+            if (c != ' ' && c != '\t' && c != '\r')
+                throw new Exception("trailing data in holder response");
+            popFront();
+        }
+        checkDeadline();
+    }
+}
+
+/// No custom fromJson hooks here: unknown META is consumed by the existing
+/// serializer's allocation-free skipValue rather than constructing a Json tree.
+private struct HolderWireTag {
+    @optional string networkId;
+    @optional string userId;
+    @optional string name;
+    @optional string egressLabel;
+}
+
+private struct HolderWireTls {
+    @optional bool ok;
+    @optional @name("version") string version_;
+    @optional string cipher;
+    @optional string certCn;
+    @optional string certIssuer;
+    @optional long certNotAfterMs;
+}
+
+private struct HolderWireEntry {
+    @optional string id;
+    @optional string instance;
+    @optional ulong ordinal;
+    @optional long gapGeneration;
+    @optional long gapAckGeneration;
+    @optional long droppedBytes;
+    @optional long droppedLines;
+    @optional long gapStartedAtMs;
+    @optional bool deliveryAmbiguous;
+    @optional HolderWireTag tag;
+    @optional string state;
+    @optional bool attached;
+    @optional string host;
+    @optional ushort port;
+    @optional HolderWireTls tls;
+    @optional string peerIp;
+    @optional string localIp;
+    @optional long connectedAtMs;
+    @optional long detachedSinceMs;
+    @optional long bufferedBytes;
+    @optional string closeReason;
+    @optional long closedAtMs;
+
+    HolderEntry entry() {
+        HolderEntry e;
+        foreach (field; __traits(allMembers, HolderWireEntry)) {
+            static if (field != "tag" && field != "tls" && field != "entry")
+                __traits(getMember, e, field) = __traits(getMember, this, field);
+        }
+        e.tag = DialTag(tag.networkId, tag.userId, tag.name, tag.egressLabel);
+        e.tlsOk = tls.ok;
+        e.tls.version_ = tls.version_;
+        e.tls.cipher = tls.cipher;
+        e.tls.certCn = tls.certCn;
+        e.tls.certIssuer = tls.certIssuer;
+        e.tls.certNotAfterMs = tls.certNotAfterMs;
+        return e;
+    }
+}
+
+private struct HolderWireList {
+    @optional HolderWireEntry[] connections;
+}
+
+private struct HolderWireError {
+    @optional string code;
+    @optional string msg;
+}
+
+private T readIpcResponse(T)(TCPConnection stream, MonoTime deadline, size_t maxBytes) {
+    auto input = new FrameInputRange(stream, deadline, maxBytes);
+    char[8] verb;
+    size_t length;
+    while (!input.empty && input.front != ' ') {
+        if (length == verb.length) throw new Exception("invalid holder response verb");
+        verb[length++] = input.front;
+        input.popFront();
+    }
+    if (input.empty) throw new Exception("missing holder response payload");
+    input.popFront();
+    if (verb[0 .. length] == "ERR") {
+        auto error = deserialize!(JsonStringSerializer!(FrameInputRange, false, 128, 65536), HolderWireError)(input);
+        input.finish();
+        throw new HolderErrorException(error.code, error.msg);
+    }
+    if (verb[0 .. length] != "OK") throw new Exception("unexpected holder response verb");
+    static if (is(T == Json)) {
+        // Full restoration deliberately retains META. Keep the existing JSON
+        // tree API, without imposing a forward-range contract on the stream.
+        import std.array : appender;
+        auto payload = appender!string;
+        while (!input.empty) { payload.put(input.front); input.popFront(); }
+        auto result = parseJsonString(payload.data);
+        input.finish();
+        return result;
+    } else {
+        auto result = deserialize!(JsonStringSerializer!(FrameInputRange, false, 128, 65536), T)(input);
+        input.finish();
+        return result;
+    }
+}
+
+/// Full-line users (DIAL/ATTACH) share the same exact-delimiter reader.
+private string readIpcLine(TCPConnection c, size_t maxBytes = HOLDER_MAX_RESPONSE) {
+    import std.array : appender;
+    const timeout = c.readTimeout == Duration.max ? 10.seconds : c.readTimeout;
+    auto input = new FrameInputRange(c, MonoTime.currTime + timeout, maxBytes);
+    auto out_ = appender!string;
+    while (!input.empty) { out_.put(input.front); input.popFront(); }
+    input.finish();
+    auto line = out_.data;
     if (line.length && line[$ - 1] == '\r') line = line[0 .. $ - 1];
     return line;
 }
@@ -457,6 +697,10 @@ final class HolderClient {
         /// Set once the first control session was established; afterwards a
         /// loss is logged as `holder_unavailable` and repaired in background.
         bool booted;
+        string currentInstance;
+        bool inventoryCapable;
+        // Identity/state only. Never retain a META tree between observations.
+        DialTag[string] knownTags;
     }
 
     enum CONTROL_TIMEOUT = 10.seconds;
@@ -543,6 +787,18 @@ final class HolderClient {
 
     /// Whether the control session is currently believed to be up.
     @property bool controlAlive() const { return controlUp; }
+    @property string instance() const { return currentInstance; }
+
+    private void observeIdentity(Json payload) {
+        const observed = jsonStr(payload, "instance");
+        if (observed != currentInstance) knownTags = null;
+        currentInstance = observed;
+        inventoryCapable = false;
+        if (payload["capabilities"].type == Json.Type.array)
+            foreach (capability; payload["capabilities"])
+                if (capability.type == Json.Type.string
+                        && capability.get!string == "inventory_v1") inventoryCapable = true;
+    }
 
     private void openControl() {
         auto c = open(OPEN_TIMEOUT);
@@ -553,10 +809,16 @@ final class HolderClient {
         hello["serverId"] = serverId;
         hello["engine"] = environment.get("IRCFIBER_BUILD_SHORT", "dev");
         if (token.length) hello["token"] = token;
+        const deadline = MonoTime.currTime + CONTROL_TIMEOUT;
+        auto timeout = setTimer(CONTROL_TIMEOUT, {
+            try c.close(); catch (Exception) {}
+        });
+        scope(exit) timeout.stop();
         writeLine(c, "HELLO " ~ hello.toString());
-        auto ok = expectOk(readIpcLine(c));
+        auto ok = readIpcResponse!Json(c, deadline, HOLDER_MAX_RESPONSE);
         if (jsonLong(ok, "proto") != HOLDER_PROTO)
             throw new HolderErrorException("proto", "holder speaks proto " ~ jsonLong(ok, "proto").to!string);
+        observeIdentity(ok);
         control = c;
         controlUp = true;
         logJsonMap("info", "holder", "Holder control session up",
@@ -617,24 +879,37 @@ final class HolderClient {
     private Json request(string verb, Json payload = Json.undefined) {
         mutex.lock();
         scope (exit) mutex.unlock();
+        return requestLocked(verb, payload);
+    }
+
+    /// The caller owns mutex, including snapshot construction and retries.
+    private Json requestLocked(string verb, Json payload = Json.undefined) {
+        return requestDecodedLocked!Json(verb, payload);
+    }
+
+    /// The same lock and framing for full restoration and metadata-free
+    /// evidence. Start the deadline before writing, not once each chunk arrives.
+    private T requestDecodedLocked(T)(string verb, Json payload = Json.undefined) {
         if (!controlUp) {
             controlLost("control session down");
             throw new HolderUnavailableException("holder control session down");
         }
-        string line = payload.type == Json.Type.undefined ? verb : verb ~ " " ~ payload.toString();
-        string reply;
+        const deadline = MonoTime.currTime + CONTROL_TIMEOUT;
+        auto stream = control;
+        auto timeout = setTimer(CONTROL_TIMEOUT, {
+            try stream.close(); catch (Exception) {}
+        });
+        scope(exit) timeout.stop();
         try {
-            writeLine(control, line);
-            reply = readIpcLine(control);
+            const line = payload.type == Json.Type.undefined ? verb : verb ~ " " ~ payload.toString();
+            writeLine(stream, line);
+            return readIpcResponse!T(stream, deadline, verb == "INVENTORY" ? 65536 : HOLDER_MAX_RESPONSE);
+        } catch (HolderErrorException e) {
+            // A valid ERR has consumed its terminator. The control is reusable.
+            throw e;
         } catch (Exception e) {
             controlLost(e.msg);
             throw new HolderUnavailableException("holder control I/O failed: " ~ e.msg);
-        }
-        try {
-            return expectOk(reply);
-        } catch (HolderUnavailableException e) {
-            controlLost(e.msg);
-            throw e;
         }
     }
 
@@ -654,14 +929,104 @@ final class HolderClient {
         return out_;
     }
 
+    /// A fresh physical scan. New holders send bounded, META-free pages;
+    /// legacy holders genuinely require LIST (no invented LIST options).
+    /// Unknown tags are learned through streaming INFO with META skipped.
+    /// includeMeta is a pre-read requirement for old LIST only; INVENTORY
+    /// restoration still fetches selected entries through INFO.
+    HolderEntry[] scan(bool includeMeta = false) {
+        if (!inventoryCapable) {
+            knownTags = null;
+            if (includeMeta) return list();
+            mutex.lock();
+            scope(exit) mutex.unlock();
+            auto wire = requestDecodedLocked!HolderWireList("LIST");
+            auto entries = new HolderEntry[wire.connections.length];
+            foreach (i, row; wire.connections) entries[i] = row.entry();
+            return entries;
+        }
+        HolderEntry[] result;
+        DialTag[string] liveTags;
+        string scanInstance;
+        long after, through;
+        bool first = true;
+        while (true) {
+            auto payload = Json.emptyObject;
+            if (!first) {
+                payload["instance"] = scanInstance;
+                payload["after"] = after;
+                payload["through"] = through;
+            }
+            auto page = request("INVENTORY", payload);
+            const identity = jsonStr(page, "instance");
+            if (!identity.length || (first ? identity != currentInstance : identity != scanInstance))
+                throw new HolderUnavailableException("holder changed during inventory");
+            if (first) { scanInstance = identity; through = jsonLong(page, "through"); }
+            else if (jsonLong(page, "through") != through)
+                throw new HolderUnavailableException("holder inventory boundary changed");
+            if (through < 0 || jsonLong(page, "after") != after)
+                throw new HolderUnavailableException("invalid holder inventory cursor");
+            auto rows = page["connections"];
+            if (rows.type != Json.Type.array || rows.length > 128)
+                throw new HolderUnavailableException("invalid bounded holder inventory");
+            auto previous = cast(ulong) after;
+            foreach (row; rows) {
+                auto entry = HolderEntry.fromJson(row);
+                entry.instance = scanInstance;
+                if (!entry.id.length || entry.ordinal <= previous
+                        || entry.ordinal > cast(ulong) through || result.length >= 65536)
+                    throw new HolderUnavailableException("invalid holder inventory ordinal");
+                previous = entry.ordinal;
+                if (auto tag = entry.id in knownTags) entry.tag = *tag;
+                else {
+                    auto detail = infoIdentity(entry.id);
+                    if (detail.id != entry.id || detail.instance != scanInstance
+                            || detail.connectedAtMs != entry.connectedAtMs || detail.state != entry.state)
+                        throw new HolderUnavailableException("holder entry changed during inventory");
+                    entry.tag = detail.tag;
+                }
+                liveTags[entry.id] = entry.tag;
+                result ~= entry;
+            }
+            if (!jsonBool(page, "more")) break;
+            const next = jsonLong(page, "nextAfter");
+            if (next <= after || next < cast(long) previous || next > through || rows.length == 0)
+                throw new HolderUnavailableException("holder inventory made no progress");
+            after = next;
+            first = false;
+        }
+        knownTags = liveTags;
+        return result;
+    }
+
+    void acknowledgeGap(string id, long generation) {
+        auto payload = idPayload(id);
+        payload["generation"] = generation;
+        request("GAP_ACK", payload);
+    }
+
     /// Holder-wide counters and identity.
     HolderStatus status() {
-        return HolderStatus.fromJson(request("STATUS"));
+        auto payload = request("STATUS");
+        observeIdentity(payload);
+        return HolderStatus.fromJson(payload);
     }
 
     /// One entry by id. `HolderErrorException("not_found")` when unknown.
     HolderEntry info(string id) {
-        return HolderEntry.fromJson(request("INFO", idPayload(id)));
+        auto entry = HolderEntry.fromJson(request("INFO", idPayload(id)));
+        if (!entry.instance.length) entry.instance = currentInstance;
+        return entry;
+    }
+
+    /// Fresh claim/state evidence without materializing the opaque META tree.
+    /// INFO still consumes and validates the complete wire response.
+    HolderEntry infoIdentity(string id) {
+        mutex.lock();
+        scope(exit) mutex.unlock();
+        auto entry = requestDecodedLocked!HolderWireEntry("INFO", idPayload(id)).entry();
+        if (!entry.instance.length) entry.instance = currentInstance;
+        return entry;
     }
 
     /// Replaces the entry's opaque META (≤ 8 MiB; `too_large` above).
@@ -669,6 +1034,33 @@ final class HolderClient {
         auto j = idPayload(id);
         j["meta"] = meta;
         request("META", j);
+    }
+
+    /// Construct META only after control admission. The callback MUST NOT
+    /// yield; undefined cancels a stale publication without sending anything.
+    /// It is scoped to this call, never retained by the holder client.
+    void setMetaLazy(string id, scope Json delegate(bool dropMembers) buildMeta) {
+        mutex.lock();
+        scope (exit) {
+            buildMeta = null;
+            mutex.unlock();
+        }
+        void attempt(bool dropMembers) {
+            auto meta = buildMeta(dropMembers);
+            scope (exit) meta = Json.undefined;
+            if (meta.type == Json.Type.undefined) return;
+            auto payload = idPayload(id);
+            payload["meta"] = meta;
+            scope (exit) payload = Json.undefined;
+            requestLocked("META", payload);
+        }
+        try attempt(false);
+        catch (HolderErrorException e) {
+            if (e.code != "too_large") throw e;
+            // The first tree has been relinquished before building another.
+            // The lock stays held, so a strict marker cannot be overtaken.
+            attempt(true);
+        }
     }
 
     /// Closes the upstream. Non-empty `quit` → the holder sends
@@ -685,20 +1077,52 @@ final class HolderClient {
         request("FORGET", idPayload(id));
     }
 
+    /// Guard and mutation share the lock: a legacy c-N reused after holder
+    /// death must never close/forget another process's socket.
+    private bool mutateClaim(string verb, string id, string incarnation, long connectedAtMs, string quit) {
+        mutex.lock();
+        scope(exit) mutex.unlock();
+        auto entry = requestDecodedLocked!HolderWireEntry("INFO", idPayload(id)).entry();
+        if (entry.id != id || entry.instance != incarnation
+                || connectedAtMs <= 0 || entry.connectedAtMs != connectedAtMs)
+            return false;
+        auto payload = idPayload(id);
+        if (verb == "CLOSE") payload["quit"] = quit;
+        requestLocked(verb, payload);
+        return true;
+    }
+
+    bool closeClaim(string id, string incarnation, long connectedAtMs, string quit = "") {
+        return mutateClaim("CLOSE", id, incarnation, connectedAtMs, quit);
+    }
+
+    bool forgetClaim(string id, string incarnation, long connectedAtMs) {
+        return mutateClaim("FORGET", id, incarnation, connectedAtMs, "");
+    }
+
     // ── DIAL / ATTACH ──────────────────────────────────────────────────
 
     /// One dial attempt through exactly the egress in `req`. `EVENT` lines
     /// are forwarded to `progress` as they arrive; returns the relay stream
     /// on `CONNECTED`; throws `DialFailedException` on `FAILED`,
     /// `HolderUnavailableException` when the holder cannot be reached.
-    DialResult dial(DialRequest req, DialProgress progress) {
+    /// onResponse commits pacing once the holder has processed this DIAL.
+    /// A completed local write alone does not prove remote admission.
+    DialResult dial(DialRequest req, DialProgress progress,
+            scope void delegate() beforeSend = null,
+            scope void delegate() onResponse = null) {
         auto requestPayload = req.toJson(token);
         if (req.addressFamily == "ipv6" && !status().supportsFamily("ipv6"))
             throw new DialFailedException("holder", "holder lacks IPv6-only dial capability");
+        const dialIncarnation = currentInstance;
         auto c = open(OPEN_TIMEOUT);
         bool keep;
         scope (exit) if (!keep) closeQuietly(c);
         c.readTimeout = DIAL_TIMEOUT;
+        // Admit at the actual DIAL boundary, after stream setup can yield.
+        if (beforeSend !is null) beforeSend();
+        if (currentInstance != dialIncarnation)
+            throw new HolderErrorException("incarnation_changed", "holder changed before DIAL; request was not sent");
         try {
             writeLine(c, "DIAL " ~ requestPayload.toString());
         } catch (Exception e) {
@@ -714,6 +1138,10 @@ final class HolderClient {
             string verb; Json payload;
             try splitStatusLine(line, verb, payload);
             catch (Exception e) throw new HolderUnavailableException("holder sent malformed dial line: " ~ e.msg);
+            if (onResponse !is null) {
+                onResponse();
+                onResponse = null;
+            }
             switch (verb) {
                 case "EVENT":
                     if (progress !is null) {
@@ -730,6 +1158,8 @@ final class HolderClient {
                 case "CONNECTED":
                     DialResult r;
                     r.stream = c;
+                    r.instance = jsonStr(payload, "instance");
+                    if (!r.instance.length) r.instance = currentInstance;
                     r.id = jsonStr(payload, "id");
                     r.peerIp = jsonStr(payload, "peerIp");
                     r.localIp = jsonStr(payload, "localIp");
@@ -738,6 +1168,7 @@ final class HolderClient {
                     r.connectedAtMs = jsonLong(payload, "connectedAtMs");
                     r.tlsOk = parseTls(payload["tls"], r.tls);
                     if (r.id.length == 0) throw new HolderUnavailableException("holder CONNECTED without id");
+                    if (inventoryCapable && knownTags.length < 65536) knownTags[r.id] = req.tag;
                     c.readTimeout = Duration.max;
                     keep = true;
                     return r;
@@ -755,24 +1186,42 @@ final class HolderClient {
     /// `not_found` / `busy` / `closed`, `HolderUnavailableException` when
     /// the holder cannot be reached.
     AttachResult attach(string id) {
+        return attachDecoded!Json(id);
+    }
+
+    /// Engine restoration already has canonical META. Consume it on the wire
+    /// without constructing another tree; retain fresh relay and claim facts.
+    AttachResult attachIdentity(string id) {
+        return attachDecoded!HolderWireEntry(id);
+    }
+
+    private AttachResult attachDecoded(T)(string id) {
         auto c = open(OPEN_TIMEOUT);
         bool keep;
         scope (exit) if (!keep) closeQuietly(c);
         c.readTimeout = CONTROL_TIMEOUT;
         auto j = idPayload(id);
         if (token.length) j["token"] = token;
-        string reply;
+        HolderEntry entry;
+        const deadline = MonoTime.currTime + CONTROL_TIMEOUT;
         try {
             writeLine(c, "ATTACH " ~ j.toString());
-            reply = readIpcLine(c);
+            auto wire = readIpcResponse!T(c, deadline, HOLDER_MAX_RESPONSE);
+            static if (is(T == Json)) {
+                // Bot checkpoints genuinely restore directly from ATTACH.
+                entry = HolderEntry.fromJson(wire);
+                if (!entry.id.length) entry.id = id;
+            } else {
+                entry = wire.entry();
+            }
+        } catch (HolderErrorException e) {
+            throw e;
         } catch (Exception e) {
             throw new HolderUnavailableException("holder attach I/O failed: " ~ e.msg);
         }
-        auto ok = expectOk(reply);
         AttachResult r;
         r.stream = c;
-        r.entry = HolderEntry.fromJson(ok);
-        if (r.entry.id.length == 0) r.entry.id = id;
+        r.entry = entry;
         c.readTimeout = Duration.max;
         keep = true;
         return r;

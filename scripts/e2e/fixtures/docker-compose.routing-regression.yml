@@ -5,6 +5,10 @@ x-labels: &labels
   ircfiber.fixture.run: ${ROUTING_REGRESSION_RUN:?wrapper must supply a unique run id}
 x-runtime: &runtime
   labels: *labels
+  platform: linux/amd64
+  logging:
+    driver: json-file
+    options: {max-size: "8m", max-file: "3"}
   restart: "no"
 x-env: &env
   IRCFIBER_REDIS_URL: redis://192.0.2.2:6379/0
@@ -14,7 +18,7 @@ x-env: &env
   IRCFIBER_DEFAULT_NETWORK_TLS: disabled
   IRCFIBER_OTEL_ENABLED: "0"
   IRCFIBER_BUGSINK_ENABLED: "0"
-  IRCFIBER_LOG_LEVEL: debug
+  IRCFIBER_LOG_LEVEL: ${ROUTING_REGRESSION_LOG_LEVEL:-debug}
   IRCFIBER_IPV6_PREFIX: ""
   IRCFIBER_MULLVAD_POOL: ""
   IRCFIBER_NORDVPN_POOL: socks5://north:test:test@192.0.2.30:1080,socks5://south:test:test@192.0.2.31:1080
@@ -55,13 +59,14 @@ services:
       context: ../../../../site
       dockerfile: Containerfile
       target: runtime-gateway
-    image: ${ROUTING_REGRESSION_RUN}-gateway:fresh
+    image: ${ROUTING_REGRESSION_GATEWAY_IMAGE:?launcher supplies image}
     command: [/app/irc-fiber]
     environment: *env
     extra_hosts: &irc-hosts
       - default.regression.test=192.0.2.10
       - alpha.example.org=192.0.2.10
       - beta.example.net=192.0.2.10
+      - fallback.example.org=192.0.2.10
     networks:
       fixture: {ipv4_address: 192.0.2.4}
     depends_on:
@@ -73,33 +78,43 @@ services:
       context: ../../..
       dockerfile: Containerfile.engine
       target: runtime-holder
-    image: ${ROUTING_REGRESSION_RUN}-holder:fresh
+    image: ${ROUTING_REGRESSION_HOLDER_IMAGE:?launcher supplies image}
+    mem_limit: 2g
+    memswap_limit: ${ROUTING_REGRESSION_HOLDER_SWAP:-3g}
     command: [/app/irc-fiber-holder]
     environment:
       <<: *env
       IRCFIBER_SERVER_ID: fixture-regression
       IRCFIBER_HOLDER_ADDR: unix:///run/ircfiber/holder.sock
       IRCFIBER_DIAL_PRIVATE_HOSTS: mock-irc
+      IRCFIBER_HOLDER_DETACH_MAX_SECS: ${ROUTING_REGRESSION_HOLDER_DETACH_SECS:-600}
+      SSL_CERT_FILE: ${ROUTING_REGRESSION_CA_FILE:-/etc/ssl/certs/ca-certificates.crt}
     extra_hosts: *irc-hosts
-    volumes: [holder-ipc:/run/ircfiber]
+    volumes: [holder-ipc:/run/ircfiber, fixture-certs:/fixture-certs:ro]
     networks: [fixture]
     healthcheck:
       test: [CMD, /app/irc-fiber-holder, --check]
       interval: 2s
       timeout: 2s
       retries: 30
+    labels:
+      <<: *labels
+      com.ircfiber.component: holder
+      com.ircfiber.engine_id: fixture-regression
   ircfiber-engine:
     <<: *runtime
     build:
       context: ../../..
       dockerfile: Containerfile.engine
       target: runtime-engine
-    image: ${ROUTING_REGRESSION_RUN}-engine:fresh
+    image: ${ROUTING_REGRESSION_ENGINE_IMAGE:?launcher supplies image}
+    mem_limit: 2g
+    memswap_limit: 3g
     command: [/app/irc-fiber-engine]
     environment:
       <<: *env
       IRCFIBER_SERVER_ID: fixture-regression
-      IRCFIBER_HOLDER_ADDR: unix:///run/ircfiber/holder.sock
+      IRCFIBER_HOLDER_ADDR: ${ROUTING_REGRESSION_ENGINE_HOLDER_ADDR:-unix:///run/ircfiber/holder.sock}
     extra_hosts: *irc-hosts
     volumes: [holder-ipc:/run/ircfiber:ro]
     networks: [fixture]
@@ -110,19 +125,21 @@ services:
       mongo: {condition: service_healthy}
   mock-irc:
     <<: *fixture
-    command: [python3, -u, /fixture/holder_mock_irc.py, "16668", /tmp/holder-mock-irc.result]
+    command: ${ROUTING_REGRESSION_MOCK_COMMAND:-python3 -u /fixture/holder_mock_irc.py 16668 /tmp/holder-mock-irc.result}
     environment:
       MOCK_IRC_TARGET_INJECT: "1"
+      MOCK_IRC_MEMORY: ${ROUTING_REGRESSION_MEMORY:-0}
+    volumes: [holder-ipc:/run/ircfiber:ro, fixture-certs:/fixture-certs]
     networks:
       fixture: {ipv4_address: 192.0.2.10}
   egress-a:
     <<: *fixture
-    command: [python3, -u, /fixture/socks_exit.py]
+    command: ${ROUTING_REGRESSION_SOCKS_COMMAND:-python3 -u /fixture/socks_exit.py}
     networks:
       fixture: {ipv4_address: 192.0.2.30}
   egress-b:
     <<: *fixture
-    command: [python3, -u, /fixture/socks_exit.py]
+    command: ${ROUTING_REGRESSION_SOCKS_COMMAND:-python3 -u /fixture/socks_exit.py}
     networks:
       fixture: {ipv4_address: 192.0.2.31}
 
@@ -138,3 +155,4 @@ volumes:
   redis-data: {labels: *labels}
   mongo-data: {labels: *labels}
   holder-ipc: {labels: *labels}
+  fixture-certs: {labels: *labels}

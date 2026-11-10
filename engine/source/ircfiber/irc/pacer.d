@@ -626,8 +626,11 @@ struct CommandRateBucket {
     }
 
     /// 0 when one more command fits under the budget, else the wait in ms.
-    long waitMs(long nowMs, const CommandRateLimit lim) pure nothrow @safe @nogc {
-        if (!lim.valid()) return 0;
+    /// `immune` is the pacer's effective exemption, not raw oper status:
+    /// a server complaint can revoke it while the user remains an oper.
+    long waitMs(long nowMs, const CommandRateLimit lim, bool immune = false)
+            pure nothrow @safe @nogc {
+        if (immune || !lim.valid()) return 0;
         drain(nowMs, lim);
         const budget = budgetMilli(lim);
         const over = penaltyMilli + 1000 - budget;
@@ -638,8 +641,11 @@ struct CommandRateBucket {
     }
 
     /// Records one command of `points` penalty (1 for ordinary commands).
-    void record(long nowMs, const CommandRateLimit lim, int points = 1) pure nothrow @safe @nogc {
-        if (!lim.valid()) return;
+    /// Exempt commands cost nothing; they must not leave a huge synthetic
+    /// debt when the effective exemption is withdrawn.
+    void record(long nowMs, const CommandRateLimit lim, int points = 1, bool immune = false)
+            pure nothrow @safe @nogc {
+        if (immune || !lim.valid()) return;
         drain(nowMs, lim);
         penaltyMilli += cast(long)(points < 1 ? 1 : points) * 1000;
     }
@@ -1585,6 +1591,65 @@ string[] splitMessage(string text, size_t maxBytes, out bool[] concatFlags)
     }
     assert(elapsed > 3_500 && elapsed < 6_000,
            "500 lines should take about 5 s, took " ~ elapsed.to!string ~ " ms");
+}
+
+@safe unittest {
+    // The trusted class still bounds an ordinary user. Becoming exempt must
+    // admit a full ANSI print even when the ordinary budget is exhausted.
+    CommandRateBucket b;
+    FakeLagPacer p;
+    const t = 1_000_000L;
+    foreach (_; 0 .. 70) {
+        assert(b.waitMs(t, PLATFORM_COMMAND_RATE, p.isImmune()) == 0);
+        b.record(t, PLATFORM_COMMAND_RATE, 1, p.isImmune());
+    }
+    assert(b.waitMs(t, PLATFORM_COMMAND_RATE, p.isImmune()) == 10);
+    p.setImmune(true);
+    foreach (_; 0 .. 4826) {
+        assert(b.waitMs(t, PLATFORM_COMMAND_RATE, p.isImmune()) == 0);
+        b.record(t, PLATFORM_COMMAND_RATE, 1, p.isImmune());
+    }
+    assert(b.penaltyPoints() == 70, "exempt traffic must not accrue command debt");
+
+    // Losing the exemption restores the existing bounded rate, rather than
+    // retaining a bypass or making us pay for 4826 exempt commands.
+    p.setImmune(false);
+    assert(b.waitMs(t, PLATFORM_COMMAND_RATE, p.isImmune()) == 10);
+    assert(b.waitMs(t + 10, PLATFORM_COMMAND_RATE, p.isImmune()) == 0);
+    b.record(t + 10, PLATFORM_COMMAND_RATE, 1, p.isImmune());
+    assert(b.waitMs(t + 10, PLATFORM_COMMAND_RATE, p.isImmune()) == 10);
+
+    // A complaint withdraws effective immunity without requiring de-oper.
+    // Consumers must use this state, never a still-true raw oper flag.
+    p.setImmune(true);
+    p.tighten(t + 10);
+    assert(!p.isImmune());
+    assert(b.waitMs(t + 10, PLATFORM_COMMAND_RATE, p.isImmune()) == 10);
+}
+
+@safe unittest {
+    // The effective exemption only removes the per-user gates. A channel
+    // +f ceiling remains independently applicable to an exempt sender.
+    CommandRateBucket b;
+    FakeLagPacer p;
+    LineRateWindow channel;
+    const cap = ChannelLineLimit(3, 5);
+    const t = 1_000_000L;
+    p.setImmune(true);
+    int sent;
+    while (sent < 4826
+            && b.waitMs(t, PLATFORM_COMMAND_RATE, p.isImmune()) == 0
+            && p.waitMs(400, t) == 0
+            && channel.waitMs(t, cap) == 0) {
+        channel.record(t);
+        b.record(t, PLATFORM_COMMAND_RATE, 1, p.isImmune());
+        p.charge(400, t);
+        sent++;
+    }
+    assert(sent == cap.lines, "trusted exemption must not bypass channel +f");
+    assert(b.penaltyPoints() == 0);
+    assert(channel.waitMs(t, cap) == 5000);
+    assert(channel.waitMs(t + 5000, cap) == 0);
 }
 
 @safe unittest {

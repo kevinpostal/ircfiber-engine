@@ -13,6 +13,62 @@ import ircfiber.models.irc_event : IRCRawEvent;
 import ircfiber.models.network : normalizeChannelName;
 import ircfiber.storage.redis : RedisStorage;
 
+/// Shared by append/rename and the engine's journal-bound cutoff purge. Tokens
+/// identify physical list incarnations, not reusable channel names. Pending
+/// journal purges pin metadata without expiry until positive checkpoint.
+enum archiveBufferLineageLua = q"LUA
+local function lineageLocator(token) return 'irc:archive:lineage:id:' .. token end
+local function lineageCompanion(key) return 'irc:archive:lineage:buffer:' .. key end
+local function lineageValidate(key)
+    local token = redis.call('GET', lineageCompanion(key))
+    if not token then return nil end
+    local locator = lineageLocator(token)
+    if redis.call('HGET', locator, 'key') ~= key or redis.call('HGET', locator, 'empty') ~= '0' then
+        error('archive lineage mismatch')
+    end
+    local refs = tonumber(redis.call('HGET', locator, 'refs'))
+    if not refs or refs < 0 or refs > 128 then error('archive lineage pin mismatch') end
+    return token
+end
+local function lineageRetire(key)
+    local token = lineageValidate(key)
+    if token then
+        local locator = lineageLocator(token)
+        if tonumber(redis.call('HGET', locator, 'refs')) > 0 then
+            redis.call('HSET', locator, 'empty', '1', 'key', '')
+            redis.call('PERSIST', locator)
+        else redis.call('DEL', locator) end
+        redis.call('DEL', lineageCompanion(key))
+    end
+end
+local function lineageRefresh(key, token)
+    local locator, companion = lineageLocator(token), lineageCompanion(key)
+    if tonumber(redis.call('HGET', locator, 'refs')) > 0 then
+        redis.call('PERSIST', locator); redis.call('PERSIST', companion)
+    else
+        local ttl = redis.call('PTTL', key)
+        if ttl == -2 then ttl = 2592000000 end -- bounded preparation before first LPUSH
+        if ttl >= 0 then
+            redis.call('PEXPIRE', locator, ttl); redis.call('PEXPIRE', companion, ttl)
+        else redis.call('PERSIST', locator); redis.call('PERSIST', companion) end
+    end
+end
+local function lineageEnsure(key, preparingAppend)
+    local token = lineageValidate(key)
+    if token then lineageRefresh(key, token); return token end
+    if not preparingAppend and redis.call('EXISTS', key) == 0 then return '' end
+    local serial = redis.call('INCR', 'irc:archive:lineage:serial')
+    local clock = redis.call('TIME')
+    local hash = redis.sha1hex(key .. ':' .. tostring(serial) .. ':' .. clock[1] .. ':' .. clock[2])
+    token = string.sub(hash,1,8) .. '-' .. string.sub(hash,9,12) .. '-4' ..
+        string.sub(hash,14,16) .. '-8' .. string.sub(hash,18,20) .. '-' .. string.sub(hash,21,32)
+    redis.call('SET', lineageCompanion(key), token)
+    redis.call('HSET', lineageLocator(token), 'key', key, 'empty', '0', 'refs', '0')
+    lineageRefresh(key, token)
+    return token
+end
+LUA";
+
 /**
  * Sanitize a string to valid UTF-8. Valid UTF-8 sequences pass through
  * unchanged. Single-byte sequences that are not valid UTF-8 lead bytes
@@ -176,9 +232,19 @@ final class BufferManager {
         auto db = redis.getDb();
         auto msgStr = message.toString();
 
-        db.lpush(key, msgStr);
-        db.ltrim(key, 0, MAX_SCROLLBACK - 1);
-        db.expire(key, 86_400 * TTL_DAYS);
+        auto result = db.eval!string(archiveBufferLineageLua ~ q"LUA
+local kind = redis.call('TYPE', KEYS[1]).ok
+if kind ~= 'none' and kind ~= 'list' then return redis.error_reply('Scrollback key is not a list') end
+lineageValidate(KEYS[1])
+if kind == 'none' then lineageRetire(KEYS[1]) end
+local token = lineageEnsure(KEYS[1], true)
+redis.call('LPUSH', KEYS[1], ARGV[1])
+redis.call('LTRIM', KEYS[1], 0, 4999)
+redis.call('EXPIRE', KEYS[1], ARGV[2])
+lineageRefresh(KEYS[1], token)
+return '1'
+LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string]);
+        if (result.empty || result.front != "1") throw new Exception("Missing atomic scrollback verdict");
     }
 
     /**
@@ -494,9 +560,10 @@ final class BufferManager {
      * The dedup key is:
      *   - the `msgid` IRC tag, if the event carries one (covers PRIVMSG,
      *     NOTICE, TAGMSG, JOIN, PART, KICK, etc. on modern servers), OR
+     *   - the existing event UUID for live PRIVMSG/NOTICE without msgid
+     *     (same-text rows in the same millisecond are still distinct), OR
      *   - a content hash of (command + channel + sorted params + timestamp)
-     *     for numeric replies (332 TOPIC, 333 TOPICWHOTIME, 366 NAMES end,
-     *     005 ISUPPORT, etc.) that never carry a msgid.
+     *     for historical replay and other events without a stable server ID.
      *
      * The check is `SADD dedup:<buf> <key>` which atomically returns 1
      * for a new key and 0 for an existing one. Storing the set in Redis
@@ -625,6 +692,12 @@ final class BufferManager {
         if (msgid.length > 0) {
             // Preferred path: msgid is globally unique per IRC server.
             key = "m:" ~ msgid;
+        } else if ((event.command == "PRIVMSG" || event.command == "NOTICE")
+                && event.getTag("batch") != "chathistory" && event.id.length) {
+            // Distinct live wire events can have identical payloads AND
+            // timestamps (including multiple lines in one socket read).
+            // Their existing UUID survives retries; content is not identity.
+            key = "i:" ~ event.id;
         } else {
             // Fallback for numeric replies and other messages without
             // msgid. Hash (command, channel, sorted params, timestamp).
@@ -683,7 +756,7 @@ final class BufferManager {
         enum lastRow = (MAX_SCROLLBACK - 1).to!string;
         enum rowTTL = (86_400 * TTL_DAYS).to!string;
         enum dedupTTL = DEDUP_TTL_SECS.to!string;
-        auto verdict = redis.getDb().eval!string(q"LUA
+        auto verdict = redis.getDb().eval!string(archiveBufferLineageLua ~ q"LUA
 local bufferType = redis.call('TYPE', KEYS[1]).ok
 local dedupType = redis.call('TYPE', KEYS[2]).ok
 if bufferType ~= 'none' and bufferType ~= 'list' then
@@ -692,10 +765,14 @@ end
 if dedupType ~= 'none' and dedupType ~= 'set' then
     return redis.error_reply('Dedup key is not a set')
 end
+lineageValidate(KEYS[1])
 if redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 1 then
     redis.call('EXPIRE', KEYS[2], ARGV[5])
     return '0'
 end
+if bufferType == 'none' then lineageRetire(KEYS[1]) end
+-- Complete lineage allocation/serial validation before accepting row/dedup.
+local token = lineageEnsure(KEYS[1], true)
 local appended = redis.pcall('LPUSH', KEYS[1], ARGV[2])
 if type(appended) == 'table' and appended.err then return appended end
 local added = redis.pcall('SADD', KEYS[2], ARGV[1])
@@ -706,6 +783,7 @@ end
 redis.call('LTRIM', KEYS[1], 0, ARGV[3])
 redis.call('EXPIRE', KEYS[1], ARGV[4])
 redis.call('EXPIRE', KEYS[2], ARGV[5])
+lineageRefresh(KEYS[1], token)
 return '1'
 LUA", [bufferKey, dedupKey],
             [member, message.toString(), lastRow, rowTTL, dedupTTL]);
@@ -808,28 +886,47 @@ LUA", [bufferKey, dedupKey],
             || oldBuf == newBuf)
             return false;
         auto db = redis.getDb();
-        bool moved = false;
-        static immutable string[2] prefixes = [KEY_PREFIX, DEDUP_PREFIX];
-        foreach (prefix; prefixes) {
-            // Namespaced variant.
-            if (serverId.length > 0) {
-                try {
-                    if (db.renameNX(prefix ~ serverId ~ ":" ~ networkId ~ ":" ~ oldBuf,
-                                    prefix ~ serverId ~ ":" ~ networkId ~ ":" ~ newBuf))
-                        moved = true;
-                } catch (Exception e) {
-                    logDebug("renameBuffer: %s", e.msg);
-                }
-            }
-            // Legacy variant (no server segment).
-            try {
-                if (db.renameNX(prefix ~ networkId ~ ":" ~ oldBuf,
-                                prefix ~ networkId ~ ":" ~ newBuf))
-                    moved = true;
-            } catch (Exception e) {
-                logDebug("renameBuffer: %s", e.msg);
-            }
-        }
+        const legacy = KEY_PREFIX ~ networkId ~ ":";
+        const scoped = serverId.length ? KEY_PREFIX ~ serverId ~ ":" ~ networkId ~ ":" : legacy;
+        const legacyDedup = DEDUP_PREFIX ~ networkId ~ ":";
+        const scopedDedup = serverId.length ? DEDUP_PREFIX ~ serverId ~ ":" ~ networkId ~ ":" : legacyDedup;
+        auto result = db.eval!string(archiveBufferLineageLua ~ q"LUA
+-- Preserve the established independent RENAMENX decisions for scoped/legacy
+-- rows and dedup sets. Update lineage only for the physical lists that move.
+for i=1,8,2 do
+    local expected = i <= 4 and 'list' or 'set'
+    local kind = redis.call('TYPE', KEYS[i]).ok
+    if kind ~= 'none' and kind ~= expected then return redis.error_reply('Invalid buffer rename type') end
+end
+for i=1,4 do lineageValidate(KEYS[i]) end
+local moved = false
+for i=1,4,2 do
+    if redis.call('EXISTS', KEYS[i]) == 1 and redis.call('EXISTS', KEYS[i+1]) == 0 then
+        local token = lineageEnsure(KEYS[i])
+        -- Any destination companion belongs to an expired/cleared old list.
+        lineageRetire(KEYS[i+1])
+        local renamed = redis.call('RENAMENX', KEYS[i], KEYS[i+1])
+        if renamed ~= 1 then return redis.error_reply('Atomic rename changed unexpectedly') end
+        redis.call('DEL', lineageCompanion(KEYS[i]))
+        redis.call('SET', lineageCompanion(KEYS[i+1]), token)
+        redis.call('HSET', lineageLocator(token), 'key', KEYS[i+1])
+        lineageRefresh(KEYS[i+1], token)
+        moved = true
+    end
+end
+for i=5,8,2 do
+    if redis.call('EXISTS', KEYS[i]) == 1 then
+        if redis.call('RENAMENX', KEYS[i], KEYS[i+1]) == 1 then moved = true end
+    end
+end
+return moved and '1' or '0'
+LUA", [scoped ~ oldBuf, scoped ~ newBuf, legacy ~ oldBuf, legacy ~ newBuf,
+            scopedDedup ~ oldBuf, scopedDedup ~ newBuf,
+            legacyDedup ~ oldBuf, legacyDedup ~ newBuf],
+            cast(string[])[]);
+        if (result.empty || (result.front != "0" && result.front != "1"))
+            throw new Exception("Missing atomic rename verdict");
+        const moved = result.front == "1";
         if (moved) {
             // The adoption guard is keyed by destination; both names just
             // changed identity, so let a fresh adoption run if needed.
@@ -1079,6 +1176,25 @@ void historyAtomicStorageRegressionChecks(RedisStorage redis) {
         assert(rejected && !db.exists(rowKey), "Invalid dedup storage must not append a row");
         db.del(dedupKey);
         assert(append() && !append(), "Retry after storage repair accepts the row only once");
+        event.tagsJson = "{}";
+        foreach (command; ["PRIVMSG", "NOTICE"]) {
+            event.command = command;
+            event.text = "\u00a0";
+            event.id = randomUUID().toString();
+            assert(append() && !append(), "A live event is accepted once");
+            const firstId = event.id;
+            event.id = randomUUID().toString();
+            assert(append() && !append(),
+                "Distinct same-payload same-timestamp live rows must both survive");
+            event.id = firstId;
+            assert(!append(), "Retry of an earlier live row must remain deduplicated");
+        }
+        event.command = "PRIVMSG";
+        event.text = "historical row";
+        event.addTag("batch", "chathistory");
+        assert(append());
+        event.id = randomUUID().toString();
+        assert(!append(), "No-msgid historical replay retains content deduplication");
         event.command = "TAGMSG";
         event.nick = "tag-peer";
         event.text = "";

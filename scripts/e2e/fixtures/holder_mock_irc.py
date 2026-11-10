@@ -714,4 +714,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if os.environ.get("MOCK_IRC_MEMORY") == "1":
+        import memory_fixture
+        memory_fixture.main()
+    else:
+        main()

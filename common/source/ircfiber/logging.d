@@ -8,8 +8,6 @@ import std.string : strip, toStringz;
 import std.format : format;
 import std.array : appender;
 import core.sync.mutex : Mutex;
-import core.time : seconds;
-import core.atomic : atomicLoad, atomicStore;
 
 /// Module-level log threshold. Messages below this level are suppressed.
 /// Controlled by `IRCFIBER_LOG_LEVEL` env var:
@@ -141,6 +139,37 @@ void logJsonMap(string level, string component, string msg,
     catch (Exception) {}
 }
 
+/// Numeric/null diagnostics retain their JSON types on stderr. Conversion to
+/// string-valued OTLP attributes happens only when that optional queue is on.
+/// Required local diagnostics may bypass the operator's severity threshold
+/// without changing their severity or enabling the optional OTLP exporter.
+void logJsonMap(string level, string component, string msg, JSONValue fields,
+                bool forceLocal = false) {
+    ensureLogLevelInitd();
+    if (!forceLocal && levelRank(level) > g_logLevel) return;
+    import ircfiber.tracing : currentTraceId, currentSpanId;
+    import std.json : JSONType;
+    auto j = JSONValue.emptyObject;
+    j["ts"] = JSONValue(Clock.currTime.toUTC().toISOExtString());
+    j["level"] = JSONValue(level);
+    j["component"] = JSONValue(component);
+    j["msg"] = JSONValue(msg);
+    auto traceId = currentTraceId();
+    auto spanId = currentSpanId();
+    if (traceId.length) j["traceId"] = JSONValue(traceId);
+    if (spanId.length) j["spanId"] = JSONValue(spanId);
+    if (fields.type == JSONType.object)
+        foreach (k, v; fields.object) j[k] = v;
+    stderr.writeln(j.toString(JSONOptions.doNotEscapeSlashes));
+    stderr.flush();
+    if (!g_logsEnabled) return;
+    string[string] attrs;
+    if (fields.type == JSONType.object) foreach (k, v; fields.object)
+        attrs[k] = v.type == JSONType.string ? v.str : v.toString(JSONOptions.doNotEscapeSlashes);
+    try enqueueLog(level, component, msg, attrs, traceId, spanId);
+    catch (Exception) {}
+}
+
 /// Convenience: tagged info log with no extra fields beyond component.
 void logInfoJ(string component, string msg, string network = "") {
     if (network.length)
@@ -188,9 +217,8 @@ void logException(string component,
         if (fields["stack"].length > 8192)
             fields["stack"] = fields["stack"][0 .. 8192] ~ "\n... (truncated)";
         logJsonMap("error", component, context.length ? context : e.msg, fields);
-        // Best-effort immediate flush so a crash that kills the heartbeat
-        // still ships the error record. The periodic heartbeat flush remains
-        // the primary path; this just eliminates the 10s window.
+        // Best-effort immediate flush supplements the independent periodic
+        // telemetry task, preserving the existing error/shutdown behavior.
         try flushAndSendLogs(); catch (Throwable) {}
         // Bugsink: independent on/off switch from the OTLP logs flush
         // above — IRCFIBER_BUGSINK_ENABLED gates this separately so ops can
@@ -214,7 +242,7 @@ void logException(string component,
 // Mirrors tracing.d / observability.d but for logs. Every call to
 // `logJsonMap()` (which is every structured log line) optionally enqueues
 // a PendingLog that is flushed every 10s via `flushAndSendLogs()` from
-// the heartbeat task. The wire format is OTLP/HTTP JSON to /v1/logs:
+// the telemetry task. The wire format is OTLP/HTTP JSON to /v1/logs:
 //
 //   {"resourceLogs":[{"resource":{"attributes":[...]},"scopeLogs":[{"scope":{"name":"ircfiber.logging"},"logRecords":[...]}]}]}
 //
@@ -233,15 +261,28 @@ private struct PendingLog {
     string[string] attributes; // component + custom fields
 }
 
+import ircfiber.observability : BoundedTelemetryQueue, telemetryStringCharge,
+    telemetryAttributesCharge, copyTelemetryAttributes, sendTelemetryJson;
+
+enum LOGGING_MAX_ENTRIES = 8192;
+enum LOGGING_MAX_BYTES = 8 * 1024 * 1024;
+private alias LoggingQueue = BoundedTelemetryQueue!(PendingLog, LOGGING_MAX_ENTRIES, LOGGING_MAX_BYTES);
 private __gshared shared(Mutex) logsMutex;
-private __gshared PendingLog[] logQueue;
+private __gshared LoggingQueue logQueue;
+private __gshared ulong reportedLoggingDrops;
 private __gshared string logsEndpoint = "http://ircfiber-otel-collector:4318/v1/logs";
 private __gshared string logsServiceName = "ircfiber-engine";
 private __gshared string logsServiceVersion = "0.3.0";
 private __gshared bool g_logsEnabled = false;
 private __gshared bool logsMutexInitd;
-// Enterprise: bump queue cap for high-volume irc engine (was 4096, now 8192) and
-// add dropped-logs counter for SigNoz metrics.
+
+struct LoggingQueueSample { ulong count, bytes, droppedCount, droppedBytes; long lastExportSuccessAtMs; }
+LoggingQueueSample sampleLoggingQueue() {
+    if (!logsMutexInitd) return LoggingQueueSample.init;
+    synchronized (logsMutex)
+        return LoggingQueueSample(logQueue.count, logQueue.bytes, logQueue.droppedCount, logQueue.droppedBytes,
+                                  logQueue.lastExportSuccessAtMs);
+}
 
 private void initLogsOnce() {
     if (logsMutexInitd) return;
@@ -287,6 +328,10 @@ private void enqueueLog(string level, string component, string msg,
                         string traceId, string spanId) {
     if (!g_logsEnabled) return;
     if (!logsMutexInitd) initLogsOnce();
+    // Preflight the caller-owned fields before allocating our attribute map.
+    auto initialCharge = LoggingQueue.addSaturated(768, telemetryStringCharge(msg));
+    initialCharge = LoggingQueue.addSaturated(initialCharge, telemetryAttributesCharge(fields));
+    synchronized (logsMutex) if (!logQueue.admits(initialCharge)) return;
     auto now = Clock.currTime.toUTC();
     long nano = now.toUnixTime() * 1_000_000_000L + now.fracSecs.total!"nsecs";
     PendingLog rec;
@@ -304,27 +349,62 @@ private void enqueueLog(string level, string component, string msg,
     attrs["level"] = level;
     if (fields !is null) foreach (k, v; fields) attrs[k] = v;
     rec.attributes = attrs;
+    enqueueLogRecord(rec);
+}
+
+private void enqueueLogRecord(PendingLog rec) {
+    ulong charge = 768;
+    string[4] strings = [rec.severityText, rec.body, rec.traceId, rec.spanId];
+    foreach (s; strings)
+        charge = LoggingQueue.addSaturated(charge, telemetryStringCharge(s));
+    charge = LoggingQueue.addSaturated(charge, telemetryAttributesCharge(rec.attributes));
     synchronized (logsMutex) {
-        logQueue ~= rec;
-        // Enterprise: cap at 8192 (was 4096) — irc engine bursts ~2k JOIN/NAMES on Supernets reconnect
-        if (logQueue.length > 8192) logQueue = logQueue[$ - 8192 .. $];
+        if (!logQueue.admits(charge)) return;
+        rec.severityText = rec.severityText.idup;
+        rec.body = rec.body.idup;
+        rec.traceId = rec.traceId.idup;
+        rec.spanId = rec.spanId.idup;
+        rec.attributes = copyTelemetryAttributes(rec.attributes);
+        logQueue.put(rec, charge);
     }
 }
 
-/// Drain and POST pending logs to OTLP /v1/logs. Called from heartbeat every 10s.
-/// Also safe to call from error paths — never throws (catches Throwable).
+/// Independent periodic callers and error/shutdown paths share one exporter.
 void flushAndSendLogs() nothrow {
-    try {
-        if (!g_logsEnabled) return;
-        if (!logsMutexInitd) initLogsOnce();
-        PendingLog[] batch;
-        try synchronized (logsMutex) {
-            if (logQueue.length == 0) return;
-            batch = logQueue;
-            logQueue = null;
-        } catch (Throwable) { return; }
-        if (batch.length) try sendLogsBatch(batch); catch (Throwable) {}
-    } catch (Throwable) {}
+    try flushLogs((string json) => sendTelemetryJson(logsEndpoint, json));
+    catch (Throwable) {
+        try stderr.writeln("otel-logs: export error; bounded queue retained");
+        catch (Throwable) {}
+    }
+}
+
+private void flushLogs(scope bool delegate(string) send) {
+    if (!g_logsEnabled || !logsMutexInitd) return;
+    string json;
+    ulong through;
+    synchronized (logsMutex) {
+        if (logQueue.exporting) return;
+        if (logQueue.droppedCount != reportedLoggingDrops) {
+            stderr.writeln("otel-logs: dropped_count=", logQueue.droppedCount,
+                " dropped_bytes=", logQueue.droppedBytes);
+            reportedLoggingDrops = logQueue.droppedCount;
+        }
+        if (!logQueue.count) return;
+        logQueue.exporting = true;
+    }
+    scope (exit) synchronized (logsMutex) logQueue.exporting = false;
+    synchronized (logsMutex) {
+        auto batch = logQueue.snapshot();
+        scope (exit) batch[] = PendingLog.init;
+        through = logQueue.watermark();
+        json = buildOtlpLogsJson(batch);
+    }
+    if (send(json)) {
+        synchronized (logsMutex) {
+            logQueue.acknowledge(through);
+            logQueue.lastExportSuccessAtMs = (Clock.currStdTime - 621_355_968_000_000_000L) / 10_000;
+        }
+    } else stderr.writeln("otel-logs: export failed; bounded queue retained");
 }
 
 private string logsJsonEscape(string s) {
@@ -384,43 +464,74 @@ private string buildOtlpLogsJson(ref PendingLog[] batch) {
     return sink.data;
 }
 
-private void sendLogsBatch(ref PendingLog[] batch) {
-    if (!g_logsEnabled) return;
-    if (batch.length == 0) return;
-    auto json = buildOtlpLogsJson(batch);
-    try {
-        import vibe.http.client : requestHTTP, HTTPMethod;
-        requestHTTP(logsEndpoint,
-            (scope req) {
-                req.method = HTTPMethod.POST;
-                req.writeBody(cast(const ubyte[])json, "application/json");
-            },
-            (res) {
-                if (res.statusCode >= 400)
-                    stderr.writeln("otel-logs: export failed status=", res.statusCode);
-            });
-    } catch (Throwable e) {
-        // Catch Throwable (SyncError, AssertError) — the OTLP path must never
-        // kill the heartbeat fiber. Previously only Exception was caught, so
-        // a SyncError from vibe's mutex left the heartbeat dead at beat=0.
-        string m;
-        try { m = e.msg; } catch (Throwable) { m = "unknown"; }
-        try stderr.writeln("otel-logs: export error: ", m);
-        catch (Throwable) {}
-    }
-}
 
 // Test helpers
 PendingLog[] drainLogQueueForTest() {
     if (!logsMutexInitd) return null;
-    synchronized (logsMutex) {
-        auto d = logQueue;
-        logQueue = null;
-        return d;
-    }
+    synchronized (logsMutex) return logQueue.drain();
 }
 
 int logQueueLengthForTest() {
     if (!logsMutexInitd) return 0;
-    synchronized (logsMutex) return cast(int)logQueue.length;
+    synchronized (logsMutex) return cast(int)logQueue.count;
+}
+
+/// Use the same private entry point as logJsonMap, avoiding thousands of
+/// irrelevant stderr lines while exercising real OTLP log ownership.
+void runLoggingQueueRegressionForTest() {
+    import std.array : replicate;
+    import std.algorithm : canFind;
+    const previous = g_logsEnabled;
+    scope (exit) {
+        cast(void) drainLogQueueForTest();
+        g_logsEnabled = previous;
+    }
+    cast(void) drainLogQueueForTest();
+    setLoggingEnabled(false);
+    const disabled = sampleLoggingQueue();
+    enqueueLog("info", "test", "disabled", null, "", "");
+    flushLogs((string) { assert(false, "disabled logs exported"); return false; });
+    assert(sampleLoggingQueue() == disabled);
+    setLoggingEnabled(true);
+    const initialDrops = sampleLoggingQueue().droppedCount;
+    foreach (i; 0 .. LOGGING_MAX_ENTRIES + 3)
+        enqueueLog("info", "test", i.to!string, null, "", "");
+    auto bounded = sampleLoggingQueue();
+    assert(bounded.count > 0 && bounded.count <= LOGGING_MAX_ENTRIES && bounded.bytes <= LOGGING_MAX_BYTES);
+    assert(bounded.droppedCount > initialDrops);
+    auto batch = drainLogQueueForTest();
+    assert(batch[0].body != "0" && batch[$ - 1].body == (LOGGING_MAX_ENTRIES + 2).to!string);
+    batch = null;
+    auto large = replicate("x", 128 * 1024);
+    foreach (i; 0 .. 12) enqueueLog("info", "test", large, ["i": i.to!string], "", "");
+    bounded = sampleLoggingQueue();
+    assert(bounded.count > 0 && bounded.count < 12 && bounded.bytes <= LOGGING_MAX_BYTES);
+    const beforeOversize = sampleLoggingQueue();
+    enqueueLog("info", "test", replicate("x", LOGGING_MAX_BYTES / 16), null, "", "");
+    auto afterOversize = sampleLoggingQueue();
+    assert(afterOversize.count == beforeOversize.count && afterOversize.bytes == beforeOversize.bytes);
+    assert(afterOversize.droppedCount == beforeOversize.droppedCount + 1);
+    int sends;
+    flushLogs((string json) {
+        ++sends;
+        flushLogs((string) { ++sends; return true; });
+        return false;
+    });
+    assert(sends == 1 && sampleLoggingQueue().count == beforeOversize.count);
+    enqueueLog("info", "test", "latest_after_failure", null, "", "");
+    flushLogs((string json) {
+        assert(json.canFind("latest_after_failure"));
+        enqueueLog("info", "test", "arrived_during_export", null, "", "");
+        return true;
+    });
+    auto arrived = drainLogQueueForTest();
+    assert(arrived.length == 1 && arrived[0].body == "arrived_during_export");
+    enqueueLog("info", "test", "recovery", null, "", "");
+    bool threw;
+    try flushLogs(delegate bool(string json) { throw new Exception("collector unavailable"); });
+    catch (Exception) { threw = true; }
+    assert(threw && sampleLoggingQueue().count == 1);
+    flushLogs((string) => true);
+    assert(sampleLoggingQueue().count == 0 && sampleLoggingQueue().bytes == 0,
+        "exception path must release the single-export guard");
 }

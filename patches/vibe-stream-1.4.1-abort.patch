@@ -1,0 +1,34 @@
+--- a/tls/vibe/stream/openssl.d
++++ b/tls/vibe/stream/openssl.d
+@@ -512,6 +512,31 @@
+ 	void flush()
+ 	{
+ 		m_stream.flush();
++	}
++
++	/** Releases a terminal TLS stream without sending close_notify.
++
++		The caller must first stop all readers and writers. Unlike finalize(),
++		this performs no I/O and is safe after the underlying stream is closed.
++		SSL_free owns the BIO; the peer certificate holds a separate reference.
++	*/
++	void abort()
++	{
++		auto tls = m_tls;
++		auto certificate = m_peerCertificate;
++		m_tls = null;
++		m_bio = null;
++		m_peerCertificate = null;
++
++		() @trusted {
++			if (tls) SSL_free(tls);
++			if (certificate) X509_free(certificate);
++			ERR_clear_error();
++		} ();
++
++		m_stream = InterfaceProxy!Stream.init;
++		m_tlsCtx = null;
++		m_peerCertificateInfo = TLSCertificateInformation.init;
+ 	}
+ 
+ 	void finalize()
