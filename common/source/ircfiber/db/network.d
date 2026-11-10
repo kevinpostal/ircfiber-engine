@@ -70,6 +70,31 @@ version (RoutingPolicyTest) {
         ids ~= id;
         collection.insertOne(Bson(["id": Bson(id.toString()), "bncToken": Bson("legacy-fixture")]));
         collection.createIndex(Bson(["bncToken": Bson(1)]));
+        // A fresh native worker must not borrow the main event loop's Redis
+        // client. Its default repository must refuse writes, not migrate data.
+        {
+            import core.thread : Thread;
+            Throwable workerFailure;
+            auto worker = new Thread({
+                try {
+                    enforce(NetworkRepository.g_redis is null, "Worker inherited another event loop's Redis");
+                    AppMongoConnection.connect(mongoUri, database);
+                    auto workerRepository = new NetworkRepository();
+                    bool unavailable;
+                    try workerRepository.setDisabled(id, true);
+                    catch (NetworkWriteUnavailableException e)
+                        unavailable = e.code == "network_write_unavailable";
+                    enforce(unavailable, "Worker without its own Redis dispatched a network change");
+                } catch (Throwable e) { workerFailure = e; }
+            });
+            worker.start();
+            worker.join();
+            if (workerFailure !is null) throw workerFailure;
+            enforce(NetworkRepository.g_redis is redis, "Worker changed the main Redis default");
+            enforce(collection.findOne(["id": id.toString()])["bncToken"].get!string == "legacy-fixture"
+                && hasIndex("bncToken_1"), "Uninitialized worker changed the network");
+        }
+
         enforce(collect() == 1, "Closed fixture gate could not be acquired");
         auto repository = new NetworkRepository(redis);
         enforce(collection.findOne(["id": id.toString()])["bncToken"].get!string == "legacy-fixture"
@@ -155,11 +180,11 @@ final class NetworkRepository {
         void delegate(UUID, string) beforeIpv6IidWriteForTest;
     }
 
-    /// Global Redis instance, set at boot from app.d / bootstrap.d.
-    __gshared RedisStorage g_redis;
+    /// The boot default is thread-local: Redis connections belong to their event loop.
+    static RedisStorage g_redis;
 
-    /// Initializes the global Redis reference for cache operations.
-    /// Must be called once at boot after Redis is connected.
+    /// Initializes this thread's default Redis reference after it connects.
+    /// Workers with their own connections should pass them explicitly.
     static void initRedis(RedisStorage redis) {
         g_redis = redis;
     }
