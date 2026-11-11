@@ -69,6 +69,9 @@ final class ArchiveControl {
         // Only consumption may release it: interruption is not non-admission.
     }
     private AuthorizedClear[128] incoming;
+    private size_t requestedNetworkCursor;
+    private size_t[1_025] requestedOperationCursors;
+    private long nextRequestedProgress;
     private size_t scopeRegistration(string network) {
         if (!canonicalId(network)) return size_t.max;
         if (lastRegistration < registrations.length && registrations[lastRegistration].networkId == network)
@@ -447,6 +450,12 @@ final class ArchiveControl {
         string buffer;
         if (auto b = "buffer" in msg.config) buffer = b.get!string;
         if (buffer.length && !validBuffer(buffer)) return;
+        // One mutation authorization per UUID/scope until FIFO consumption.
+        // Status probes cannot upgrade it, or turn a query into a mutation.
+        foreach (ref entry; incoming)
+            if (entry.nonce.length && entry.operationId == id && entry.userId == msg.userId
+                    && entry.networkId == msg.networkId && entry.statusOnly == statusOnly)
+                return;
         size_t slot = size_t.max;
         foreach (i, ref entry; incoming) if (!entry.nonce.length) { slot = i; break; }
         if (slot == size_t.max) return;
@@ -467,13 +476,15 @@ final class ArchiveControl {
     void consume(ref EngineContext ctx, ref IRCRawEvent event) {
         if (stopping || ctx.archiveSpool is null) return;
         AuthorizedClear authorization;
-        foreach (ref entry; incoming) if (entry.nonce == event.text
+        size_t consumedSlot = size_t.max;
+        foreach (i, ref entry; incoming) if (entry.nonce == event.text
                 && entry.networkId == event.networkId) {
             authorization = entry;
-            entry = AuthorizedClear.init;
+            consumedSlot = i;
             break;
         }
         if (!authorization.nonce.length) return;
+        scope(exit) incoming[consumedSlot] = AuthorizedClear.init;
         const id = authorization.operationId, user = authorization.userId;
         string buffer = authorization.buffer;
         const statusOnly = authorization.statusOnly;
@@ -501,6 +512,7 @@ final class ArchiveControl {
         if (!raw.length || raw.length > archiveClearGroupMaxBytes) return;
         auto group = parseJsonString(raw);
         if (!validArchiveClearGroup(group, id, user, event.networkId, buffer)
+                || group["queryOnly"].get!bool || group["state"].get!string != "requested"
                 || !archiveClearGroupIncludes(group, ctx.localServer.serverId)) return;
         if (group["cutoffEid"].get!long == 0) {
             auto frozen = ctx.redis.getDb().eval!string(archiveBufferLineageLua ~ archiveFreezeClearGroupLua,
@@ -724,6 +736,86 @@ LUA", [archiveOperationKey(status.serverId, status.operationId),
         return retry;
     }
 
+    /// Redis retains authenticated POST intent before any journal anchor exists.
+    /// Recover one bounded item per turn, including after process restart. GET
+    /// probes never create this intent and cannot authorize this path.
+    private void progressRequested(ref EngineContext ctx) {
+        if (!acceptingControls || stopping || nowMs() < nextRequestedProgress) return;
+        nextRequestedProgress = nowMs() + 1_000;
+        ArchiveSpoolStatus spool;
+        if (!ctx.archiveSpool.tryStatus(spool) || !spool.ready || spool.failed
+                || spool.stopping || spool.stopped) return;
+        string network;
+        size_t selectedNetwork;
+        foreach (offset; 0 .. registrations.length) {
+            const i = (requestedNetworkCursor + offset) % registrations.length;
+            if (!registrations[i].networkId.length) continue;
+            network = registrations[i].networkId;
+            requestedNetworkCursor = (i + 1) % registrations.length;
+            selectedNetwork = i + 1;
+            break;
+        }
+        // Both indexes are bounded by capture. Original archival servers can
+        // rediscover offline intents; current coordinators discover their
+        // network's intents even when the original scope was another server.
+        auto pending = ctx.redis.getDb().eval!string(q"LUA
+for _,key in ipairs(KEYS) do
+    local kind = redis.call('TYPE', key).ok
+    if kind ~= 'none' and kind ~= 'set' then return 'unknown' end
+    if redis.call('SCARD', key) > 128 then return 'overflow' end
+end
+local ids = redis.call('SUNION', unpack(KEYS))
+table.sort(ids)
+return cjson.encode(ids)
+LUA", ["irc:archive:clear-pending:" ~ ctx.localServer.serverId,
+                "irc:archive:clear-network-pending:" ~ network], cast(string[])[]);
+        if (pending.empty || !pending.front.length || pending.front[0] != '['
+                || pending.front.length > 10_240) return;
+        auto ids = parseJsonString(pending.front);
+        if (ids.type != Json.Type.array || !ids.length || ids.length > 256) return;
+        const item = ids[requestedOperationCursors[selectedNetwork]++ % ids.length];
+        if (item.type != Json.Type.string || !canonicalId(item.get!string)) return;
+        const id = item.get!string;
+        const raw = ctx.redis.getDb().get(archiveClearGroupKey(id));
+        if (!raw.length || raw.length > archiveClearGroupMaxBytes) return;
+        auto group = parseJsonString(raw);
+        if (group["userId"].type != Json.Type.string || group["networkId"].type != Json.Type.string) return;
+        const user = group["userId"].get!string, nid = group["networkId"].get!string;
+        if (!canonicalId(user) || !canonicalId(nid)
+                || !validArchiveClearGroup(group, id, user, nid)
+                || group["queryOnly"].get!bool || group["state"].get!string != "requested"
+                || !validBuffer(group["buffer"].get!string)
+                || !archiveClearGroupIncludes(group, ctx.localServer.serverId)
+                || !userOwnsNetwork(ctx, user, nid) || !scopeReady(nid)) return;
+        // Refresh retained-ID evidence, never fabricate absence on a busy or
+        // uncertain native lookup. The freeze script independently checks all
+        // scope observations and elects the current assignment in the FIFO.
+        ArchiveOperationStatus local;
+        const lookup = ctx.archiveSpool.lookupOperationById(id, user, ctx.localServer.serverId, nid, local);
+        if (lookup != ArchiveLookup.found && lookup != ArchiveLookup.notFound) return;
+        if (lookup == ArchiveLookup.found) projectOperation(ctx, local);
+        projectLookup(ctx, id, user, nid, group["buffer"].get!string, lookup, local);
+        auto probe = ControlMessage("archiveClear", nid);
+        probe.userId = user; probe.timestampMs = nowMs();
+        probe.config = Json(["operationId": Json(id), "buffer": group["buffer"], "statusOnly": Json(true)]);
+        const encoded = probe.toJson().toString();
+        foreach (scopeId; group["servers"]) {
+            const server = scopeId.get!string;
+            if (server == ctx.localServer.serverId) continue;
+            auto sent = ctx.redis.getDb().eval!string(archiveDispatchControlLua,
+                [RedisKeys.control(server)], [encoded]);
+            if (sent.empty || (sent.front != "1" && sent.front != "full")) return;
+        }
+        if (group["cutoffEid"].get!long > 0 && lookup == ArchiveLookup.found) return;
+        probe.config["statusOnly"] = false;
+        const coordinator = group["coordinator"].get!string;
+        if (group["cutoffEid"].get!long > 0 || coordinator == ctx.localServer.serverId)
+            accept(ctx, probe);
+        else
+            ctx.redis.getDb().eval!string(archiveDispatchControlLua,
+                [RedisKeys.control(coordinator)], [probe.toJson().toString()]);
+    }
+
     void start(ref EngineContext ctx) {
         if (started) return;
         started = true;
@@ -739,6 +831,7 @@ LUA", [archiveOperationKey(status.serverId, status.operationId),
                     }
                     registerRequestedScope(ctx);
                     drainMoveReleases(ctx);
+                    progressRequested(ctx);
                     ArchiveSpoolStatus aggregate;
                     if (ctx.archiveSpool.tryStatus(aggregate)) {
                         const ready = !stopping && aggregate.ready && !aggregate.failed && !aggregate.stopping && !aggregate.stopped

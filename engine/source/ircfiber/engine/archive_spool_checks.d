@@ -59,8 +59,9 @@ private ArchiveSpoolStatus awaitStatus(ArchiveSpool spool,
     return status;
 }
 
-private void awaitReady(ArchiveSpool spool) {
-    auto status = awaitStatus(spool, (ref ArchiveSpoolStatus s) => s.ready || s.failed || s.stopped);
+private void awaitReady(ArchiveSpool spool, Duration timeout = 5.seconds) {
+    auto status = awaitStatus(spool, (ref ArchiveSpoolStatus s) => s.ready || s.failed || s.stopped,
+        timeout);
     requireCheck(status.ready && !status.failed && !status.stopped,
         "journal not ready: " ~ status.failureReason);
 }
@@ -643,7 +644,8 @@ private void quotaAndOversizeCheck() {
     requireCheck(exhausted && accepted > 0, "finite disk budget did not saturate within bounded input");
     stopOwned(spool);
     spool = new ArchiveSpool(fixtureConfig(root));
-    awaitReady(spool);
+    // Bounded 32-MiB journal recovery may exceed five seconds on emulated Linux.
+    awaitReady(spool, 30.seconds);
     status = awaitStatus(spool, (ref ArchiveSpoolStatus s) => s.ready);
     requireCheck(status.durableSequence == accepted && status.checkpoint == 0
         && hasGap(status, "disk_capacity_rejected") && hasGap(status, "admission_rejected"),
@@ -801,7 +803,8 @@ private void byteSaturationCheck() {
             fixtureBounds(root, status);
             requireCheck(until({ return spool.harnessResumeDrain(); }), "drain release failed");
             status = awaitStatus(spool, (ref ArchiveSpoolStatus s) =>
-                (s.ingressCommands == 0 && s.durableSequence == admitted && s.gapCount > 0) || s.failed);
+                (s.ingressCommands == 0 && s.durableSequence == admitted && s.gapCount > 0) || s.failed,
+                30.seconds);
             requireCheck(!status.failed && hasGap(status, "admission_rejected"),
                 "byte rejection lost explicit uncertainty");
             return;

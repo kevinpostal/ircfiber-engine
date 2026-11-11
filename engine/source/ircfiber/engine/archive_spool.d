@@ -130,7 +130,12 @@ private struct NetworkPending {
     bool oldestKnown;
 }
 
-private struct Command { string encoded; ArchiveKind kind; size_t tracker = size_t.max; }
+private struct Command {
+    string encoded;
+    ArchiveKind kind;
+    size_t tracker = size_t.max;
+    long timestampMs;
+}
 private struct Segment { ulong first, last; size_t size; string name; ulong allocated; }
 private long nowMs() { return Clock.currTime.stdTime / 10_000 - 62_135_596_800_000L; }
 private ulong roundBlock(ulong n) { return (n + 4095) & ~4095UL; }
@@ -195,6 +200,7 @@ final class ArchiveSpool {
     private ArchiveOperationStatus[1_152] diskOperations;
     private size_t diskOperationCount;
     private size_t scanSegment, scanOffset = 8;
+    private size_t replayTracker = size_t.max;
 
     this(ArchiveSpoolConfig config = ArchiveSpoolConfig.init, RuntimeDiagnosticMailbox diagnostics = null) {
         this.config = config;
@@ -238,7 +244,8 @@ final class ArchiveSpool {
             j["timestampMs"] = event["t"].get!long;
             j["payload"] = compactJson;
             if (pendingCatalogOwner.length) j["pendingCatalogOwner"] = pendingCatalogOwner;
-            return enqueue(j.toString(), ArchiveKind.append, serverId, networkId, j["queuedAtMs"].get!long);
+            return enqueue(j.toString(), ArchiveKind.append, serverId, networkId,
+                j["queuedAtMs"].get!long, j["timestampMs"].get!long);
         } catch (Exception) { return reject(ArchiveAdmission.unavailable); }
     }
 
@@ -254,7 +261,8 @@ final class ArchiveSpool {
         j["cutoffEid"] = cutoffEid;
         j["legacyCutoffMs"] = legacyCutoffMs;
         if (pendingCatalogOwner.length) j["pendingCatalogOwner"] = pendingCatalogOwner;
-        return enqueue(j.toString(), ArchiveKind.rename, serverId, networkId, j["queuedAtMs"].get!long);
+        const queuedAt = j["queuedAtMs"].get!long;
+        return enqueue(j.toString(), ArchiveKind.rename, serverId, networkId, queuedAt, queuedAt);
     }
 
     /// ID and scope are stable; callers must consult tryOperationStatus first on
@@ -274,7 +282,8 @@ final class ArchiveSpool {
         j["legacyCutoffMs"] = legacyCutoffMs;
         j["scopedLineageId"] = scopedLineageId;
         j["legacyLineageId"] = legacyLineageId;
-        return enqueue(j.toString(), ArchiveKind.purge, serverId, networkId, j["queuedAtMs"].get!long);
+        const queuedAt = j["queuedAtMs"].get!long;
+        return enqueue(j.toString(), ArchiveKind.purge, serverId, networkId, queuedAt, queuedAt);
     }
 
     bool tryStatus(out ArchiveSpoolStatus result) {
@@ -602,7 +611,7 @@ final class ArchiveSpool {
         return admission;
     }
     private ArchiveAdmission enqueue(string encoded, ArchiveKind kind, string serverId,
-            string networkId, long queuedAt) {
+            string networkId, long queuedAt, long timestampMs) {
         if (encoded.length > archiveMaxRecordBytes || (kind != ArchiveKind.append && encoded.length > maxControlRecordBytes))
             return reject(ArchiveAdmission.oversized);
         // Never wait for capacity or I/O. Yield only for bounded in-memory
@@ -633,7 +642,7 @@ final class ArchiveSpool {
             return reject(ArchiveAdmission.full);
         // All callers pass a newly encoded, exact-sized immutable JSON string.
         auto tracker = addNetworkPending(serverId, networkId, encoded.length, queuedAt);
-        ingress[(head + count) % maxCommands] = Command(encoded, kind, tracker);
+        ingress[(head + count) % maxCommands] = Command(encoded, kind, tracker, timestampMs);
         ++count; bytes += encoded.length;
         if (kind == ArchiveKind.append) { ++dataCount; dataBytes += encoded.length; }
         if (kind == ArchiveKind.purge) {
@@ -1229,10 +1238,11 @@ final class ArchiveSpool {
             putLittle!ulong(header[8 .. 16], nextSequence);
             fullWrite(appendFd, header[]);
             fullWrite(appendFd, cast(const(ubyte)[]) command.encoded);
-            auto r = decodeArchiveRecord(command.encoded, nextSequence);
             segments[segmentCount - 1].last = nextSequence;
             segments[segmentCount - 1].size += 16 + command.encoded.length;
-            if (!oldestAtMs) oldestAtMs = r.timestampMs;
+            // Admission already validated and encoded this immutable command.
+            // Carry its original timestamp rather than parsing its payload again.
+            if (!oldestAtMs) oldestAtMs = command.timestampMs;
             ++nextSequence;
         }
 
@@ -1263,6 +1273,8 @@ final class ArchiveSpool {
                         if (operations[operationIndex].sequence == seq && operations[operationIndex].redisApplied)
                             redisAppliedSequence = seq;
                     auto tracker = networkIndex(record.serverId, record.networkId, false);
+                    // Its pending count pins this cell until acknowledgement.
+                    replayTracker = tracker;
                     if (tracker != size_t.max) {
                         networks[tracker].oldestAtMs = record.queuedAtMs;
                         networks[tracker].oldestKnown = true;
@@ -1298,7 +1310,6 @@ final class ArchiveSpool {
             mutex.unlock();
             if (!seq) return;
             require(seq == checkpoint + 1, "checkpoint_order_violation");
-            auto completedRecord = decodeArchiveRecord(replay, seq);
             const completedBytes = replay.length;
             foreach (i; 0 .. diskOperationCount) if (diskOperations[i].sequence == seq) {
                 require(redisReady, "purge_redis_stage_unconfirmed");
@@ -1316,11 +1327,13 @@ final class ArchiveSpool {
             reclaim();
             mutex.lock();
             try {
-                auto tracker = networkIndex(completedRecord.serverId, completedRecord.networkId, false);
-                removeNetworkPending(tracker, completedBytes);
+                // prepareReplay validated the immutable frame and retained only
+                // its scalar tracker; no second payload decode is needed here.
+                removeNetworkPending(replayTracker, completedBytes);
                 if (!count && checkpoint == durableSequence) networkOverflow = false;
                 replay = null; replaySequence = 0; borrowed = false; acknowledgeSequence = 0;
                 redisAppliedSequence = 0;
+                replayTracker = size_t.max;
                 syncPublicOperations();
             } finally mutex.unlock();
             if (checkpoint == durableSequence) oldestAtMs = 0;

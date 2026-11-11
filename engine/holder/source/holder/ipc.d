@@ -8,9 +8,10 @@
 module holder.ipc;
 
 import core.time : Duration, msecs, seconds;
+import std.array : appender;
 import std.conv : to;
 import std.process : environment, thisProcessID;
-import std.string : startsWith, indexOf, lastIndexOf;
+import std.string : startsWith, indexOf, lastIndexOf, strip;
 import vibe.core.core : runTask, sleep;
 import vibe.core.net : NetworkAddress, TCPConnection, TCPListener, connectTCP, createStreamConnection,
     listenTCP, resolveHost;
@@ -209,7 +210,8 @@ private string readRequestLine(ref TCPConnection c, size_t maxBytes) {
 }
 
 private void writeLine(ref TCPConnection c, string line) {
-    c.write(cast(const(ubyte)[]) (line ~ "\n"));
+    c.write(cast(const(ubyte)[]) line);
+    c.write(cast(const(ubyte)[]) "\n");
     c.flush();
 }
 
@@ -571,85 +573,104 @@ final class HolderServer {
         logJsonMap("info", "holder", "Control session opened",
             ["engine": hello.engine, "event": "hello"]);
         while (true) {
-            string verb;
-            Json req;
-            string rawLine;
-            try {
-                rawLine = readRequestLine(c, MAX_META + 4096);
-                parseFirstLine(rawLine, verb, req);
-            } catch (RequestError e) {
-                writeLine(c, errLine(e.code, e.msg));
-                continue;
-            } catch (Exception) {
-                break; // engine closed the control session
-            }
-            string reply;
-            try {
-                if (verb != "META" && rawLine.length > MAX_LINE)
-                    throw new RequestError(ERR_TOO_LARGE, "request exceeds 1 MiB");
-                const metaBytes = verb == "META" ? rawMetaEncodedBytes(rawLine) : 0;
-                reply = okLine(controlRequest(verb, req, metaBytes));
-            } catch (RequestError e) {
-                reply = errLine(e.code, e.msg);
-            } catch (Exception e) {
-                reply = errLine(ERR_BAD_REQUEST, e.msg);
-            }
-            writeLine(c, reply);
+            try { controlExchange(c); }
+            catch (Exception) { break; } // engine closed the control session
         }
         logJsonMap("info", "holder", "Control session closed", ["engine": hello.engine, "event": "hello_closed"]);
     }
 
-    private Json controlRequest(string verb, Json req, size_t metaBytes = 0) {
+    pragma(inline, false)
+    private void controlExchange(ref TCPConnection c) {
+        // Initialize before a potentially idle read; neither the last request
+        // backing allocation nor the last full reply belongs to that wait.
+        string rawLine, reply;
+        scope(exit) { rawLine = null; reply = null; }
+        try { rawLine = readRequestLine(c, MAX_META + 4096); }
+        catch (RequestError e) { writeLine(c, errLine(e.code, e.msg)); return; }
+        reply = controlReply(rawLine);
+        rawLine = null;
+        writeLine(c, reply);
+    }
+
+    // Keep the transient parser graph off the sleeping control-session frame,
+    // even in an optimized build.
+    pragma(inline, false)
+    private string controlReply(string rawLine) {
+        try {
+            const line = rawLine.strip;
+            const space = line.indexOf(' ');
+            string verb = space < 0 ? line : line[0 .. space];
+            Json req;
+            ValidatedMeta meta;
+            if (verb == "META") meta = ValidatedMeta.fromRequest(rawLine, req);
+            else {
+                if (rawLine.length > MAX_LINE)
+                    throw new RequestError(ERR_TOO_LARGE, "request exceeds 1 MiB");
+                parseFirstLine(rawLine, verb, req);
+            }
+            return controlRequest(verb, req, meta);
+        } catch (RequestError e) {
+            return errLine(e.code, e.msg);
+        } catch (Exception) {
+            // JSON parser messages may contain private META text.
+            return errLine(ERR_BAD_REQUEST, "invalid control request");
+        }
+    }
+
+    private string controlRequest(string verb, Json req, ValidatedMeta meta = ValidatedMeta.init) {
         pruneTombstones(unixMsNow());
         switch (verb) {
             case "LIST": {
-                auto arr = Json.emptyArray;
-                for (auto record = first; record !is null; record = record.next)
-                    if (record.visible) arr ~= record.entry().toJson();
-                auto j = Json.emptyObject;
-                j["connections"] = arr;
-                return j;
+                auto output = appender!string();
+                output.put(`OK {"connections":[`);
+                bool comma;
+                for (auto record = first; record !is null; record = record.next) {
+                    if (!record.visible) continue;
+                    if (comma) output.put(',');
+                    record.entry().appendTo(output);
+                    comma = true;
+                }
+                output.put("]}");
+                return output.data;
             }
             case "INVENTORY":
-                return inventory(req);
+                return okLine(inventory(req));
             case "STATUS":
-                return statusJson();
+                return okLine(statusJson());
             case "INFO":
-                return lookupRecord(req).entry().toJson();
+                return okLine(lookupRecord(req).entry());
             case "META": {
-                if (!metaBytes) throw new RequestError(ERR_BAD_REQUEST, "META wire size required");
+                if (!meta.encodedBytes) throw new RequestError(ERR_BAD_REQUEST, "validated META required");
                 auto h = lookup(req);
-                auto meta = req["meta"];
-                if (meta.type == Json.Type.undefined) throw new RequestError(ERR_BAD_REQUEST, "meta required");
-                if (!h.replaceMeta(meta, metaBytes))
+                if (!h.replaceMeta(meta))
                     throw new RequestError(ERR_TOO_LARGE, "META entry or aggregate byte budget exceeded");
-                return Json.emptyObject;
+                return "OK {}";
             }
             case "GAP_ACK": {
                 auto h = lookup(req);
                 const generation = jsonUnsigned(req, "generation", true);
                 if (!h.acknowledgeGap(generation))
                     throw new RequestError(ERR_BAD_REQUEST, "future gap generation");
-                return h.entry(false).inventoryJson();
+                return okLine(h.entry(false).inventoryJson());
             }
             case "CLOSE": {
                 auto record = lookupRecord(req, true);
-                if (record is null) return Json.emptyObject;
+                if (record is null) return "OK {}";
                 if (record.owner !is null && record.owner.isOpen) {
                     auto quit = req["quit"].type == Json.Type.string ? req["quit"].get!string : "";
                     if (quit.length > 512) throw new RequestError(ERR_BAD_REQUEST, "quit exceeds 512 bytes");
                     record.owner.close(quit);
                 }
-                return Json.emptyObject;
+                return "OK {}";
             }
             case "FORGET": {
                 auto record = lookupRecord(req, true);
-                if (record is null) return Json.emptyObject;
+                if (record is null) return "OK {}";
                 if (record.owner !is null && record.owner.isOpen)
                     throw new RequestError(ERR_BUSY, "connection is open; use CLOSE");
                 if (record.owner is null) removeRecord(record);
                 else record.visible = false; // owner remains until explicit completion
-                return Json.emptyObject;
+                return "OK {}";
             }
             default:
                 throw new RequestError(ERR_BAD_REQUEST, "unknown request " ~ verb);
@@ -778,7 +799,7 @@ unittest {
     assert(server.instance != other.instance);
     const now = unixMsNow();
     foreach (_; 0 .. 260) inventoryFixture(server, now);
-    auto first = server.controlRequest("INVENTORY", Json.emptyObject);
+    auto first = parseJsonString(server.controlRequest("INVENTORY", Json.emptyObject)[3 .. $]);
     assert(first["through"].get!long == 260);
     assert(first["connections"].length == MAX_INVENTORY_ROWS && first["more"].get!bool);
     assert(okLine(first).length + 1 <= MAX_INVENTORY_BYTES);
@@ -791,12 +812,12 @@ unittest {
     request["instance"] = server.instance;
     request["through"] = first["through"];
     request["after"] = cursor;
-    auto second = server.controlRequest("INVENTORY", request);
+    auto second = parseJsonString(server.controlRequest("INVENTORY", request)[3 .. $]);
     assert(second["connections"].length == MAX_INVENTORY_ROWS);
     assert(second["connections"][0]["ordinal"].get!long == 129);
     assert(okLine(second).length + 1 <= MAX_INVENTORY_BYTES);
     request["after"] = second["nextAfter"];
-    auto finalPage = server.controlRequest("INVENTORY", request);
+    auto finalPage = parseJsonString(server.controlRequest("INVENTORY", request)[3 .. $]);
     assert(!finalPage["more"].get!bool && finalPage["nextAfter"].get!long == 260);
     assert(finalPage["connections"].length == 4);
     foreach (row; finalPage["connections"].get!(Json[])) {
@@ -836,4 +857,152 @@ unittest {
     server.pruneTombstones(now + CLOSED_RETAIN_SECS * 1000);
     assert(server.tinyTombstones() == 0 && server.records.length == 0 && server.ordinals.length == 0);
     assert(server.first is null && server.last is null && server.firstClosed is null && server.lastClosed is null);
+}
+
+/// Real socket/public-consumer regression, included only in the existing
+/// dial harness. Registry seeding avoids relaxing production DIAL policy.
+version (HolderDialHarness)
+void runHolderMetaRegressions(string directory, scope void delegate(bool, string) check) {
+    import std.path : buildPath;
+    import ircfiber.holder_client : HolderEntry;
+    import vibe.core.net : WaitForDataStatus;
+    import vibe.stream.operations : readLine;
+
+    const before = sampleHeldMemory();
+    auto upstream = listenTCP(0, (TCPConnection c) @trusted nothrow {
+        scope(exit) { try c.close(); catch (Exception) {} }
+        try {
+            ubyte[1024] bytes;
+            while (c.waitForDataEx(Duration.max) == WaitForDataStatus.dataAvailable)
+                c.read(bytes[], IOMode.once);
+        } catch (Exception) {}
+    }, "127.0.0.1");
+    scope(exit) upstream.stopListening();
+    HolderConfig cfg;
+    cfg.serverId = "meta-harness";
+    cfg.token = "fixture-only-token";
+    cfg.addrText = "unix://" ~ buildPath(directory, "meta-holder.sock");
+    cfg.addr = parseHolderAddr(cfg.addrText);
+    cfg.closedRetainSecs = 60;
+    cfg.detachMaxSecs = 60;
+    cfg.detachBufferBytes = 64 * 1024;
+    auto server = new HolderServer(cfg);
+    server.start();
+    scope(exit) { server.quitAll(); server.stop(); }
+    DialRequest request;
+    request.host = "127.0.0.1";
+    request.port = upstream.bindAddress.port;
+    request.tag = Tag("meta-network", "private-user", "private-network", "");
+    DialOutcome outcome;
+    outcome.conn = connectTCP("127.0.0.1", request.port);
+    outcome.peerIp = outcome.localIp = "127.0.0.1";
+    outcome.peerPort = request.port;
+    const ordinal = ++server.nextId;
+    auto id = "c-" ~ server.instance ~ "-" ~ ordinal.to!string;
+    auto owner = new Held(id, request, outcome, cfg.detachBufferBytes, cfg.detachMaxSecs, ordinal, server.instance);
+    scope(exit) owner.close("");
+    server.registerHeld(owner);
+    auto control = connectHolderAddr(cfg.addr.toNetworkAddress(true), 3.seconds);
+    scope(exit) control.close();
+    control.readTimeout = 3.seconds;
+
+    Json exchange(string command, string expectedVerb = "OK") {
+        writeLine(control, command);
+        string verb;
+        Json payload;
+        const line = cast(string) readLine(control, MAX_RESPONSE, "\n").idup;
+        parseFirstLine(line, verb, payload);
+        check(verb == expectedVerb, "META harness response verb " ~ expectedVerb);
+        return payload;
+    }
+    exchange("HELLO " ~ HelloRequest(PROTO_VERSION, cfg.serverId, "meta-harness", cfg.token).toJson().toString());
+    const idJson = Json(id).toString();
+    const idPayload = `{"id":` ~ idJson ~ `}`;
+    const metaPrefix = `META {"id":` ~ idJson ~ `,"meta":`;
+    void publish(string value) { exchange(metaPrefix ~ value ~ "}"); }
+    auto output = appender!string();
+    output.put(`{"wasConnected":true,"graceful":false,"usersDropped":false,"channelUsers":{"#large":[`);
+    enum size_t largeMembers = 25_000;
+    foreach (i; 0 .. largeMembers) {
+        if (i) output.put(',');
+        output.put(`"nick` ~ i.to!string ~ `"`);
+    }
+    output.put(`],"#overlap":["nick0"]},"private":"quote\"slash\\unicode-é"}`);
+    const largeText = output.data;
+    const expected = parseJsonString(largeText);
+    publish(largeText);
+    auto counters = sampleHeldMemory();
+    check(counters.metaBytes == before.metaBytes + largeText.length
+        && counters.metaMembersKnown == before.metaMembersKnown + largeMembers + 1
+        && counters.openMembersKnown == before.openMembersKnown + 1,
+        "large META is byte-accounted and counts memberships, not unique nicks");
+    auto info = HolderEntry.fromJson(exchange("INFO " ~ idPayload));
+    check(info.id == id && info.hasMeta && info.meta == expected, "INFO round-trips all large META fields through shared consumer");
+    auto list = exchange("LIST")["connections"];
+    check(list.length == 1 && HolderEntry.fromJson(list[0]).meta == expected, "LIST round-trips large META without changing shape");
+    auto page = exchange("INVENTORY");
+    check(page["connections"].length == 1 && page["connections"][0]["meta"].type == Json.Type.undefined
+        && page["connections"][0]["tag"].type == Json.Type.undefined,
+        "INVENTORY stays metadata/identity private with a large retained roster");
+    auto relay = connectHolderAddr(cfg.addr.toNetworkAddress(true), 3.seconds);
+    scope(exit) relay.close();
+    relay.readTimeout = 3.seconds;
+    writeLine(relay, "ATTACH " ~ `{"id":` ~ idJson ~ `,"token":` ~ Json(cfg.token).toString() ~ `}`);
+    string attachVerb;
+    Json attachedJson;
+    parseFirstLine(cast(string) readLine(relay, MAX_RESPONSE, "\n").idup, attachVerb, attachedJson);
+    auto attached = HolderEntry.fromJson(attachedJson);
+    check(attachVerb == "OK" && attached.attached && attached.meta == expected,
+        "ATTACH preserves large META and strict bool markers through shared consumer");
+
+    const replacement = `{"wasConnected":"true","graceful":0,"usersDropped":false,"channelUsers":{"#small":["a","b","a"]}}`;
+    publish(replacement);
+    counters = sampleHeldMemory();
+    check(counters.metaBytes == before.metaBytes + replacement.length
+        && counters.metaMembersKnown == before.metaMembersKnown + 3
+        && counters.openMembersKnown == before.openMembersKnown + 1,
+        "replacement releases old byte/member accounting");
+    auto replaced = HolderEntry.fromJson(exchange("INFO " ~ idPayload));
+    check(replaced.meta["wasConnected"].type == Json.Type.string && replaced.meta["graceful"].type == Json.Type.int_
+        && replaced.meta["channelUsers"]["#small"].length == 3 && attached.meta == expected,
+        "replacement neither coerces strict markers nor mutates an earlier consumer snapshot");
+    // Fill with legal JSON string bytes, not NULs, so the byte cap is the reason.
+    auto huge = new char[MAX_META + 2];
+    huge[] = 'x';
+    huge[0] = huge[$ - 1] = '"';
+    const rejectedBefore = sampleHeldMemory().metaRejectedBytes;
+    auto rejected = exchange(metaPrefix ~ cast(string) huge ~ "}", "ERR");
+    check(rejected["code"].get!string == ERR_TOO_LARGE
+        && sampleHeldMemory().metaRejectedBytes == rejectedBefore + huge.length,
+        "oversized fully valid META is refused by the unchanged byte cap");
+    foreach (bad; [
+        metaPrefix ~ `{}` ~ `,"m\u0065ta":[]}`,
+        metaPrefix ~ `{"bad":tru}}`
+    ]) {
+        auto error = exchange(bad, "ERR");
+        check(error["code"].get!string == ERR_BAD_REQUEST, "invalid/duplicate META is rejected");
+    }
+    auto deep = appender!string();
+    deep.put(metaPrefix);
+    foreach (_; 0 .. 257) deep.put('[');
+    deep.put('0');
+    foreach (_; 0 .. 257) deep.put(']');
+    deep.put('}');
+    check(exchange(deep.data, "ERR")["code"].get!string == ERR_BAD_REQUEST, "META depth bound rejects before graph parsing");
+    check(HolderEntry.fromJson(exchange("INFO " ~ idPayload)).meta == replaced.meta
+        && sampleHeldMemory().metaBytes == before.metaBytes + replacement.length
+        && sampleHeldMemory().metaMembersKnown == before.metaMembersKnown + 3,
+        "rejection preserves the previous META and all current accounting");
+    publish(`{"usersDropped":"false","channelUsers":{"#small":["a"]}}`);
+    check(sampleHeldMemory().openMembersKnown == before.openMembersKnown
+        && sampleHeldMemory().metaMembersKnown == before.metaMembersKnown,
+        "non-bool roster marker makes membership evidence unavailable");
+    publish("null");
+    check(!HolderEntry.fromJson(exchange("INFO " ~ idPayload)).hasMeta
+        && sampleHeldMemory().metaBytes == before.metaBytes + 4, "null META retains legacy wire semantics");
+    exchange("CLOSE " ~ idPayload);
+    check(sampleHeldMemory().metaBytes == before.metaBytes
+        && sampleHeldMemory().metaMembersKnown == before.metaMembersKnown
+        && sampleHeldMemory().openMembersKnown == before.openMembersKnown,
+        "close releases all META bytes and membership evidence");
 }

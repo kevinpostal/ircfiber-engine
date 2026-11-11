@@ -236,6 +236,10 @@ candidate holder. `archive_reliability.sh` is the candidate-only archive proof.
 The memory harness treats asynchronous producer-preparation exceptions as a
 failed check, while satisfying vibe's non-throwing task callback contract.
 Smoke-duration runs are not the full warm-up/soak qualification receipts.
+Failed archive runs capture bounded wire status, exact container generations,
+registry and logs before Mongo resume or launcher teardown. Evidence/cleanup
+errors are retained separately without replacing the original failure reason;
+constructor failures cannot provide observations from an uncreated fixture.
 
 The coordinated fixture's legacy IPC source digest comes from the plain
 `fea67fb4` revision declared by the immutable `8e7447fa` holder image and its

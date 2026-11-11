@@ -29,7 +29,7 @@ import ircfiber.db.mongo : AppMongoConnection;
 import ircfiber.db.messages : MessageRepository;
 import ircfiber.irc.registry : ServerRegistry;
 import ircfiber.archive_protocol : isCanonicalArchiveOperationId, archiveInstallCatalogLua,
-    archiveOwnerKey, archiveLookupKey, archiveProjectionKey;
+    archiveOwnerKey, archiveLookupKey, archiveProjectionKey, archiveClearGroupKey, archiveOperationKey;
 import ircfiber.models.irc_event : IRCRawEvent;
 import ircfiber.storage.buffer : BufferManager;
 import ircfiber.storage.redis : RedisStorage;
@@ -38,11 +38,12 @@ import ircfiber.engine.archive_control : applyArchiveRedisPurge, archiveHarnessC
     archiveHarnessObserve, archiveHarnessFreeze, archiveHarnessPin, archiveHarnessRelease,
     archiveHarnessAssumeRegisteredScope, stopArchive, ArchiveControl;
 import ircfiber.engine.archive_spool : ArchiveRecord, ArchiveKind, ArchiveSpool,
-    ArchiveSpoolConfig, ArchiveSpoolStatus, ArchiveShutdown, decodeArchiveRecord;
+    ArchiveSpoolConfig, ArchiveSpoolStatus, ArchiveShutdown, decodeArchiveRecord,
+    ArchiveOperationStatus, ArchiveOperationState, ArchiveLookup;
 import ircfiber.irc.manager : ConnectionManager;
 import ircfiber.engine.processor : startEventProcessor;
 import ircfiber.models.network : NetworkConfig;
-import ircfiber.redis.protocol : RedisKeys;
+import ircfiber.redis.protocol : RedisKeys, ControlMessage;
 
 private size_t cases, passed, failed;
 
@@ -633,7 +634,7 @@ private void pinCapacity(Fixture f) {
 
 /// Real Mongo majority catalog -> real Redis projection -> fresh controller ->
 /// actual processor/native replay. There is no registered-scope assumption.
-private void preparedDestinationAdmission(Fixture f, string redisUrl) {
+private void preparedDestinationAdmission(Fixture f, string redisUrl, bool requestedRecovery = false) {
     const uri = environment.get("IRCFIBER_ARCHIVE_TEST_MONGO_URL", "");
     check(environment.get("IRCFIBER_ARCHIVE_TEST_ISOLATED", "") == "1"
         && !uri.matchFirst(regex(
@@ -681,6 +682,10 @@ private void preparedDestinationAdmission(Fixture f, string redisUrl) {
     network.id = parseUUID(networkCursor);
     network.name = "ArchiveFixture"; network.nick = "fixture"; network.host = "archive-fixture.invalid";
     f.context.connManager.addNetwork(network, parseUUID(ownerCursor));
+    if (requestedRecovery) {
+        requestedIntentRecovery(f, network);
+        return;
+    }
     // Discard the test's synthetic catalog. All positive evidence below must
     // be installed by the actual strictly acknowledged source controller.
     f.redis.getDb().del(archiveOwnerKey(f.network));
@@ -713,6 +718,161 @@ private void preparedDestinationAdmission(Fixture f, string redisUrl) {
     check(f.context.archiveControl.scopeReady(f.network),
         "controller startup discarded acknowledged destination readiness");
     pausedProcessorShutdown(f, redisUrl, true);
+}
+
+/// Actual Mongo ownership/catalog, Redis request reservation, processor FIFO
+/// and native journal recovery. No warm-scope assumption or fabricated anchor.
+private void requestedIntentRecovery(Fixture f, NetworkConfig network) {
+    check(!f.redis.getDb().hget(RedisKeys.networkAssignments(), f.network).length,
+        "requested-intent fixture assignment already exists");
+    f.redis.getDb().hset(RedisKeys.networkAssignments(), f.network, f.server);
+    scope(exit) {
+        check(f.redis.getDb().hget(RedisKeys.networkAssignments(), f.network) == f.server,
+            "requested-intent assignment ownership changed; cleanup refused");
+        f.redis.getDb().hdel(RedisKeys.networkAssignments(), f.network);
+    }
+    const buffer = "#requested";
+    const id = f.operation(), queryId = f.operation(), foreignId = f.operation();
+    foreach (operation; [id, queryId, foreignId]) f.own(archiveOperationKey(f.server, operation));
+    f.own("irc:archive:completed-projections:" ~ f.server);
+    f.own(RedisKeys.server(f.server));
+    f.own(archiveProjectionKey(f.server, f.network));
+    f.context.serverRegistry = new ServerRegistry(f.redis);
+    f.append(buffer, 1, 1, "before-intent");
+    auto created = archiveHarnessCreateGroup(f.context, id, f.user, f.network, buffer,
+        1_800_000_000_000L, f.server, id);
+    check(created.length && created[0] == '{', "requested group was not reserved");
+    auto query = parseJsonString(archiveHarnessCreateGroup(f.context, queryId, f.user,
+        f.network, buffer, 1_800_000_000_000L, f.server, queryId));
+    // Historical status placeholders are deliberately not deletion intent.
+    query["queryOnly"] = true;
+    f.redis.getDb().set(archiveClearGroupKey(queryId), query.toString());
+    const foreignUser = randomUUID().toString();
+    created = archiveHarnessCreateGroup(f.context, foreignId, foreignUser, f.network,
+        buffer, 1_800_000_000_000L, f.server, foreignId);
+    check(created.length && created[0] == '{', "foreign placeholder setup failed");
+    f.context.archiveControl = new ArchiveControl;
+    bool processorStarted, processorDone;
+    string processorFailure;
+    size_t retriesStarted, retriesDone;
+    void startProcessor() {
+        processorDone = false; processorStarted = true;
+        runTask(() nothrow {
+            scope(exit) processorDone = true;
+            try startEventProcessor(f.context);
+            catch (Throwable error) { processorFailure = error.msg; }
+        });
+    }
+    void quiesce() {
+        const deadline = MonoTime.currTime + 5.seconds;
+        while (retriesDone != retriesStarted && MonoTime.currTime < deadline) sleep(5.msecs);
+        check(retriesDone == retriesStarted, "retry tasks still own fixture context");
+        if (processorStarted && !processorDone)
+            check(f.context.archiveControl.awaitShutdownBarrier(f.context, deadline),
+                "requested-intent FIFO failed to drain");
+        while (processorStarted && !processorDone && MonoTime.currTime < deadline) sleep(5.msecs);
+        check(!processorStarted || processorDone, "requested-intent processor still owns fixture context");
+        f.context.archiveControl.stop();
+        while (!f.context.archiveControl.isStopped() && MonoTime.currTime < deadline) sleep(5.msecs);
+        check(f.context.archiveControl.isStopped(), "requested-intent controller still owns fixture context");
+        f.tasksQuiescent = true;
+        check(!processorFailure.length, "requested-intent processor failed: " ~ processorFailure);
+    }
+    f.tasksQuiescent = false;
+    scope(exit) {
+        quiesce();
+        f.context.serverRegistry.unregisterServer(f.server);
+    }
+    auto request = ControlMessage("archiveClear", f.network);
+    request.userId = f.user;
+    request.config = Json(["operationId": Json(id), "buffer": Json(buffer)]);
+    // The initial authenticated dispatch arrives before scope readiness.
+    f.context.archiveControl.accept(f.context, request);
+    foreach (_; 0 .. 8) f.context.archiveControl.accept(f.context, request);
+    check(f.context.eventChannel.bufferFill == 1, "duplicate same-ID dispatch duplicated FIFO admission");
+    startProcessor();
+    check(f.context.archiveControl.awaitShutdownBarrier(f.context, MonoTime.currTime + 5.seconds),
+        "initial request did not cross actual FIFO");
+    quiesce();
+    auto initial = parseJsonString(f.redis.getDb().get(archiveClearGroupKey(id)));
+    check(initial["cutoffEid"].get!long == 0
+        && f.nativeStatus(MonoTime.currTime + 2.seconds).durableSequence == 0,
+        "unready initial dispatch manufactured an archive anchor");
+    // A true cold controller and reopened journal have no RAM intent/admission.
+    check(f.context.archiveSpool.shutdown(5.seconds, ArchiveShutdown.producersDrained),
+        "pre-anchor journal did not stop");
+    f.context.archiveSpool = new ArchiveSpool(f.nativeConfig);
+    auto recoveryDeadline = MonoTime.currTime + 5.seconds;
+    ArchiveSpoolStatus recovered;
+    do {
+        recovered = f.nativeStatus(recoveryDeadline);
+        if (!recovered.ready) sleep(5.msecs);
+    } while (!recovered.ready && MonoTime.currTime < recoveryDeadline);
+    check(recovered.ready && !recovered.failed && recovered.durableSequence == 0,
+        "cold journal was not empty and ready");
+    f.context.eventChannel = EngineEventChannel.create();
+    f.context.connManager = new ConnectionManager(f.context.eventChannel, f.redis, f.server, null);
+    auto ownerCursor = f.user;
+    f.context.connManager.addNetwork(network, parseUUID(ownerCursor));
+    f.context.archiveControl = new ArchiveControl;
+    check(!f.context.archiveControl.scopeReady(f.network), "cold controller retained warm admission");
+    f.tasksQuiescent = false;
+    startProcessor();
+    // GET-like probes alone must not upgrade the query-only placeholder.
+    auto statusProbe = request;
+    statusProbe.config = Json(["operationId": Json(queryId), "buffer": Json(buffer), "statusOnly": Json(true)]);
+    f.context.archiveControl.accept(f.context, statusProbe);
+    f.context.archiveControl.start(f.context);
+    ArchiveOperationStatus admitted;
+    const deadline = MonoTime.currTime + 15.seconds;
+    bool durable;
+    do {
+        const lookup = f.context.archiveSpool.lookupOperationById(id, f.user, f.server, f.network, admitted);
+        durable = lookup == ArchiveLookup.found && admitted.durable();
+        if (!durable) sleep(10.msecs);
+    } while (!durable && MonoTime.currTime < deadline);
+    check(durable && admitted.state == ArchiveOperationState.admitted
+        && f.context.archiveControl.scopeReady(f.network),
+        "requested intent did not recover through strict Mongo preparation and real FIFO");
+    const cutoff = admitted.cutoffEid, timestamp = admitted.legacyCutoffMs;
+    check(cutoff > 0 && timestamp > 0, "recovered intent lacks its frozen boundary");
+    for (size_t i; i < 8; ++i) {
+        ++retriesStarted;
+        const statusOnly = i % 2 == 0;
+        runTask(() nothrow {
+            scope(exit) ++retriesDone;
+            try {
+                auto retry = request;
+                retry.config = Json(["operationId": Json(id), "buffer": Json(buffer),
+                    "statusOnly": Json(statusOnly)]);
+                f.context.archiveControl.accept(f.context, retry);
+            } catch (Throwable error) { processorFailure = error.msg; }
+        });
+    }
+    // Let the background cursor inspect every placeholder and repeated intent.
+    sleep(4.seconds);
+    quiesce();
+    auto finalGroup = parseJsonString(f.redis.getDb().get(archiveClearGroupKey(id)));
+    auto untouched = parseJsonString(f.redis.getDb().get(archiveClearGroupKey(queryId)));
+    auto foreign = parseJsonString(f.redis.getDb().get(archiveClearGroupKey(foreignId)));
+    check(finalGroup["operationId"].get!string == id && finalGroup["cutoffEid"].get!long == cutoff
+        && finalGroup["legacyTimestampCutoffMs"].get!long == timestamp
+        && f.nativeStatus(MonoTime.currTime + 2.seconds).durableSequence == 1,
+        "concurrent same-ID status/retry allocated another cutoff or native record");
+    check(untouched["queryOnly"].get!bool && untouched["cutoffEid"].get!long == 0
+        && foreign["cutoffEid"].get!long == 0,
+        "background progression admitted a query-only or unauthenticated placeholder");
+    check(f.context.archiveSpool.shutdown(5.seconds, ArchiveShutdown.producersDrained),
+        "admitted journal did not stop");
+    f.context.archiveSpool = new ArchiveSpool(f.nativeConfig);
+    string encoded; ulong sequence;
+    const replayDeadline = MonoTime.currTime + 5.seconds;
+    while (!f.context.archiveSpool.tryPeek(encoded, sequence) && MonoTime.currTime < replayDeadline) sleep(5.msecs);
+    check(encoded.length > 0, "recovered requested intent is absent from native replay");
+    auto record = decodeArchiveRecord(encoded, sequence);
+    check(record.kind == ArchiveKind.purge && record.operationId == id && record.cutoffEid == cutoff
+        && record.legacyCutoffMs == timestamp && sequence == 1,
+        "cold replay did not retain exactly the recovered requested intent");
 }
 
 private void pausedProcessorShutdown(Fixture f, string redisUrl, bool preparedScope = false) {
@@ -986,6 +1146,9 @@ private void runFixtures(RedisStorage redis, string run, string redisUrl) {
     });
     fixtureCase("strict source handoff prepares a cold destination before its first real processor event", (f) {
         preparedDestinationAdmission(f, redisUrl);
+    });
+    fixtureCase("unanchored authenticated clear survives cold restart and concurrent status/retry without admitting probes", (f) {
+        preparedDestinationAdmission(f, redisUrl, true);
     });
 }
 

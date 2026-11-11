@@ -8,7 +8,6 @@ import vibe.core.net : TCPConnection, WaitForDataStatus;
 import vibe.core.stream : IOMode;
 import vibe.core.sync : LocalManualEvent, createManualEvent;
 import vibe.core.task : Task;
-import vibe.data.json : Json;
 import vibe.stream.tls : TLSStream;
 import vibe.stream.openssl : OpenSSLStream;
 import ircfiber.async : safeFiberRun;
@@ -85,22 +84,6 @@ void mergeHeldQueueProgress(Held owner, ref HeldQueueCounters[3] totals) {
     }
 }
 
-/// This counts stored membership entries, not unique nicks or fresh engine
-/// state. Missing or deliberately dropped rosters remain unavailable.
-private bool metaMemberCount(Json value, out ulong members) {
-    members = 0;
-    if (value.type != Json.Type.object) return false;
-    auto dropped = value["usersDropped"];
-    if (dropped.type != Json.Type.bool_ || dropped.get!bool) return false;
-    auto rosters = value["channelUsers"];
-    if (rosters.type != Json.Type.object) return false;
-    foreach (roster; rosters.get!(Json[string]).byValue) {
-        if (roster.type != Json.Type.array) return false;
-        if (ulong.max - members < roster.length) return false;
-        members += roster.length;
-    }
-    return true;
-}
 bool heldAdmissionAvailable() {
     return laneBytes[0] <= GLOBAL_LIMITS[0] - STREAM_BUFFER_SIZE - LINE_LIMIT;
 }
@@ -115,6 +98,7 @@ string pingReply(string line) @safe pure nothrow {
 private final class Attachment {
     TCPConnection stream;
     ulong generation;
+    string responseLine;
     OwnedBytes flight;
     bool uncertain;
     long writeStartedAtMs;
@@ -140,7 +124,7 @@ final class Held {
     long detachedSinceMs;
     string closeReason;
     long closedAtMs;
-    private Json storedMeta = Json(null);
+    private ValidatedMeta storedMeta;
     private size_t metaSize;
     private ulong metaMembers;
     private bool membersKnown;
@@ -229,15 +213,15 @@ final class Held {
         catch (Throwable) { return Task.init; }
     }
 
-    @property Json meta() { return storedMeta; }
-    bool replaceMeta(Json value, size_t encodedBytes) {
-        if (!isOpen || encodedBytes > MAX_META || encodedBytes > META_TOTAL_LIMIT ||
+    bool replaceMeta(ValidatedMeta value) {
+        const encodedBytes = value.encodedBytes;
+        if (!encodedBytes || !isOpen || encodedBytes > MAX_META || encodedBytes > META_TOTAL_LIMIT ||
             counts.metaBytes - metaSize > META_TOTAL_LIMIT - encodedBytes) {
             counts.metaRejectedBytes = saturatingAdd(counts.metaRejectedBytes, encodedBytes);
             return false;
         }
         ulong newMembers;
-        const newKnown = metaMemberCount(value, newMembers);
+        const newKnown = value.memberCount(newMembers);
         if (membersKnown) {
             counts.metaMembersKnown -= metaMembers;
             --counts.openMembersKnown;
@@ -517,8 +501,8 @@ final class Held {
         attached = true;
         detachedSinceMs = 0;
         scope(failure) { if (owns(current)) detach(current, "attachment_setup_failed"); }
-        if (responseLine is null) responseLine = okLine(entry().toJson());
-        responseLine ~= "\n";
+        current.responseLine = responseLine is null ? okLine(entry(), true) : responseLine ~ "\n";
+        responseLine = null;
         ++relayWriters;
         ++counts.attachmentWriterTasks;
         ++pumps;
@@ -531,9 +515,10 @@ final class Held {
         }
         writerAttachment = current;
         if (launchOwner("holder_attachment_writer",
-                { attachmentWriterLoop(current, responseLine); }) == Task.init) {
+                { attachmentWriterLoop(current); }) == Task.init) {
             --relayWriters;
             --counts.attachmentWriterTasks;
+            current.responseLine = null;
             writerAttachment = null;
             detach(current, "attachment_writer_start_failed");
             return;
@@ -543,8 +528,9 @@ final class Held {
     private bool owns(Attachment current) {
         return isOpen && attached && attachment is current && current.generation == attachGen;
     }
-    private void attachmentWriterLoop(Attachment current, string responseLine) {
+    private void attachmentWriterLoop(Attachment current) {
         scope(exit) {
+            current.responseLine = null;
             if (current.flight.length) relay.release(current.flight);
             if (writerAttachment is current) writerAttachment = null;
             attachmentWriterCompletions = saturatingAdd(attachmentWriterCompletions, 1);
@@ -554,8 +540,8 @@ final class Held {
         }
         try {
             if (!owns(current)) return;
-            writeAttachment(current, cast(const(ubyte)[]) responseLine);
-            responseLine = null;
+            writeAttachment(current, cast(const(ubyte)[]) current.responseLine);
+            current.responseLine = null;
             while (owns(current)) {
                 const ec = relayChanged.emitCount;
                 current.flight = relay.take();
@@ -686,7 +672,7 @@ final class Held {
         }
         counts.metaBytes -= metaSize;
         metaSize = 0;
-        storedMeta = Json(null);
+        storedMeta = ValidatedMeta.init;
         relay.clear();
         commands.clear();
         pongs.clear();
@@ -855,20 +841,3 @@ unittest {
     });
 }
 
-unittest {
-    auto meta = Json.emptyObject;
-    ulong members;
-    assert(!metaMemberCount(meta, members));
-    meta["usersDropped"] = false;
-    auto rosters = Json.emptyObject;
-    rosters["#one"] = Json([Json("a"), Json("b")]);
-    rosters["#two"] = Json([Json("a")]);
-    meta["channelUsers"] = rosters;
-    assert(metaMemberCount(meta, members) && members == 3);
-    meta["usersDropped"] = true;
-    assert(!metaMemberCount(meta, members));
-    meta["usersDropped"] = false;
-    meta["channelUsers"] = Json.emptyObject;
-    assert(metaMemberCount(meta, members) && members == 0);
-    assert(!metaMemberCount(Json(null), members));
-}

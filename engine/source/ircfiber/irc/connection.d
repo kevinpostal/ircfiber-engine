@@ -16852,6 +16852,9 @@ Ircv3Check[] slowdownWireChecks(out string[] wire) {
 version (MemoryReliabilityHarness)
 Ircv3Check[] memoryIdentityRegressionChecks() {
     import vibe.data.json : parseJsonString;
+    import vibe.core.core : sleep;
+    import vibe.core.net : listenTCP;
+    import vibe.stream.operations : readLine;
 
     Ircv3Check[] checks;
     void check(string name, bool passed) { checks ~= Ircv3Check(name, passed); }
@@ -16860,6 +16863,40 @@ Ircv3Check[] memoryIdentityRegressionChecks() {
     auto channel = EngineEventChannel.create();
     scope (exit) channel.close();
     auto client = new PersistentIRCClient(cfg, channel);
+    string[] requestedWire;
+    bool peerClosed;
+    auto listener = listenTCP(0, (TCPConnection peer) {
+        try {
+            while (!peer.empty) requestedWire ~= (cast(const(char)[]) peer.readLine()).idup;
+        } catch (Exception) {}
+        try peer.close(); catch (Exception) {}
+        peerClosed = true;
+    }, "127.0.0.1");
+    client.connection = connectTCP("127.0.0.1", listener.bindAddress.port);
+    scope (exit) {
+        client.connection.close();
+        foreach (_; 0 .. 200) {
+            if (peerClosed) break;
+            sleep(1.msecs);
+        }
+        listener.stopListening();
+        sleep(1.msecs);
+    }
+    // Reads rejected while disconnected never acquire response ownership.
+    // Use the real admission/write path, then keep synthetic membership
+    // traffic disconnected so it cannot start unrelated background probes.
+    bool request(string line, bool fromClient = false) {
+        const before = requestedWire.length;
+        client.state = ConnectionState.connected;
+        scope (exit) client.state = ConnectionState.disconnected;
+        client.sendRaw(line, fromClient);
+        foreach (_; 0 .. 200) {
+            client.drainPacedQueue();
+            if (requestedWire.length > before) break;
+            sleep(1.msecs);
+        }
+        return requestedWire.length == before + 1 && requestedWire[before] == line;
+    }
     IRCRawEvent[100] rows;
     size_t rowCount;
     void drain() {
@@ -16919,15 +16956,17 @@ Ircv3Check[] memoryIdentityRegressionChecks() {
 
     // Reuse the registration harness's two-channel, host-bearing session.
     fiberCheckSession(client, 1_000);
-    client.state = ConnectionState.disconnected; // writes stay in the in-memory wire queue
+    client.state = ConnectionState.disconnected; // suppress unrelated automatic reads
     drain();
     feed(":s 005 me WHOX BOT=b :are supported");
     feed(":s 354 me 152 #c ~a ha alice Gb stable :Alice Stable");
     feed(":s METADATA alice pronouns * :they/them");
     // Finish an actual initial WHO before freezing the steady-state
     // baseline: 315 legitimately marks every existing member as probed.
-    client.sendRaw("WHO #c");
+    const initialWhoSent = request("WHO #c");
     feed(":s 315 me #c :End");
+    check("initial WHO reaches upstream and closes its response ownership",
+        initialWhoSent && client.pendingWhos.length == 0 && "WHO #c" !in client.optionalReads);
     const baselineCounts = client.memoryCounters();
     const baselineSnapshot = serializedIdentity();
     bool bounded = true;
@@ -16945,24 +16984,45 @@ Ircv3Check[] memoryIdentityRegressionChecks() {
 
     // Late private WHO/WHOX/WHOIS rows still reach their requesting client
     // but neither retain a departed identity nor reinsert it into a roster.
-    client.sendRaw("WHO #c", true);
+    const whoSent = request("WHO #c", true);
     feed(":s 352 me #c old host s churn9999 G@ :0 Departed");
     bool deliveredWho = false;
     foreach (row; rows[0 .. rowCount]) deliveredWho = deliveredWho || row.command == "352";
     feed(":s 315 me #c :End");
-    client.sendRaw("WHO #c %na", true);
+    bool completedWho = false;
+    foreach (row; rows[0 .. rowCount]) completedWho = completedWho || row.command == "315";
+    check("late requested WHO delivers its row and terminator and releases response ownership",
+        whoSent && deliveredWho && completedWho && client.pendingWhos.length == 0
+        && "WHO #c" !in client.optionalReads);
+    check("late requested WHO does not recreate departed caches or roster entries",
+        !cached("churn9999") && sameCounts(baselineCounts, client.memoryCounters()));
+
+    const whoxSent = request("WHO #c %na", true);
+    // whoxField reads requested fields in tcuihsnfdlaor order: %na
+    // returns [me, nick, account], without a token because t was not asked for.
     feed(":s 354 me churn9999 oldaccount");
     bool deliveredWhox = false;
     foreach (row; rows[0 .. rowCount]) deliveredWhox = deliveredWhox || row.command == "354";
     feed(":s 315 me #c :End");
-    client.sendRaw("WHOIS churn9999", true);
+    bool completedWhox = false;
+    foreach (row; rows[0 .. rowCount]) completedWhox = completedWhox || row.command == "315";
+    check("late requested WHOX delivers its row and terminator and releases response ownership",
+        whoxSent && deliveredWhox && completedWhox && client.pendingWhos.length == 0
+        && "WHO #c %na" !in client.optionalReads);
+    check("late requested WHOX does not recreate departed caches or roster entries",
+        !cached("churn9999") && sameCounts(baselineCounts, client.memoryCounters()));
+
+    const whoisSent = request("WHOIS churn9999", true);
     feed(":s 311 me churn9999 old host * :Departed");
     bool deliveredWhois = false;
     foreach (row; rows[0 .. rowCount]) deliveredWhois = deliveredWhois || row.command == "311";
     feed(":s 318 me churn9999 :End");
-    check("late requested WHO/WHOX/WHOIS responses complete without recreating departed caches",
-        deliveredWho && deliveredWhox && deliveredWhois && !cached("churn9999")
-        && sameCounts(baselineCounts, client.memoryCounters()));
+    bool completedWhois = false;
+    foreach (row; rows[0 .. rowCount]) completedWhois = completedWhois || row.command == "318";
+    check("late requested WHOIS delivers its row and terminator and releases response ownership",
+        whoisSent && deliveredWhois && completedWhois && "WHOIS churn9999" !in client.optionalReads);
+    check("late requested WHOIS does not recreate departed caches or roster entries",
+        !cached("churn9999") && sameCounts(baselineCounts, client.memoryCounters()));
 
     feed(":wander!u@h JOIN #c acct :Wander");
     feed(":wander!u@h JOIN #d acct :Wander");

@@ -891,12 +891,20 @@ def main():
                       reason=(type(error).__name__ + ": " + str(error))[:2000], scope="archival B")
     finally:
         if qualification:
+            if result["state"] != "passed":
+                try:
+                    qualification.capture_failure_evidence(result)
+                except BaseException as error:
+                    result.setdefault("evidenceErrors", {})["capture"] = (
+                        type(error).__name__ + ": " + str(error))[:500]
             for cleanup in (qualification.resume_mongo, qualification.stop_logs):
                 try:
                     cleanup()
                 except BaseException as error:
-                    result = dict(state="failed", qualified=False, scope="archival B",
-                                  reason=("qualification cleanup failed: " + str(error))[:2000])
+                    result["state"] = "failed"
+                    result["qualified"] = False
+                    result.setdefault("cleanupErrors", []).append(
+                        (type(error).__name__ + ": " + str(error))[:500])
     result.update(case=os.environ.get("ARCHIVE_CASE"), run=os.environ.get("ROUTING_REGRESSION_RUN"),
                   inputImages={component: os.environ.get("ROUTING_REGRESSION_" + component.upper() + "_IMAGE")
                                for component in ("engine", "holder", "gateway")},

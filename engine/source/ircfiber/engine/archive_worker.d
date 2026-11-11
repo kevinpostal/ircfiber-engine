@@ -189,7 +189,7 @@ void runPendingCatalogArchiveRegressionChecks(RedisStorage redis, MessageReposit
         heldSnapshot.connectedAtMs = established.connectedAtMs;
         heldSnapshot.graceful = true;
         heldSnapshot.activeRoute = "direct";
-        heldClient.setMeta(established.id, toJSON(heldSnapshot));
+        heldClient.setMetaLazy(established.id, (bool _) => toJSON(heldSnapshot));
         established.stream.close();
         awaitState({
             heldEntry = heldClient.info(established.id);

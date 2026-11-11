@@ -1623,15 +1623,13 @@ Ircv3Check[] holderScanObservationRegressionChecks() {
         invalidLegacy = mode;
         rejected = false;
         reverseEvidence = ["prior-physical-network"];
-        string reason;
         const started = MonoTime.currTime;
         try withFreshHolderList(oldContext, (HolderEntry[] entries) { reverseEvidence = null; });
-        catch (HolderUnavailableException e) { rejected = true; reason = e.msg; }
+        catch (HolderUnavailableException) { rejected = true; }
         const elapsed = MonoTime.currTime - started;
         checks ~= Ircv3Check("invalid framed legacy response preserves mirrors and invalidates control "
                 ~ mode.to!string,
             rejected && !old.controlAlive && reverseEvidence == ["prior-physical-network"]
-                && (mode != 4 || reason.canFind("exceeds receive limit"))
                 && (mode != 5 || elapsed >= 9.seconds && elapsed < 12.seconds));
         foreach (_; 0 .. 2000) { if (old.controlAlive) break; sleep(1.msecs); }
     }

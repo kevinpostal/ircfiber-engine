@@ -30,7 +30,7 @@ import vibe.core.stream : IOMode;
 import vibe.stream.operations : readLine;
 import vibe.stream.tls : TLSContext, TLSContextKind, TLSStream, createTLSContext, createTLSStream;
 import vibe.data.json : Json, parseJsonString;
-import holder.ipc : HolderConfig, HolderServer, connectHolderAddr, parseHolderAddr;
+import holder.ipc : HolderConfig, HolderServer, connectHolderAddr, parseHolderAddr, runHolderMetaRegressions;
 import ircfiber.holder_client : HolderClient, ClientDialRequest = DialRequest, DialFailedException;
 import holder.dial : DialFailed, DialOutcome, ResolvedAddr, createTLSStreamWithTimeout, dialUpstream,
     seedResolvedAddresses;
@@ -788,6 +788,8 @@ int main() {
             caseNativeAOnly();
             caseSourcePoolBoundary(dir);
             caseOldHolderCapability();
+            begin("holder META: owned bounded wire storage and public-consumer round trips");
+            runHolderMetaRegressions(dir, (bool passed, string name) { check(passed, name); });
         } catch (Throwable t) {
             try gFailures ~= gCase ~ ": unexpected " ~ t.toString(); catch (Throwable) {}
         }

@@ -251,6 +251,9 @@ services:
       IRCFIBER_MONGO_URL: mongodb://mongo:27017/ircfiber
       IRCFIBER_LOG_LEVEL: debug
       IRCFIBER_MULLVAD_POOL: socks5://tailscale-mullvad-de:1055,socks5://tailscale-mullvad-ch:1055,socks5://tailscale-mullvad-nl:1055
+      IRCFIBER_ARCHIVE_DIR: /var/lib/ircfiber/archive
+    volumes:
+      - engine_archive:/var/lib/ircfiber/archive
     depends_on:
       redis:
         condition: service_healthy
@@ -311,4 +314,6 @@ volumes:
   zookeeper_datalog:
     driver: local
   uploads_data:
+    driver: local
+  engine_archive:
     driver: local

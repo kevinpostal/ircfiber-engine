@@ -1029,13 +1029,6 @@ final class HolderClient {
         return entry;
     }
 
-    /// Replaces the entry's opaque META (≤ 8 MiB; `too_large` above).
-    void setMeta(string id, Json meta) {
-        auto j = idPayload(id);
-        j["meta"] = meta;
-        request("META", j);
-    }
-
     /// Construct META only after control admission. The callback MUST NOT
     /// yield; undefined cancels a stale publication without sending anything.
     /// It is scoped to this call, never retained by the holder client.

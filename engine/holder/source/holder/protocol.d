@@ -10,6 +10,7 @@
 module holder.protocol;
 
 import std.conv : to;
+import std.array : Appender, appender;
 import std.string : indexOf, strip;
 import vibe.data.json : Json, parseJsonString;
 import ircfiber.redis.protocol : TlsInfo;
@@ -307,10 +308,10 @@ struct Entry {
     string closeReason;
     /// 0 = open (serialised as null).
     long closedAtMs;
-    /// `Json(null)` when the engine never set one.
-    Json meta = Json(null);
+    /// Validated, independently owned wire JSON; no retained roster graph.
+    ValidatedMeta meta;
 
-    Json toJson() const {
+    private Json fieldsJson() const {
         auto j = Json.emptyObject;
         j["id"] = id;
         j["instance"] = instance;
@@ -338,8 +339,21 @@ struct Entry {
         j["bufferedBytes"] = cast(long) bufferedBytes;
         j["closeReason"] = closeReason.length ? Json(closeReason) : Json(null);
         j["closedAtMs"] = closedAtMs > 0 ? Json(closedAtMs) : Json(null);
-        j["meta"] = meta.type == Json.Type.undefined ? Json(null) : meta;
         return j;
+    }
+
+    void appendTo(ref Appender!string output) const {
+        const fields = fieldsJson().toString();
+        output.put(fields[0 .. $ - 1]);
+        output.put(`,"meta":`);
+        meta.appendTo(output);
+        output.put('}');
+    }
+
+    string toString() const {
+        auto output = appender!string();
+        appendTo(output);
+        return output.data;
     }
 
     /// Deliberately excludes routing tags, TLS and META. All strings originate
@@ -365,44 +379,6 @@ struct Entry {
         j["deliveryAmbiguous"] = deliveryAmbiguous;
     }
 
-    static Entry fromJson(Json j) {
-        Entry e;
-        e.id = jstr(j, "id");
-        e.instance = jstr(j, "instance");
-        e.ordinal = jsonUnsigned(j, "ordinal");
-        e.gapGeneration = jsonUnsigned(j, "gapGeneration");
-        e.gapAckGeneration = jsonUnsigned(j, "gapAckGeneration");
-        e.droppedBytes = jsonUnsigned(j, "droppedBytes");
-        e.droppedLines = jsonUnsigned(j, "droppedLines");
-        e.gapStartedAtMs = jlong(j, "gapStartedAtMs");
-        e.deliveryAmbiguous = jbool(j, "deliveryAmbiguous");
-        e.relayBytes = cast(size_t) jsonUnsigned(j, "relayBytes");
-        e.outboundBytes = cast(size_t) jsonUnsigned(j, "outboundBytes");
-        e.pongBytes = cast(size_t) jsonUnsigned(j, "pongBytes");
-        e.relayWriterFlightBytes = cast(size_t) jsonUnsigned(j, "relayWriterFlightBytes");
-        e.relayWriteInFlightMs = jlong(j, "relayWriteInFlightMs");
-        e.upstreamWriteInFlightMs = jlong(j, "upstreamWriteInFlightMs");
-        e.attachmentGeneration = jsonUnsigned(j, "attachmentGeneration");
-        e.attachmentWriterCompletions = jsonUnsigned(j, "attachmentWriterCompletions");
-        e.upstreamWriterDone = jbool(j, "upstreamWriterDone");
-        e.tlsFinalized = jbool(j, "tlsFinalized");
-        e.tag = Tag.fromJson(j["tag"]);
-        e.state = jstr(j, "state");
-        e.attached = jbool(j, "attached");
-        e.host = jstr(j, "host");
-        e.port = cast(ushort) jlong(j, "port");
-        e.tls = TlsInfoJson.fromJson(j["tls"]);
-        e.peerIp = jstr(j, "peerIp");
-        e.localIp = jstr(j, "localIp");
-        e.connectedAtMs = jlong(j, "connectedAtMs");
-        e.detachedSinceMs = jlong(j, "detachedSinceMs");
-        e.bufferedBytes = cast(size_t) jlong(j, "bufferedBytes");
-        e.closeReason = jstr(j, "closeReason");
-        e.closedAtMs = jlong(j, "closedAtMs");
-        auto m = j["meta"];
-        e.meta = (m.type == Json.Type.undefined) ? Json(null) : m;
-        return e;
-    }
 }
 
 /// `EVENT` line emitted while a `DIAL` is in progress.
@@ -593,17 +569,81 @@ long parseDetachMaxSecs(string value) {
     return cast(long) result;
 }
 
-/// Locate a top-level META value in the original validated request. Count wire
-/// bytes, including internal whitespace/escapes, without serializing its tree.
-/// Duplicate (including escaped) meta keys are refused rather than measured
-/// differently from the parser's winning key. Scanning uses constant storage.
-size_t rawMetaEncodedBytes(string line) {
+/// A raw value can reach the serializer only through complete request parsing.
+/// The parser's duplicate-key/type semantics are also used for cached counters.
+/// No parsed roster, envelope, or substring of a request is retained.
+struct ValidatedMeta {
+    private string text;
+    private ulong members;
+    private bool membersKnown;
+
+    @property size_t encodedBytes() const { return text.length; }
+    bool memberCount(out ulong result) const {
+        result = members;
+        return membersKnown;
+    }
+
+    void appendTo(ref Appender!string output) const {
+        output.put(text.length ? text : "null");
+    }
+
+    static ValidatedMeta fromRequest(string line, out Json envelope) {
+        import std.utf : validate;
+        validate(line);
+        // Vibe's DOM parser accepts non-JSON forms (e.g. trailing commas and
+        // literal string controls). Validate strict wire syntax before parsing
+        // so its permissive extensions can never be replayed as raw JSON.
+        const raw = rawMetaValue(line);
+        string verb;
+        Json parsed;
+        scope(exit) parsed = Json.undefined;
+        parseFirstLine(line, verb, parsed);
+        if (verb != "META" || parsed.type != Json.Type.object)
+            throw new Exception("META payload must be an object");
+        ValidatedMeta result;
+        result.membersKnown = metaMemberCount(parsed["meta"], result.members);
+        // Keep only the field consumed by META dispatch. In particular the
+        // returned envelope cannot keep the parsed membership graph alive.
+        envelope = Json.emptyObject;
+        auto id = parsed["id"];
+        if (id.type == Json.Type.string) envelope["id"] = id.get!string.idup;
+        // JSON whitespace may contain CR; never splice it into line framing.
+        // The strict syntax scan has rejected literal controls in strings.
+        auto owned = raw.dup;
+        foreach (ref c; owned) if (c == '\r' || c == '\n') c = ' ';
+        result.text = cast(string) owned;
+        return result;
+    }
+}
+
+/// Stored memberships, not unique nicks or fresh engine state. Strict bool
+/// markers and roster array types are preserved; dropped/missing is unknown.
+private bool metaMemberCount(Json value, out ulong members) {
+    members = 0;
+    if (value.type != Json.Type.object) return false;
+    auto dropped = value["usersDropped"];
+    if (dropped.type != Json.Type.bool_ || dropped.get!bool) return false;
+    auto rosters = value["channelUsers"];
+    if (rosters.type != Json.Type.object) return false;
+    foreach (roster; rosters.get!(Json[string]).byValue) {
+        if (roster.type != Json.Type.array) return false;
+        if (ulong.max - members < roster.length) return false;
+        members += roster.length;
+    }
+    return true;
+}
+
+/// Validate the complete envelope and locate its META slice before DOM parsing.
+/// Duplicate escaped meta keys and nesting beyond 256 are refused as before.
+/// The resulting slice stays private until fromRequest also parses its values.
+private string rawMetaValue(string line) {
     line = line.strip;
     const space = line.indexOf(' ');
     if (space < 0) throw new Exception("META payload required");
     auto text = line[space + 1 .. $].strip;
     if (!text.length || text[0] != '{') throw new Exception("META payload must be an object");
-    size_t i = 1, bytes;
+    size_t i = 1;
+    string raw;
     bool found;
     while (true) {
         skipJsonSpace(text, i);
@@ -621,15 +661,20 @@ size_t rawMetaEncodedBytes(string line) {
         if (key == "meta") {
             if (found) throw new Exception("duplicate meta field");
             found = true;
-            bytes = i - start;
+            raw = text[start .. i];
         }
         skipJsonSpace(text, i);
         if (i == text.length) throw new Exception("unterminated META object");
         if (text[i] == '}') break;
         if (text[i++] != ',') throw new Exception("META comma required");
+        skipJsonSpace(text, i);
+        if (i < text.length && text[i] == '}') throw new Exception("trailing META comma");
     }
+    ++i; // closing envelope brace
+    skipJsonSpace(text, i);
+    if (i != text.length) throw new Exception("trailing META content");
     if (!found) throw new Exception("meta required");
-    return bytes;
+    return raw;
 }
 
 private void skipJsonSpace(string text, ref size_t i) {
@@ -637,44 +682,110 @@ private void skipJsonSpace(string text, ref size_t i) {
         || text[i] == '\r' || text[i] == '\n')) ++i;
 }
 
+private uint jsonHex4(string text, ref size_t i) {
+    if (text.length - i < 4) throw new Exception("incomplete JSON Unicode escape");
+    uint value;
+    foreach (_; 0 .. 4) {
+        const c = text[i++];
+        uint digit;
+        if (c >= '0' && c <= '9') digit = c - '0';
+        else if (c >= 'a' && c <= 'f') digit = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') digit = c - 'A' + 10;
+        else throw new Exception("invalid JSON Unicode escape");
+        value = value * 16 + digit;
+    }
+    return value;
+}
+
 private void skipJsonString(string text, ref size_t i) {
     if (i == text.length || text[i++] != '"') throw new Exception("JSON string required");
     while (i < text.length) {
-        auto c = text[i++];
+        const c = text[i++];
         if (c == '"') return;
-        if (c == '\\') {
-            if (i == text.length) break;
-            ++i;
+        if (c < 0x20) throw new Exception("literal JSON string control");
+        if (c != '\\') continue;
+        if (i == text.length) break;
+        switch (text[i++]) {
+            case '"', '\\', '/', 'b', 'f', 'n', 'r', 't': break;
+            case 'u': {
+                const unit = jsonHex4(text, i);
+                if (unit >= 0xd800 && unit <= 0xdbff) {
+                    if (text.length - i < 2 || text[i .. i + 2] != `\u`)
+                        throw new Exception("missing JSON low surrogate");
+                    i += 2;
+                    const low = jsonHex4(text, i);
+                    if (low < 0xdc00 || low > 0xdfff) throw new Exception("invalid JSON low surrogate");
+                } else if (unit >= 0xdc00 && unit <= 0xdfff)
+                    throw new Exception("unpaired JSON low surrogate");
+                break;
+            }
+            default: throw new Exception("invalid JSON escape");
         }
     }
     throw new Exception("unterminated JSON string");
 }
 
-private void skipJsonValue(string text, ref size_t i) {
+private bool jsonDigit(char c) { return c >= '0' && c <= '9'; }
+
+private void skipJsonValue(string text, ref size_t i, size_t depth = 0) {
     if (i == text.length) throw new Exception("JSON value required");
     if (text[i] == '"') { skipJsonString(text, i); return; }
     if (text[i] == '{' || text[i] == '[') {
-        size_t depth;
-        do {
-            auto c = text[i];
-            if (c == '"') { skipJsonString(text, i); continue; }
-            ++i;
-            if (c == '{' || c == '[') ++depth;
-            if (c == '}' || c == ']') --depth;
-            if (depth > 256) throw new Exception("META nesting exceeds 256");
-        } while (i < text.length && depth);
-        if (depth) throw new Exception("unterminated JSON value");
-        return;
+        if (depth == 256) throw new Exception("META nesting exceeds 256");
+        const object = text[i++] == '{';
+        const closing = object ? '}' : ']';
+        skipJsonSpace(text, i);
+        if (i < text.length && text[i] == closing) { ++i; return; }
+        while (true) {
+            if (object) {
+                skipJsonString(text, i);
+                skipJsonSpace(text, i);
+                if (i == text.length || text[i++] != ':') throw new Exception("JSON colon required");
+                skipJsonSpace(text, i);
+            }
+            skipJsonValue(text, i, depth + 1);
+            skipJsonSpace(text, i);
+            if (i == text.length) throw new Exception("unterminated JSON value");
+            if (text[i] == closing) { ++i; return; }
+            if (text[i++] != ',') throw new Exception("JSON comma required");
+            skipJsonSpace(text, i);
+        }
     }
-    const start = i;
-    while (i < text.length && text[i] != ',' && text[i] != '}'
-        && text[i] != ' ' && text[i] != '\t' && text[i] != '\r' && text[i] != '\n') ++i;
-    if (i == start) throw new Exception("JSON value required");
+    static foreach (literal; ["true", "false", "null"]) {
+        if (text.length - i >= literal.length && text[i .. i + literal.length] == literal) {
+            i += literal.length;
+            return;
+        }
+    }
+    if (text[i] == '-') ++i;
+    if (i == text.length || !jsonDigit(text[i])) throw new Exception("JSON number required");
+    if (text[i] == '0') ++i;
+    else while (i < text.length && jsonDigit(text[i])) ++i;
+    if (i < text.length && text[i] == '.') {
+        ++i;
+        if (i == text.length || !jsonDigit(text[i])) throw new Exception("JSON fraction required");
+        while (i < text.length && jsonDigit(text[i])) ++i;
+    }
+    if (i < text.length && (text[i] == 'e' || text[i] == 'E')) {
+        ++i;
+        if (i < text.length && (text[i] == '+' || text[i] == '-')) ++i;
+        if (i == text.length || !jsonDigit(text[i])) throw new Exception("JSON exponent required");
+        while (i < text.length && jsonDigit(text[i])) ++i;
+    }
 }
 
 /// `OK <json>` response line (no trailing newline).
 string okLine(Json payload) {
     return "OK " ~ payload.toString();
+}
+
+/// Serialize only the bounded entry fields as a DOM; META is a validated value.
+string okLine(Entry payload, bool newline = false) {
+    auto output = appender!string();
+    output.put("OK ");
+    payload.appendTo(output);
+    if (newline) output.put('\n');
+    return output.data;
 }
 
 /// `ERR {"code":..,"msg":..}` response line (no trailing newline).
@@ -814,16 +925,16 @@ unittest {
     e.peerIp = "1.2.3.4";
     e.localIp = "10.0.0.2";
     e.connectedAtMs = 1_700_000_000_000;
-    auto j = e.toJson();
+    auto j = parseJsonString(e.toString());
     assert(j["detachedSinceMs"].type == Json.Type.null_);
     assert(j["closeReason"].type == Json.Type.null_);
     assert(j["closedAtMs"].type == Json.Type.null_);
     assert(j["meta"].type == Json.Type.null_);
     assert(j["tls"]["ok"].get!bool && j["tls"]["version"].get!string == "TLSv1.3");
-    auto back = Entry.fromJson(parseJsonString(j.toString()));
-    assert(back.id == e.id && back.tag == e.tag && back.state == e.state && back.attached == e.attached);
-    assert(back.tls == e.tls && back.peerIp == e.peerIp && back.connectedAtMs == e.connectedAtMs);
-    assert(back.meta.type == Json.Type.null_);
+    assert(j["id"].get!string == e.id && Tag.fromJson(j["tag"]) == e.tag);
+    assert(j["state"].get!string == e.state && j["attached"].get!bool == e.attached);
+    assert(TlsInfoJson.fromJson(j["tls"]) == e.tls && j["peerIp"].get!string == e.peerIp);
+    assert(j["connectedAtMs"].get!long == e.connectedAtMs);
 
     e.state = "closed";
     e.attached = false;
@@ -831,10 +942,12 @@ unittest {
     e.closeReason = CLOSE_PEER_CLOSED;
     e.closedAtMs = 6;
     e.bufferedBytes = 7;
-    e.meta = parseJsonString(`{"nick":"z"}`);
-    back = Entry.fromJson(parseJsonString(e.toJson().toString()));
-    assert(back.detachedSinceMs == 5 && back.closeReason == CLOSE_PEER_CLOSED && back.closedAtMs == 6);
-    assert(back.bufferedBytes == 7 && back.meta["nick"].get!string == "z");
+    Json envelope;
+    e.meta = ValidatedMeta.fromRequest(`META {"meta":{"nick":"z"}}`, envelope);
+    auto back = parseJsonString(e.toString());
+    assert(back["detachedSinceMs"].get!long == 5 && back["closeReason"].get!string == CLOSE_PEER_CLOSED);
+    assert(back["closedAtMs"].get!long == 6 && back["bufferedBytes"].get!long == 7);
+    assert(back["meta"]["nick"].get!string == "z");
 }
 
 @("EVENT / CONNECTED / FAILED round-trip")
@@ -902,18 +1015,19 @@ unittest {
     import std.exception : assertThrown;
     auto value = `{ "text" : "escaped \" } ],", "nested" : [null, {"x":true}] }`;
     auto line = `META {"id":"c-test","meta": ` ~ value ~ ` , "extra":[{},1]}`;
-    assert(rawMetaEncodedBytes(line) == value.length);
-    assert(rawMetaEncodedBytes(`META {"meta":null}`) == 4);
-    assert(rawMetaEncodedBytes(`META {"m\u0065ta":"\u00e9"}`) == `"\u00e9"`.length);
-    assert(rawMetaEncodedBytes("META {\"meta\":\"é\"}") == "\"é\"".length);
-    assertThrown(rawMetaEncodedBytes(`META {"meta":{},"m\u0065ta":[]}`));
-    assertThrown(rawMetaEncodedBytes(`META {"id":"none"}`));
+    Json envelope;
+    assert(ValidatedMeta.fromRequest(line, envelope).encodedBytes == value.length);
+    assert(ValidatedMeta.fromRequest(`META {"meta":null}`, envelope).encodedBytes == 4);
+    assert(ValidatedMeta.fromRequest(`META {"m\u0065ta":"\u00e9"}`, envelope).encodedBytes == `"\u00e9"`.length);
+    assert(ValidatedMeta.fromRequest("META {\"meta\":\"é\"}", envelope).encodedBytes == "\"é\"".length);
+    assertThrown(ValidatedMeta.fromRequest(`META {"meta":{},"m\u0065ta":[]}`, envelope));
+    assertThrown(ValidatedMeta.fromRequest(`META {"id":"none"}`, envelope));
     string deep = "META {\"meta\":";
     foreach (_; 0 .. 257) deep ~= "[";
     deep ~= "0";
     foreach (_; 0 .. 257) deep ~= "]";
     deep ~= "}";
-    assertThrown(rawMetaEncodedBytes(deep));
+    assertThrown(ValidatedMeta.fromRequest(deep, envelope));
 }
 
 @("Zero detach timeout is unlimited and invalid configuration is rejected")
@@ -948,16 +1062,17 @@ unittest {
     entry.attachmentWriterCompletions = 3;
     entry.upstreamWriterDone = true;
     entry.tlsFinalized = true;
-    entry.meta = parseJsonString(`{"private":"not-in-inventory"}`);
+    Json envelope;
+    entry.meta = ValidatedMeta.fromRequest(`META {"meta":{"private":"not-in-inventory"}}`, envelope);
     entry.tag.name = "not-in-inventory-either";
-    auto full = Entry.fromJson(entry.toJson());
-    assert(full.ordinal == 42 && full.gapGeneration == 3 && full.gapAckGeneration == 2);
-    assert(full.droppedBytes == 12345 && full.droppedLines == 67);
-    assert(full.gapStartedAtMs == 9988 && full.deliveryAmbiguous);
-    assert(full.relayBytes == 4096 && full.outboundBytes == 128 && full.pongBytes == 64);
-    assert(full.relayWriterFlightBytes == 1024 && full.relayWriteInFlightMs == 100);
-    assert(full.upstreamWriteInFlightMs == 200 && full.attachmentGeneration == 4);
-    assert(full.attachmentWriterCompletions == 3 && full.upstreamWriterDone && full.tlsFinalized);
+    auto full = parseJsonString(entry.toString());
+    assert(full["ordinal"].get!long == 42 && full["gapGeneration"].get!long == 3 && full["gapAckGeneration"].get!long == 2);
+    assert(full["droppedBytes"].get!long == 12345 && full["droppedLines"].get!long == 67);
+    assert(full["gapStartedAtMs"].get!long == 9988 && full["deliveryAmbiguous"].get!bool);
+    assert(full["relayBytes"].get!long == 4096 && full["outboundBytes"].get!long == 128 && full["pongBytes"].get!long == 64);
+    assert(full["relayWriterFlightBytes"].get!long == 1024 && full["relayWriteInFlightMs"].get!long == 100);
+    assert(full["upstreamWriteInFlightMs"].get!long == 200 && full["attachmentGeneration"].get!long == 4);
+    assert(full["attachmentWriterCompletions"].get!long == 3 && full["upstreamWriterDone"].get!bool && full["tlsFinalized"].get!bool);
     auto row = entry.inventoryJson();
     assert(row["meta"].type == Json.Type.undefined && row["tag"].type == Json.Type.undefined);
     assert(row["gapGeneration"].get!long == 3 && row["deliveryAmbiguous"].get!bool);
@@ -979,9 +1094,81 @@ unittest {
     Entry entry;
     entry.id = "c-example-1";
     entry.instance = "00000000-0000-4000-8000-000000000000";
-    assert(Entry.fromJson(entry.toJson()).instance == entry.instance);
+    assert(parseJsonString(entry.toString())["instance"].get!string == entry.instance);
     ConnectedLine connected;
     connected.id = entry.id;
     connected.instance = entry.instance;
     assert(ConnectedLine.fromJson(connected.toJson()).instance == entry.instance);
+}
+
+@("Owned META round-trips through the shared consumer without framing injection")
+unittest {
+    import ircfiber.holder_client : HolderEntry;
+    import std.exception : assertThrown;
+    auto request = ("META {\"id\":\"owned\",\"meta\":{\r\"wasConnected\":true,"
+        ~ "\"graceful\":\"false\",\"text\":\"line\\nquote\\\"\\\\é\","
+        ~ "\"usersDropped\":false,\"channelUsers\":{\"#one\":[\"a\",\"b\"]}}}").dup;
+    Json envelope;
+    auto meta = ValidatedMeta.fromRequest(cast(string) request, envelope);
+    const bytes = meta.encodedBytes;
+    request[] = 'x'; // Caller-owned mutable storage must no longer be referenced.
+    Entry entry;
+    entry.id = envelope["id"].get!string;
+    entry.meta = meta;
+    const line = okLine(entry, true);
+    size_t newlines;
+    foreach (c; line) {
+        assert(c != '\r');
+        if (c == '\n') ++newlines;
+    }
+    assert(newlines == 1 && line[$ - 1] == '\n');
+    const consumer = HolderEntry.fromJson(parseJsonString(line[3 .. $ - 1]));
+    assert(consumer.id == "owned" && consumer.hasMeta);
+    assert(consumer.meta["wasConnected"].type == Json.Type.bool_ && consumer.meta["wasConnected"].get!bool);
+    assert(consumer.meta["graceful"].type == Json.Type.string && consumer.meta["graceful"].get!string == "false");
+    assert(consumer.meta["text"].get!string == "line\nquote\"\\é");
+    assert(consumer.meta["channelUsers"]["#one"].length == 2);
+    ulong members;
+    assert(meta.memberCount(members) && members == 2 && bytes == meta.encodedBytes);
+    assert(envelope["meta"].type == Json.Type.undefined && envelope.length == 1);
+    foreach (bad; [
+        `META {"meta":{"x":tru}}`,
+        `META {"meta":[1,]}`,
+        `META {"meta":{"text":"bad\q"}}`,
+        `META {"meta":{"x":1],"later":{}}`,
+        `META {"meta":1.}`,
+        `META {"meta":01}`,
+        `META {"meta":0e+}`,
+        `META {"meta":{},"extra":[],}`,
+        `META {"meta":{}} trailing`,
+        `META {"meta":"\ud800"}`,
+        `META {"meta":"\udc00"}`,
+        "META {\"meta\":\"literal\tcontrol\"}",
+        "META {\"meta\":{\"text\":\"literal\nnewline\"}}"
+    ]) assertThrown(ValidatedMeta.fromRequest(bad, envelope));
+}
+
+@("Cached META memberships preserve parser duplicate and strict marker semantics")
+unittest {
+    Json envelope;
+    ulong members;
+    auto complete = ValidatedMeta.fromRequest(
+        `META {"meta":{"usersDropped":true,"usersDropped":false,"channelUsers":{"#one":["a","b"],"#two":["a"]}}}`,
+        envelope);
+    assert(complete.memberCount(members) && members == 3);
+    Entry entry;
+    entry.meta = complete;
+    const decoded = parseJsonString(entry.toString())["meta"];
+    assert(!decoded["usersDropped"].get!bool && decoded["channelUsers"]["#two"].length == 1);
+    foreach (value; [
+        `null`, `{}`, `{"usersDropped":true,"channelUsers":{}}`,
+        `{"usersDropped":"false","channelUsers":{}}`,
+        `{"usersDropped":0,"channelUsers":{}}`,
+        `{"usersDropped":false,"channelUsers":{"#one":null}}`
+    ]) {
+        auto unavailable = ValidatedMeta.fromRequest(`META {"meta":` ~ value ~ `}`, envelope);
+        assert(!unavailable.memberCount(members));
+    }
+    auto empty = ValidatedMeta.fromRequest(`META {"meta":{"usersDropped":false,"channelUsers":{}}}`, envelope);
+    assert(empty.memberCount(members) && members == 0);
 }
