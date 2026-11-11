@@ -25,8 +25,9 @@
 ///       "Clear backlog" must not leave a dedup set behind, or the buffer
 ///       can never refill.
 ///
-/// Requires the local test Redis (irc_redis_test on 6379).
-/// Run with: `dub build --config=buffer-dedup-test && ./buffer-dedup-test`.
+/// Requires an isolated loopback Redis via IRCFIBER_HISTORY_TEST_REDIS_URL.
+/// Build: `dub build --config=buffer-dedup-test`
+/// Run: `IRCFIBER_HISTORY_TEST_REDIS_URL=redis://127.0.0.1:16379 ./buffer-dedup-test`
 module buffer_dedup_test;
 
 import std.conv : to;
@@ -36,6 +37,7 @@ import std.uuid : randomUUID;
 import ircfiber.models.irc_event : IRCRawEvent;
 import ircfiber.storage.buffer : BufferManager;
 import ircfiber.storage.redis : RedisStorage;
+import ircfiber.testing.isolated_db : isolatedTestRedis;
 
 /// Tracks the number of passing checks.
 int passed;
@@ -54,8 +56,9 @@ void check(string name)(bool cond, string msg = "") {
 }
 
 RedisStorage connect() {
-    auto redis = new RedisStorage();
-    redis.connectFromUrl("redis://127.0.0.1:6379");
+    auto redis = isolatedTestRedis("BufferManager dedup");
+    if (redis is null)
+        throw new Exception("Explicit isolated IRCFIBER_HISTORY_TEST_REDIS_URL is required");
     return redis;
 }
 
@@ -251,6 +254,233 @@ void test_reply_and_reaction_history(RedisStorage redis) {
     }
 }
 
+/// The production forms differ only in transport metadata and extended JOIN.
+IRCRawEvent stateEvent(string nid, string command, bool historical,
+        string msgid = "history-state", string time = "2026-11-10T22:00:00.123Z") {
+    import std.datetime.systime : SysTime;
+    auto ev = joinEvent(nid, "#chan", "alice", 0);
+    ev.command = command;
+    const stamp = SysTime.fromISOExtString(time);
+    ev.timestampMs = stamp.toUnixTime!long * 1000 + stamp.fracSecs.total!"msecs";
+    ev.addTag("time", time);
+    if (command == "JOIN") {
+        ev.setParams(historical ? ["#chan"] : ["#chan", "alice", "Alice Real Name"]);
+        ev.text = historical ? "" : "Alice Real Name";
+        if (!historical) ev.addTag("account", "alice");
+    } else {
+        ev.setParams(["#chan", "+v", "alice"]);
+    }
+    if (historical) {
+        ev.addTag("batch", "chathistory");
+        ev.addTag("msgid", msgid);
+    }
+    return ev;
+}
+
+void test_state_replay_both_arrival_orders(RedisStorage redis) {
+    stderr.writeln("\n[dedup] extended/basic JOIN and voice replay, both arrival orders");
+    foreach (command; ["JOIN", "MODE"]) foreach (historyFirst; [false, true]) {
+        const nid = randomUUID().toString();
+        scope (exit) cleanup(redis, nid);
+        auto first = stateEvent(nid, command, historyFirst);
+        auto second = stateEvent(nid, command, !historyFirst);
+        auto bm = new BufferManager(redis);
+        check!("first state form stores")(bm.appendIRCEvent(first, "engine1"));
+        // Fresh process-local state and a different server namespace.
+        bm = new BufferManager(redis);
+        check!("opposite provenance is suppressed after reassignment")(
+            !bm.appendIRCEvent(second, "engine2"));
+        check!("both event UUIDs differ")(first.id != second.id);
+        foreach (_; 0 .. 3) {
+            auto replay = stateEvent(nid, command, true);
+            check!("repeated CHATHISTORY playback stays suppressed")(
+                !bm.appendIRCEvent(replay, "engine2"));
+        }
+        auto stored = bm.getRecent("engine1", nid, "#chan", 50);
+        check!("only the first physical row persists")(stored.length == 1);
+        check!("reassignment does not create a second scrollback row")(
+            bm.getRecent("engine2", nid, "#chan", 50).length == 0);
+        if (stored.length == 1 && command == "JOIN" && !historyFirst) {
+            check!("extended JOIN payload is retained, not rewritten")(
+                stored[0]["x"].get!string == "Alice Real Name"
+                && stored[0]["p"].length == 3
+                && stored[0]["a"].get!string == "alice");
+        }
+        // Once suppressed, replay identity must work without the semantic alias.
+        auto primaryRetry = stateEvent(nid, command, true);
+        primaryRetry.tagsJson = `{ "msgid": "history-state" }`;
+        check!("suppressed replay records its primary msgid")(
+            !bm.appendIRCEvent(primaryRetry, "engine2"));
+    }
+}
+
+void test_state_identity_boundaries(RedisStorage redis) {
+    stderr.writeln("\n[dedup] state semantic identity does not erase distinct events");
+    foreach (command; ["JOIN", "MODE"]) foreach (difference; 0 .. 6) {
+        const nid = randomUUID().toString();
+        scope (exit) cleanup(redis, nid);
+        auto bm = new BufferManager(redis);
+        auto live = stateEvent(nid, command, false);
+        auto replay = stateEvent(nid, command, true);
+        switch (difference) {
+            case 0:
+                replay = stateEvent(nid, command, true, "other-time", "2026-11-10T22:00:00.124Z");
+                break;
+            case 1:
+                replay.nick = "bob";
+                replay.prefix = "bob!user@cloaked.example";
+                break;
+            case 2:
+                replay.channel = "#other";
+                replay.setParams(command == "JOIN" ? ["#other"] : ["#other", "+v", "alice"]);
+                break;
+            case 3:
+                replay.prefix = "alice!other@cloaked.example";
+                break;
+            case 4:
+                // Same milliseconds, distinct actual server-time precision.
+                replay = stateEvent(nid, command, true, "sub-ms", "2026-11-10T22:00:00.123100Z");
+                break;
+            case 5:
+                replay.prefix = "Alice!user@cloaked.example";
+                replay.nick = "Alice";
+                break;
+            default: assert(0, "Unknown identity boundary");
+        }
+        check!("baseline state stores")(bm.appendIRCEvent(live, "engine1"));
+        check!("different timestamp, nick, channel or exact prefix survives")(
+            bm.appendIRCEvent(replay, "engine1"));
+    }
+    foreach (changedText; [false, true]) {
+        const nid = randomUUID().toString();
+        scope (exit) cleanup(redis, nid);
+        auto bm = new BufferManager(redis);
+        auto live = stateEvent(nid, "MODE", false);
+        live.setParams(["#chan", "+ov", "alice", "bob"]);
+        auto replay = stateEvent(nid, "MODE", true);
+        replay.setParams(["#chan", "+ov", "bob", "alice"]);
+        if (changedText) {
+            replay.setParams(["#chan", "+ov", "alice", "bob"]);
+            replay.text = "different trailing content";
+        }
+        check!("ordered MODE baseline stores")(bm.appendIRCEvent(live, "engine1"));
+        check!("MODE retains ordered bindings and full text identity")(
+            bm.appendIRCEvent(replay, "engine1"));
+    }
+}
+
+void test_state_alias_provenance(RedisStorage redis) {
+    stderr.writeln("\n[dedup] semantic aliases apply only across accepted provenance");
+    foreach (command; ["JOIN", "MODE"]) foreach (historical; [false, true]) {
+        const nid = randomUUID().toString();
+        scope (exit) cleanup(redis, nid);
+        auto bm = new BufferManager(redis);
+        auto a = stateEvent(nid, command, historical, "tagged-a");
+        a.addTag("msgid", "tagged-a");
+        auto b = stateEvent(nid, command, historical, "tagged-b");
+        b.addTag("msgid", "tagged-b");
+        check!("first genuine msgid event stores")(bm.appendIRCEvent(a, "engine1"));
+        if (historical) {
+            auto live = stateEvent(nid, command, false);
+            check!("live counterpart of accepted history is suppressed")(
+                !bm.appendIRCEvent(live, "engine1"));
+            check!("suppressed live primary is remembered")(
+                !bm.appendIRCEvent(live, "engine1"));
+        }
+        check!("distinct genuine msgid event with identical content survives")(
+            bm.appendIRCEvent(b, "engine1"));
+        check!("genuine tagged retries still deduplicate")(
+            !bm.appendIRCEvent(a, "engine1") && !bm.appendIRCEvent(b, "engine1"));
+    }
+}
+
+void test_state_alias_requires_wire_identity(RedisStorage redis) {
+    stderr.writeln("\n[dedup] incomplete or ineligible wire identity never bridges");
+    foreach (command; ["JOIN", "MODE"]) foreach (invalid; 0 .. 7) {
+        const nid = randomUUID().toString();
+        scope (exit) cleanup(redis, nid);
+        auto bm = new BufferManager(redis);
+        auto live = stateEvent(nid, command, false);
+        auto replay = stateEvent(nid, command, true);
+        switch (invalid) {
+            case 0: live.tagsJson = "{}"; break;
+            case 1: live.addTag("time", "not-a-time"); break;
+            case 2: live.addTag("time", "2026-11-10T22:00:00.123"); break;
+            case 3: live.prefix = replay.prefix = ""; break;
+            case 4:
+                live.channel = replay.channel = "";
+                break;
+            case 5: live.addTag("msgid", "tagged-live"); break;
+            case 6: live.addTag("batch", "chathistory"); break;
+            default: assert(0, "Unknown invalid identity");
+        }
+        check!("ineligible baseline retains primary behavior")(bm.appendIRCEvent(live, "engine1"));
+        check!("no semantic bridge without complete eligible identity")(
+            bm.appendIRCEvent(replay, "engine1"));
+    }
+}
+
+void test_state_alias_failure_atomicity(RedisStorage redis) {
+    stderr.writeln("\n[dedup] alias storage validates types before any primary/alias writes");
+    foreach (command; ["JOIN", "MODE"]) {
+        const nid = randomUUID().toString();
+        scope (exit) cleanup(redis, nid);
+        auto bm = new BufferManager(redis);
+        auto db = redis.getDb();
+        auto live = stateEvent(nid, command, false);
+        auto replay = stateEvent(nid, command, true);
+        const rowKey = "scrollback:engine1:" ~ nid ~ ":#chan";
+        const replayKey = "scrollback:engine2:" ~ nid ~ ":#chan";
+        const dedupKey = "dedup:" ~ nid ~ ":#chan";
+        db.set(rowKey, "wrong-type");
+        bool rejected;
+        try bm.appendIRCEvent(live, "engine1"); catch (Exception) { rejected = true; }
+        check!("failed live append leaves no alias or primary")(rejected && !db.exists(dedupKey));
+        db.del(rowKey);
+        db.set(dedupKey, "wrong-type");
+        rejected = false;
+        try bm.appendIRCEvent(live, "engine1"); catch (Exception) { rejected = true; }
+        check!("invalid dedup storage leaves no row")(rejected && !db.exists(rowKey));
+        db.del(dedupKey);
+        check!("repaired storage accepts the exact failed live row")(
+            bm.appendIRCEvent(live, "engine1"));
+        db.set(replayKey, "wrong-type");
+        rejected = false;
+        try bm.appendIRCEvent(replay, "engine2"); catch (Exception) { rejected = true; }
+        check!("alias duplicate still preflights destination type")(rejected);
+        auto primary = replay;
+        primary.tagsJson = `{ "msgid": "history-state" }`;
+        db.del(replayKey);
+        check!("failed alias verdict did not poison replay primary")(
+            bm.appendIRCEvent(primary, "engine2"));
+        check!("live alias still suppresses another replay ID")(
+            !bm.appendIRCEvent(stateEvent(nid, command, true, "history-state-2"), "engine2"));
+    }
+}
+
+void test_repeated_chat_identity_is_unchanged(RedisStorage redis) {
+    stderr.writeln("\n[dedup] state bridge never collapses repeated chat");
+    foreach (command; ["PRIVMSG", "NOTICE"]) {
+        const nid = randomUUID().toString();
+        scope (exit) cleanup(redis, nid);
+        auto bm = new BufferManager(redis);
+        auto a = stateEvent(nid, "MODE", false);
+        a.command = command;
+        a.text = "same text";
+        a.setParams(["#chan"]);
+        auto b = a;
+        b.id = randomUUID().toString();
+        check!("same-millisecond same-text live chat keeps both UUIDs")(
+            bm.appendIRCEvent(a, "engine1") && bm.appendIRCEvent(b, "engine1"));
+        check!("live chat UUID retries remain duplicates")(
+            !bm.appendIRCEvent(a, "engine1") && !bm.appendIRCEvent(b, "engine1"));
+        b.addTag("batch", "chathistory");
+        b.addTag("msgid", "chat-history");
+        check!("state alias does not bridge chat with different primary IDs")(
+            bm.appendIRCEvent(b, "engine1") && !bm.appendIRCEvent(b, "engine1"));
+    }
+}
+
 int main() {
     stderr.writeln("BufferManager dedup regression suite");
     RedisStorage redis;
@@ -258,7 +488,7 @@ int main() {
         redis = connect();
         redis.getDb().exists("probe");
     } catch (Exception e) {
-        stderr.writeln("FATAL: local Redis unavailable on 6379: ", e.msg);
+        stderr.writeln("FATAL: isolated test Redis unavailable: ", e.msg);
         return 1;
     }
 
@@ -268,6 +498,12 @@ int main() {
     test_distinct_events_are_not_collapsed(redis);
     test_clear_buffer_drops_both_dedup_spellings(redis);
     test_reply_and_reaction_history(redis);
+    test_state_replay_both_arrival_orders(redis);
+    test_state_identity_boundaries(redis);
+    test_state_alias_provenance(redis);
+    test_state_alias_requires_wire_identity(redis);
+    test_state_alias_failure_atomicity(redis);
+    test_repeated_chat_identity_is_unchanged(redis);
 
     writeln("\n", passed, " passed, ", failed, " failed");
     return failed == 0 ? 0 : 1;

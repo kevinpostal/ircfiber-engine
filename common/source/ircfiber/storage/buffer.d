@@ -565,8 +565,14 @@ LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string]);
      *   - a content hash of (command + channel + sorted params + timestamp)
      *     for historical replay and other events without a stable server ID.
      *
-     * The check is `SADD dedup:<buf> <key>` which atomically returns 1
-     * for a new key and 0 for an existing one. Storing the set in Redis
+     * JOIN/MODE additionally carry provenance-specific semantic aliases when
+     * server-time is valid: untagged live events match only accepted history,
+     * and msgid-tagged CHATHISTORY matches only accepted untagged live events.
+     * Extended JOIN account/realname is not identity; MODE argument order is.
+     * The primary identity is retained even when an alias suppresses a replay.
+     *
+     * The check and row/identity writes are one atomic Lua operation.
+     * Storing the set in Redis
      * (not in-memory) means engine restarts, failovers, and network
      * reassignments between connection servers don't replay duplicates
      * — exactly the kind of edge case that bit us before (332/333
@@ -745,6 +751,51 @@ LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string]);
         return key;
     }
 
+    /// Only bridge the wire forms that CHATHISTORY changes. Never use content
+    /// identity between two msgid-tagged events of the same provenance.
+    private string eventReplayIdentity(string channel,
+            ref const IRCRawEvent event, string[] params) @trusted {
+        import std.datetime.systime : SysTime;
+        import std.format : format;
+        if ((event.command != "JOIN" && event.command != "MODE")
+                || !event.channel.length || !event.prefix.length
+                || !canFind("#&+!", event.channel[0])) return "";
+        const time = event.getTag("time");
+        // IRCv3 server-time is UTC, not an engine receive-time fallback.
+        if (time.length < 20 || time[$ - 1] != 'Z') return "";
+        long timestamp;
+        try timestamp = SysTime.fromISOExtString(time).stdTime;
+        catch (Exception) { return ""; }
+
+        // Length-framed, ordered FNV-1a; do not sort MODE's bound arguments.
+        // Framing avoids delimiter collisions without allocating a joined copy.
+        ulong hash = 14_695_981_039_346_656_037UL;
+        void number(ulong value) {
+            foreach (_; 0 .. 8) {
+                hash ^= value & 0xff;
+                hash *= 1_099_511_628_211UL;
+                value >>= 8;
+            }
+        }
+        void field(string value) {
+            number(value.length);
+            foreach (ubyte b; cast(const(ubyte)[]) value) {
+                hash ^= b;
+                hash *= 1_099_511_628_211UL;
+            }
+        }
+        field(event.command);
+        field(channel);
+        field(event.prefix);
+        number(cast(ulong) timestamp);
+        if (event.command == "MODE") {
+            number(params.length);
+            foreach (param; params) field(param);
+            field(event.text);
+        }
+        return format!"%016x"(hash);
+    }
+
     /// Commit the row and its dedup verdict together. A failed append must
     /// never poison a retry's authoritative "already accepted" verdict.
     private bool appendDeduplicatedEvent(string bufferKey, string serverId,
@@ -753,6 +804,15 @@ LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string]);
         const dedupKey = dedupSetKey(networkId, channel);
         adoptServerDedupSet(serverId, networkId, channel, dedupKey);
         const member = eventDedupMember(channel, msgid, event, params);
+        string ownAlias, oppositeAlias;
+        const historical = event.getTag("batch") == "chathistory";
+        if ((!msgid.length && !historical) || (msgid.length && historical)) {
+            const identity = eventReplayIdentity(channel, event, params);
+            if (identity.length) {
+                ownAlias = (historical ? "state:history:" : "state:live:") ~ identity;
+                oppositeAlias = (historical ? "state:live:" : "state:history:") ~ identity;
+            }
+        }
         enum lastRow = (MAX_SCROLLBACK - 1).to!string;
         enum rowTTL = (86_400 * TTL_DAYS).to!string;
         enum dedupTTL = DEDUP_TTL_SECS.to!string;
@@ -766,7 +826,14 @@ if dedupType ~= 'none' and dedupType ~= 'set' then
     return redis.error_reply('Dedup key is not a set')
 end
 lineageValidate(KEYS[1])
-if redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 1 then
+local duplicate = redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 1
+if not duplicate and ARGV[7] ~= '' then
+    duplicate = redis.call('SISMEMBER', KEYS[2], ARGV[7]) == 1
+end
+if duplicate then
+    -- Remember this primary ID even when its differently identified counterpart
+    -- won the race. Do not plant a reverse alias for a row never accepted.
+    redis.call('SADD', KEYS[2], ARGV[1])
     redis.call('EXPIRE', KEYS[2], ARGV[5])
     return '0'
 end
@@ -775,7 +842,12 @@ if bufferType == 'none' then lineageRetire(KEYS[1]) end
 local token = lineageEnsure(KEYS[1], true)
 local appended = redis.pcall('LPUSH', KEYS[1], ARGV[2])
 if type(appended) == 'table' and appended.err then return appended end
-local added = redis.pcall('SADD', KEYS[2], ARGV[1])
+local added
+if ARGV[6] ~= '' then
+    added = redis.pcall('SADD', KEYS[2], ARGV[1], ARGV[6])
+else
+    added = redis.pcall('SADD', KEYS[2], ARGV[1])
+end
 if type(added) == 'table' and added.err then
     redis.call('LPOP', KEYS[1])
     return added
@@ -786,7 +858,7 @@ redis.call('EXPIRE', KEYS[2], ARGV[5])
 lineageRefresh(KEYS[1], token)
 return '1'
 LUA", [bufferKey, dedupKey],
-            [member, message.toString(), lastRow, rowTTL, dedupTTL]);
+            [member, message.toString(), lastRow, rowTTL, dedupTTL, ownAlias, oppositeAlias]);
         if (verdict.empty) throw new Exception("Missing atomic scrollback verdict");
         if (verdict.front == "0") return false;
         if (verdict.front != "1") throw new Exception("Invalid atomic scrollback verdict");
