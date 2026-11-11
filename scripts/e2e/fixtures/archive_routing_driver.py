@@ -98,6 +98,7 @@ ENGINES = {"fixture-old": "old-engine", "fixture-native": "native-engine"}
 ARCHIVES = {"fixture-old": "/archive/old", "fixture-native": "/archive/native"}
 BUFFERS = ("#proof", "#renamed", "#offline", "#unsupported", "#rename-source", "#rename-target", "_server")
 INITIAL_ARCHIVE_GAPS = {}
+RECOVERY_ARCHIVE_GAPS = {}
 MONGO_FAULTS = set()
 COMPOSE = sys.argv[1]
 PAUSED = set()
@@ -230,8 +231,9 @@ def raw_journal(server):
 def journal(server):
     snapshot = raw_journal(server)
     assert server in INITIAL_ARCHIVE_GAPS, "startup archival evidence was not frozen"
-    assert snapshot["state"]["gaps"] == INITIAL_ARCHIVE_GAPS[server], \
-        (server, "new archival loss/uncertainty during routing proof", snapshot["state"]["gaps"])
+    expected_gaps = RECOVERY_ARCHIVE_GAPS.get(server, INITIAL_ARCHIVE_GAPS[server])
+    assert snapshot["state"]["gaps"] == expected_gaps, \
+        (server, "new archival loss/uncertainty outside frozen proof", snapshot["state"]["gaps"])
     return snapshot
 
 
@@ -490,10 +492,22 @@ def rename_before_purge(network, nick):
     wait("both real purge records blocked on Mongo delete", lambda: admitted_everywhere(ident))
     assert original["eid"] < frozen["cutoffEid"]
     assert marker_rows(network, "rename-before-purge") == [moved_document], "delete fault did not preserve renamed Mongo evidence"
-    reused = message(network, nick, "rename-source-reused-after-cutoff", "#rename-source")
+    # The sole FIFO Mongo replayer is blocked by the injected delete failure.
+    # Prove the append reached the durable journal, then verify strict replay after unblocking it.
+    reused = message(network, nick, "rename-source-reused-after-cutoff", "#rename-source", persisted=False)
     assert reused["eid"] > frozen["cutoffEid"]
+    owner = routed.owner(network)
+    def reused_journaled():
+        snapshot = raw_journal(owner)
+        return next((frame for frame in snapshot["frames"]
+                     if frame["record"].get("kind") == "append"
+                     and "rename-source-reused-after-cutoff" in frame["record"].get("payload", "")), None)
+    wait("post-cutoff append durably journaled behind blocked purge", reused_journaled)
     not_cleared(status(network, ident, "#rename-target"), status_query=True)
     mongo_fault("delete", False)
+    reused_document = wait("strict Mongo replay: rename-source-reused-after-cutoff",
+                           lambda: marker_rows(network, "rename-source-reused-after-cutoff"))
+    assert len(reused_document) == 1 and reused_document[0]["eid"] == reused["eid"], reused_document
     proof = wait("renamed clear completes in both journals",
                  lambda: completed(network, ident, frozen["cutoffEid"], "#rename-target"), 120)
     assert not marker_rows(network, "rename-before-purge") and not live_rows(network, "rename-before-purge")
@@ -508,7 +522,17 @@ def rename_before_purge(network, nick):
 def start():
     dc("up", "-d", "--no-build", "redis", "mongo", "native-net", "endpoint", "nord", "mull")
     wait("Redis", lambda: routed.redis("ping") == "PONG")
-    wait("Mongo", lambda: routed.mongo("print(db.runCommand({ping:1}).ok)") == "1")
+    def mongo_ready():
+        try:
+            return routed.mongo("print(db.runCommand({ping:1}).ok)") == "1"
+        except AssertionError as error:
+            # The compose exec may beat mongod's first bind; retry only that
+            # expected startup race, never a different fixture command failure.
+            if (len(error.args) == 3 and error.args[1] == 1
+                    and "MongoNetworkError: connect ECONNREFUSED 127.0.0.1:27017" in error.args[2]):
+                return False
+            raise
+    wait("Mongo", mongo_ready)
     wait("routed endpoint", lambda: routed.endpoint())
     routed.redis("set", "irc:config:fiberEnabled", "0")
     routed.redis("set", "irc:config:routingSchemaVersion", "1")
@@ -685,26 +709,26 @@ def run():
     assert socket_identity(network, nick) == archive_socket, "coordination loss changed physical socket"
     case("status-GET-cannot-admit-requested-clear")
     status_id = str(uuid.uuid4())
+    marker = "status-get-must-preserve-new-message"
+    queued = message(network, nick, marker)
     with pause("native-engine"), pause("old-engine"):
         code, requested = clear(network, status_id)
         not_cleared((code, requested))
         initial_group = group(status_id)
         assert initial_group.get("state") == "requested" and initial_group.get("cutoffEid", 0) == 0, initial_group
-    marker = "status-get-must-preserve-new-message"
-    queued = message(network, nick, marker)
-    before_backends = backend_snapshot(network)
-    before_journals = {server: journal(server) for server in ENGINES}
-    code, response = status(network, status_id)
-    not_cleared((code, response), status_query=True)
-    after_group = group(status_id)
-    assert after_group.get("state") == "requested" and after_group.get("cutoffEid", 0) == 0, after_group
-    assert backend_snapshot(network) == before_backends, "status GET admitted and applied a purge"
-    for server in ENGINES:
-        after = journal(server)
-        before = before_journals[server]
-        assert not operation(server, status_id), "status GET admitted a purge journal operation"
-        assert after["state"]["checkpoint"] == before["state"]["checkpoint"]
-        assert after["state"]["operations"] == before["state"]["operations"] and after["frames"] == before["frames"]
+        before_backends = backend_snapshot(network)
+        before_journals = {server: journal(server) for server in ENGINES}
+        code, response = status(network, status_id)
+        not_cleared((code, response), status_query=True)
+        after_group = group(status_id)
+        assert after_group == initial_group, (initial_group, after_group)
+        assert backend_snapshot(network) == before_backends, "status GET admitted and applied a purge"
+        for server in ENGINES:
+            after = journal(server)
+            before = before_journals[server]
+            assert not operation(server, status_id), "status GET admitted a purge journal operation"
+            assert after["state"]["checkpoint"] == before["state"]["checkpoint"]
+            assert after["state"]["operations"] == before["state"]["operations"] and after["frames"] == before["frames"]
     code, accepted = clear(network, status_id)
     assert code in (200, 503), (code, accepted)
     if code == 200:
@@ -749,6 +773,19 @@ def run():
     assert restarted["Id"] == old_generation[0] and restarted["State"]["StartedAt"] != old_generation[1], restarted
     STARTED["old-engine"] = (restarted["Id"], restarted["State"]["StartedAt"])
     wait("holder-owned physical socket survived engine SIGKILL", lambda: socket_identity(network, nick) == crash_socket, 60)
+    # SIGKILL necessarily leaves the unclean marker; preserve its conservative
+    # uncertainty and the one startup admission gap instead of claiming completeness.
+    recovered = raw_journal("fixture-old")["state"]["gaps"]
+    initial = INITIAL_ARCHIVE_GAPS["fixture-old"]
+    assert recovered[:len(initial)] == initial, ("crash recovery rewrote prior gap evidence", recovered)
+    new_recovery_gaps = recovered[len(initial):]
+    assert len(new_recovery_gaps) == 2 and sorted(gap["reason"] for gap in new_recovery_gaps) == [
+        "admission_rejected", "unclean_ram_admission_uncertainty"], new_recovery_gaps
+    assert all(0 < gap["from"] <= gap["through"] for gap in new_recovery_gaps), new_recovery_gaps
+    assert next(gap for gap in new_recovery_gaps
+                if gap["reason"] == "unclean_ram_admission_uncertainty")["from"] == min(
+                    gap["from"] for gap in initial), new_recovery_gaps
+    RECOVERY_ARCHIVE_GAPS["fixture-old"] = recovered
     assert routed.owner(network) == "fixture-old", "engine SIGKILL changed archive producer ownership"
     routed.command_ping(network, nick)
     assert operation("fixture-old", crash_id)[1]["state"] == 1
@@ -762,7 +799,7 @@ def run():
     baseline()
     case("purge-recovery-evidence", operationId=crash_id, cutoffEid=crash_group["cutoffEid"],
          admittedSequences=crash_admission, journals=crash_proof, mongoRowsRemoved=True,
-         holderSocketPreserved=True)
+         holderSocketPreserved=True, crashRecoveryGaps=recovered)
     case("offline-unreachable-and-uncatalogued-legacy-Mongo-discovery")
     routed.api("POST", f"/api/networks/{network}/disconnect", {})
     wait("explicit offline network has no upstream", lambda: not routed.held(network) and not routed.physical_registered(nick))
