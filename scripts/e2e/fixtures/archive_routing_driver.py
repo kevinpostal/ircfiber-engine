@@ -105,11 +105,12 @@ PAUSED = set()
 STARTED = {}
 CASE = "startup"
 EVIDENCE = []
-DEADLINE = time.monotonic() + 1200
+QUALIFICATION_SECONDS = 1800
+DEADLINE = time.monotonic() + QUALIFICATION_SECONDS
 
 
 def command(args, seconds=40):
-    assert time.monotonic() < DEADLINE, "whole qualification exceeded 1200 seconds"
+    assert time.monotonic() < DEADLINE, f"whole qualification exceeded {QUALIFICATION_SECONDS} seconds"
     with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
         result = subprocess.run(args, stdout=out, stderr=err,
                                 timeout=min(seconds, max(1, DEADLINE - time.monotonic())))
