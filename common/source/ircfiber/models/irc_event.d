@@ -35,6 +35,8 @@ struct IRCRawEvent {
     long eid;
     /// Parser-only wire boundary; never serialized into JSON or durable state.
     bool hasTrailingParam;
+    /// Engine-only pending JOIN refusal correlation; never serialized.
+    bool persistChannelIntent;
     
     /// Construct a new IRCRawEvent
     this(string network, string command) {

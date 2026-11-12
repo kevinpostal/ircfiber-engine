@@ -7709,6 +7709,57 @@ final class PersistentIRCClient {
         } catch (Exception) {}
     }
 
+    /// Only an admission refusal for an outstanding JOIN retires reconnect
+    /// intent. Channel-read errors and malformed targets are not JOIN results.
+    private bool retireRefusedJoin(string channel) {
+        if (!channel.length || channelTypes().indexOf(channel[0]) < 0) return false;
+        foreach (c; channel)
+            if (c <= ' ' || c == ',' || c == ':' || c == 0x7F) return false;
+        auto chan = normalizeChannelName(channel);
+        if (!chan.length) return false;
+        const mapping = casemapping();
+        if (!joinsAwaitingConfirm.canFind!(pending =>
+                nicksEqualMapped(pending, chan, mapping))) return false;
+
+        size_t keep;
+        foreach (pending; joinsAwaitingConfirm)
+            if (!nicksEqualMapped(pending, chan, mapping))
+                joinsAwaitingConfirm[keep++] = pending;
+        joinsAwaitingConfirm.length = keep;
+        keep = 0;
+        foreach (configured; config.autoJoinChannels)
+            if (!nicksEqualMapped(configured, chan, mapping))
+                config.autoJoinChannels[keep++] = configured;
+        config.autoJoinChannels.length = keep;
+        bool alreadyParted;
+        keep = 0;
+        foreach (parted; config.partedChannels) {
+            if (nicksEqualMapped(parted, chan, mapping)) {
+                if (alreadyParted) continue;
+                alreadyParted = true;
+            }
+            config.partedChannels[keep++] = parted;
+        }
+        config.partedChannels.length = keep;
+        if (!alreadyParted) config.partedChannels ~= chan;
+
+        chan = gapNamesChannelKey(chan);
+        forgetMemberFlaps(chan);
+        channelState.remove(chan);
+        confirmedMembership.remove(foldNick(chan));
+        channelUsers.remove(chan);
+        namesBurst.remove(chan);
+        namesBurstAt.remove(chan);
+        namesBurstIndex.remove(chan);
+        resetNamesIdentIndex();
+        gapNamesPending.remove(chan);
+        channelTopics.remove(chan);
+        channelMetadata.remove(chan.toLower);
+        pruneUnownedIdentities();
+        markMetaDirty();
+        return true;
+    }
+
     private void prunePendingJoins() nothrow {
         try {
             size_t keep;
@@ -7722,9 +7773,12 @@ final class PersistentIRCClient {
     /// the shared queue actually admits it, not merely after a retry sleep.
     private void sendAutomaticJoins(string[] channels, bool retry = false) {
         prunePendingJoins();
+        const mapping = casemapping();
         string[] targets;
         foreach (chan; channels) {
             if (foldNick(chan) in confirmedMembership) continue;
+            if (config.partedChannels.canFind!(parted =>
+                    nicksEqualMapped(parted, chan, mapping))) continue;
             if (retry && !joinsAwaitingConfirm.canFind(chan)) continue;
             targets ~= chan;
         }
@@ -7738,9 +7792,12 @@ final class PersistentIRCClient {
 
     private string currentAutomaticJoin(string line, bool retry) {
         prunePendingJoins();
+        const mapping = casemapping();
         string[] targets;
         foreach (chan; line[5 .. $].split(",")) {
             if (foldNick(chan) in confirmedMembership) continue;
+            if (config.partedChannels.canFind!(parted =>
+                    nicksEqualMapped(parted, chan, mapping))) continue;
             if (retry && !joinsAwaitingConfirm.canFind(chan)) continue;
             targets ~= chan;
         }
@@ -11279,11 +11336,16 @@ private void processEvents() {
                             channelUsers.get(chan, null), rosterIdentityOf(event), casemapping());
                         if (chan in namesBurst)
                             upsertNamesMember(chan, rosterIdentityOf(event));
-                        bool wasAutoJoin = config.autoJoinChannels.canFind(chan);
+                        const mapping = casemapping();
+                        bool wasAutoJoin = config.autoJoinChannels.canFind!(configured =>
+                            nicksEqualMapped(configured, chan, mapping));
                         if (!wasAutoJoin)
                             config.autoJoinChannels ~= chan;
-                        auto pi = config.partedChannels.countUntil(chan);
-                        if (pi >= 0) config.partedChannels = config.partedChannels.remove(pi);
+                        size_t keep;
+                        foreach (parted; config.partedChannels)
+                            if (!nicksEqualMapped(parted, chan, mapping))
+                                config.partedChannels[keep++] = parted;
+                        config.partedChannels.length = keep;
                         // Request server-side history if available. Goes
                         // through requestChathistory so it uses the spec
                         // wire format and takes the per-channel in-flight
@@ -11552,41 +11614,19 @@ private void processEvents() {
             }
 
             case "403": // ERR_NOSUCHCHANNEL
+            case "437": // ERR_UNAVAILRESOURCE (channel target only)
+            case "470": // ERR_LINKCHANNEL — retire the requested channel, not its destination
             case "471": // ERR_CHANNELISFULL
             case "473": // ERR_INVITEONLYCHAN
             case "474": // ERR_BANNEDFROMCHAN
             case "475": // ERR_BADCHANNELKEY
+            case "476": // ERR_BADCHANMASK
             case "477": // ERR_NOCHANMODES / registration required
+            case "484": // ERR_RESTRICTED
             case "489": { // ERR_SECUREONLYCHAN
-                // Permanent refusal invalidates observed membership, not
-                // configured autojoin/parted intent. No throttle retry may
-                // keep asking for this channel after it was rejected.
                 auto ps = event.getParams();
-                bool validChannel = ps.length > 1 && ps[1].length > 0
-                    && channelTypes().indexOf(ps[1][0]) >= 0;
-                if (validChannel)
-                    foreach (c; ps[1])
-                        if (c <= ' ' || c == ',' || c == ':' || c == 0x7F) {
-                            validChannel = false;
-                            break;
-                        }
-                if (validChannel) {
-                    auto chan = gapNamesChannelKey(normalizeChannelName(ps[1]));
-                    clearPendingJoin(chan);
-                    forgetMemberFlaps(chan);
-                    channelState.remove(chan);
-                    confirmedMembership.remove(foldNick(chan));
-                    channelUsers.remove(chan);
-                    namesBurst.remove(chan);
-                    namesBurstAt.remove(chan);
-                    namesBurstIndex.remove(chan);
-                    resetNamesIdentIndex();
-                    gapNamesPending.remove(chan);
-                    channelTopics.remove(chan);
-                    channelMetadata.remove(chan.toLower);
-                    pruneUnownedIdentities();
-                    markMetaDirty();
-                }
+                if (ps.length > 1 && retireRefusedJoin(ps[1]))
+                    event.persistChannelIntent = true;
                 break;
             }
 
@@ -11612,8 +11652,8 @@ private void processEvents() {
                 if (isFloodNotice(event.text)) {
                     onFloodComplaint("405", event.text);
                     scheduleFloodJoinRetry();
-                } else if (channelName.length > 0) {
-                    clearPendingJoin(channelName);
+                } else if (retireRefusedJoin(channelName)) {
+                    event.persistChannelIntent = true;
                 }
                 break;
             }
@@ -15914,13 +15954,15 @@ unittest {
 unittest {
     NetworkConfig cfg;
     cfg.nick = "Zodiac";
+    cfg.autoJoinChannels = ["#superbowl"];
+    cfg.partedChannels = ["#left"];
     auto ch = EngineEventChannel.create();
     auto c = new PersistentIRCClient(cfg, ch);
+    scope (exit) ++c.joinRetryEpoch;
     assert(!c.pacer.isArmed(), "fresh client starts unarmed");
-    // The autojoin burst recorded #superbowl as awaiting confirmation —
-    // sendRaw is safe to call pre-connect, it just queues the line.
-    c.sendRaw("JOIN #superbowl");
-    assert(c.joinsAwaitingConfirm == ["#superbowl"], "JOIN must record the pending channel");
+    // Model an autojoin already admitted to the wire, not merely queued.
+    c.recordPendingJoins("#superbowl");
+    assert(c.joinsAwaitingConfirm == ["#superbowl"]);
     c.processLine(":contra.supernets.org 405 Zodiac #superbowl :\x1F\x0304slow down nerd\x0F");
     assert(c.pacer.isArmed(),
            "a channel-targeted 405 carrying a flood phrase must tighten the pacer");
@@ -15937,23 +15979,38 @@ unittest {
            "a flood complaint is not a real refusal — #superbowl must stay pending for the retry, not be abandoned");
     assert(c.joinThrottleRetryInFlight,
            "the flood complaint must schedule a bounded retry, mirroring the 421 throttle path");
+    assert(c.config.autoJoinChannels == ["#superbowl"] && c.config.partedChannels == ["#left"],
+           "a flood complaint must preserve configured channel intent");
     ch.close();
+    IRCRawEvent event;
+    while (ch.tryConsumeOne(event, Duration.zero))
+        assert(!event.persistChannelIntent, "flood retry must not request refusal persistence");
 }
 
-@("a genuine (non-flood) 405 ERR_TOOMANYCHANNELS still clears the pending join")
+@("a genuine (non-flood) 405 ERR_TOOMANYCHANNELS retires pending automatic intent")
 unittest {
     NetworkConfig cfg;
     cfg.nick = "Zodiac";
+    cfg.autoJoinChannels = ["#toomany", "#TOOMANY", "#other"];
+    cfg.partedChannels = ["#left"];
     auto ch = EngineEventChannel.create();
     auto c = new PersistentIRCClient(cfg, ch);
-    c.sendRaw("JOIN #toomany");
+    c.recordPendingJoins("#toomany");
     assert(c.joinsAwaitingConfirm == ["#toomany"]);
     c.processLine(":irc.example.net 405 Zodiac #toomany :You have joined too many channels");
     assert(!c.pacer.isArmed(), "a genuine ERR_TOOMANYCHANNELS is not a flood signal");
     assert(c.joinsAwaitingConfirm.length == 0,
            "a real refusal must still be cleared — waiting will not fix it");
     assert(!c.joinThrottleRetryInFlight, "no retry for a channel that was genuinely refused");
+    assert(c.config.autoJoinChannels == ["#other"]
+        && c.config.partedChannels == ["#left", "#toomany"],
+           "a genuine refusal must suppress future automatic attempts until explicit recovery");
     ch.close();
+    IRCRawEvent event;
+    bool persisted;
+    while (ch.tryConsumeOne(event, Duration.zero))
+        if (event.command == "405") persisted = event.persistChannelIntent;
+    assert(persisted, "the correlated genuine refusal must request channel-intent persistence");
 }
 
 @("scheduleJoinConfirmSweep arms once per auto-join burst and does not double-arm")
@@ -16653,19 +16710,37 @@ Ircv3Check[] slowdownWireChecks(out string[] wire) {
     Ircv3Check[] checks;
     void check(string name, bool passed) { checks ~= Ircv3Check(name, passed); }
     string[] received;
+    TCPConnection serverPeer;
     bool peerClosed;
     auto listener = listenTCP(0, (TCPConnection peer) {
+        serverPeer = peer;
+        bool registered;
         try {
-            peer.write(":s 001 me :Welcome\r\n"
-                ~ ":s 005 me CHANTYPES=# CHANMODES=b,k,l,imnst :supported\r\n"
-                ~ ":me!u@host JOIN #superbowl\r\n"
-                ~ ":s 353 me = #superbowl :me\r\n"
-                ~ ":s 366 me #superbowl :End of NAMES\r\n"
-                ~ ":s 376 me :End of MOTD\r\n");
-            peer.flush();
             while (!peer.empty) {
                 const line = (cast(const(char)[]) peer.readLine()).idup;
                 received ~= line;
+                // A welcome acknowledges the registration actually consumed
+                // by this peer, not a greeting raced ahead of NICK/USER.
+                if (!registered && line.startsWith("USER ")) {
+                    registered = true;
+                    peer.write(":s 001 me :Welcome\r\n"
+                        ~ ":s 005 me CHANTYPES=# CHANMODES=b,k,l,imnst :supported\r\n"
+                        ~ ":me!u@host JOIN #superbowl\r\n"
+                        ~ ":s 353 me = #superbowl :me\r\n"
+                        ~ ":s 366 me #superbowl :End of NAMES\r\n"
+                        ~ ":s 376 me :End of MOTD\r\n");
+                    peer.flush();
+                }
+                // Complete automatic enrichment before the next scenario.
+                // Only #one/#two deliberately remain open for the refusal test.
+                if (line.startsWith("WHO ")) {
+                    const target = line.split()[1];
+                    if (target != "#one" && target != "#two") {
+                        peer.write(":s 352 me " ~ target ~ " u host s me H :0 Me\r\n"
+                            ~ ":s 315 me " ~ target ~ " :End of WHO\r\n");
+                        peer.flush();
+                    }
+                }
                 if (line.startsWith("JOIN ")) {
                     foreach (target; line[5 .. $].split(",")) {
                         if (target == "#superbowl") {
@@ -16701,6 +16776,8 @@ Ircv3Check[] slowdownWireChecks(out string[] wire) {
         events.close();
     }
     scope(exit) cleanup();
+    string awaitedReply;
+    bool replyConsumed;
     void pump(long milliseconds = 75) {
         const until = unixMsNow() + milliseconds;
         ubyte[4096] buffer;
@@ -16714,8 +16791,19 @@ Ircv3Check[] slowdownWireChecks(out string[] wire) {
                 const line = client.inboundPartial[0 .. end].idup;
                 client.inboundPartial = client.inboundPartial[end + 2 .. $];
                 client.processLine(line);
+                if (line == awaitedReply) replyConsumed = true;
             }
         }
+    }
+    void reply(string line) {
+        awaitedReply = line;
+        replyConsumed = false;
+        serverPeer.write(line ~ "\r\n");
+        serverPeer.flush();
+        const until = unixMsNow() + 2_000;
+        while (!replyConsumed && unixMsNow() < until) pump(25);
+        assert(replyConsumed, "slowdown fixture did not consume its wire response");
+        awaitedReply = "";
     }
     size_t occurrences(string line) { return received.count(line); }
     client.sendRaw("WEBIRC fixture ircfiber 192.0.2.1 192.0.2.1");
@@ -16737,6 +16825,11 @@ Ircv3Check[] slowdownWireChecks(out string[] wire) {
     pump();
     check("the confirmation watchdog does not retry an already joined channel",
         occurrences("JOIN #superbowl") == 0 && client.joinThrottleRounds == 0);
+    for (auto until = unixMsNow() + 2_000;
+            (client.pendingWhos.length || client.optionalReads.length) && unixMsNow() < until;)
+        pump(25);
+    check("registration enrichment is acknowledged before optional-read ownership checks",
+        client.pendingWhos.length == 0 && client.optionalReads.length == 0);
 
     client.sendRaw("WHO #one", true);
     client.sendRaw("WHO #one", true);
@@ -16744,36 +16837,48 @@ Ircv3Check[] slowdownWireChecks(out string[] wire) {
     pump();
     check("identical reads share one operation while distinct targets still reach the wire",
         occurrences("WHO #one") == 1 && occurrences("WHO #two") == 1);
-    client.processLine(":s 263 me WHO :Try again later");
+    reply(":s 263 me WHO :Try again later");
     client.sendRaw("WHO #one", true);
     client.sendRaw("WHO #two", true);
     pump();
     check("a command-only refusal releases only the oldest outstanding read",
         occurrences("WHO #one") == 2 && occurrences("WHO #two") == 1);
-    client.processLine(":s 315 me #one :End of WHO");
-    client.processLine(":s 315 me #two :End of WHO");
+    // The first #one was refused and has no 315. The surviving wire
+    // order is #two, then the retried #one; finish them in that order so
+    // closeWho also retires the older unanswered ownership record.
+    reply(":s 315 me #two :End of WHO");
+    reply(":s 315 me #one :End of WHO");
     client.sendRaw("NAMES #one,#two", true);
-    client.processLine(":s 366 me #one :End of NAMES");
+    pump();
+    reply(":s 366 me #one :End of NAMES");
     client.sendRaw("NAMES #one,#two", true);
     pump();
     check("a multi-channel NAMES read remains pending until every channel completes",
         occurrences("NAMES #one,#two") == 1);
-    client.processLine(":s 366 me #two :End of NAMES");
+    reply(":s 366 me #two :End of NAMES");
     client.sendRaw("NAMES #one,#two", true);
     pump();
     check("a completed multi-channel read can be explicitly requested again",
         occurrences("NAMES #one,#two") == 2);
+    reply(":s 366 me #one :End of NAMES");
+    reply(":s 366 me #two :End of NAMES");
     client.sendRaw("MODE me", true);
-    client.processLine(":s 221 me +i");
+    pump();
+    reply(":s 221 me +i");
     client.sendRaw("MODE me", true);
     pump();
     check("user MODE queries finish on 221 rather than waiting for expiry", occurrences("MODE me") == 2);
+    reply(":s 221 me +i");
     client.sendRaw("NAMES #room", true);
-    client.processLine(":s 482 me #room :You are not a channel operator");
+    pump();
+    reply(":s 482 me #room :You are not a channel operator");
     client.sendRaw("NAMES #room", true);
     pump();
     check("a mode-mutation error cannot release an unrelated pending NAMES read",
         occurrences("NAMES #room") == 1);
+    reply(":s 366 me #room :End of NAMES");
+    check("optional-read scenarios close their response ownership before pacing",
+        client.pendingWhos.length == 0 && client.optionalReads.length == 0);
 
     client.pacer.tighten(unixMsNow());
     const before = received.length;
@@ -16806,7 +16911,16 @@ Ircv3Check[] slowdownWireChecks(out string[] wire) {
     client.processLine(":me!u@host PART #retained :left");
     client.sendAutomaticJoins(["#retained"]);
     pump();
-    check("PART revokes current-socket proof and permits a real rejoin", occurrences("JOIN #retained") == 2);
+    check("PART revokes current-socket proof and suppresses automatic rejoin",
+        occurrences("JOIN #retained") == 1
+        && client.foldNick("#retained") !in client.confirmedMembership
+        && client.config.partedChannels.canFind("#retained"));
+    client.sendRaw("JOIN #retained", true);
+    pump();
+    check("an explicit rejoin after PART reaches the wire and restores intent",
+        occurrences("JOIN #retained") == 2
+        && client.config.autoJoinChannels.canFind("#retained")
+        && !client.config.partedChannels.canFind("#retained"));
     client.channelState["#names"] = "";
     client.joinsAwaitingConfirm ~= "#names";
     client.processLine(":s 353 me = #names :me");
@@ -16818,6 +16932,14 @@ Ircv3Check[] slowdownWireChecks(out string[] wire) {
     const snapshot = fromJSON(toJSON(capturedSnapshot));
     check("retained-socket metadata never promotes unproven membership into confirmed state",
         snapshot.confirmedChannels.canFind("#names") && !snapshot.confirmedChannels.canFind("#unproven"));
+    // Pump any automatic reads NAMES may emit before recording the next
+    // wire baseline; already enriched rosters legitimately emit none.
+    pump();
+    for (auto until = unixMsNow() + 2_000;
+            (client.pendingWhos.length || client.optionalReads.length) && unixMsNow() < until;)
+        pump(25);
+    check("prior read ownership is settled before reconnect pacing",
+        client.pendingWhos.length == 0 && client.optionalReads.length == 0);
 
     client.pacer.tighten(unixMsNow());
     const beforeReconnect = received.length;
@@ -17511,17 +17633,22 @@ Ircv3Check[] ircv3ProtocolChecks(out string[] wire) {
         results ~= Ircv3Check("nonmember JOIN and public NAMES still publish normally",
             published == ["JOIN", "KICK", "353", "366", "JOIN"]);
     }
-    foreach (numeric; ["403", "471", "473", "474", "475", "477", "489"]) {
+    foreach (numeric; ["403", "405", "437", "470", "471", "473", "474", "475",
+            "476", "477", "484", "489"]) {
         NetworkConfig cfg;
         cfg.nick = "me";
-        cfg.autoJoinChannels = ["#refused", "#elsewhere"];
+        cfg.autoJoinChannels = ["#refused", "#REFUSED", "#elsewhere", "#read"];
         cfg.partedChannels = ["#left"];
         auto ch = EngineEventChannel.create();
         auto client = new PersistentIRCClient(cfg, ch);
         client.processLine(":me!u@h JOIN #refused");
         client.processLine(":alice!user@host JOIN #refused account :Alice");
         client.processLine(":s 353 me = #refused :me alice partial!user@host");
+        // Retained observed state can outlive membership proof (holder gap).
+        // The actual pending request, not that retained state, owns refusal.
+        client.confirmedMembership.remove(client.foldNick("#refused"));
         client.recordPendingJoins("#REFUSED,#elsewhere");
+        client.joinsAwaitingConfirm ~= "#rEFUSED";
         client.channelTopics["#refused"] = "retained topic";
         client.channelMetadata["#refused"]["url"] = "https://example.test/";
         client.gapNamesPending["#refused"] = true;
@@ -17532,18 +17659,21 @@ Ircv3Check[] ircv3ProtocolChecks(out string[] wire) {
             ":s " ~ numeric ~ " me me :No channel",
             ":s " ~ numeric ~ " me :#refused invalid",
             ":s " ~ numeric ~ " me #refused,other :Not a single channel",
+            ":s " ~ numeric ~ " me #read :Unrelated channel read",
         ]) {
             wire ~= line;
             client.processLine(line);
         }
-        results ~= Ircv3Check(numeric ~ " with a missing or invalid channel leaves observed state alone",
+        results ~= Ircv3Check(numeric ~ " missing, malformed or nonpending targets leave state and intent alone",
             "#refused" in client.channelState && "#refused" in client.channelUsers
-            && client.joinsAwaitingConfirm.canFind("#refused") && !client.metaDirty);
-        client.metaDirty = false;
-        const refusal = ":s " ~ numeric ~ " me #REFUSED :Cannot join channel";
+            && client.joinsAwaitingConfirm == ["#refused", "#elsewhere", "#rEFUSED"]
+            && client.config.autoJoinChannels == ["#refused", "#REFUSED", "#elsewhere", "#read"]
+            && client.config.partedChannels == ["#left"] && !client.metaDirty);
+        const refusal = ":s " ~ numeric ~ " me #REFUSED"
+            ~ (numeric == "470" ? " #elsewhere" : "") ~ " :Cannot join channel";
         wire ~= refusal;
         client.processLine(refusal);
-        results ~= Ircv3Check(numeric ~ " clears normalized observed state and pending JOIN, preserving intent",
+        results ~= Ircv3Check(numeric ~ " retires every equivalent pending/autojoin entry and clears observed state",
             "#refused" !in client.channelState && "#refused" !in client.channelUsers
             && "#refused" !in client.namesBurst && "#refused" !in client.namesBurstAt
             && "#refused" !in client.gapNamesPending && "#refused" !in client.channelTopics
@@ -17551,17 +17681,223 @@ Ircv3Check[] ircv3ProtocolChecks(out string[] wire) {
             && "alice" !in client.idents && "alice" !in client.accounts
             && "alice" !in client.realnames && "partial" !in client.idents
             && client.joinsAwaitingConfirm == ["#elsewhere"]
-            && client.config.autoJoinChannels == ["#refused", "#elsewhere"]
-            && client.config.partedChannels == ["#left"] && client.metaDirty);
+            && client.config.autoJoinChannels == ["#elsewhere", "#read"]
+            && client.config.partedChannels == ["#left", "#refused"] && client.metaDirty);
+        client.metaDirty = false;
+        wire ~= refusal;
+        client.processLine(refusal);
+        results ~= Ircv3Check(numeric ~ " duplicate refusal without a pending JOIN cannot retire intent again",
+            client.config.autoJoinChannels == ["#elsewhere", "#read"]
+            && client.config.partedChannels == ["#left", "#refused"] && !client.metaDirty);
         client.processLine(":s 366 me #refused :End of old NAMES");
         results ~= Ircv3Check(numeric ~ " cannot recover from the refused partial burst's late 366",
             "#refused" !in client.channelState && "#refused" !in client.channelUsers);
         ch.close();
         IRCRawEvent event;
-        bool published;
+        size_t published, persisted;
+        while (ch.tryConsumeOne(event, Duration.zero)) {
+            if (event.command == numeric && event.text == "Cannot join channel") ++published;
+            if (event.persistChannelIntent) ++persisted;
+        }
+        results ~= Ircv3Check(numeric ~ " publishes refusals but flags only the correlated retirement",
+            published == 2 && persisted == 1);
+    }
+    {
+        NetworkConfig cfg;
+        cfg.nick = "me";
+        cfg.autoJoinChannels = ["#other"];
+        auto ch = EngineEventChannel.create();
+        auto client = new PersistentIRCClient(cfg, ch);
+        scope (exit) ++client.joinRetryEpoch;
+        client.sendRaw("JOIN #newrefused fixture-key", true);
+        results ~= Ircv3Check("queued browser raw JOIN is not pending before transport admission",
+            client.joinsAwaitingConfirm.length == 0 && client.pacedQueue.length == 1);
+        const sent = historyWrites(client);
+        results ~= Ircv3Check("browser raw JOIN to an unknown channel records pending context on actual wire admission",
+            sent == ["JOIN #newrefused fixture-key"]
+            && client.joinsAwaitingConfirm == ["#newrefused"]);
+        const refusal = ":s 474 me #newrefused :Cannot join channel (+b)";
+        wire ~= refusal;
+        client.processLine(refusal);
+        results ~= Ircv3Check("real raw-JOIN pending context retires an unknown refused channel",
+            client.joinsAwaitingConfirm.length == 0
+            && client.config.autoJoinChannels == ["#other"]
+            && client.config.partedChannels == ["#newrefused"] && client.metaDirty);
+        ch.close();
+        IRCRawEvent event;
+        bool persisted;
         while (ch.tryConsumeOne(event, Duration.zero))
-            if (event.command == numeric && event.text == "Cannot join channel") published = true;
-        results ~= Ircv3Check(numeric ~ " refusal remains visible on the event channel", published);
+            if (event.command == "474") persisted = event.persistChannelIntent;
+        results ~= Ircv3Check("unknown raw-JOIN refusal carries internal persistence correlation to the consumer",
+            persisted);
+    }
+    foreach (numeric; ["474", "405"]) {
+        NetworkConfig cfg;
+        cfg.nick = "me";
+        cfg.autoJoinChannels = ["#blocked", "#eligible"];
+        auto ch = EngineEventChannel.create();
+        auto client = new PersistentIRCClient(cfg, ch);
+        scope (exit) ++client.joinRetryEpoch;
+        historyWrites(client); // Attach the existing real wire-capture harness.
+        client.sendAutomaticJoins(["#blocked"]);
+        auto sent = historyWrites(client);
+        results ~= Ircv3Check(numeric ~ " eligible automatic JOIN reaches the wire and awaits admission",
+            sent == ["JOIN #blocked"] && client.joinsAwaitingConfirm == ["#blocked"]);
+
+        client.state = ConnectionState.disconnected; // Hold stale initial and retry batches.
+        client.sendAutomaticJoins(["#BLOCKED", "#eligible"]);
+        client.sendAutomaticJoins(["#blocked"], true);
+        results ~= Ircv3Check(numeric ~ " automatic initial and retry batches remain queued before refusal",
+            client.pacedQueue.length == 2 && client.automaticJoinLines.length == 2);
+        const refusal = ":s " ~ numeric ~ " me #BLOCKED :"
+            ~ (numeric == "405" ? "You have joined too many channels" : "Cannot join channel");
+        wire ~= refusal;
+        client.processLine(refusal);
+        results ~= Ircv3Check(numeric ~ " actual refusal retires pending wire intent without flood pacing",
+            client.config.autoJoinChannels == ["#eligible"]
+            && client.config.partedChannels == ["#blocked"]
+            && client.joinsAwaitingConfirm.length == 0
+            && !client.pacer.isArmed() && !client.joinThrottleRetryInFlight);
+        // A managed network can re-add required channels, and restored retry
+        // state can still name a departed channel. Departed intent wins both.
+        client.config.autoJoinChannels ~= "#BLOCKED";
+        client.recordPendingJoins("#blocked");
+        client.state = ConnectionState.connected;
+        sent = historyWrites(client);
+        results ~= Ircv3Check(numeric ~ " wire admission filters departed targets from stale initial and retry batches",
+            sent == ["JOIN #blocked", "JOIN #eligible"]
+            && client.pacedQueue.length == 0 && client.automaticJoinLines.length == 0);
+        client.state = ConnectionState.disconnected;
+        client.sendAutomaticJoins(["#BLOCKED"]);
+        client.sendAutomaticJoins(["#BLOCKED"], true);
+        results ~= Ircv3Check(numeric ~ " new automatic batches cannot queue a case-equivalent departed target",
+            client.pacedQueue.length == 0 && client.automaticJoinLines.length == 0);
+
+        client.state = ConnectionState.connected;
+        client.sendRaw("JOIN #BLOCKED fixture-key", true);
+        sent = historyWrites(client);
+        results ~= Ircv3Check(numeric ~ " explicit raw JOIN bypasses departed suppression and preserves its key on wire",
+            sent == ["JOIN #blocked", "JOIN #eligible", "JOIN #BLOCKED fixture-key"]);
+        client.config.partedChannels ~= "#BLOCKED";
+        const joined = ":ME!u@h JOIN #BLOCKED";
+        wire ~= joined;
+        client.processLine(joined);
+        results ~= Ircv3Check(numeric ~ " successful explicit self-JOIN restores intent and clears every equivalent departed entry",
+            "#blocked" in client.channelState && client.joinsAwaitingConfirm == ["#eligible"]
+            && client.config.autoJoinChannels == ["#eligible", "#BLOCKED"]
+            && client.config.partedChannels.length == 0);
+        ch.close();
+        IRCRawEvent event;
+        while (ch.tryConsumeOne(event, Duration.zero)) {}
+    }
+    foreach (transient; [false, true]) {
+        NetworkConfig cfg;
+        cfg.nick = "me";
+        cfg.autoJoinChannels = ["#waiting"];
+        auto ch = EngineEventChannel.create();
+        auto client = new PersistentIRCClient(cfg, ch);
+        scope (exit) ++client.joinRetryEpoch;
+        historyWrites(client);
+        client.sendAutomaticJoins(["#waiting"]);
+        historyWrites(client);
+        const line = transient
+            ? ":s 405 me #WAITING :\x1F\x0304slow down nerd\x0F"
+            : ":s 421 me JOIN :You must be connected for at least 5 seconds";
+        wire ~= line;
+        client.processLine(line);
+        results ~= Ircv3Check((transient ? "flood 405" : "grace-period 421")
+            ~ " keeps pending JOIN and configured intent for bounded retry",
+            client.joinsAwaitingConfirm == ["#waiting"]
+            && client.config.autoJoinChannels == ["#waiting"]
+            && client.config.partedChannels.length == 0 && client.joinThrottleRetryInFlight
+            && (!transient || client.pacer.isArmed()));
+        ch.close();
+        IRCRawEvent event;
+        bool persisted;
+        while (ch.tryConsumeOne(event, Duration.zero))
+            persisted = persisted || event.persistChannelIntent;
+        results ~= Ircv3Check((transient ? "flood 405" : "grace-period 421")
+            ~ " publishes no channel-intent persistence flag", !persisted);
+    }
+    foreach (line; [":s 442 me #waiting :You're not on that channel",
+            ":s 443 me me #waiting :is already on channel"]) {
+        NetworkConfig cfg;
+        cfg.nick = "me";
+        cfg.autoJoinChannels = ["#waiting"];
+        auto ch = EngineEventChannel.create();
+        auto client = new PersistentIRCClient(cfg, ch);
+        client.recordPendingJoins("#waiting");
+        client.metaDirty = false;
+        wire ~= line;
+        client.processLine(line);
+        results ~= Ircv3Check(line[3 .. 6] ~ " is not an admission refusal and cannot retire intent",
+            client.config.autoJoinChannels == ["#waiting"]
+            && client.config.partedChannels.length == 0 && !client.metaDirty);
+        ch.close();
+        IRCRawEvent event;
+        bool persisted;
+        while (ch.tryConsumeOne(event, Duration.zero))
+            persisted = persisted || event.persistChannelIntent;
+        results ~= Ircv3Check(line[3 .. 6] ~ " does not request refusal persistence", !persisted);
+    }
+    foreach (alreadyParted; [false, true]) {
+        NetworkConfig cfg;
+        cfg.nick = "me";
+        cfg.autoJoinChannels = ["#other"];
+        if (alreadyParted) cfg.partedChannels = ["#ONLYPENDING", "#onlypending"];
+        auto ch = EngineEventChannel.create();
+        auto client = new PersistentIRCClient(cfg, ch);
+        client.recordPendingJoins("#onlypending");
+        const refusal = ":s 474 me #ONLYPENDING :Cannot join channel";
+        wire ~= refusal;
+        client.processLine(refusal);
+        results ~= Ircv3Check("pending JOIN without configured autojoin retires into one departed entry"
+            ~ (alreadyParted ? " even when already suppressed" : ""),
+            client.joinsAwaitingConfirm.length == 0
+            && client.config.autoJoinChannels == ["#other"]
+            && client.config.partedChannels == [alreadyParted ? "#ONLYPENDING" : "#onlypending"]);
+        const joined = ":me!u@h JOIN #ONLYPENDING";
+        wire ~= joined;
+        client.processLine(joined);
+        results ~= Ircv3Check("successful self-JOIN restores previously absent autojoin intent"
+            ~ (alreadyParted ? " after another refused retry" : ""),
+            client.config.autoJoinChannels == ["#other", "#onlypending"]
+            && client.config.partedChannels.length == 0);
+        ch.close();
+        IRCRawEvent event;
+        size_t persisted;
+        while (ch.tryConsumeOne(event, Duration.zero))
+            if (event.persistChannelIntent) ++persisted;
+        results ~= Ircv3Check("pending-only refusal flags persistence exactly once"
+            ~ (alreadyParted ? " even with existing departed intent" : ""), persisted == 1);
+    }
+    foreach (mapping; ["rfc1459", "strict-rfc1459", "ascii"]) {
+        NetworkConfig cfg;
+        cfg.nick = "me";
+        cfg.autoJoinChannels = ["#[room]", "#{ROOM}"];
+        auto ch = EngineEventChannel.create();
+        auto client = new PersistentIRCClient(cfg, ch);
+        client.isupportMap["CASEMAPPING"] = mapping;
+        client.recordPendingJoins("#[room]");
+        const refusal = ":s 437 me #{ROOM} :Unavailable resource";
+        wire ~= refusal;
+        client.processLine(refusal);
+        const equivalent = mapping != "ascii";
+        results ~= Ircv3Check(mapping ~ " refusal correlates channels using the advertised CASEMAPPING",
+            equivalent
+                ? client.joinsAwaitingConfirm.length == 0
+                    && client.config.autoJoinChannels.length == 0
+                    && client.config.partedChannels == ["#{room}"]
+                : client.joinsAwaitingConfirm == ["#[room]"]
+                    && client.config.autoJoinChannels == ["#[room]", "#{ROOM}"]
+                    && client.config.partedChannels.length == 0);
+        ch.close();
+        IRCRawEvent event;
+        bool persisted;
+        while (ch.tryConsumeOne(event, Duration.zero))
+            persisted = persisted || event.persistChannelIntent;
+        results ~= Ircv3Check(mapping ~ " persistence follows pending-channel correlation",
+            persisted == equivalent);
     }
     foreach (mapping; ["rfc1459", "strict-rfc1459", "ascii"]) {
         NetworkConfig cfg;
@@ -18616,14 +18952,23 @@ ServicesIdentityCheck[] servicesIdentityWireChecks(out string[] wire) {
         ~ ":s 376 me :End of MOTD\r\n";
     const anonymous = ":s 001 me :Welcome\r\n:s 376 me :End of MOTD\r\n";
     string[] got;
+    TCPConnection serverPeer;
     int accepted;
     int closedPeers;
     auto listener = listenTCP(0, (TCPConnection peer) {
         const n = accepted++;
+        serverPeer = peer;
+        bool registered;
         try {
-            peer.write(n == 0 ? loggedIn : anonymous);
-            peer.flush();
-            while (!peer.empty) got ~= (cast(const(char)[]) peer.readLine()).idup;
+            while (!peer.empty) {
+                const line = (cast(const(char)[]) peer.readLine()).idup;
+                got ~= line;
+                if (!registered && line.startsWith("USER ")) {
+                    registered = true;
+                    peer.write(n == 0 ? loggedIn : anonymous);
+                    peer.flush();
+                }
+            }
         } catch (Exception) {}
         try peer.close(); catch (Exception) {}
         ++closedPeers;
@@ -18639,6 +18984,28 @@ ServicesIdentityCheck[] servicesIdentityWireChecks(out string[] wire) {
         IRCRawEvent ev;
         while (ch.tryConsumeOne(ev, 0.msecs))
             if (ev.command == "SERVICES_STATE") announced ~= ev.getParams();
+    }
+    // Keep live identity statements on the socket, and consume each one
+    // before asserting its account/epoch effect or starting another phase.
+    void feed(string line) {
+        serverPeer.write(line ~ "\r\n");
+        serverPeer.flush();
+        const until = unixMsNow() + 2_000;
+        ubyte[4096] buffer;
+        while (unixMsNow() < until) {
+            const n = c.readFromStream(buffer[], 10.msecs);
+            if (!n) continue;
+            c.inboundPartial ~= cast(const(char)[]) buffer[0 .. n];
+            for (;;) {
+                const end = c.inboundPartial.indexOf("\r\n");
+                if (end < 0) break;
+                const incoming = c.inboundPartial[0 .. end].idup;
+                c.inboundPartial = c.inboundPartial[end + 2 .. $];
+                c.processLine(incoming);
+                if (incoming == line) return;
+            }
+        }
+        assert(false, "services fixture did not consume its wire response");
     }
     void closeSocket(int peersBefore) {
         try c.connection.close(); catch (Exception) {}
@@ -18660,6 +19027,10 @@ ServicesIdentityCheck[] servicesIdentityWireChecks(out string[] wire) {
     /// RPL_WELCOME tail for the services generation.
     void register() {
         c.connection = connectTCP("127.0.0.1", listener.bindAddress.port);
+        // Match a fresh holder DIAL/attemptConnectionImpl boundary, rather
+        // than registering from the previous socket's connected state.
+        c.state = ConnectionState.connecting;
+        c.observed001AtMs = 0;
         c.performRegistration();
         c.connectedAtMs = unixMsNow();
         c.state = ConnectionState.connected;
@@ -18668,6 +19039,8 @@ ServicesIdentityCheck[] servicesIdentityWireChecks(out string[] wire) {
     }
 
     register();
+    check("the registration welcome acknowledges NICK before live account statements",
+        c.sessionNick == "me" && c.optimisticNickOld.length == 0);
     const epoch1 = c.getConnectionEpoch();
     check("a SASL 900 read off the wire during registration is the observed account",
         c.getServicesAccountState() == ServicesAccountState.account && c.getServicesAccount() == "acct");
@@ -18678,21 +19051,25 @@ ServicesIdentityCheck[] servicesIdentityWireChecks(out string[] wire) {
         announced == [["account", "acct", epoch1, "unknown"]]);
 
     c.requestSelfWho();
-    sleep(300.msecs);
+    foreach (_; 0 .. 400) {
+        if (got.canFind("WHO me %tcuhnfar,152")) break;
+        sleep(5.msecs);
+    }
     check("a self WHO asks WHOX to restate our account", got.canFind("WHO me %tcuhnfar,152"));
-    c.processLine(":s 354 me 152 * ~m host.a me H acct :Me");
+    feed(":s 354 me 152 * ~m host.a me H acct :Me");
+    feed(":s 315 me me :End of WHO");
     drain();
     check("a WHOX row restating the same account announces nothing", announced.length == 1);
-    c.processLine(":s 901 me me!~m@host.a :You are now logged out");
+    feed(":s 901 me me!~m@host.a :You are now logged out");
     drain();
     check("901 is a logout on the same epoch",
         c.getServicesAccountState() == ServicesAccountState.none && c.getServicesAccount() == ""
         && c.getConnectionEpoch() == epoch1 && announced[$ - 1] == ["none", "", epoch1, "unknown"]);
-    c.processLine("@batch=hist :me!~m@host.a ACCOUNT replayed");
-    c.processLine(":bob!~b@hb ACCOUNT acct");
+    feed("@batch=hist :me!~m@host.a ACCOUNT replayed");
+    feed(":bob!~b@hb ACCOUNT acct");
     check("replayed and other users' ACCOUNT lines are not our login",
         c.getServicesAccountState() == ServicesAccountState.none);
-    c.processLine(":me!~m@host.a ACCOUNT acct2");
+    feed(":me!~m@host.a ACCOUNT acct2");
     drain();
     check("a live self ACCOUNT is a relogin",
         c.getServicesAccount() == "acct2" && announced[$ - 1] == ["account", "acct2", epoch1, "unknown"]);
@@ -18706,12 +19083,14 @@ ServicesIdentityCheck[] servicesIdentityWireChecks(out string[] wire) {
         c.getConnectionEpoch() == "" && c.servicesAccount == ""
         && announced[$ - 1] == ["unknown", "", "", "unavailable"]);
     register();
+    check("a fresh socket acknowledges its registration NICK independently",
+        c.sessionNick == "me" && c.optimisticNickOld.length == 0);
     const epoch2 = c.getConnectionEpoch();
     check("the next registered socket gets a different epoch", canonicalUuid(epoch2) && epoch2 != epoch1);
     check("no 900 leaves identity unknown, whatever SASL config says",
         c.getServicesAccountState() == ServicesAccountState.unknown && c.getServicesAccount() == ""
         && announced[$ - 1] == ["unknown", "", epoch2, "unknown"]);
-    c.processLine(":me!~m@host.a ACCOUNT acct2");
+    feed(":me!~m@host.a ACCOUNT acct2");
     drain();
 
     // Hot swap of the retained socket: META carries the login, never the
@@ -18719,7 +19098,7 @@ ServicesIdentityCheck[] servicesIdentityWireChecks(out string[] wire) {
     auto meta = c.snapshotSession(true);
     c.detachedForHotSwap = true;
     const before = announced.length;
-    c.processLine(":s 901 me me!~m@host.a :You are now logged out");
+    feed(":s 901 me me!~m@host.a :You are now logged out");
     drain();
     check("a detached engine exports and announces nothing",
         c.getConnectionEpoch() == "" && c.getServicesAccount() == "" && announced.length == before);

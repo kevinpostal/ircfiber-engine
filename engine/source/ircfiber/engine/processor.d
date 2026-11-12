@@ -3,7 +3,7 @@ module ircfiber.engine.processor;
 import vibe.core.core : runTask, yield;
 import vibe.core.log;
 
-import std.uuid : parseUUID;
+import std.uuid : UUID, parseUUID;
 
 import ircfiber.models.irc_event : IRCRawEvent;
 import ircfiber.models.network : Network, normalizeChannelName;
@@ -13,6 +13,7 @@ import ircfiber.redis.protocol : RedisKeys, StateTTL;
 import ircfiber.engine.session_snapshot : HistoryRecovery, historyRecoveryFromJSON,
     historyRecoveryToJSON;
 import ircfiber.irc.mls_peer : normalizeFiberChannel;
+import ircfiber.irc.connection : PersistentIRCClient;
 import vibe.data.json : Json, parseJsonString;
 
 import ircfiber.engine.archive_spool : ArchiveAdmission;
@@ -482,12 +483,12 @@ void startEventProcessor(ref EngineContext ctx) {
                     }
                 }
 
-                // Persist autoJoinChannels changes to MongoDB when we join/part/kick
+                // Persist membership changes and correlated pending JOIN refusals.
                 if (!historical && foundNet && (event.command == "JOIN" || event.command == "PART" || event.command == "KICK"
-                                 || event.command == "RENAME")) {
+                                 || event.command == "RENAME" || event.persistChannelIntent)) {
                     auto client = ctx.connManager.getClient(matchedNet.config.id);
                     if (client !is null) {
-                        bool isOwnEvent = false;
+                        bool isOwnEvent = event.persistChannelIntent;
                         if (event.command == "JOIN" && event.nick == client.getCurrentNick) {
                             isOwnEvent = true;
                         } else if (event.command == "PART" && event.nick == client.getCurrentNick) {
@@ -502,23 +503,27 @@ void startEventProcessor(ref EngineContext ctx) {
                             isOwnEvent = true;
                         }
                         if (isOwnEvent) {
-                            runTask(() nothrow {
+                            // Mongo can yield while the event-drain loop
+                            // advances. Task arguments keep this admission's
+                            // identity independent of the mutable drain locals.
+                            runTask((UUID networkId, string networkIdStr, string networkName,
+                                    PersistentIRCClient originClient) nothrow {
                                 try {
                                     import ircfiber.irc.dial_guard : ownsNetworkForDial;
-                                    const ownerIdStr = ctx.connManager.getOwnerId(matchedNet.config.id);
-                                    auto row = ctx.networkRepo.findByIdWithUser(matchedNet.config.id);
+                                    const ownerIdStr = ctx.connManager.getOwnerId(networkId);
+                                    auto row = ctx.networkRepo.findByIdWithUser(networkId);
                                     if (ownerIdStr.length > 0 && row.userId.toString() == ownerIdStr
-                                            && ownsNetworkForDial(ctx.redis, serverId, event.networkId)) {
+                                            && ownsNetworkForDial(ctx.redis, serverId, networkIdStr)) {
                                         // Runtime channel bookkeeping must not
                                         // write an older routing/IID/tenant copy.
-                                        row.config.autoJoinChannels = client.getConfig.autoJoinChannels;
-                                        row.config.partedChannels = client.getConfig.partedChannels;
+                                        row.config.autoJoinChannels = originClient.getConfig.autoJoinChannels;
+                                        row.config.partedChannels = originClient.getConfig.partedChannels;
                                         ctx.networkRepo.save(row.config, row.userId);
                                     }
                                 } catch (Exception e) {
-                                    logWarn("Failed to persist autoJoinChannels for %s: %s", event.network, e.msg);
+                                    logWarn("Failed to persist autoJoinChannels for %s: %s", networkName, e.msg);
                                 }
-                            });
+                            }, matchedNet.config.id, event.networkId, matchedNet.config.name, client);
                         }
                     }
                 }
