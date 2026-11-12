@@ -217,7 +217,6 @@ void startEventProcessor(ref EngineContext ctx) {
     bool[string] failedHistoryStorage;
 
     while (true) {
-        bool processedAny = false;
 
         // Drain up to 50 events per iteration before yielding.  During
         // ASCII art bursts (40+ PRIVMSG lines arriving in a single TCP
@@ -230,7 +229,6 @@ void startEventProcessor(ref EngineContext ctx) {
             try {
                 storageResolved = false;
                 if (!ctx.eventChannel.tryConsumeOne(event)) break;
-                processedAny = true;
 
                 if (event.command == "ARCHIVE_SHUTDOWN_BARRIER") {
                     storageResolved = true;
@@ -535,9 +533,8 @@ void startEventProcessor(ref EngineContext ctx) {
                 logError("Engine event processor error: %s", e.msg);
             }
         }
-        // Yield only when no events were processed, so other fibers
-        // (IRC connection, etc.) get CPU time.
-        if (!processedAny) yield();
+        // Keep a scheduler checkpoint even while ingress remains full.
+        yield();
     }
 }
 
