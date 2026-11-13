@@ -170,7 +170,7 @@ immutable ClientPrefSpec[] CLIENT_PREFS = [
     ClientPrefSpec("textSize", ClientPrefKind.enum_, TEXT_SIZE_VALUES),
     ClientPrefSpec("compactMode", ClientPrefKind.bool_),
     ClientPrefSpec("sidebarLeft", ClientPrefKind.bool_),
-    ClientPrefSpec("messageLayout", ClientPrefKind.enum_, ["compact", "comfortable", "separate"]),
+    ClientPrefSpec("messageLayout", ClientPrefKind.enum_, ["compact", "comfortable", "separate", "inline"]),
     ClientPrefSpec("defaultScrollPreset", ClientPrefKind.int_, null, 0, 4),
     ClientPrefSpec("inlineImages", ClientPrefKind.bool_),
     ClientPrefSpec("inlineVideos", ClientPrefKind.bool_),

@@ -143,7 +143,12 @@ DiagnosticWriteResult writeLatest(string path, string encoded) {
 }
 
 version (Posix) {
-    import core.sys.posix.fcntl : open, O_RDONLY, O_WRONLY, O_CREAT, O_CLOEXEC, O_NOFOLLOW, O_DIRECTORY, O_NONBLOCK, AT_SYMLINK_NOFOLLOW;
+    import core.sys.posix.fcntl : open, O_RDONLY, O_WRONLY, O_CREAT, O_NOFOLLOW, O_NONBLOCK, AT_SYMLINK_NOFOLLOW;
+    version (OSX) {
+        // Darwin's SDK defines these, but this druntime omits their declarations.
+        private enum O_DIRECTORY = 0x00100000;
+        private enum O_CLOEXEC = 0x01000000;
+    } else import core.sys.posix.fcntl : O_CLOEXEC, O_DIRECTORY;
     import core.sys.posix.unistd : close, write, fsync, ftruncate, geteuid;
     import core.sys.posix.sys.stat : stat_t, fstat, fchmod, S_ISREG;
     // This druntime version does not declare the POSIX.1-2008 *at APIs.
