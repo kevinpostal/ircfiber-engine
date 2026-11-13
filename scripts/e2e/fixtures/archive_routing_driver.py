@@ -90,6 +90,7 @@ import contextlib
 import subprocess
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import routed_policy_driver as routed
@@ -190,12 +191,12 @@ def case(name, **evidence):
     print(json.dumps(EVIDENCE[-1], sort_keys=True), flush=True)
 
 
-def http(method, path, body=None):
+def http(method, path, body=None, opener=None):
     request = urllib.request.Request(routed.BASE + path, method=method,
               data=None if body is None else json.dumps(body).encode(),
               headers={"Content-Type": "application/json"})
     try:
-        response = routed.http.open(request, timeout=12)
+        response = (opener or routed.http).open(request, timeout=12)
     except urllib.error.HTTPError as error:
         response = error
     with response:
@@ -602,7 +603,7 @@ def run():
     assert journal("fixture-old")["state"]["spoolId"] != journal("fixture-native")["state"]["spoolId"]
     case("pending-journal-refuses-before-CLOSE", network=network, originalEid=original["eid"])
     source_before = message(network, nick, "A-before-move")
-    message(network, nick, "A-offline", "#offline")
+    source_offline = message(network, nick, "A-offline", "#offline")
     insert_fault(True)
     pending = message(network, nick, "A-pending-before-move", persisted=False)
     wait("real pending append frame", lambda: any("A-pending-before-move" in json.dumps(frame["record"])
@@ -616,6 +617,36 @@ def run():
     wait("source journal fully checkpointed", lambda: drained("fixture-old"))
     case("quiescent-A-to-B-to-A")
     move(network, nick, "fixture-native")
+    case("empty-first-load-retained-historical-scope", network=network)
+    assert routed.redis("llen", f"scrollback:fixture-native:{network}:#offline") == "0"
+    retained_offline = marker_rows(network, "A-offline")
+    assert len(retained_offline) == 1 and retained_offline[0]["serverId"] == "fixture-old", retained_offline
+    history_path = f"/api/channels/{network}/%23offline/messages?count=200"
+    code, history = http("GET", history_path)
+    assert code == 200 and history["backlog_size"] > 0, (code, history)
+    assert history["messages"] == [source_offline], history
+    assert history["messages"][0] == json.loads(retained_offline[0]["payload"]), history
+    empty_buffer = "#never-written"
+    assert all(routed.redis("llen", f"scrollback:{server}:{network}:{empty_buffer}") == "0"
+               for server in ENGINES)
+    assert not any(row["channel"] == empty_buffer for row in rows(network))
+    empty_code, empty_history = http("GET", f"/api/channels/{network}/%23never-written/messages?count=200")
+    assert empty_code == 200 and empty_history["messages"] == [] and empty_history["backlog_size"] == 0, (
+        empty_code, empty_history)
+    unrelated = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(
+        routed.LoopbackFixtureCookies(routed.BASE)))
+    credentials = urllib.parse.urlencode({"username": "archiveunrelated",
+        "email": "archiveunrelated@local.test", "password": "ArchiveUnrelated123!"}).encode()
+    for path in ("/register", "/login"):
+        with unrelated.open(urllib.request.Request(routed.BASE + path, data=credentials), timeout=30) as response:
+            response.read()
+    unrelated_code, unrelated_networks = http("GET", "/api/networks", opener=unrelated)
+    assert unrelated_code == 200 and all(row["id"] != network for row in unrelated_networks), unrelated_networks
+    forbidden_code, forbidden = http("GET", history_path, opener=unrelated)
+    assert forbidden_code == 403 and forbidden.get("code") == "network_forbidden", (forbidden_code, forbidden)
+    case("empty-first-load-history-evidence", network=network, retainedEid=source_offline["eid"],
+         retainedServer=retained_offline[0]["serverId"], returnedRows=len(history["messages"]),
+         backlogSize=history["backlog_size"], emptyRows=0, unrelatedStatus=forbidden_code)
     target_before = message(network, nick, "B-before-return")
     message(network, nick, "B-offline", "#offline")
     wait("B journal drained", lambda: drained("fixture-native"))
