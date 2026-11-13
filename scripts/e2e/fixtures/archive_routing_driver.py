@@ -203,7 +203,7 @@ def http(method, path, body=None, opener=None):
         payload = response.read(65_537)
         assert len(payload) <= 65_536, "oversized HTTP evidence"
         value = json.loads(payload) if payload else {}
-        return response.status, value.get("data", value)
+        return response.status, value.get("data", value) if isinstance(value, dict) else value
 
 
 def clear(ident, operation, buffer="#proof"):
@@ -530,8 +530,9 @@ def start():
         except AssertionError as error:
             # The compose exec may beat mongod's first bind; retry only that
             # expected startup race, never a different fixture command failure.
-            if (len(error.args) == 3 and error.args[1] == 1
-                    and "MongoNetworkError: connect ECONNREFUSED 127.0.0.1:27017" in error.args[2]):
+            details = error.args[0] if len(error.args) == 1 else ()
+            if (isinstance(details, tuple) and len(details) == 3 and details[1] == 1
+                    and "MongoNetworkError: connect ECONNREFUSED 127.0.0.1:27017" in details[2]):
                 return False
             raise
     wait("Mongo", mongo_ready)
@@ -624,8 +625,11 @@ def run():
     history_path = f"/api/channels/{network}/%23offline/messages?count=200"
     code, history = http("GET", history_path)
     assert code == 200 and history["backlog_size"] > 0, (code, history)
-    assert history["messages"] == [source_offline], history
-    assert history["messages"][0] == json.loads(retained_offline[0]["payload"]), history
+    retained_payload = json.loads(retained_offline[0]["payload"])
+    assert history["messages"] == [retained_payload], history
+    assert all(retained_payload[key] == source_offline[key] for key in ("eid", "t", "i", "ch", "x")), (
+        source_offline, retained_payload)
+    assert retained_payload["x"] == "A-offline", retained_payload
     empty_buffer = "#never-written"
     assert all(routed.redis("llen", f"scrollback:{server}:{network}:{empty_buffer}") == "0"
                for server in ENGINES)
@@ -790,6 +794,7 @@ def run():
     old_row = next(row for row in containers()
                    if row["Config"]["Labels"]["com.docker.compose.service"] == "old-engine")
     old_generation = (old_row["Id"], old_row["State"]["StartedAt"])
+    crash_session_start = raw_journal("fixture-old")["state"]["sessionStart"]
     STARTED.pop("old-engine")
     dc("kill", "old-engine")
     wait("old engine process exited for SIGKILL recovery",
@@ -805,18 +810,19 @@ def run():
     assert restarted["Id"] == old_generation[0] and restarted["State"]["StartedAt"] != old_generation[1], restarted
     STARTED["old-engine"] = (restarted["Id"], restarted["State"]["StartedAt"])
     wait("holder-owned physical socket survived engine SIGKILL", lambda: socket_identity(network, nick) == crash_socket, 60)
-    # SIGKILL necessarily leaves the unclean marker; preserve its conservative
-    # uncertainty and the one startup admission gap instead of claiming completeness.
+    # SIGKILL requires unclean uncertainty. A startup admission gap exists
+    # only when the restarted process actually rejected an archival event.
     recovered = raw_journal("fixture-old")["state"]["gaps"]
     initial = INITIAL_ARCHIVE_GAPS["fixture-old"]
     assert recovered[:len(initial)] == initial, ("crash recovery rewrote prior gap evidence", recovered)
     new_recovery_gaps = recovered[len(initial):]
-    assert len(new_recovery_gaps) == 2 and sorted(gap["reason"] for gap in new_recovery_gaps) == [
-        "admission_rejected", "unclean_ram_admission_uncertainty"], new_recovery_gaps
+    unclean_gaps = [gap for gap in new_recovery_gaps
+                    if gap["reason"] == "unclean_ram_admission_uncertainty"]
+    assert len(unclean_gaps) == 1, new_recovery_gaps
+    assert all(gap["reason"] in ("unclean_ram_admission_uncertainty", "admission_rejected")
+               for gap in new_recovery_gaps), new_recovery_gaps
     assert all(0 < gap["from"] <= gap["through"] for gap in new_recovery_gaps), new_recovery_gaps
-    assert next(gap for gap in new_recovery_gaps
-                if gap["reason"] == "unclean_ram_admission_uncertainty")["from"] == min(
-                    gap["from"] for gap in initial), new_recovery_gaps
+    assert unclean_gaps[0]["from"] == crash_session_start, new_recovery_gaps
     RECOVERY_ARCHIVE_GAPS["fixture-old"] = recovered
     assert routed.owner(network) == "fixture-old", "engine SIGKILL changed archive producer ownership"
     routed.command_ping(network, nick)

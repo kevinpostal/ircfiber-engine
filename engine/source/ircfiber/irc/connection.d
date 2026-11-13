@@ -11172,6 +11172,12 @@ private void processEvents() {
             event.channel = target;
             return true;
         }
+        // Private notices belong to server history, even when a query for
+        // their sender already exists. Do not create or refresh DM identity.
+        if (event.command == "NOTICE") {
+            event.channel = "_server";
+            return true;
+        }
         if (event.nick.length == 0) return true;
         const outgoing = sessionNick.length > 0 && sameNick(event.nick, sessionNick);
         string other = outgoing ? target : event.nick;
@@ -11187,7 +11193,7 @@ private void processEvents() {
         if (!tracked) queryBuffers ~= other;
         // Only ordinary messages update query-follow identity evidence.
         // TAGMSG without account-tag is not evidence of a logout.
-        if (!outgoing && (event.command == "PRIVMSG" || event.command == "NOTICE")) {
+        if (!outgoing && event.command == "PRIVMSG") {
             const key = foldNick(other);
             const account = event.getTag("account");
             if (account.length) queryAccounts[key] = account;
@@ -15722,6 +15728,7 @@ private void processEvents() {
         event.text = text;
         event.setParams([target, text]);
         event.channel = target;
+        if (command == "NOTICE") resolveConversation(event);
         event.addTag("self_echo", "true");
         event.addTag("synthetic", "true");
         if (label.length > 0) {
@@ -18007,7 +18014,7 @@ Ircv3Check[] ircv3ProtocolChecks(out string[] wire) {
         IRCRawEvent event;
         while (ch.tryConsumeOne(event, Duration.zero)) {}
     }
-    foreach (command; ["PRIVMSG", "NOTICE", "REDACT", "TAGMSG"]) {
+    foreach (command; ["PRIVMSG", "REDACT", "TAGMSG"]) {
         foreach (outgoing; [false, true]) {
             NetworkConfig cfg;
             cfg.nick = "m[e]";
@@ -18032,6 +18039,125 @@ Ircv3Check[] ircv3ProtocolChecks(out string[] wire) {
             results ~= Ircv3Check(command ~ (outgoing ? " own echo" : " incoming")
                 ~ " uses the CASEMAPPING-equivalent canonical DM", found);
         }
+    }
+    foreach (existing; [false, true]) {
+        foreach (echo; [false, true]) {
+            foreach (source; ["b{OB}!u@h", "NickServ!service@services", "irc.example", "M{E}!u@h"]) {
+                NetworkConfig cfg;
+                cfg.nick = "m[e]";
+                auto ch = EngineEventChannel.create();
+                auto client = new PersistentIRCClient(cfg, ch);
+                if (echo) client.ackedCaps["echo-message"] = true;
+                if (existing) {
+                    client.queryBuffers = ["B[ob]"];
+                    client.queryAccounts[client.foldNick("B[ob]")] = "original";
+                    client.queryHosts[client.foldNick("B[ob]")] = "original@host";
+                }
+                const queries = client.queryBuffers.dup;
+                auto accounts = client.queryAccounts.dup;
+                auto hosts = client.queryHosts.dup;
+                const outgoing = source == "M{E}!u@h";
+                const target = outgoing ? "b{ob}" : "M{E}";
+                const line = "@account=notice-account;+reply=ref :" ~ source ~ " NOTICE " ~ target ~ " :hello";
+                wire ~= line;
+                client.processLine(line);
+                ch.close();
+                IRCRawEvent event;
+                size_t emitted;
+                bool intact = true;
+                while (ch.tryConsumeOne(event)) {
+                    if (event.command != "NOTICE") continue;
+                    emitted++;
+                    intact = intact && event.channel == "_server" && event.text == "hello"
+                        && event.getParams() == [target, "hello"]
+                        && event.getTag("account") == "notice-account" && event.getTag("+reply") == "ref"
+                        && event.prefix == source;
+                }
+                results ~= Ircv3Check("private NOTICE keeps server history and query state: " ~ source
+                    ~ (existing ? " existing query" : " no query") ~ (echo ? " echo enabled" : " echo disabled"),
+                    intact && emitted == (outgoing && !echo ? 0 : 1)
+                    && client.queryBuffers == queries && client.queryAccounts == accounts && client.queryHosts == hosts);
+            }
+        }
+    }
+    foreach (target; ["#chan", "&chan", "+chan", "!chan"]) {
+        NetworkConfig cfg;
+        cfg.nick = "me";
+        auto ch = EngineEventChannel.create();
+        auto client = new PersistentIRCClient(cfg, ch);
+        client.isupportMap["CHANTYPES"] = "#&+!";
+        client.processLine(":bob!u@h NOTICE " ~ target ~ " :channel notice");
+        ch.close();
+        IRCRawEvent event;
+        bool found;
+        while (ch.tryConsumeOne(event))
+            if (event.command == "NOTICE") found = event.channel == target;
+        results ~= Ircv3Check("NOTICE retains negotiated channel " ~ target,
+            found && client.queryBuffers.length == 0 && client.queryAccounts.length == 0 && client.queryHosts.length == 0);
+    }
+    {
+        NetworkConfig cfg;
+        cfg.nick = "me";
+        auto ch = EngineEventChannel.create();
+        auto client = new PersistentIRCClient(cfg, ch);
+        client.gapReplayUncertain = true;
+        const line = "@account=bob :bob!u@h NOTICE me :retained before gap";
+        client.attachBacklogBytes = line.length + 2;
+        wire ~= line;
+        client.processLine(line);
+        ch.close();
+        IRCRawEvent event;
+        bool found;
+        while (ch.tryConsumeOne(event))
+            if (event.command == "NOTICE")
+                found = event.channel == "_server" && event.getTag("batch") == "chathistory";
+        results ~= Ircv3Check("uncertain-gap NOTICE replays into server history without query evidence",
+            found && client.queryBuffers.length == 0 && client.queryAccounts.length == 0 && client.queryHosts.length == 0);
+    }
+    foreach (target; ["bob", "#chan", "&chan", "+chan", "!chan"]) {
+        NetworkConfig cfg;
+        cfg.nick = "me";
+        auto ch = EngineEventChannel.create();
+        auto client = new PersistentIRCClient(cfg, ch);
+        client.isupportMap["CHANTYPES"] = "#&+!";
+        client.sendLabeledNotice(target, "sent without echo-message", "notice-label");
+        ch.close();
+        IRCRawEvent event;
+        bool found;
+        while (ch.tryConsumeOne(event)) {
+            if (event.command != "NOTICE") continue;
+            found = event.channel == (target == "bob" ? "_server" : target)
+                && event.getParams() == [target, "sent without echo-message"]
+                && event.getTag("self_echo") == "true" && event.getTag("synthetic") == "true"
+                && event.getTag("label") == "notice-label";
+        }
+        results ~= Ircv3Check("synthetic NOTICE without echo-message retains destination " ~ target,
+            found && client.queryBuffers.length == 0 && client.queryAccounts.length == 0 && client.queryHosts.length == 0);
+    }
+    {
+        NetworkConfig cfg;
+        cfg.nick = "me";
+        auto ch = EngineEventChannel.create();
+        auto client = new PersistentIRCClient(cfg, ch);
+        client.isupportMap["CHANTYPES"] = "#&+!";
+        client.processLine(":s BATCH +notice-history chathistory bob");
+        client.processLine("@batch=notice-history :bob!u@h NOTICE me :historical reply");
+        client.processLine("@batch=notice-history :me!u@h NOTICE bob :historical echo");
+        client.processLine("@batch=notice-history :bob!u@h NOTICE &chan :historical channel");
+        client.processLine(":s BATCH -notice-history");
+        ch.close();
+        IRCRawEvent event;
+        size_t notices;
+        bool routed = true;
+        while (ch.tryConsumeOne(event)) {
+            if (event.command != "NOTICE") continue;
+            notices++;
+            routed = routed && event.channel == (event.text == "historical channel" ? "&chan" : "_server")
+                && event.getTag("batch") == "chathistory";
+        }
+        results ~= Ircv3Check("historical NOTICE classifies private replies and echoes separately from channels",
+            routed && notices == 3 && client.queryBuffers.length == 0
+            && client.queryAccounts.length == 0 && client.queryHosts.length == 0);
     }
     foreach (target; ["#chan", "&chan", "+chan", "!chan"]) {
         NetworkConfig cfg;

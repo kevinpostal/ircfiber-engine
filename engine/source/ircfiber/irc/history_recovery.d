@@ -355,6 +355,7 @@ mixin template HistoryRecoveryMixin() {
             && event.text.length && event.text[0] == '\x01'
             && !(event.text.startsWith("\x01ACTION ") && event.text[$ - 1] == '\x01')) return;
         event.channel = replay.target;
+        if (event.command == "NOTICE") resolveConversation(event);
         event.addTag("batch", "chathistory");
         if (replay.contextMessage) event.addTag("draft/chathistory-context", "");
         if (replay.label.startsWith("hist-") || replay.label.startsWith("bnc-")) event.addTag("label", "");
