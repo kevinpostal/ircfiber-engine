@@ -334,12 +334,6 @@ def recovery_suite(args):
         def live_marker(marker):
             return [row for row in redis('LRANGE', 'scrollback:ovh:' + healthy + ':#proof', 0, -1).splitlines()
                     if marker in row]
-        def writer_gate_counts():
-            return {'writerType': redis('TYPE', 'irc:holder:maintenance:writers'),
-                    'writerCount': redis('SCARD', 'irc:holder:maintenance:writers'),
-                    'writerTTL': redis('TTL', 'irc:holder:maintenance:writers'),
-                    'globalExists': redis('EXISTS', 'irc:holder:maintenance:write-exclusion'),
-                    'serverExists': redis('EXISTS', 'irc:holder:maintenance:exclusion:ovh')}
         try:
             network = dock('network', 'create', '--internal', '--subnet', '203.0.113.0/24',
                            '--label', label, tag).stdout.strip()
@@ -403,6 +397,19 @@ def recovery_suite(args):
             dial_key = 'irc:routing:dials:ovh:' + blocked
             dial_value = 'holder_v1:legacy-pid:' + str(holder_status['pid'])
             redis('HSET', dial_key, token, dial_value)
+            # Canonical UserRepository.userToBson fields; this engine-only
+            # account has no login credential or HTTP authentication surface.
+            # Its owned networks must never refer to a missing account.
+            account = {'id': owner, 'username': 'physical' + secrets.token_hex(8),
+                       'email': 'physical-' + secrets.token_hex(8) + '@fixture.invalid',
+                       'passwordHash': '',
+                       'roles': ['user'], 'signupIp': '127.0.0.1', 'provisionedFrom': '',
+                       'lastLoginIp': '127.0.0.1', 'lastLoginAt': float(time.time()),
+                       'createdAt': float(time.time()), 'loginIps': ['127.0.0.1'],
+                       'emailUnsubscribed': False, 'nickservPasswordCustom': False,
+                       'oauthIdentities': [], 'isTestAccount': True}
+            mongo('db.users.insertOne(' + json.dumps(account) + ')')
+            assert mongo('print(db.users.countDocuments({id:' + json.dumps(owner) + '}))') == '1'
             for ident, nick, port in ((healthy, 'PhysicalHealthy', 16667), (blocked, 'PhysicalBlocked', 16668)):
                 doc = {'id': ident, 'userId': owner, 'name': nick, 'host': '203.0.113.10', 'port': port,
                        'tls': 'disabled', 'nick': nick, 'realName': 'Private physical proof', 'ident': 'fixture',
@@ -411,7 +418,9 @@ def recovery_suite(args):
                        'archiveScopeVersion': 1, 'archiveServers': ['ovh']}
                 mongo('db.networks.insertOne(' + json.dumps(doc) + ')')
                 redis('HSET', 'irc:assignments', ident, 'ovh')
-                redis('SADD', 'irc:server-assignments:ovh', ident)
+                redis('HSET', 'irc:server-assignments:ovh', ident, 'ovh')
+                assert redis('TYPE', 'irc:server-assignments:ovh') == 'hash'
+                assert redis('HGET', 'irc:server-assignments:ovh', ident) == 'ovh'
                 redis('SET', 'irc:archive:owner:' + ident,
                       json.dumps({'version': 1, 'networkId': ident, 'serverId': 'ovh', 'servers': ['ovh']}))
             redis('SET', 'irc:config:fiberEnabled', '0')
@@ -477,8 +486,7 @@ def recovery_suite(args):
             differences = sorted(key for key in set(expected_config) | set(actual_config)
                                  if expected_config.get(key) != actual_config.get(key) or
                                  (key in expected_config) != (key in actual_config))
-            print(json.dumps({'candidateConfigDifferingKeys': differences}), flush=True)
-            assert not differences, 'exact cloned candidate Config differs from source'
+            assert not differences, 'exact cloned candidate Config differs from source: ' + ', '.join(differences)
             observation = barrier.Observer(pid, f'/proc/{pid}/root/ipc/holder.sock', 'ovh', '', deadline)
             original_held = observation.request('LIST', {})['connections']
             assert observation.request('STATUS', {})['pid'] == holder_status['pid']
@@ -516,8 +524,11 @@ def recovery_suite(args):
                 redis('HSET', dial_key, secrets.token_hex(16), dial_value)
             before = reservation()
             if case in ('lost-ownership', 'unknown-accepted'):
-                unknown = socket.socket(socket.AF_UNIX)
-                unknown.connect(f'/proc/{pid}/root/ipc/holder.sock')
+                # Match the observer's socket domain so unix_diag sees the
+                # accepted peer in the holder's namespace, not the VM host's.
+                with barrier.network_namespace(pid):
+                    unknown = socket.socket(socket.AF_UNIX)
+                    unknown.connect(f'/proc/{pid}/root/ipc/holder.sock')
                 unknown.sendall(b'HE')
                 # A later authenticated observer orders accept after this
                 # partial stream. Kernel ownership independently proves it is
@@ -525,11 +536,28 @@ def recovery_suite(args):
                 sentinel = barrier.Observer(pid, f'/proc/{pid}/root/ipc/holder.sock', 'ovh', '',
                                             min(deadline, time.monotonic() + 10))
                 try:
-                    unix, _ = barrier.diagnostics(pid, deadline)
-                    owned = set(barrier.owned_fds(pid).values())
-                    peer_inode = os.fstat(unknown.fileno()).st_ino
-                    assert any(inode in owned and row['peer'] == peer_inode and row['state'] == 1
-                               for inode, row in unix.items()), 'unknown IPC stream was not positively accepted'
+                    accepted_view = {}
+                    def partial_stream_accepted():
+                        try:
+                            answer = unknown.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+                        except BlockingIOError:
+                            pass
+                        else:
+                            raise AssertionError('partial IPC request unexpectedly ' +
+                                                 ('answered' if answer else 'closed'))
+                        unix, _ = barrier.diagnostics(pid, deadline)
+                        owned = set(barrier.owned_fds(pid).values())
+                        peer_inode = os.fstat(unknown.fileno()).st_ino
+                        accepted_view.update(peer=peer_inode, sockets=[
+                            {'inode': inode, 'peer': row['peer'], 'state': row['state']}
+                            for inode, row in unix.items() if inode in owned])
+                        return any(inode in owned and row['peer'] == peer_inode and row['state'] == 1
+                                   for inode, row in unix.items())
+                    try:
+                        wait(partial_stream_accepted, 'positively accepted live partial IPC stream', 10)
+                    except RuntimeError as error:
+                        raise AssertionError('unknown IPC stream was not positively accepted: ' +
+                                             json.dumps(accepted_view)) from error
                 finally:
                     sentinel.close()
             if case in ('failed-graceful-drain', 'inflight-dial'):
@@ -544,13 +572,13 @@ def recovery_suite(args):
                        '--deadline', '45' if case == 'failed-graceful-drain' else '90',
                        '--engine-stop-timeout', '120' if case == 'failed-graceful-drain' else '15',
                        '--recovery-manifest', str(manifest_path)]
-            print(json.dumps({'case': case, 'writerGateBeforeHelper': writer_gate_counts()}), flush=True)
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             if case == 'inflight-dial':
                 evidence = evidence_root / 'before.json'
                 wait(evidence.exists, 'healthy baseline durably captured before unknown DIAL', 20)
-                unknown = socket.socket(socket.AF_UNIX)
-                unknown.connect(f'/proc/{pid}/root/ipc/holder.sock')
+                with barrier.network_namespace(pid):
+                    unknown = socket.socket(socket.AF_UNIX)
+                    unknown.connect(f'/proc/{pid}/root/ipc/holder.sock')
                 unknown.sendall(('DIAL ' + json.dumps({'token': '', 'host': '203.0.113.90', 'port': 6697,
                     'tls': 'implicit', 'sni': 'legacy-barrier.fixture.invalid',
                     'proxy': {'host': '203.0.113.10', 'port': 1080}, 'tlsTimeoutMs': 25000,
@@ -562,10 +590,14 @@ def recovery_suite(args):
                 paused = None
             if case in ('lost-ownership', 'unknown-accepted', 'inflight-dial'):
                 def source_exited():
+                    nonlocal stdout, stderr
                     if process.poll() is not None:
-                        raise AssertionError('recovery refused before physical case: ' + process.stderr.read()[-6000:])
+                        stdout, stderr = process.communicate(timeout=5)
+                        raise AssertionError('recovery refused before physical case: ' + stderr[-6000:])
                     return not info(engine)['State']['Running']
-                wait(source_exited, 'natural engine shutdown', 30)
+                # Admission precedes SIGTERM; do not consume the helper's
+                # bounded transaction budget with a shorter fixture deadline.
+                wait(source_exited, 'natural engine shutdown within the recovery deadline', 90)
                 assert reservation() == before, 'reservation retired before physical exclusion'
                 detach_marker = 'detached-' + secrets.token_hex(12)
                 (control / 'inject').write_text(detach_marker)
@@ -668,15 +700,14 @@ def recovery_suite(args):
                             'operationId': manifest['operationId']})
             print(json.dumps({'caseAssertions': results[-1]}), flush=True)
         except BaseException:
+            if process is not None:
+                stdout, stderr = process.communicate(timeout=120)
+            print('Recovery case ' + case + ' helper stdout: ' + stdout[-6000:], file=sys.stderr)
             print('Recovery case ' + case + ' helper stderr: ' + stderr[-6000:], file=sys.stderr)
-            try:
-                print(json.dumps({'case': case, 'writerGateAtFailure': writer_gate_counts()}), file=sys.stderr)
-            except Exception:
-                print(json.dumps({'writerGateFailureDiagnosticUnavailable': True}), file=sys.stderr)
-            for cid in containers:
-                print(dock('logs', '--tail', '40', cid, check=False).stdout[-6000:], file=sys.stderr)
             raise
         finally:
+            if process is not None and process.poll() is None:
+                raise RuntimeError('live recovery controller; preserving its owned fixture cohort')
             if unknown is not None:
                 unknown.close()
             if paused is not None:
@@ -684,12 +715,19 @@ def recovery_suite(args):
                     os.kill(paused, signal.SIGCONT)
                 except ProcessLookupError:
                     pass
-            if process is not None and process.poll() is None:
-                process.terminate()
-                process.communicate(timeout=10)
             for cid in reversed(containers):
-                assert (info(cid)['Config'].get('Labels') or {}).get('ircfiber.fixture.run') == tag
-                dock('rm', '-f', cid)
+                container = info(cid)
+                labels = container['Config'].get('Labels') or {}
+                assert labels.get('ircfiber.fixture.run') == tag
+                if labels.get('com.ircfiber.component') == 'engine':
+                    if container['State']['Running']:
+                        dock('kill', '--signal', 'TERM', cid)
+                        # Teardown is not recovery admission: allow the known
+                        # 60-second DIAL guard to exit, never SIGKILL an engine.
+                        wait(lambda: not info(cid)['State']['Running'], 'owned engine cleanup exits naturally', 90)
+                    dock('rm', cid)
+                else:
+                    dock('rm', '-f', cid)
             for volume in volumes:
                 assert json.loads(dock('volume', 'inspect', volume).stdout)[0]['Labels']['ircfiber.fixture.run'] == tag
                 dock('volume', 'rm', volume)
