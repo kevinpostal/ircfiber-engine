@@ -4301,16 +4301,15 @@ bool channelNeedsRealnameWho(const string[] members,
 }
 
 /// One WHO written to the server whose RPL_ENDOFWHO (315) has not arrived.
-/// A server answers commands in the order it reads them, so the oldest
-/// pending WHO owns every 352/354 row that arrives. That ownership is what
-/// separates a client's own WHO (the E2EE roster probe `WHO #chan %na`, a
-/// `/raw WHO`) from the engine's realname sweep: the sweep's rows feed
-/// engine state and stay unpublished, a client's rows go to the client.
+/// Unlabelled replies follow write order; labelled replies carry their own
+/// correlation and never enter this FIFO. Ownership separates a client's
+/// WHO from the engine's private realname sweep.
 struct PendingWho {
     string mask;    /// the WHO target as sent; 315 echoes it back
     string fields;  /// WHOX field letters (`na` for `%na`), "" for plain WHO
     bool   client;  /// a client sent it: its replies are published
     long   sentAt;  /// unix seconds; an answer that never comes ages out
+    string line;    /// exact untagged wire command, also the coalescing key
 }
 
 /// Seconds a WHO may go unanswered before it stops owning reply rows.
@@ -5622,10 +5621,9 @@ final class PersistentIRCClient {
         // MAX_WHO_ENRICH_ATTEMPTS so a server that answers WHO without
         // naming every member cannot keep the sweep alive forever.
         int[string]         whoEnrichAttempts;
-        // Every WHO sent and not yet closed by its 315, oldest first (see
-        // `PendingWho`). Not cleared on reconnect: a WHO queued in
-        // `outboundQueue` while the socket was down is still owed an
-        // answer, and one lost with the old socket ages out.
+        // Unlabelled WHOs written on this socket, oldest first. Terminal
+        // failures, deadlines and disconnects retire their reply ownership
+        // together with the corresponding optional-read admission.
         PendingWho[]        pendingWhos;
         long                lastWhoisTime; // throttle: 1/s for WHOIS queries
         // IRCCloud-style realname cache. Populated from extended-join
@@ -6563,25 +6561,7 @@ final class PersistentIRCClient {
         foreach (entry; pacedQueue)
             if (entry.owner.request.length) bncState().restorePendingWrite(entry);
         automaticJoinLines = s.automaticJoins.dup;
-        optionalReads = null;
-        nextReadSequence = 0;
-        clientReadLines = null;
-        foreach (line; s.clientReadLines) clientReadLines[line] = true;
-        foreach (saved; s.optionalReads) {
-            auto read = optionalRead(saved.line);
-            if (!read.command.length) continue;
-            read.fromClient = saved.fromClient;
-            read.sentAtMs = saved.sentAtMs;
-            read.sequence = saved.sequence > 0 ? saved.sequence : nextReadSequence + 1;
-            if (read.sequence > nextReadSequence) nextReadSequence = read.sequence;
-            if (saved.remainingTargets.length) read.remainingTargets = saved.remainingTargets.dup;
-            optionalReads[saved.line] = read;
-            if (saved.sentAtMs && read.command == "WHO") {
-                trackWho(saved.line, saved.fromClient);
-                pendingWhos[$ - 1].sentAt = saved.sentAtMs / 1000;
-            }
-        }
-        expireOptionalReads(unixMsNow());
+        restoreOptionalReads(s);
         ServicesQuietMarker retainedQuiet;
         retainedQuiet.prefixes = s.servicesQuietPrefixes.dup;
         retainedQuiet.untilMs = s.servicesQuietUntilMs;
@@ -7514,6 +7494,7 @@ final class PersistentIRCClient {
         joinsAwaitingConfirm = [];
         confirmedMembership = null;
         optionalReads = null;
+        pendingWhos = null;
         nextReadSequence = 0;
         clientReadLines = null;
         const oldAutomaticJoins = automaticJoinLines;
@@ -11021,7 +11002,17 @@ private void processEvents() {
         string mask, fields;
         if (!parseWhoLine(line, mask, fields)) return;
         if (pendingWhos.length >= MAX_PENDING_WHOS) pendingWhos = pendingWhos[1 .. $];
-        pendingWhos ~= PendingWho(mask, fields, client, Clock.currTime.toUnixTime!long);
+        pendingWhos ~= PendingWho(mask, fields, client, Clock.currTime.toUnixTime!long, line);
+    }
+
+    /// Retire one failed/expired operation without consuming a later WHO.
+    private void forgetWho(string line) {
+        foreach (i, who; pendingWhos) {
+            if (who.line != line) continue;
+            foreach (j; i + 1 .. pendingWhos.length) pendingWhos[j - 1] = pendingWhos[j];
+            pendingWhos.length--;
+            return;
+        }
     }
 
     /// The WHO the next 352/354 row answers — the oldest one pending, once
@@ -11030,7 +11021,7 @@ private void processEvents() {
     private bool whoReplyOwner(out PendingWho owner) {
         const now = Clock.currTime.toUnixTime!long;
         size_t i = 0;
-        while (i < pendingWhos.length && now - pendingWhos[i].sentAt > WHO_REPLY_TIMEOUT_SECS) i++;
+        while (i < pendingWhos.length && now - pendingWhos[i].sentAt >= WHO_REPLY_TIMEOUT_SECS) i++;
         pendingWhos = pendingWhos[i .. $];
         if (pendingWhos.length == 0) return false;
         owner = pendingWhos[0];
@@ -11244,7 +11235,9 @@ private void processEvents() {
             processHistoricalEvent(event, replay);
             return;
         }
-        finishOptionalReads(event);
+        // Only untagged, unowned commands enter optionalReads. A labelled
+        // response (including an inherited batch label) belongs elsewhere.
+        if (!replay.label.length) finishOptionalReads(event);
         if (observeMonitorNumeric(event)) return;
         publishBncPresence(event);
         if (replay.label.length && !replay.label.startsWith("bnc-")
@@ -12200,7 +12193,7 @@ private void processEvents() {
                     applyWhoReply(mp[1], mp[2], mp[3], mp[5], mp[6], rn, "", !fiberHistorical(event));
                 }
                 PendingWho owner;
-                if (whoReplyOwner(owner) && owner.client) break;
+                if (event.getTag("label").length || (whoReplyOwner(owner) && owner.client)) break;
                 return;
             }
 
@@ -12244,7 +12237,7 @@ private void processEvents() {
                 auto p = event.getParams();
                 bool forClient = false;
                 if (p.length >= 2) {
-                    forClient = closeWho(p[1]);
+                    forClient = event.getTag("label").length != 0 || closeWho(p[1]);
                     if (auto members = p[1] in channelUsers)
                         foreach (u; *members) {
                             const bare = stripNickPrefix(u);
@@ -12270,6 +12263,7 @@ private void processEvents() {
                 if (p.length >= 8 && p[1] == "152")
                     applyWhoReply(p[2], p[3], p[4], p[5], p[6], event.text, p[7], !fiberHistorical(event));
                 PendingWho owner;
+                if (event.getTag("label").length) break;
                 if (!whoReplyOwner(owner) || !owner.client) return;
                 const nick = whoxField(p, owner.fields, 'n');
                 const acct = whoxField(p, owner.fields, 'a');
@@ -14229,18 +14223,57 @@ private void processEvents() {
         return result;
     }
 
+    private void restoreOptionalReads(SessionSnapshot s) {
+        import std.algorithm : sort;
+        optionalReads = null;
+        pendingWhos = null;
+        nextReadSequence = 0;
+        clientReadLines = null;
+        foreach (line; s.clientReadLines) clientReadLines[line] = true;
+        // Snapshot admissions come from an associative array, not wire order.
+        // Restore the WHO reply FIFO in the order those reads were admitted.
+        sort!((a, b) => a.sequence < b.sequence)(s.optionalReads);
+        foreach (saved; s.optionalReads) {
+            auto read = optionalRead(saved.line);
+            if (!read.command.length) continue;
+            if (!saved.sentAtMs && !pacedQueue.canFind!(entry =>
+                    !entry.owner.request.length && entry.line == saved.line)) {
+                // Older engines could snapshot a popped, failed write with
+                // no deadline and no queue entry that could ever send it.
+                clientReadLines.remove(saved.line);
+                continue;
+            }
+            read.fromClient = saved.fromClient;
+            read.sentAtMs = saved.sentAtMs;
+            read.sequence = saved.sequence > 0 ? saved.sequence : nextReadSequence + 1;
+            if (read.sequence > nextReadSequence) nextReadSequence = read.sequence;
+            if (saved.remainingTargets.length) read.remainingTargets = saved.remainingTargets.dup;
+            optionalReads[saved.line] = read;
+            if (saved.sentAtMs && read.command == "WHO") {
+                trackWho(saved.line, saved.fromClient);
+                pendingWhos[$ - 1].sentAt = saved.sentAtMs / 1000;
+            }
+        }
+        expireOptionalReads(unixMsNow());
+    }
+
+    /// A coalescing slot and its private WHO routing record have one lifetime.
+    private void forgetOptionalRead(string line) {
+        forgetWho(line);
+        optionalReads.remove(line);
+        clientReadLines.remove(line);
+    }
+
     private void expireOptionalReads(long nowMs) {
         string[] expired;
         foreach (line, read; optionalReads)
             if (read.sentAtMs > 0 && nowMs - read.sentAtMs >= 30_000) expired ~= line;
-        foreach (line; expired) {
-            optionalReads.remove(line);
-            clientReadLines.remove(line);
-        }
+        foreach (line; expired) forgetOptionalRead(line);
     }
 
-    /// Complete only the query that the numeric actually answers. Command-only
-    /// failures name the oldest sent operation; unrelated mutation failures do not.
+    /// An unlabelled terminal response answers the oldest matching operation,
+    /// not every wire variant with the same target. Command-only failures
+    /// likewise release one sent read, never a queued or unrelated mutation.
     private void finishOptionalReads(const ref IRCRawEvent event) {
         if (!optionalReads.length) return;
         expireOptionalReads(unixMsNow());
@@ -14250,20 +14283,12 @@ private void processEvents() {
             failedCommand = params[0].toUpper();
         else if (["263", "421", "461", "416"].canFind(event.command) && params.length > 1)
             failedCommand = params[1].toUpper();
-        string oldest;
+        string oldest, answeredTarget;
         long oldestSequence = long.max;
-        string[] finished;
-        foreach (line, ref read; optionalReads) {
-            if (!read.sentAtMs) continue;
-            if (failedCommand.length && failedCommand == read.command) {
-                if (read.sequence < oldestSequence) {
-                    oldest = line;
-                    oldestSequence = read.sequence;
-                }
-                continue;
-            }
+        foreach (line, read; optionalReads) {
+            if (!read.sentAtMs || read.sequence >= oldestSequence) continue;
             string target;
-            bool response;
+            bool response = failedCommand.length && failedCommand == read.command;
             if (event.command == read.terminator) {
                 if (read.command == "LIST") response = true;
                 else if (event.command == "221" && params.length) {
@@ -14281,21 +14306,27 @@ private void processEvents() {
                 response = true;
             }
             if (!response) continue;
-            if (read.remainingTargets.length) {
-                size_t keep;
-                bool matched;
-                foreach (part; read.remainingTargets) {
-                    if (sameNick(part, target)) matched = true;
-                    else read.remainingTargets[keep++] = part;
-                }
-                read.remainingTargets.length = keep;
-                if (matched && !keep) finished ~= line;
-            } else if (read.command == "LIST" || sameNick(target, read.target)) {
-                finished ~= line;
-            }
+            if (!failedCommand.length && read.command != "LIST"
+                    && !(read.remainingTargets.length
+                        ? read.remainingTargets.canFind!(part => sameNick(part, target))
+                        : sameNick(target, read.target))) continue;
+            oldest = line;
+            answeredTarget = target;
+            oldestSequence = read.sequence;
         }
-        if (oldest.length) finished ~= oldest;
-        foreach (line; finished) optionalReads.remove(line);
+        if (!oldest.length) return;
+        auto read = oldest in optionalReads;
+        if (!failedCommand.length && read.remainingTargets.length) {
+            size_t keep;
+            foreach (part; read.remainingTargets)
+                if (!sameNick(part, answeredTarget)) read.remainingTargets[keep++] = part;
+            read.remainingTargets.length = keep;
+            if (keep) return;
+        }
+        // A successful 315 still needs closeWho below to decide whether its
+        // terminator belongs on the client's event stream.
+        if (event.command == "315") optionalReads.remove(oldest);
+        else forgetOptionalRead(oldest);
     }
 
     private static string rawCommand(string line) {
@@ -14850,12 +14881,17 @@ private void processEvents() {
     /// Outgoing state changes start at admission to the actual transport,
     /// never when a command merely enters a queue.
     private void noteRawWrite(string line) {
+        import std.algorithm : splitter;
         auto commandLine = line;
-        bool privateLabel;
+        bool privateLabel, labeled;
         if (commandLine.startsWith("@")) {
             const space = commandLine.indexOf(' ');
             if (space < 0) return;
-            privateLabel = commandLine[0 .. space].canFind("label=bnc-");
+            foreach (tag; commandLine[1 .. space].splitter(';')) {
+                if (!tag.startsWith("label=")) continue;
+                labeled = tag.length > "label=".length;
+                privateLabel = tag.startsWith("label=bnc-");
+            }
             commandLine = commandLine[space + 1 .. $];
         }
         const command = rawCommand(commandLine);
@@ -14885,7 +14921,7 @@ private void processEvents() {
                     scheduleJoinConfirmSweep();
                 break;
             case "WHO":
-                if (!privateLabel) trackWho(commandLine, fromClient);
+                if (!labeled) trackWho(commandLine, fromClient);
                 break;
             case "WHOIS":
                 if (fromClient && !privateLabel) {
@@ -14898,6 +14934,9 @@ private void processEvents() {
     }
 
     private void writeRaw(string line) {
+        // A popped paced read can fail before noteRawWrite starts its response
+        // deadline. Retire it at the transport boundary on every failed write.
+        scope (failure) forgetOptionalRead(line);
         linesOut++;
         if (line.length >= 3 && line[0 .. 3] == "WHO") whoOut++;
         // Every byte the server reads costs us fake lag, not just paced
@@ -14938,6 +14977,9 @@ private void processEvents() {
             // *that* the connection is dead but isn't drowned in
             // identical warnings. The flag is reset on successful
             // (re-)connection.
+            // During registration this branch can return without throwing;
+            // that is still a terminal non-send, not a queued read.
+            forgetOptionalRead(line);
             if (!droppedNoConnWarned) {
                 logJsonMap("warn", "connection",
                     "Outbound message dropped — no active connection",
@@ -15444,8 +15486,7 @@ private void processEvents() {
         }
         if (sensitive || immediateProtocolLine(wire)) writeRaw(wire);
         else if (!enqueuePaced(wire)) {
-            optionalReads.remove(wire);
-            clientReadLines.remove(wire);
+            forgetOptionalRead(wire);
         }
     }
 
@@ -16845,14 +16886,15 @@ Ircv3Check[] slowdownWireChecks(out string[] wire) {
     check("identical reads share one operation while distinct targets still reach the wire",
         occurrences("WHO #one") == 1 && occurrences("WHO #two") == 1);
     reply(":s 263 me WHO :Try again later");
+    check("a refusal also retires exactly the refused WHO reply owner",
+        client.pendingWhos.length == 1 && client.pendingWhos[0].mask == "#two");
     client.sendRaw("WHO #one", true);
     client.sendRaw("WHO #two", true);
     pump();
     check("a command-only refusal releases only the oldest outstanding read",
         occurrences("WHO #one") == 2 && occurrences("WHO #two") == 1);
-    // The first #one was refused and has no 315. The surviving wire
-    // order is #two, then the retried #one; finish them in that order so
-    // closeWho also retires the older unanswered ownership record.
+    // The refused #one has no 315; the surviving write order is #two,
+    // then the explicitly retried #one.
     reply(":s 315 me #two :End of WHO");
     reply(":s 315 me #one :End of WHO");
     client.sendRaw("NAMES #one,#two", true);
@@ -16886,6 +16928,165 @@ Ircv3Check[] slowdownWireChecks(out string[] wire) {
     reply(":s 366 me #room :End of NAMES");
     check("optional-read scenarios close their response ownership before pacing",
         client.pendingWhos.length == 0 && client.optionalReads.length == 0);
+    // The failed write is popped before writeRaw detects a dead transport.
+    // It never reaches noteRawWrite, so sentAtMs remains zero and the old
+    // implementation's sent-only deadline could never release this key.
+    {
+        auto failedEvents = EngineEventChannel.create();
+        scope (exit) failedEvents.close();
+        NetworkConfig failedCfg;
+        failedCfg.nick = "me";
+        auto failed = new PersistentIRCClient(failedCfg, failedEvents);
+        failed.state = ConnectionState.connected;
+        failed.sendRaw("WHO #failed", true);
+        check("a paced send failing before its sent timestamp releases its admission",
+            failed.nextReadSequence == 1 && failed.optionalReads.length == 0
+            && failed.clientReadLines.length == 0 && failed.pendingWhos.length == 0
+            && failed.pacedQueue.length == 0 && failed.linesOut == 1);
+        failed.sendRaw("WHO #failed", true);
+        check("the identical failed unsent read is admitted again instead of coalescing forever",
+            failed.nextReadSequence == 2 && failed.linesOut == 2
+            && failed.optionalReads.length == 0 && failed.clientReadLines.length == 0);
+        // A read queued on a live registration transport may be drained after
+        // that transport dies. Unlike state=connected, writeRaw returns here.
+        failed.state = ConnectionState.connecting;
+        failed.observed001AtMs = unixMsNow();
+        failed.optionalReads["WHO #registration"] = failed.optionalRead("WHO #registration");
+        failed.clientReadLines["WHO #registration"] = true;
+        failed.pacedQueue = [BncPendingWrite("WHO #registration")];
+        failed.drainPacedQueue();
+        check("a non-throwing no-transport drop also releases an unsent queued read",
+            failed.optionalReads.length == 0 && failed.clientReadLines.length == 0
+            && failed.pendingWhos.length == 0 && failed.pacedQueue.length == 0
+            && failed.linesOut == 3);
+        failed.state = ConnectionState.disconnected;
+        failed.sendRaw("WHO #disconnected", true);
+        check("a disconnected read is rejected without acquiring any pending ownership",
+            failed.optionalReads.length == 0 && failed.clientReadLines.length == 0
+            && failed.pacedQueue.length == 0 && failed.nextReadSequence == 2);
+    }
+
+    IRCRawEvent[] takeResponses() {
+        IRCRawEvent[] result;
+        IRCRawEvent event;
+        while (events.tryConsumeOne(event, 0.msecs)) result ~= event;
+        return result;
+    }
+    takeResponses();
+    client.sendRaw("WHO #one %n");
+    client.sendRaw("WHO #two %na", true);
+    client.sendRaw("WHO #two %na", true);
+    pump();
+    reply(":s 263 me WHO :Try again later");
+    reply(":s 354 me witness account");
+    reply(":s 315 me #two :End of WHO");
+    auto refusedResponses = takeResponses();
+    check("a refused private WHO cannot swallow the surviving coalesced client's WHOX response",
+        occurrences("WHO #two %na") == 1
+        && refusedResponses.count!(e => e.command == "354") == 1
+        && refusedResponses.count!(e => e.command == "315") == 1
+        && client.optionalReads.length == 0 && client.pendingWhos.length == 0);
+
+    // Same target, different WHOX schemas: the first 315 is not completion
+    // of both wire commands, and the second operation must still coalesce.
+    client.sendRaw("WHO #one %n");
+    client.sendRaw("WHO #one %na", true);
+    pump();
+    reply(":s 315 me #one :End of first WHO");
+    client.sendRaw("WHO #one %na", true);
+    pump();
+    check("a terminator releases only the oldest same-target wire variant",
+        occurrences("WHO #one %na") == 1 && "WHO #one %na" in client.optionalReads
+        && "WHO #one %n" !in client.optionalReads && client.pendingWhos.length == 1);
+    reply(":s 354 me witness account");
+    reply(":s 315 me #one :End of second WHO");
+    auto variantResponses = takeResponses();
+    check("the surviving same-target WHO delivers its own row and terminator",
+        variantResponses.count!(e => e.command == "354") == 1
+        && variantResponses.count!(e => e.command == "315") == 1
+        && client.optionalReads.length == 0 && client.pendingWhos.length == 0);
+
+    const beforeLabelledWho = occurrences("WHO #one");
+    client.sendRaw("WHO #one");
+    client.sendRaw("@label=client-who WHO #one %na", true);
+    pump();
+    reply("@label=client-who :s BATCH +client-who-batch labeled-response");
+    reply("@batch=client-who-batch :s 354 me witness account");
+    reply("@batch=client-who-batch :s 315 me #one :End of labelled WHO");
+    reply(":s BATCH -client-who-batch");
+    client.sendRaw("WHO #one");
+    pump();
+    auto labelledResponses = takeResponses();
+    check("a labelled WHO batch delivers its replies without consuming an unlabelled read",
+        labelledResponses.count!(e => e.command == "354" && e.getTag("label") == "client-who") == 1
+        && labelledResponses.count!(e => e.command == "315" && e.getTag("label") == "client-who") == 1
+        && occurrences("WHO #one") == beforeLabelledWho + 1
+        && client.optionalReads.length == 1 && client.pendingWhos.length == 1);
+    reply(":s 315 me #one :End of unlabelled WHO");
+
+    const deadline = unixMsNow();
+    client.sendRaw("WHO #one %na", true);
+    pump();
+    client.optionalReads["WHO #one %na"].sentAtMs = deadline - 30_000;
+    client.pendingWhos[0].sentAt = (deadline - 30_000) / 1000;
+    client.expireOptionalReads(deadline);
+    check("the response deadline releases both coalescing and WHO routing ownership",
+        client.optionalReads.length == 0 && client.pendingWhos.length == 0);
+    const beforeExpiredRetry = occurrences("WHO #one %na");
+    client.sendRaw("WHO #one %na", true);
+    pump();
+    check("an expired identical read can be explicitly requested again",
+        occurrences("WHO #one %na") == beforeExpiredRetry + 1);
+    reply(":s FAIL WHO TEMPORARILY_UNAVAILABLE :Try later");
+    check("a standard FAIL also retires the read and its WHO response owner",
+        client.optionalReads.length == 0 && client.pendingWhos.length == 0);
+
+    client.sendRaw("WHO #one %n");
+    client.sendRaw("WHO #two %na", true);
+    pump();
+    auto retained = fromJSON(toJSON(client.snapshotSession()));
+    import std.algorithm : sort;
+    sort!((a, b) => a.sequence > b.sequence)(retained.optionalReads);
+    {
+        auto retainedEvents = EngineEventChannel.create();
+        scope (exit) retainedEvents.close();
+        auto adopted = new PersistentIRCClient(cfg, retainedEvents);
+        adopted.sessionNick = "me";
+        // No socket is required to exercise the production restore/response
+        // path. Include an old orphan with no write deadline or queue owner.
+        retained.optionalReads ~= SessionSnapshot.OptionalReadState("NAMES #orphan", true, 0, 99);
+        retained.clientReadLines ~= "NAMES #orphan";
+        adopted.restoreOptionalReads(retained);
+        check("retained read restoration reconstructs wire order and drops failed unsent orphans",
+            adopted.optionalReads.length == 2 && adopted.pendingWhos.length == 2
+            && adopted.pendingWhos[0].line == "WHO #one %n"
+            && adopted.pendingWhos[1].line == "WHO #two %na"
+            && "NAMES #orphan" !in adopted.clientReadLines);
+        adopted.processLine(":s 263 me WHO :Try again later");
+        adopted.processLine(":s 354 me retained-witness account");
+        adopted.processLine(":s 315 me #two :End of retained WHO");
+        size_t rows, ends;
+        IRCRawEvent event;
+        while (retainedEvents.tryConsumeOne(event, 0.msecs)) {
+            if (event.command == "354") rows++;
+            if (event.command == "315") ends++;
+        }
+        check("a retained surviving client read receives its response after an older refusal",
+            rows == 1 && ends == 1 && adopted.optionalReads.length == 0
+            && adopted.pendingWhos.length == 0);
+        retained.optionalReads[0].sentAtMs = unixMsNow() - 30_000;
+        adopted.restoreOptionalReads(retained);
+        check("adoption expires old sent reads without granting a fresh response deadline",
+            adopted.optionalReads.length == 1 && adopted.pendingWhos.length == 1
+            && adopted.pendingWhos[0].line == "WHO #two %na");
+    }
+    client.resetConnectionTelemetry();
+    check("disconnect clears every coalescing and WHO routing owner from the dead socket",
+        client.optionalReads.length == 0 && client.pendingWhos.length == 0
+        && client.clientReadLines.length == 0);
+    client.state = ConnectionState.connected;
+    client.pacer = FakeLagPacer.init;
+    takeResponses();
 
     client.pacer.tighten(unixMsNow());
     const before = received.length;

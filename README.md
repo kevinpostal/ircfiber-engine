@@ -29,6 +29,25 @@ spacing, including Super Nets' decorated `ENTER THE VOID` refusal. A rejected
 exit is host-banned by the existing routing policy; the next attempt uses another
 eligible exit within the network's selected provider rather than retrying that IP.
 
+## Optional read lifetime
+
+Identical untagged, unowned `WHO`, `WHOIS`, `NAMES`, `LIST` and recognised
+`MODE` reads share one queued/in-flight wire operation. Failed transport
+admission releases that exact slot even when no sent timestamp was recorded.
+Terminal responses release the oldest matching operation, not every variant
+with the same target; command-only refusals release only the oldest sent read.
+WHO reply ownership is retired with failures, the existing 30-second response
+deadline and disconnects, so refused private sweeps cannot swallow later
+client replies. Labelled responses never consume unlabelled read ownership.
+
+Retained-socket snapshots preserve read ownership, remaining multi-target
+terminators and original deadlines, not a separate per-caller response cache.
+Adoption restores WHO wire order and discards unsent slots with no queued write.
+Coalesced requests receive the shared live network response stream.
+
+The focused localhost-wire regressions run from this repository with
+`dub run --root=engine --config=connection-registration-test --compiler=ldc2`.
+
 ## IRCv3 recovery
 
 Replay ancestry is resolved before current-state handlers. Historical state
