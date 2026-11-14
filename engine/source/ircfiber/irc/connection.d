@@ -17842,7 +17842,9 @@ Ircv3Check[] ircv3ProtocolChecks(out string[] wire) {
             client.ctcpReplyNotBeforeMs = 0;
             const before = historyWrites(client).length;
             const parameter = command == "PING" ? "exact nonce 123.456" : "";
+            const requestAtMs = unixMsNow();
             receive(":alice!u@h PRIVMSG me :" ~ ctcpReply(command, parameter));
+            const repliedAtMs = unixMsNow();
             const sent = historyWrites(client);
             const expected = command == "VERSION" ? ctcpReply(command, "IRC Fiber")
                 : command == "PING" ? ctcpReply(command, parameter)
@@ -17855,7 +17857,7 @@ Ircv3Check[] ircv3ProtocolChecks(out string[] wire) {
                     : sent[$ - 1] == "NOTICE alice :" ~ expected));
             const slot = client.ctcpReplyNotBeforeMs;
             results ~= Ircv3Check("CTCP " ~ command ~ " reserves the one-second global reply slot",
-                slot > unixMsNow() && slot <= unixMsNow() + CTCP_REPLY_MIN_INTERVAL_MS);
+                slot >= requestAtMs + 1_000 && slot <= repliedAtMs + 1_000);
             foreach (sender; ["bob", "carol", "alice"])
                 receive(":" ~ sender ~ "!u@h PRIVMSG me :\x01PING blocked\x01");
             results ~= Ircv3Check("CTCP " ~ command ~ " cooldown is shared across senders",
