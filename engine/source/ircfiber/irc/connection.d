@@ -18378,6 +18378,7 @@ Ircv3Check[] ircv3ProtocolChecks(out string[] wire) {
             client.historyPages[firstId].awaitingCommit
             && client.historyPages[firstId].proposed.state == "recovering");
         client.confirmHistoryPage(firstId, true);
+        client.tickHistoryRecovery();
         results ~= Ircv3Check("committed page continues BEFORE first opaque msgid across timestamp ties",
             historyWrites(client).canFind("CHATHISTORY BEFORE #gap msgid=z 20")
             && client.historyRecovery["#gap"].lowerBound.msgid == "old");
@@ -18448,6 +18449,7 @@ Ircv3Check[] ircv3ProtocolChecks(out string[] wire) {
         next.processLine("@batch=retry;time=2023-11-14T22:14:00.000Z;msgid=retry-last :history-peer!u@h PRIVMSG me :two");
         next.processLine("BATCH -retry");
         next.confirmHistoryPage(requestId, true);
+        next.tickHistoryRecovery();
         results ~= Ircv3Check("retried LATEST refreshes seed upper bound and continues the frozen gap with BEFORE",
             next.historyRecovery["history-peer"].lowerBound.msgid == "seed"
             && next.historyRecovery["history-peer"].upperBound.msgid == "retry-last"
@@ -18575,6 +18577,7 @@ Ircv3Check[] ircv3ProtocolChecks(out string[] wire) {
         client.processLine("@batch=t;time=2023-11-14T22:13:21.000Z :a!u@h PRIVMSG #ties :newer");
         client.processLine("BATCH -t");
         client.confirmHistoryPage(id, true);
+        client.tickHistoryRecovery();
         results ~= Ircv3Check("timestamp-only mixed pages overlap the boundary group toward newer time",
             historyWrites(client).canFind("CHATHISTORY BEFORE #ties timestamp=2023-11-14T22:13:21.000Z 3"));
         client.processLine("BATCH +repeat chathistory #ties");

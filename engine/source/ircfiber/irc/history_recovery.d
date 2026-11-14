@@ -660,6 +660,9 @@ mixin template HistoryRecoveryMixin() {
         if (ownsHistoryRequest(requestId, epoch)) stallHistory(requestId, "storage_failure");
     }
 
+    // Runs on the single event-processor fiber. It must only mutate history
+    // state: sending the next page can publish pacing logs into the bounded
+    // channel this fiber is draining. The reader loop's tick dispatches queued work.
     public void confirmHistoryPage(string requestId, bool committed) {
         auto found = requestId in historyPages;
         if (found is null) return;
@@ -667,7 +670,6 @@ mixin template HistoryRecoveryMixin() {
         if (!committed || page.malformed || page.quarantined) {
             stallHistory(requestId, "storage_failure");
             historyPages.remove(requestId);
-            drainHistoryQueue();
             return;
         }
         const key = historyKey(page.proposed.target);
@@ -703,7 +705,6 @@ mixin template HistoryRecoveryMixin() {
                 }
             }
         }
-        drainHistoryQueue();
     }
 
     public void noteAcceptedLiveHistory(ref const IRCRawEvent event) {
