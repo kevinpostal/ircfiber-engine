@@ -16969,7 +16969,7 @@ Ircv3Check[] slowdownWireChecks(out string[] wire) {
     IRCRawEvent[] takeResponses() {
         IRCRawEvent[] result;
         IRCRawEvent event;
-        while (events.tryConsumeOne(event, 0.msecs)) result ~= event;
+        while (events.bufferFill && events.tryConsumeOne(event, 0.msecs)) result ~= event;
         return result;
     }
     takeResponses();
@@ -17068,7 +17068,7 @@ Ircv3Check[] slowdownWireChecks(out string[] wire) {
         adopted.processLine(":s 315 me #two :End of retained WHO");
         size_t rows, ends;
         IRCRawEvent event;
-        while (retainedEvents.tryConsumeOne(event, 0.msecs)) {
+        while (retainedEvents.bufferFill && retainedEvents.tryConsumeOne(event, 0.msecs)) {
             if (event.command == "354") rows++;
             if (event.command == "315") ends++;
         }
@@ -17169,7 +17169,7 @@ Ircv3Check[] slowdownWireChecks(out string[] wire) {
     client.processOutboundQueue();
     bool pacing, done;
     IRCRawEvent event;
-    while (events.tryConsumeOne(event, 0.msecs)) {
+    while (events.bufferFill && events.tryConsumeOne(event, 0.msecs)) {
         pacing = pacing || event.getTag("phase") == "flood_pacing";
         done = done || event.getTag("phase") == "flood_pacing_done";
     }
