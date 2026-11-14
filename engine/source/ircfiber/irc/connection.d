@@ -17044,7 +17044,8 @@ Ircv3Check[] slowdownWireChecks(out string[] wire) {
     client.sendRaw("WHO #one %n");
     client.sendRaw("WHO #two %na", true);
     pump();
-    auto retained = fromJSON(toJSON(client.snapshotSession()));
+    auto retainedSnapshot = client.snapshotSession();
+    auto retained = fromJSON(toJSON(retainedSnapshot));
     import std.algorithm : sort;
     sort!((a, b) => a.sequence > b.sequence)(retained.optionalReads);
     {
