@@ -18377,22 +18377,42 @@ Ircv3Check[] ircv3ProtocolChecks(out string[] wire) {
         results ~= Ircv3Check("short nonempty history page awaits ordered storage checkpoint",
             client.historyPages[firstId].awaitingCommit
             && client.historyPages[firstId].proposed.state == "recovering");
+        const writesBeforeCommit = historyWrites(client).length;
+        IRCRawEvent event;
+        while (ch.tryConsumeOne(event, Duration.zero)) {}
         client.confirmHistoryPage(firstId, true);
+        results ~= Ircv3Check("ordered history acknowledgement queues follow-up without wire writes or event publication",
+            client.historyAutomaticQueue.length == 1 && client.historyPages.length == 0
+            && historyWrites(client).length == writesBeforeCommit
+            && !ch.tryConsumeOne(event, Duration.zero));
         client.tickHistoryRecovery();
-        results ~= Ircv3Check("committed page continues BEFORE first opaque msgid across timestamp ties",
+        results ~= Ircv3Check("next history tick dispatches BEFORE first opaque msgid across timestamp ties",
             historyWrites(client).canFind("CHATHISTORY BEFORE #gap msgid=z 20")
+            && client.historyAutomaticQueue.length == 0 && client.historyPages.length == 1
             && client.historyRecovery["#gap"].lowerBound.msgid == "old");
         const secondId = client.historyPages.keys[0];
         client.processLine("@draft/chathistory-end BATCH +p2 chathistory #gap");
         client.processLine("@batch=p2;time=2023-11-14T22:13:00.000Z;msgid=older :a!u@h PRIVMSG #gap :older");
         client.processLine("BATCH -p2");
+        client.beginTargetRecovery("#queued");
         client.failHistoryStorage(secondId, client.connectionEpoch);
+        const writesBeforeFailure = historyWrites(client).length;
+        while (ch.tryConsumeOne(event, Duration.zero)) {}
         client.confirmHistoryPage(secondId, false);
+        results ~= Ircv3Check("rejected history acknowledgement leaves queued work without wire writes or event publication",
+            client.historyAutomaticQueue.length == 1
+            && client.historyAutomaticQueue[0].target == "#queued"
+            && historyWrites(client).length == writesBeforeFailure
+            && !ch.tryConsumeOne(event, Duration.zero));
         results ~= Ircv3Check("failed row storage cannot commit newer coverage",
             client.historyRecovery["#gap"].lowerBound.msgid == "old"
             && client.historyRecovery["#gap"].state == "stalled"
             && client.historyPages.length == 0);
-        IRCRawEvent event;
+        client.tickHistoryRecovery();
+        results ~= Ircv3Check("next history tick dispatches queued target after rejected acknowledgement",
+            historyWrites(client).canFind("CHATHISTORY LATEST #queued * 20")
+            && client.historyAutomaticQueue.length == 0 && client.historyPages.length == 1
+            && client.historyRecovery["#gap"].state == "stalled");
         while (ch.tryConsumeOne(event, Duration.zero)) {}
         ch.close();
     }

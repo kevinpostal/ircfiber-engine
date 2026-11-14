@@ -42,6 +42,12 @@ not imply completion. TARGETS discovery also finds missed conversations.
 `irc:history:recovery:<networkId>` stores committed per-target progress and
 `*targets` discovery state without a TTL. Ordered processor acknowledgement
 advances a page only after Redis append/dedup acceptance under current ownership.
+Acknowledgement must only update recovery state and enqueue follow-up work; it
+must not send IRC commands or publish into the bounded event ring drained by
+that same ordered processor. Sending can publish flood-pacing logs and block
+the processor on its own full ring, stopping event consumption and checkpoint
+progress. The connection reader's next recovery tick dispatches queued work,
+including work left pending after a rejected acknowledgement.
 This preserves, rather than strengthens, existing asynchronous MongoDB durability.
 Crash adoption merges committed Redis cursors with unresolved holder-META intent:
 a complete pre-gap seed must not erase a stalled failed-storage page's retry.
