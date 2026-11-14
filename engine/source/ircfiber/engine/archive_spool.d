@@ -761,8 +761,19 @@ final class ArchiveSpool {
             mutex.lock(); status.failed = true;
             status.failureReason = journalError is null ? "journal_failure" : journalError.msg;
             mutex.unlock();
-            emitGap();
+            emitGap(status.failureReason, true);
             publish();
+            // Failed archival admission stays closed, but the same native
+            // disk owner must keep writing fresh failure diagnostics. Never
+            // retry/reopen a failed journal or create a second disk thread.
+            while (diagnostics !is null) {
+                serviceDiagnostic();
+                mutex.lock();
+                try {
+                    if (stopRequested) break;
+                    changed.wait(100.msecs);
+                } finally mutex.unlock();
+            }
         }
     }
 
@@ -776,13 +787,21 @@ final class ArchiveSpool {
         encoded = null;
         diagnostics.finishWrite(result, nowMs());
     }
-    private void emitGap() {
+    private void emitGap(string reason = "degraded", bool terminalFailure = false) {
         auto now = nowMs();
-        if (lastDiagnostic && now - lastDiagnostic < 30_000) return;
+        if (!terminalFailure && lastDiagnostic && now - lastDiagnostic < 30_000) return;
         lastDiagnostic = now;
-        // Fixed diagnostic: no IRC contents, nicknames, credentials or paths.
-        import core.stdc.stdio : fputs, stderr;
-        fputs("{\"event\":\"archive_gap\",\"state\":\"degraded\",\"component\":\"engine\"}\n", stderr);
+        // Only bounded reason codes: never IRC contents, credentials or paths.
+        if (!reason.length || reason.length > 64) reason = "journal_failure";
+        foreach (c; reason) {
+            if ((c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '_') {
+                reason = "journal_failure";
+                break;
+            }
+        }
+        import core.stdc.stdio : fprintf, stderr;
+        fprintf(stderr, "{\"event\":\"archive_gap\",\"state\":\"degraded\",\"component\":\"engine\",\"reason\":\"%.*s\"}\n",
+            cast(int) reason.length, reason.ptr);
     }
     private void addGap(long first, long last, string reason) {
         if (!first) first = nowMs();
@@ -1632,7 +1651,12 @@ private void putLittle(T)(ubyte[] bytes, T value) {
 }
 
 version (Posix) {
-    import core.sys.posix.fcntl : open, O_RDWR, O_RDONLY, O_CREAT, O_EXCL, O_CLOEXEC, O_NOFOLLOW, O_DIRECTORY, O_NONBLOCK;
+    import core.sys.posix.fcntl : open, O_RDWR, O_RDONLY, O_CREAT, O_EXCL, O_NOFOLLOW, O_NONBLOCK;
+    version (OSX) {
+        // Match the SDK flags omitted by this druntime, as in runtime_diagnostic.
+        private enum O_DIRECTORY = 0x00100000;
+        private enum O_CLOEXEC = 0x01000000;
+    } else import core.sys.posix.fcntl : O_CLOEXEC, O_DIRECTORY;
     import core.sys.posix.unistd : close, write, pread, pwrite, fsync, ftruncate, geteuid, lseek;
     import core.stdc.stdio : SEEK_END;
     import core.sys.posix.sys.stat : stat_t, fstat, S_ISREG;

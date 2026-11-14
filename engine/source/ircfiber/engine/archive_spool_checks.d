@@ -27,6 +27,7 @@ import ircfiber.engine.archive_spool : ArchiveSpool, ArchiveSpoolConfig,
     ArchiveSpoolStatus, ArchiveAdmission, ArchiveRecord, ArchiveKind, ArchiveShutdown,
     ArchiveOperationStatus, ArchiveOperationState, ArchiveLookup,
     decodeArchiveRecord, archiveMaxRecordBytes, archiveSegmentBytes;
+import ircfiber.runtime_diagnostic : RuntimeDiagnosticMailbox, DiagnosticAdmission;
 
 private enum ulong fixtureBudget = 32UL * 1024 * 1024;
 private enum string fixturePrefix = "ircfiber-archive-check-";
@@ -845,6 +846,38 @@ private void syncFailureCheck() {
         "restart hid sticky sync failure or discarded its evidence");
 }
 
+private void failedJournalDiagnosticsCheck() {
+    auto root = createRoot();
+    ArchiveSpool spool;
+    scope(exit) { stopOwned(spool); removeOwned(root); }
+    auto config = fixtureConfig(root);
+    config.diagnosticPath = buildPath(root, "runtime.json");
+    auto diagnostics = new RuntimeDiagnosticMailbox;
+    spool = new ArchiveSpool(config, diagnostics);
+    awaitReady(spool);
+    spool.reportWorkerFailure();
+    auto status = awaitStatus(spool, (ref ArchiveSpoolStatus s) =>
+        s.failed && s.failureReason == "archive_consumer_failure");
+    requireCheck(!status.ready && !status.stopped
+        && status.failureReason == "archive_consumer_failure",
+        "failed journal did not preserve its diagnostic owner");
+    const first = "{\"sample\":1,\"archive\":{\"failed\":true}}";
+    requireCheck(until({ return diagnostics.tryPublish(first) == DiagnosticAdmission.queued; }),
+        "failed diagnostic mailbox rejected first update");
+    requireCheck(until({ return exists(config.diagnosticPath) && readText(config.diagnosticPath) == first; }),
+        "native failure left the diagnostic snapshot stale");
+    const second = "{\"sample\":2,\"archive\":{\"failed\":true}}";
+    requireCheck(until({ return diagnostics.tryPublish(second) == DiagnosticAdmission.queued; }),
+        "failed diagnostic mailbox rejected next update");
+    requireCheck(until({ return readText(config.diagnosticPath) == second; }),
+        "failed owner stopped refreshing diagnostic snapshots");
+    requireCheck(spool.tryAppend("original-server", "original-network", "#original",
+        originalEid, originalCompact) == ArchiveAdmission.unavailable,
+        "diagnostic availability reopened failed journal admission");
+    noRecord(spool);
+    stopOwned(spool);
+}
+
 private void admissionContentionCheck() {
     auto root = createRoot();
     ArchiveSpool spool;
@@ -950,6 +983,8 @@ Ircv3Check[] archiveSpoolRegressionChecks() {
         { byteSaturationCheck(); });
     run("journal injected native sync failure retains durable prefix and sticky uncertainty",
         { syncFailureCheck(); });
+    run("failed journal keeps fresh native diagnostics while admission remains closed and shutdown stays bounded",
+        { failedJournalDiagnosticsCheck(); });
     run("journal bookkeeping contention preserves history while event-loop timers remain responsive",
         { admissionContentionCheck(); });
     run("journal empty ingress and a late processor ack cannot upgrade an unclean shutdown",

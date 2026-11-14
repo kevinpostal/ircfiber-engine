@@ -231,7 +231,7 @@ keys[#keys+1] = 'scrollback:' .. g.networkId .. ':' .. g.buffer
 for i,key in ipairs(keys) do
     local kind = redis.call('TYPE', key).ok
     if kind ~= 'none' and kind ~= 'list' then return 'unknown' end
-    lineageValidate(key)
+    lineageReconcile(key)
     if redis.call('EXISTS', key) == 0 then lineageRetire(key); tokens[i] = ''
     else
         tokens[i] = lineageEnsure(key)

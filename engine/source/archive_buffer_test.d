@@ -27,12 +27,13 @@ import vibe.data.json : Json, parseJsonString, serializeToJson;
 import vibe.data.bson : Bson;
 import ircfiber.db.mongo : AppMongoConnection;
 import ircfiber.db.messages : MessageRepository;
+import ircfiber.db.network : NetworkRepository;
 import ircfiber.irc.registry : ServerRegistry;
 import ircfiber.archive_protocol : isCanonicalArchiveOperationId, archiveInstallCatalogLua,
     archiveOwnerKey, archiveLookupKey, archiveProjectionKey, archiveClearGroupKey, archiveOperationKey;
 import ircfiber.models.irc_event : IRCRawEvent;
-import ircfiber.storage.buffer : BufferManager;
-import ircfiber.storage.redis : RedisStorage;
+import ircfiber.storage.buffer : BufferManager, bufferRecoveryRegressionChecks;
+import ircfiber.storage.redis : RedisStorage, stopEventSubscriber;
 import ircfiber.engine.bootstrap : EngineContext;
 import ircfiber.engine.archive_control : applyArchiveRedisPurge, archiveHarnessCreateGroup,
     archiveHarnessObserve, archiveHarnessFreeze, archiveHarnessPin, archiveHarnessRelease,
@@ -662,6 +663,7 @@ private void preparedDestinationAdmission(Fixture f, string redisUrl, bool reque
     scope(exit) if (inserted) command(cleanup);
     f.ensureContext();
     f.context.messageRepo = new MessageRepository;
+    f.context.networkRepo = new NetworkRepository(f.redis);
     auto destination = new ArchiveControl;
     // A structurally valid Redis projection is not proof the canonical Mongo
     // network exists, even if it already names this destination.
@@ -691,6 +693,15 @@ private void preparedDestinationAdmission(Fixture f, string redisUrl, bool reque
     f.redis.getDb().del(archiveOwnerKey(f.network));
     auto sourceContext = f.context;
     sourceContext.localServer.serverId = f.server ~ "-source";
+    check(!f.redis.getDb().hget(RedisKeys.networkAssignments(), f.network).length,
+        "handoff fixture assignment already exists");
+    string assignedServer = sourceContext.localServer.serverId;
+    f.redis.getDb().hset(RedisKeys.networkAssignments(), f.network, assignedServer);
+    scope(exit) {
+        check(f.redis.getDb().hget(RedisKeys.networkAssignments(), f.network) == assignedServer,
+            "handoff fixture assignment changed; cleanup refused");
+        f.redis.getDb().hdel(RedisKeys.networkAssignments(), f.network);
+    }
     auto source = new ArchiveControl;
     check(source.prepareScope(sourceContext, f.network, f.user), "source majority registration failed");
     check(source.prepareHandoff(sourceContext, f.network, f.server),
@@ -698,6 +709,8 @@ private void preparedDestinationAdmission(Fixture f, string redisUrl, bool reque
     auto projected = parseJsonString(f.redis.getDb().get(archiveOwnerKey(f.network)));
     check(projected["servers"].length == 2 && projected["serverId"].get!string == sourceContext.localServer.serverId,
         "handoff lost source attribution or destination catalog membership");
+    assignedServer = f.server;
+    f.redis.getDb().hset(RedisKeys.networkAssignments(), f.network, assignedServer);
     f.context.archiveControl = new ArchiveControl;
     check(!f.context.archiveControl.scopeReady(f.network), "new destination was unexpectedly warm");
     check(f.context.archiveControl.prepareScope(f.context, f.network, f.user),
@@ -867,7 +880,7 @@ private void requestedIntentRecovery(Fixture f, NetworkConfig network) {
     f.context.archiveSpool = new ArchiveSpool(f.nativeConfig);
     string encoded; ulong sequence;
     const replayDeadline = MonoTime.currTime + 5.seconds;
-    while (!f.context.archiveSpool.tryPeek(encoded, sequence) && MonoTime.currTime < replayDeadline) sleep(5.msecs);
+    while (!f.context.archiveSpool.tryTake(encoded, sequence) && MonoTime.currTime < replayDeadline) sleep(5.msecs);
     check(encoded.length > 0, "recovered requested intent is absent from native replay");
     auto record = decodeArchiveRecord(encoded, sequence);
     check(record.kind == ArchiveKind.purge && record.operationId == id && record.cutoffEid == cutoff
@@ -1073,6 +1086,147 @@ private void pausedProcessorShutdown(Fixture f, string redisUrl, bool preparedSc
     check(MonoTime.currTime < recoveryDeadline,
         "shutdown plus durable replay proof exceeded five seconds without Mongo");
 }
+private void scrollbackFailurePreservesLive(Fixture f, string redisUrl) {
+    f.ensureContext();
+    NetworkConfig network;
+    auto networkCursor = f.network, ownerCursor = f.user;
+    network.id = parseUUID(networkCursor);
+    network.name = "ArchiveFixture";
+    network.nick = "fixture";
+    network.host = "archive-fixture.invalid";
+    f.context.connManager.addNetwork(network, parseUUID(ownerCursor));
+    const readyDeadline = MonoTime.currTime + 2.seconds;
+    bool ready;
+    while (MonoTime.currTime < readyDeadline) {
+        if (archiveHarnessAssumeRegisteredScope(f.context, f.network)) { ready = true; break; }
+        sleep(1.msecs);
+    }
+    check(ready, "fault fixture scope did not become ready");
+
+    const brokenBuffer = "#cache-fault", healthyBuffer = "#cache-control";
+    auto accepted = f.event(brokenBuffer, 1, "accepted-before-cache-fault-" ~ f.server);
+    f.appendEvent(accepted);
+    const brokenKey = f.list(brokenBuffer);
+    const token = f.token(brokenKey);
+    const locator = f.locator(token);
+    // An existing mismatched incarnation must remain fail-closed, not be
+    // silently repaired or mistaken for a duplicate by the live processor.
+    f.redis.getDb().hset(locator, "key", brokenKey ~ ":other-incarnation");
+    scope(exit) f.redis.getDb().hset(locator, "key", brokenKey);
+    const healthyKey = f.list(healthyBuffer);
+    f.companion(healthyKey);
+    f.dedup(healthyBuffer); f.dedup(healthyBuffer, true);
+    f.dedup(brokenBuffer); f.dedup(brokenBuffer, true);
+    const streamKey = f.own(RedisKeys.userStream(f.user));
+
+    auto subscriberRedis = new RedisStorage;
+    subscriberRedis.connectFromUrl(redisUrl);
+    auto subscriber = subscriberRedis.getClient().createSubscriber();
+    const channel = RedisKeys.events(f.user);
+    string[] published;
+    subscriber.subscribe(channel);
+    subscriber.listen((string _, string message) @safe nothrow { published ~= message; });
+    scope(exit) {
+        stopEventSubscriber(subscriber, channel);
+        subscriberRedis.close();
+    }
+    auto live = f.event(brokenBuffer, 2, "live-cache-fault-" ~ f.server);
+    auto historical = f.event(brokenBuffer, 3, "replay-cache-fault-" ~ f.server);
+    historical.addTag("batch", "chathistory");
+    auto control = f.event(healthyBuffer, 4, "healthy-control-" ~ f.server);
+    foreach (event; [live, historical, accepted, control, control]) f.context.eventChannel.put(event);
+    bool done;
+    string failure;
+    f.tasksQuiescent = false;
+    runTask(() nothrow {
+        scope(exit) done = true;
+        try startEventProcessor(f.context);
+        catch (Throwable error) { failure = error.msg; }
+    });
+    void quiesce() {
+        if (done) { f.tasksQuiescent = true; return; }
+        const deadline = MonoTime.currTime + 5.seconds;
+        check(f.context.archiveControl.awaitShutdownBarrier(f.context, deadline),
+            "fault fixture processor did not acknowledge its FIFO barrier");
+        while (!done && MonoTime.currTime < deadline) sleep(1.msecs);
+        check(done, "fault fixture processor still owns its context");
+        f.tasksQuiescent = true;
+    }
+    scope(exit) quiesce();
+    quiesce();
+    check(!failure.length, "fault fixture processor failed: " ~ failure);
+    const publishDeadline = MonoTime.currTime + 2.seconds;
+    while (published.length < 2 && MonoTime.currTime < publishDeadline) sleep(1.msecs);
+    check(published.length == 2
+        && parseJsonString(published[0])["i"].get!string == live.id
+        && parseJsonString(published[1])["i"].get!string == control.id,
+        "storage failure lost a live message, exposed failed replay, or bypassed confirmed dedup");
+    auto stream = f.rows(streamKey);
+    check(stream.length == 2 && parseJsonString(stream[1])["i"].get!string == live.id
+        && parseJsonString(stream[0])["i"].get!string == control.id,
+        "resumable stream disagrees with actual live publication");
+    check(f.texts(brokenKey) == [accepted.text]
+        && f.redis.getDb().hget(locator, "key") == brokenKey ~ ":other-incarnation",
+        "live failover mutated the rejected cache incarnation");
+    check(f.texts(healthyKey) == [control.text], "confirmed duplicate changed healthy history");
+    f.token(healthyKey);
+
+    check(f.context.archiveSpool.shutdown(5.seconds, ArchiveShutdown.producersDrained),
+        "fault fixture journal did not sync");
+    f.context.archiveSpool = new ArchiveSpool(f.nativeConfig);
+    foreach (expected; [live, control]) {
+        string encoded;
+        ulong sequence;
+        bool found;
+        const deadline = MonoTime.currTime + 5.seconds;
+        while (MonoTime.currTime < deadline) {
+            if (f.context.archiveSpool.tryTake(encoded, sequence)) { found = true; break; }
+            sleep(1.msecs);
+        }
+        check(found, "live publication missing from durable recovery after cache rejection");
+        auto record = decodeArchiveRecord(encoded, sequence);
+        auto payload = parseJsonString(record.compactJson);
+        check(record.kind == ArchiveKind.append && record.networkId == f.network
+            && record.channel == expected.channel && payload["i"].get!string == expected.id
+            && payload["x"].get!string == expected.text && record.eid > 0,
+            "durable recovery changed live message identity or content");
+        while (!f.context.archiveSpool.tryAcknowledge(sequence)) {
+            check(MonoTime.currTime < deadline, "fault fixture checkpoint admission timed out");
+            sleep(1.msecs);
+        }
+    }
+}
+
+private void lostLineageCannotPurgeReplacement(Fixture f) {
+    foreach (retainRows; [false, true]) {
+        const buffer = retainRows ? "#surviving-lineage" : "#lost-lineage";
+        auto original = f.event(buffer, 10, "original-" ~ buffer);
+        f.appendEvent(original);
+        auto frozen = f.pin(buffer, 20, 1_900_000_000_000L);
+        const key = f.list(buffer), companion = f.companion(key);
+        const oldToken = f.token(key);
+        f.redis.getDb().del(f.locator(oldToken));
+        if (!retainRows) f.redis.getDb().del(key);
+        // Model partial Redis loss including a lost pin TTL. The durable
+        // old operation still names its original token; it must not be
+        // allowed to clear a new incarnation, even with an older eid.
+        f.redis.getDb().expire(companion, 60);
+        auto replacement = f.event(buffer, 12, "replacement-" ~ buffer);
+        f.appendEvent(replacement);
+        const newToken = f.token(key);
+        const before = f.rows(key);
+        check(newToken != oldToken && !f.redis.getDb().exists(f.locator(oldToken)),
+            "recovery reconstructed old destructive authority");
+        check(f.apply(frozen) == "retry", "old frozen purge acquired replacement lineage");
+        check(f.rows(key) == before && f.token(key) == newToken,
+            "unresolved old purge mutated replacement rows or incarnation");
+        check(!f.buffers.appendIRCEvent(replacement, f.server),
+            "lineage repair lost accepted-message dedup");
+        if (retainRows) check(f.texts(key) == [replacement.text, original.text],
+            "lineage repair discarded surviving history");
+    }
+}
+
 private bool fencedIngressPreservesBlockedTail() {
     auto events = EngineEventChannel.create();
     void releaseWaiters() {
@@ -1121,6 +1275,9 @@ private bool fencedIngressPreservesBlockedTail() {
 }
 
 private void runFixtures(RedisStorage redis, string run, string redisUrl) {
+    runCase("orphan recovery and backfill ordering preserve recent, cursor and unread semantics", {
+        bufferRecoveryRegressionChecks(redis);
+    });
     runCase("event ingress fence preserves a blocked pre-fence tail in FIFO order and rejects later producers", {
         check(fencedIngressPreservesBlockedTail(), "full-ring admission fence lost or reordered accepted events");
     });
@@ -1141,6 +1298,12 @@ private void runFixtures(RedisStorage redis, string run, string redisUrl) {
     fixtureCase("empty frozen tokens are authoritative absence, not a newly created buffer", (f) { absentIsAuthoritative(f); });
     fixtureCase("pending pins survive expiry; final release starts bounded retention", (f) { pinLifetime(f); });
     fixtureCase("fixed pin capacity rejects new intent without evicting pending proof", (f) { pinCapacity(f); });
+    fixtureCase("lost old lineage never authorizes a frozen purge of absent or surviving replacement history", (f) {
+        lostLineageCannotPurgeReplacement(f);
+    });
+    fixtureCase("cache lineage rejection preserves real live pubsub and durable replay without admitting failed history or duplicates", (f) {
+        scrollbackFailurePreservesLive(f, redisUrl);
+    });
     fixtureCase("shutdown drains an actual processor suspended on real Redis I/O into durable replay", (f) {
         pausedProcessorShutdown(f, redisUrl);
     });

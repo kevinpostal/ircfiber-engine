@@ -26,9 +26,31 @@ local function lineageValidate(key)
     if redis.call('HGET', locator, 'key') ~= key or redis.call('HGET', locator, 'empty') ~= '0' then
         error('archive lineage mismatch')
     end
-    local refs = tonumber(redis.call('HGET', locator, 'refs'))
-    if not refs or refs < 0 or refs > 128 then error('archive lineage pin mismatch') end
+    local rawRefs = redis.call('HGET', locator, 'refs')
+    local refs = tonumber(rawRefs)
+    if not rawRefs or not string.match(rawRefs, '^%d+$') or not refs
+        or refs < 0 or refs > 128 or tostring(refs) ~= rawRefs then
+        error('archive lineage pin mismatch')
+    end
     return token
+end
+-- An expiring companion without its locator cannot authorize destructive
+-- work. Detach it and allocate a NEW incarnation for an absent/list buffer,
+-- preserving surviving rows and dedup. Never reconstruct the old locator:
+-- every retained old pin/freeze must continue to see missing proof and retry.
+-- Persistent companions (possible pins), wrong types and existing mismatched
+-- locators still require operator recovery.
+local function lineageReconcile(key)
+    local companion = lineageCompanion(key)
+    local token = redis.call('GET', companion)
+    if token and redis.call('EXISTS', lineageLocator(token)) == 0
+        and redis.call('PTTL', companion) >= 0 then
+        local kind = redis.call('TYPE', key).ok
+        if kind ~= 'none' and kind ~= 'list' then return lineageValidate(key) end
+        redis.call('DEL', companion)
+        return nil
+    end
+    return lineageValidate(key)
 end
 local function lineageRetire(key)
     local token = lineageValidate(key)
@@ -54,7 +76,7 @@ local function lineageRefresh(key, token)
     end
 end
 local function lineageEnsure(key, preparingAppend)
-    local token = lineageValidate(key)
+    local token = lineageReconcile(key)
     if token then lineageRefresh(key, token); return token end
     if not preparingAppend and redis.call('EXISTS', key) == 0 then return '' end
     local serial = redis.call('INCR', 'irc:archive:lineage:serial')
@@ -175,8 +197,6 @@ final class BufferManager {
         enum MAX_SCROLLBACK = 5000;
         enum KEY_PREFIX = "scrollback:";
         enum TTL_DAYS = 30;
-        enum UNREAD_CHUNK = 100;      // LRANGE slice per round trip
-        enum UNREAD_MAX_SCAN = 1000;  // hard cap on rows scanned per buffer
         static immutable string[] UNREAD_COMMANDS = ["PRIVMSG", "NOTICE", "INVITE", "WALLOPS"];
         // Dedup-set key namespace: `dedup:<networkId>:<channel>`.
         //
@@ -235,7 +255,7 @@ final class BufferManager {
         auto result = db.eval!string(archiveBufferLineageLua ~ q"LUA
 local kind = redis.call('TYPE', KEYS[1]).ok
 if kind ~= 'none' and kind ~= 'list' then return redis.error_reply('Scrollback key is not a list') end
-lineageValidate(KEYS[1])
+lineageReconcile(KEYS[1])
 if kind == 'none' then lineageRetire(KEYS[1]) end
 local token = lineageEnsure(KEYS[1], true)
 redis.call('LPUSH', KEYS[1], ARGV[1])
@@ -254,11 +274,9 @@ LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string]);
      * - Timestamp-based (before / after): skips messages whose timestamp
      *   falls at/after `before` or at/before `after`. Used when no
      *   msgid cursor is available.
-     * - Index-based (beforeIdx): skips messages at or before the given
-     *   index in the Redis list. Used when a msgid cursor was resolved
-     *   to a specific position, avoiding false positives from messages
-     *   that share a similar timestamp but belong to the same batch
-     *   (e.g. 353 NAMES / 366 ENDOFNAMES arriving just before a JOIN).
+     * - A resolved beforeIdx disambiguates rows at the cursor's timestamp.
+     *   Physical arrival order alone is not chronology: CHATHISTORY backfill
+     *   is LPUSHed above newer live traffic.
      */
     /// Commands the chat UI cannot render (mirrors the frontend's
     /// `isSkippedCommand` list). Reading them back from a channel's
@@ -322,9 +340,23 @@ LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string]);
     }
 
     private Json[] _getRecentFiltered(string key, long count, long before, long after,
-                                      long beforeIdx = -1, bool filterNoise = false) @trusted {
+                                      long beforeIdx = -1, bool filterNoise = false,
+                                      bool unreadOnly = false) @trusted {
+        if (count <= 0) return [];
         auto db = redis.getDb();
-        Json[] messages;
+        struct StoredRow {
+            Json message;
+            long timestamp;
+            long index;
+        }
+        static bool newer(StoredRow a, StoredRow b) {
+            return a.timestamp != b.timestamp ? a.timestamp > b.timestamp : a.index < b.index;
+        }
+        const keep = cast(size_t) min(count, MAX_SCROLLBACK);
+        // Compact in batches: bounded O(count) retained rows, expected O(n)
+        // selection, and only the final page is sorted.
+        StoredRow[] selected;
+        size_t selectedCount;
         auto results = db.lrange!(ubyte[])(key, 0, MAX_SCROLLBACK - 1);
         long idx;
         foreach (raw; results) {
@@ -339,24 +371,40 @@ LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string]);
             }
             try {
                 auto msg = parseJson(r);
+                if (msg.type != Json.Type.object) continue;
+                long timestamp;
+                if (auto t = "t" in msg) timestamp = t.get!long;
+                else if (auto t = "timestamp" in msg) timestamp = t.get!long;
                 if (beforeIdx >= 0) {
-                    if (curIdx <= beforeIdx) continue;
-                } else if (before > 0 && "t" in msg) {
-                    const ts = msg["t"].get!long;
-                    if (ts >= before) continue;
-                }
-                if (after > 0 && "t" in msg) {
-                    const ts = msg["t"].get!long;
-                    if (ts <= after) continue;
-                }
+                    if (before > 0) {
+                        if (timestamp > before || (timestamp == before && curIdx <= beforeIdx)) continue;
+                    } else if (curIdx <= beforeIdx) continue;
+                } else if (before > 0 && timestamp >= before) continue;
+                if ((after > 0 || unreadOnly) && timestamp <= after) continue;
                 if (filterNoise && isScrollbackNoiseRow(msg)) continue;
-                messages ~= msg;
-                if (messages.length >= count) break;
+                if (unreadOnly) {
+                    auto command = "c" in msg;
+                    if (command is null || command.type != Json.Type.string
+                            || !UNREAD_COMMANDS.canFind(command.get!string)) continue;
+                }
+                if (selected is null)
+                    selected = new StoredRow[min(cast(size_t) MAX_SCROLLBACK, keep * 2)];
+                selected[selectedCount++] = StoredRow(msg, timestamp, curIdx);
+                if (selectedCount == selected.length && selectedCount > keep) {
+                    topN!newer(selected, keep);
+                    selected[keep .. $] = StoredRow.init;
+                    selectedCount = keep;
+                }
             } catch (Exception e) {
                 logWarn("Failed to parse scrollback message: %s", e.msg);
             }
         }
-        messages.reverse;
+        auto newest = selected[0 .. selectedCount];
+        if (newest.length > keep) newest = topN!newer(newest, keep);
+        // Index disambiguates equal timestamps without a stable-sort allocation.
+        newest.sort!((a, b) => newer(b, a));
+        auto messages = new Json[newest.length];
+        foreach (i, row; newest) messages[i] = row.message;
         return messages;
     }
 
@@ -389,42 +437,15 @@ LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string]);
     /// Chat entries (PRIVMSG / NOTICE / INVITE / WALLOPS) strictly newer than
     /// `afterTs` (ms), oldest-first, at most `limit` — the NEWEST `limit` when
     /// more exist. Feeds the connect-time sync's per-buffer unread tail
-    /// (IRCCloud OOB backlog). Bounded newest-first scan in UNREAD_CHUNK
-    /// slices: a slice with no newer row ends the scan (a CHATHISTORY
-    /// backfill batch of older rows can sit above live traffic, so the
-    /// first old row must not), as does UNREAD_MAX_SCAN. Empty `serverId`
+    /// (IRCCloud OOB backlog). Scan the bounded hot buffer, including live rows
+    /// beneath arbitrarily sized older CHATHISTORY batches. Empty `serverId`
     /// reads the legacy non-namespaced key. Never throws on bad rows.
     Json[] getUnreadTail(string serverId, string networkId, string channel, long afterTs, long limit) @trusted {
-        import std.algorithm : canFind;
         auto norm = normalizeChannel(channel);
         auto key = serverId.length
             ? KEY_PREFIX ~ serverId ~ ":" ~ networkId ~ ":" ~ norm
             : KEY_PREFIX ~ networkId ~ ":" ~ norm;
-        auto db = redis.getDb();
-        Json[] messages;
-        for (long start = 0; start < UNREAD_MAX_SCAN && messages.length < limit; start += UNREAD_CHUNK) {
-            auto results = db.lrange!(ubyte[])(key, start, start + UNREAD_CHUNK - 1);
-            long rows = 0;
-            bool sawNewer = false;
-            foreach (raw; results) {
-                rows++;
-                Json msg;
-                try {
-                    auto r = sanitizeUtf8(() @trusted { return cast(string) raw.idup; } ());
-                    msg = parseJson(r);
-                } catch (Exception e) { continue; }
-                auto tp = "t" in msg;
-                if (tp is null || tp.type != Json.Type.int_ || tp.get!long <= afterTs) continue;
-                sawNewer = true;
-                auto cp = "c" in msg;
-                if (cp is null || cp.type != Json.Type.string || !UNREAD_COMMANDS.canFind(cp.get!string)) continue;
-                messages ~= msg;
-                if (messages.length >= limit) break;
-            }
-            if (!sawNewer || rows < UNREAD_CHUNK) break;
-        }
-        messages.reverse;
-        return messages;
+        return _getRecentFiltered(key, limit, 0, afterTs, -1, false, true);
     }
 
     /**
@@ -817,15 +838,10 @@ LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string]);
         enum rowTTL = (86_400 * TTL_DAYS).to!string;
         enum dedupTTL = DEDUP_TTL_SECS.to!string;
         auto verdict = redis.getDb().eval!string(archiveBufferLineageLua ~ q"LUA
-local bufferType = redis.call('TYPE', KEYS[1]).ok
 local dedupType = redis.call('TYPE', KEYS[2]).ok
-if bufferType ~= 'none' and bufferType ~= 'list' then
-    return redis.error_reply('Scrollback key is not a list')
-end
 if dedupType ~= 'none' and dedupType ~= 'set' then
     return redis.error_reply('Dedup key is not a set')
 end
-lineageValidate(KEYS[1])
 local duplicate = redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 1
 if not duplicate and ARGV[7] ~= '' then
     duplicate = redis.call('SISMEMBER', KEYS[2], ARGV[7]) == 1
@@ -837,6 +853,11 @@ if duplicate then
     redis.call('EXPIRE', KEYS[2], ARGV[5])
     return '0'
 end
+local bufferType = redis.call('TYPE', KEYS[1]).ok
+if bufferType ~= 'none' and bufferType ~= 'list' then
+    return redis.error_reply('Scrollback key is not a list')
+end
+lineageReconcile(KEYS[1])
 if bufferType == 'none' then lineageRetire(KEYS[1]) end
 -- Complete lineage allocation/serial validation before accepting row/dedup.
 local token = lineageEnsure(KEYS[1], true)
@@ -970,7 +991,7 @@ for i=1,8,2 do
     local kind = redis.call('TYPE', KEYS[i]).ok
     if kind ~= 'none' and kind ~= expected then return redis.error_reply('Invalid buffer rename type') end
 end
-for i=1,4 do lineageValidate(KEYS[i]) end
+for i=1,4 do lineageReconcile(KEYS[i]) end
 local moved = false
 for i=1,4,2 do
     if redis.call('EXISTS', KEYS[i]) == 1 and redis.call('EXISTS', KEYS[i+1]) == 0 then
@@ -1280,4 +1301,172 @@ void historyAtomicStorageRegressionChecks(RedisStorage redis) {
             assert(!append(), "The same accepted tag state must remain deduplicated");
         }
     }
+}
+
+/// Consumer-level regressions using only the caller's isolated Redis fixture.
+void bufferRecoveryRegressionChecks(RedisStorage redis) {
+    import std.uuid : randomUUID;
+    assert(redis !is null);
+    auto db = redis.getDb();
+    auto manager = new BufferManager(redis);
+    string[] owned;
+    string own(string key) { owned ~= key; return key; }
+    string locator(string token) { return own("irc:archive:lineage:id:" ~ token); }
+    string companion(string key) { return own("irc:archive:lineage:buffer:" ~ key); }
+    string token(string key) {
+        auto value = db.get(companion(key)).idup;
+        if (value.length) locator(value);
+        return value;
+    }
+    scope (exit) {
+        foreach (key; owned.dup) if (key.startsWith("scrollback:")) {
+            auto value = db.get("irc:archive:lineage:buffer:" ~ key);
+            if (value.length) locator(value.idup);
+        }
+        foreach_reverse (key; owned) db.del(key);
+    }
+    foreach (namespaced; [false, true]) {
+        const network = "buffer-recovery-" ~ randomUUID().toString();
+        const server = "buffer-recovery";
+        const key = own("scrollback:" ~ (namespaced ? server ~ ":" : "") ~ network ~ ":#recover");
+        const metadata = companion(key);
+        own("dedup:" ~ network ~ ":#recover");
+        auto event = IRCRawEvent("RecoveryFixture", "PRIVMSG");
+        event.networkId = network; event.channel = "#recover";
+        event.nick = "fixture"; event.text = "accepted after orphan";
+        event.timestampMs = 1_800_000_000_000L;
+        event.addTag("msgid", randomUUID().toString());
+        bool append() {
+            return namespaced ? manager.appendIRCEvent(event, server) : manager.appendIRCEvent(event);
+        }
+        bool rejected() {
+            try { append(); } catch (Exception) { return true; }
+            return false;
+        }
+        const orphan = randomUUID().toString();
+        const absentLocator = locator(orphan);
+        db.set(metadata, orphan); db.expire(metadata, 60);
+        assert(append() && !append(), "Expiring empty orphan must recover without poisoning atomic dedup");
+        auto current = token(key);
+        assert(current.length && current != orphan && !db.exists(absentLocator),
+            "Recovery must allocate a fresh incarnation, never reconstruct missing proof");
+        auto retained = namespaced ? manager.getRecent(server, network, "#recover", 3)
+            : manager.getRecent(network, "#recover", 3);
+        assert(retained.length == 1 && retained[0]["x"].get!string == event.text,
+            "Recovered real traffic must be visible through the normal history consumer");
+        db.hset(locator(current), "key", key ~ "-damaged");
+        assert(!append(), "Readable accepted identity must suppress duplicates despite mismatched lineage");
+        db.hset(locator(current), "key", key);
+        db.del(key); db.set(key, "wrong-type");
+        assert(!append() && db.get(key) == "wrong-type",
+            "Readable accepted identity must suppress duplicates without mutating a wrong-type buffer");
+        db.del(key);
+        // A real pinned incarnation can lose its list without losing its
+        // immutable empty proof when new traffic reuses the physical name.
+        const pinnedLocator = locator(current);
+        db.hset(pinnedLocator, "refs", "1");
+        db.persist(pinnedLocator); db.persist(metadata);
+        event.addTag("msgid", randomUUID().toString());
+        assert(append() && !append(), "Reuse after pinned list expiry must still accept exactly once");
+        assert(token(key) != current && db.hget(pinnedLocator, "empty") == "1"
+            && db.hget(pinnedLocator, "key") == "" && db.hget(pinnedLocator, "refs") == "1",
+            "Reuse must retain every pinned reference to explicit old empty proof");
+        const lostToken = token(key);
+        const lostLocator = locator(lostToken);
+        auto accepted = event;
+        db.del(lostLocator);
+        assert(!append(), "An already accepted row must stay suppressed during surviving-list recovery");
+        event.addTag("msgid", randomUUID().toString());
+        event.text = "new traffic after surviving-list loss";
+        assert(append() && !append(),
+            "Expiring orphan with surviving rows must recover and accept new traffic exactly once");
+        const liveToken = token(key);
+        const liveLocator = locator(liveToken);
+        assert(liveToken != lostToken && !db.exists(lostLocator),
+            "Surviving-list recovery must not recreate the old purge's locator");
+        const acceptedAgain = namespaced ? manager.appendIRCEvent(accepted, server)
+            : manager.appendIRCEvent(accepted);
+        assert(!acceptedAgain, "Surviving-list reconciliation must preserve already accepted dedup identities");
+        retained = namespaced ? manager.getRecent(server, network, "#recover", 3)
+            : manager.getRecent(network, "#recover", 3);
+        assert(retained.length == 2 && retained[0]["x"].get!string == accepted.text
+            && retained[1]["x"].get!string == event.text,
+            "Surviving-list recovery must preserve every old row plus the new row");
+        db.del(liveLocator);
+        db.persist(metadata);
+        event.addTag("msgid", randomUUID().toString());
+        assert(rejected() && token(key) == liveToken,
+            "Persistent orphan with surviving rows may have pins and must remain fail-closed");
+        db.del(key);
+        assert(rejected() && token(key) == liveToken,
+            "Persistent empty orphan may have pending pins and must remain fail-closed");
+        db.hset(liveLocator, "key", key ~ "-different");
+        db.hset(liveLocator, "empty", "0"); db.hset(liveLocator, "refs", "0");
+        db.expire(metadata, 60);
+        assert(rejected() && db.hget(liveLocator, "key") == key ~ "-different",
+            "A mismatched existing locator must never be reset, even with zero refs");
+        db.hset(liveLocator, "key", key);
+        foreach (invalidRefs; ["0.5", "1.0", "1e0", "-0", "129"]) {
+            db.hset(liveLocator, "refs", invalidRefs);
+            assert(rejected(), "Only canonical bounded HINCRBY-compatible pin counts may pass preflight");
+        }
+        db.hset(liveLocator, "refs", "0");
+        assert(append() && !append(), "Failed lineage validation must leave the same row retryable");
+        token(key);
+    }
+    const network = "buffer-order-" ~ randomUUID().toString();
+    foreach (namespaced; [false, true]) {
+        const server = namespaced ? "buffer-order" : "";
+        const key = own("scrollback:" ~ (server.length ? server ~ ":" : "") ~ network ~ ":#order");
+        void row(long timestamp, string id) {
+            db.lpush(key, Json(["t": Json(timestamp), "c": Json("PRIVMSG"),
+                "m": Json(id), "x": Json(id)]).toString());
+        }
+        row(400, "live-400"); row(500, "live-500-older");
+        row(500, "live-500-cursor"); row(600, "live-600");
+        // An all-old chunk above live traffic must not stop unread scanning.
+        foreach (i; 0 .. 120) row(100 + i, "history-" ~ i.to!string);
+        row(450, "history-450");
+        db.lpush(key, `{"t":2000,"c":"353","x":"noise-after-live"}`);
+        db.lpush(key, `{"t":"invalid","c":"PRIVMSG","x":"invalid-timestamp"}`);
+        Json[] recent(long count, long before = 0, string beforeId = "") {
+            return server.length
+                ? manager.getRecent(server, network, "#order", count, before, 0, beforeId, "")
+                : manager.getRecent(network, "#order", count, before, 0, beforeId, "");
+        }
+        auto latest = recent(3);
+        assert(latest.length == 3 && latest[0]["m"].get!string == "live-500-older"
+            && latest[1]["m"].get!string == "live-500-cursor"
+            && latest[2]["m"].get!string == "live-600",
+            "Recent count must select newest timestamps, not newest LPUSH arrivals");
+        auto page = recent(3, 0, "live-500-cursor");
+        assert(page.length == 3 && page[0]["m"].get!string == "live-400"
+            && page[1]["m"].get!string == "history-450"
+            && page[2]["m"].get!string == "live-500-older",
+            "Msgid paging must respect chronology and same-timestamp cursor position");
+        auto before = recent(2, 500);
+        assert(before.length == 2 && before[0]["m"].get!string == "live-400"
+            && before[1]["m"].get!string == "history-450",
+            "Timestamp paging must select the newest matching chronological rows");
+        auto unread = manager.getUnreadTail(server, network, "#order", 450, 3);
+        assert(unread == latest, "Unread tail must see live rows beneath an older backfill chunk");
+        assert(!recent(0).length && !manager.getUnreadTail(server, network, "#order", 0, 0).length,
+            "Zero-count reads must not return an arbitrary row");
+    }
+    const renameNetwork = "buffer-rename-" ~ randomUUID().toString();
+    const source = own("scrollback:buffer-recovery:" ~ renameNetwork ~ ":alice");
+    const destination = own("scrollback:buffer-recovery:" ~ renameNetwork ~ ":bob");
+    companion(source);
+    const destinationMetadata = companion(destination);
+    auto message = Json(["t": Json(100), "c": Json("PRIVMSG"), "x": Json("rename-retained")]);
+    manager.appendMessage("buffer-recovery", renameNetwork, "alice", message);
+    const original = token(source);
+    const orphan = randomUUID().toString();
+    locator(orphan);
+    db.set(destinationMetadata, orphan); db.expire(destinationMetadata, 60);
+    assert(manager.renameBuffer("buffer-recovery", renameNetwork, "alice", "bob")
+        && token(destination) == original && !db.exists(source),
+        "An expiring destination orphan must not block the original incarnation's rename");
+    assert(manager.getRecent("buffer-recovery", renameNetwork, "bob", 1)[0]["x"].get!string
+        == "rename-retained", "Orphan reconciliation must preserve the renamed history");
 }

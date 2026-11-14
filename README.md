@@ -236,6 +236,27 @@ candidate holder. `archive_reliability.sh` is the candidate-only archive proof.
 The memory harness treats asynchronous producer-preparation exceptions as a
 failed check, while satisfying vibe's non-throwing task callback contract.
 Smoke-duration runs are not the full warm-up/soak qualification receipts.
+
+Scrollback is not a prerequisite for live publication: a failed Redis buffer
+write is reported separately, while nonhistorical messages still enter the
+durable journal and live/user-stream paths. Confirmed duplicates remain
+suppressed; failed historical pages never advance their storage checkpoint.
+Scope preparation parses UUIDs through a local cursor, preserving the original
+network identifier for ownership checks and majority catalog registration.
+This does not make Redis sequencing/pubsub outages or rejected journal
+admission lossless.
+
+An expiring lineage companion whose locator disappeared receives a fresh
+incarnation on append, preserving surviving rows and dedup. The old locator is
+never reconstructed, so an old frozen purge cannot acquire replacement
+history. Persistent companions, wrong types and existing mismatches fail
+closed. Redis must use `noeviction`: paired lineage, dedup and scrollback keys
+are one logical dataset, not independently disposable cache entries.
+
+Recent, cursor and unread reads select by message time across bounded hot
+history, not by backfill arrival order. A terminal journal failure keeps the
+existing native disk owner available for fresh diagnostic snapshots until
+shutdown, without reopening archival admission or retrying the failed journal.
 Failed archive runs capture bounded wire status, exact container generations,
 registry and logs before Mongo resume or launcher teardown. Evidence/cleanup
 errors are retained separately without replacing the original failure reason;

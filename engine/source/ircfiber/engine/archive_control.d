@@ -148,7 +148,8 @@ final class ArchiveControl {
         registrations[index].preparedOwnerId = null;
         registrations[index].validatedOwnerId = null;
         try {
-            const id = parseUUID(network);
+            auto cursor = network;
+            const id = parseUUID(cursor);
             auto row = ctx.networkRepo.findByIdWithUser(id);
             if (row.config.id != id || row.config.disabled || row.config.servicesProvisioningPending
                     || row.userId.toString() != expectedOwner || ctx.connManager is null

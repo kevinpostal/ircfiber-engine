@@ -31,6 +31,22 @@ private void noteArchiveAdmission(ArchiveAdmission admission) {
         ["event":"archive_gap", "admission":admission.to!string]);
 }
 
+private long lastScrollbackFailureNotice;
+private ulong scrollbackFailuresSinceNotice;
+
+private void noteScrollbackFailure(ref const IRCRawEvent event, string reason) {
+    ++scrollbackFailuresSinceNotice;
+    const now = Clock.currTime.stdTime / 10_000 - 62_135_596_800_000L;
+    if (now - lastScrollbackFailureNotice < 60_000) return;
+    lastScrollbackFailureNotice = now;
+    logJsonMap("error", "engine", "Scrollback storage failed; live delivery remains independent",
+        ["event":"scrollback_failure", "networkId":event.networkId,
+         "buffer":event.channel.length ? event.channel : "_server",
+         "historical":isHistorical(event) ? "true" : "false",
+         "failures":scrollbackFailuresSinceNotice.to!string, "error":reason]);
+    scrollbackFailuresSinceNotice = 0;
+}
+
 private void archiveRename(ref EngineContext ctx, string serverId, string networkId,
         string from, string toChannel, long cutoffEid) {
     auto admission = ArchiveAdmission.unavailable;
@@ -336,19 +352,26 @@ void startEventProcessor(ref EngineContext ctx) {
                 // Redis is the hot scrollback/checkpoint authority. Journal
                 // admission below is independent and reports gaps explicitly.
                 //
-                // The dedup verdict is authoritative for ALL THREE sinks.
-                // It used to gate only the Redis scrollback while Mongo and
-                // the live WebSocket publish below ran unconditionally, so a
-                // re-emitted event (an IRCv3 batch replayed on rejoin, a
-                // roster fan-out that matched a nick twice) reached the
-                // browser as a second row with its own id and eid — nothing
-                // downstream can collapse those — while the scrollback kept
-                // exactly one. That is the "it showed my JOIN twice" class
-                // of bug: duplicated live rows over a clean scrollback.
-                const stored = publishOnly || ctx.bufferManager.appendIRCEvent(event, serverId);
-                // A false dedup verdict means already accepted, never storage failure.
+                // A confirmed duplicate is suppressed across all sinks. A
+                // storage exception is NOT a duplicate verdict: live messages
+                // must still reach the independent journal and publication
+                // paths. Historical pages remain unacknowledged and retryable.
+                bool stored = true;
+                bool scrollbackFailed;
+                if (!publishOnly) {
+                    try stored = ctx.bufferManager.appendIRCEvent(event, serverId);
+                    catch (Exception e) {
+                        scrollbackFailed = true;
+                        noteScrollbackFailure(event, e.msg);
+                    }
+                }
                 storageResolved = true;
-                if (!publishOnly) noteAcceptedLiveHistory(ctx, event);
+                if (scrollbackFailed) {
+                    noteHistoryStorageFailure(ctx, event, failedHistoryStorage);
+                    if (historical) continue;
+                } else if (!publishOnly) {
+                    noteAcceptedLiveHistory(ctx, event);
+                }
                 if (!stored) {
                     logDebug("Dropping duplicate %s eid=%d for %s/%s (already in scrollback)",
                         event.command, event.eid, event.network,
