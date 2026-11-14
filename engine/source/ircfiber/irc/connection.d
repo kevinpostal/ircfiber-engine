@@ -83,6 +83,8 @@ import ircfiber.services.config : ServicesConfig, effectiveServicesConfig;
 import ircfiber.services.privacy : sensitiveServiceLine, sensitiveServiceMessage;
 import ircfiber.services.protocol : ServicesRequest, ServicesResult, ServicesManualPayload;
 
+enum DEFAULT_QUIT_REASON = "IRC Fiber — https://ircfiber.com";
+
 /// IRC connection state.
 ///
 /// W1-T01 (plan B1): added `waiting_to_retry` to the engine enum so
@@ -6116,11 +6118,10 @@ final class PersistentIRCClient {
     void inhibitNewDials() { dialStopIntent = true; }
     void requestMoveStop() { isShutdownRequested = true; }
 
-    /// Stops the connection and requests shutdown. If `quitReason` is
-    /// supplied (or default empty), a QUIT is sent first so the server
-    /// emits a final ERROR and closes the link cleanly; otherwise the
-    /// socket is closed immediately. Either way the holder's upstream
-    /// socket is closed too (see `transportClose`).
+    /// Stops the connection and requests shutdown. Registered connections send
+    /// QUIT with the caller's nonempty reason or the branded default, then use
+    /// the existing grace/forced-close path. Unregistered connections close
+    /// immediately; transportClose("") still means close without another QUIT.
     void stop(string quitReason = "") {
         isShutdownRequested = true;
         // In-flight services requests are answered now (stale, or unconfirmed
@@ -6130,7 +6131,7 @@ final class PersistentIRCClient {
 
         if (state == ConnectionState.connected && connection.connected) {
             try {
-                 writeRaw("QUIT :" ~ quitReason);
+                 writeRaw("QUIT :" ~ (quitReason.length ? quitReason : DEFAULT_QUIT_REASON));
             } catch (Exception e) {
                 logWarn("Failed to send QUIT for %s: %s", config.host, e.msg);
                 transportClose();
@@ -17802,6 +17803,92 @@ Ircv3Check[] ircv3ProtocolChecks(out string[] wire) {
         client.processOutboundQueue();
         sleep(10.msecs);
         return historyPeers[client].lines;
+    }
+    foreach (registered; [false, true]) {
+        foreach (reason; ["", "Gone fishing"]) {
+            NetworkConfig cfg;
+            cfg.nick = "me";
+            auto ch = EngineEventChannel.create();
+            scope (exit) ch.close();
+            auto client = new PersistentIRCClient(cfg, ch);
+            historyWrites(client);
+            if (!registered) client.state = ConnectionState.connecting;
+            client.stop(reason);
+            sleep(10.msecs);
+            const sent = historyPeers[client].lines;
+            results ~= Ircv3Check(
+                (registered ? "registered" : "unregistered") ~ " stop with "
+                    ~ (reason.length ? "custom" : "default") ~ " reason",
+                registered
+                    ? sent == ["QUIT :" ~ (reason.length ? reason : DEFAULT_QUIT_REASON)]
+                    : sent.length == 0 && !client.transportAlive);
+            // No socket reader runs in this harness; release the grace task's
+            // transport now rather than leave it alive after the assertion.
+            client.transportClose();
+        }
+    }
+    {
+        NetworkConfig cfg;
+        cfg.nick = "me";
+        auto ch = EngineEventChannel.create();
+        scope (exit) ch.close();
+        auto client = new PersistentIRCClient(cfg, ch);
+        historyWrites(client);
+        void receive(string line) {
+            wire ~= line;
+            client.processLine(line);
+        }
+        foreach (command; ["VERSION", "PING", "TIME", "CLIENTINFO"]) {
+            client.ctcpReplyNotBeforeMs = 0;
+            const before = historyWrites(client).length;
+            const parameter = command == "PING" ? "exact nonce 123.456" : "";
+            receive(":alice!u@h PRIVMSG me :" ~ ctcpReply(command, parameter));
+            const sent = historyWrites(client);
+            const expected = command == "VERSION" ? ctcpReply(command, "IRC Fiber")
+                : command == "PING" ? ctcpReply(command, parameter)
+                : command == "CLIENTINFO" ? ctcpReply(command, "ACTION VERSION PING TIME CLIENTINFO")
+                : "";
+            results ~= Ircv3Check("direct CTCP " ~ command ~ " writes one correctly framed NOTICE",
+                sent.length == before + 1 && (command == "TIME"
+                    ? sent[$ - 1].startsWith("NOTICE alice :\x01TIME ")
+                        && sent[$ - 1].endsWith("\x01")
+                    : sent[$ - 1] == "NOTICE alice :" ~ expected));
+            const slot = client.ctcpReplyNotBeforeMs;
+            results ~= Ircv3Check("CTCP " ~ command ~ " reserves the one-second global reply slot",
+                slot > unixMsNow() && slot <= unixMsNow() + CTCP_REPLY_MIN_INTERVAL_MS);
+            foreach (sender; ["bob", "carol", "alice"])
+                receive(":" ~ sender ~ "!u@h PRIVMSG me :\x01PING blocked\x01");
+            results ~= Ircv3Check("CTCP " ~ command ~ " cooldown is shared across senders",
+                historyWrites(client).length == sent.length && client.ctcpReplyNotBeforeMs == slot);
+        }
+        foreach (line; [
+            ":alice!u@h PRIVMSG me :\x01USERINFO\x01",
+            ":alice!u@h PRIVMSG me :\x01UNKNOWN\x01",
+            ":alice!u@h PRIVMSG #room :\x01VERSION\x01",
+            ":alice!u@h PRIVMSG &room :\x01PING channel\x01",
+            ":alice!u@h PRIVMSG @#room :\x01TIME\x01",
+            ":alice!u@h PRIVMSG +me :\x01CLIENTINFO\x01",
+            ":alice!u@h PRIVMSG @me :\x01VERSION\x01",
+            ":alice!u@h PRIVMSG me :\x01VERSION",
+            ":alice!u@h PRIVMSG me :\x01VERSION\x01trailing",
+            ":alice!u@h PRIVMSG me :VERSION",
+            ":ME!u@h PRIVMSG me :\x01VERSION\x01",
+            ":alice!u@h NOTICE me :\x01PING response\x01",
+        ]) {
+            client.ctcpReplyNotBeforeMs = 0;
+            const before = historyWrites(client).length;
+            receive(line);
+            results ~= Ircv3Check("CTCP nonrequest emits no automatic reply: " ~ line,
+                historyWrites(client).length == before && client.ctcpReplyNotBeforeMs == 0);
+        }
+        client.ctcpReplyNotBeforeMs = 0;
+        const before = historyWrites(client).length;
+        receive(":s BATCH +ctcp-history chathistory alice");
+        receive("@batch=ctcp-history :alice!u@h PRIVMSG me :\x01VERSION\x01");
+        receive("@batch=ctcp-history :bob!u@h PRIVMSG me :\x01PING historical\x01");
+        receive(":s BATCH -ctcp-history");
+        results ~= Ircv3Check("replayed CTCP requests consume no reply slot and emit no NOTICE",
+            historyWrites(client).length == before && client.ctcpReplyNotBeforeMs == 0);
     }
     {
         NetworkConfig cfg;

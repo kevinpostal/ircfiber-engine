@@ -551,7 +551,7 @@ private void handleAdmittedControlMessage(ref EngineContext ctx, ControlMessage 
                 auto id = parseUUID(msg.networkId[]);
                 auto row = ctx.networkRepo.findByIdWithUser(id);
                 const hadLocalHistory = ctx.connManager.hasNetworkHistory(id);
-                if (hadLocalHistory && !ctx.connManager.stopNetworkForMove(id, 60.seconds)) {
+                if (hadLocalHistory && !ctx.connManager.stopNetworkForMove(id, 60.seconds, msg.reason)) {
                     retainNetworkWriteUncertainty(writer);
                     throw new Exception("disconnect source quiescence unproven; inspect holder and irc:routing:dials");
                 }

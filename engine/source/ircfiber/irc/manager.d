@@ -9,7 +9,8 @@ import vibe.core.log;
 
 import ircfiber.models.irc_event : IRCRawEvent;
 import ircfiber.models.network : Network, NetworkConfig, TLSMode;
-import ircfiber.irc.connection : PersistentIRCClient, HistoryRequestResult, ClientMemoryCounters;
+import ircfiber.irc.connection : PersistentIRCClient, HistoryRequestResult, ClientMemoryCounters,
+    DEFAULT_QUIT_REASON;
 import ircfiber.irc.bnc_ownership : BncCommandOwner;
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.holder_client : HolderClient, HolderEntry, AttachResult;
@@ -578,12 +579,13 @@ final class ConnectionManager {
 
     /// Positive source closure, bounded independently of the control consumer.
     /// Missing/untracked generations and ambiguous IPC are not closure proof.
-    bool stopNetworkForMove(UUID networkId, Duration timeout) {
+    bool stopNetworkForMove(UUID networkId, Duration timeout, string quitReason = "") {
         import vibe.core.core : sleep;
         import core.time : msecs;
         import ircfiber.irc.dial_guard : networkDialsQuiescent;
         import ircfiber.term_signal : termSignal;
         const key = networkId.toString();
+        const reason = quitReason.length ? quitReason : DEFAULT_QUIT_REASON;
         if (terminating || termSignal() != 0 || holder is null || key !in knownNetworks
                 || key in moveStops) return false;
         moveStops[key] = true;
@@ -600,7 +602,7 @@ final class ConnectionManager {
         if (auto old = key in retiredClients) generations ~= *old;
         if (auto client = key in clients) generations ~= *client;
         foreach (client; generations) client.requestMoveStop();
-        foreach (client; generations) client.stop();
+        foreach (client; generations) client.stop(reason);
         while (true) {
             if (terminating || termSignal() != 0 || Clock.currTime >= deadline) return false;
             bool quiet = true;
@@ -613,7 +615,7 @@ final class ConnectionManager {
         foreach (entry; holder.scan()) {
             if (Clock.currTime >= deadline || terminating || termSignal() != 0) return false;
             if (entry.tag.networkId == key && entry.state == "open")
-                holder.closeClaim(entry.id, entry.instance, entry.connectedAtMs, "routing move");
+                holder.closeClaim(entry.id, entry.instance, entry.connectedAtMs, reason);
         }
         if (Clock.currTime >= deadline || terminating || termSignal() != 0) return false;
         foreach (entry; holder.scan())
