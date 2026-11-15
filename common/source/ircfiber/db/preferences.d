@@ -174,6 +174,7 @@ immutable ClientPrefSpec[] CLIENT_PREFS = [
     ClientPrefSpec("defaultScrollPreset", ClientPrefKind.int_, null, 0, 4),
     ClientPrefSpec("inlineImages", ClientPrefKind.bool_),
     ClientPrefSpec("inlineVideos", ClientPrefKind.bool_),
+    ClientPrefSpec("inlineTweets", ClientPrefKind.bool_),
     ClientPrefSpec("inlinePastes", ClientPrefKind.bool_),
     ClientPrefSpec("autoplayMedia", ClientPrefKind.bool_),
     ClientPrefSpec("linkPreviewSize", ClientPrefKind.enum_, ["small", "medium", "large"]),
@@ -2596,7 +2597,7 @@ unittest {
     assert(err("theme", Json(null)) == "");
 
     auto unknown = Json.emptyObject;
-    unknown["inlineTweets"] = Json(true);
+    unknown["inlineSocial"] = Json(true);
     unknown["customCSS"] = Json("body{display:none}");
     assert(checkClientPrefsPatch(unknown, any, field) == "" && !any, "unknown keys alone are not a client pref");
     unknown["inlineImages"] = Json(false);
@@ -2612,13 +2613,13 @@ unittest {
     auto patch = Json.emptyObject;
     patch["textSize"] = Json(null);
     patch["compactMode"] = Json(true);
-    patch["inlineTweets"] = Json(true);
+    patch["inlineSocial"] = Json(true);
     patch["customCSS"] = Json("body{display:none}");
     applyClientPrefsPatch(prefs, patch);
     assert(prefs["theme"].get!string == "gruvbox");
     assert("textSize" !in prefs, "null deletes the key");
     assert(prefs["compactMode"].get!bool);
-    assert("inlineTweets" !in prefs);
+    assert("inlineSocial" !in prefs);
     assert("customCSS" !in prefs);
     assert(base["textSize"].get!string == "s" && "compactMode" !in base, "the old object is untouched");
     applyClientPrefsPatch(prefs, parseJsonString(`{"theme":null}`));
@@ -2663,7 +2664,7 @@ unittest {
     auto badCp = Json.emptyObject;
     badCp["theme"] = Json("sand");
     badCp["textSize"] = Json("l");
-    badCp["inlineTweets"] = Json(true);
+    badCp["inlineSocial"] = Json(true);
     badCp["customCSS"] = Json("body{display:none}");
     auto j = Json.emptyObject;
     j["clientPrefs"] = badCp;
