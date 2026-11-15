@@ -50,6 +50,7 @@ final class ArchiveControl {
     private ulong lastGapCount;
     private string[1_024] gapNoticeNetworks;
     private long[1_024] gapNoticeTimes;
+    private size_t[1_024] gapNoticeSignatures;
     private size_t nextGapNoticeSlot;
     private struct ScopeRegistration {
         string networkId, preparedOwnerId, validatedOwnerId;
@@ -970,10 +971,14 @@ LUA", ["irc:archive:pins:" ~ ctx.localServer.serverId], cast(string[])[]);
         }
     }
 
-    private void publishGapNotice(ref EngineContext ctx, string networkId) {
+    /// The gap ledger is durable and never shrinks, so "a gap exists" stays true forever.
+    /// Notify once per network per ledger change (new gap entry), not on a timer; the
+    /// 5-minute floor only bounds bursts of distinct new gaps.
+    private void publishGapNotice(ref EngineContext ctx, string networkId, size_t signature) {
         size_t slot = size_t.max;
         foreach (i, id; gapNoticeNetworks) if (id == networkId) { slot = i; break; }
-        if (slot != size_t.max && nowMs() - gapNoticeTimes[slot] < 300_000) return;
+        if (slot != size_t.max && (gapNoticeSignatures[slot] == signature
+                || nowMs() - gapNoticeTimes[slot] < 300_000)) return;
         foreach (net; ctx.connManager.getNetworks()) {
             if (net.config.id.toString() != networkId) continue;
             auto notice = IRCRawEvent.makeServerLog(net.config.name, networkId, "error",
@@ -986,6 +991,7 @@ LUA", ["irc:archive:pins:" ~ ctx.localServer.serverId], cast(string[])[]);
                 gapNoticeNetworks[slot] = networkId;
             }
             gapNoticeTimes[slot] = nowMs();
+            gapNoticeSignatures[slot] = signature;
             return;
         }
     }
@@ -1001,7 +1007,10 @@ redis.call('SETEX', KEYS[1], 90, ARGV[1])
 redis.call('EXPIRE', KEYS[2], 604800)
 return '1'
 LUA", [archiveProjectionKey(n.serverId, n.networkId), archiveOwnerKey(n.networkId)], [projection.toString()]);
-        if (n.gapLength) publishGapNotice(ctx, n.networkId);
+        if (n.gapLength && n.gapLength <= n.gaps.length) {
+            const last = n.gaps[n.gapLength - 1];
+            publishGapNotice(ctx, n.networkId, hashOf(last.fromMs, hashOf(last.reason, n.gapLength)));
+        }
     }
 }
 
