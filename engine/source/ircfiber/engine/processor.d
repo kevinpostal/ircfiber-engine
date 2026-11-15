@@ -1,6 +1,9 @@
 module ircfiber.engine.processor;
 
-import vibe.core.core : runTask, yield;
+import vibe.core.channel : Channel, createChannel;
+import vibe.core.core : runTask, sleep, yield;
+import core.time : msecs;
+import std.algorithm.mutation : move;
 import vibe.core.log;
 
 import std.uuid : UUID, parseUUID;
@@ -20,6 +23,27 @@ import ircfiber.engine.archive_spool : ArchiveAdmission;
 import ircfiber.logging : logJsonMap;
 import std.datetime : Clock;
 import std.conv : to;
+
+private enum PUBLISH_AND_STREAM_LUA =
+    "redis.call('PUBLISH', KEYS[1], ARGV[1]) "
+    ~ "redis.call('LPUSH', KEYS[2], ARGV[1]) "
+    ~ "redis.call('LTRIM', KEYS[2], 0, 999) "
+    ~ "redis.call('EXPIRE', KEYS[2], ARGV[2]) "
+    ~ "return 1";
+
+/// Live publish plus resumable user-stream append in one Redis round trip.
+private void publishAndStream(ref EngineContext ctx, string userId, string msg) {
+    try ctx.redis.getDb().eval!long(PUBLISH_AND_STREAM_LUA,
+        [RedisKeys.events(userId), RedisKeys.userStream(userId)],
+        [msg, StateTTL.USER_STREAM_TTL.to!string]);
+    catch (Exception e) logWarn("Live publish/stream append failed for %s: %s", userId, e.msg);
+}
+
+/// Non-throwing UUID parse for hot per-event paths.
+private bool tryParseNetworkId(string id, out UUID uuid) nothrow {
+    try { uuid = parseUUID(id[]); return true; }
+    catch (Exception) { return false; }
+}
 
 private long lastArchiveRejectionNotice;
 private void noteArchiveAdmission(ArchiveAdmission admission) {
@@ -217,6 +241,375 @@ private bool isTransientServerLogPhase(ref IRCRawEvent event) nothrow @safe {
     return false;
 }
 
+/// Processes one event on its owner's shard worker; never throws.
+/// The ARCHIVE_SHUTDOWN_BARRIER is handled by the dispatcher, not here.
+private void processEvent(ref EngineContext ctx, ref IRCRawEvent event, string serverId,
+        ProcessorState state) {
+    bool storageResolved;
+    try {
+        storageResolved = false;
+
+        if (event.command == "ARCHIVE_MOVE_BARRIER") {
+            storageResolved = true;
+            if (ctx.archiveControl !is null) ctx.archiveControl.consumeMoveBarrier(ctx, event);
+            return;
+        }
+
+        if (event.command == "ARCHIVE_CONTROL") {
+            storageResolved = true;
+            if (ctx.archiveControl !is null) ctx.archiveControl.consume(ctx, event);
+            return;
+        }
+
+        // A network removed on this engine keeps emitting for a
+        // moment: stopping the client produces the QUIT echo and
+        // the server's `ERROR :Quit:`. Persisting those re-creates
+        // the scrollback the delete path just cleared, which left a
+        // deleted network's rooms readable at
+        // /irc/<name>/channel/%23chan. Nothing downstream wants
+        // them, so drop them here — before the eid is spent.
+        if (ctx.connManager !is null && ctx.connManager.isRemoved(event.networkId)) {
+            logDebug("Dropping %s for removed network %s",
+                event.command, event.networkId);
+            return;
+        }
+
+        if (event.command == "HISTORY_CHECKPOINT") {
+            consumeHistoryCheckpoint(ctx, event, state.failedHistoryStorage);
+            return;
+        }
+        if (event.command == "BNC_RESPONSE" || event.command == "BNC_PRESENCE") {
+            storageResolved = true;
+            publishPrivateBncEvent(ctx, event);
+            return;
+        }
+        const historical = isHistorical(event);
+
+        // Internal identity changes refresh proof immediately, without
+        // exposing a synthetic chat event or spending a history eid.
+        if (!historical && event.command == "own_prefix") {
+            UUID ownNid;
+            Network ownNet;
+            if (tryParseNetworkId(event.networkId, ownNid)
+                    && ctx.connManager.tryGetNetwork(ownNid, ownNet))
+                writeStateSnapshotForNetwork(ctx, ownNet, serverId);
+            return;
+        }
+
+        // IRCCloud-style: assign a global sequential eid to every
+        // event. This is the primary key for pagination, dedup,
+        // and stream resume — always present, never missing.
+        event.eid = ctx.redis.getDb().incr(RedisKeys.globalEid());
+        logDebug("Engine event [server=%s]: %s %s (eid=%d)", serverId, event.network, event.command, event.eid);
+
+        // Publish-only events: assigned an eid and published live,
+        // but never written to Redis scrollback, Mongo, or the user
+        // stream.
+        //
+        // CHANNEL_LIST chunks are a live reply to a /LIST request,
+        // not scrollback (a 20k channel network would otherwise fill
+        // all three sinks). WHO replies (352/354/315) are the same:
+        // the connection only publishes the ones answering a
+        // client's own WHO, and a big channel's roster would
+        // otherwise land row by row in the `_server` scrollback.
+        //
+        // Non-ACTION CTCP (connection.d tags it `ctcp`, routed to
+        // `_server`) is a live server-log diagnostic. Its raw
+        // parameters can carry PING tokens or DCC addresses, so it
+        // is deliberately never persisted anywhere.
+        //
+        // Safe identity/epoch and capability invalidations for the
+        // owner's browsers: live only, never scrollback, Mongo or
+        // the user stream.
+        const bool publishOnly = event.command == "CHANNEL_LIST"
+            || event.command == "352" || event.command == "354"
+            || event.command == "315"
+            || event.command == "SERVICES_STATE"
+            || event.command == "SERVICES_INVALIDATED"
+            || event.getTag("ctcp").length > 0;
+
+        // Rename Redis immediately and journal the cutoff mutation at
+        // this FIFO position before appending the renamed event.
+        // A frozen purge follows the physical Redis lineage across
+        // later successful renames, not the reusable channel spelling.
+        if (!historical && event.command == "RENAME") {
+            try {
+                auto rp = event.getParams();
+                if (rp.length >= 2 && rp[0].length > 0 && rp[1].length > 0) {
+                    ctx.bufferManager.renameBuffer(serverId, event.networkId, rp[0], rp[1]);
+                    archiveRename(ctx, serverId, event.networkId, rp[0], rp[1], event.eid);
+                }
+            } catch (Exception e) {
+                logWarn("RENAME storage rename failed: %s", e.msg);
+            }
+        }
+
+        // Store buffer with server namespace (prevents ID collision).
+        // Redis is the hot scrollback/checkpoint authority. Journal
+        // admission below is independent and reports gaps explicitly.
+        //
+        // A confirmed duplicate is suppressed across all sinks. A
+        // storage exception is NOT a duplicate verdict: live messages
+        // must still reach the independent journal and publication
+        // paths. Historical pages remain unacknowledged and retryable.
+        bool stored = true;
+        bool scrollbackFailed;
+        if (!publishOnly) {
+            try stored = ctx.bufferManager.appendIRCEvent(event, serverId);
+            catch (Exception e) {
+                scrollbackFailed = true;
+                noteScrollbackFailure(event, e.msg);
+            }
+        }
+        storageResolved = true;
+        if (scrollbackFailed) {
+            noteHistoryStorageFailure(ctx, event, state.failedHistoryStorage);
+            if (historical) return;
+        } else if (!publishOnly) {
+            noteAcceptedLiveHistory(ctx, event);
+        }
+        if (!stored) {
+            logDebug("Dropping duplicate %s eid=%d for %s/%s (already in scrollback)",
+                event.command, event.eid, event.network,
+                event.channel.length ? event.channel : "_server");
+            return;
+        }
+
+        // Archive admission is bounded/nonblocking. Redis acceptance,
+        // checkpoints and live delivery do not wait for disk or Mongo.
+        Network matchedNet;
+        bool foundNet = false;
+        string userIdStr = "";
+        UUID eventNid;
+        if (ctx.connManager !is null && tryParseNetworkId(event.networkId, eventNid)
+                && ctx.connManager.tryGetNetwork(eventNid, matchedNet)) {
+            foundNet = true;
+            userIdStr = ctx.connManager.getOwnerId(eventNid);
+        }
+        // stopNetworkForMove removes the active client only after its
+        // producer loops stop. Preserve canonical attribution for the
+        // already-queued tail until the final processor barrier.
+        if (!userIdStr.length && ctx.archiveControl !is null)
+            userIdStr = ctx.archiveControl.movingOwner(event.networkId);
+        auto json = event.toCompactJson();
+        if (userIdStr.length > 0 && !publishOnly
+                && !isTransientServerLogPhase(event) && event.getTag("archive_gap").length == 0) {
+            auto admission = ArchiveAdmission.unavailable;
+            if (ctx.archiveSpool !is null) {
+                string pendingOwner;
+                if (ctx.archiveControl !is null)
+                    pendingOwner = ctx.archiveControl.pendingScopeOwner(event.networkId, userIdStr);
+                if (ctx.archiveControl !is null
+                        && (ctx.archiveControl.scopeReady(event.networkId) || pendingOwner.length))
+                    admission = ctx.archiveSpool.tryAppend(serverId, event.networkId,
+                        event.channel.length ? normalizeChannelName(event.channel) : "_server",
+                        event.eid, json.toString(), pendingOwner);
+                else ctx.archiveSpool.reportAdmissionUnavailable();
+            }
+            noteArchiveAdmission(admission);
+        }
+
+        // Only the live/user-stream envelope gets publication fields.
+        json["y"] = "irc_event";
+        json["serverId"] = serverId;
+        auto msg = json.toString();
+
+        if (userIdStr.length > 0) {
+            if (publishOnly) ctx.redis.publish(RedisKeys.events(userIdStr), msg);
+            else publishAndStream(ctx, userIdStr, msg);
+        }
+
+        if (!historical && foundNet && (event.command == "001"
+            || event.command == "CONNECT" || event.command == "CONNECTED"
+            || event.command == "DISCONNECT" || event.command == "DISCONNECTED"
+            || event.command == "JOIN"
+            || event.command == "PART" || event.command == "KICK"
+            || event.command == "366"
+            // account-notify: a login/logout must republish the
+            // `accounts` map so member-list badges don't wait for
+            // the next JOIN/heartbeat.
+            || event.command == "ACCOUNT"
+            // End of a client's WHO: a `WHO #chan %na` (the E2EE
+            // roster probe) has filled `accounts` for the channel.
+            || event.command == "315"
+            // draft/metadata-2: a key change republishes the
+            // `userMetadata` / `channelMetadata` maps so a
+            // reloading client sees it at once.
+            || event.command == "METADATA"
+            // Member state the snapshot carries (away, host,
+            // realname, caps, renamed channel, MONITOR status).
+            || event.command == "AWAY" || event.command == "CHGHOST"
+            || event.command == "NICK" || event.command == "you_nickchange"
+            || event.command == "396"
+            || event.command == "SETNAME" || event.command == "CAP"
+            || event.command == "RENAME"
+            || event.command == "730" || event.command == "731"
+            // W1-T01: CONNECTION_RETRY_STATUS + CONNECTION_FAIL
+            // are the synthetic events that carry structured
+            // retry/fail payloads to the frontend. Writing a
+            // snapshot immediately on receipt ensures the WS
+            // sync payload's `retryStatus` / `failInfo` fields
+            // are fresh for any new client connection without
+            // waiting for the 10s heartbeat cycle. Without
+            // this the user-facing banner can lag the engine
+            // state by up to 10s on a fast-fail network.
+            || event.command == "CONNECTION_RETRY_STATUS"
+            || event.command == "CONNECTION_FAIL"
+            // Observed services login / connection epoch changed.
+            || event.command == "SERVICES_STATE")) {
+            try {
+                writeStateSnapshotForNetwork(ctx, matchedNet, serverId);
+            } catch (Exception e) {
+                logWarn("Failed to snapshot state for %s: %s", event.network, e.msg);
+            }
+        }
+
+        // NICK-follow storage rename (IRCCloud rename model): when a
+        // DM counterparty changes nick, rename Redis and journal the
+        // ordered Mongo cutoff mutation so history follows
+        // the conversation across reloads/backfill. Only for the
+        // base event the connection tagged `query_follow`, i.e. the
+        // renamer is verifiably the person the DM was held with
+        // (connection.d `dmFollowsNick`) — never on the nick alone,
+        // and never on the per-channel dups.
+        // Runs INLINE (not runTask): a follow-up PRIVMSG under the
+        // new nick must append after the rename, otherwise RENAMENX
+        // sees an existing destination and the history splits.
+        // Best-effort try/catch: storage must never break the loop.
+        if (!historical && userIdStr.length > 0 && event.command == "NICK" && event.channel.length == 0
+            && event.getTag("query_follow").length > 0) {
+            try {
+                auto nickParams = event.getParams();
+                if (nickParams.length > 0 && event.nick.length > 0) {
+                    string newNick = nickParams[$ - 1];
+                    if (newNick.length > 0) {
+                        ctx.bufferManager.renameBuffer(
+                            serverId, event.networkId, event.nick, newNick);
+                        archiveRename(ctx, serverId, event.networkId, event.nick, newNick, event.eid);
+                    }
+                }
+            } catch (Exception e) {
+                logWarn("NICK storage rename failed: %s", e.msg);
+            }
+        }
+
+        // Persist membership changes and correlated pending JOIN refusals.
+        if (!historical && foundNet && (event.command == "JOIN" || event.command == "PART" || event.command == "KICK"
+                         || event.command == "RENAME" || event.persistChannelIntent)) {
+            auto client = ctx.connManager.getClient(matchedNet.config.id);
+            if (client !is null) {
+                bool isOwnEvent = event.persistChannelIntent;
+                if (event.command == "JOIN" && event.nick == client.getCurrentNick) {
+                    isOwnEvent = true;
+                } else if (event.command == "PART" && event.nick == client.getCurrentNick) {
+                    isOwnEvent = true;
+                } else if (event.command == "KICK") {
+                    auto params = event.getParams();
+                    if (params.length >= 2 && params[1] == client.getCurrentNick) {
+                        isOwnEvent = true;
+                    }
+                } else if (event.command == "RENAME") {
+                    // Whoever renamed it, our autojoin list followed.
+                    isOwnEvent = true;
+                }
+                if (isOwnEvent) {
+                    // Mongo can yield while the event-drain loop
+                    // advances. Task arguments keep this admission's
+                    // identity independent of the mutable drain locals.
+                    auto ctxp = &ctx;
+                    runTask((UUID networkId, string networkIdStr, string networkName,
+                            PersistentIRCClient originClient) nothrow {
+                        try {
+                            import ircfiber.irc.dial_guard : ownsNetworkForDial;
+                            const ownerIdStr = ctxp.connManager.getOwnerId(networkId);
+                            auto row = ctxp.networkRepo.findByIdWithUser(networkId);
+                            if (ownerIdStr.length > 0 && row.userId.toString() == ownerIdStr
+                                    && ownsNetworkForDial(ctxp.redis, serverId, networkIdStr)) {
+                                // Runtime channel bookkeeping must not
+                                // write an older routing/IID/tenant copy.
+                                row.config.autoJoinChannels = originClient.getConfig.autoJoinChannels;
+                                row.config.partedChannels = originClient.getConfig.partedChannels;
+                                ctxp.networkRepo.save(row.config, row.userId);
+                            }
+                        } catch (Exception e) {
+                            logWarn("Failed to persist autoJoinChannels for %s: %s", networkName, e.msg);
+                        }
+                    }, matchedNet.config.id, event.networkId, matchedNet.config.name, client);
+                }
+            }
+        }
+    } catch (Exception e) {
+        if (!storageResolved && event.command != "HISTORY_CHECKPOINT") {
+            try noteHistoryStorageFailure(ctx, event, state.failedHistoryStorage);
+            catch (Exception failure) logWarn("Could not attribute history storage failure: %s", failure.msg);
+        }
+        logError("Engine event processor error: %s", e.msg);
+    }
+}
+
+private enum PROCESSOR_SHARDS = 16;
+/// Bounded: a full shard blocks the dispatcher (backpressure, no drops).
+private enum SHARD_QUEUE_EVENTS = 2048;
+private enum BACKLOG_LOG_MIN_PENDING = 1000;
+private enum BACKLOG_LOG_INTERVAL_MS = 10_000;
+
+private final class ProcessorShard {
+    Channel!(IRCRawEvent, SHARD_QUEUE_EVENTS) queue;
+    size_t pending;
+}
+
+private final class ProcessorState {
+    ProcessorShard[PROCESSOR_SHARDS] shards;
+    bool[string] failedHistoryStorage;
+    ulong processed;
+}
+
+/// FNV-1a 32-bit; stable shard for an owner key.
+size_t shardIndexOf(const(char)[] key) pure nothrow @safe @nogc {
+    uint h = 2166136261u;
+    foreach (c; key) {
+        h ^= c;
+        h *= 16777619u;
+    }
+    return h % PROCESSOR_SHARDS;
+}
+
+/// All events of one owner share a shard so their eids reach the owner's user
+/// stream in increasing order (the gateway drops live frames with
+/// `eid <= lastDeliveredEid`). Barriers carry their network's id and route
+/// like that network's events.
+private string shardKeyOf(ref EngineContext ctx, ref const IRCRawEvent event) {
+    UUID nid;
+    string owner;
+    if (ctx.connManager !is null && tryParseNetworkId(event.networkId, nid))
+        owner = ctx.connManager.getOwnerId(nid);
+    if (!owner.length && ctx.archiveControl !is null)
+        owner = ctx.archiveControl.movingOwner(event.networkId);
+    return owner.length ? owner : event.networkId;
+}
+
+private bool anyPending(ProcessorState state) nothrow @safe @nogc {
+    foreach (shard; state.shards) if (shard.pending > 0) return true;
+    return false;
+}
+
+private void shardWorker(EngineContext* ctx, string serverId, ProcessorState state,
+        ProcessorShard shard) nothrow {
+    try {
+        while (true) {
+            IRCRawEvent event;
+            // Blocks while empty; false only once closed and drained.
+            if (!shard.queue.tryConsumeOne(event)) return;
+            try processEvent(*ctx, event, serverId, state);
+            catch (Exception e) logError("Engine event processor error: %s", e.msg);
+            --shard.pending;
+            ++state.processed;
+        }
+    } catch (Exception e) {
+        try logError("Shard worker stopped: %s", e.msg); catch (Exception) {}
+    }
+}
+
 /**
  * Event processor for decentralized connection server.
  *
@@ -227,337 +620,64 @@ private bool isTransientServerLogPhase(ref IRCRawEvent event) nothrow @safe {
  * Accepted non-transient events enter the bounded durable journal for strict
  * Mongo replay. Rejected archival admission is an explicit gap, never a reason
  * to hold live IRC delivery or create waiting per-event fibers.
+ *
+ * A dispatcher drains the shared event channel and routes every event to one
+ * of PROCESSOR_SHARDS ordered workers by owner, so one owner's flood no longer
+ * serialises behind (or in front of) every other owner's events. Per-owner
+ * order is unchanged. ARCHIVE_SHUTDOWN_BARRIER is global: it is consumed only
+ * after every worker has finished everything dispatched before it.
  */
 void startEventProcessor(ref EngineContext ctx) {
     auto serverId = ctx.localServer.serverId;
-    bool[string] failedHistoryStorage;
+    auto state = new ProcessorState;
+    auto ctxp = &ctx;
+    foreach (ref shard; state.shards) {
+        shard = new ProcessorShard;
+        shard.queue = createChannel!(IRCRawEvent, SHARD_QUEUE_EVENTS)();
+        runTask(&shardWorker, ctxp, serverId, state, shard);
+    }
+    scope(exit) foreach (shard; state.shards) shard.queue.close();
 
+    ulong dispatched;
+    long lastBacklogLog;
     while (true) {
+        IRCRawEvent event;
+        if (!ctx.eventChannel.tryConsumeOne(event)) {
+            yield();
+            continue;
+        }
 
-        // Drain up to 50 events per iteration before yielding.  During
-        // ASCII art bursts (40+ PRIVMSG lines arriving in a single TCP
-        // read) this keeps all events in the same fiber slice so Redis
-        // operations can be batched by the client and the WebSocket
-        // gateway receives the burst as a contiguous stream.
-        foreach (batch; 0 .. 50) {
-            IRCRawEvent event;
-            bool storageResolved;
-            try {
-                storageResolved = false;
-                if (!ctx.eventChannel.tryConsumeOne(event)) break;
+        if (event.command == "ARCHIVE_SHUTDOWN_BARRIER") {
+            while (anyPending(state)) sleep(1.msecs);
+            if (ctx.archiveControl !is null && ctx.archiveControl.consumeShutdownBarrier(event))
+                return;
+            continue;
+        }
 
-                if (event.command == "ARCHIVE_SHUTDOWN_BARRIER") {
-                    storageResolved = true;
-                    if (ctx.archiveControl !is null && ctx.archiveControl.consumeShutdownBarrier(event))
-                        return;
-                    continue;
-                }
+        auto shard = state.shards[shardIndexOf(shardKeyOf(ctx, event))];
+        ++shard.pending;
+        shard.queue.put(event.move);
 
-                if (event.command == "ARCHIVE_MOVE_BARRIER") {
-                    storageResolved = true;
-                    if (ctx.archiveControl !is null) ctx.archiveControl.consumeMoveBarrier(ctx, event);
-                    continue;
+        // Same cadence as the former 50-event batch: keep a scheduler
+        // checkpoint while ingress stays full.
+        if (++dispatched % 50 == 0) {
+            yield();
+            size_t pending, deepest;
+            foreach (s; state.shards) {
+                pending += s.pending;
+                if (s.pending > deepest) deepest = s.pending;
+            }
+            if (pending >= BACKLOG_LOG_MIN_PENDING) {
+                const now = Clock.currTime.stdTime / 10_000 - 62_135_596_800_000L;
+                if (now - lastBacklogLog >= BACKLOG_LOG_INTERVAL_MS) {
+                    lastBacklogLog = now;
+                    logJsonMap("warn", "engine", "Event processor backlog",
+                        ["event":"processor_backlog", "pending":pending.to!string,
+                         "deepestShard":deepest.to!string, "shards":PROCESSOR_SHARDS.to!string,
+                         "processed":state.processed.to!string]);
                 }
-
-                if (event.command == "ARCHIVE_CONTROL") {
-                    storageResolved = true;
-                    if (ctx.archiveControl !is null) ctx.archiveControl.consume(ctx, event);
-                    continue;
-                }
-
-                // A network removed on this engine keeps emitting for a
-                // moment: stopping the client produces the QUIT echo and
-                // the server's `ERROR :Quit:`. Persisting those re-creates
-                // the scrollback the delete path just cleared, which left a
-                // deleted network's rooms readable at
-                // /irc/<name>/channel/%23chan. Nothing downstream wants
-                // them, so drop them here — before the eid is spent.
-                if (ctx.connManager !is null && ctx.connManager.isRemoved(event.networkId)) {
-                    logDebug("Dropping %s for removed network %s",
-                        event.command, event.networkId);
-                    continue;
-                }
-
-                if (event.command == "HISTORY_CHECKPOINT") {
-                    consumeHistoryCheckpoint(ctx, event, failedHistoryStorage);
-                    continue;
-                }
-                if (event.command == "BNC_RESPONSE" || event.command == "BNC_PRESENCE") {
-                    storageResolved = true;
-                    publishPrivateBncEvent(ctx, event);
-                    continue;
-                }
-                const historical = isHistorical(event);
-
-                // Internal identity changes refresh proof immediately, without
-                // exposing a synthetic chat event or spending a history eid.
-                if (!historical && event.command == "own_prefix") {
-                    foreach (net; ctx.connManager.getNetworks()) {
-                        if (net.config.id.toString() != event.networkId) continue;
-                        writeStateSnapshotForNetwork(ctx, net, serverId);
-                        break;
-                    }
-                    continue;
-                }
-
-                // IRCCloud-style: assign a global sequential eid to every
-                // event. This is the primary key for pagination, dedup,
-                // and stream resume — always present, never missing.
-                event.eid = ctx.redis.getDb().incr(RedisKeys.globalEid());
-                logDebug("Engine event [server=%s]: %s %s (eid=%d)", serverId, event.network, event.command, event.eid);
-
-                // Publish-only events: assigned an eid and published live,
-                // but never written to Redis scrollback, Mongo, or the user
-                // stream.
-                //
-                // CHANNEL_LIST chunks are a live reply to a /LIST request,
-                // not scrollback (a 20k channel network would otherwise fill
-                // all three sinks). WHO replies (352/354/315) are the same:
-                // the connection only publishes the ones answering a
-                // client's own WHO, and a big channel's roster would
-                // otherwise land row by row in the `_server` scrollback.
-                //
-                // Non-ACTION CTCP (connection.d tags it `ctcp`, routed to
-                // `_server`) is a live server-log diagnostic. Its raw
-                // parameters can carry PING tokens or DCC addresses, so it
-                // is deliberately never persisted anywhere.
-                //
-                // Safe identity/epoch and capability invalidations for the
-                // owner's browsers: live only, never scrollback, Mongo or
-                // the user stream.
-                const bool publishOnly = event.command == "CHANNEL_LIST"
-                    || event.command == "352" || event.command == "354"
-                    || event.command == "315"
-                    || event.command == "SERVICES_STATE"
-                    || event.command == "SERVICES_INVALIDATED"
-                    || event.getTag("ctcp").length > 0;
-
-                // Rename Redis immediately and journal the cutoff mutation at
-                // this FIFO position before appending the renamed event.
-                // A frozen purge follows the physical Redis lineage across
-                // later successful renames, not the reusable channel spelling.
-                if (!historical && event.command == "RENAME") {
-                    try {
-                        auto rp = event.getParams();
-                        if (rp.length >= 2 && rp[0].length > 0 && rp[1].length > 0) {
-                            ctx.bufferManager.renameBuffer(serverId, event.networkId, rp[0], rp[1]);
-                            archiveRename(ctx, serverId, event.networkId, rp[0], rp[1], event.eid);
-                        }
-                    } catch (Exception e) {
-                        logWarn("RENAME storage rename failed: %s", e.msg);
-                    }
-                }
-
-                // Store buffer with server namespace (prevents ID collision).
-                // Redis is the hot scrollback/checkpoint authority. Journal
-                // admission below is independent and reports gaps explicitly.
-                //
-                // A confirmed duplicate is suppressed across all sinks. A
-                // storage exception is NOT a duplicate verdict: live messages
-                // must still reach the independent journal and publication
-                // paths. Historical pages remain unacknowledged and retryable.
-                bool stored = true;
-                bool scrollbackFailed;
-                if (!publishOnly) {
-                    try stored = ctx.bufferManager.appendIRCEvent(event, serverId);
-                    catch (Exception e) {
-                        scrollbackFailed = true;
-                        noteScrollbackFailure(event, e.msg);
-                    }
-                }
-                storageResolved = true;
-                if (scrollbackFailed) {
-                    noteHistoryStorageFailure(ctx, event, failedHistoryStorage);
-                    if (historical) continue;
-                } else if (!publishOnly) {
-                    noteAcceptedLiveHistory(ctx, event);
-                }
-                if (!stored) {
-                    logDebug("Dropping duplicate %s eid=%d for %s/%s (already in scrollback)",
-                        event.command, event.eid, event.network,
-                        event.channel.length ? event.channel : "_server");
-                    continue;
-                }
-
-                // Archive admission is bounded/nonblocking. Redis acceptance,
-                // checkpoints and live delivery do not wait for disk or Mongo.
-                Network matchedNet;
-                bool foundNet = false;
-                string userIdStr = "";
-                foreach (net; ctx.connManager.getNetworks()) {
-                    if (net.config.id.toString() == event.networkId) {
-                        userIdStr = ctx.connManager.getOwnerId(net.config.id);
-                        matchedNet = net;
-                        foundNet = true;
-                        break;
-                    }
-                }
-                // stopNetworkForMove removes the active client only after its
-                // producer loops stop. Preserve canonical attribution for the
-                // already-queued tail until the final processor barrier.
-                if (!userIdStr.length && ctx.archiveControl !is null)
-                    userIdStr = ctx.archiveControl.movingOwner(event.networkId);
-                auto json = event.toCompactJson();
-                if (userIdStr.length > 0 && !publishOnly
-                        && !isTransientServerLogPhase(event) && event.getTag("archive_gap").length == 0) {
-                    auto admission = ArchiveAdmission.unavailable;
-                    if (ctx.archiveSpool !is null) {
-                        string pendingOwner;
-                        if (ctx.archiveControl !is null)
-                            pendingOwner = ctx.archiveControl.pendingScopeOwner(event.networkId, userIdStr);
-                        if (ctx.archiveControl !is null
-                                && (ctx.archiveControl.scopeReady(event.networkId) || pendingOwner.length))
-                            admission = ctx.archiveSpool.tryAppend(serverId, event.networkId,
-                                event.channel.length ? normalizeChannelName(event.channel) : "_server",
-                                event.eid, json.toString(), pendingOwner);
-                        else ctx.archiveSpool.reportAdmissionUnavailable();
-                    }
-                    noteArchiveAdmission(admission);
-                }
-
-                // Only the live/user-stream envelope gets publication fields.
-                json["y"] = "irc_event";
-                json["serverId"] = serverId;
-                auto msg = json.toString();
-
-                if (userIdStr.length > 0) {
-                    ctx.redis.publish(RedisKeys.events(userIdStr), msg);
-                    if (!publishOnly) {
-                        auto streamKey = RedisKeys.userStream(userIdStr);
-                        ctx.redis.getDb().lpush(streamKey, msg);
-                        ctx.redis.getDb().ltrim(streamKey, 0, 999);
-                        ctx.redis.getDb().expire(streamKey, StateTTL.USER_STREAM_TTL);
-                    }
-                }
-
-                if (!historical && foundNet && (event.command == "001"
-                    || event.command == "CONNECT" || event.command == "CONNECTED"
-                    || event.command == "DISCONNECT" || event.command == "DISCONNECTED"
-                    || event.command == "JOIN"
-                    || event.command == "PART" || event.command == "KICK"
-                    || event.command == "366"
-                    // account-notify: a login/logout must republish the
-                    // `accounts` map so member-list badges don't wait for
-                    // the next JOIN/heartbeat.
-                    || event.command == "ACCOUNT"
-                    // End of a client's WHO: a `WHO #chan %na` (the E2EE
-                    // roster probe) has filled `accounts` for the channel.
-                    || event.command == "315"
-                    // draft/metadata-2: a key change republishes the
-                    // `userMetadata` / `channelMetadata` maps so a
-                    // reloading client sees it at once.
-                    || event.command == "METADATA"
-                    // Member state the snapshot carries (away, host,
-                    // realname, caps, renamed channel, MONITOR status).
-                    || event.command == "AWAY" || event.command == "CHGHOST"
-                    || event.command == "NICK" || event.command == "you_nickchange"
-                    || event.command == "396"
-                    || event.command == "SETNAME" || event.command == "CAP"
-                    || event.command == "RENAME"
-                    || event.command == "730" || event.command == "731"
-                    // W1-T01: CONNECTION_RETRY_STATUS + CONNECTION_FAIL
-                    // are the synthetic events that carry structured
-                    // retry/fail payloads to the frontend. Writing a
-                    // snapshot immediately on receipt ensures the WS
-                    // sync payload's `retryStatus` / `failInfo` fields
-                    // are fresh for any new client connection without
-                    // waiting for the 10s heartbeat cycle. Without
-                    // this the user-facing banner can lag the engine
-                    // state by up to 10s on a fast-fail network.
-                    || event.command == "CONNECTION_RETRY_STATUS"
-                    || event.command == "CONNECTION_FAIL"
-                    // Observed services login / connection epoch changed.
-                    || event.command == "SERVICES_STATE")) {
-                    try {
-                        writeStateSnapshotForNetwork(ctx, matchedNet, serverId);
-                    } catch (Exception e) {
-                        logWarn("Failed to snapshot state for %s: %s", event.network, e.msg);
-                    }
-                }
-
-                // NICK-follow storage rename (IRCCloud rename model): when a
-                // DM counterparty changes nick, rename Redis and journal the
-                // ordered Mongo cutoff mutation so history follows
-                // the conversation across reloads/backfill. Only for the
-                // base event the connection tagged `query_follow`, i.e. the
-                // renamer is verifiably the person the DM was held with
-                // (connection.d `dmFollowsNick`) — never on the nick alone,
-                // and never on the per-channel dups.
-                // Runs INLINE (not runTask): a follow-up PRIVMSG under the
-                // new nick must append after the rename, otherwise RENAMENX
-                // sees an existing destination and the history splits.
-                // Best-effort try/catch: storage must never break the loop.
-                if (!historical && userIdStr.length > 0 && event.command == "NICK" && event.channel.length == 0
-                    && event.getTag("query_follow").length > 0) {
-                    try {
-                        auto nickParams = event.getParams();
-                        if (nickParams.length > 0 && event.nick.length > 0) {
-                            string newNick = nickParams[$ - 1];
-                            if (newNick.length > 0) {
-                                ctx.bufferManager.renameBuffer(
-                                    serverId, event.networkId, event.nick, newNick);
-                                archiveRename(ctx, serverId, event.networkId, event.nick, newNick, event.eid);
-                            }
-                        }
-                    } catch (Exception e) {
-                        logWarn("NICK storage rename failed: %s", e.msg);
-                    }
-                }
-
-                // Persist membership changes and correlated pending JOIN refusals.
-                if (!historical && foundNet && (event.command == "JOIN" || event.command == "PART" || event.command == "KICK"
-                                 || event.command == "RENAME" || event.persistChannelIntent)) {
-                    auto client = ctx.connManager.getClient(matchedNet.config.id);
-                    if (client !is null) {
-                        bool isOwnEvent = event.persistChannelIntent;
-                        if (event.command == "JOIN" && event.nick == client.getCurrentNick) {
-                            isOwnEvent = true;
-                        } else if (event.command == "PART" && event.nick == client.getCurrentNick) {
-                            isOwnEvent = true;
-                        } else if (event.command == "KICK") {
-                            auto params = event.getParams();
-                            if (params.length >= 2 && params[1] == client.getCurrentNick) {
-                                isOwnEvent = true;
-                            }
-                        } else if (event.command == "RENAME") {
-                            // Whoever renamed it, our autojoin list followed.
-                            isOwnEvent = true;
-                        }
-                        if (isOwnEvent) {
-                            // Mongo can yield while the event-drain loop
-                            // advances. Task arguments keep this admission's
-                            // identity independent of the mutable drain locals.
-                            runTask((UUID networkId, string networkIdStr, string networkName,
-                                    PersistentIRCClient originClient) nothrow {
-                                try {
-                                    import ircfiber.irc.dial_guard : ownsNetworkForDial;
-                                    const ownerIdStr = ctx.connManager.getOwnerId(networkId);
-                                    auto row = ctx.networkRepo.findByIdWithUser(networkId);
-                                    if (ownerIdStr.length > 0 && row.userId.toString() == ownerIdStr
-                                            && ownsNetworkForDial(ctx.redis, serverId, networkIdStr)) {
-                                        // Runtime channel bookkeeping must not
-                                        // write an older routing/IID/tenant copy.
-                                        row.config.autoJoinChannels = originClient.getConfig.autoJoinChannels;
-                                        row.config.partedChannels = originClient.getConfig.partedChannels;
-                                        ctx.networkRepo.save(row.config, row.userId);
-                                    }
-                                } catch (Exception e) {
-                                    logWarn("Failed to persist autoJoinChannels for %s: %s", networkName, e.msg);
-                                }
-                            }, matchedNet.config.id, event.networkId, matchedNet.config.name, client);
-                        }
-                    }
-                }
-            } catch (Exception e) {
-                if (!storageResolved && event.command != "HISTORY_CHECKPOINT") {
-                    try noteHistoryStorageFailure(ctx, event, failedHistoryStorage);
-                    catch (Exception failure) logWarn("Could not attribute history storage failure: %s", failure.msg);
-                }
-                logError("Engine event processor error: %s", e.msg);
             }
         }
-        // Keep a scheduler checkpoint even while ingress remains full.
-        yield();
     }
 }
 

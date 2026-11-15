@@ -234,6 +234,13 @@ configuration "processor-ctcp-test" {
     versions "VibeUseFibers"
 }
 
+configuration "processor-shard-test" {
+    targetType "executable"
+    targetName "processor-shard-test"
+    mainSourceFile "source/processor_shard_test.d"
+    versions "VibeUseFibers"
+}
+
 configuration "janitor-safety-test" {
     targetType "executable"
     targetName "janitor-safety-test"

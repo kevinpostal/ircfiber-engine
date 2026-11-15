@@ -689,30 +689,34 @@ final class ConnectionManager {
         return null;
     }
 
+    private static Network snapshotNetwork(PersistentIRCClient client) {
+        Network net;
+        net.config = client.getConfig;
+        net.isConnected = client.getConnected;
+        net.status = client.getState.to!string;
+        net.currentNick = client.getCurrentNick;
+        return net;
+    }
+
+    /// One network without scanning every client; false when this engine does not run it.
+    bool tryGetNetwork(UUID networkId, out Network net) {
+        auto client = getClient(networkId);
+        if (client is null) return false;
+        net = snapshotNetwork(client);
+        return true;
+    }
+
     Network[] getNetworks() {
         Network[] result;
-        foreach (client; clients) {
-            Network net;
-            net.config = client.getConfig;
-            net.isConnected = client.getConnected;
-            net.status = client.getState.to!string;
-            net.currentNick = client.getCurrentNick;
-            result ~= net;
-        }
+        foreach (client; clients) result ~= snapshotNetwork(client);
         return result;
     }
 
     Network[] getNetworksForUser(UUID userId) {
         Network[] result;
         foreach (id, client; clients) {
-            if (networkOwners.get(id, UUID.init) == userId) {
-                Network net;
-                net.config = client.getConfig;
-                net.isConnected = client.getConnected;
-                net.status = client.getState.to!string;
-                net.currentNick = client.getCurrentNick;
-                result ~= net;
-            }
+            if (networkOwners.get(id, UUID.init) == userId)
+                result ~= snapshotNetwork(client);
         }
         return result;
     }

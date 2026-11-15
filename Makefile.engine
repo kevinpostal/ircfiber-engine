@@ -971,6 +971,11 @@ processor-ctcp-test: ## Test > Event processor publishes CTCP diagnostics live o
 	@$(DUB) build --config=processor-ctcp-test 2>&1 | tail -3
 	@timeout 60 ./engine/processor-ctcp-test
 
+processor-shard-test: ## Test > Event processor keeps per-owner order and reports flood throughput (needs local Redis + Mongo)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Processor shard/throughput tests  $(R)"
+	@$(DUB) build --config=processor-shard-test 2>&1 | tail -3
+	@timeout 240 ./engine/processor-shard-test
+
 janitor-test: ## Test > EngineJanitor basic reap (orphan → reaped, live → skipped)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  EngineJanitor basic-reap tests  $(R)"
 	@$(DUB) build --config=janitor-test 2>&1 | tail -3
