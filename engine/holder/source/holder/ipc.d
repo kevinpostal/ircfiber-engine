@@ -870,7 +870,10 @@ void runHolderMetaRegressions(string directory, scope void delegate(bool, string
 
     const before = sampleHeldMemory();
     auto upstream = listenTCP(0, (TCPConnection c) @trusted nothrow {
-        scope(exit) { try c.close(); catch (Exception) {} }
+        void closeUpstream() nothrow {
+            try { c.close(); } catch (Exception) {}
+        }
+        scope(exit) closeUpstream();
         try {
             ubyte[1024] bytes;
             while (c.waitForDataEx(Duration.max) == WaitForDataStatus.dataAvailable)
