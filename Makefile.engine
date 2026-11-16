@@ -991,6 +991,11 @@ janitor-safety-test: ## Test > EngineJanitor status / events / purgeLocalServerN
 	@$(DUB) build --config=janitor-safety-test 2>&1 | tail -3
 	@./engine/janitor-safety-test
 
+dial-guard-test: ## Test > Holder DIAL marker retirement (needs Redis on :6379)
+	@printf '\n%b\n' "$(_BCn)$(K)$(B)  dial_guard marker retirement tests  $(R)"
+	@$(DUB) build --config=dial-guard-test 2>&1 | tail -3
+	@./engine/dial-guard-test
+
 janitor-tests: ## Test > All EngineJanitor test suites (basic + lock + safety)
 	@./run-janitor-tests.sh
 fix-assignments: ## Operational > Rebuild irc:assignments from MongoDB (emergency recovery — does not disconnect IRC sessions)

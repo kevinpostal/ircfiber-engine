@@ -248,6 +248,13 @@ configuration "janitor-safety-test" {
     versions "VibeUseFibers"
 }
 
+configuration "dial-guard-test" {
+    targetType "executable"
+    targetName "dial-guard-test"
+    mainSourceFile "source/dial_guard_test.d"
+    versions "VibeUseFibers"
+}
+
 configuration "janitor-migrate" {
     targetType "executable"
     targetName "janitor-migrate"

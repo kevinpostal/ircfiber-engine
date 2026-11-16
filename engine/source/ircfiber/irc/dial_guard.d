@@ -1,7 +1,10 @@
 module ircfiber.irc.dial_guard;
 
+import core.sync.mutex : Mutex;
 import std.conv : to;
+import std.datetime : Clock;
 import std.range : empty, front;
+import std.string : startsWith;
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.redis.protocol : RedisKeys;
 import ircfiber.holder_client : HolderClient, DialRequest, DialResult, DialProgress,
@@ -20,19 +23,91 @@ string holderDialIncarnation(HolderClient holder) {
     return "legacy-pid:" ~ status.pid.to!string;
 }
 
-private void retireLostIncarnationDials(RedisStorage redis, string serverId, string networkId,
-        string incarnation) {
-    import std.string : startsWith;
-    // Only a UUID-bearing incarnation proves earlier process-owned DIALs
-    // gone. Legacy unversioned '1' markers remain deliberately unproven.
-    if (incarnation.startsWith("legacy-pid:")) return;
-    redis.getDb().eval!string(
-        "local rows=redis.call('HGETALL',KEYS[1]); for i=1,#rows,2 do local v=rows[i+1]; if string.sub(v,1,10)=='holder_v1:' and v~=ARGV[1] then redis.call('HDEL',KEYS[1],rows[i]) end end; return '1'",
-        [dialKey(serverId, networkId)], ["holder_v1:" ~ incarnation]);
+/// Upper bound on how long one holder DIAL can still be running after the
+/// engine sent it: connect 10 s + TLS 10 s + STARTTLS 15 s + SOCKS 15 s is
+/// ~50 s, and the engine's IPC read timeout is 60 s. A marker for the same
+/// holder incarnation that is older than this, and not owned by a dial that is
+/// still running in this process, belongs to an engine that died or lost the
+/// IPC reply. Its DIAL has necessarily finished: it either left an open holder
+/// entry (visible to `holder.scan()`, which every dial checks) or nothing.
+enum long orphanedDialProofMs = 180_000;
+
+private long unixMsNow() {
+    return (Clock.currStdTime - 621_355_968_000_000_000L) / 10_000;
 }
 
-/// Deliberately has no TTL: a crashed process/ambiguous IPC failure must not
+// Tokens of dials that are executing in this process right now, per dial key.
+// A live dial may legitimately wait a long time in registration admission, so
+// age alone must never retire its marker.
+private __gshared bool[string][string] liveDials;
+private __gshared Mutex liveDialsMutex;
+shared static this() { liveDialsMutex = new Mutex; }
+
+private string[] liveDialTokens(string key) {
+    synchronized (liveDialsMutex) {
+        if (auto tokens = key in liveDials) return (*tokens).keys;
+    }
+    return null;
+}
+
+/// Registers `token` as a dial executing in this process for the dial key of
+/// (`serverId`, `networkId`). Pair with `endLocalDial`.
+void beginLocalDial(string serverId, string networkId, string token) {
+    synchronized (liveDialsMutex) liveDials[dialKey(serverId, networkId)][token] = true;
+}
+
+void endLocalDial(string serverId, string networkId, string token) {
+    const key = dialKey(serverId, networkId);
+    synchronized (liveDialsMutex) {
+        if (auto tokens = key in liveDials) {
+            (*tokens).remove(token);
+            if ((*tokens).length == 0) liveDials.remove(key);
+        }
+    }
+}
+
+/// Marker value: `holder_v1:<incarnation>@<unix ms the marker was written>`.
+private string markerValue(string incarnation, long atMs) {
+    return "holder_v1:" ~ incarnation ~ "@" ~ atMs.to!string;
+}
+
+/// Retires DIAL markers whose completion is proven:
+///  - written for another holder incarnation (a UUID incarnation proves that
+///    process, and every DIAL it ran, is gone; a pid-only incarnation cannot);
+///  - same incarnation, not live in this process, and at least
+///    `orphanedDialProofMs` old. A marker without a timestamp (written by an
+///    older engine) is stamped on first sight and ages from there, which only
+///    lengthens the wait.
+/// Legacy unversioned '1' markers are never touched.
+void retireOrphanedDials(RedisStorage redis, string serverId, string networkId,
+        string incarnation, long nowMs) {
+    const key = dialKey(serverId, networkId);
+    const trustIncarnationChange = !incarnation.startsWith("legacy-pid:");
+    string[] args = [incarnation, nowMs.to!string, orphanedDialProofMs.to!string,
+        trustIncarnationChange ? "1" : "0"];
+    args ~= liveDialTokens(key);
+    redis.getDb().eval!string(
+        "local rows=redis.call('HGETALL',KEYS[1]); local live={}; " ~
+        "for i=5,#ARGV do live[ARGV[i]]=true end; " ~
+        "local now=tonumber(ARGV[2]); local proof=tonumber(ARGV[3]); " ~
+        "for i=1,#rows,2 do local f=rows[i]; local v=rows[i+1]; " ~
+        "if string.sub(v,1,10)=='holder_v1:' then " ~
+        "local body=string.sub(v,11); local at=string.find(body,'@',1,true); " ~
+        "local inc=body; if at then inc=string.sub(body,1,at-1) end; " ~
+        "if inc~=ARGV[1] then " ~
+        "if ARGV[4]=='1' then redis.call('HDEL',KEYS[1],f) end " ~
+        "elseif not live[f] then " ~
+        "local ts=at and tonumber(string.sub(body,at+1)) or nil; " ~
+        "if ts==nil then redis.call('HSET',KEYS[1],f,'holder_v1:'..inc..'@'..ARGV[2]) " ~
+        "elseif now-ts>=proof then redis.call('HDEL',KEYS[1],f) end " ~
+        "end end end; return '1'",
+        [key], args);
+}
+
+/// The marker hash has no TTL: a crashed process/ambiguous IPC failure must not
 /// turn an unobserved, possibly still running holder DIAL into closure proof.
+/// Markers leave only by their own terminal HDEL or `retireOrphanedDials`
+/// proof (holder replaced, or older than `orphanedDialProofMs` and not live here).
 bool networkDialsQuiescent(RedisStorage redis, string serverId, string networkId, HolderClient holder) {
     if (redis is null || !serverId.length) return false;
     auto reply = redis.getDb().eval!string(
@@ -40,7 +115,7 @@ bool networkDialsQuiescent(RedisStorage redis, string serverId, string networkId
         [dialKey(serverId, networkId)]);
     if (!reply.empty && reply.front == "1") return true;
     if (holder is null) return false;
-    retireLostIncarnationDials(redis, serverId, networkId, holderDialIncarnation(holder));
+    retireOrphanedDials(redis, serverId, networkId, holderDialIncarnation(holder), unixMsNow());
     auto after = redis.getDb().eval!string(
         "if redis.call('HLEN',KEYS[1]) == 0 then return '1' else return '0' end",
         [dialKey(serverId, networkId)]);
@@ -62,7 +137,7 @@ DialResult dialWithOwnership(HolderClient holder, DialRequest req, DialProgress 
     import deimos.openssl.rand : RAND_bytes;
     if (redis is null || stopping()) throw new HolderUnavailableException("connection stopped before dial");
     const incarnation = holderDialIncarnation(holder);
-    retireLostIncarnationDials(redis, serverId, req.tag.networkId, incarnation);
+    retireOrphanedDials(redis, serverId, req.tag.networkId, incarnation, unixMsNow());
     ubyte[16] random;
     if (RAND_bytes(random.ptr, cast(int) random.length) != 1)
         throw new HolderUnavailableException("unable to reserve dial ownership token");
@@ -73,11 +148,13 @@ DialResult dialWithOwnership(HolderClient holder, DialRequest req, DialProgress 
     }
     const token = hex[].idup;
     const key = dialKey(serverId, req.tag.networkId);
+    beginLocalDial(serverId, req.tag.networkId, token);
+    scope(exit) endLocalDial(serverId, req.tag.networkId, token);
     auto db = redis.getDb();
     auto reply = db.eval!string(
         "if redis.call('HGET',KEYS[1],ARGV[1]) ~= ARGV[2] or redis.call('EXISTS',KEYS[2]) ~= 0 or redis.call('HLEN',KEYS[3]) ~= 0 then return '0' end redis.call('HSET',KEYS[3],ARGV[3],ARGV[4]); return '1'",
         [RedisKeys.networkAssignments(), RedisKeys.routingMove(req.tag.networkId), key],
-        [req.tag.networkId, serverId, token, "holder_v1:" ~ incarnation]);
+        [req.tag.networkId, serverId, token, markerValue(incarnation, unixMsNow())]);
     if (reply.empty || reply.front != "1")
         throw new HolderUnavailableException("canonical owner changed, routing move fenced, or an earlier holder DIAL has unproven completion (inspect " ~ key ~ ")");
     bool terminal = true;
@@ -106,7 +183,7 @@ DialResult dialWithOwnership(HolderClient holder, DialRequest req, DialProgress 
             auto committed = db.eval!string(
                 "if redis.call('HEXISTS',KEYS[1],ARGV[1]) == 0 or redis.call('HGET',KEYS[2],ARGV[2]) ~= ARGV[3] or redis.call('EXISTS',KEYS[3]) ~= 0 then return '0' end redis.call('HSET',KEYS[1],ARGV[1],ARGV[4]); return '1'",
                 [key, RedisKeys.networkAssignments(), RedisKeys.routingMove(req.tag.networkId)],
-                [token, req.tag.networkId, serverId, "holder_v1:" ~ actualIncarnation]);
+                [token, req.tag.networkId, serverId, markerValue(actualIncarnation, unixMsNow())]);
             if (committed.empty || committed.front != "1")
                 throw new HolderUnavailableException("dial ownership lost before registration admission");
             admitRegistration(actualIncarnation);
