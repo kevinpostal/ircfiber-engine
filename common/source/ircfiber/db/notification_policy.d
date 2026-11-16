@@ -160,6 +160,14 @@ immutable QuietTemplate[3] QUIET_TEMPLATES = [
         QuietWindow([4], 18 * 60, 1440), QuietWindow([5, 6], 0, 1440)]),
 ];
 
+/// The `focused` preset with the email column on for the two classes email is offered for.
+private Cells[6] defaultMatrix() pure {
+    Cells[6] m = PRESETS[1].cells;
+    m[NotifyClass.dm].email = true;
+    m[NotifyClass.mention].email = true;
+    return m;
+}
+
 /// The stored policy (`UserPreferences.notificationPolicy`). `init` is the
 /// new-account default (`defaultPolicy`).
 struct NotificationPolicy {
@@ -167,8 +175,8 @@ struct NotificationPolicy {
     int v = 2;
     /// Bumped by every policy change; the If-Match token (`"np-<rev>"`).
     long rev = 1;
-    /// Indexed by `NotifyClass`. Default: the `focused` preset, email off.
-    Cells[6] matrix = PRESETS[1].cells;
+    /// Indexed by `NotifyClass`. Default: the `focused` preset, email on for DMs and mentions.
+    Cells[6] matrix = defaultMatrix();
     /// Account snooze: 0 = off, -1 = until resumed, else unix ms.
     long snoozeUntil;
     QuietHours quiet;
@@ -1294,12 +1302,13 @@ version (unittest) {
     }
 }
 
-@("defaultPolicy: focused matrix, email off, nights template, v2/rev 1")
+@("defaultPolicy: focused matrix, email on for dm+mention, nights template, v2/rev 1")
 unittest {
     const p = defaultPolicy();
     assert(p.v == 2 && p.rev == 1 && p.snoozeUntil == 0 && p.migratedAt == 0 && !p.bannerDismissed);
     assert(matchPreset(p) == "focused");
-    foreach (i; 0 .. 6) assert(!p.matrix[i].email);
+    foreach (i; 0 .. 6)
+        assert(p.matrix[i].email == (i == NotifyClass.dm || i == NotifyClass.mention));
     assert(p.matrix[NotifyClass.all] == Cells(true, false, false, false));
     assert(p.matrix[NotifyClass.invite] == Cells(true, false, true, false));
     assert(!p.quiet.enabled && p.quiet.tz == "" && p.quiet.tzMode == "account" && p.quiet.summary);
@@ -1328,7 +1337,7 @@ unittest {
     auto p = defaultPolicy();
     p.rev = 7;
     p.snoozeUntil = -1;
-    p.matrix[NotifyClass.dm].email = true;
+    p.matrix[NotifyClass.dm].email = false;
     p.quiet.enabled = true;
     p.quiet.tz = "Europe/Berlin";
     p.quiet.tzMode = "device";
@@ -1463,11 +1472,11 @@ unittest {
 @("applyPatch: merge-patch semantics; arrays replace; applyPreset keeps email")
 unittest {
     auto p = defaultPolicy();
-    p.matrix[NotifyClass.dm].email = true;
+    p.matrix[NotifyClass.dm].email = false;
     p.networks["n1"] = "muted";
     auto before = p;   // shares the networks AA: applyPatch must not touch it
     applyPatch(p, parseJsonString(`{"applyPreset":"everything"}`));
-    assert(matchPreset(p) == "everything" && p.matrix[NotifyClass.dm].email, "a preset leaves email alone");
+    assert(matchPreset(p) == "everything" && !p.matrix[NotifyClass.dm].email, "a preset leaves email alone");
     applyPatch(p, parseJsonString(`{"matrix":{"all":{"sound":false}},"networks":{"n1":null,"n2":"all"},
         "quiet":{"enabled":true,"tz":"Europe/Berlin","windows":[{"days":[5,6],"start":"00:00","end":"24:00"}],
         "breakthrough":{"vip":["Bob","bob"," alice "]}},
@@ -1484,7 +1493,7 @@ unittest {
     assert(p.email == EmailSettings("daily", 7) && p.bannerDismissed && p.snoozeUntil == 99);
     assert(p.rev == 1, "applyPatch does not bump rev");
     applyPatch(p, parseJsonString(`{"applyPreset":"quiet"}`));
-    assert(matchPreset(p) == "quiet" && p.matrix[NotifyClass.dm].email);
+    assert(matchPreset(p) == "quiet" && !p.matrix[NotifyClass.dm].email);
 }
 
 @("client patches: ownership per target, null deletes, an empty entry is removed")
