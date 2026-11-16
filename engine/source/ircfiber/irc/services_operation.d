@@ -66,6 +66,9 @@ struct ServiceSyntaxSpec {
     string command;
     string suffix;
     ServiceSyntaxKind kind;
+    /// Command words printed after `Syntax:` when they differ from the HELP
+    /// query (`HELP SET LIMIT` prints `Syntax: LIMIT ...`). Empty = `command`.
+    string shown;
 }
 
 /// Read forms not represented by an individual mutation action.
@@ -75,8 +78,8 @@ enum ServiceReadSyntax {
 }
 
 private ServiceSyntaxSpec syntax(string command, string suffix = "",
-        ServiceSyntaxKind kind = ServiceSyntaxKind.catalog) {
-    return ServiceSyntaxSpec(command, suffix, suffix.length ? kind : ServiceSyntaxKind.argumentless);
+        ServiceSyntaxKind kind = ServiceSyntaxKind.catalog, string shown = "") {
+    return ServiceSyntaxSpec(command, suffix, suffix.length ? kind : ServiceSyntaxKind.argumentless, shown);
 }
 
 /// Alternatives are OR. Provider names and tier names come from the existing
@@ -134,6 +137,15 @@ ServiceSyntaxSpec[] servicesSyntax(ServiceAction action, bool v21, string provid
         case ServiceAction.memoRead: return [syntax("READ", "[channel] {num | list | LAST | NEW | ALL}")];
         case ServiceAction.memoSend: return [syntax("SEND", "{nick | channel} memo-text")];
         case ServiceAction.memoDelete: return [syntax("DEL", "[channel] {num | list | LAST | ALL}")];
+        case ServiceAction.memoIgnoreList: return [syntax("IGNORE", "[channel] LIST")];
+        case ServiceAction.memoIgnoreAdd: return [syntax("IGNORE", "[channel] ADD entry")];
+        case ServiceAction.memoIgnoreRemove: return [syntax("IGNORE", "[channel] DEL entry")];
+        case ServiceAction.memoSettings: return [syntax("INFO", "[nick | channel]")];
+        // The printed syntax omits SET: `HELP SET LIMIT` shows `Syntax: LIMIT ...`.
+        // Non-oper and oper forms are alternatives; the wire form is identical.
+        case ServiceAction.memoLimitSet:
+            return [syntax("SET LIMIT", "[channel] limit", ServiceSyntaxKind.literal, "LIMIT"),
+                syntax("SET LIMIT", "[user | channel] {limit | NONE} [HARD]", ServiceSyntaxKind.literal, "LIMIT")];
         case ServiceAction.operStats: return servicesReadSyntax(ServiceReadSyntax.stats, v21);
         case ServiceAction.akillList:
         case ServiceAction.akillView: return servicesReadSyntax(ServiceReadSyntax.akillView, v21);
@@ -224,10 +236,11 @@ private void readHelpAlternatives(ServicesTransaction txn, ServiceId service, Se
     // Inventory alternatives always share one HELP query. Do not fetch one
     // response per suffix (REGISTER and GLIST each have two forms).
     const command = specs[0].command;
+    const shown = specs[0].shown.length ? specs[0].shown : command;
     foreach (s; specs) enforce(s.command == command, "HELP alternatives must share one command");
     fetchServicesHelp(txn, service, command, (ServicesEndpoint ep, AnopeGrammar g, ServiceFrame f) {
         done(anopeRelease(ep.version_) != AnopeRelease.unknown
-            ? classifyServicesHelp(g, command, f) : classifyHelpAlternatives(g, specs, command, f));
+            ? classifyServicesHelp(g, shown, f) : classifyHelpAlternatives(g, specs, shown, f));
     });
 }
 
@@ -306,7 +319,8 @@ private immutable string[] GLIST20_HELP = [
 /// through the reply grammar's table-template capture machinery.
 HelpEvidence classifyServicesCommandHelp(AnopeGrammar g, const ref ServiceSyntaxSpec spec,
         const ref ServiceFrame frame) {
-    auto available = classifyServicesHelp(g, spec.command, frame);
+    const shown = spec.shown.length ? spec.shown : spec.command;
+    auto available = classifyServicesHelp(g, shown, frame);
     if (available.state == "denied" || available.state == "unsupported"
             || !frameComplete(frame) || (available.state == "unknown"
                 && available.reasonCode != "help_unrecognized")) return available;
@@ -336,7 +350,7 @@ HelpEvidence classifyServicesCommandHelp(AnopeGrammar g, const ref ServiceSyntax
             break;
     }
     foreach (suffix; suffixes)
-        if (fullSyntaxLine(g, spec.command, suffix, frame))
+        if (fullSyntaxLine(g, shown, suffix, frame))
             return HelpEvidence("allowed", "", available.permission);
     // Unknown prose is still unknown. A recognized syntax block for a
     // different command, or a permission-only reply, cannot prove this form.

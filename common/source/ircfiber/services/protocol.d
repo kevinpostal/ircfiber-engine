@@ -20,6 +20,7 @@ enum ServiceAction {
     accountRecover, accountPrivacy,
     hostInfo, hostRequest, hostOn, hostOff,
     memoList, memoRead, memoSend, memoDelete,
+    memoIgnoreList, memoIgnoreAdd, memoIgnoreRemove, memoSettings, memoLimitSet,
     operStats, akillList, akillView, akillAdd, akillRemove,
     hostWaiting, hostActivate, hostReject, globalQueue, globalSend
 }
@@ -53,6 +54,9 @@ struct HostRequestParams { string host; }
 struct MemoReadParams { string selection; }
 struct MemoSendParams { string recipient; string targetNick; string text; }
 struct MemoDeleteParams { uint number; }
+struct MemoDeleteAllParams { bool all; }
+struct MemoIgnoreParams { string entry; }
+struct MemoLimitParams { uint limit; }
 struct AkillViewParams { string entry; }
 struct AkillAddParams { string mask; uint expirySeconds; string reason; bool broadMaskConfirmed; }
 struct AkillRemoveParams { string entry; }
@@ -262,7 +266,9 @@ ServiceId serviceFor(ServiceAction action) pure nothrow {
         case ServiceAction.hostOff: case ServiceAction.hostWaiting: case ServiceAction.hostActivate:
         case ServiceAction.hostReject: return ServiceId.hostServ;
         case ServiceAction.memoList: case ServiceAction.memoRead: case ServiceAction.memoSend:
-        case ServiceAction.memoDelete: return ServiceId.memoServ;
+        case ServiceAction.memoDelete: case ServiceAction.memoIgnoreList: case ServiceAction.memoIgnoreAdd:
+        case ServiceAction.memoIgnoreRemove: case ServiceAction.memoSettings:
+        case ServiceAction.memoLimitSet: return ServiceId.memoServ;
         case ServiceAction.operStats: case ServiceAction.akillList: case ServiceAction.akillView:
         case ServiceAction.akillAdd: case ServiceAction.akillRemove: return ServiceId.operServ;
         case ServiceAction.globalQueue: case ServiceAction.globalSend: return ServiceId.global;
@@ -276,7 +282,8 @@ bool isMutation(ServiceAction action) pure nothrow {
         case ServiceAction.botList: case ServiceAction.botInfo: case ServiceAction.accountInfo:
         case ServiceAction.accountGroups: case ServiceAction.hostInfo: case ServiceAction.memoList:
         case ServiceAction.operStats: case ServiceAction.akillList: case ServiceAction.akillView:
-        case ServiceAction.hostWaiting: case ServiceAction.globalQueue: return false;
+        case ServiceAction.hostWaiting: case ServiceAction.globalQueue: case ServiceAction.memoIgnoreList:
+        case ServiceAction.memoSettings: return false;
         default: return true; // READ marks a memo read; it is deliberately a mutation.
     }
 }
@@ -320,7 +327,8 @@ Json validateParams(ServiceAction action, Json j) {
         case ServiceAction.discover: case ServiceAction.botList: case ServiceAction.accountGroups:
         case ServiceAction.hostInfo: case ServiceAction.hostOn: case ServiceAction.hostOff:
         case ServiceAction.memoList: case ServiceAction.operStats: case ServiceAction.akillList:
-        case ServiceAction.hostWaiting: case ServiceAction.globalQueue: return decode!EmptyParams(j);
+        case ServiceAction.hostWaiting: case ServiceAction.globalQueue: case ServiceAction.memoIgnoreList:
+        case ServiceAction.memoSettings: return decode!EmptyParams(j);
         case ServiceAction.channelInfo: case ServiceAction.channelAccessList:
         case ServiceAction.channelModeLockList: case ServiceAction.channelAkickList:
         case ServiceAction.botInfo: case ServiceAction.botUnassign: return decode!ChannelParams(j);
@@ -377,8 +385,23 @@ Json validateParams(ServiceAction action, Json j) {
         }
         case ServiceAction.memoSend: return decode!MemoSendParams(j, ["targetNick"]);
         case ServiceAction.memoDelete: {
+            if (j["all"].type != Json.Type.undefined) {
+                auto everything = decode!MemoDeleteAllParams(j);
+                enforce(everything["all"].get!bool, "Invalid memo selection");
+                return everything;
+            }
             auto result = decode!MemoDeleteParams(j);
             enforce(result["number"].get!uint > 0, "Invalid memo number");
+            return result;
+        }
+        case ServiceAction.memoIgnoreAdd: case ServiceAction.memoIgnoreRemove: {
+            auto result = decode!MemoIgnoreParams(j);
+            enforce(result["entry"].get!string.length <= 128, "Invalid memo ignore entry");
+            return result;
+        }
+        case ServiceAction.memoLimitSet: {
+            auto result = decode!MemoLimitParams(j);
+            enforce(result["limit"].get!uint <= 32767, "Invalid memo limit");
             return result;
         }
         case ServiceAction.akillView: return decode!AkillViewParams(j);
@@ -513,6 +536,24 @@ private string optionalString(Json j, string key) {
         Json(["account": Json("alice"), "password": Json("secret"), "owner": Json("victim")])));
     assertThrown(validateParams(ServiceAction.channelInfo, Json(["channel": Json("#foo JOIN #bar")])));
     assertThrown(validateParams(ServiceAction.memoDelete, Json(["number": Json(0)])));
+    import std.exception : assertNotThrown;
+    assertNotThrown(validateParams(ServiceAction.memoDelete, Json(["all": Json(true)])));
+    assertThrown(validateParams(ServiceAction.memoDelete, Json(["all": Json(false)])));
+    assertThrown(validateParams(ServiceAction.memoDelete, Json(["all": Json(true), "number": Json(1)])));
+    import std.array : replicate;
+    assertNotThrown(validateParams(ServiceAction.memoIgnoreAdd, Json(["entry": Json("bob")])));
+    assertNotThrown(validateParams(ServiceAction.memoIgnoreAdd, Json(["entry": Json("*!*@spam.example")])));
+    assertNotThrown(validateParams(ServiceAction.memoLimitSet, Json(["limit": Json(0)])));
+    assertNotThrown(validateParams(ServiceAction.memoLimitSet, Json(["limit": Json(32767)])));
+    assertNotThrown(validateParams(ServiceAction.memoIgnoreList, Json.emptyObject));
+    assertNotThrown(validateParams(ServiceAction.memoSettings, Json.emptyObject));
+    assertThrown(validateParams(ServiceAction.memoIgnoreAdd, Json(["entry": Json("")])));
+    assertThrown(validateParams(ServiceAction.memoIgnoreRemove, Json(["entry": Json("a b")])));
+    assertThrown(validateParams(ServiceAction.memoIgnoreAdd, Json(["entry": Json("x\r\nQUIT")])));
+    assertThrown(validateParams(ServiceAction.memoIgnoreAdd, Json(["entry": Json("a".replicate(129))])));
+    assertThrown(validateParams(ServiceAction.memoLimitSet, Json(["limit": Json(32768)])));
+    assertThrown(validateParams(ServiceAction.memoLimitSet, Json(["limit": Json(-1)])));
+    assertThrown(validateParams(ServiceAction.memoIgnoreList, Json(["x": Json(1)])));
 }
 
 @("native ACCESS boundaries exclude reserved founder and disabled levels") unittest {

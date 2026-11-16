@@ -69,6 +69,11 @@ void registerIdentityServicesOperations() {
     reg(ServiceAction.memoRead, &runMemoRead);
     reg(ServiceAction.memoSend, &runMemoSend);
     reg(ServiceAction.memoDelete, &runMemoDelete);
+    reg(ServiceAction.memoIgnoreList, &runMemoIgnoreList);
+    reg(ServiceAction.memoIgnoreAdd, &runMemoIgnoreAdd);
+    reg(ServiceAction.memoIgnoreRemove, &runMemoIgnoreRemove);
+    reg(ServiceAction.memoSettings, &runMemoSettings);
+    reg(ServiceAction.memoLimitSet, &runMemoLimitSet);
 }
 
 private alias Runner = void function(ServicesTransaction, AnopeGrammar);
@@ -223,6 +228,7 @@ private enum M_MEMO_READ_HINT_20 = "To delete, type: \x02%s%s %s %d\x02";
 private enum M_MEMO_NOT_FOUND = "No memos to display.";
 private enum M_MEMO_SENT = "Memo sent to \x02%s\x02.";
 private enum M_MEMO_DELETED = "Memo %d has been deleted.";
+private enum M_MEMO_DELETED_ALL = "All of your memos have been deleted.";
 private enum M_MEMO_ARRIVED_21 = "You have a new memo from %s. Type \x02%s\x1B%zu\x02 to read it.";
 private enum M_MEMO_X_ARRIVED_21 = "There is a new memo on channel %s. Type \x02%s\x1B%s\x1B%zu\x02 to read it.";
 private enum M_MEMO_ARRIVED_20 = "You have a new memo from %s.\nType \x02%s%s READ %d\x02 to read it.";
@@ -230,6 +236,34 @@ private enum M_MEMO_X_ARRIVED_20 = "There is a new memo on channel %s.\nType \x0
 /// Unsolicited MemoServ arrival notices (no `+reply`), both releases.
 private static immutable string[] MEMO_ARRIVALS = [M_MEMO_ARRIVED_21, M_MEMO_X_ARRIVED_21, M_MEMO_ARRIVED_20,
     M_MEMO_X_ARRIVED_20];
+
+// MemoServ IGNORE / INFO / SET LIMIT (ms_ignore.cpp, ms_info.cpp, ms_set.cpp).
+private enum M_IGNORE_NONE = "Memo ignore list is empty.";
+private enum M_IGNORE_HEADER_21 = "Memo ignore list:";
+private enum M_IGNORE_HEADER_20 = "Ignore list:";
+private enum M_IGNORE_ADDED = "\x02%s\x02 added to ignore list.";
+private enum M_IGNORE_REMOVED = "\x02%s\x02 removed from the ignore list.";
+private enum M_IGNORE_DUP = "\x02%s\x02 is already on the ignore list.";
+private enum M_IGNORE_ABSENT = "\x02%s\x02 is not on the ignore list.";
+private enum M_IGNORE_FULL_21 = "The memo ignore list for \x02%s\x02 is full.";
+private enum M_IGNORE_FULL_20 = "Sorry, the memo ignore list for \x02%s\x02 is full.";
+private enum M_INFO_LIMIT = "Your memo limit is \x02%d\x02.";
+private enum M_INFO_LIMIT_LOCKED = "Your memo limit is \x02%d\x02, and may not be changed.";
+private enum M_INFO_LIMIT_ZERO = "Your memo limit is \x020\x02; you will not receive any new memos.";
+private enum M_INFO_LIMIT_ZERO_LOCKED = "Your memo limit is \x020\x02; you will not receive any new memos. You cannot change this limit.";
+private enum M_INFO_NO_LIMIT = "You have no limit on the number of memos you may keep.";
+private enum M_LIMIT_SET = "Your memo limit has been set to \x02%d\x02.";
+private enum M_LIMIT_ZERO = "You will no longer be able to receive memos.";
+/// `HELP SET LIMIT` for a non-oper; the trailing `%d` is `memoserv maxmemos`.
+private enum M_HELP_LIMIT_21 = "Syntax: \x02LIMIT [\x1fchannel\x1f] \x1flimit\x1f\x02\n\n"
+    ~ "Sets the maximum number of memos you (or the given channel) are allowed to have. If you set this to 0, "
+    ~ "no one will be able to send any memos to you. However, you cannot set this any higher than %d.";
+private enum M_HELP_LIMIT_20 = "Syntax: \x02LIMIT [\x1fchannel\x1f] \x1flimit\x1f\x02\n \n"
+    ~ "Sets the maximum number of memos you (or the given channel)\nare allowed to have. If you set this to 0, no one will be\n"
+    ~ "able to send any memos to you.  However, you cannot set\nthis any higher than %d.";
+private static immutable string[] MEMO_HELP_LIMIT = [M_HELP_LIMIT_21, M_HELP_LIMIT_20];
+private static immutable string[] MEMO_INFO_LIMITS = [M_INFO_LIMIT, M_INFO_LIMIT_LOCKED, M_INFO_LIMIT_ZERO,
+    M_INFO_LIMIT_ZERO_LOCKED, M_INFO_NO_LIMIT];
 
 /// Failure texts shared by every NickServ/HostServ/MemoServ command used here.
 private static immutable string[3][] COMMON_REFUSALS = [
@@ -328,6 +362,19 @@ private static immutable string[3][] MEMO_REFUSALS = [
     [M_MEMO_NONE, "r", "memo_not_found"],
     [M_MEMO_NOT_FOUND, "r", "memo_not_found"],
     ["Sorry, memo sending is temporarily disabled.", "u", "temporarily_unavailable"],
+];
+
+private static immutable string[3][] MEMO_IGNORE_REFUSALS = [
+    [M_IGNORE_DUP, "r", "already_ignored"],
+    [M_IGNORE_ABSENT, "r", "not_ignored"],
+    [M_IGNORE_FULL_21, "r", "ignore_list_full"],
+    [M_IGNORE_FULL_20, "r", "ignore_list_full"],
+];
+
+private static immutable string[3][] MEMO_LIMIT_REFUSALS = [
+    ["You are not permitted to change your memo limit.", "r", "memo_limit_locked"],
+    ["You cannot set your memo limit higher than %d.", "r", "limit_above_maximum"],
+    ["Sorry, memo option setting is temporarily disabled.", "u", "temporarily_unavailable"],
 ];
 
 private static immutable string[3][] MEMO_SEND_REFUSALS = [
@@ -2358,27 +2405,35 @@ bool memoDeleted(AnopeGrammar g, const ref ServiceFrame f, uint number) {
     return g.matches(M_MEMO_DELETED, f, c) && c.length && c[0] == number.to!string;
 }
 
+/// DEL ALL ack.
+bool memoDeletedAll(AnopeGrammar g, const ref ServiceFrame f) {
+    string[] c;
+    return g.matches(M_MEMO_DELETED_ALL, f, c);
+}
+
 private void runMemoDelete(ServicesTransaction txn, AnopeGrammar g) {
+    const all = paramBool(txn, "all");
     const number = paramLong(txn, "number");
     const account = txn.actor.account;
-    if (number <= 0 || number > uint.max) {
+    if (!all && (number <= 0 || number > uint.max)) {
         txn.complete(ServiceStatus.rejected, "memo_not_found");
         return;
     }
-    const n = cast(uint) number;
+    const n = all ? 0u : cast(uint) number;
     requireHelp(txn, ServiceAction.memoDelete, () {
         readInbox(txn, g, (MemoInbox before) {
             if (!requireServicesRevision(txn, servicesRevision(txn, inboxCanonical(account, before.entries)),
                     inboxJson(account, before.entries), Json.undefined)) return;
-            if (n > before.entries.length) {
+            if (all ? before.entries.length == 0 : n > before.entries.length) {
                 txn.complete(ServiceStatus.rejected, "memo_not_found");
                 return;
             }
-            txn.frame(writeSpec(txn, "DEL " ~ n.to!string, ServiceFrameKind.ordinary, null, memoArrivalRelease(g)),
-                    (ServiceFrame f) {
+            txn.frame(writeSpec(txn, all ? "DEL ALL" : "DEL " ~ n.to!string, ServiceFrameKind.ordinary, null,
+                    memoArrivalRelease(g)), (ServiceFrame f) {
                 if (ambiguousWrite(txn, f)) return;
-                auto details = recognizedDetails(txn, g, f, [M_MEMO_DELETED] ~ refusalMsgids(MEMO_REFUSALS));
-                if (!memoDeleted(g, f, n)) {
+                auto details = recognizedDetails(txn, g, f,
+                    [M_MEMO_DELETED, M_MEMO_DELETED_ALL] ~ refusalMsgids(MEMO_REFUSALS));
+                if (!(all ? memoDeletedAll(g, f) : memoDeleted(g, f, n))) {
                     ServiceStatus st;
                     string reason;
                     if (findRefusal(g, f, MEMO_REFUSALS, st, reason))
@@ -2395,8 +2450,298 @@ private void runMemoDelete(ServicesTransaction txn, AnopeGrammar g) {
                             Json.undefined, details);
                         return;
                     }
+                    if (all && after.entries.length) {
+                        txn.complete(ServiceStatus.unconfirmed, "readback_mismatch", Json.undefined, "",
+                            Json.undefined, details);
+                        return;
+                    }
                     txn.complete(ServiceStatus.confirmed, "", inboxJson(account, after.entries),
                         servicesRevision(txn, inboxCanonical(account, after.entries)), Json.undefined, details);
+                });
+            });
+        });
+    });
+}
+
+// ── MemoServ IGNORE / INFO / SET LIMIT ─────────────────────────────────────
+
+/// Own memo ignore list (`IGNORE LIST`): empty, or a header, an optional
+/// translated `Mask` column title (fixed form) and one mask per row.
+struct MemoIgnoreList {
+    bool ok;
+    string[] masks;
+}
+
+private bool maskColumnTitle(AnopeGrammar g, string text) {
+    foreach (v; g.variants("Mask"))
+        if (!g.contested("Mask", v) && v.strip == text) return true;
+    return false;
+}
+
+/// An entry that spells the table's column title could not be told apart
+/// from the header in the flexible 2.1 form.
+private bool maskTitleEntry(AnopeGrammar g, string entry) {
+    if (asciiSame(entry, "Mask")) return true;
+    foreach (v; g.variants("Mask"))
+        if (asciiSame(v.strip, entry)) return true;
+    return false;
+}
+
+MemoIgnoreList parseMemoIgnoreList(AnopeGrammar g, const ref ServiceFrame f) {
+    MemoIgnoreList r;
+    const(ServiceReplyLine)[] lines;
+    foreach (ref l; f.lines)
+        if (!memoArrival(g, l.plain)) lines ~= l;
+    if (!lines.length) return r;
+    string[] c;
+    size_t which;
+    if (lines.length == 1 && g.matches(M_IGNORE_NONE, lines[0].plain, c)) {
+        r.ok = true;
+        return r;
+    }
+    if (!g.matchesAny([M_IGNORE_HEADER_21, M_IGNORE_HEADER_20], lines[0].plain, c, which)) return r;
+    auto rows = lines[1 .. $];
+    if (rows.length && maskColumnTitle(g, rows[0].plain.strip)) rows = rows[1 .. $];
+    string[] masks;
+    foreach (ref l; rows) {
+        const mask = l.plain.strip;
+        if (!mask.length) return r;
+        masks ~= mask;
+    }
+    r.ok = masks.length > 0;
+    if (r.ok) r.masks = masks;
+    return r;
+}
+
+/// Own memo limit from `INFO`. Exactly one limit line is expected.
+struct MemoSettings {
+    bool ok;
+    bool unlimited;
+    uint limit;
+    bool locked;
+}
+
+MemoSettings parseMemoInfo(AnopeGrammar g, const ref ServiceFrame f) {
+    MemoSettings r;
+    size_t found;
+    foreach (ref l; f.lines) {
+        if (memoArrival(g, l.plain)) continue;
+        string[] c;
+        size_t which;
+        if (!g.matchesAny(MEMO_INFO_LIMITS, l.plain, c, which)) continue;
+        ++found;
+        if (which <= 1) {
+            if (c.length != 1 || !c[0].length || c[0].length > 9) return MemoSettings.init;
+            r.limit = c[0].to!uint;
+            r.locked = which == 1;
+        } else if (which <= 3) {
+            r.limit = 0;
+            r.locked = which == 3;
+        } else r.unlimited = true;
+    }
+    r.ok = found == 1;
+    return r;
+}
+
+private bool hasMask(const string[] masks, string entry) {
+    foreach (m; masks) if (asciiSame(m, entry)) return true;
+    return false;
+}
+
+private Json ignoreJson(string account, const string[] masks) {
+    Json[] list;
+    foreach (m; masks) list ~= Json(["mask": Json(m)]);
+    return Json(["kind": Json("memoIgnore"), "account": Json(account), "entries": Json(list)]);
+}
+
+/// Anope 2.0 keeps insertion order and 2.1 sorts: the revision must not care.
+private Json ignoreCanonical(string account, const string[] masks) {
+    string[] folded;
+    foreach (m; masks) folded ~= m.toLower;
+    folded.sort();
+    Json[] list;
+    foreach (m; folded) list ~= Json(m);
+    return Json(["kind": Json("memoIgnore"), "account": Json(account.toLower), "entries": Json(list)]);
+}
+
+/// `maxLimit` <= 0 means unknown or uncapped.
+private Json settingsJson(string account, const MemoSettings s, long maxLimit) {
+    return Json(["kind": Json("memoSettings"), "account": Json(account),
+        "limit": s.unlimited ? Json(null) : Json(cast(long) s.limit), "locked": Json(s.locked),
+        "maxLimit": maxLimit > 0 ? Json(maxLimit) : Json(null)]);
+}
+
+private Json settingsCanonical(string account, const MemoSettings s) {
+    return Json(["kind": Json("memoSettings"), "account": Json(account.toLower),
+        "limit": s.unlimited ? Json(null) : Json(cast(long) s.limit), "locked": Json(s.locked)]);
+}
+
+/// Fresh `IGNORE LIST`, parsed; answers the request itself on failure.
+private void readIgnoreList(ServicesTransaction txn, AnopeGrammar g, void delegate(MemoIgnoreList) done) {
+    txn.frame(readSpec("IGNORE LIST", memoArrivalRelease(g)), (ServiceFrame f) {
+        ServiceStatus st;
+        string reason;
+        if (readFailed(txn, f)) return;
+        auto list = parseMemoIgnoreList(g, f);
+        if (!list.ok) {
+            if (findRefusal(g, f, null, st, reason)) txn.complete(st, reason);
+            else txn.complete(ServiceStatus.unconfirmed, f.lines.length ? "unrecognized_reply" : "no_reply");
+            return;
+        }
+        done(list);
+    });
+}
+
+/// Fresh own `INFO`, parsed; answers the request itself on failure.
+private void readSettings(ServicesTransaction txn, AnopeGrammar g, void delegate(MemoSettings) done) {
+    txn.frame(readSpec("INFO", memoArrivalRelease(g)), (ServiceFrame f) {
+        ServiceStatus st;
+        string reason;
+        if (readFailed(txn, f)) return;
+        auto settings = parseMemoInfo(g, f);
+        if (!settings.ok) {
+            if (findRefusal(g, f, null, st, reason)) txn.complete(st, reason);
+            else txn.complete(ServiceStatus.unconfirmed, f.lines.length ? "unrecognized_reply" : "no_reply");
+            return;
+        }
+        done(settings);
+    });
+}
+
+private void runMemoIgnoreList(ServicesTransaction txn, AnopeGrammar g) {
+    const account = txn.actor.account;
+    readIgnoreList(txn, g, (MemoIgnoreList list) {
+        const revision = servicesRevision(txn, ignoreCanonical(account, list.masks));
+        auto data = ignoreJson(account, list.masks);
+        readCapabilities(txn, [ServiceAction.memoIgnoreAdd, ServiceAction.memoIgnoreRemove], (Json caps) {
+            if (!list.masks.length) narrowCapability(caps, ServiceAction.memoIgnoreRemove, "denied", "no_ignores");
+            txn.complete(ServiceStatus.confirmed, "", data, revision, caps);
+        });
+    });
+}
+
+/// Shared IGNORE ADD / IGNORE DEL: HELP gate, fresh list + revision, one
+/// write, exact ack, fresh readback. The entry names are private, so no
+/// `details` are attached.
+private void ignoreWrite(ServicesTransaction txn, AnopeGrammar g, bool add) {
+    const entry = paramString(txn, "entry");
+    const account = txn.actor.account;
+    const action = add ? ServiceAction.memoIgnoreAdd : ServiceAction.memoIgnoreRemove;
+    if (maskTitleEntry(g, entry)) {
+        txn.complete(ServiceStatus.rejected, "invalid_entry");
+        return;
+    }
+    const body_ = (add ? "IGNORE ADD " : "IGNORE DEL ") ~ entry;
+    if (!fitsOrReject(txn, body_)) return;
+    requireHelp(txn, action, () {
+        readIgnoreList(txn, g, (MemoIgnoreList before) {
+            if (!requireServicesRevision(txn, servicesRevision(txn, ignoreCanonical(account, before.masks)),
+                    ignoreJson(account, before.masks), Json.undefined)) return;
+            if (hasMask(before.masks, entry) == add) {
+                txn.complete(ServiceStatus.rejected, add ? "already_ignored" : "not_ignored");
+                return;
+            }
+            txn.frame(writeSpec(txn, body_, ServiceFrameKind.ordinary, null, memoArrivalRelease(g)),
+                    (ServiceFrame f) {
+                if (ambiguousWrite(txn, f)) return;
+                string[] c;
+                if (!(g.matches(add ? M_IGNORE_ADDED : M_IGNORE_REMOVED, f, c) && c.length && c[0] == entry)) {
+                    ServiceStatus st;
+                    string reason;
+                    if (findRefusal(g, f, MEMO_IGNORE_REFUSALS, st, reason)) txn.complete(st, reason);
+                    else txn.complete(ServiceStatus.unconfirmed, f.outcome == ServiceFrameOutcome.completed
+                        ? (f.lines.length ? "unrecognized_reply" : "no_reply") : incompleteReason(f));
+                    return;
+                }
+                txn.frame(readSpec("IGNORE LIST", memoArrivalRelease(g)), (ServiceFrame lf) {
+                    auto after = parseMemoIgnoreList(g, lf);
+                    if (lf.outcome != ServiceFrameOutcome.completed || !frameComplete(lf) || !after.ok) {
+                        txn.complete(ServiceStatus.unconfirmed, "readback_unavailable");
+                        return;
+                    }
+                    if (hasMask(after.masks, entry) != add) {
+                        txn.complete(ServiceStatus.unconfirmed, "readback_mismatch");
+                        return;
+                    }
+                    txn.complete(ServiceStatus.confirmed, "", ignoreJson(account, after.masks),
+                        servicesRevision(txn, ignoreCanonical(account, after.masks)));
+                });
+            });
+        });
+    });
+}
+
+private void runMemoIgnoreAdd(ServicesTransaction txn, AnopeGrammar g) { ignoreWrite(txn, g, true); }
+
+private void runMemoIgnoreRemove(ServicesTransaction txn, AnopeGrammar g) { ignoreWrite(txn, g, false); }
+
+/// Best-effort network maximum from the cached non-oper `HELP SET LIMIT`
+/// prose. 0 = unknown or uncapped; never an error.
+private long memoMaxLimit(ServicesTransaction txn, AnopeGrammar g) {
+    auto ep = txn.endpoint;
+    ServiceFrame help;
+    if (!txn.cachedServicesHelp(ep, "SET LIMIT", help)) return 0;
+    string[] c;
+    size_t which;
+    if (!g.matchesAny(MEMO_HELP_LIMIT, help, c, which) || c.length != 1 || !c[0].length || c[0].length > 9)
+        return 0;
+    return c[0].to!long;
+}
+
+private void runMemoSettings(ServicesTransaction txn, AnopeGrammar g) {
+    const account = txn.actor.account;
+    readSettings(txn, g, (MemoSettings s) {
+        const revision = servicesRevision(txn, settingsCanonical(account, s));
+        readCapabilities(txn, [ServiceAction.memoLimitSet], (Json caps) {
+            // The HELP read above filled the cache this reads from.
+            txn.complete(ServiceStatus.confirmed, "", settingsJson(account, s, memoMaxLimit(txn, g)), revision, caps);
+        });
+    });
+}
+
+private void runMemoLimitSet(ServicesTransaction txn, AnopeGrammar g) {
+    const limit = paramLong(txn, "limit");
+    const account = txn.actor.account;
+    const body_ = "SET LIMIT " ~ limit.to!string;
+    requireHelp(txn, ServiceAction.memoLimitSet, () {
+        readSettings(txn, g, (MemoSettings before) {
+            if (!requireServicesRevision(txn, servicesRevision(txn, settingsCanonical(account, before)),
+                    settingsJson(account, before, 0), Json.undefined)) return;
+            if (before.locked) {
+                txn.complete(ServiceStatus.rejected, "memo_limit_locked");
+                return;
+            }
+            if (!before.unlimited && before.limit == limit) {
+                txn.complete(ServiceStatus.rejected, "limit_unchanged");
+                return;
+            }
+            txn.frame(writeSpec(txn, body_, ServiceFrameKind.ordinary, null, memoArrivalRelease(g)),
+                    (ServiceFrame f) {
+                if (ambiguousWrite(txn, f)) return;
+                string[] c;
+                const acked = limit > 0
+                    ? g.matches(M_LIMIT_SET, f, c) && c.length && c[0] == limit.to!string
+                    : g.matches(M_LIMIT_ZERO, f, c);
+                if (!acked) {
+                    ServiceStatus st;
+                    string reason;
+                    if (findRefusal(g, f, MEMO_LIMIT_REFUSALS, st, reason)) txn.complete(st, reason);
+                    else txn.complete(ServiceStatus.unconfirmed, f.outcome == ServiceFrameOutcome.completed
+                        ? (f.lines.length ? "unrecognized_reply" : "no_reply") : incompleteReason(f));
+                    return;
+                }
+                txn.frame(readSpec("INFO", memoArrivalRelease(g)), (ServiceFrame lf) {
+                    auto after = parseMemoInfo(g, lf);
+                    if (lf.outcome != ServiceFrameOutcome.completed || !frameComplete(lf) || !after.ok) {
+                        txn.complete(ServiceStatus.unconfirmed, "readback_unavailable");
+                        return;
+                    }
+                    if (after.unlimited || after.limit != limit) {
+                        txn.complete(ServiceStatus.unconfirmed, "readback_mismatch");
+                        return;
+                    }
+                    txn.complete(ServiceStatus.confirmed, "", settingsJson(account, after, 0),
+                        servicesRevision(txn, settingsCanonical(account, after)));
                 });
             });
         });

@@ -13,7 +13,8 @@
 /// Run with: `dub run --config=services-test` (from engine/engine).
 module services_test;
 
-import std.algorithm : any, canFind, startsWith;
+import std.algorithm : any, canFind, filter, startsWith;
+import std.array : array;
 import std.conv : to;
 import std.stdio : stderr, writeln;
 import std.string : indexOf;
@@ -1159,6 +1160,277 @@ void fingerprintChecks() {
             && countBody(r, "LIST") == 3 && r.last.data["text"].get!string == "candidate memo body");
         ok("memo body remains private rather than appearing in generic result details",
             !r.last.details.canFind("candidate memo body"));
+    }
+    foreach (scenario; ["all", "leftover", "empty", "stale"]) {
+        auto r = Rig.make();
+        size_t cursor;
+        bool deleted;
+        string[] memoReply(string service, string body) {
+            if (body == "LIST")
+                return scenario == "empty" || (scenario == "all" && deleted) ? ["You have no memos."]
+                    : ["Memos for acct:", "Number  Sender  Date/Time", "* 1     bob     Nov 06 2026",
+                        "  2     carol   Nov 07 2026"];
+            if (body == "HELP DEL") return ["Syntax: DEL [channel] {num | list | LAST | ALL}"];
+            if (body == "DEL ALL") {
+                deleted = true;
+                return ["All of your memos have been deleted."];
+            }
+            return ["Unknown command"];
+        }
+        r.run(r.request(ServiceAction.memoList, `{}`));
+        answer(r, cursor, &memoReply);
+        auto del = r.request(ServiceAction.memoDelete, `{"all":true}`);
+        del.expectedRevision = scenario == "stale" ? "stale-revision" : r.last.revision;
+        r.run(del);
+        answer(r, cursor, &memoReply);
+        if (scenario == "all")
+            ok("memo DEL ALL sends one native command and confirms only an empty fresh LIST",
+                r.last.status == ServiceStatus.confirmed && countBody(r, "DEL ALL") == 1
+                && r.last.data["entries"].length == 0);
+        else if (scenario == "leftover")
+            ok("memo DEL ALL stays unconfirmed when the fresh LIST still shows memos",
+                r.last.status == ServiceStatus.unconfirmed && r.last.reasonCode == "readback_mismatch"
+                && countBody(r, "DEL ALL") == 1);
+        else if (scenario == "empty")
+            ok("memo DEL ALL on an empty inbox is rejected without a write",
+                r.last.status == ServiceStatus.rejected && r.last.reasonCode == "memo_not_found"
+                && countBody(r, "DEL ALL") == 0);
+        else
+            ok("memo DEL ALL with a stale reviewed revision never writes",
+                r.last.status != ServiceStatus.confirmed && countBody(r, "DEL ALL") == 0);
+    }
+    {
+        static immutable ignoreHelp = ["Syntax: IGNORE [channel] ADD entry", "        IGNORE [channel] DEL entry",
+            "        IGNORE [channel] LIST"];
+        foreach (shape; ["empty", "fixed", "flexible", "v20header", "garbage"]) {
+            auto r = Rig.make();
+            size_t cursor;
+            string[] ignoreReply(string service, string body) {
+                if (body == "HELP IGNORE") return ignoreHelp.dup;
+                if (body == "IGNORE LIST") {
+                    switch (shape) {
+                        case "empty": return ["Memo ignore list is empty."];
+                        case "fixed": return ["Memo ignore list:", "Mask", "bob", "*!*@spam.example"];
+                        case "flexible": return ["Memo ignore list:", "bob", "*!*@spam.example"];
+                        case "v20header": return ["Ignore list:", "Mask", "bob", "*!*@spam.example"];
+                        default: return ["something unexpected"];
+                    }
+                }
+                return ["Unknown command"];
+            }
+            r.run(r.request(ServiceAction.memoIgnoreList, `{}`));
+            answer(r, cursor, &ignoreReply);
+            if (shape == "empty")
+                ok("memo IGNORE LIST reads an empty list and narrows unblock",
+                    r.last.status == ServiceStatus.confirmed && r.last.data["entries"].length == 0
+                    && !requestable(r.last.capabilities, ServiceAction.memoIgnoreRemove)
+                    && requestable(r.last.capabilities, ServiceAction.memoIgnoreAdd));
+            else if (shape == "garbage")
+                ok("memo IGNORE LIST with an unknown shape is unconfirmed",
+                    r.last.status == ServiceStatus.unconfirmed && r.last.reasonCode == "unrecognized_reply");
+            else
+                ok("memo IGNORE LIST parses the " ~ shape ~ " form into two entries",
+                    r.last.status == ServiceStatus.confirmed && r.last.data["entries"].length == 2
+                    && r.last.data["entries"][1]["mask"].get!string == "*!*@spam.example"
+                    && requestable(r.last.capabilities, ServiceAction.memoIgnoreRemove));
+        }
+        foreach (scenario; ["ok", "dup", "mismatch", "stale", "invalid"]) {
+            auto r = Rig.make();
+            size_t cursor;
+            string[] masks = scenario == "dup" ? ["Carol"] : ["bob"];
+            string[] ignoreReply(string service, string body) {
+                if (body == "HELP IGNORE") return ignoreHelp.dup;
+                if (body == "IGNORE LIST") return ["Memo ignore list:", "Mask"] ~ masks;
+                if (body == "IGNORE ADD carol") {
+                    if (scenario != "mismatch") masks ~= "carol";
+                    return ["\x02carol\x02 added to ignore list."];
+                }
+                return ["Unknown command"];
+            }
+            r.run(r.request(ServiceAction.memoIgnoreList, `{}`));
+            answer(r, cursor, &ignoreReply);
+            auto add = r.request(ServiceAction.memoIgnoreAdd,
+                scenario == "invalid" ? `{"entry":"Mask"}` : `{"entry":"carol"}`);
+            add.expectedRevision = scenario == "stale" ? "stale-revision" : r.last.revision;
+            r.run(add);
+            answer(r, cursor, &ignoreReply);
+            if (scenario == "ok")
+                ok("memo IGNORE ADD sends one native command and confirms only a fresh list containing the entry",
+                    r.last.status == ServiceStatus.confirmed && countBody(r, "IGNORE ADD carol") == 1
+                    && r.last.data["entries"].length == 2
+                    && r.last.data["entries"][1]["mask"].get!string == "carol");
+            else if (scenario == "dup")
+                ok("memo IGNORE ADD of an already listed name (other case) is rejected without a write",
+                    r.last.status == ServiceStatus.rejected && r.last.reasonCode == "already_ignored"
+                    && countBody(r, "IGNORE ADD carol") == 0);
+            else if (scenario == "mismatch")
+                ok("memo IGNORE ADD stays unconfirmed when the fresh list lacks the entry",
+                    r.last.status == ServiceStatus.unconfirmed && r.last.reasonCode == "readback_mismatch"
+                    && countBody(r, "IGNORE ADD carol") == 1);
+            else if (scenario == "stale")
+                ok("memo IGNORE ADD with a stale reviewed revision never writes",
+                    r.last.status != ServiceStatus.confirmed && countBody(r, "IGNORE ADD carol") == 0);
+            else
+                ok("memo IGNORE ADD of the table's column title is rejected before any write",
+                    r.last.status == ServiceStatus.rejected && r.last.reasonCode == "invalid_entry"
+                    && countBody(r, "IGNORE ADD Mask") == 0);
+        }
+        foreach (scenario; ["present", "absent", "last"]) {
+            auto r = Rig.make();
+            size_t cursor;
+            string[] masks = scenario == "last" ? ["bob"] : ["bob", "carol"];
+            string[] ignoreReply(string service, string body) {
+                if (body == "HELP IGNORE") return ignoreHelp.dup;
+                if (body == "IGNORE LIST")
+                    return masks.length ? ["Memo ignore list:", "Mask"] ~ masks : ["Memo ignore list is empty."];
+                if (body == "IGNORE DEL bob") {
+                    masks = masks.filter!(m => m != "bob").array;
+                    return ["\x02bob\x02 removed from the ignore list."];
+                }
+                return ["Unknown command"];
+            }
+            r.run(r.request(ServiceAction.memoIgnoreList, `{}`));
+            answer(r, cursor, &ignoreReply);
+            auto del = r.request(ServiceAction.memoIgnoreRemove,
+                scenario == "absent" ? `{"entry":"dave"}` : `{"entry":"bob"}`);
+            del.expectedRevision = r.last.revision;
+            r.run(del);
+            answer(r, cursor, &ignoreReply);
+            if (scenario == "present")
+                ok("memo IGNORE DEL sends one native command and confirms only a fresh list without the entry",
+                    r.last.status == ServiceStatus.confirmed && countBody(r, "IGNORE DEL bob") == 1
+                    && r.last.data["entries"].length == 1);
+            else if (scenario == "absent")
+                ok("memo IGNORE DEL of an unlisted name is rejected without a write",
+                    r.last.status == ServiceStatus.rejected && r.last.reasonCode == "not_ignored"
+                    && countBody(r, "IGNORE DEL dave") == 0);
+            else
+                ok("memo IGNORE DEL of the last entry confirms an empty list",
+                    r.last.status == ServiceStatus.confirmed && countBody(r, "IGNORE DEL bob") == 1
+                    && r.last.data["entries"].length == 0);
+        }
+    }
+    {
+        static immutable limitHelp = ["Syntax: LIMIT [channel] limit", " ",
+            "Sets the maximum number of memos you (or the given channel) are allowed to have. If you set this to 0, "
+            ~ "no one will be able to send any memos to you. However, you cannot set this any higher than 20."];
+        struct InfoCase { string line; long limit; bool locked; }
+        static immutable infoCases = [
+            InfoCase("Your memo limit is \x0220\x02.", 20, false),
+            InfoCase("Your memo limit is \x0220\x02, and may not be changed.", 20, true),
+            InfoCase("Your memo limit is \x020\x02; you will not receive any new memos.", 0, false),
+            InfoCase("Your memo limit is \x020\x02; you will not receive any new memos. You cannot change this limit.",
+                0, true),
+            InfoCase("You have no limit on the number of memos you may keep.", -1, false),
+        ];
+        foreach (info; infoCases) {
+            auto r = Rig.make();
+            size_t cursor;
+            string[] settingsReply(string service, string body) {
+                if (body == "HELP INFO") return ["Syntax: INFO [nick | channel]"];
+                if (body == "HELP SET LIMIT") return limitHelp.dup;
+                if (body == "INFO") return ["You have 3 memos, and 1 is unread.", info.line];
+                return ["Unknown command"];
+            }
+            r.run(r.request(ServiceAction.memoSettings, `{}`));
+            answer(r, cursor, &settingsReply);
+            const data = r.last.data;
+            ok("memo INFO reads the limit form: " ~ info.line,
+                r.last.status == ServiceStatus.confirmed && data["locked"].get!bool == info.locked
+                && (info.limit < 0 ? data["limit"].type == Json.Type.null_ : data["limit"].get!long == info.limit));
+        }
+        foreach (shape; ["two", "none"]) {
+            auto r = Rig.make();
+            size_t cursor;
+            string[] settingsReply(string service, string body) {
+                if (body == "HELP INFO") return ["Syntax: INFO [nick | channel]"];
+                if (body == "INFO")
+                    return shape == "two" ? ["Your memo limit is \x0220\x02.", "Your memo limit is \x0221\x02."]
+                        : ["You have 3 memos."];
+                return ["Unknown command"];
+            }
+            r.run(r.request(ServiceAction.memoSettings, `{}`));
+            answer(r, cursor, &settingsReply);
+            ok("memo INFO with " ~ shape ~ " limit lines is unconfirmed",
+                r.last.status == ServiceStatus.unconfirmed && r.last.reasonCode == "unrecognized_reply");
+        }
+        static immutable wrappedHelp = ["Syntax: LIMIT [channel] limit", " ",
+            "Sets the maximum number of memos you (or the given channel)", "are allowed to have. If you set this to 0, no one will be",
+            "able to send any memos to you.  However, you cannot set", "this any higher than 35."];
+        foreach (wrapped; [false, true]) {
+            auto r = Rig.make();
+            size_t cursor;
+            string[] settingsReply(string service, string body) {
+                if (body == "HELP INFO") return ["Syntax: INFO [nick | channel]"];
+                if (body == "HELP SET LIMIT") return wrapped ? wrappedHelp.dup : limitHelp.dup;
+                if (body == "INFO") return ["Your memo limit is \x0220\x02."];
+                return ["Unknown command"];
+            }
+            r.run(r.request(ServiceAction.memoSettings, `{}`));
+            answer(r, cursor, &settingsReply);
+            ok(wrapped ? "memo INFO reads the network maximum from the hard-wrapped 2.0 HELP SET LIMIT prose"
+                    : "memo INFO reports the network maximum from the cached HELP SET LIMIT prose",
+                r.last.status == ServiceStatus.confirmed && r.last.data["maxLimit"].type == Json.Type.int_
+                && r.last.data["maxLimit"].get!long == (wrapped ? 35 : 20)
+                && requestable(r.last.capabilities, ServiceAction.memoLimitSet));
+        }
+        foreach (scenario; ["disable", "enable", "locked", "unchanged", "refused", "mismatch", "stale"]) {
+            auto r = Rig.make();
+            size_t cursor;
+            long limit = scenario == "enable" ? 0 : 20;
+            string[] limitReply(string service, string body) {
+                if (body == "HELP INFO") return ["Syntax: INFO [nick | channel]"];
+                if (body == "HELP SET LIMIT") return limitHelp.dup;
+                if (body == "INFO") {
+                    if (scenario == "locked") return ["Your memo limit is \x0220\x02, and may not be changed."];
+                    return limit == 0 ? ["Your memo limit is \x020\x02; you will not receive any new memos."]
+                        : ["Your memo limit is \x02" ~ limit.to!string ~ "\x02."];
+                }
+                if (body == "SET LIMIT 0") {
+                    if (scenario != "mismatch") limit = 0;
+                    return ["You will no longer be able to receive memos."];
+                }
+                if (body == "SET LIMIT 20") {
+                    limit = 20;
+                    return ["Your memo limit has been set to \x0220\x02."];
+                }
+                if (body == "SET LIMIT 50") return ["You cannot set your memo limit higher than 10."];
+                return ["Unknown command"];
+            }
+            r.run(r.request(ServiceAction.memoSettings, `{}`));
+            answer(r, cursor, &limitReply);
+            const target = scenario == "enable" || scenario == "unchanged" ? 20 : scenario == "refused" ? 50 : 0;
+            auto set = r.request(ServiceAction.memoLimitSet, `{"limit":` ~ target.to!string ~ `}`);
+            set.expectedRevision = scenario == "stale" ? "stale-revision" : r.last.revision;
+            r.run(set);
+            answer(r, cursor, &limitReply);
+            const writes = countBody(r, "SET LIMIT 0") + countBody(r, "SET LIMIT 20") + countBody(r, "SET LIMIT 50");
+            if (scenario == "disable")
+                ok("memo SET LIMIT 0 sends one native command and confirms only a fresh INFO showing 0",
+                    r.last.status == ServiceStatus.confirmed && writes == 1 && r.last.data["limit"].get!long == 0);
+            else if (scenario == "enable")
+                ok("memo SET LIMIT n re-enables incoming memos and confirms the fresh limit",
+                    r.last.status == ServiceStatus.confirmed && writes == 1 && r.last.data["limit"].get!long == 20);
+            else if (scenario == "locked")
+                ok("memo SET LIMIT on a locked limit is rejected without a write",
+                    r.last.status == ServiceStatus.rejected && r.last.reasonCode == "memo_limit_locked"
+                    && writes == 0);
+            else if (scenario == "unchanged")
+                ok("memo SET LIMIT to the current limit is rejected without a write",
+                    r.last.status == ServiceStatus.rejected && r.last.reasonCode == "limit_unchanged"
+                    && writes == 0);
+            else if (scenario == "refused")
+                ok("memo SET LIMIT above the network maximum maps its refusal",
+                    r.last.status == ServiceStatus.rejected && r.last.reasonCode == "limit_above_maximum"
+                    && writes == 1);
+            else if (scenario == "mismatch")
+                ok("memo SET LIMIT stays unconfirmed when the fresh INFO shows the old limit",
+                    r.last.status == ServiceStatus.unconfirmed && r.last.reasonCode == "readback_mismatch"
+                    && writes == 1);
+            else
+                ok("memo SET LIMIT with a stale reviewed revision never writes",
+                    r.last.status != ServiceStatus.confirmed && writes == 0);
+        }
     }
     {
         auto r = Rig.make();
