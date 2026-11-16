@@ -9,6 +9,34 @@ import std.typecons : Nullable;
 import core.time : seconds, Duration;
 import ircfiber.db.circuit_breaker : initMongoCircuitBreaker;
 
+/// `uri` with the password of its `user:password@` userinfo replaced by `***`,
+/// safe to log. A URI without credentials is returned unchanged.
+string redactMongoUri(string uri) @safe pure {
+    import std.string : indexOf, lastIndexOf;
+    const schemeEnd = uri.indexOf("://");
+    if (schemeEnd < 0) return uri;
+    const authStart = schemeEnd + 3;
+    // Userinfo ends at the last '@' before the first '/' or '?' that follows the authority.
+    size_t authEnd = uri.length;
+    foreach (i; authStart .. uri.length)
+        if (uri[i] == '/' || uri[i] == '?') { authEnd = i; break; }
+    const at = uri[authStart .. authEnd].lastIndexOf('@');
+    if (at < 0) return uri;
+    const userinfo = uri[authStart .. authStart + at];
+    const colon = userinfo.indexOf(':');
+    if (colon < 0) return uri;
+    return uri[0 .. authStart + colon + 1] ~ "***" ~ uri[authStart + at .. $];
+}
+
+@("redactMongoUri hides the password only")
+@safe pure unittest {
+    assert(redactMongoUri("mongodb://u:p%40ss@h1:27017,h2/db?authSource=admin") == "mongodb://u:***@h1:27017,h2/db?authSource=admin");
+    assert(redactMongoUri("mongodb://u:a@b@host/db") == "mongodb://u:***@host/db");
+    assert(redactMongoUri("mongodb://127.0.0.1:27017") == "mongodb://127.0.0.1:27017");
+    assert(redactMongoUri("mongodb://user@host/db") == "mongodb://user@host/db");
+    assert(redactMongoUri("mongodb://host/db?x=a:b@c") == "mongodb://host/db?x=a:b@c");
+}
+
 /// Cap on simultaneous open MongoDB connections per process.
 ///
 /// vibe.d's `ConnectionPool` defaults to `uint.max` (effectively unlimited)
@@ -54,12 +82,12 @@ final class AppMongoConnection {
             }
             effectiveUri ~= inject;
             if (inject.length > 0) {
-                logInfo("MongoDB URI augmented for replica set: %s -> %s", uri, effectiveUri);
+                logInfo("MongoDB URI augmented for replica set: %s -> %s", redactMongoUri(uri), redactMongoUri(effectiveUri));
             }
         }
         MongoClientSettings settings;
         if (!parseMongoDBUrl(settings, effectiveUri)) {
-            throw new Exception("Unable to parse MongoDB URL: " ~ effectiveUri);
+            throw new Exception("Unable to parse MongoDB URL: " ~ redactMongoUri(effectiveUri));
         }
         settings.maxConnections = min(settings.maxConnections, MAX_MONGO_CONNECTIONS);
         logInfo("MongoDB connection pool size capped at %d", settings.maxConnections);
@@ -67,7 +95,7 @@ final class AppMongoConnection {
         db = client.getDatabase(dbName);
         connected = true;
         initMongoCircuitBreaker();
-        logInfo("Connected to MongoDB database %s (uri: %s)", dbName, effectiveUri);
+        logInfo("Connected to MongoDB database %s (uri: %s)", dbName, redactMongoUri(effectiveUri));
     }
     /// Returns the MongoDB database.
     static MongoDatabase getDb() { return db; }
