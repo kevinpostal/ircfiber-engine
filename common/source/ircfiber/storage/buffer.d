@@ -339,6 +339,42 @@ LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string]);
         return hasString(msg, "rx") || hasString(msg, "ux");
     }
 
+    /// Millisecond `t` of a stored scrollback row, read from the raw bytes
+    /// without parsing. Rows are compact JSON whose leading keys are
+    /// `"i":"<id>"` (optional) then `"t":<digits>`; anything else (other key
+    /// order, escapes in the id, a non-integer `t`) returns false so the
+    /// caller falls back to a full parse.
+    ///
+    /// The connect-time unread tail scans every buffer's 5000-row hot list and
+    /// almost every row is older than lastSeen; parsing them all built a Json
+    /// tree per row and OOM-killed the gateway when several users reconnected.
+    static bool peekRowTimestamp(const(ubyte)[] raw, out long ts) @safe pure nothrow @nogc {
+        enum scanLimit = 96;
+        const n = raw.length < scanLimit ? raw.length : scanLimit;
+        size_t i = 1;
+        if (n < 2 || raw[0] != '{') return false;
+        if (n >= 6 && raw[1] == '"' && raw[2] == 'i' && raw[3] == '"' && raw[4] == ':' && raw[5] == '"') {
+            i = 6;
+            while (i < n && raw[i] != '"' && raw[i] != '\\') i++;
+            // `"i":"<id>","t":` — the id's closing quote, then a comma.
+            if (i + 1 >= n || raw[i] != '"' || raw[i + 1] != ',') return false;
+            i += 2;
+        }
+        if (i + 4 > n || raw[i] != '"' || raw[i + 1] != 't' || raw[i + 2] != '"' || raw[i + 3] != ':')
+            return false;
+        i += 4;
+        long value;
+        size_t digits;
+        while (i < raw.length && raw[i] >= '0' && raw[i] <= '9') {
+            if (++digits > 18) return false;
+            value = value * 10 + (raw[i] - '0');
+            i++;
+        }
+        if (digits == 0 || i >= raw.length || (raw[i] != ',' && raw[i] != '}')) return false;
+        ts = value;
+        return true;
+    }
+
     private Json[] _getRecentFiltered(string key, long count, long before, long after,
                                       long beforeIdx = -1, bool filterNoise = false,
                                       bool unreadOnly = false) @trusted {
@@ -361,6 +397,11 @@ LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string]);
         long idx;
         foreach (raw; results) {
             const curIdx = idx++;
+            if (after > 0 || unreadOnly) {
+                // Same skip the parsed path takes below, minus the allocations.
+                long peeked;
+                if (peekRowTimestamp(raw, peeked) && peeked <= after) continue;
+            }
             string r;
             try {
                 r = () @trusted { return cast(string)raw.idup; } ();
@@ -1171,6 +1212,60 @@ unittest {
         parseJsonString(`{"c":"PRIVMSG","n":"stanzi","x":"good evening!"}`)));
     assert(BufferManager.isScrollbackNoiseRow(parseJsonString(`{"c":"315"}`)));
     assert(BufferManager.isScrollbackNoiseRow(parseJsonString(`{"command":"QUIT"}`)));
+}
+
+@("BufferManager.peekRowTimestamp reads the leading t and refuses anything it cannot be sure of")
+unittest {
+    long ts;
+    assert(BufferManager.peekRowTimestamp(
+        cast(const(ubyte)[]) `{"i":"d6f53d04-02aa-4989-967c-8d9539b25414","t":1794826321036,"n":"x"}`, ts));
+    assert(ts == 1794826321036);
+    assert(BufferManager.peekRowTimestamp(cast(const(ubyte)[]) `{"t":42,"c":"PRIVMSG"}`, ts));
+    assert(ts == 42);
+    assert(BufferManager.peekRowTimestamp(cast(const(ubyte)[]) `{"t":7}`, ts));
+    assert(ts == 7);
+    // A nested or later "t" must never be mistaken for the row's own.
+    assert(!BufferManager.peekRowTimestamp(cast(const(ubyte)[]) `{"n":"x","t":42,"c":"PRIVMSG"}`, ts));
+    assert(!BufferManager.peekRowTimestamp(cast(const(ubyte)[]) `{"a":{"t":42},"c":"PRIVMSG"}`, ts));
+    assert(!BufferManager.peekRowTimestamp(cast(const(ubyte)[]) `{"i":"a\"b","t":42,"c":"PRIVMSG"}`, ts));
+    assert(!BufferManager.peekRowTimestamp(cast(const(ubyte)[]) `{"t":4.2e1,"c":"PRIVMSG"}`, ts));
+    assert(!BufferManager.peekRowTimestamp(cast(const(ubyte)[]) `{"t":-5,"c":"PRIVMSG"}`, ts));
+    assert(!BufferManager.peekRowTimestamp(cast(const(ubyte)[]) `{"t":"42","c":"PRIVMSG"}`, ts));
+    assert(!BufferManager.peekRowTimestamp(cast(const(ubyte)[]) `{"t":12345678901234567890,"c":"PRIVMSG"}`, ts));
+    assert(!BufferManager.peekRowTimestamp(cast(const(ubyte)[]) `{"t":42`, ts));
+    assert(!BufferManager.peekRowTimestamp(cast(const(ubyte)[]) `["t",42]`, ts));
+    assert(!BufferManager.peekRowTimestamp(null, ts));
+}
+
+@("BufferManager.getUnreadTail handles stored id-prefixed rows and rows it must fully parse")
+unittest {
+    import std.uuid : randomUUID;
+    import ircfiber.testing.isolated_db : isolatedTestRedis;
+    auto redis = isolatedTestRedis("BufferManager.getUnreadTail.rows");
+    if (redis is null) return;
+    const netId = "netT-" ~ randomUUID().toString();
+    const key = "scrollback:srvT:" ~ netId ~ ":#rows";
+    void cleanup() {
+        try { redis.getDb().del(key); } catch (Exception) {}
+    }
+    cleanup();
+    scope (exit) cleanup();
+
+    auto db = redis.getDb();
+    // Oldest first so slice 0 is the newest. The out-of-order and reordered
+    // rows model backfilled history landing beneath live rows.
+    db.lpush(key, `{"i":"00000000-0000-4000-8000-000000000001","t":100,"c":"PRIVMSG","n":"a","x":"old"}`);
+    db.lpush(key, `{"n":"b","t":900,"c":"PRIVMSG","x":"reordered-new"}`);
+    db.lpush(key, `{"i":"00000000-0000-4000-8000-000000000002","t":200,"c":"PRIVMSG","n":"c","x":"older-than-seen"}`);
+    db.lpush(key, `{"i":"00000000-0000-4000-8000-000000000003","t":300,"c":"JOIN","n":"d","x":""}`);
+    db.lpush(key, `{"i":"00000000-0000-4000-8000-000000000004","t":500,"c":"NOTICE","n":"e","x":"new-notice"}`);
+
+    auto bm = new BufferManager(redis);
+    auto tail = bm.getUnreadTail("srvT", netId, "#rows", 250, 100);
+    assert(tail.length == 2);
+    assert(tail[0]["x"].get!string == "new-notice");
+    assert(tail[1]["x"].get!string == "reordered-new");
+    assert(bm.getUnreadTail("srvT", netId, "#rows", 900, 100).length == 0);
 }
 
 @("BufferManager.getUnreadTail returns newest chat rows after lastSeen, oldest-first, capped")
