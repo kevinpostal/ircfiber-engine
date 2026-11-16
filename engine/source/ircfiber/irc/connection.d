@@ -12593,7 +12593,13 @@ private void processEvents() {
                     // it caps both our line rate and a multiline batch.
                     if (mp.length >= 3) applyChannelFloodMode(mp[0], mp[1], mp[2 .. $]);
                     if (mp.length >= 3) {
-                        const chan = mp[0];
+                        // The roster is keyed by the normalized name; a server
+                        // that echoes its own channel casing (Efnet: `MODE
+                        // #IRC30 +v nick` for #irc30) would otherwise miss
+                        // the held roster and plant a one-member `#IRC30`
+                        // entry that the state snapshot folds over the real
+                        // `#irc30` roster.
+                        const chan = normalizeChannelName(mp[0]);
                         auto modeStr = mp[1];
                         // Modifying the array through `ref` inside a foreach
                         // over `*members` (AA value pointer) can leave stale
@@ -16674,6 +16680,23 @@ unittest {
     // WHO fills the bare one in and promotes it without losing the host.
     c.processLine(":s 352 me #c ~c hc s carol H@ :0 Carol");
     assert(c.channelUsers["#c"] == ["@me!~m@host.a", "b!~a@ha", "@carol!~c@hc"]);
+    ch.close();
+}
+
+@("roster: a MODE echoed in the server's own channel casing updates the held roster")
+unittest {
+    NetworkConfig cfg;
+    cfg.nick = "me";
+    auto ch = EngineEventChannel.create();
+    auto c = new PersistentIRCClient(cfg, ch);
+    c.processLine(":me!~m@host.a JOIN #irc30");
+    c.processLine(":s 353 me = #irc30 :me alice bob");
+    c.processLine(":s 366 me #irc30 :End of NAMES");
+    // Efnet restates the channel as registered (`#IRC30`), not as we joined.
+    c.processLine(":efnetbot!b@h MODE #IRC30 +v me");
+    assert(c.channelUsers.length == 1 && "#irc30" in c.channelUsers,
+        "no differently-cased roster key may be created");
+    assert(c.channelUsers["#irc30"] == ["+me!~m@host.a", "alice", "bob"]);
     ch.close();
 }
 
