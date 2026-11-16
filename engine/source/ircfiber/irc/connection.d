@@ -33,6 +33,9 @@ import ircfiber.irc.routing_policy : RouteKind, RoutingPreferences, EffectiveRou
 import ircfiber.irc.routing_policy_store : loadEffectiveRoutingPolicy;
 import ircfiber.metadata : USER_METADATA_KEYS, CHANNEL_METADATA_KEYS, PROFILE_KEYS, isValidMetadataValue;
 import ircfiber.db.lastseen : LastSeenRepository, heartbeatEchoJson;
+import ircfiber.db.messages : MessageRepository;
+import ircfiber.db.mongo : AppMongoConnection;
+import ircfiber.irc.query_restore : QUERY_RESTORE_LIMIT, QUERY_RESTORE_WINDOW_MS, queriesToReopen;
 import ircfiber.redis.protocol : RedisKeys, TlsInfo;
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.network_write_gate : NetworkWriter, runNetworkWrite,
@@ -6463,6 +6466,34 @@ final class PersistentIRCClient {
         }
     }
 
+    /// Query tabs live in this process and the holder's META snapshot only, so a
+    /// holder restart or a fresh dial leaves every open private conversation
+    /// behind while its messages stay in Mongo. Re-open, once per session start,
+    /// the conversations with recent history that are not already tabs. Runs in
+    /// its own fiber: a slow or unavailable Mongo only delays the tabs.
+    private void restoreQueryBuffersFromHistory() nothrow {
+        try {
+            runTask({
+                try {
+                    if (!AppMongoConnection.isConnected()) return;
+                    const epoch = connectionEpoch;
+                    const since = unixMsNow() - QUERY_RESTORE_WINDOW_MS;
+                    const names = (new MessageRepository()).recentDirectBuffers(
+                        config.id.toString(), since, QUERY_RESTORE_LIMIT);
+                    // The session may have ended or been replaced while Mongo answered.
+                    if (epoch != connectionEpoch) return;
+                    auto fresh = queriesToReopen(queryBuffers, names, (a, b) => sameNick(a, b));
+                    if (!fresh.length) return;
+                    queryBuffers ~= fresh;
+                    requestMetaPublication();
+                    logInfo("Re-opened %d private conversation(s) from history on %s", fresh.length, config.name);
+                } catch (Exception e) {
+                    logWarn("restore query buffers[%s]: %s", config.name, e.msg);
+                }
+            });
+        } catch (Exception) {}
+    }
+
     /// Attach to a live connection the holder kept across an engine restart
     /// (planned hot swap or crash). Restores the snapshot the previous
     /// engine published, re-takes the egress slot hold, and resumes the
@@ -6628,6 +6659,7 @@ final class PersistentIRCClient {
         // server-log line tells the user what happened.
         emitLog("info", "Engine reattached to live connection (hot swap); connected for "
             ~ formatUptime(upSecs) ~ (activeEgressLabel.length ? " via " ~ egressDisplay() : "") ~ ".");
+        restoreQueryBuffersFromHistory();
         logInfo("Attached to held connection %s for %s (%d joined channels, %d acked caps, graceful=%s)",
             holderConnId, config.host, channelState.length, ackedCaps.length, graceful);
         logJsonMap("info", "connection",
@@ -9814,6 +9846,7 @@ final class PersistentIRCClient {
                             externalRefusalAtMs = 0;
                             externalRefusalReason = "";
                             releaseRegistrationPermit();
+                            restoreQueryBuffersFromHistory();
                             // Registration NICK has no separate echo: 001 is
                             // its confirmation, not an outstanding /nick.
                             const welcomeParams = evt.getParams();

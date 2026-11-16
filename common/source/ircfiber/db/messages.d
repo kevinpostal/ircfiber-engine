@@ -191,12 +191,36 @@ int messageRetentionDays() @trusted {
     return MESSAGE_RETENTION_DAYS_DEFAULT;
 }
 
+/// MongoDB (PCRE) spelling of `isDirectBuffer` for server-side filters.
+enum DIRECT_BUFFER_REGEX = `^[^#&.:*,\s]+$`;
+
+/// Whether a `messages.channel` value is a private conversation (a nick),
+/// as opposed to a channel, the `_server` log or a server-name pseudo buffer.
+/// Private conversations are not subject to retention: `messageDocument`
+/// writes no `tsAt` for them, so the TTL index never deletes them.
+bool isDirectBuffer(string channel) @safe pure nothrow @nogc {
+    if (channel.length == 0 || channel == "_server") return false;
+    if (channel[0] == '#' || channel[0] == '&') return false;
+    foreach (char c; channel) {
+        if (c <= 0x20 || c == 0x7F || c == '.' || c == ':' || c == '*' || c == ',') return false;
+    }
+    return true;
+}
+
+@("isDirectBuffer: nicks yes; channels, _server, server names, wildcards no")
+@safe pure nothrow @nogc unittest {
+    assert(isDirectBuffer("Boogie1488") && isDirectBuffer("a[b]\\c`d^e|f{g}h-i_j"));
+    assert(!isDirectBuffer("") && !isDirectBuffer("_server") && !isDirectBuffer("#dlang") && !isDirectBuffer("&local"));
+    assert(!isDirectBuffer("irc.example.org") && !isDirectBuffer("*targets") && !isDirectBuffer("two words"));
+    assert(!isDirectBuffer("a,b") && !isDirectBuffer("fe80::1"));
+}
+
 /**
  * Rolling message storage (IRCCloud-style).
  *
- * MongoDB stores every message the engine sees; rows expire after
+ * MongoDB stores every message the engine sees; channel and server-log rows expire after
  * `messageRetentionDays()` via the `tsAt` TTL index (Mongo's TTL monitor
- * deletes them in the background). Redis keeps a hot cache of the most
+ * deletes them in the background; private conversations carry no `tsAt` and are kept). Redis keeps a hot cache of the most
  * recent N messages for fast access. When the cache is exhausted, the
  * REST API falls through to MongoDB for scrollback within the retention
  * window.
@@ -315,11 +339,18 @@ final class MessageRepository {
 
         // Rows written before `tsAt` existed never age out unless they get
         // one. `{tsAt: {$exists: false}}` is served by the non-sparse tsAt_1
-        // index, so after the first run this is a cheap seek returning 0.
+        // index, so after the first run this is a cheap seek. Private
+        // conversations (see `isDirectBuffer`) deliberately carry no `tsAt`
+        // and are excluded, or they would be given an expiry on every start.
         // Runs in a fiber so engine boot and gateway requests never block.
         runTask({
             try {
-                auto filter = Bson(["tsAt": Bson(["$exists": Bson(false)])]);
+                auto filter = Bson.emptyObject;
+                filter["tsAt"] = Bson(["$exists": Bson(false)]);
+                filter["$or"] = Bson([
+                    Bson(["channel": Bson("_server")]),
+                    Bson(["channel": Bson(["$not": Bson(["$regex": Bson(DIRECT_BUFFER_REGEX)])])]),
+                ]);
                 Bson[] pipeline = [Bson(["$set": Bson(["tsAt": Bson(["$toDate": Bson("$t")])])])];
                 auto res = collection.updateMany(filter, Bson(pipeline));
                 if (res.modifiedCount > 0)
@@ -447,8 +478,53 @@ final class MessageRepository {
         if (msgid.length > 0) jdoc["msgid"] = Json(msgid);
         if (eid > 0) jdoc["eid"] = Json(eid);
         auto doc = Bson(jdoc);
-        doc["tsAt"] = Bson(BsonDate(timestampMs));
+        // Private conversations are kept for good: a row without `tsAt` is never
+        // matched by the TTL index (see `isDirectBuffer`).
+        if (!isDirectBuffer(channel)) doc["tsAt"] = Bson(BsonDate(timestampMs));
         return doc;
+    }
+
+    /// The private conversations of `networkId` with a message newer than
+    /// `sinceMs` (unix ms), newest first, at most `limit`. Backs re-opening
+    /// the query tabs a network lost with its in-memory session (holder
+    /// restart, fresh dial): the history is the durable record of who the
+    /// user talked to. One `distinct` over the (networkId, channel, t) index;
+    /// only a network with more than `limit` candidates pays for the ranking.
+    string[] recentDirectBuffers(string networkId, long sinceMs, size_t limit) @trusted {
+        auto query = Bson.emptyObject;
+        query["networkId"] = Bson(networkId);
+        query["t"] = Bson(["$gt": Bson(sinceMs)]);
+        auto cmd = Bson.emptyObject;              // field order matters: command name first
+        cmd["distinct"] = Bson("messages");
+        cmd["key"] = Bson("channel");
+        cmd["query"] = query;
+        cmd["maxTimeMS"] = Bson(15_000L);
+        auto reply = AppMongoConnection.runCommand(cmd);
+
+        string[] names;
+        foreach (value; reply["values"]) {
+            if (value.type != Bson.Type.string) continue;
+            const name = value.get!string;
+            if (isDirectBuffer(name)) names ~= name;
+        }
+        if (names.length <= limit) return names;
+
+        Bson[] pipeline;
+        auto match = Bson.emptyObject;
+        match["networkId"] = Bson(networkId);
+        match["channel"] = Bson(["$in": serializeToBson(names)]);
+        match["t"] = Bson(["$gt": Bson(sinceMs)]);
+        pipeline ~= Bson(["$match": match]);
+        auto group = Bson.emptyObject;
+        group["_id"] = Bson("$channel");
+        group["last"] = Bson(["$max": Bson("$t")]);
+        pipeline ~= Bson(["$group": group]);
+        pipeline ~= Bson(["$sort": Bson(["last": Bson(-1)])]);
+        pipeline ~= Bson(["$limit": Bson(cast(long) limit)]);
+        AggregateOptions options;
+        string[] newest;
+        foreach (doc; collection.aggregate!Bson(pipeline, options)) newest ~= doc["_id"].get!string;
+        return newest;
     }
 
     /// Replay the original compact event, never assigning an eid or wall-clock
@@ -1475,4 +1551,46 @@ final class MessageRepository {
         }
         return all;
     }
+}
+
+@("private conversations carry no retention stamp and are listed newest first")
+unittest {
+    import std.uuid : randomUUID;
+    import ircfiber.testing.isolated_db : connectIsolatedTestMongo;
+    if (!connectIsolatedTestMongo("messages private conversations")) return;
+
+    const network = randomUUID().toString();
+    const now = Clock.currTime.toUnixTime!long * 1000;
+    auto repo = new MessageRepository();
+    auto coll = AppMongoConnection.getDb()["messages"];
+    scope (exit) coll.deleteMany(Bson(["networkId": Bson(network)]));
+
+    long eid;
+    void put(string channel, long agoMs) {
+        auto row = Json.emptyObject;
+        row["t"] = Json(now - agoMs);
+        row["eid"] = Json(++eid);
+        row["c"] = Json("PRIVMSG");
+        repo.appendMessage("ovh", network, channel, row);
+    }
+    put("#dlang", 1_000);
+    put("_server", 1_000);
+    put("alice", 5_000);
+    put("bob", 3_000);
+    put("carol", 9_000);
+    put("old", 200L * 86_400_000);
+
+    // Only channel and server-log rows get a TTL stamp.
+    assert(!coll.findOne(["networkId": network, "channel": "#dlang"]).isNull
+        && coll.findOne(["networkId": network, "channel": "#dlang"])["tsAt"].type == Bson.Type.date);
+    assert(coll.findOne(["networkId": network, "channel": "_server"])["tsAt"].type == Bson.Type.date);
+    foreach (nick; ["alice", "bob", "carol", "old"])
+        assert(coll.findOne(["networkId": network, "channel": nick])["tsAt"].type == Bson.Type.null_, nick);
+
+    const since = now - 90L * 86_400_000;
+    auto all = repo.recentDirectBuffers(network, since, 10);
+    all.sort();
+    assert(all == ["alice", "bob", "carol"], "channels, _server and rows outside the window are not conversations");
+    assert(repo.recentDirectBuffers(network, since, 2) == ["bob", "alice"], "the newest two, newest first");
+    assert(repo.recentDirectBuffers(randomUUID().toString(), since, 10).length == 0);
 }
