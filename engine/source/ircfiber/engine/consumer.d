@@ -18,6 +18,7 @@ import ircfiber.logging : logJsonMap;
 import ircfiber.storage.buffer : BufferManager;
 import std.datetime.systime : Clock;
 import core.time : seconds, Duration, msecs;
+import ircfiber.observability : recordHistogram;
 import ircfiber.irc.routing_policy : routingPreferencesFromJson, RoutingValidationException;
 import ircfiber.engine.state : writeStateSnapshotForNetwork;
 import ircfiber.network_write_gate : NetworkWriter, runNetworkWrite,
@@ -786,6 +787,14 @@ private void handleNetworkCommand(ref EngineContext ctx, string networkId, IRCCo
         logJsonMap("debug", "consumer", "Stale FIBERMLS command dropped",
             ["networkId": networkId, "event": "fibermls_stale_command_dropped"]);
         return;
+    }
+
+    // Time a typed message spent in the command list and consumer before it
+    // reached the connection.
+    if (cmd.cmd == "msg" && cmd.timestampMs > 0) {
+        const waitedMs = (Clock.currStdTime - 621_355_968_000_000_000L) / 10_000 - cmd.timestampMs;
+        if (waitedMs >= 0)
+            recordHistogram("ircfiber.send.command_wait_seconds", waitedMs / 1000.0);
     }
 
     // Ownership is stamped by the authenticated gateway; never trust a queued

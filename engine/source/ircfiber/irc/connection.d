@@ -14403,6 +14403,19 @@ private void processEvents() {
         emitLog("flood_pacing", "The outbound queue is full. Your new command was not queued; try again after it drains.");
     }
 
+    /// Automatic traffic a typed line may overtake in the paced queue: unowned
+    /// optional reads the engine itself issued, history requests, and
+    /// automatic CTCP replies. Everything else (JOIN, NICK, MODE changes,
+    /// connect-script lines, user messages, client-requested reads) is
+    /// foreground, so no line a user message depends on can be overtaken.
+    private bool backgroundPacedLine(const ref BncPendingWrite entry) {
+        if (entry.owner.request.length) return false;
+        if (auto read = entry.line in optionalReads) return !read.fromClient;
+        const command = rawCommand(entry.line);
+        if (command == "CHATHISTORY") return true;
+        return command == "NOTICE" && entry.line.indexOf(" :\x01") >= 0;
+    }
+
     /// Queues noncritical traffic, retaining each owned request separately.
     private bool enqueuePaced(string line, BncCommandOwner owner = BncCommandOwner.init,
             string epoch = "", string wireLabel = "") {
@@ -14424,7 +14437,16 @@ private void processEvents() {
                 bncState().reject(owner, "COMMAND_REJECTED", "Private command was not queued", wireLabel, epoch);
             return false;
         }
-        pacedQueue ~= BncPendingWrite(line, owner, epoch, wireLabel);
+        auto entry = BncPendingWrite(line, owner, epoch, wireLabel);
+        entry.acceptedAtMs = unixMsNow();
+        // A foreground line passes only the trailing run of background lines,
+        // never another foreground line; no lane state is stored, so this
+        // stays correct after snapshot restore and the reconnect merge.
+        size_t position = pacedQueue.length;
+        if (!backgroundPacedLine(entry))
+            while (position > 0 && backgroundPacedLine(pacedQueue[position - 1])) --position;
+        if (position == pacedQueue.length) pacedQueue ~= entry;
+        else pacedQueue = pacedQueue[0 .. position] ~ entry ~ pacedQueue[position .. $];
         // Give the first line a chance to leave immediately rather than
         // waiting for the next 50 ms event-loop tick.
         drainPacedQueue();
@@ -14619,6 +14641,7 @@ private void processEvents() {
 
         while (pacedQueue.length > 0) {
             const entry = pacedQueue[0];
+            const background = backgroundPacedLine(entry);
             string line = entry.line;
             if (!entry.owner.request.length) {
                 if (auto retry = line in automaticJoinLines) {
@@ -14698,6 +14721,11 @@ private void processEvents() {
                         if (floodLimitFor(target).valid()
                             || pacer.isArmed() && !floodTrusted && serverHasTargetFlood(ircdSoftwareFromVersion(serverSoftware)))
                             window.record(now);
+                    if (entry.acceptedAtMs > 0) {
+                        const waitedMs = now > entry.acceptedAtMs ? now - entry.acceptedAtMs : 0;
+                        recordHistogram("ircfiber.send.paced_wait_seconds", waitedMs / 1000.0,
+                            ["lane": background ? "background" : "interactive"]);
+                    }
                 }
             }
             catch (Exception e) {
@@ -17231,6 +17259,31 @@ Ircv3Check[] slowdownWireChecks(out string[] wire) {
         done = done || event.getTag("phase") == "flood_pacing_done";
     }
     check("small queued operations report both cooldown and eventual completion", pacing && done);
+
+    // Typed lines queue ahead of the engine's own reads, never ahead of each
+    // other.
+    client.pacer = FakeLagPacer.init;
+    client.pacer.tighten(unixMsNow());
+    const beforeLanes = received.length;
+    client.sendRaw("NAMES #lane");
+    client.sendRaw("PRIVMSG #lane :typed one", true);
+    client.sendRaw("NAMES #lane2");
+    client.sendRaw("PRIVMSG #lane :typed two", true);
+    string[] queuedLanes;
+    foreach (queued; client.pacedQueue) queuedLanes ~= queued.line;
+    check("typed lines queue ahead of automatic reads and keep their own order",
+        queuedLanes == ["PRIVMSG #lane :typed one", "PRIVMSG #lane :typed two", "NAMES #lane", "NAMES #lane2"]);
+    foreach (_; 0 .. 4) {
+        client.pacer = FakeLagPacer.init;
+        client.processOutboundQueue();
+        pump();
+        if (!client.pacedQueue.length) break;
+    }
+    string[] laneWire;
+    foreach (sent; received[beforeLanes .. $])
+        if (sent.canFind("#lane")) laneWire ~= sent;
+    check("queued typed lines reach the wire ahead of automatic reads, in the same order",
+        laneWire == ["PRIVMSG #lane :typed one", "PRIVMSG #lane :typed two", "NAMES #lane", "NAMES #lane2"]);
     foreach (line; received)
         wire ~= line.startsWith("PRIVMSG NickServ :IDENTIFY ")
             ? "PRIVMSG NickServ :IDENTIFY [fixture-redacted]" : line;

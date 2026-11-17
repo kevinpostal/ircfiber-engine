@@ -22,6 +22,7 @@ struct BncPendingWrite {
     BncCommandOwner owner;
     string epoch;
     string wireLabel;
+    long acceptedAtMs;
 }
 
 struct MonitorStatus {
