@@ -214,7 +214,17 @@ final class BufferManager {
         // `dedup:<serverId>:<networkId>:<channel>` sets are adopted once
         // per buffer via RENAMENX (see adoptServerDedupSet) and otherwise
         // expire on their own TTL.
+        //
+        // Bounded by generation rotation, not by TTL: every append refreshes
+        // the TTL, so on a busy channel it never fires. When the live set
+        // reaches DEDUP_MAX / 2 it is RENAMEd over `<key>:prev`, and lookups
+        // consult both, so the newest >= DEDUP_MAX / 2 identities are always
+        // retained and the pair never exceeds DEDUP_MAX. (`:` cannot occur
+        // in an IRC channel or nick, so the suffix cannot collide.) The
+        // unenforced bound grew one Rizon channel's set to 1.6M members and
+        // drove Redis to maxmemory on 2026-11-17.
         enum DEDUP_PREFIX = "dedup:";
+        enum DEDUP_PREV_SUFFIX = ":prev";
         enum DEDUP_MAX = 10_000;
         enum DEDUP_TTL_SECS = 30 * 86_400;  // 30 days, same as scrollback
     }
@@ -641,10 +651,11 @@ LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string]);
      * re-firing on every reconnect, with no in-memory cache to suppress
      * them after restart).
      *
-     * The set is bounded to DEDUP_MAX entries and TTL'd to match the
-     * scrollback. When the bound is hit, a sampled trim keeps the most
-     * recent half — the cost of briefly re-allowing duplicates on
-     * ancient history is much lower than the cost of unbounded growth.
+     * The set is bounded to DEDUP_MAX entries across two generations and
+     * TTL'd to match the scrollback. When the live generation reaches half
+     * the bound it replaces the previous one, so the most recent half is
+     * always kept — the cost of briefly re-allowing duplicates on ancient
+     * history is much lower than the cost of unbounded growth.
      *
      * Returns `true` when the event was stored and `false` when the dedup
      * set already held it. Callers MUST honour `false`: the event processor
@@ -864,6 +875,7 @@ LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string]);
             string networkId, string channel, string msgid,
             ref const IRCRawEvent event, string[] params, Json message) @trusted {
         const dedupKey = dedupSetKey(networkId, channel);
+        const dedupPrevKey = dedupKey ~ DEDUP_PREV_SUFFIX;
         adoptServerDedupSet(serverId, networkId, channel, dedupKey);
         const member = eventDedupMember(channel, msgid, event, params);
         string ownAlias, oppositeAlias;
@@ -878,20 +890,36 @@ LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string]);
         enum lastRow = (MAX_SCROLLBACK - 1).to!string;
         enum rowTTL = (86_400 * TTL_DAYS).to!string;
         enum dedupTTL = DEDUP_TTL_SECS.to!string;
+        enum dedupRotateAt = (DEDUP_MAX / 2).to!string;
         auto verdict = redis.getDb().eval!string(archiveBufferLineageLua ~ q"LUA
 local dedupType = redis.call('TYPE', KEYS[2]).ok
 if dedupType ~= 'none' and dedupType ~= 'set' then
     return redis.error_reply('Dedup key is not a set')
 end
-local duplicate = redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 1
+local prevType = redis.call('TYPE', KEYS[3]).ok
+if prevType ~= 'none' and prevType ~= 'set' then
+    return redis.error_reply('Dedup key is not a set')
+end
+local function seen(member)
+    return redis.call('SISMEMBER', KEYS[2], member) == 1
+        or redis.call('SISMEMBER', KEYS[3], member) == 1
+end
+-- RENAME carries the TTL and drops the older generation in one step.
+local function rotateDedup()
+    if redis.call('SCARD', KEYS[2]) >= tonumber(ARGV[8]) then
+        redis.call('RENAME', KEYS[2], KEYS[3])
+    end
+end
+local duplicate = seen(ARGV[1])
 if not duplicate and ARGV[7] ~= '' then
-    duplicate = redis.call('SISMEMBER', KEYS[2], ARGV[7]) == 1
+    duplicate = seen(ARGV[7])
 end
 if duplicate then
     -- Remember this primary ID even when its differently identified counterpart
     -- won the race. Do not plant a reverse alias for a row never accepted.
     redis.call('SADD', KEYS[2], ARGV[1])
     redis.call('EXPIRE', KEYS[2], ARGV[5])
+    rotateDedup()
     return '0'
 end
 local bufferType = redis.call('TYPE', KEYS[1]).ok
@@ -918,9 +946,11 @@ redis.call('LTRIM', KEYS[1], 0, ARGV[3])
 redis.call('EXPIRE', KEYS[1], ARGV[4])
 redis.call('EXPIRE', KEYS[2], ARGV[5])
 lineageRefresh(KEYS[1], token)
+rotateDedup()
 return '1'
-LUA", [bufferKey, dedupKey],
-            [member, message.toString(), lastRow, rowTTL, dedupTTL, ownAlias, oppositeAlias]);
+LUA", [bufferKey, dedupKey, dedupPrevKey],
+            [member, message.toString(), lastRow, rowTTL, dedupTTL, ownAlias, oppositeAlias,
+             dedupRotateAt]);
         if (verdict.empty) throw new Exception("Missing atomic scrollback verdict");
         if (verdict.front == "0") return false;
         if (verdict.front != "1") throw new Exception("Invalid atomic scrollback verdict");
@@ -978,7 +1008,7 @@ LUA", [bufferKey, dedupKey],
         auto dedupKey = dedupSetKey(networkId, buffer);
         auto legacyDedupKey = DEDUP_PREFIX ~ serverId ~ ":" ~ networkId ~ ":" ~ buffer;
         // DEL is idempotent — missing keys just return 0.
-        auto deleted = db.del(scrollbackKey, dedupKey, legacyDedupKey);
+        auto deleted = db.del(scrollbackKey, dedupKey, dedupKey ~ DEDUP_PREV_SUFFIX, legacyDedupKey);
         dedupAdopted.remove(dedupKey);
         logInfo("Cleared buffer %s:%s:%s from Redis (keys deleted: %s)",
             serverId, networkId, buffer, deleted.to!string);
@@ -997,7 +1027,7 @@ LUA", [bufferKey, dedupKey],
         auto db = redis.getDb();
         auto scrollbackKey = KEY_PREFIX ~ networkId ~ ":" ~ buffer;
         auto dedupKey = dedupSetKey(networkId, buffer);
-        auto deleted = db.del(scrollbackKey, dedupKey);
+        auto deleted = db.del(scrollbackKey, dedupKey, dedupKey ~ DEDUP_PREV_SUFFIX);
         dedupAdopted.remove(dedupKey);
         logInfo("Cleared legacy buffer %s:%s from Redis (keys deleted: %s)",
             networkId, buffer, deleted.to!string);
@@ -1027,7 +1057,7 @@ LUA", [bufferKey, dedupKey],
         auto result = db.eval!string(archiveBufferLineageLua ~ q"LUA
 -- Preserve the established independent RENAMENX decisions for scoped/legacy
 -- rows and dedup sets. Update lineage only for the physical lists that move.
-for i=1,8,2 do
+for i=1,10,2 do
     local expected = i <= 4 and 'list' or 'set'
     local kind = redis.call('TYPE', KEYS[i]).ok
     if kind ~= 'none' and kind ~= expected then return redis.error_reply('Invalid buffer rename type') end
@@ -1048,7 +1078,7 @@ for i=1,4,2 do
         moved = true
     end
 end
-for i=5,8,2 do
+for i=5,10,2 do
     if redis.call('EXISTS', KEYS[i]) == 1 then
         if redis.call('RENAMENX', KEYS[i], KEYS[i+1]) == 1 then moved = true end
     end
@@ -1056,7 +1086,8 @@ end
 return moved and '1' or '0'
 LUA", [scoped ~ oldBuf, scoped ~ newBuf, legacy ~ oldBuf, legacy ~ newBuf,
             scopedDedup ~ oldBuf, scopedDedup ~ newBuf,
-            legacyDedup ~ oldBuf, legacyDedup ~ newBuf],
+            legacyDedup ~ oldBuf, legacyDedup ~ newBuf,
+            legacyDedup ~ oldBuf ~ DEDUP_PREV_SUFFIX, legacyDedup ~ newBuf ~ DEDUP_PREV_SUFFIX],
             cast(string[])[]);
         if (result.empty || (result.front != "0" && result.front != "1"))
             throw new Exception("Missing atomic rename verdict");

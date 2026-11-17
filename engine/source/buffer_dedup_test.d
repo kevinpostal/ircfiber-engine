@@ -481,6 +481,42 @@ void test_repeated_chat_identity_is_unchanged(RedisStorage redis) {
     }
 }
 
+/// The bound used to be documented but never enforced, and the TTL refreshes
+/// on every append, so a busy channel's set grew without limit (1.6M members
+/// for one Rizon channel) until Redis hit maxmemory.
+void test_dedup_set_is_bounded(RedisStorage redis) {
+    stderr.writeln("\n[dedup] set stays bounded on a busy channel");
+    const nid = randomUUID().toString();
+    scope (exit) cleanup(redis, nid);
+    auto bm = new BufferManager(redis);
+    auto db = redis.getDb();
+    const live = "dedup:" ~ nid ~ ":#busy";
+    const prev = live ~ ":prev";
+    IRCRawEvent message(int n) {
+        auto ev = IRCRawEvent("TestNet", "PRIVMSG");
+        ev.networkId = nid;
+        ev.channel = "#busy";
+        ev.nick = "flood";
+        ev.text = "line " ~ n.to!string;
+        ev.timestampMs = 1_790_000_000_000L + n;
+        ev.setParams(["#busy", ev.text]);
+        ev.addTag("msgid", "busy-" ~ n.to!string);
+        return ev;
+    }
+    enum total = 12_001;
+    bool allStored = true;
+    foreach (n; 0 .. total) allStored &= bm.appendIRCEvent(message(n), "engine1");
+    check!("every distinct message is stored")(allStored);
+    const members = db.scard(live) + db.scard(prev);
+    check!("both generations together stay within DEDUP_MAX")(members <= 10_000, members.to!string);
+    check!("dedup keys keep a TTL")(db.ttl(live) > 0 && db.ttl(prev) > 0);
+    check!("newest identity is still a duplicate")(!bm.appendIRCEvent(message(total - 1), "engine1"));
+    check!("identity in the previous generation is still a duplicate")(
+        !bm.appendIRCEvent(message(total - 5_000), "engine1"));
+    bm.clearBuffer("engine1", nid, "#busy");
+    check!("clear backlog drops both generations")(!db.exists(live) && !db.exists(prev));
+}
+
 int main() {
     stderr.writeln("BufferManager dedup regression suite");
     RedisStorage redis;
@@ -504,6 +540,7 @@ int main() {
     test_state_alias_requires_wire_identity(redis);
     test_state_alias_failure_atomicity(redis);
     test_repeated_chat_identity_is_unchanged(redis);
+    test_dedup_set_is_bounded(redis);
 
     writeln("\n", passed, " passed, ", failed, " failed");
     return failed == 0 ? 0 : 1;

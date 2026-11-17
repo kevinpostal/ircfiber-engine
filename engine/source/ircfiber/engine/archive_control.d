@@ -1238,7 +1238,10 @@ for buffer,_ in pairs(buffers) do
             end
         end
     end
-    if allEmpty then redis.call('DEL', 'dedup:' .. scope.networkId .. ':' .. buffer) end
+    if allEmpty then
+        local dedup = 'dedup:' .. scope.networkId .. ':' .. buffer
+        redis.call('DEL', dedup, dedup .. ':prev')
+    end
 end
 -- This marker is bounded by the pending pin registry; expiry starts at the
 -- positive journal completion checkpoint, not seven days into an outage.
