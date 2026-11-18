@@ -28,6 +28,7 @@ version (RoutingPolicyTest) {
         import std.string : endsWith, replace;
         import ircfiber.network_write_gate : NETWORK_WRITE_EXCLUSION_KEY, NETWORK_WRITERS_KEY,
             networkMutationAdmittedForTest, networkMutationRepliedForTest;
+        import ircfiber.irc.registry : ServerRegistry;
         enforce(mongoUri.length && AppMongoConnection.name().endsWith("_test"),
             "Repository proof requires an explicitly admitted test Mongo URI");
         const originalDatabase = AppMongoConnection.name();
@@ -172,6 +173,44 @@ version (RoutingPolicyTest) {
         enforce(db.scard(NETWORK_WRITERS_KEY) == 1 && collect() == 0
             && collection.findOne(["id": second.toString()]).tryIndex("ipv6Iid").isNull,
             "Caught real uniqueness-index failure released its writer or dispatched a reservation");
+        foreach (token; tokens) db.srem(NETWORK_WRITERS_KEY, token);
+        // Durable absence is distinct from a malformed-but-present document.
+        enforce(!repository.isDurablyAbsent(id),
+            "Malformed persisted network document was classified as absent");
+        const absentId = randomUUID();
+        const unrelatedId = randomUUID();
+        enforce(repository.isDurablyAbsent(absentId), "Majority read missed an absent network");
+        auto registry = new ServerRegistry(redis);
+        const expectedOwner = "retirement-fixture-" ~ randomUUID().toString();
+        const assignments = RedisKeys.networkAssignments();
+        const mirror = RedisKeys.serverAssignments(expectedOwner);
+        const lease = RedisKeys.lease(absentId.toString());
+        scope(exit) {
+            db.hdel(assignments, absentId.toString(), unrelatedId.toString());
+            db.hdel(mirror, absentId.toString(), unrelatedId.toString());
+            db.del(lease);
+        }
+        db.hset(assignments, absentId.toString(), expectedOwner);
+        db.hset(assignments, unrelatedId.toString(), expectedOwner);
+        db.hset(mirror, absentId.toString(), expectedOwner);
+        db.hset(mirror, unrelatedId.toString(), expectedOwner);
+        db.set(lease, expectedOwner);
+        enforce(!registry.retireMissingNetworkAssignment(absentId, expectedOwner, repository, {
+            return false;
+        }) && db.hget(assignments, absentId.toString()) == expectedOwner,
+            "Uncertain physical evidence retired a canonical assignment");
+        enforce(registry.retireMissingNetworkAssignment(absentId, expectedOwner, repository, {
+            return true;
+        }), "Durably absent and physically absent assignment was not retired");
+        enforce(db.hget(assignments, absentId.toString()).length == 0
+                && db.hget(assignments, unrelatedId.toString()) == expectedOwner
+                && db.hget(mirror, absentId.toString()).length == 0
+                && db.hget(mirror, unrelatedId.toString()) == expectedOwner
+                && !db.exists(lease),
+            "Retirement changed unrelated hash fields or left stale ownership");
+        foreach (assignment; registry.getAllAssignments())
+            enforce(assignment.networkId != absentId.toString(),
+                "Reverse-mirror recovery resurrected a retired missing network");
     }
 }
 
@@ -349,6 +388,44 @@ final class NetworkRepository {
         try uid = parseUUID(doc["userId"].get!string);
         catch (Exception) uid = UUID.init;
         return NetworkWithUser(docToConfig(doc), uid);
+    }
+
+    /// Majority-read proof for cleanup of stale assignment metadata. A valid
+    /// document of any shape means "not absent"; malformed command evidence
+    /// and database failures are unknown and throw.
+    bool isDurablyAbsent(UUID id) @trusted {
+        if (id == UUID.init) throw new Exception("Invalid network ID for absence proof");
+        auto command = Bson.emptyObject;
+        command["find"] = Bson("networks");
+        command["filter"] = Bson(["id": Bson(id.toString())]);
+        command["projection"] = Bson(["_id": Bson(0), "id": Bson(1)]);
+        command["limit"] = Bson(1);
+        command["singleBatch"] = Bson(true);
+        command["maxTimeMS"] = Bson(5000);
+        command["readConcern"] = Bson(["level": Bson("majority")]);
+        auto reply = AppMongoConnection.getDb().runCommandUnchecked(command);
+        const ok = reply["ok"];
+        if ((ok.type != Bson.Type.int_ && ok.type != Bson.Type.long_
+                && ok.type != Bson.Type.double_)
+                || ok.get!double != 1.0)
+            throw new Exception("Mongo majority absence command failed");
+        const cursor = reply["cursor"];
+        if (cursor.type != Bson.Type.object
+                || cursor["ns"].type != Bson.Type.string
+                || cursor["ns"].get!string != AppMongoConnection.name() ~ ".networks"
+                || cursor["firstBatch"].type != Bson.Type.array
+                || cursor["firstBatch"].length > 1)
+            throw new Exception("Mongo majority absence reply malformed");
+        const cursorId = cursor["id"];
+        bool exhausted;
+        switch (cursorId.type) {
+            case Bson.Type.int_: exhausted = cursorId.get!int == 0; break;
+            case Bson.Type.long_: exhausted = cursorId.get!long == 0; break;
+            case Bson.Type.double_: exhausted = cursorId.get!double == 0.0; break;
+            default: throw new Exception("Mongo absence cursor ID malformed");
+        }
+        if (!exhausted) throw new Exception("Mongo single-batch absence cursor not exhausted");
+        return cursor["firstBatch"].length == 0;
     }
 
     /// Networks whose IDs are in `ids`, each with its owner (`UUID.init`

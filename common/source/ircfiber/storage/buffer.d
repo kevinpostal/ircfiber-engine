@@ -4,6 +4,7 @@ import std.array;
 import std.algorithm;
 import std.conv;
 import std.utf;
+import std.uuid : randomUUID;
 
 import vibe.core.log;
 import vibe.data.json;
@@ -191,6 +192,10 @@ private void appendReplyReactionTags(ref Json msg, ref const(IRCRawEvent) event)
  * Without server namespacing, buffer IDs from different servers collide
  * in shared Redis storage, causing cross-user log leakage.
  */
+/// An oversized inherited filter is never treated as a successful duplicate.
+class DedupMigrationUnavailableException : Exception {
+    this(string reason) { super("Dedup migration unavailable: " ~ reason); }
+}
 final class BufferManager {
     private {
         RedisStorage redis;
@@ -211,9 +216,8 @@ final class BufferManager {
         // set and re-published every event it had already seen — to the
         // live WebSocket stream and to Mongo, both of which are
         // network-scoped, so the client saw duplicate rows. The old
-        // `dedup:<serverId>:<networkId>:<channel>` sets are adopted once
-        // per buffer via RENAMENX (see adoptServerDedupSet) and otherwise
-        // expire on their own TTL.
+        // `dedup:<serverId>:<networkId>:<channel>` sets are adopted atomically
+        // with append only when the network-scoped destination is absent.
         //
         // Bounded by generation rotation, not by TTL: every append refreshes
         // the TTL, so on a busy channel it never fires. When the live set
@@ -229,10 +233,6 @@ final class BufferManager {
         enum DEDUP_TTL_SECS = 30 * 86_400;  // 30 days, same as scrollback
     }
 
-    /// Buffers whose legacy server-scoped dedup set has already been
-    /// considered for adoption in this process. Keyed by the new
-    /// network-scoped key.
-    private bool[string] dedupAdopted;
 
     /// Creates a new buffer manager.
     this(RedisStorage redisStorage) {
@@ -742,26 +742,6 @@ LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string]);
         return DEDUP_PREFIX ~ networkId ~ ":" ~ normalizeChannel(channel);
     }
 
-    /// One-time, per-buffer adoption of the pre-existing server-scoped
-    /// dedup set. Without it the first append after a deploy (or after a
-    /// reassignment) faces an empty set and re-stores everything the old
-    /// key already knew — a single burst of duplicates, exactly what the
-    /// set exists to prevent. RENAMENX moves the set into place only when
-    /// the network-scoped key does not exist yet, so it never clobbers
-    /// live state; leftovers from other servers keep their own TTL.
-    private void adoptServerDedupSet(string serverId, string networkId,
-                                     string channel, string dedupKey) @trusted {
-        if (serverId.length == 0 || dedupKey in dedupAdopted) return;
-        dedupAdopted[dedupKey] = true;
-        const legacyKey = DEDUP_PREFIX ~ serverId ~ ":" ~ networkId ~ ":" ~ channel;
-        try {
-            if (redis.getDb().renameNX(legacyKey, dedupKey))
-                logInfo("Adopted server-scoped dedup set %s -> %s", legacyKey, dedupKey);
-        } catch (Exception e) {
-            // Source missing (the common case) or destination exists.
-            logDebug("adoptServerDedupSet: %s", e.msg);
-        }
-    }
 
     /// Stable member identity; transport/storage changes must not change it.
     private string eventDedupMember(string channel, string msgid,
@@ -869,14 +849,164 @@ LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string]);
         return format!"%016x"(hash);
     }
 
+
+/// Rebuild only identities proven by the bounded retained archive sources.
+/// The Lua transaction CAS-checks catalog bytes, source types and lineage,
+/// prepares an owned temporary set, then replaces the two old generations.
+private void rebuildOversizedDedup(RedisStorage redis,
+        string networkId, string channel, string dedupKey, string dedupPrevKey,
+        string legacyDedupKey) @trusted {
+    import ircfiber.archive_protocol : archiveOwnerKey, archiveOwnerServers,
+        archiveClearGroupMaxBytes;
+    auto db = redis.getDb();
+    const ownerKey = archiveOwnerKey(networkId);
+    string ownerRaw;
+    try ownerRaw = db.get(ownerKey);
+    catch (Exception e) { throw new DedupMigrationUnavailableException("catalog_read"); }
+    if (!ownerRaw.length || ownerRaw.length > archiveClearGroupMaxBytes)
+        throw new DedupMigrationUnavailableException("catalog_missing_or_oversized");
+    Json owner;
+    try owner = parseJsonString(ownerRaw);
+    catch (Exception e) { throw new DedupMigrationUnavailableException("catalog_invalid"); }
+    auto scopes = archiveOwnerServers(owner, networkId);
+    if (scopes.type != Json.Type.array)
+        throw new DedupMigrationUnavailableException("catalog_invalid");
+
+    string[] sources;
+    foreach (scopeId; scopes.get!(Json[]))
+        sources ~= KEY_PREFIX ~ scopeId.get!string ~ ":" ~ networkId ~ ":" ~ channel;
+    sources ~= KEY_PREFIX ~ networkId ~ ":" ~ channel; // exact legacy key only
+    auto temporary = dedupKey ~ ":rebuild:" ~ randomUUID().toString();
+    string[] keys = [ownerKey, dedupKey, dedupPrevKey, legacyDedupKey];
+    keys ~= sources;
+    keys ~= temporary;
+    string resultRaw;
+    try {
+        auto result = db.eval!string(archiveBufferLineageLua ~ q"LUA
+local function refusal(reason) return 'refused:' .. reason end
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return refusal('catalog_changed') end
+local kind = redis.call('TYPE', KEYS[2]).ok
+if kind ~= 'none' and kind ~= 'set' then return refusal('current_type') end
+kind = redis.call('TYPE', KEYS[3]).ok
+if kind ~= 'none' and kind ~= 'set' then return refusal('previous_type') end
+kind = redis.call('TYPE', KEYS[4]).ok
+if kind ~= 'none' and kind ~= 'set' then return refusal('legacy_type') end
+for i = 5, #KEYS - 1 do
+    kind = redis.call('TYPE', KEYS[i]).ok
+    if kind ~= 'none' and kind ~= 'list' then return refusal('source_type') end
+    lineageValidate(KEYS[i])
+    if redis.call('LLEN', KEYS[i]) > 5000 then return refusal('source_rows') end
+end
+if redis.call('EXISTS', KEYS[#KEYS]) ~= 0 then return refusal('temporary_collision') end
+local info = redis.call('INFO', 'memory')
+local used = tonumber(string.match(info, 'used_memory:(%d+)'))
+local maximum = tonumber(string.match(info, 'maxmemory:(%d+)'))
+if not used or not maximum or maximum == 0 or maximum - used < 301989888 then
+    return refusal('allocation_headroom')
+end
+local before = redis.call('SCARD', KEYS[2]) + redis.call('SCARD', KEYS[3])
+    + redis.call('SCARD', KEYS[4])
+local rows, bytes = {}, 0
+for source = 5, #KEYS - 1 do
+    local entries = redis.call('LRANGE', KEYS[source], 0, -1)
+    if #rows + #entries > 10000 then return refusal('source_rows') end
+    for index, raw in ipairs(entries) do
+        bytes = bytes + string.len(raw)
+        if bytes > 16777216 then return refusal('source_bytes') end
+        local ok, row = pcall(cjson.decode, raw)
+        if not ok or type(row) ~= 'table' or type(row.eid) ~= 'number'
+            or row.eid <= 0 or row.eid > 9007199254740991
+            or math.floor(row.eid) ~= row.eid or type(row.t) ~= 'number'
+            or row.t <= 0 or row.t > 9007199254740991
+            or math.floor(row.t) ~= row.t
+            or type(row.i) ~= 'string' or #row.i == 0 or #row.i > 1024
+            or (row.m ~= nil and (type(row.m) ~= 'string' or #row.m > 1022)) then
+            return refusal('malformed_row')
+        end
+        rows[#rows + 1] = {row=row, source=source, index=index}
+    end
+end
+table.sort(rows, function(a, b)
+    if a.row.eid ~= b.row.eid then return a.row.eid > b.row.eid end
+    if a.row.t ~= b.row.t then return a.row.t > b.row.t end
+    if a.source ~= b.source then return a.source < b.source end
+    return a.index < b.index
+end)
+local selected, seen = {}, {}
+for _, item in ipairs(rows) do
+    local row, identity = item.row, nil
+    if type(row.m) == 'string' and #row.m > 0 then
+        local candidate = 'm:' .. row.m
+        if redis.call('SISMEMBER', KEYS[2], candidate) == 1
+            or redis.call('SISMEMBER', KEYS[3], candidate) == 1
+            or redis.call('SISMEMBER', KEYS[4], candidate) == 1 then identity = candidate end
+    end
+    if not identity and type(row.i) == 'string' and #row.i > 0 then
+        local candidate = 'i:' .. row.i
+        if redis.call('SISMEMBER', KEYS[2], candidate) == 1
+            or redis.call('SISMEMBER', KEYS[3], candidate) == 1
+            or redis.call('SISMEMBER', KEYS[4], candidate) == 1 then identity = candidate end
+    end
+    if identity then
+        if #identity > 1024 then return refusal('identity_size') end
+        if not seen[identity] then
+            if #selected == 5000 then return refusal('identity_count') end
+            seen[identity] = true
+            selected[#selected + 1] = identity
+        end
+    end
+end
+local temporary = KEYS[#KEYS]
+if #selected > 0 then
+    local added = redis.pcall('SADD', temporary, unpack(selected))
+    if type(added) == 'table' and added.err then
+        redis.call('DEL', temporary)
+        return refusal('prepare_failed')
+    end
+    local ttl = redis.pcall('EXPIRE', temporary, 300)
+    if type(ttl) == 'table' and ttl.err then
+        redis.call('DEL', temporary)
+        return refusal('prepare_failed')
+    end
+end
+local removed = redis.pcall('UNLINK', KEYS[2], KEYS[3], KEYS[4])
+if type(removed) == 'table' and removed.err then
+    redis.call('DEL', temporary)
+    return refusal('replace_failed')
+end
+if #selected > 0 then
+    local renamed = redis.pcall('RENAME', temporary, KEYS[3])
+    if type(renamed) == 'table' and renamed.err then
+        return refusal('replace_failed')
+    end
+    redis.call('EXPIRE', KEYS[3], 2592000)
+end
+return table.concat({'rebuilt', tostring(before), tostring(#selected),
+    tostring(math.max(0, before - #selected))}, ':')
+LUA", keys, [ownerRaw]);
+        if (result.empty) throw new DedupMigrationUnavailableException("unknown_acknowledgement");
+        resultRaw = result.front.idup;
+    } catch (Exception e) {
+        throw new DedupMigrationUnavailableException("transaction_failed");
+    }
+    if (!resultRaw.startsWith("rebuilt:"))
+        throw new DedupMigrationUnavailableException(resultRaw.length ? resultRaw : "unknown_acknowledgement");
+    auto parts = resultRaw.split(":");
+    if (parts.length != 4)
+        throw new DedupMigrationUnavailableException("invalid_acknowledgement");
+    logInfo("dedup_legacy_rebuilt before=%s after=%s recovered=%s discarded=%s",
+        parts[1], parts[2], parts[2], parts[3]);
+}
+
     /// Commit the row and its dedup verdict together. A failed append must
     /// never poison a retry's authoritative "already accepted" verdict.
     private bool appendDeduplicatedEvent(string bufferKey, string serverId,
             string networkId, string channel, string msgid,
-            ref const IRCRawEvent event, string[] params, Json message) @trusted {
+            ref const IRCRawEvent event, string[] params, Json message,
+            bool migrationAttempted = false) @trusted {
         const dedupKey = dedupSetKey(networkId, channel);
         const dedupPrevKey = dedupKey ~ DEDUP_PREV_SUFFIX;
-        adoptServerDedupSet(serverId, networkId, channel, dedupKey);
+        const legacyDedupKey = DEDUP_PREFIX ~ serverId ~ ":" ~ networkId ~ ":" ~ channel;
         const member = eventDedupMember(channel, msgid, event, params);
         string ownAlias, oppositeAlias;
         const historical = event.getTag("batch") == "chathistory";
@@ -900,11 +1030,27 @@ local prevType = redis.call('TYPE', KEYS[3]).ok
 if prevType ~= 'none' and prevType ~= 'set' then
     return redis.error_reply('Dedup key is not a set')
 end
+local bufferType = redis.call('TYPE', KEYS[1]).ok
+if bufferType ~= 'none' and bufferType ~= 'list' then
+    return redis.error_reply('Scrollback key is not a list')
+end
+local legacyType = redis.call('TYPE', KEYS[4]).ok
+if legacyType ~= 'none' and legacyType ~= 'set' then
+    return redis.error_reply('Legacy dedup key is not a set')
+end
+if redis.call('SCARD', KEYS[2]) + redis.call('SCARD', KEYS[3])
+    + redis.call('SCARD', KEYS[4]) > tonumber(ARGV[9]) then
+    return 'migration_required'
+end
+if redis.call('EXISTS', KEYS[2]) == 0 and legacyType == 'set' then
+    redis.call('RENAMENX', KEYS[4], KEYS[2])
+end
+-- A duplicate verdict must not bypass destination validation: alias updates
+-- below can mutate dedup state even when no row is appended.
 local function seen(member)
     return redis.call('SISMEMBER', KEYS[2], member) == 1
         or redis.call('SISMEMBER', KEYS[3], member) == 1
-end
--- RENAME carries the TTL and drops the older generation in one step.
+    end
 local function rotateDedup()
     if redis.call('SCARD', KEYS[2]) >= tonumber(ARGV[8]) then
         redis.call('RENAME', KEYS[2], KEYS[3])
@@ -922,10 +1068,7 @@ if duplicate then
     rotateDedup()
     return '0'
 end
-local bufferType = redis.call('TYPE', KEYS[1]).ok
-if bufferType ~= 'none' and bufferType ~= 'list' then
-    return redis.error_reply('Scrollback key is not a list')
-end
+-- The list type was preflighted before duplicate detection above.
 lineageReconcile(KEYS[1])
 if bufferType == 'none' then lineageRetire(KEYS[1]) end
 -- Complete lineage allocation/serial validation before accepting row/dedup.
@@ -948,12 +1091,18 @@ redis.call('EXPIRE', KEYS[2], ARGV[5])
 lineageRefresh(KEYS[1], token)
 rotateDedup()
 return '1'
-LUA", [bufferKey, dedupKey, dedupPrevKey],
+LUA", [bufferKey, dedupKey, dedupPrevKey, legacyDedupKey],
             [member, message.toString(), lastRow, rowTTL, dedupTTL, ownAlias, oppositeAlias,
-             dedupRotateAt]);
+             dedupRotateAt, DEDUP_MAX.to!string]);
         if (verdict.empty) throw new Exception("Missing atomic scrollback verdict");
+        if (verdict.front == "migration_required") {
+            if (migrationAttempted)
+                throw new DedupMigrationUnavailableException("rebuild_did_not_bound_filter");
+            rebuildOversizedDedup(redis, networkId, channel, dedupKey, dedupPrevKey, legacyDedupKey);
+            return appendDeduplicatedEvent(bufferKey, serverId, networkId, channel, msgid,
+                event, params, message, true);
+        }
         if (verdict.front == "0") return false;
-        if (verdict.front != "1") throw new Exception("Invalid atomic scrollback verdict");
         return true;
     }
 
@@ -1009,7 +1158,6 @@ LUA", [bufferKey, dedupKey, dedupPrevKey],
         auto legacyDedupKey = DEDUP_PREFIX ~ serverId ~ ":" ~ networkId ~ ":" ~ buffer;
         // DEL is idempotent — missing keys just return 0.
         auto deleted = db.del(scrollbackKey, dedupKey, dedupKey ~ DEDUP_PREV_SUFFIX, legacyDedupKey);
-        dedupAdopted.remove(dedupKey);
         logInfo("Cleared buffer %s:%s:%s from Redis (keys deleted: %s)",
             serverId, networkId, buffer, deleted.to!string);
     }
@@ -1028,7 +1176,6 @@ LUA", [bufferKey, dedupKey, dedupPrevKey],
         auto scrollbackKey = KEY_PREFIX ~ networkId ~ ":" ~ buffer;
         auto dedupKey = dedupSetKey(networkId, buffer);
         auto deleted = db.del(scrollbackKey, dedupKey, dedupKey ~ DEDUP_PREV_SUFFIX);
-        dedupAdopted.remove(dedupKey);
         logInfo("Cleared legacy buffer %s:%s from Redis (keys deleted: %s)",
             networkId, buffer, deleted.to!string);
     }
@@ -1093,10 +1240,6 @@ LUA", [scoped ~ oldBuf, scoped ~ newBuf, legacy ~ oldBuf, legacy ~ newBuf,
             throw new Exception("Missing atomic rename verdict");
         const moved = result.front == "1";
         if (moved) {
-            // The adoption guard is keyed by destination; both names just
-            // changed identity, so let a fresh adoption run if needed.
-            dedupAdopted.remove(dedupSetKey(networkId, oldBuf));
-            dedupAdopted.remove(dedupSetKey(networkId, newBuf));
             logInfo("Renamed buffer %s:%s %s -> %s", serverId, networkId, oldBuf, newBuf);
         }
         return moved;
@@ -1131,8 +1274,6 @@ LUA", [scoped ~ oldBuf, scoped ~ newBuf, legacy ~ oldBuf, legacy ~ newBuf,
         // duplicate.
         const deleted = deleteByPrefix(serverId ~ ":" ~ networkId ~ ":")
             + deleteMatching(DEDUP_PREFIX ~ networkId ~ ":*");
-        foreach (k; dedupAdopted.keys)
-            if (k.startsWith(DEDUP_PREFIX ~ networkId ~ ":")) dedupAdopted.remove(k);
         logInfo("Cleared %s buffer key(s) for network %s on server %s",
             deleted.to!string, networkId, serverId);
     }

@@ -1,6 +1,6 @@
 module ircfiber.irc.registry;
 
-import std.uuid : UUID, parseUUID;
+import std.uuid : UUID, parseUUID, randomUUID;
 import std.conv : to;
 import std.datetime : Clock;
 import std.array : array, split;
@@ -21,7 +21,7 @@ import ircfiber.irc.routing_moves : requestNetworkMove, networkMoveFenced,
     RoutingMoveConflictException, NETWORK_ROUTING_LEASE_TTL_SECONDS;
 import ircfiber.netaddr : canonicalHost;
 import ircfiber.network_write_gate : NetworkWriteUnavailableException, NetworkWriter,
-    runNetworkWrite, runNetworkRedisMutation;
+    runNetworkWrite, runNetworkRedisMutation, NETWORK_WRITE_EXCLUSION_KEY, NETWORK_WRITERS_KEY;
 
 /// Summary of connections per IRC host for the admin dashboard.
 struct HostConnectionSummary {
@@ -800,6 +800,82 @@ LUA";
                 result ~= k;
         }
         return result;
+    }
+
+    /// Retire only a durably deleted network assignment after a majority
+    /// absence read and a fresh physical holder scan. Never closes holders or
+    /// removes user/network data.
+    bool retireMissingNetworkAssignment(UUID networkId, string expectedServerId,
+            NetworkRepository repository, scope bool delegate() physicalAbsent) {
+        if (networkId == UUID.init || !expectedServerId.length || repository is null
+                || physicalAbsent is null) return false;
+        const id = networkId.toString();
+        const token = randomUUID().toString();
+        auto acquired = db.eval!string(q"LUA
+local lockType = redis.call('TYPE', KEYS[1]).ok
+local writersType = redis.call('TYPE', KEYS[2]).ok
+if lockType ~= 'none' and lockType ~= 'string' then return 'unknown' end
+if writersType ~= 'none' and writersType ~= 'set' then return 'unknown' end
+if lockType ~= 'none' or redis.call('SCARD', KEYS[2]) ~= 0 then return 'busy' end
+if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', 15) then return 'acquired' end
+return 'busy'
+LUA", [NETWORK_WRITE_EXCLUSION_KEY, NETWORK_WRITERS_KEY], [token]);
+        if (acquired.empty || acquired.front != "acquired") return false;
+        scope(exit) releaseMissingAssignmentFence(token);
+        if (!repository.isDurablyAbsent(networkId) || !physicalAbsent()) return false;
+        auto result = db.eval!string(q"LUA
+local function refuse() return 'changed' end
+local fenceType = redis.call('TYPE', KEYS[1]).ok
+local writersType = redis.call('TYPE', KEYS[2]).ok
+if fenceType ~= 'string' or (writersType ~= 'none' and writersType ~= 'set') then
+    return refuse()
+end
+if redis.call('GET', KEYS[1]) ~= ARGV[1]
+    or redis.call('SCARD', KEYS[2]) ~= 0 then return refuse() end
+local function requireType(key, expected)
+    local kind = redis.call('TYPE', key).ok
+    return kind == 'none' or kind == expected
+end
+if not requireType(KEYS[3], 'hash') or not requireType(KEYS[4], 'string')
+    or not requireType(KEYS[5], 'string') or not requireType(KEYS[6], 'hash')
+    or redis.call('HGET', KEYS[3], ARGV[2]) ~= ARGV[3]
+    or redis.call('EXISTS', KEYS[4]) ~= 0 then return refuse() end
+local lease = redis.call('GET', KEYS[5])
+if lease and lease ~= ARGV[3] then return refuse() end
+local expectedMirror = redis.call('HGET', KEYS[6], ARGV[2])
+if expectedMirror and expectedMirror ~= ARGV[3] then return refuse() end
+local cursor = '0'
+repeat
+    local batch = redis.call('SCAN', cursor, 'MATCH', ARGV[4] .. '*', 'COUNT', 100)
+    cursor = batch[1]
+    for _, key in ipairs(batch[2]) do
+        local kind = redis.call('TYPE', key).ok
+        if kind ~= 'hash' then return refuse() end
+        local mirrorOwner = redis.call('HGET', key, ARGV[2])
+        if mirrorOwner and (key ~= KEYS[6] or mirrorOwner ~= ARGV[3]) then return refuse() end
+    end
+until cursor == '0'
+redis.call('HDEL', KEYS[3], ARGV[2])
+if expectedMirror == ARGV[3] then redis.call('HDEL', KEYS[6], ARGV[2]) end
+if lease == ARGV[3] then redis.call('DEL', KEYS[5]) end
+return 'retired'
+LUA", [NETWORK_WRITE_EXCLUSION_KEY, NETWORK_WRITERS_KEY,
+        RedisKeys.networkAssignments(), RedisKeys.routingMove(id), RedisKeys.lease(id),
+        RedisKeys.serverAssignments(expectedServerId)],
+        [token, id, expectedServerId, RedisKeys.serverAssignments("")]);
+        if (result.empty) throw new Exception("Missing stale-assignment retirement acknowledgement");
+        if (result.front != "retired") return false;
+        logInfo("network_assignment_retired networkId=%s serverId=%s", id, expectedServerId);
+        return true;
+    }
+
+    private void releaseMissingAssignmentFence(string token) {
+        try {
+            db.eval!string(q"LUA
+if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
+return 0
+LUA", [NETWORK_WRITE_EXCLUSION_KEY], [token]);
+        } catch (Exception) {}
     }
 
     /**

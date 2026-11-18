@@ -752,7 +752,7 @@ final class MessageRepository {
             command = Bson.emptyObject; command["getMore"] = Bson(cursorId);
             command["collection"] = Bson("messages");
             command["batchSize"] = Bson(cast(int)(65 - rows));
-            command["maxTimeMS"] = Bson(5000);
+            // maxTimeMS limits the initial aggregate command, not getMore.
             first = false;
         }
     }
