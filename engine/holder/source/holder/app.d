@@ -24,6 +24,7 @@ import ircfiber.async : safeFiberRun;
 import ircfiber.logging : logJsonMap;
 import ircfiber.term_signal : installTermSignalFlag, termSignal;
 import holder.ipc : HolderConfig, HolderServer, configFromEnv, connectHolderAddr;
+import holder.dial : dnsCacheStats, DNS_CACHE_TTL_MS, DNS_CACHE_MAX_ADDRESSES;
 import holder.protocol;
 import holder.held : HeldMemoryCounters, HeldQueueCounters, sampleHeldMemory;
 import ircfiber.runtime_memory : sampleRuntimeMemory, runtimeMemorySampleJson, compactRuntimeDiagnosticJson;
@@ -112,8 +113,14 @@ private int runDaemon() {
                     owners["members"] = counters.openMembersKnown == counters.liveEntries
                         ? JSONValue(counters.metaMembersKnown) : JSONValue(null);
                     owners["membersAvailable"] = JSONValue(counters.openMembersKnown == counters.liveEntries);
-                    owners["memberAccounting"] = JSONValue("stored_meta_memberships");
                     diagnostic["holderOwners"] = owners;
+                    const dns = dnsCacheStats();
+                    auto dnsJson = JSONValue.emptyObject;
+                    dnsJson["entries"] = JSONValue(cast(ulong) dns.entries);
+                    dnsJson["capacity"] = JSONValue(cast(ulong) dns.capacity);
+                    dnsJson["maxAddressesPerEntry"] = JSONValue(cast(ulong) DNS_CACHE_MAX_ADDRESSES);
+                    dnsJson["ttlMs"] = JSONValue(DNS_CACHE_TTL_MS);
+                    diagnostic["holderDnsCache"] = dnsJson;
                     auto queues = JSONValue.emptyObject;
                     auto lanes = server.runtimeQueues();
                     foreach (lane; 0 .. 3) {

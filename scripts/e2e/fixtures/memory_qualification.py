@@ -10,6 +10,7 @@ from fixture_http import LoopbackFixtureCookies
 import json
 import os
 from pathlib import Path
+import re
 import statistics
 import subprocess
 import threading
@@ -51,6 +52,19 @@ def number(value):
         value = json.loads(value)
     require(isinstance(value, (int, float)) and not isinstance(value, bool), "unavailable numeric diagnostic")
     return value
+
+
+def require_image_source_revision(image, expected):
+    require(isinstance(expected, str) and re.fullmatch(r'[0-9a-f]{40}', expected) is not None,
+            "explicit 40-character holder source revision required")
+    config = image.get("Config")
+    require(isinstance(config, dict), "holder image build metadata unavailable")
+    labels = config.get("Labels") or {}
+    revisions = [value.split("=", 1)[1] for value in config.get("Env", [])
+                 if isinstance(value, str) and value.startswith("IRCFIBER_BUILD_COMMIT=")]
+    require(labels.get("org.opencontainers.image.revision") == expected and revisions == [expected],
+            "holder image source revision does not match explicit qualification source")
+    return expected
 
 
 def slope(points):
@@ -100,13 +114,14 @@ class Qualification:
                 "A requires exact old holder" if self.expected_holder_image == OLD_HOLDER
                 else "candidate holder differs from explicit expected immutable image")
         self.cookie = LoopbackFixtureCookies(self.gateway)
+        self.holder_source_commit = None
         self.http = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.cookie))
         self.samples = []
         self.sample_lock = threading.Lock()
         self.log_error = None
         self.log_process = None
-        self.log_thread = None
         self.engine_epoch = 0
+        self.engine_generation = None
         self.networks = {}
         self.names = {}
         self.ids = {}
@@ -226,9 +241,13 @@ class Qualification:
     def start_logs(self):
         self.engine_epoch += 1
         epoch = self.engine_epoch
+        info = self.owned("ircfiber-engine")
+        require(info["Id"] == self.ids["ircfiber-engine"] and info["State"]["Running"],
+                "memory sampler target is not the owned running engine")
+        generation = info["Id"] + ":" + info["State"]["StartedAt"]
+        self.engine_generation = generation
         self.log_process = subprocess.Popen(["docker", "--context", self.context, "logs", "--follow", "--since",
-                                             self.inspect(self.ids["ircfiber-engine"])["State"]["StartedAt"],
-                                             self.ids["ircfiber-engine"]], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                                             info["State"]["StartedAt"], info["Id"]], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         def read_logs():
             try:
                 while True:
@@ -247,6 +266,7 @@ class Qualification:
                         if isinstance(record.get(key), str):
                             record[key] = json.loads(record[key])
                     record["fixtureEpoch"] = epoch
+                    record["fixtureGeneration"] = generation
                     record["fixtureObservedAt"] = time.time()
                     with self.sample_lock:
                         require(len(self.samples) < 1100, "sample ring bound exceeded")
@@ -268,6 +288,9 @@ class Qualification:
 
     def latest(self):
         require(self.log_error is None, "sample collector failed: " + str(self.log_error))
+        info = self.owned("ircfiber-engine")
+        require(info["Id"] + ":" + info["State"]["StartedAt"] == self.engine_generation
+                and info["State"]["Running"], "engine diagnostic generation changed")
         with self.sample_lock:
             samples = [s for s in self.samples if s["fixtureEpoch"] == self.engine_epoch]
         require(samples, "no actual engine memory diagnostic")
@@ -277,6 +300,14 @@ class Qualification:
         return sample
 
     def check_sample(self, sample):
+        require(type(sample.get("schemaVersion")) is int and sample["schemaVersion"] == 1,
+                "unsupported engine memory diagnostic schema")
+        require(sample.get("fixtureGeneration") == self.engine_generation,
+                "engine memory sample crossed a container generation")
+        observed = sample.get("fixtureObservedAt")
+        require(isinstance(observed, (int, float)) and not isinstance(observed, bool)
+                and abs(observed - number(sample.get("sampledAtMs")) / 1000) <= 75,
+                "engine sample timestamp is stale or malformed")
         for field in ("gcUsedBytes", "gcCollections", "cgroupBytes", "cgroupSwapBytes", "cgroupMaxEvents",
                       "cgroupOomEvents", "cgroupOomKillEvents"):
             number(sample.get(field))
@@ -351,6 +382,9 @@ class Qualification:
             require(info["Image"] == expected, "running fixture image differs from immutable input")
             image = json.loads(self.command("image", "inspect", expected))[0]
             require(image["Architecture"] == "amd64" and image["Os"] == "linux", "fixture image not Linux/amd64")
+            if component == "holder" and self.expected_holder_image != OLD_HOLDER:
+                self.holder_source_commit = require_image_source_revision(
+                    image, os.environ.get("ROUTING_REGRESSION_HOLDER_SOURCE_COMMIT"))
             if component in ("engine", "holder"):
                 require(info["HostConfig"]["Memory"] == 2 * 1024**3
                         and info["HostConfig"]["MemorySwap"] == 3 * 1024**3,
@@ -401,9 +435,9 @@ class Qualification:
         self.baseline = {s["nick"]: s["physical"] for s in status["sessions"]}
         self.held_baseline = self.held()
         self.save("before.json", dict(wire=status, held=self.held_baseline, protected=self.protected))
-        self.save("manifest.json", dict(run=self.run_id, images={k: os.environ["ROUTING_REGRESSION_" + k.upper() + "_IMAGE"]
-                                                               for k in ("engine", "holder", "gateway")},
-                                        sessions=self.sessions, tlsSessions=tls_count, channels=CHANNELS, stableMembers=2000,
+        self.save("manifest.json", dict(run=self.run_id, holderSourceCommit=self.holder_source_commit,
+                                        images={k: os.environ["ROUTING_REGRESSION_" + k.upper() + "_IMAGE"]
+                                                for k in ("engine", "holder", "gateway")},
                                         stableNicknameFormat="m%03x", stableRealname="Stable",
                                         messagesPerSecond=100, burstLinesPerProtocol=5000, warmupSeconds=self.warmup,
                                         measuredSeconds=self.soak, networks=self.networks,

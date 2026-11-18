@@ -37,6 +37,7 @@ class HolderMemoryQualification(MemoryQualification):
         self.holder_samples = []
         self.holder_lock = threading.Lock()
         self.holder_process = self.holder_thread = None
+        self.holder_generation = None
         self.holder_error = None
         self.http_trace = deque(maxlen=16)
         self.http_auth_captured = False
@@ -132,15 +133,29 @@ class HolderMemoryQualification(MemoryQualification):
             result["evidenceErrors"] = errors
 
     def check_holder_sample(self, sample):
+        require(type(sample.get("schemaVersion")) is int and sample["schemaVersion"] == 1,
+                "unsupported holder memory diagnostic schema")
+        require(sample.get("fixtureGeneration") == self.holder_generation,
+                "holder memory sample crossed a container generation")
+        observed = sample.get("fixtureObservedAt")
+        require(isinstance(observed, (int, float)) and not isinstance(observed, bool)
+                and abs(observed - number(sample.get("sampledAtMs")) / 1000) <= 75,
+                "holder sample timestamp is stale or malformed")
         for field in ("gcUsedBytes", "gcCollections", "cgroupBytes", "cgroupSwapBytes",
                       "cgroupMaxEvents", "cgroupOomEvents", "cgroupOomKillEvents"):
             number(sample.get(field))
         for field in ("cgroupMaxEvents", "cgroupOomEvents", "cgroupOomKillEvents"):
             require(number(sample[field]) == 0, "corrected holder hit cgroup pressure/OOM: " + field)
-        for key in ("holderOwners", "holderQueues"):
+        for key in ("holderOwners", "holderQueues", "holderDnsCache"):
             if isinstance(sample.get(key), str):
                 sample[key] = json.loads(sample[key])
             require(isinstance(sample.get(key), dict), "missing actual holder diagnostic: " + key)
+        dns = sample["holderDnsCache"]
+        require(number(dns.get("capacity")) == 512
+                and number(dns.get("maxAddressesPerEntry")) == 32
+                and number(dns.get("ttlMs")) == 30_000
+                and 0 <= number(dns.get("entries")) <= number(dns.get("capacity")),
+                "holder DNS cache exceeded its configured bound")
         owners = sample["holderOwners"]
         require(0 <= number(owners.get("metaBytes")) <= 128 * MIB, "holder META aggregate exceeds 128 MiB")
         require(0 <= number(owners.get("tombstones")) <= 4096, "holder tombstones exceed fixed bound")
@@ -161,10 +176,14 @@ class HolderMemoryQualification(MemoryQualification):
         super().start_logs()
         if self.holder_process is not None:
             return
+        info = self.owned("ircfiber-holder")
+        require(info["Id"] == self.ids["ircfiber-holder"] and info["State"]["Running"],
+                "holder sampler target is not the owned running holder")
+        generation = info["Id"] + ":" + info["State"]["StartedAt"]
+        self.holder_generation = generation
         self.holder_process = subprocess.Popen(
             ["docker", "--context", self.context, "logs", "--follow", "--since",
-             self.inspect(self.ids["ircfiber-holder"])["State"]["StartedAt"], self.ids["ircfiber-holder"]],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+             info["State"]["StartedAt"], info["Id"]], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         process = self.holder_process
         def collect():
             try:
@@ -181,6 +200,7 @@ class HolderMemoryQualification(MemoryQualification):
                         sample = sample["fields"]
                     if sample.get("event") != "memory_sample":
                         continue
+                    sample["fixtureGeneration"] = generation
                     sample["fixtureObservedAt"] = time.time()
                     self.check_holder_sample(sample)
                     with self.holder_lock:
@@ -195,6 +215,9 @@ class HolderMemoryQualification(MemoryQualification):
 
     def latest_holder(self):
         require(self.holder_error is None, "holder collector failed: " + str(self.holder_error))
+        info = self.owned("ircfiber-holder")
+        require(info["Id"] + ":" + info["State"]["StartedAt"] == self.holder_generation
+                and info["State"]["Running"], "holder diagnostic generation changed")
         with self.holder_lock:
             require(self.holder_samples, "no actual holder memory samples")
             sample = self.holder_samples[-1]

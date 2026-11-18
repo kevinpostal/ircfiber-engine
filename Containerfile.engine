@@ -112,6 +112,8 @@ RUN --mount=type=cache,target=/build/.dub,sharing=locked \
     bash scripts/apply-vibe-stream-patches.sh /root/.dub && \
     dub fetch vibe-serialization --version=1.2.0 && \
     bash common/scripts/apply-vibe-serialization-patches.sh /root/.dub && \
+    dub fetch vibe-d --version=0.10.3 && \
+    bash common/scripts/apply-vibe-mongodb-patches.sh /root/.dub && \
     rm -rf /root/.dub/cache/irc-fiber-common /root/.dub/cache/irc-fiber && \
     dub build --root=engine --compiler=ldc2 --build=release && \
     dub build --root=engine :holder --compiler=ldc2 --build=release && \

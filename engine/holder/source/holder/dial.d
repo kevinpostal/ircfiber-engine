@@ -42,6 +42,8 @@ enum HAPPY_EYEBALLS_RACE_TIMEOUT_SECONDS   = 15;
 enum HAPPY_EYEBALLS_DELAY_MS               = 250;
 enum STARTTLS_REPLY_TIMEOUT_MS             = 15_000;
 enum DNS_CACHE_TTL_MS                      = 30_000;
+enum size_t DNS_CACHE_MAX_ENTRIES          = 512;
+enum size_t DNS_CACHE_MAX_ADDRESSES        = 32;
 /// Read chunk while waiting for the STARTTLS reply.
 private enum STARTTLS_READ_BUFFER          = 8192;
 /// Most bytes kept while waiting for 670 (partial line + NOTICEs relayed later).
@@ -178,6 +180,51 @@ struct ResolvedAddr {
 private __gshared ResolvedAddr[][string] dnsCache;
 private __gshared long[string]           dnsCacheTime;
 private __gshared Object gDnsLock;
+
+struct DnsCacheStats {
+    size_t entries;
+    size_t capacity;
+}
+
+/// Caller holds gDnsLock.
+private void pruneDnsCache(long now) {
+    foreach (key; dnsCacheTime.keys) {
+        const inserted = dnsCacheTime[key];
+        if (now >= inserted && now - inserted >= DNS_CACHE_TTL_MS) {
+            dnsCache.remove(key);
+            dnsCacheTime.remove(key);
+        }
+    }
+}
+
+/// Caller holds gDnsLock. Never retains an unbounded hostname or answer list.
+private void cacheDnsAddresses(string key, ResolvedAddr[] addresses, long now) {
+    if (!key.length || key.length > 255 || !addresses.length
+            || addresses.length > DNS_CACHE_MAX_ADDRESSES) return;
+    pruneDnsCache(now);
+    if (key !in dnsCacheTime && dnsCacheTime.length >= DNS_CACHE_MAX_ENTRIES) {
+        string oldestKey;
+        long oldestTime = long.max;
+        foreach (candidate, inserted; dnsCacheTime) {
+            if (inserted < oldestTime) {
+                oldestKey = candidate;
+                oldestTime = inserted;
+            }
+        }
+        if (oldestKey.length) {
+            dnsCache.remove(oldestKey);
+            dnsCacheTime.remove(oldestKey);
+        }
+    }
+    dnsCache[key] = addresses.dup;
+    dnsCacheTime[key] = now;
+}
+
+DnsCacheStats dnsCacheStats() {
+    if (gDnsLock !is null) synchronized (gDnsLock)
+        return DnsCacheStats(dnsCacheTime.length, DNS_CACHE_MAX_ENTRIES);
+    return DnsCacheStats(dnsCacheTime.length, DNS_CACHE_MAX_ENTRIES);
+}
 shared static this() {
     try { gDnsLock = new Object(); } catch (Throwable) {}
 }
@@ -189,15 +236,19 @@ ResolvedAddr[] resolveAllAddresses(string host, ushort port) {
     // Check cache under lock (enterprise: avoid SyncError on __gshared AA).
     if (gDnsLock !is null) synchronized (gDnsLock) {
         if (auto t = cacheKey in dnsCacheTime) {
-            if (now - *t < DNS_CACHE_TTL_MS) {
+            if (now >= *t && now - *t < DNS_CACHE_TTL_MS) {
                 if (auto cached = cacheKey in dnsCache) return (*cached).dup;
             }
+            dnsCache.remove(cacheKey);
+            dnsCacheTime.remove(cacheKey);
         }
     } else {
         if (auto t = cacheKey in dnsCacheTime) {
-            if (now - *t < DNS_CACHE_TTL_MS) {
+            if (now >= *t && now - *t < DNS_CACHE_TTL_MS) {
                 if (auto cached = cacheKey in dnsCache) return *cached;
             }
+            dnsCache.remove(cacheKey);
+            dnsCacheTime.remove(cacheKey);
         }
     }
     auto ch = createChannel!string();
@@ -210,6 +261,7 @@ ResolvedAddr[] resolveAllAddresses(string host, ushort port) {
             // RAW). Dedupe so Happy Eyeballs does not race three identical
             // connects and then wait three race timeouts for the same host.
             bool[string] seen;
+            size_t added;
             foreach (addr; addrs) {
                 auto key = addr.toAddrString();
                 if (key in seen) continue;
@@ -217,6 +269,7 @@ ResolvedAddr[] resolveAllAddresses(string host, ushort port) {
                 if (encoded.length > 0) encoded ~= "|";
                 encoded ~= key
                     ~ (addr.addressFamily == AddressFamily.INET6 ? "/6" : "/4");
+                if (++added == DNS_CACHE_MAX_ADDRESSES) break;
             }
             try { c.put(encoded); } catch (Exception) {}
         } catch (Exception) {
@@ -237,11 +290,9 @@ ResolvedAddr[] resolveAllAddresses(string host, ushort port) {
         }
         if (result.length > 0) {
             if (gDnsLock !is null) synchronized (gDnsLock) {
-                dnsCache[cacheKey]     = result;
-                dnsCacheTime[cacheKey] = now;
+                cacheDnsAddresses(cacheKey, result, now);
             } else {
-                dnsCache[cacheKey]     = result;
-                dnsCacheTime[cacheKey] = now;
+                cacheDnsAddresses(cacheKey, result, now);
             }
             return result;
         }
@@ -1035,15 +1086,10 @@ DialOutcome dialUpstream(ref DialRequest req, EventSink emit) {
 }
 
 version (HolderDialHarness) {
-    /// Harness-only: makes `host` resolve to `addrs` (in this order) through
-    /// the real resolver cache for `DNS_CACHE_TTL_MS`, so a test dial can
-    /// reach several loopback addresses under one TLS hostname.
+    /// Harness-only: makes `host` resolve to `addrs` through the real cache.
     void seedResolvedAddresses(string host, ResolvedAddr[] addrs) {
         const now = Clock.currTime.toUnixTime!long * 1000;
-        synchronized (gDnsLock) {
-            dnsCache[host] = addrs.dup;
-            dnsCacheTime[host] = now;
-        }
+        synchronized (gDnsLock) cacheDnsAddresses(host, addrs, now);
     }
 }
 

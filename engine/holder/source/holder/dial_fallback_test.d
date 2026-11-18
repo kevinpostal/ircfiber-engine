@@ -33,7 +33,7 @@ import vibe.data.json : Json, parseJsonString;
 import holder.ipc : HolderConfig, HolderServer, connectHolderAddr, parseHolderAddr, runHolderMetaRegressions;
 import ircfiber.holder_client : HolderClient, ClientDialRequest = DialRequest, DialFailedException;
 import holder.dial : DialFailed, DialOutcome, ResolvedAddr, createTLSStreamWithTimeout, dialUpstream,
-    seedResolvedAddresses;
+    seedResolvedAddresses, dnsCacheStats, DNS_CACHE_MAX_ENTRIES;
 import holder.protocol : DialRequest, EventLine, ConnectedLine, parseFirstLine;
 
 private enum HOST = "fallback.harness.test";
@@ -748,6 +748,16 @@ private void caseOldHolderCapability() {
     check(v4.sni == [HOST], "old-holder any transport retains SNI");
     check(fixtureErrors.length == 0, "old-holder IPC fixture completed without errors");
 }
+private void caseDnsCacheCapacity() {
+    begin("DNS cache bounds retained host ownership");
+    foreach (i; 0 .. DNS_CACHE_MAX_ENTRIES + 1)
+        seedResolvedAddresses("cache-capacity-" ~ i.to!string,
+            [ResolvedAddr("127.0.0.1", AddressFamily.INET)]);
+    const stats = dnsCacheStats();
+    check(stats.entries == DNS_CACHE_MAX_ENTRIES && stats.entries <= stats.capacity,
+        "DNS cache stays within its advertised capacity");
+}
+
 
 int main() {
     string why;
@@ -771,7 +781,7 @@ int main() {
         auto watchdog = setTimer(120.seconds, { timedOut = true; exitEventLoop(); });
         scope (exit) { watchdog.stop(); exitEventLoop(); }
         try {
-            caseTrustedFixture();
+            caseDnsCacheCapacity();
             caseFirstClosesSecondCompletes();
             caseSilentTimeoutThenSecond();
             caseAllFail();

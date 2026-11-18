@@ -25,7 +25,7 @@ import uuid
 
 from fixture_http import LoopbackFixtureCookies
 from memory_fixture import Fixture, Session, CERTS, encode, resp
-from memory_qualification import Qualification, require, wait, number
+from memory_qualification import Qualification, require, wait, number, require_image_source_revision
 
 MAX_EVENTS = 24000
 CAPABILITIES = {"inventory_v1", "gap_ack_v1", "bounded_meta_v1", "independent_pong_v1"}
@@ -497,6 +497,7 @@ class EngineQualification(Qualification):
         self.cookie = LoopbackFixtureCookies(self.gateway)
         self.http = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.cookie))
         self.ids, self.protected, self.networks, self.names = {}, {}, {}, {}
+        self.holder_source_commit = None
         self.coverage = []
         self.phase = "prerequisites"
         self.helper = os.environ["HOLDER_MAINTENANCE_HELPER"]
@@ -565,6 +566,10 @@ class EngineQualification(Qualification):
             info = self.inspect(self.ids["ircfiber-" + component])
             expected = os.environ["ROUTING_REGRESSION_" + component.upper() + "_IMAGE"]
             require(expected.startswith("sha256:") and info["Image"] == expected, "immutable candidate identity mismatch")
+            if component == "holder":
+                image = json.loads(self.command("image", "inspect", expected))[0]
+                self.holder_source_commit = require_image_source_revision(
+                    image, os.environ.get("ROUTING_REGRESSION_HOLDER_SOURCE_COMMIT"))
         holder_env = self.inspect(self.ids["ircfiber-holder"])["Config"]["Env"]
         require("IRCFIBER_HOLDER_DETACH_MAX_SECS=0" in holder_env, "candidate fixture must use unlimited detach")
         status = wait(lambda: self.rpc("holderStatus"), "candidate holder status")
@@ -586,6 +591,7 @@ class EngineQualification(Qualification):
         self.save("manifest.json", dict(run=self.run_id, project=self.project, context=self.context,
                                          images={k: os.environ["ROUTING_REGRESSION_" + k.upper() + "_IMAGE"]
                                                  for k in ("engine", "holder", "gateway")},
+                                         holderSourceCommit=self.holder_source_commit,
                                          protected=self.protected, initialHolder=self.identity(self.owned("ircfiber-holder")),
                                          nativeIpv6="not configured; no native IPv6 claim"))
 
@@ -1124,6 +1130,7 @@ class EngineQualification(Qualification):
         self.save("final-wire.json", self.rpc("status"))
         return dict(state="passed", scope="step8 physical engine/maintenance", coverage=self.coverage,
                     nativeIpv6="unavailable; no native IPv6 physical claim", noAutomaticHolderRollback=True,
+                    singleAttemptSafetyProved=True, holderSourceCommit=self.holder_source_commit,
                     maintenance=self.maintenance_counts)
 
 

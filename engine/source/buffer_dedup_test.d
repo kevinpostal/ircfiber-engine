@@ -84,6 +84,7 @@ void cleanup(RedisStorage redis, string networkId) {
             foreach (k; db.keys(pattern)) keys ~= cast(string) k.idup;
             foreach (k; keys) db.del(k);
         }
+        db.del("irc:archive:owner:" ~ networkId);
     } catch (Exception e) {
         stderr.writeln("cleanup: ", e.msg);
     }
@@ -517,6 +518,59 @@ void test_dedup_set_is_bounded(RedisStorage redis) {
     check!("clear backlog drops both generations")(!db.exists(live) && !db.exists(prev));
 }
 
+/// Oversized inherited filters are rebuilt only from the exact retained
+/// archive scopes. The fixture Redis must have maxmemory configured so the
+/// production allocation-headroom gate is exercised rather than bypassed.
+void test_oversized_dedup_rebuilds_from_retained_rows(RedisStorage redis) {
+    stderr.writeln("\n[dedup] oversized inherited filters rebuild from retained rows");
+    const nid = randomUUID().toString();
+    scope (exit) cleanup(redis, nid);
+    auto db = redis.getDb();
+    auto bm = new BufferManager(redis);
+    const live = "dedup:" ~ nid ~ ":#chan";
+    const previous = live ~ ":prev";
+    const owner = "irc:archive:owner:" ~ nid;
+    const scrollback = "scrollback:engine1:" ~ nid ~ ":#chan";
+    db.set(owner, `{"version":1,"networkId":"` ~ nid
+        ~ `","serverId":"engine1","servers":["engine1"]}`);
+    auto old = IRCRawEvent("TestNet", "PRIVMSG");
+    old.networkId = nid;
+    old.channel = "#chan";
+    old.nick = "retained";
+    old.text = "known history";
+    old.timestampMs = 1_790_000_000_111L;
+    old.eid = 77;
+    old.setParams(["#chan", old.text]);
+    old.addTag("msgid", "known-history");
+    check!("retained row is stored")(bm.appendIRCEvent(old, "engine1"));
+    const lineageBefore = db.get("irc:archive:lineage:buffer:" ~ scrollback);
+    auto overflow = db.eval!string(q"LUA
+for i = 1, 10001 do redis.call('SADD', KEYS[1], 'stale:' .. i) end
+redis.call('SADD', KEYS[1], 'm:known-history')
+return 'seeded'
+LUA", [live], cast(string[])[]);
+    check!("oversized legacy generation seeded")(overflow.front == "seeded");
+
+    auto next = old;
+    next.eid = 78;
+    next.timestampMs++;
+    next.tagsJson = `{ "msgid": "new-event" }`;
+    check!("append succeeds after bounded rebuild")(bm.appendIRCEvent(next, "engine1"));
+    check!("recovered primary identity still suppresses replay")(
+        !bm.appendIRCEvent(old, "engine1"));
+    auto recovered = db.eval!string(
+        "return tostring(redis.call('SISMEMBER', KEYS[1], ARGV[1]))",
+        [previous], ["m:known-history"]);
+    check!("rebuilt previous generation contains only verified recent identity")(
+        db.scard(previous) == 1 && recovered.front == "1");
+    check!("original scrollback and lineage remain intact")(
+        db.llen(scrollback) == 2
+            && db.get("irc:archive:lineage:buffer:" ~ scrollback) == lineageBefore);
+    check!("dedup generations return to the normal bound")(
+        db.scard(live) + db.scard(previous) <= 10_000);
+}
+
+
 int main() {
     stderr.writeln("BufferManager dedup regression suite");
     RedisStorage redis;
@@ -541,6 +595,7 @@ int main() {
     test_state_alias_failure_atomicity(redis);
     test_repeated_chat_identity_is_unchanged(redis);
     test_dedup_set_is_bounded(redis);
+    test_oversized_dedup_rebuilds_from_retained_rows(redis);
 
     writeln("\n", passed, " passed, ", failed, " failed");
     return failed == 0 ? 0 : 1;

@@ -686,6 +686,21 @@ void loadNetworksWithRetry(ref EngineContext ctx) {
     }
 }
 
+/// Retire a deleted assignment only after the registry obtains a majority
+/// Mongo absence proof and this callback completes a fresh holder LIST.
+private bool retireMissingCanonical(ref EngineContext ctx, string serverId, string networkId) {
+    const id = parseUUID(networkId[]);
+    return ctx.serverRegistry.retireMissingNetworkAssignment(id, serverId, ctx.networkRepo, {
+        if (ctx.connManager.hasNetwork(networkId)) return false;
+        bool absent = true;
+        withFreshHolderList(ctx, (HolderEntry[] entries) {
+            foreach (entry; entries)
+                if (entry.tag.networkId == networkId) { absent = false; break; }
+        });
+        return absent;
+    });
+}
+
 private void startNetworkReconciliation(ref EngineContext ctx, HolderEntry[] physicalEntries) {
     if (networksLoading || reconciliationRunning) return;
     // withFreshHolderList hands us owned, metadata-free evidence. Retain that
@@ -739,6 +754,13 @@ private void startNetworkReconciliation(ref EngineContext ctx, HolderEntry[] phy
                     if (!ownsNetworkForDial(ctx.redis, sid, nid)) continue;
                     missing ~= nid;
                 } catch (Exception e) {
+                    try {
+                        if (retireMissingCanonical(ctx, sid, nid)) continue;
+                    } catch (Exception proofError) {
+                        logWarn("Network reconciliation deferred for %s: %s; absence proof blocked: %s",
+                            nid, e.msg, proofError.msg);
+                        continue;
+                    }
                     logWarn("Network reconciliation deferred for %s: %s", nid, e.msg);
                 }
             }
@@ -791,6 +813,13 @@ private void startNetworkReconciliation(ref EngineContext ctx, HolderEntry[] phy
                         }
                         spawnNetworkCommandConsumer(ctx, nid);
                     } catch (Exception e) {
+                        try {
+                            if (retireMissingCanonical(ctx, sid, nid)) continue;
+                        } catch (Exception proofError) {
+                            logWarn("Network reconciliation deferred for %s: %s; absence proof blocked: %s",
+                                nid, e.msg, proofError.msg);
+                            continue;
+                        }
                         logWarn("Network reconciliation deferred for %s: %s", nid, e.msg);
                     }
                 }

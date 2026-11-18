@@ -165,6 +165,11 @@ if [[ $mode == holder_memory_reliability ]]; then
     [[ $ROUTING_REGRESSION_HOLDER_IMAGE != sha256:8e7447fa51f9b2fa88fb4b88de8687af6483d8e078c147181469125bc0d82f09 ]] ||
         fail 'corrected-holder working-set qualification requires an explicit new holder candidate'
 fi
+if [[ $mode == holder_engine_qualification || $mode == holder_memory_reliability || $mode == archive_reliability ]]; then
+    [[ ${ROUTING_REGRESSION_HOLDER_SOURCE_COMMIT:-} =~ ^[a-f0-9]{40}$ ]] ||
+        fail 'candidate-holder qualification requires the exact 40-character source commit used to build the holder image'
+    export ROUTING_REGRESSION_HOLDER_SOURCE_COMMIT
+fi
 if [[ $mode == legacy_holder_continuity ]]; then
     [[ $ROUTING_REGRESSION_HOLDER_IMAGE == sha256:8e7447fa51f9b2fa88fb4b88de8687af6483d8e078c147181469125bc0d82f09 ]] ||
         fail 'legacy continuity requires the exact unchanged old holder image'
