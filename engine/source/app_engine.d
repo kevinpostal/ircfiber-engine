@@ -183,8 +183,24 @@ void main() {
     runTask(() nothrow {
         try {
             logInfo("Registration task STARTING for server %s", ctx.localServer.serverId);
-            refreshRoutingCapabilities(ctx);
-            ctx.serverRegistry.registerServer(ctx.localServer);
+            import ircfiber.network_write_gate : NetworkWriteUnavailableException;
+            enum registrationAttempts = 12;
+            enum retryDelay = 5.seconds;
+            foreach (attempt; 1 .. registrationAttempts + 1) {
+                refreshRoutingCapabilities(ctx);
+                try {
+                    ctx.serverRegistry.registerServer(ctx.localServer);
+                    break;
+                } catch (NetworkWriteUnavailableException e) {
+                    if (attempt == registrationAttempts) throw e;
+                    // Registration rewrites this engine's registry metadata.
+                    // Keep any uncertain writer evidence; do not replay network
+                    // loading or start it without acknowledged registration.
+                    logWarn("Server registration attempt %d/%d failed (%s) — retrying in %s",
+                        attempt, registrationAttempts, e.code, retryDelay);
+                    sleep(retryDelay);
+                }
+            }
             logInfo("Server registered via event loop: %s@%s",
                 ctx.localServer.serverId, ctx.localServer.bindAddress);
             try {
