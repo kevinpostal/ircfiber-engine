@@ -1,5 +1,5 @@
---- a/vibe-d/mongodb/vibe/db/mongo/collection.d
-+++ b/vibe-d/mongodb/vibe/db/mongo/collection.d
+--- a/mongodb/vibe/db/mongo/collection.d
++++ b/mongodb/vibe/db/mongo/collection.d
 @@ -864,7 +864,6 @@
  		return MongoCursor!R(m_client, cmd,
  			!options.batchSize.isNull ? options.batchSize.get : 0,
