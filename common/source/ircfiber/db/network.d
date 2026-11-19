@@ -995,13 +995,20 @@ final class NetworkRepository {
         try { cfg.nspass = doc["nspass"].get!string; } catch (Exception) {}
         try { cfg.commands = doc["commands"].get!string; } catch (Exception) {}
         try { cfg.serverPass = doc["serverPass"].get!string; } catch (Exception) {}
-        cfg.decodeBncServers(doc["bncAlternateServers"].toJson(), doc["bncSelectedServerIndex"].toJson());
-        cfg.decodeBncTlsPolicy(doc["verifyServerCertificates"].toJson(), doc["trustedServerFingerprints"].toJson());
-        cfg.decodeBncChannels(doc["disabledChannels"].toJson(), doc["channelOrder"].toJson());
-        cfg.bncPlayback = BncPlaybackPolicy.fromJson(doc["bncPlayback"].toJson());
-        if (doc["bncPerformState"].type != Bson.Type.undefined)
-            cfg.bncPerformState = doc["bncPerformState"].get!string.to!BncPerformState;
-        static foreach (field; BNC_CONTROL_NETWORK_FIELDS) cfg.decodeBncControlField!field(doc[field].toJson());
+        // BSON's JSON conversion maps a missing field to null. Keep legacy
+        // absence distinct from explicitly malformed BNC policy.
+        Json optionalBncField(string name) {
+            const field = doc.tryIndex(name);
+            return field.isNull ? Json.undefined : field.get.toJson();
+        }
+        cfg.decodeBncServers(optionalBncField("bncAlternateServers"), optionalBncField("bncSelectedServerIndex"));
+        cfg.decodeBncTlsPolicy(optionalBncField("verifyServerCertificates"), optionalBncField("trustedServerFingerprints"));
+        cfg.decodeBncChannels(optionalBncField("disabledChannels"), optionalBncField("channelOrder"));
+        cfg.bncPlayback = BncPlaybackPolicy.fromJson(optionalBncField("bncPlayback"));
+        const performState = optionalBncField("bncPerformState");
+        if (performState.type != Json.Type.undefined)
+            cfg.bncPerformState = performState.get!string.to!BncPerformState;
+        static foreach (field; BNC_CONTROL_NETWORK_FIELDS) cfg.decodeBncControlField!field(optionalBncField(field));
         try { cfg.operUsername = doc["operUsername"].get!string; } catch (Exception) {}
         try { cfg.operPassword = doc["operPassword"].get!string; } catch (Exception) {}
         cfg.services = storedServices(doc["services"].toJson(), cfg.id.toString());
