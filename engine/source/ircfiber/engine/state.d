@@ -175,7 +175,7 @@ void writeStateSnapshotForNetwork(ref EngineContext ctx, Network net) {
  */
 void writeStateSnapshotForNetwork(ref EngineContext ctx, Network net, string serverId) {
     auto snap = NetworkStateSnapshot();
-    snap.config = net.config.toJson();
+    snap.config = net.config.toPublicJson();
     snap.connected = net.isConnected;
     snap.status = net.status;
     snap.currentNick = net.currentNick.length ? net.currentNick : net.config.nick;
@@ -325,6 +325,9 @@ void writeStateSnapshotForNetwork(ref EngineContext ctx, Network net, string ser
             snap.peerIp = clientForEgress.getActivePeerIp();
             snap.localIp = clientForEgress.getActiveLocalIp();
             snap.activeRoute = clientForEgress.getActiveRoute();
+            snap.observedUpstreamHost = clientForEgress.getObservedUpstreamHost();
+            snap.observedUpstreamPort = clientForEgress.getObservedUpstreamPort();
+            snap.observedUpstreamTls = clientForEgress.getObservedUpstreamTls();
             snap.ownPrefix = clientForEgress.getOwnPrefix();
             // Engine-observed services identity of this epoch (getters
             // export nothing without a live, attached generation).

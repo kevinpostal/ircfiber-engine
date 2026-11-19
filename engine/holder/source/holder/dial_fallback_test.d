@@ -23,7 +23,7 @@ import std.process : environment, execute;
 import std.random : uniform;
 import std.socket : AddressFamily, Internet6Address, TcpSocket;
 import std.stdio : stderr, writeln;
-import std.string : strip;
+import std.string : indexOf, replace, strip, toLower;
 import vibe.core.core : exitEventLoop, runEventLoop, runTask, setTimer, sleep;
 import vibe.core.net : TCPConnection, TCPListener, WaitForDataStatus, connectTCP, listenTCP;
 import vibe.core.stream : IOMode;
@@ -33,8 +33,8 @@ import vibe.data.json : Json, parseJsonString;
 import holder.ipc : HolderConfig, HolderServer, connectHolderAddr, parseHolderAddr, runHolderMetaRegressions;
 import ircfiber.holder_client : HolderClient, ClientDialRequest = DialRequest, DialFailedException;
 import holder.dial : DialFailed, DialOutcome, ResolvedAddr, createTLSStreamWithTimeout, dialUpstream,
-    seedResolvedAddresses, dnsCacheStats, DNS_CACHE_MAX_ENTRIES;
-import holder.protocol : DialRequest, EventLine, ConnectedLine, parseFirstLine;
+    seedResolvedAddresses, dnsCacheStats, DNS_CACHE_MAX_ENTRIES, resolveAllAddresses, DnsLookupOutcome;
+import holder.protocol : DialRequest, EventLine, ConnectedLine, parseFirstLine, DETACH_BUFFER_BYTES;
 
 private enum HOST = "fallback.harness.test";
 private enum BLOCKED_HOST = "blocked.harness.test";
@@ -68,11 +68,16 @@ private final class Endpoint {
     string[] sni;
     string received;
     TCPListener listener;
+    TLSContext certCtx;
+    bool holdAfterReply;
     this(string ip, Upstream behavior) { this.ip = ip; this.behavior = behavior; }
 }
 
 private __gshared TLSContext gCertCtx;
 private __gshared string gCaFile;
+private __gshared TLSContext gSelfCertCtx;
+private __gshared string gSelfFingerprint;
+private __gshared string gCaFingerprint;
 private __gshared string[] gFailures;
 private __gshared int gCases;
 
@@ -87,9 +92,10 @@ private bool mintCertificates(string dir, out string why) {
         ~ "subjectKeyIdentifier = hash\n"
         ~ "[v3_srv]\nbasicConstraints = critical,CA:FALSE\n"
         ~ "keyUsage = critical,digitalSignature,keyEncipherment\nextendedKeyUsage = serverAuth\n"
-        ~ "subjectAltName = DNS:" ~ HOST ~ "\n");
+        ~ "subjectAltName = DNS:" ~ HOST ~ ",IP:127.0.0.1,IP:::1\n");
     const ca = buildPath(dir, "ca.crt"), caKey = buildPath(dir, "ca.key");
     const csr = buildPath(dir, "srv.csr"), crt = buildPath(dir, "srv.crt"), key = buildPath(dir, "srv.key");
+    const selfCrt = buildPath(dir, "self.crt"), selfKey = buildPath(dir, "self.key");
     const steps = [
         ["openssl", "req", "-x509", "-new", "-newkey", "rsa:2048", "-nodes", "-keyout", caKey, "-out", ca,
             "-days", "2", "-subj", "/CN=ircfiber-holder-harness-ca", "-config", cfg, "-extensions", "v3_ca"],
@@ -98,6 +104,9 @@ private bool mintCertificates(string dir, out string why) {
         ["openssl", "x509", "-req", "-in", csr, "-CA", ca, "-CAkey", caKey,
             "-set_serial", uniform(1, int.max).to!string, "-out", crt, "-days", "2",
             "-extfile", cfg, "-extensions", "v3_srv"],
+        ["openssl", "req", "-x509", "-new", "-newkey", "rsa:2048", "-nodes",
+            "-keyout", selfKey, "-out", selfCrt, "-days", "2",
+            "-config", cfg, "-extensions", "v3_srv"],
     ];
     foreach (cmd; steps) {
         try {
@@ -112,6 +121,17 @@ private bool mintCertificates(string dir, out string why) {
     gCertCtx = createTLSContext(TLSContextKind.server);
     gCertCtx.useCertificateChainFile(crt);
     gCertCtx.usePrivateKeyFile(key);
+    gSelfCertCtx = createTLSContext(TLSContextKind.server);
+    gSelfCertCtx.useCertificateChainFile(selfCrt);
+    gSelfCertCtx.usePrivateKeyFile(selfKey);
+    string fingerprint(string path) {
+        auto r = execute(["openssl", "x509", "-in", path, "-noout", "-fingerprint", "-sha256"]);
+        if (r.status != 0 || r.output.indexOf('=') < 0)
+            throw new Exception("cannot read fixture SHA-256 fingerprint");
+        return r.output[r.output.indexOf('=') + 1 .. $].strip.replace(":", "").toLower;
+    }
+    gSelfFingerprint = fingerprint(selfCrt);
+    gCaFingerprint = fingerprint(crt);
     return true;
 }
 
@@ -148,7 +168,7 @@ private void send(ref TCPConnection c, string line) {
 
 /// Server side of the TLS leg: SNI must be HOST, then one line each way.
 private void serveTls(Endpoint ep, TCPConnection c) {
-    auto certCtx = gCertCtx;
+    auto certCtx = ep.certCtx is null ? gCertCtx : ep.certCtx;
     auto sctx = createTLSContext(TLSContextKind.serverSNI);
     sctx.sniCallback = (string name) @safe {
         ep.sni ~= name;
@@ -158,6 +178,10 @@ private void serveTls(Endpoint ep, TCPConnection c) {
     ep.received = cast(string) readLine(tls).idup;
     tls.write(cast(const(ubyte)[]) (":" ~ ep.ip ~ " PONG " ~ ep.received ~ "\r\n"));
     tls.flush();
+    if (ep.holdAfterReply) {
+        c.readTimeout = 3.seconds;
+        try readLine(tls); catch (Exception) {}
+    }
     tls.finalize();
 }
 
@@ -308,6 +332,141 @@ private void caseTrustedFixture() {
     conn.close();
 }
 
+/// Every success/failure goes through production dialUpstream/negotiate.
+private void caseCertificatePolicy(bool selfSigned, string mode, bool pinned, bool matching,
+        bool wrongHost = false, bool ipTarget = false) {
+    begin("verified " ~ mode ~ (selfSigned ? " self-signed" : " CA")
+        ~ (pinned ? (matching ? " matching pin" : " mismatched pin") : " PKI")
+        ~ (wrongHost ? " wrong target with correct SNI" : ""));
+    auto v6 = new Endpoint("::1", mode == "starttls" ? Upstream.starttlsTls : Upstream.tls);
+    auto v4 = new Endpoint("127.0.0.1", v6.behavior);
+    if (selfSigned) { v6.certCtx = gSelfCertCtx; v4.certCtx = gSelfCertCtx; }
+    const port = bindPair(v6, v4);
+    scope (exit) stopPair(v6, v4);
+    const host = ipTarget ? "127.0.0.1" : wrongHost ? BLOCKED_HOST : HOST;
+    const priorAllowHosts = environment.get("IRCFIBER_DIAL_PRIVATE_HOSTS", "");
+    environment["IRCFIBER_DIAL_PRIVATE_HOSTS"] = HOST ~ "," ~ host;
+    scope (exit) environment["IRCFIBER_DIAL_PRIVATE_HOSTS"] = priorAllowHosts;
+    seedResolvedAddresses(host, [ResolvedAddr("127.0.0.1", AddressFamily.INET)]);
+    auto req = request(host, port, mode);
+    req.sni = HOST; // PKI identity MUST still be checked against req.host.
+    req.verifyServerCertificates = true;
+    if (pinned) req.trustedServerFingerprints = [matching
+        ? (selfSigned ? gSelfFingerprint : gCaFingerprint)
+        : "0000000000000000000000000000000000000000000000000000000000000000"];
+    const succeeds = pinned ? matching : !selfSigned && !wrongHost;
+    DialOutcome o;
+    DialFailed failure;
+    try o = dialUpstream(req, null);
+    catch (DialFailed e) { failure = e; }
+    scope (exit) closeOutcome(o);
+    if (succeeds) {
+        check(failure is null, failure is null ? "accepted" : failure.msg);
+        check(o.tlsVerified && o.tls !is null, "actual socket carries positive verification proof");
+        if (o.tls !is null) roundTrip(o, v4);
+    } else {
+        check(failure !is null && failure.phase == "tls", "certificate policy fails in TLS phase");
+        check(failure is null || !failure.terminalDnsTcp, "TLS rejection is not terminal DNS/TCP proof");
+        sleep(50.msecs);
+        check(v4.received.length == 0, "rejected peer received ZERO IRC application bytes");
+        check(v4.accepts == 1 && v6.accepts == 0, "no plaintext retry after TLS rejection");
+        check(!o.tlsVerified, "rejection never attests verification");
+    }
+}
+
+private void caseCertificateRequestValidation() {
+    begin("strict TLS policy JSON and in-process validation before TCP");
+    auto req = request(HOST, 6697, "implicit");
+    auto payload = req.toJson();
+    auto legacy = DialRequest.fromJson(payload);
+    check(!legacy.verifyServerCertificates && !legacy.trustedServerFingerprints.length,
+        "absent fields retain legacy policy");
+    void rejected(Json value, string label) {
+        bool failed;
+        try { auto unused = DialRequest.fromJson(value); } catch (Exception) { failed = true; }
+        check(failed, label);
+    }
+    foreach (bad; [Json(null), Json("true"), Json(1), Json.emptyArray]) {
+        auto p = req.toJson();
+        p["verifyServerCertificates"] = bad;
+        rejected(p, "wrong verification flag type");
+    }
+    foreach (bad; [Json(null), Json("abcd"), Json(1), Json(true)]) {
+        auto p = req.toJson();
+        p["verifyServerCertificates"] = true;
+        p["trustedServerFingerprints"] = bad;
+        rejected(p, "wrong fingerprint collection type");
+    }
+    foreach (bad; [Json(1), Json(null), Json("AB"), Json(gSelfFingerprint.toLower ~ "0"),
+            Json("A000000000000000000000000000000000000000000000000000000000000000"),
+            Json(gSelfFingerprint.toLower[0 .. 63]), Json(gSelfFingerprint ~ ":")]) {
+        auto p = req.toJson();
+        p["verifyServerCertificates"] = true;
+        p["trustedServerFingerprints"] = Json([bad]);
+        rejected(p, "noncanonical fingerprint");
+    }
+    auto pinsOff = req.toJson();
+    pinsOff["trustedServerFingerprints"] = Json([Json(gSelfFingerprint)]);
+    rejected(pinsOff, "pins without enabled verification");
+    foreach (field; ["verifyServerCertificates", "trustedServerFingerprints"]) {
+        auto plain = request(HOST, 6667, "none").toJson();
+        plain[field] = field == "verifyServerCertificates" ? Json(false) : Json.emptyArray;
+        rejected(plain, "plaintext forbids even empty policy field");
+    }
+    req.trustedServerFingerprints = [gSelfFingerprint];
+    bool failed;
+    try { auto unused = dialUpstream(req, null); } catch (DialFailed e) { failed = e.phase == "bad_request"; }
+    check(failed, "in-process pins with verification off fail before dialing");
+    req.verifyServerCertificates = true;
+    req.trustedServerFingerprints = ["bad"];
+    failed = false;
+    try { auto unused = dialUpstream(req, null); } catch (DialFailed e) { failed = e.phase == "bad_request"; }
+    check(failed, "in-process malformed pin fails before dialing");
+    req.trustedServerFingerprints = [gSelfFingerprint];
+    req.tls = "none";
+    failed = false;
+    try { auto unused = dialUpstream(req, null); } catch (DialFailed e) { failed = e.phase == "bad_request"; }
+    check(failed, "in-process plaintext policy fails before dialing");
+}
+
+/// Real HELLO/DIAL/CONNECTED plus an encrypted upstream round trip. The shared
+/// client accepts this only with affirmative instance-bound verification.
+private void caseHolderCertificateAttestation(string dir) {
+    begin("real holder HELLO and instance-bound verified CONNECTED");
+    auto v6 = new Endpoint("::1", Upstream.tls), v4 = new Endpoint("127.0.0.1", Upstream.tls);
+    v6.certCtx = gSelfCertCtx;
+    v4.certCtx = gSelfCertCtx;
+    v4.holdAfterReply = true;
+    const port = bindPair(v6, v4);
+    scope (exit) stopPair(v6, v4);
+    seedResolvedAddresses(HOST, [ResolvedAddr("127.0.0.1", AddressFamily.INET)]);
+    HolderConfig cfg;
+    cfg.serverId = "tls-policy-harness";
+    cfg.token = "fixture-only-token";
+    cfg.addrText = "unix://" ~ buildPath(dir, "tls-holder.sock");
+    cfg.addr = parseHolderAddr(cfg.addrText);
+    cfg.detachBufferBytes = DETACH_BUFFER_BYTES;
+    auto server = new HolderServer(cfg);
+    server.start();
+    scope (exit) { server.quitAll(); server.stop(); }
+    auto client = new HolderClient(cfg.serverId, cfg.addrText, cfg.token);
+    client.connectControl();
+    ClientDialRequest req;
+    req.host = HOST;
+    req.port = port;
+    req.tls = "implicit";
+    req.sni = HOST;
+    req.verifyServerCertificates = true;
+    req.trustedServerFingerprints = [gSelfFingerprint];
+    auto result = client.dial(req, null);
+    scope (exit) result.stream.close();
+    check(result.tlsOk && result.id.length && result.instance == server.statusJson()["instance"].get!string,
+        "verified CONNECTED is bound to the real holder and connection");
+    send(result.stream, "PING :verified-holder\r\n");
+    check(cast(string) readLine(result.stream).idup == ":127.0.0.1 PONG PING :verified-holder",
+        "credentials-capable relay is exposed only after leaf enforcement");
+}
+
 /// The reported production shape: the TCP winner drops the handshake, the
 /// other family completes it. IPv6 attempts bind the IPv6 source only.
 private void caseFirstClosesSecondCompletes() {
@@ -391,6 +550,7 @@ private void caseAllFail() {
     } catch (DialFailed e) failed = e;
     if (failed !is null) {
         check(failed.phase == "tls", "phase tls, got " ~ failed.phase);
+        check(!failed.terminalDnsTcp, "TLS failure is never terminal DNS/TCP proof");
         check(failed.msg.canFind("TLS handshake timed out"), "first failure kept verbatim: " ~ failed.msg);
         check(failed.msg.canFind("(2 addresses failed TLS)"), "attempt count in reason: " ~ failed.msg);
     }
@@ -516,6 +676,7 @@ private void caseNativeTcpFailure() {
         closeOutcome(o);
     } catch (DialFailed e) failed = e;
     check(failed !is null && failed.phase == "tcp", "native TCP refusal stays a failed dial");
+    check(failed !is null && failed.terminalDnsTcp, "completed TCP refusal carries terminal proof");
     sleep(300.msecs);
     check(v4.accepts == 0, "TCP refusal produced ZERO IPv4 accepts");
 }
@@ -588,6 +749,8 @@ private void caseSourcePoolBoundary(string dir) {
     server.start();
     scope (exit) { server.quitAll(); server.stop(); }
     check(server.statusJson()["dialFamilies"] == Json([Json("any"), Json("ipv6")]), "STATUS advertises both dial families");
+    check(server.statusJson()["capabilities"].get!(Json[]).canFind(Json("tls_leaf_sha256_v1")),
+        "STATUS advertises exact TLS leaf policy capability");
 
     string exchange(Json payload) {
         auto c = connectHolderAddr(cfg.addr.toNetworkAddress(true), 3.seconds);
@@ -729,10 +892,27 @@ private void caseOldHolderCapability() {
         check(false, "shared client must refuse native transport through old holder");
     } catch (DialFailedException e) rejected = e;
     check(rejected !is null && rejected.phase == "holder", "native rejected at holder capability gate");
+    check(rejected !is null && !rejected.terminalDnsTcp, "old holder cannot synthesize terminal proof");
     sleep(300.msecs);
     check(statusCommands >= 2, "native request performs a fresh STATUS capability check");
     check(dialCommands == 0, "old holder received ZERO native DIAL commands");
     check(v6.accepts == 0 && v4.accepts == 0, "capability failure opened ZERO upstream sockets");
+    // A valid pin does not bypass an old holder's missing TLS capability.
+    auto verifiedReq = nativeReq;
+    verifiedReq.addressFamily = "any";
+    verifiedReq.bindIp6 = "";
+    verifiedReq.verifyServerCertificates = true;
+    verifiedReq.trustedServerFingerprints = [gCaFingerprint];
+    rejected = null;
+    try {
+        auto unexpected = client.dial(verifiedReq, null);
+        unexpected.stream.close();
+        check(false, "old holder accepted verification-required TLS");
+    } catch (DialFailedException e) rejected = e;
+    check(rejected !is null && rejected.phase == "tls" && !rejected.terminalDnsTcp,
+        "old holder rejected at TLS capability gate without triggering backup selection");
+    check(dialCommands == 0 && v4.accepts == 0 && v6.accepts == 0,
+        "unsupported TLS capability opens ZERO DIAL/upstream sockets");
 
     auto anyReq = nativeReq;
     anyReq.addressFamily = "any";
@@ -748,6 +928,16 @@ private void caseOldHolderCapability() {
     check(v4.sni == [HOST], "old-holder any transport retains SNI");
     check(fixtureErrors.length == 0, "old-holder IPC fixture completed without errors");
 }
+private void caseResolverFailureNotProof() {
+    begin("resolver errors/timeouts are not successful empty DNS proof");
+    DnsLookupOutcome outcome;
+    auto addresses = resolveAllAddresses("not a legal DNS name", 6667, outcome);
+    check(outcome == DnsLookupOutcome.failed || outcome == DnsLookupOutcome.timedOut,
+        "resolver failure is distinct from a successfully completed empty result");
+    check(addresses.length == 1 && addresses[0].ip == "not a legal DNS name",
+        "legacy unresolved-host fallback remains separate from proof");
+}
+
 private void caseDnsCacheCapacity() {
     begin("DNS cache bounds retained host ownership");
     foreach (i; 0 .. DNS_CACHE_MAX_ENTRIES + 1)
@@ -775,6 +965,12 @@ int main() {
         return 2;
     }
     environment["IRCFIBER_DIAL_PRIVATE_HOSTS"] = HOST;
+    const oldCertFile = environment.get("SSL_CERT_FILE", "");
+    environment["SSL_CERT_FILE"] = gCaFile;
+    scope (exit) {
+        if (oldCertFile.length) environment["SSL_CERT_FILE"] = oldCertFile;
+        else environment.remove("SSL_CERT_FILE");
+    }
 
     bool timedOut;
     runTask(() nothrow {
@@ -782,6 +978,21 @@ int main() {
         scope (exit) { watchdog.stop(); exitEventLoop(); }
         try {
             caseDnsCacheCapacity();
+            caseResolverFailureNotProof();
+            caseTrustedFixture();
+            caseHolderCertificateAttestation(dir);
+            caseCertificateRequestValidation();
+            caseCertificatePolicy(false, "implicit", false, false);
+            caseCertificatePolicy(false, "implicit", false, false, true);
+            caseCertificatePolicy(false, "implicit", false, false, false, true);
+            caseCertificatePolicy(false, "implicit", true, false);
+            caseCertificatePolicy(true, "implicit", true, true);
+            caseCertificatePolicy(true, "implicit", true, false);
+            caseCertificatePolicy(true, "implicit", false, false);
+            caseCertificatePolicy(false, "starttls", false, false);
+            caseCertificatePolicy(false, "starttls", false, false, true);
+            caseCertificatePolicy(true, "starttls", true, true);
+            caseCertificatePolicy(true, "starttls", true, false);
             caseFirstClosesSecondCompletes();
             caseSilentTimeoutThenSecond();
             caseAllFail();

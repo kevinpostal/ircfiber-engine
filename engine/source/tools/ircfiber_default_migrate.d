@@ -57,6 +57,8 @@ import ircfiber.storage.redis : RedisStorage;
 import ircfiber.irc.registry : ServerRegistry;
 import ircfiber.default_network : ensureDefaultFiberNetwork, buildDefaultFiberNetwork, buildDefaultNick, DEFAULT_FIBER_HOST;
 import ircfiber.redis.protocol : RedisKeys, ControlMessage;
+import ircfiber.network_write_gate : NetworkWriter, NetworkWriteUnavailableException,
+    runNetworkWrite, runNetworkRedisMutation;
 import vibe.core.log;
 import std.datetime : Clock;
 
@@ -188,27 +190,31 @@ private int fixNicksBulk(NetworkRepository netRepo, UserRepository userRepo, Red
             // If mongo is already correct but redis still has suffix, clear it
             if (!dryRun && redis !is null) {
                 try {
+                    runNetworkWrite!void(redis, (ref NetworkWriter writer) {
                     auto persisted = redis.getDb().get(RedisKeys.networkNick(nw.config.id.toString()));
                     if (persisted.length > 0 && persisted != user.username) {
                         writefln("  [fix redis] %s: persisted '%s' -> '%s'", user.username, persisted, user.username);
-                        redis.getDb().del(RedisKeys.networkNick(nw.config.id.toString()));
+                        runNetworkRedisMutation!void(writer, (db) {
+                            db.del(RedisKeys.networkNick(nw.config.id.toString()));
+                        });
                         // Trigger reconnect to pick up clean nick
                         try {
                             auto serverId = registry.getServerForNetwork(nw.config.id.toString());
                             if (serverId.length > 0) {
                                 // Need fresh config with correct nick for reconnect message
-                                auto cfg = nw.config;
-                                cfg.nick = user.username;
-                                cfg.realName = user.username;
+                                auto cfg = netRepo.findById(nw.config.id);
                                 auto msg = ControlMessage("reconnectNetwork", cfg.id.toString(), user.id.toString(), cfg.toJson());
                                 msg.timestampMs = Clock.currTime.toUnixTime!long * 1000;
-                                redis.lpush(RedisKeys.control(serverId), msg.toJson().toString());
+                                runNetworkRedisMutation!void(writer, (db) {
+                                    db.lpush(RedisKeys.control(serverId), msg.toJson().toString());
+                                });
                             }
                         } catch (Exception) {}
                         fixed++;
                     } else {
                         skipped++;
                     }
+                    });
                 } catch (Exception) { skipped++; }
             } else {
                 skipped++;
@@ -218,29 +224,42 @@ private int fixNicksBulk(NetworkRepository netRepo, UserRepository userRepo, Red
         writefln("  [%s] %s: '%s' -> '%s' (network %s)", dryRun ? "would fix" : "fix", user.username, nw.config.nick, user.username, nw.config.id.toString());
         if (dryRun) { fixed++; continue; }
         try {
+            runNetworkWrite!void(redis, (ref NetworkWriter writer) {
             auto cfg = nw.config;
             cfg.nick = user.username;
             cfg.realName = user.username;
-            netRepo.save(cfg, nw.userId);
-            redis.del(RedisKeys.userNetworks(nw.userId.toString()));
-            try { redis.getDb().del(RedisKeys.networkNick(cfg.id.toString())); } catch (Exception) {}
+            if (!netRepo.updateOwnedFields!("nick", "realName")(nw.config, cfg, nw.userId, writer))
+                throw new NetworkWriteUnavailableException("network_config_changed");
+            cfg = netRepo.findById(cfg.id);
+            runNetworkRedisMutation!void(writer, (db) {
+                db.del(RedisKeys.userNetworks(nw.userId.toString()));
+            });
+            try runNetworkRedisMutation!void(writer, (db) {
+                db.del(RedisKeys.networkNick(cfg.id.toString()));
+            });
+            catch (Exception) {}
             try {
                 auto serverId = registry.getServerForNetwork(cfg.id.toString());
                 if (serverId.length > 0) {
                     auto msg = ControlMessage("reconnectNetwork", cfg.id.toString(), nw.userId.toString(), cfg.toJson());
                     msg.timestampMs = Clock.currTime.toUnixTime!long * 1000;
-                    redis.lpush(RedisKeys.control(serverId), msg.toJson().toString());
+                    runNetworkRedisMutation!void(writer, (db) {
+                        db.lpush(RedisKeys.control(serverId), msg.toJson().toString());
+                    });
                 } else {
-                    auto sid = registry.assignNetwork(cfg.id.toString());
+                    auto sid = registry.assignNetwork(cfg.id.toString(), writer);
                     if (sid.length > 0) {
                         auto msg = ControlMessage("reconnectNetwork", cfg.id.toString(), nw.userId.toString(), cfg.toJson());
                         msg.timestampMs = Clock.currTime.toUnixTime!long * 1000;
-                        redis.lpush(RedisKeys.control(sid), msg.toJson().toString());
+                        runNetworkRedisMutation!void(writer, (db) {
+                            db.lpush(RedisKeys.control(sid), msg.toJson().toString());
+                        });
                     }
                 }
             } catch (Exception e) {
                 writefln("    warn: reconnect push failed: %s", e.msg);
             }
+            });
             fixed++;
         } catch (Exception e) {
             stderr.writefln("  [error] %s: %s", user.username, e.msg);

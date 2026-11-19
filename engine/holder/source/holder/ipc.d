@@ -706,7 +706,7 @@ final class HolderServer {
             fields["error"] = e.msg;
             fields["tookMs"] = (unixMsNow() - startMs).to!string;
             logJsonMap("warn", "holder", "Dial failed", fields);
-            writeLine(c, "FAILED " ~ FailedLine(e.phase, e.msg).toJson().toString());
+            writeLine(c, "FAILED " ~ FailedLine(e.phase, e.msg, e.terminalDnsTcp).toJson().toString());
             return;
         } catch (Exception e) {
             fields["event"] = "dial_fail";
@@ -747,7 +747,7 @@ final class HolderServer {
         fields["tookMs"] = (unixMsNow() - startMs).to!string;
         logJsonMap("info", "holder", "Dial succeeded", fields);
         auto connected = ConnectedLine(id, held.peerIp, held.localIp, held.peerPort, held.localPort,
-            held.connectedAtMs, held.tlsInfo, instance);
+            held.connectedAtMs, held.tlsInfo, instance, outcome.tlsVerified);
         held.attach(c, "CONNECTED " ~ connected.toJson().toString());
     }
 
@@ -888,7 +888,7 @@ void runHolderMetaRegressions(string directory, scope void delegate(bool, string
     cfg.addr = parseHolderAddr(cfg.addrText);
     cfg.closedRetainSecs = 60;
     cfg.detachMaxSecs = 60;
-    cfg.detachBufferBytes = 64 * 1024;
+    cfg.detachBufferBytes = DETACH_BUFFER_BYTES;
     auto server = new HolderServer(cfg);
     server.start();
     scope(exit) { server.quitAll(); server.stop(); }

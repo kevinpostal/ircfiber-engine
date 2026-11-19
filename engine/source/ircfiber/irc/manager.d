@@ -480,7 +480,7 @@ final class ConnectionManager {
 
     /// Adds a network for a user and starts its IRC client.
     void addNetwork(NetworkConfig config, UUID userId) {
-        if (config.servicesProvisioningPending) return;
+        if (!config.hasUpstreamServer() || config.disabled || config.servicesProvisioningPending) return;
         auto key = config.id.toString();
         if (terminating || key in moveStops) return;
         knownNetworks[key] = true;
@@ -503,7 +503,7 @@ final class ConnectionManager {
     /// Used when a single network needs to start outside the bootstrap loop
     /// (e.g. reconnectNetwork control message).
     void addAndStartNetwork(NetworkConfig config, UUID userId) {
-        if (config.servicesProvisioningPending) return;
+        if (!config.hasUpstreamServer() || config.disabled || config.servicesProvisioningPending) return;
         auto key = config.id.toString();
         if (terminating || key in moveStops) return;
         knownNetworks[key] = true;
@@ -1188,7 +1188,7 @@ final class ConnectionManager {
         installMaintenanceProjection(projection, operation, now, (Json row) {
             const network = row["networkId"].get!string;
             auto current = repository.findByIdWithUser(maintenanceUuid(network));
-            if (current.config.id == UUID.init || current.config.disabled
+            if (current.config.id == UUID.init || !current.config.hasUpstreamServer() || current.config.disabled
                     || current.config.servicesProvisioningPending
                     || current.userId.toString() != row["userId"].get!string
                     || db.hget(RedisKeys.networkAssignments(), network) != serverId
@@ -1494,7 +1494,7 @@ final class ConnectionManager {
         import ircfiber.engine.session_snapshot : fromJSON;
         import vibe.core.core : runTask, sleep;
         import core.time : seconds;
-        if (config.servicesProvisioningPending) return;
+        if (!config.hasUpstreamServer() || config.disabled || config.servicesProvisioningPending) return;
         auto key = config.id.toString();
         const ownerId = userId.toString();
         if (terminating || key in moveStops) return;

@@ -161,6 +161,10 @@ struct RedisKeys {
     /// members (record expired) are pruned by the reader.
     static string bncClients() { return "irc:bnc:clients"; }
 
+    /// External IRC registrations and live sessions, indexed by physical holder identity.
+    static string bncExternalReservations(string userId) { return "irc:bnc:external-reservations:" ~ userId; }
+    static string userPreferences(string userId) { return "prefs:" ~ userId; }
+
     /// Presence record of one connected chat WebSocket (JSON, 150 s TTL
     /// refreshed by inbound frames). Keyed by a random per-handshake id,
     /// written by every gateway, read by the admin sessions API.
@@ -262,6 +266,7 @@ struct RedisKeys {
     /// TTL — persists across restarts until the user explicitly changes
     /// their configured nick or the admin clears the key.
     static string networkNick(string networkId) { return "irc:nick:" ~ networkId; }
+    static string networkNickRevision(string networkId) { return "irc:nick:revision:" ~ networkId; }
 
     /// Committed recovery coverage; folded target fields and reserved *targets.
     /// Deliberately persistent until network runtime state is purged.
@@ -766,6 +771,11 @@ struct NetworkStateSnapshot {
     /// Actual local socket source (native pool, shared host, or proxy hop).
     /// Not necessarily the IRC-visible source when using a VPN.
     string localIp;
+    /// Endpoint observed on the attached holder socket, never current config.
+    string observedUpstreamHost;
+    ushort observedUpstreamPort;
+    /// "tls" or "none"; empty when transport was not positively observed.
+    string observedUpstreamTls;
     /// Observed transport tier, never a requested or unused reservation.
     string activeRoute;
     /// Most recent reason an earlier permitted tier could not be used.
@@ -889,6 +899,9 @@ struct NetworkStateSnapshot {
         if (activeEgressLocation.length) j["activeEgressLocation"] = Json(activeEgressLocation);
         if (peerIp.length) j["peerIp"] = Json(peerIp);
         if (localIp.length) j["localIp"] = Json(localIp);
+        if (connected && observedUpstreamHost.length) j["observedUpstreamHost"] = Json(observedUpstreamHost);
+        if (connected && observedUpstreamPort) j["observedUpstreamPort"] = Json(observedUpstreamPort);
+        if (connected && observedUpstreamTls.length) j["observedUpstreamTls"] = Json(observedUpstreamTls);
         if (activeRoute.length) j["activeRoute"] = Json(activeRoute);
         if (routingFallbackReason.length) j["routingFallbackReason"] = Json(routingFallbackReason);
         j["lagMs"] = Json(lagMs);
@@ -982,6 +995,16 @@ struct NetworkStateSnapshot {
         if (j["activeEgressLocation"].type == Json.Type.string) s.activeEgressLocation = j["activeEgressLocation"].get!string;
         if (j["peerIp"].type == Json.Type.string) s.peerIp = j["peerIp"].get!string;
         if (j["localIp"].type == Json.Type.string) s.localIp = j["localIp"].get!string;
+        if (j["observedUpstreamHost"].type == Json.Type.string)
+            s.observedUpstreamHost = j["observedUpstreamHost"].get!string;
+        if (j["observedUpstreamPort"].type == Json.Type.int_) {
+            const port = j["observedUpstreamPort"].get!long;
+            if (port > 0 && port <= ushort.max) s.observedUpstreamPort = cast(ushort) port;
+        }
+        if (j["observedUpstreamTls"].type == Json.Type.string) {
+            const tls = j["observedUpstreamTls"].get!string;
+            if (tls == "tls" || tls == "none") s.observedUpstreamTls = tls;
+        }
         if (j["activeRoute"].type == Json.Type.string) s.activeRoute = j["activeRoute"].get!string;
         if (j["routingFallbackReason"].type == Json.Type.string)
             s.routingFallbackReason = j["routingFallbackReason"].get!string;
@@ -1083,6 +1106,23 @@ string normalizedServicesAvailability(string value) @safe pure nothrow {
         case "disabled":    return "disabled";
         default:            return "unknown";
     }
+}
+
+@("observed upstream endpoint is independent of selection and absent offline") unittest {
+    NetworkStateSnapshot snap;
+    assert(snap.toJson()["observedUpstreamHost"].type == Json.Type.undefined);
+    snap.connected = true;
+    snap.observedUpstreamHost = "observed.example.org";
+    snap.observedUpstreamPort = 6697;
+    snap.observedUpstreamTls = "tls";
+    auto back = NetworkStateSnapshot.fromJson(snap.toJson());
+    assert(back.observedUpstreamHost == snap.observedUpstreamHost);
+    assert(back.observedUpstreamPort == 6697 && back.observedUpstreamTls == "tls");
+    snap.connected = false;
+    auto offline = snap.toJson();
+    assert(offline["observedUpstreamHost"].type == Json.Type.undefined);
+    assert(offline["observedUpstreamPort"].type == Json.Type.undefined);
+    assert(offline["observedUpstreamTls"].type == Json.Type.undefined);
 }
 
 @("NetworkStateSnapshot services identity round-trips only for a live generation")

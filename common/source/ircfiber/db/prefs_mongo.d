@@ -80,16 +80,21 @@ PrefsDoc prefsDocFromBson(Bson doc) @trusted {
     return r;
 }
 
-/// Loads the durable copy. Never throws: Mongo being down must not break a
-/// pref read, since Redis remains authoritative.
-PrefsDoc loadPrefsDoc(string userId) @trusted {
-    if (!AppMongoConnection.isConnected()) return PrefsDoc.init;
+/// A strict consumer distinguishes absent durable settings from an unavailable store.
+PrefsDoc loadPrefsDoc(string userId, bool strict = false) @trusted {
+    if (!AppMongoConnection.isConnected()) {
+        if (strict) throw new Exception("Durable preference store unavailable");
+        return PrefsDoc.init;
+    }
     try {
         auto coll = AppMongoConnection.getDb()[PREFS_COLLECTION];
         auto doc = coll.findOne(Bson(["_id": Bson(userId)]));
         if (doc.isNull) return PrefsDoc.init;
-        return prefsDocFromBson(doc);
+        auto decoded = prefsDocFromBson(doc);
+        if (strict && !decoded.found) throw new Exception("Invalid durable preferences");
+        return decoded;
     } catch (Exception e) {
+        if (strict) throw e;
         logWarn("prefs_mongo: load failed for %s: %s", userId, e.msg);
         return PrefsDoc.init;
     }

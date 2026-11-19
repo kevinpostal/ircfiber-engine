@@ -81,6 +81,8 @@ struct ConnectionServer {
     string gitCommitUrl;
     /// Enforced routing contract. Old metadata decodes to zero, never capable.
     int routingPolicyVersion;
+    /// ZNC endpoint/ring readers and scoped writers; absent means unsupported.
+    int zncStatusConfigVersion;
     /// Explicit transport capabilities, not inferred from health or node names.
     string[] supportedRoutes;
     /// Verified native pool only; empty unless IPv6 capability is usable.
@@ -102,6 +104,7 @@ struct ConnectionServer {
         j["fallbackOnly"] = Json(fallbackOnly);
         j["draining"] = Json(draining);
         j["routingPolicyVersion"] = Json(routingPolicyVersion);
+        j["zncStatusConfigVersion"] = Json(zncStatusConfigVersion);
         j["supportedRoutes"] = serializeToJson(supportedRoutes);
         j["ipv6Prefix"] = Json(ipv6Prefix);
         j["archiveVersion"] = Json(archiveVersion);
@@ -141,6 +144,8 @@ struct ConnectionServer {
         if (j["draining"].type != Json.Type.undefined) s.draining = j["draining"].get!bool;
         if (j["routingPolicyVersion"].type == Json.Type.int_)
             s.routingPolicyVersion = j["routingPolicyVersion"].get!int;
+        if (j["zncStatusConfigVersion"].type == Json.Type.int_)
+            s.zncStatusConfigVersion = j["zncStatusConfigVersion"].get!int;
         if (j["archiveVersion"].type == Json.Type.int_)
             s.archiveVersion = j["archiveVersion"].get!int;
         if (j["ipv6Prefix"].type == Json.Type.string) {

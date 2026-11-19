@@ -175,6 +175,7 @@ private HolderEntry restorationEntry(HolderClient holder, HolderEntry entry) {
 void refreshRoutingCapabilities(ref EngineContext ctx, bool publish = false) {
     import vibe.data.json : Json;
     ctx.localServer.routingPolicyVersion = 1;
+    ctx.localServer.zncStatusConfigVersion = 1;
     ctx.localServer.supportedRoutes = supportedRoutingRoutes(ctx.holder, ctx.localServer.ipv6Prefix);
     if (!publish) return;
     auto routes = Json.emptyArray;
@@ -182,6 +183,7 @@ void refreshRoutingCapabilities(ref EngineContext ctx, bool publish = false) {
     auto db = ctx.redis.getDb();
     const key = RedisKeys.server(ctx.localServer.serverId);
     db.hset(key, "routingPolicyVersion", "1");
+    db.hset(key, "zncStatusConfigVersion", "1");
     db.hset(key, "supportedRoutes", routes.toString());
     db.hset(key, "ipv6Prefix", ctx.localServer.ipv6Prefix);
 }
@@ -358,6 +360,7 @@ EngineContext bootstrapEngine() {
     localServer.port = adminPort;
     localServer.isHealthy = true;
     localServer.routingPolicyVersion = 1;
+    localServer.zncStatusConfigVersion = 1;
     localServer.lastHeartbeat = Clock.currTime.toUnixTime!long * 1000;
     localServer.bufferOffset = 0; // Registry will set proper offset
     auto bi = buildInfo();
@@ -498,7 +501,7 @@ void loadNetworks(ref EngineContext ctx) {
     auto serverId = ctx.localServer.serverId;
 
     foreach (nw; allNetworks) {
-        if (nw.config.disabled || nw.config.servicesProvisioningPending) {
+        if (!nw.config.hasUpstreamServer() || nw.config.disabled || nw.config.servicesProvisioningPending) {
             skippedCount++;
             continue;
         }
@@ -519,7 +522,7 @@ void loadNetworks(ref EngineContext ctx) {
             skippedCount++;
             continue;
         }
-        if (nw.config.disabled || nw.config.servicesProvisioningPending) {
+        if (!nw.config.hasUpstreamServer() || nw.config.disabled || nw.config.servicesProvisioningPending) {
             skippedCount++;
             continue;
         }
@@ -732,7 +735,7 @@ private void startNetworkReconciliation(ref EngineContext ctx, HolderEntry[] phy
                 }
                 auto row = ctx.networkRepo.findByIdWithUser(network.config.id);
                 auto client = ctx.connManager.getClient(network.config.id);
-                if (owner != sid || row.config.id == UUID.init || row.config.disabled
+                if (owner != sid || row.config.id == UUID.init || !row.config.hasUpstreamServer() || row.config.disabled
                         || row.config.servicesProvisioningPending || (client !is null && client.getStopping)
                         || ctx.connManager.getOwnerId(network.config.id) != row.userId.toString()) {
                     if (!ctx.connManager.stopNetworkForMove(network.config.id, 60.seconds))
@@ -750,7 +753,7 @@ private void startNetworkReconciliation(ref EngineContext ctx, HolderEntry[] phy
                         continue;
                     }
                     auto row = loadCanonicalNetwork(ctx, parseUUID(nid[]));
-                    if (row.config.disabled || row.config.servicesProvisioningPending) continue;
+                    if (!row.config.hasUpstreamServer() || row.config.disabled || row.config.servicesProvisioningPending) continue;
                     if (!ownsNetworkForDial(ctx.redis, sid, nid)) continue;
                     missing ~= nid;
                 } catch (Exception e) {
@@ -784,7 +787,7 @@ private void startNetworkReconciliation(ref EngineContext ctx, HolderEntry[] phy
                             continue;
                         }
                         auto row = loadCanonicalNetwork(ctx, parseUUID(nid[]));
-                        if (row.config.disabled || row.config.servicesProvisioningPending) continue;
+                        if (!row.config.hasUpstreamServer() || row.config.disabled || row.config.servicesProvisioningPending) continue;
                         if (!ownsNetworkForDial(ctx.redis, sid, nid)) continue;
                         HolderEntry held;
                         if (auto entry = nid in heldByNetwork) held = *entry;

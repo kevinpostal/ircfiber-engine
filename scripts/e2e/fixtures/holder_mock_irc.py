@@ -47,6 +47,76 @@ SERVER = "mock.irc"
 HISTORY_ENABLED = os.environ.get("MOCK_IRC_HISTORY", "") == "1"
 HISTORY_CONTROL_PREFIX = "!history "
 
+# Enabled only by an explicit control on the disposable parity control file.
+# Lifecycle/command evidence is separate from the historical raw-line contract.
+PARITY_PREFIX = "!parity "
+PARITY_AUDIT = "/tmp/mock-irc.connections.jsonl"
+PARITY_CONTROL = "/tmp/mock-irc.parity-control"
+parity_options = {"enabled": False, "reject_nick": "", "expect_pass": None, "expect_keys": {}}
+parity_connections = set()
+parity_sequence = 0
+
+
+def parity_record(event, connection=0, **fields):
+    if not parity_options["enabled"]:
+        return
+    with lock:
+        row = {"event": event, "connection": connection,
+               "at": time.monotonic(), "active": len(parity_connections)}
+        row.update(fields)
+        with open(PARITY_AUDIT, "a") as stream:
+            stream.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def parity_control(data):
+    """Consume only fixture controls; never turn a test instruction into IRC."""
+    wire = []
+    for line in data.decode("utf-8").splitlines():
+        if not line.startswith(PARITY_PREFIX):
+            wire.append(line)
+            continue
+        value = json.loads(line[len(PARITY_PREFIX):])
+        if value.get("op") != "configure" or set(value) - {
+                "op", "reject_nick", "expect_pass", "expect_keys"}:
+            raise ValueError("invalid parity control")
+        nick = value.get("reject_nick", parity_options["reject_nick"])
+        if not isinstance(nick, str) or len(nick) > 30 or any(
+                not (c.isascii() and (c.isalnum() or c in "_-")) for c in nick):
+            raise ValueError("invalid parity rejection nickname")
+        password = value.get("expect_pass", parity_options["expect_pass"])
+        keys = value.get("expect_keys", parity_options["expect_keys"])
+        if password is not None and (not isinstance(password, str) or
+                any(c in password for c in "\r\n\x00")):
+            raise ValueError("invalid parity PASS expectation")
+        if not isinstance(keys, dict) or any(
+                not isinstance(k, str) or not isinstance(v, str) or
+                any(c in k + v for c in "\r\n\x00") for k, v in keys.items()):
+            raise ValueError("invalid parity key expectation")
+        parity_options.update(enabled=True, reject_nick=nick,
+                              expect_pass=password, expect_keys=keys)
+        parity_record("configured")
+    return "".join(line + "\r\n" for line in wire).encode()
+
+
+def parity_control_loop():
+    """Allows opt-in before the first connection or any registration secret."""
+    while True:
+        try:
+            with open(PARITY_CONTROL, "rb") as stream:
+                data = stream.read()
+            parity_control(PARITY_PREFIX.encode() + data)
+            os.remove(PARITY_CONTROL)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, TypeError):
+            # No untrusted control values (possibly passwords) in diagnostics.
+            print("mock_irc: invalid parity control", flush=True)
+            try:
+                os.remove(PARITY_CONTROL)
+            except FileNotFoundError:
+                pass
+        time.sleep(0.02)
+
 
 def history_time(timestamp_ms):
     return datetime.datetime.fromtimestamp(
@@ -533,7 +603,7 @@ class HistorySession:
 history_fixture = HistoryFixture() if HISTORY_ENABLED else None
 
 accepted = []  # (remote_port, inode)
-lock = threading.Lock()
+lock = threading.RLock()
 
 
 def write_result():
@@ -568,6 +638,8 @@ def send(conn, line):
 def welcome(conn, nick):
     send(conn, f":{SERVER} 001 {nick} :Welcome to the holder mock IRC {nick}!u@mock")
     send(conn, f":{SERVER} 002 {nick} :Your host is {SERVER}, running version mock-1")
+    if parity_options["enabled"]:
+        send(conn, f":{SERVER} 005 {nick} CASEMAPPING=rfc1459 CHANTYPES=# PREFIX=(ov)@+ CHANMODES=beI,k,l,imnst NICKLEN=30 :are supported by this server")
     send(conn, f":{SERVER} 376 {nick} :End of MOTD")
 
 
@@ -606,6 +678,8 @@ def inject_loop(conn, stop, history=None):
                 if not history:
                     os.remove(INJECT_FILE)
                 if data:
+                    data = parity_control(data)
+                if data:
                     print(f"mock_irc: inject: {data!r}", flush=True)
                     if history:
                         history.raw_inject(data)
@@ -620,7 +694,7 @@ def inject_loop(conn, stop, history=None):
         time.sleep(0.2)
 
 
-def handle(conn, addr, ino):
+def handle(conn, addr, ino, connection):
     print(f"mock_irc: accepted {addr} inode={ino}", flush=True)
     accepted.append((addr[1], ino))
     print(f"mock_irc: result: {write_result().strip()}", flush=True)
@@ -633,6 +707,7 @@ def handle(conn, addr, ino):
                          args=(conn, stop, lambda: nick), daemon=True).start()
     user_seen = False
     welcomed = False
+    rejected_nick = False
     buf = b""
     try:
         conn.settimeout(None)
@@ -644,34 +719,79 @@ def handle(conn, addr, ino):
             while b"\n" in buf:
                 line, _, buf = buf.partition(b"\n")
                 text = line.rstrip(b"\r").decode("utf-8", errors="replace")
-                print(f"mock_irc: rcv: {text!r}", flush=True)
-                record_line(text, nick)
-                parts = text.split(" ")
-                cmd = parts[0].upper() if parts else ""
+                body = text
+                label = ""
+                if parity_options["enabled"] and text.startswith("@"):
+                    head, _, body = text.partition(" ")
+                    label = next((tag[6:] for tag in head[1:].split(";")
+                                  if tag.startswith("label=")), "")
+                parts = body.split(" ")
+                cmd = parts[0].upper()
+                # Treat tags as an envelope, including for credential redaction.
+                diagnostic = text
+                if parity_options["enabled"]:
+                    if cmd in ("PASS", "AUTHENTICATE", "ZNC"):
+                        diagnostic = cmd + " <redacted>"
+                    elif cmd == "JOIN":
+                        diagnostic = " ".join(parts[:2]) + (" <redacted>" if len(parts) > 2 else "")
+                    elif cmd in ("PRIVMSG", "NOTICE") and len(parts) > 1 and any(
+                            target.startswith("*") for target in parts[1].split(",")):
+                        diagnostic = " ".join(parts[:2]) + " <redacted>"
+                print(f"mock_irc: rcv: {diagnostic!r}", flush=True)
+                record_line(diagnostic, nick)
+                if parity_options["enabled"] and cmd == "PASS":
+                    parity_record("credential", connection, verb="PASS",
+                                  matched=(body[5:].removeprefix(":") == parity_options["expect_pass"]))
+                if parity_options["enabled"] and cmd == "JOIN" and len(parts) > 2:
+                    parity_record("join_key", connection, target=parts[1],
+                                  matched=(parts[2] == parity_options["expect_keys"].get(parts[1])))
+                if parity_options["enabled"] and cmd in (
+                        "NICK", "USER", "JOIN", "PART", "MODE", "PRIVMSG", "NOTICE", "QUIT"):
+                    target = parts[1].lstrip(":") if len(parts) > 1 and cmd != "USER" else ""
+                    parity_record("command", connection, verb=cmd, target=target)
                 if history and history.handle(text):
                     pass
                 elif cmd == "CAP" and len(parts) > 1 and parts[1].upper() == "LS":
                     send(conn, "CAP * LS :")
                 elif cmd == "NICK" and len(parts) > 1:
-                    nick = parts[1].lstrip(":")
+                    candidate = parts[1].lstrip(":")
+                    if (parity_options["enabled"] and not welcomed and not rejected_nick
+                            and candidate == parity_options["reject_nick"]):
+                        rejected_nick = True
+                        send(conn, f":{SERVER} 433 * {candidate} :Nickname is already in use")
+                        continue
+                    previous = nick
+                    nick = candidate
+                    if parity_options["enabled"] and welcomed and previous:
+                        send(conn, f":{previous}!u@mock NICK :{nick}")
                     if history:
                         history.nick = nick
                 elif cmd == "USER":
                     user_seen = True
                 elif cmd == "PING":
-                    payload = text.split(":", 1)[1] if ":" in text else (parts[1] if len(parts) > 1 else "mock")
+                    payload = body.split(":", 1)[1] if ":" in body else (parts[1] if len(parts) > 1 else "mock")
                     send(conn, f"PONG :{payload}")
                 elif cmd == "JOIN" and len(parts) > 1 and nick:
                     for chan in parts[1].split(","):
                         send(conn, f":{nick}!u@mock JOIN {chan}")
                         names(conn, nick, chan)
+                    if label:
+                        send(conn, f"@label={label} :{SERVER} ACK")
                 elif cmd == "NAMES" and len(parts) > 1 and nick:
                     for chan in parts[1].split(","):
                         names(conn, nick, chan)
+                elif cmd == "PART" and len(parts) > 1 and nick and parity_options["enabled"]:
+                    for chan in parts[1].split(","):
+                        send(conn, f":{nick}!u@mock PART {chan} :Leaving")
+                    if label:
+                        send(conn, f"@label={label} :{SERVER} ACK")
                 elif cmd == "QUIT":
                     print(f"mock_irc: saw QUIT from {addr}", flush=True)
+                    if parity_options["enabled"]:
+                        return
                 if not welcomed and nick and user_seen and (not history or history.registration_ready):
                     welcomed = True
+                    parity_record("registered", connection, nick=nick)
                     if history:
                         with history.send_lock:
                             send(conn, f":{SERVER} 001 {nick} :Welcome to the holder mock IRC {nick}!u@mock")
@@ -688,11 +808,15 @@ def handle(conn, addr, ino):
             conn.close()
         except OSError:
             pass
+        with lock:
+            parity_connections.discard(connection)
+            parity_record("close", connection)
         print(f"mock_irc: closed {addr}", flush=True)
 
 
 def main():
-    for path in (LINES_FILE, INJECT_FILE):
+    global parity_sequence
+    for path in (LINES_FILE, INJECT_FILE, PARITY_AUDIT, PARITY_CONTROL):
         try:
             os.remove(path)
         except FileNotFoundError:
@@ -701,14 +825,20 @@ def main():
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(("0.0.0.0", PORT))
     server.listen(4)
+    threading.Thread(target=parity_control_loop, daemon=True).start()
     print(f"mock_irc: listening on 0.0.0.0:{PORT}", flush=True)
     write_result()
     try:
         while True:
             conn, addr = server.accept()
+            with lock:
+                parity_sequence += 1
+                connection = parity_sequence
+                parity_connections.add(connection)
+                parity_record("accept", connection)
             fd_path = f"/proc/{os.getpid()}/fd/{conn.fileno()}"
             ino = os.stat(fd_path).st_ino if os.path.exists(fd_path) else 0
-            threading.Thread(target=handle, args=(conn, addr, ino), daemon=True).start()
+            threading.Thread(target=handle, args=(conn, addr, ino, connection), daemon=True).start()
     finally:
         print(f"mock_irc: result: {write_result().strip()}", flush=True)
 

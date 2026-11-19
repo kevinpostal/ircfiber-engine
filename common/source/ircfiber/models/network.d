@@ -25,6 +25,83 @@ enum TLSMode {
     starttls
 }
 
+/// A configured endpoint, including its registration credential.
+struct BncServerEndpoint {
+    string host;
+    ushort port;
+    TLSMode tls;
+    string serverPass;
+
+    bool sameAddress(const BncServerEndpoint other) const @safe {
+        import std.uni : icmp;
+        static string dnsHost(string name) {
+            return name.length && name[$ - 1] == '.' ? name[0 .. $ - 1] : name;
+        }
+        if (port != other.port || tls != other.tls) return false;
+        if (icmp(dnsHost(host), dnsHost(other.host)) == 0) return true;
+        ubyte[16] left, right;
+        return address6(host, left) && address6(other.host, right) && left == right;
+    }
+
+    private static bool address6(string name, ref ubyte[16] result) nothrow @trusted @nogc {
+        import core.sys.posix.arpa.inet : inet_pton;
+        import core.sys.posix.sys.socket : AF_INET6;
+        if (!name.length || name.length > 45) return false;
+        char[46] buffer = void;
+        bool colon;
+        foreach (i, char c; name) {
+            if (c == 0) return false;
+            colon = colon || c == ':';
+            buffer[i] = c;
+        }
+        buffer[name.length] = 0;
+        return colon && inet_pton(AF_INET6, buffer.ptr, result.ptr) == 1;
+    }
+}
+
+bool isCanonicalServerFingerprint(string value) @safe pure nothrow @nogc {
+    if (value.length != 64) return false;
+    foreach (char c; value)
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    return true;
+}
+
+/// Accepted user inputs are bare hex or exactly 32 colon-separated bytes.
+string normalizeServerFingerprint(string value) @safe pure {
+    const separated = value.length == 95;
+    if (!separated && value.length != 64) return "";
+    char[64] result = void;
+    foreach (i, ref c; result) {
+        const pos = separated ? i + i / 2 : i;
+        if (separated && i > 0 && i % 2 == 0 && value[pos - 1] != ':') return "";
+        c = value[pos];
+        if (c >= 'A' && c <= 'F') c = cast(char)(c + ('a' - 'A'));
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return "";
+    }
+    return result[].idup;
+}
+
+/// Absent fields preserve legacy behavior; incorrect published types or
+/// pins without verification fail closed, including when loaded from Mongo.
+void decodeServerCertificatePolicy(Json verify, Json pins, out bool verification, out string[] fingerprints) {
+    import std.exception : enforce;
+    if (verify.type != Json.Type.undefined) {
+        enforce(verify.type == Json.Type.bool_, "Invalid server certificate verification policy");
+        verification = verify.get!bool;
+    }
+    if (pins.type == Json.Type.undefined) return;
+    enforce(pins.type == Json.Type.array, "Invalid server fingerprint list");
+    if (!pins.length) return;
+    enforce(verification, "Server fingerprint allowlist requires verification");
+    fingerprints = new string[pins.length];
+    foreach (i; 0 .. pins.length) {
+        const pin = pins[i];
+        enforce(pin.type == Json.Type.string && isCanonicalServerFingerprint(pin.get!string),
+            "Invalid server certificate fingerprint");
+        fingerprints[i] = pin.get!string;
+    }
+}
+
 /// SASL authentication mechanism
 enum SASLMechanism {
     /// No SASL
@@ -104,6 +181,158 @@ string[] dedupChannels(string[] channels) @safe {
     return outArr;
 }
 
+enum IrcCaseMapping { rfc1459, ascii, strictRfc1459 }
+
+IrcCaseMapping ircCaseMapping(string mode) @safe pure nothrow @nogc {
+    if (mode == "ascii") return IrcCaseMapping.ascii;
+    if (mode == "strict-rfc1459" || mode == "rfc1459-strict") return IrcCaseMapping.strictRfc1459;
+    return IrcCaseMapping.rfc1459;
+}
+
+char foldIrcCaseChar(char c, IrcCaseMapping mapping) @safe pure nothrow @nogc {
+    if (c >= 'A' && c <= 'Z') return cast(char)(c + ('a' - 'A'));
+    if (mapping == IrcCaseMapping.ascii) return c;
+    switch (c) {
+        case '[': return '{';
+        case ']': return '}';
+        case '\\': return '|';
+        case '^': return mapping == IrcCaseMapping.strictRfc1459 ? '^' : '~';
+        default: return c;
+    }
+}
+
+bool ircCaseEquals(string a, string b, IrcCaseMapping mapping) @safe pure nothrow @nogc {
+    if (a.length != b.length) return false;
+    foreach (i, char c; a)
+        if (foldIrcCaseChar(c, mapping) != foldIrcCaseChar(b[i], mapping)) return false;
+    return true;
+}
+
+string foldIrcName(string name, IrcCaseMapping mapping) @trusted pure {
+    import std.exception : assumeUnique;
+    char[] folded;
+    foreach (i, char c; name) {
+        const changed = foldIrcCaseChar(c, mapping);
+        if (changed == c) continue;
+        if (folded is null) folded = name.dup;
+        folded[i] = changed;
+    }
+    return folded is null ? name : assumeUnique(folded);
+}
+
+/// Explicit clear requires both the timestamp and event-sequence fences.
+struct BncPlaybackCutoff {
+    long eid;
+    long timestampMs;
+
+    bool active() const @safe pure nothrow @nogc { return eid > 0 || timestampMs > 0; }
+
+    bool allows(long time, long eventId) const @safe pure nothrow @nogc {
+        return !active() || (time >= timestampMs
+            && (eventId > eid || (eventId <= 0 && time > timestampMs)));
+    }
+
+    void advance(BncPlaybackCutoff next) @safe pure nothrow @nogc {
+        if (eid < next.eid) eid = next.eid;
+        if (timestampMs < next.timestampMs) timestampMs = next.timestampMs;
+    }
+
+    Json toJson() const { return Json(["eid": Json(eid), "timestampMs": Json(timestampMs)]); }
+
+    static BncPlaybackCutoff fromJson(Json j) {
+        if (j.type == Json.Type.undefined) return BncPlaybackCutoff.init;
+        import std.exception : enforce;
+        const e = j["eid"].get!long;
+        const t = j["timestampMs"].get!long;
+        enforce(e >= 0 && t >= 0, "Invalid BNC playback cutoff");
+        return BncPlaybackCutoff(e, t);
+    }
+}
+
+enum BncAutoClear { inherit, on, off }
+
+/// Consumed playback is ordered by the delivered row, not the explicit-clear fence.
+struct BncPlaybackConsumption {
+    long timestampMs;
+    long eid;
+
+    bool active() const @safe pure nothrow @nogc { return timestampMs > 0 || eid > 0; }
+    bool allows(long time, long eventId) const @safe pure nothrow @nogc {
+        return !active() || time > timestampMs || (time == timestampMs && eventId > eid);
+    }
+    void advance(BncPlaybackConsumption next) @safe pure nothrow @nogc {
+        if (allows(next.timestampMs, next.eid)) this = next;
+    }
+    Json toJson() const { return Json(["timestampMs": Json(timestampMs), "eid": Json(eid)]); }
+    static BncPlaybackConsumption fromJson(Json j) {
+        auto point = BncPlaybackCutoff.fromJson(j);
+        return BncPlaybackConsumption(point.timestampMs, point.eid);
+    }
+}
+
+struct BncPlaybackTarget {
+    int lines = -1;
+    BncPlaybackCutoff cleared;
+    BncAutoClear autoClear;
+    BncPlaybackConsumption consumed;
+}
+
+/// BNC view only. The web and explicit CHATHISTORY still use the archive.
+struct BncPlaybackPolicy {
+    BncPlaybackCutoff channelsCleared;
+    BncPlaybackCutoff queriesCleared;
+    BncPlaybackTarget[string] targets;
+
+    bool active() const { return channelsCleared.active || queriesCleared.active || targets.length != 0; }
+
+    Json toJson() const {
+        import std.algorithm : sort;
+        auto rows = Json.emptyArray;
+        foreach (name; sort(targets.keys)) {
+            const target = targets[name];
+            rows ~= Json(["name": Json(name), "lines": Json(target.lines), "cleared": target.cleared.toJson(),
+                "autoClear": Json(target.autoClear.to!string), "consumed": target.consumed.toJson()]);
+        }
+        return Json(["channelsCleared": channelsCleared.toJson(), "queriesCleared": queriesCleared.toJson(),
+            "targets": rows]);
+    }
+
+    static BncPlaybackPolicy fromJson(Json j) {
+        if (j.type == Json.Type.undefined) return BncPlaybackPolicy.init;
+        import std.exception : enforce;
+        BncPlaybackPolicy policy;
+        policy.channelsCleared = BncPlaybackCutoff.fromJson(j["channelsCleared"]);
+        policy.queriesCleared = BncPlaybackCutoff.fromJson(j["queriesCleared"]);
+        const rows = j["targets"];
+        enforce(rows.type == Json.Type.array, "Invalid BNC playback target list");
+        foreach (row; rows) {
+            const name = row["name"].get!string;
+            const lines = row["lines"].get!long;
+            enforce(name.length && name !in policy.targets && lines >= -1 && lines <= 1000,
+                "Invalid BNC playback target");
+            auto target = BncPlaybackTarget(cast(int) lines, BncPlaybackCutoff.fromJson(row["cleared"]));
+            if (row["autoClear"].type != Json.Type.undefined) target.autoClear = row["autoClear"].get!string.to!BncAutoClear;
+            target.consumed = BncPlaybackConsumption.fromJson(row["consumed"]);
+            policy.targets[name] = target;
+        }
+        return policy;
+    }
+}
+
+/// Inherit keeps pre-existing web-configured registration scripts active.
+enum BncPerformState { inherit, loaded, unloaded }
+
+enum BNC_CONTROL_NETWORK_FIELDS = ["altNick", "quitMessage", "bncNickRevision", "bncJoinDelaySeconds",
+    "bncFloodIntervalMs", "bncFloodBurst", "bncUnsavedChannels", "bncChannelKeys", "bncChannelDefaultModes"];
+
+/// Ordered records make the whole BSON value stable for conditional writes.
+Json encodeBncStringMap(const string[string] values) {
+    import std.algorithm : sort;
+    auto rows = Json.emptyArray;
+    foreach (key; sort(values.keys)) rows ~= Json(["name": Json(key), "value": Json(values[key])]);
+    return rows;
+}
+
 /// Network configuration
 struct NetworkConfig {
     /// The network ID
@@ -137,6 +366,20 @@ struct NetworkConfig {
     string[] autoJoinChannels;
     /// Channels the user has parted (kept for inactive sidebar)
     string[] partedChannels;
+    /// Reconnect suppression independent of saved intent or current membership.
+    string[] disabledChannels;
+    /// BNC presentation order, regardless of the website's sidebar ordering.
+    string[] channelOrder;
+    BncPlaybackPolicy bncPlayback;
+    string altNick;
+    string quitMessage;
+    long bncNickRevision;
+    uint bncJoinDelaySeconds;
+    uint bncFloodIntervalMs;
+    uint bncFloodBurst = 9;
+    string[] bncUnsavedChannels;
+    string[string] bncChannelKeys;
+    string[string] bncChannelDefaultModes;
     /// The nick
     string nick;
     /// The real name
@@ -157,6 +400,12 @@ struct NetworkConfig {
     string nspass;
     /// Commands to execute on connect (one per line, WAIT N supported for delays)
     string commands;
+    BncPerformState bncPerformState;
+
+    bool bncPerformLoaded() const @safe pure nothrow @nogc {
+        return bncPerformState == BncPerformState.loaded
+            || (bncPerformState == BncPerformState.inherit && commands.length != 0);
+    }
     /// Seconds to wait after connecting before auto-JOINs are sent.
     /// Measured from the start of the registration handshake (≈ TCP
     /// connect). Some IRCds throttle JOIN until the client has been
@@ -169,6 +418,13 @@ struct NetworkConfig {
     uint autoJoinDelaySeconds = 0;
     /// Server password — sent as PASS <serverPass> before NICK/USER during registration
     string serverPass;
+    /// The selected tuple occupies this index in the ordered ring. The
+    /// remaining tuples are stored in order, without duplicating the scalar.
+    BncServerEndpoint[] bncAlternateServers;
+    uint bncSelectedServerIndex;
+    /// Opt-in: exact leaf allowlist when nonempty, system PKI otherwise.
+    bool verifyServerCertificates;
+    string[] trustedServerFingerprints;
     /// Whether this network is provisioned by the platform (cannot be removed
     /// by the user via the API; admin tools can still override). The default
     /// IRC Fiber network is provisioned this way so every user has a working
@@ -199,9 +455,121 @@ struct NetworkConfig {
     string effectiveAvatarUrl() const @safe pure nothrow {
         return avatarUrl.length ? avatarUrl : defaultAvatarUrl;
     }
+
+    bool hasUpstreamServer() const @safe pure nothrow @nogc {
+        return host.length != 0 && port != 0;
+    }
+
+    BncServerEndpoint selectedBncServer() const @safe pure nothrow @nogc {
+        return BncServerEndpoint(host, port, tls, serverPass);
+    }
+
+    BncServerEndpoint[] bncServers() const {
+        if (!hasUpstreamServer()) return null;
+        const i = bncSelectedServerIndex;
+        auto servers = new BncServerEndpoint[bncAlternateServers.length + 1];
+        servers[0 .. i] = bncAlternateServers[0 .. i];
+        servers[i] = selectedBncServer();
+        servers[i + 1 .. $] = bncAlternateServers[i .. $];
+        return servers;
+    }
+
+    /// Updates the scalar and its ring together; an empty list parks the row.
+    void selectBncServer(const BncServerEndpoint[] servers, uint index) {
+        const endpoint = servers.length ? servers[index] : BncServerEndpoint.init;
+        host = endpoint.host;
+        port = endpoint.port;
+        tls = endpoint.tls;
+        serverPass = endpoint.serverPass;
+        bncSelectedServerIndex = servers.length ? index : 0;
+        bncAlternateServers = null;
+        if (servers.length > 1) {
+            bncAlternateServers = new BncServerEndpoint[servers.length - 1];
+            bncAlternateServers[0 .. index] = servers[0 .. index];
+            bncAlternateServers[index .. $] = servers[index + 1 .. $];
+        }
+    }
+
+    Json bncAlternateServersJson() const {
+        auto rows = Json.emptyArray;
+        foreach (server; bncAlternateServers)
+            rows ~= Json(["host": Json(server.host), "port": Json(server.port),
+                "tls": Json(server.tls.to!string), "serverPass": Json(server.serverPass)]);
+        return rows;
+    }
+
+    /// Shared reader for Mongo, the account cache and queued engine controls.
+    /// Bad metadata is not silently reinterpreted as a different selection.
+    void decodeBncServers(Json alternates, Json index) {
+        import std.exception : enforce;
+        if (alternates.type != Json.Type.undefined) {
+            enforce(alternates.type == Json.Type.array, "Invalid alternate server array");
+            foreach (row; alternates) {
+                const host = row["host"].get!string;
+                const port = row["port"].get!long;
+                enforce(host.length && port > 0 && port <= ushort.max, "Invalid alternate server address");
+                bncAlternateServers ~= BncServerEndpoint(host, cast(ushort) port,
+                    row["tls"].get!string.to!TLSMode, row["serverPass"].get!string);
+            }
+        }
+        if (index.type != Json.Type.undefined) {
+            const position = index.get!long;
+            enforce(position >= 0 && position <= bncAlternateServers.length
+                && position <= uint.max, "Invalid selected server index");
+            bncSelectedServerIndex = cast(uint) position;
+        }
+        enforce(hasUpstreamServer() || !bncAlternateServers.length, "Missing selected server");
+    }
+
+    void decodeBncTlsPolicy(Json verify, Json pins) {
+        decodeServerCertificatePolicy(verify, pins, verifyServerCertificates, trustedServerFingerprints);
+    }
+
+    void decodeBncChannels(Json disabled, Json order) {
+        if (disabled.type != Json.Type.undefined) disabledChannels = deserializeJson!(string[])(disabled);
+        if (order.type != Json.Type.undefined) channelOrder = deserializeJson!(string[])(order);
+    }
+
+    void decodeBncControlField(string field)(Json j) {
+        if (j.type == Json.Type.undefined) return;
+        import std.exception : enforce;
+        alias T = typeof(__traits(getMember, this, field));
+        static if (is(T == string[string])) {
+            enforce(j.type == Json.Type.array, "Invalid BNC channel settings map");
+            string[string] values;
+            foreach (i; 0 .. j.length) {
+                auto row = j[i];
+                const name = row["name"].get!string;
+                enforce(name.length && name !in values, "Invalid BNC channel setting");
+                values[name] = row["value"].get!string;
+            }
+            __traits(getMember, this, field) = values;
+        } else static if (is(T == string[])) {
+            __traits(getMember, this, field) = deserializeJson!(string[])(j);
+        } else static if (is(T == string)) {
+            __traits(getMember, this, field) = j.get!string;
+        } else {
+            const value = j.get!long;
+            enum long minimum = field == "bncFloodBurst" ? 1 : 0;
+            enum long maximum = field == "bncFloodBurst" ? 1000
+                : field == "bncFloodIntervalMs" ? 60_000 : field == "bncJoinDelaySeconds" ? 65_535 : long.max;
+            enforce(value >= minimum && value <= maximum, "Invalid BNC network setting");
+            __traits(getMember, this, field) = cast(T) value;
+        }
+    }
+
+    /// Do not construct credential-bearing alternate rows for public sync.
+    Json toPublicJson() const {
+        return serializeConfig(false);
+    }
+
     /// Serialize to JSON
     Json toJson() const {
-        return Json([
+        return serializeConfig(true);
+    }
+
+    private Json serializeConfig(bool internal) const {
+        auto json = Json([
             "id": Json(id.toString()),
             "ipv6Iid": Json(ipv6Iid),
             "name": Json(name),
@@ -232,6 +600,22 @@ struct NetworkConfig {
             "monitoredNicks": serializeToJson(monitoredNicks),
             "services": services.toJson()
         ]);
+        if (internal) {
+            json["bncAlternateServers"] = bncAlternateServersJson();
+            json["bncSelectedServerIndex"] = Json(bncSelectedServerIndex);
+            json["verifyServerCertificates"] = Json(verifyServerCertificates);
+            json["trustedServerFingerprints"] = serializeToJson(trustedServerFingerprints);
+            json["disabledChannels"] = serializeToJson(disabledChannels);
+            json["channelOrder"] = serializeToJson(channelOrder);
+            json["bncPlayback"] = bncPlayback.toJson();
+            json["bncPerformState"] = Json(bncPerformState.to!string);
+            static foreach (field; BNC_CONTROL_NETWORK_FIELDS) {
+                static if (field == "bncChannelKeys" || field == "bncChannelDefaultModes")
+                    json[field] = encodeBncStringMap(__traits(getMember, this, field));
+                else json[field] = serializeToJson(__traits(getMember, this, field));
+            }
+        }
+        return json;
     }
 }
 

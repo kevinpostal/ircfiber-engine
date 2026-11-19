@@ -17,7 +17,7 @@ import ircfiber.storage.redis : RedisStorage;
 import ircfiber.redis.protocol : RedisKeys;
 import ircfiber.db.user : idInFilters;
 import ircfiber.network_write_gate : NetworkWriter, runNetworkWrite, runNetworkMutation,
-    retainNetworkWriteUncertainty, NetworkWriteUnavailableException;
+    runNetworkRedisMutation, retainNetworkWriteUncertainty, NetworkWriteUnavailableException;
 
 version (RoutingPolicyTest) {
     /// Called by the guarded real-Mongo/Redis runner with its explicit URI.
@@ -625,10 +625,8 @@ final class NetworkRepository {
 
     private static Bson saveUpdate(NetworkConfig config, UUID userId) {
         return Bson([
-            "$set": persistedFields(config, userId),
-            "$setOnInsert": Bson([
-                "servicesProvisioningPending": Bson(config.servicesProvisioningPending)
-            ])
+            "$set": persistedFields(config, userId, false),
+            "$setOnInsert": insertOnlyFields(config)
         ]);
     }
 
@@ -652,11 +650,109 @@ final class NetworkRepository {
         return runNetworkMutation(writer, command);
     }
 
-    /// The `$set` document `save` writes: every user/admin-editable field.
-    /// `servicesProvisioningPending` is insert-only (see `save`).
-    /// The immutable `ipv6Iid` is deliberately never written by this path.
-    private static Bson persistedFields(ref NetworkConfig config, UUID userId) {
-        return Bson([
+    private static Bson configField(string field)(const ref NetworkConfig cfg) {
+        auto value = __traits(getMember, cfg, field);
+        static if (field == "bncAlternateServers")
+            return Bson.fromJson(cfg.bncAlternateServersJson());
+        else static if (field == "bncPlayback")
+            return Bson.fromJson(cfg.bncPlayback.toJson());
+        else static if (field == "bncChannelKeys" || field == "bncChannelDefaultModes")
+            return Bson.fromJson(encodeBncStringMap(value));
+        else static if (field == "routing")
+            return cfg.routing.valid ? Bson.fromJson(cfg.routing.toJson()) : Bson(null);
+        else static if (field == "services")
+            return Bson.fromJson(cfg.services.toJson());
+        else static if (is(typeof(value) == enum))
+            return Bson(value.to!string);
+        else static if (is(typeof(value) : const(string)[]))
+            return Bson(value.map!(s => Bson(s)).array);
+        else
+            return serializeToBson(value);
+    }
+
+    private static Bson insertOnlyFields(const ref NetworkConfig config) {
+        auto fields = Bson([
+            "servicesProvisioningPending": Bson(config.servicesProvisioningPending),
+            "bncAlternateServers": configField!"bncAlternateServers"(config),
+            "bncSelectedServerIndex": configField!"bncSelectedServerIndex"(config),
+            "verifyServerCertificates": Bson(config.verifyServerCertificates),
+            "trustedServerFingerprints": configField!"trustedServerFingerprints"(config),
+            "disabledChannels": configField!"disabledChannels"(config),
+            "channelOrder": configField!"channelOrder"(config),
+            "bncPlayback": configField!"bncPlayback"(config),
+            "bncPerformState": configField!"bncPerformState"(config)
+        ]);
+        static foreach (field; BNC_CONTROL_NETWORK_FIELDS) fields[field] = configField!field(config);
+        return fields;
+    }
+
+    private struct ConfigDelta {
+        Bson fields;
+        Bson[] conditions;
+
+        void compare(string field)(const ref NetworkConfig before, const ref NetworkConfig after) {
+            const expected = configField!field(before);
+            const desired = configField!field(after);
+            if (expected != desired) fields[field] = desired;
+            const NetworkConfig defaults;
+            auto equal = Bson([field: Bson(["$eq": expected])]);
+            if (expected == configField!field(defaults))
+                equal = Bson(["$or": Bson([equal, Bson([field: Bson(["$exists": Bson(false)])])])]);
+            conditions ~= equal;
+        }
+    }
+
+    private bool applyOwnedDelta(UUID id, UUID userId, ref NetworkWriter writer, ref ConfigDelta delta,
+            bool* acknowledged = null) {
+        auto selector = Bson(["id": Bson(id.toString()), "userId": Bson(userId.toString())]);
+        if (delta.conditions.length) selector["$and"] = Bson(delta.conditions);
+        if (!delta.fields.length) return true;
+        auto result = updateConfig(selector, Bson(["$set": delta.fields]), writer);
+        if (result["n"].to!double != 1) return false;
+        if (acknowledged !is null) *acknowledged = true;
+        if (cache !is null) runNetworkRedisMutation!void(writer, (db) {
+            db.del(RedisKeys.userNetworks(userId.toString()));
+        });
+        return true;
+    }
+
+    /// Compare the fields used to formulate an owned change, including any
+    /// unchanged members of a compound invariant. Never upsert a changed row.
+    bool updateOwnedFields(fields...)(const ref NetworkConfig before, const ref NetworkConfig after,
+            UUID userId, ref NetworkWriter writer, bool* acknowledged = null) {
+        assert(before.id == after.id && before.id != UUID.init && userId != UUID.init);
+        if (acknowledged !is null) *acknowledged = false;
+        ConfigDelta delta;
+        delta.fields = Bson.emptyObject;
+        static foreach (field; fields) delta.compare!field(before, after);
+        return applyOwnedDelta(before.id, userId, writer, delta, acknowledged);
+    }
+
+    /// Legacy editors submit a delta against their actual input row, not a
+    /// replacement document. Scalar endpoint edits compare the entire ring.
+    bool updateOwnedLegacyConfig(const ref NetworkConfig before, const ref NetworkConfig after,
+            UUID userId, ref NetworkWriter writer) {
+        assert(before.id == after.id && before.id != UUID.init && userId != UUID.init);
+        ConfigDelta delta;
+        delta.fields = Bson.emptyObject;
+        if (before.selectedBncServer != after.selectedBncServer) {
+            static foreach (field; ["host", "port", "tls", "serverPass",
+                    "bncAlternateServers", "bncSelectedServerIndex"])
+                delta.compare!field(before, after);
+        }
+        static foreach (field; ["name", "sasl", "saslUsername", "saslPassword", "operUsername",
+                "operPassword", "nspass", "commands", "autoJoinChannels", "partedChannels",
+                "nick", "realName", "ident", "disabled", "systemManaged", "autoJoinDelaySeconds",
+                "routing", "avatarUrl", "defaultAvatarUrl", "profileMetadata", "monitoredNicks", "services"]) {
+            if (configField!field(before) != configField!field(after)) delta.compare!field(before, after);
+        }
+        return applyOwnedDelta(before.id, userId, writer, delta);
+    }
+
+    /// New fields are included on insert, never on a legacy full-config update.
+    /// The immutable `ipv6Iid` is reserved separately.
+    private static Bson persistedFields(ref NetworkConfig config, UUID userId, bool includeAuxiliary = true) {
+        auto fields = Bson([
             "id": Bson(config.id.toString()),
             "userId": Bson(userId.toString()),
             "name": Bson(config.name),
@@ -686,6 +782,9 @@ final class NetworkRepository {
             "monitoredNicks": Bson(config.monitoredNicks.map!(n => Bson(n)).array),
             "services": Bson.fromJson(config.services.toJson())
         ]);
+        if (includeAuxiliary) foreach (field, value; insertOnlyFields(config).byKeyValue)
+            fields[field] = value;
+        return fields;
     }
 
     /// Decodes a stored `services` value; absent (legacy) or malformed
@@ -832,6 +931,13 @@ final class NetworkRepository {
             try { cfg.nspass = elem["nspass"].get!string; } catch (Exception) {}
             try { cfg.commands = elem["commands"].get!string; } catch (Exception) {}
             try { cfg.serverPass = elem["serverPass"].get!string; } catch (Exception) {}
+            cfg.decodeBncServers(elem["bncAlternateServers"], elem["bncSelectedServerIndex"]);
+            cfg.decodeBncTlsPolicy(elem["verifyServerCertificates"], elem["trustedServerFingerprints"]);
+            cfg.decodeBncChannels(elem["disabledChannels"], elem["channelOrder"]);
+            cfg.bncPlayback = BncPlaybackPolicy.fromJson(elem["bncPlayback"]);
+            if (elem["bncPerformState"].type != Json.Type.undefined)
+                cfg.bncPerformState = elem["bncPerformState"].get!string.to!BncPerformState;
+            static foreach (field; BNC_CONTROL_NETWORK_FIELDS) cfg.decodeBncControlField!field(elem[field]);
             try { cfg.operUsername = elem["operUsername"].get!string; } catch (Exception) {}
             try { cfg.operPassword = elem["operPassword"].get!string; } catch (Exception) {}
             // systemManaged is optional in cached records (added July 2026).
@@ -889,6 +995,13 @@ final class NetworkRepository {
         try { cfg.nspass = doc["nspass"].get!string; } catch (Exception) {}
         try { cfg.commands = doc["commands"].get!string; } catch (Exception) {}
         try { cfg.serverPass = doc["serverPass"].get!string; } catch (Exception) {}
+        cfg.decodeBncServers(doc["bncAlternateServers"].toJson(), doc["bncSelectedServerIndex"].toJson());
+        cfg.decodeBncTlsPolicy(doc["verifyServerCertificates"].toJson(), doc["trustedServerFingerprints"].toJson());
+        cfg.decodeBncChannels(doc["disabledChannels"].toJson(), doc["channelOrder"].toJson());
+        cfg.bncPlayback = BncPlaybackPolicy.fromJson(doc["bncPlayback"].toJson());
+        if (doc["bncPerformState"].type != Bson.Type.undefined)
+            cfg.bncPerformState = doc["bncPerformState"].get!string.to!BncPerformState;
+        static foreach (field; BNC_CONTROL_NETWORK_FIELDS) cfg.decodeBncControlField!field(doc[field].toJson());
         try { cfg.operUsername = doc["operUsername"].get!string; } catch (Exception) {}
         try { cfg.operPassword = doc["operPassword"].get!string; } catch (Exception) {}
         cfg.services = storedServices(doc["services"].toJson(), cfg.id.toString());

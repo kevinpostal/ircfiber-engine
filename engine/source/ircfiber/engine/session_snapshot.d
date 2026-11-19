@@ -173,6 +173,23 @@ struct SessionSnapshot {
     string[] confirmedChannels;
     string[] joinsAwaitingConfirm;
     bool[string] automaticJoins;
+    string[] initialAutomaticJoins;
+    /// Target facts captured at JOIN/PART admission on this retained socket.
+    /// Old snapshots omit these maps and therefore prove no explicit command.
+    struct ChannelIntentState {
+        bool saved, parted, disabled, explicitCommand;
+        string mapping;
+        bool unsaved;
+    }
+    ChannelIntentState[string] pendingJoinIntent, pendingPartIntent;
+    /// Optional user flood bucket, in 1/60000 token units; never reset on transfer.
+    long bncFloodCredit, bncFloodAtMs;
+    uint bncFloodInterval, bncFloodBurst;
+    bool bncFloodInitialized;
+    long registrationStartedAtMs, observed001AtMs, nickRevision;
+    bool initialJoinPending;
+    /// Only actual self-JOINs, not recovery NAMES, arm first-membership modes.
+    string[] firstNamesPending;
     string[] clientReadLines;
     struct OptionalReadState {
         string line;
@@ -354,7 +371,34 @@ Json toJSON(ref SessionSnapshot s) {
     auto automaticJoins = Json.emptyObject;
     foreach (line, retry; s.automaticJoins) automaticJoins[line] = retry;
     j["automaticJoins"] = automaticJoins;
+    Json channelIntentJson(SessionSnapshot.ChannelIntentState[string] intents) {
+        auto value = Json.emptyObject;
+        foreach (target, intent; intents) {
+            auto facts = Json.emptyObject;
+            facts["saved"] = intent.saved;
+            facts["parted"] = intent.parted;
+            facts["disabled"] = intent.disabled;
+            facts["explicitCommand"] = intent.explicitCommand;
+            facts["mapping"] = intent.mapping;
+            facts["unsaved"] = intent.unsaved;
+            value[target] = facts;
+        }
+        return value;
+    }
+    j["pendingJoinIntent"] = channelIntentJson(s.pendingJoinIntent);
+    j["pendingPartIntent"] = channelIntentJson(s.pendingPartIntent);
     j["clientReadLines"] = jsonArrayOf(s.clientReadLines);
+    j["initialAutomaticJoins"] = jsonArrayOf(s.initialAutomaticJoins);
+    j["bncFloodCredit"] = s.bncFloodCredit;
+    j["bncFloodAtMs"] = s.bncFloodAtMs;
+    j["bncFloodInterval"] = s.bncFloodInterval;
+    j["bncFloodBurst"] = s.bncFloodBurst;
+    j["bncFloodInitialized"] = s.bncFloodInitialized;
+    j["registrationStartedAtMs"] = s.registrationStartedAtMs;
+    j["observed001AtMs"] = s.observed001AtMs;
+    j["nickRevision"] = s.nickRevision;
+    j["initialJoinPending"] = s.initialJoinPending;
+    j["firstNamesPending"] = jsonArrayOf(s.firstNamesPending);
     auto reads = Json.emptyArray;
     foreach (read; s.optionalReads) {
         auto v = Json.emptyObject;
@@ -751,6 +795,23 @@ SessionSnapshot fromJSON(Json j) {
     s.metaAtMs = integer(j["metaAtMs"]);
     s.usersDropped = boolean(j["usersDropped"]);
     s.connectedAtMs = integer(j["connectedAtMs"]);
+    s.bncFloodCredit = integer(j["bncFloodCredit"]);
+    s.bncFloodAtMs = integer(j["bncFloodAtMs"]);
+    const interval = integer(j["bncFloodInterval"]), burst = integer(j["bncFloodBurst"]);
+    if (interval < 0 || interval > 60_000 || burst < 0 || burst > 1000
+            || s.bncFloodCredit < 0 || s.bncFloodCredit > 60_000_000 || s.bncFloodAtMs < 0)
+        throw new Exception("Invalid BNC flood bucket");
+    s.bncFloodInterval = cast(uint) interval;
+    s.bncFloodBurst = cast(uint) burst;
+    s.bncFloodInitialized = boolean(j["bncFloodInitialized"]);
+    s.registrationStartedAtMs = integer(j["registrationStartedAtMs"]);
+    s.observed001AtMs = integer(j["observed001AtMs"]);
+    s.nickRevision = integer(j["nickRevision"]);
+    s.initialJoinPending = boolean(j["initialJoinPending"]);
+    if (isArr(j["initialAutomaticJoins"]))
+        foreach (v; j["initialAutomaticJoins"]) s.initialAutomaticJoins ~= str(v);
+    if (isArr(j["firstNamesPending"]))
+        foreach (v; j["firstNamesPending"]) s.firstNamesPending ~= str(v);
     s.ownPrefix = str(j["ownPrefix"]);
     s.servicesAccountState = str(j["servicesAccountState"]);
     s.servicesAccount = str(j["servicesAccount"]);
@@ -850,6 +911,35 @@ SessionSnapshot fromJSON(Json j) {
                 throw new Exception("Invalid automatic JOIN admission");
             s.automaticJoins[line] = retry.get!bool;
         }
+    void readChannelIntents(string field, ref SessionSnapshot.ChannelIntentState[string] intents) {
+        if (j[field].type == Json.Type.undefined) return;
+        if (!isObj(j[field])) throw new Exception("Invalid pending channel intent");
+        foreach (string target, facts; j[field]) {
+            if (intents.length >= 64 || !target.length || target.length > 512 || !isObj(facts)
+                    || facts["saved"].type != Json.Type.bool_ || facts["parted"].type != Json.Type.bool_
+                    || facts["disabled"].type != Json.Type.bool_
+                    || facts["explicitCommand"].type != Json.Type.bool_
+                    || facts["mapping"].type != Json.Type.string)
+                throw new Exception("Invalid pending channel intent");
+            const mapping = facts["mapping"].get!string;
+            if (mapping != "ascii" && mapping != "rfc1459" && mapping != "rfc1459-strict"
+                    && mapping != "strict-rfc1459")
+                throw new Exception("Invalid pending channel casemapping");
+            foreach (c; target)
+                if (c <= ' ' || c == ',' || c == ':' || c == 0x7f)
+                    throw new Exception("Invalid pending channel target");
+            intents[target] = SessionSnapshot.ChannelIntentState(
+                facts["saved"].get!bool, facts["parted"].get!bool, facts["disabled"].get!bool,
+                facts["explicitCommand"].get!bool, mapping);
+            if (facts["unsaved"].type != Json.Type.undefined) {
+                if (facts["unsaved"].type != Json.Type.bool_)
+                    throw new Exception("Invalid pending channel tombstone");
+                intents[target].unsaved = facts["unsaved"].get!bool;
+            }
+        }
+    }
+    readChannelIntents("pendingJoinIntent", s.pendingJoinIntent);
+    readChannelIntents("pendingPartIntent", s.pendingPartIntent);
     if (isArr(j["clientReadLines"]))
         foreach (v; j["clientReadLines"]) s.clientReadLines ~= str(v);
     if (isArr(j["optionalReads"]))
@@ -1076,6 +1166,10 @@ void historySnapshotRegressionChecks() {
     snapshot.historyLastAutomatic = true;
     snapshot.historyDiscoverySeen = ["NewPeer", "OldPeer"];
     snapshot.historyDiscoveryOverlap = true;
+    snapshot.pendingJoinIntent["#case{"] = SessionSnapshot.ChannelIntentState(
+        true, false, true, true, "rfc1459");
+    snapshot.pendingPartIntent["#other"] = SessionSnapshot.ChannelIntentState(
+        true, false, false, true, "ascii");
     // Round-trip actual JSON bytes, not a shared in-memory Json object.
     auto restored = fromJSON(parseJsonString(toJSON(snapshot).toString()));
     assert(restored.historyRecovery == snapshot.historyRecovery);
@@ -1088,6 +1182,18 @@ void historySnapshotRegressionChecks() {
     assert(restored.historyLastAutomatic);
     assert(restored.historyDiscoverySeen == snapshot.historyDiscoverySeen);
     assert(restored.historyDiscoveryOverlap);
+    assert(restored.pendingJoinIntent == snapshot.pendingJoinIntent);
+    assert(restored.pendingPartIntent == snapshot.pendingPartIntent);
+    auto oldIntentJson = Json.emptyObject;
+    oldIntentJson["schemaTag"] = SESSION_SNAPSHOT_SCHEMA;
+    auto oldIntent = fromJSON(oldIntentJson);
+    assert(!oldIntent.pendingJoinIntent.length && !oldIntent.pendingPartIntent.length,
+        "legacy handoff carries no explicit command proof");
+    auto badIntent = toJSON(snapshot);
+    badIntent["pendingJoinIntent"]["#case{"]["explicitCommand"] = "true";
+    bool rejectedIntent;
+    try fromJSON(badIntent); catch (Exception) rejectedIntent = true;
+    assert(rejectedIntent, "mistyped explicit command proof must fail closed");
     assert(toJSON(snapshot)["chathistoryInFlight"].type == Json.Type.undefined);
     // Equal timestamps never reorder or replace opaque msgid boundaries.
     assert(restored.historyPages[0].first.msgid == "opaque-a");

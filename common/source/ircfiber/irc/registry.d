@@ -305,7 +305,7 @@ local old = raw and cjson.decode(raw) or {}
 local proposed = cjson.decode(ARGV[1])
 local same = raw ~= false
 for _, field in ipairs({'serverId','priority','maxConnections','fallbackOnly','bindAddress','port',
-    'routingPolicyVersion','supportedRoutes','ipv6Prefix','draining'}) do
+    'routingPolicyVersion','zncStatusConfigVersion','supportedRoutes','ipv6Prefix','draining'}) do
   if cjson.encode(old[field]) ~= cjson.encode(proposed[field]) then same = false end
 end
 if not same then
@@ -516,7 +516,7 @@ LUA";
         string savedHost;
         if (networkId.length) {
             const cfg = repo.findById(parseUUID(networkId[]));
-            if (cfg.id != UUID.init) savedHost = canonicalHost(cfg.host);
+            if (cfg.id != UUID.init && cfg.hasUpstreamServer()) savedHost = canonicalHost(cfg.host);
         }
         // Explicit host is a validated prospective edit supplied by lifecycle;
         // admin/worker/claim callers omit it to use canonical saved context.
@@ -554,7 +554,7 @@ LUA";
     private bool eligible(const ConnectionServer server, const EffectiveRoutingPolicy effective,
                           ref const CapacityContext ctx) {
         const now = Clock.currTime.toUnixTime!long * 1000;
-        if (!server.serverId.length || !server.isHealthy || !heartbeatFresh(server, now)
+        if ((ctx.networkId.length && !ctx.host.length) || !server.serverId.length || !server.isHealthy || !heartbeatFresh(server, now)
                 || isDraining(server.serverId) || routingTier(server, effective) == size_t.max)
             return false;
         const existing = ctx.networkId in ctx.assignments;
@@ -634,7 +634,7 @@ LUA";
         // Each retry revalidates policy, target health and canonical capacity.
         foreach (attempt; 0 .. 3) {
             const cfg = repo.findById(parseUUID(networkId[]));
-            if (cfg.id == UUID.init || cfg.disabled || cfg.servicesProvisioningPending) return "";
+            if (cfg.id == UUID.init || !cfg.hasUpstreamServer() || cfg.disabled || cfg.servicesProvisioningPending) return "";
             requireRoutingUpgrade(db, targetServerId);
             const policyRaw = db.get(RedisKeys.egressRoutingPolicy());
             const effective = resolveRoutingPolicy(routingPolicyFromJson(parseJsonString(policyRaw)), cfg.host, cfg.routing);
@@ -696,7 +696,7 @@ LUA";
         if (!networkId.length) return "";
         auto repo = new NetworkRepository(redis, writer);
         const cfg = repo.findById(parseUUID(networkId[]));
-        if (cfg.id == UUID.init || cfg.disabled || cfg.servicesProvisioningPending) return "";
+        if (cfg.id == UUID.init || !cfg.hasUpstreamServer() || cfg.disabled || cfg.servicesProvisioningPending) return "";
         requireRoutingUpgrade(db);
         auto owner = getServerForNetwork(networkId);
         if (!owner.length) {
@@ -958,7 +958,7 @@ LUA";
     private bool requestAlternative(string networkId, string owner) {
         if (networkMoveFenced(db, networkId)) return false;
         const cfg = (new NetworkRepository(redis)).findById(parseUUID(networkId[]));
-        if (cfg.id == UUID.init || cfg.disabled || cfg.servicesProvisioningPending) return false;
+        if (cfg.id == UUID.init || !cfg.hasUpstreamServer() || cfg.disabled || cfg.servicesProvisioningPending) return false;
         requireRoutingUpgrade(db);
         const effective = resolveRoutingPolicy(loadRoutingPolicy(db), cfg.host, cfg.routing);
         if (!effective.available || !effective.order.length) return false;

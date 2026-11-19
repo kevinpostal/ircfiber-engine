@@ -243,6 +243,7 @@ NetworkConfig ensureDefaultFiberNetwork(
         const selectedServer = requireDefaultFiberPlacement(cfg, redis, serverRegistry, networkRepo);
         const existingId = cfg.id;
         auto current = networkRepo.findByIdWithIpv6Iid(existingId, writer);
+        const before = current;
         // Deliberately parted defaults stay parted.
         bool[string] have; foreach (c; current.autoJoinChannels) have[c] = true;
         bool[string] parted; foreach (c; current.partedChannels) parted[c] = true;
@@ -250,7 +251,8 @@ NetworkConfig ensureDefaultFiberNetwork(
         foreach (ch; DEFAULT_FIBER_CHANNELS)
             if (ch !in have && ch !in parted) { current.autoJoinChannels ~= ch; added ~= ch; }
         if (added.length) {
-            networkRepo.save(current, user.id, writer);
+            if (!networkRepo.updateOwnedFields!("autoJoinChannels", "partedChannels")(before, current, user.id, writer))
+                throw new NetworkWriteUnavailableException("network_config_changed");
             current = networkRepo.findByIdWithIpv6Iid(current.id, writer);
             const sid = serverRegistry.getServerForNetwork(current.id.toString());
             if (sid.length && selectedServer.length

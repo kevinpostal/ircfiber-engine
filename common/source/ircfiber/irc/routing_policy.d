@@ -244,7 +244,7 @@ private Json scopeToJson(const RoutingPolicyScope settings, bool hostRule) {
     return j;
 }
 
-private bool validRoutingHost(string raw) {
+bool validRoutingHost(string raw) {
     if (raw.length == 0 || raw != raw.strip || raw.length > 254) return false;
     if (isIpLiteral(raw)) return true;
     auto host = raw;

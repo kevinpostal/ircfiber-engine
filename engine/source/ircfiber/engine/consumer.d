@@ -417,6 +417,7 @@ private auto loadCanonicalNetwork(ref EngineContext ctx, UUID id, ref NetworkWri
 }
 
 bool canonicalRoutingParked(ref EngineContext ctx, const NetworkConfig config) {
+    if (!config.hasUpstreamServer()) return true;
     import ircfiber.irc.routing_policy_store : loadEffectiveRoutingPolicy;
     auto effective = loadEffectiveRoutingPolicy(ctx.redis.getDb(), config.host, config.routing);
     return effective.available && effective.order.length == 0;
@@ -509,7 +510,7 @@ private void handleAdmittedControlMessage(ref EngineContext ctx, ControlMessage 
                 auto row = loadCanonicalNetwork(ctx, parseUUID(msg.networkId[]), writer);
                 auto cfg = row.config;
                 import ircfiber.irc.dial_guard : ownsNetworkForDial;
-                if (cfg.disabled || cfg.servicesProvisioningPending
+                if (!cfg.hasUpstreamServer() || cfg.disabled || cfg.servicesProvisioningPending
                         || !ownsNetworkForDial(ctx.redis, ctx.localServer.serverId, msg.networkId)) break;
                 if (ctx.connManager.hasNetwork(cfg.id)) break;
                 if (canonicalRoutingParked(ctx, cfg)) break;
@@ -551,6 +552,9 @@ private void handleAdmittedControlMessage(ref EngineContext ctx, ControlMessage 
             if (msg.networkId.length) {
                 auto id = parseUUID(msg.networkId[]);
                 auto row = ctx.networkRepo.findByIdWithUser(id);
+                if (msg.userId.length && (row.config.id != id
+                        || row.userId.toString() != msg.userId
+                        || (row.config.hasUpstreamServer() && !row.config.disabled))) break;
                 const hadLocalHistory = ctx.connManager.hasNetworkHistory(id);
                 if (hadLocalHistory && !ctx.connManager.stopNetworkForMove(id, 60.seconds, msg.reason)) {
                     retainNetworkWriteUncertainty(writer);
@@ -565,7 +569,7 @@ private void handleAdmittedControlMessage(ref EngineContext ctx, ControlMessage 
                 auto row = loadCanonicalNetwork(ctx, parseUUID(msg.networkId[]), writer);
                 auto cfg = row.config;
                 import ircfiber.irc.dial_guard : ownsNetworkForDial;
-                if (cfg.disabled || cfg.servicesProvisioningPending
+                if (!cfg.hasUpstreamServer() || cfg.disabled || cfg.servicesProvisioningPending
                         || !ownsNetworkForDial(ctx.redis, ctx.localServer.serverId, msg.networkId)) break;
                 auto id = parseUUID(msg.networkId[]);
                 // Registration completes the prior reconnect; the TTL only
@@ -624,7 +628,7 @@ private void handleAdmittedControlMessage(ref EngineContext ctx, ControlMessage 
                 // or tenant transfer. Reload again before creating its successor.
                 row = loadCanonicalNetwork(ctx, id, writer);
                 if (!ownsNetworkForDial(ctx.redis, ctx.localServer.serverId, msg.networkId)) break;
-                if (row.config.disabled || row.config.servicesProvisioningPending) break;
+                if (!row.config.hasUpstreamServer() || row.config.disabled || row.config.servicesProvisioningPending) break;
                 if (canonicalRoutingParked(ctx, row.config)) {
                     finishReconnect(msg.networkId, pendingGeneration);
                     if (hadLocalHistory)
@@ -656,6 +660,26 @@ private void handleAdmittedControlMessage(ref EngineContext ctx, ControlMessage 
                 if (!ownsNetworkForDial(ctx.redis, ctx.localServer.serverId, msg.networkId)) break;
                 auto row = loadCanonicalNetwork(ctx, parseUUID(msg.networkId[]), writer);
                 auto id = row.config.id;
+                // Saved-channel controls refresh an existing client only. A
+                // cold/config-only update must never start or stop a socket.
+                const existingOnly = msg.config.type == Json.Type.object
+                    && msg.config["existingOnly"].type == Json.Type.bool_
+                    && msg.config["existingOnly"].get!bool;
+                if (existingOnly) {
+                    if (ctx.connManager.getOwnerId(id) == row.userId.toString()
+                            && ctx.connManager.getClient(id) !is null)
+                        ctx.connManager.updateConfig(row.config);
+                    break;
+                }
+                if (!row.config.hasUpstreamServer() || row.config.disabled || row.config.servicesProvisioningPending) {
+                    if (ctx.connManager.hasNetworkHistory(id)
+                            && !ctx.connManager.stopNetworkForMove(id, 60.seconds)) {
+                        retainNetworkWriteUncertainty(writer);
+                        throw new Exception("configuration stop source quiescence unproven");
+                    }
+                    publishStoppedNetwork(ctx, row.config, row.userId, "Network stopped");
+                    break;
+                }
                 if (ctx.connManager.getOwnerId(id) != row.userId.toString()) {
                     if (ctx.connManager.hasNetwork(id)
                             && !ctx.connManager.stopNetworkForMove(id, 60.seconds)) {
@@ -663,7 +687,7 @@ private void handleAdmittedControlMessage(ref EngineContext ctx, ControlMessage 
                         throw new Exception("tenant update source quiescence unproven");
                     }
                     row = loadCanonicalNetwork(ctx, id, writer);
-                    if (!row.config.disabled && !row.config.servicesProvisioningPending
+                    if (row.config.hasUpstreamServer() && !row.config.disabled && !row.config.servicesProvisioningPending
                             && ownsNetworkForDial(ctx.redis, ctx.localServer.serverId, msg.networkId))
                         ctx.connManager.addAndStartNetwork(row.config, row.userId);
                 } else ctx.connManager.updateConfig(row.config);
@@ -1188,13 +1212,24 @@ private NetworkConfig parseNetworkConfig(Json j) {
     cfg.autoJoinChannels = deserializeJson!(string[])(j["autoJoinChannels"]);
     if (j["partedChannels"].type != Json.Type.undefined)
         cfg.partedChannels = deserializeJson!(string[])(j["partedChannels"]);
+    cfg.decodeBncChannels(j["disabledChannels"], j["channelOrder"]);
+    import ircfiber.models.network : BncPlaybackPolicy;
+    cfg.bncPlayback = BncPlaybackPolicy.fromJson(j["bncPlayback"]);
     cfg.nick = j["nick"].get!string;
     if (j["realName"].type != Json.Type.undefined) cfg.realName = j["realName"].get!string;
     else cfg.realName = cfg.nick;
     if (j["ident"].type != Json.Type.undefined) cfg.ident = sanitizeIdent(j["ident"].get!string);
     if (j["nspass"].type != Json.Type.undefined) cfg.nspass = j["nspass"].get!string;
     if (j["commands"].type != Json.Type.undefined) cfg.commands = j["commands"].get!string;
+    if (j["bncPerformState"].type != Json.Type.undefined) {
+        import ircfiber.models.network : BncPerformState;
+        cfg.bncPerformState = j["bncPerformState"].get!string.to!BncPerformState;
+    }
+    import ircfiber.models.network : BNC_CONTROL_NETWORK_FIELDS;
+    static foreach (field; BNC_CONTROL_NETWORK_FIELDS) cfg.decodeBncControlField!field(j[field]);
     if (j["serverPass"].type != Json.Type.undefined) cfg.serverPass = j["serverPass"].get!string;
+    cfg.decodeBncServers(j["bncAlternateServers"], j["bncSelectedServerIndex"]);
+    cfg.decodeBncTlsPolicy(j["verifyServerCertificates"], j["trustedServerFingerprints"]);
     if (j["operUsername"].type != Json.Type.undefined) cfg.operUsername = j["operUsername"].get!string;
     if (j["operPassword"].type != Json.Type.undefined) cfg.operPassword = j["operPassword"].get!string;
     // Full control configs carry routing just like the canonical Mongo/cache
@@ -1221,6 +1256,36 @@ private NetworkConfig parseNetworkConfig(Json j) {
     cfg.services = decodeStoredServicesConfig(j["services"], servicesError);
     if (servicesError.length) logWarn("Invalid services config in engine control; trust cleared");
     return cfg;
+}
+
+@("engine control: ordered endpoints and serverless rows round-trip") unittest {
+    import ircfiber.models.network : BncServerEndpoint;
+    NetworkConfig original;
+    const servers = [
+        BncServerEndpoint("one.example.org", 6667, TLSMode.disabled, "scratch-one"),
+        BncServerEndpoint("two.example.org", 6697, TLSMode.required, "scratch-two")];
+    original.selectBncServer(servers, 1);
+    auto decoded = parseNetworkConfig(original.toJson());
+    assert(decoded.bncSelectedServerIndex == 1);
+    assert(decoded.bncServers() == servers);
+    original.selectBncServer(null, 0);
+    decoded = parseNetworkConfig(original.toJson());
+    assert(!decoded.hasUpstreamServer() && decoded.bncServers().length == 0);
+}
+
+@("engine control: saved-channel suppression and order round-trip") unittest {
+    NetworkConfig original;
+    original.autoJoinChannels = ["#one", "#two"];
+    original.disabledChannels = ["#two"];
+    original.channelOrder = ["#two", "#one"];
+    auto decoded = parseNetworkConfig(original.toJson());
+    assert(decoded.disabledChannels == original.disabledChannels);
+    assert(decoded.channelOrder == original.channelOrder);
+    auto legacy = original.toJson();
+    legacy["disabledChannels"] = Json.init;
+    legacy["channelOrder"] = Json.init;
+    decoded = parseNetworkConfig(legacy);
+    assert(!decoded.disabledChannels.length && !decoded.channelOrder.length);
 }
 
 @("engine control: routing round trips complete orders and malformed saved preferences stay blocked")

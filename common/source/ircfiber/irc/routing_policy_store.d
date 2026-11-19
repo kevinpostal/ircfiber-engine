@@ -85,6 +85,15 @@ bool routingEnginesPolicyAware(RedisDatabase db) {
     } catch (Exception) { return false; }
 }
 
+/// Same complete fleet coverage as routing policy, including orphan hashes.
+bool zncStatusEnginesConfigAware(RedisDatabase db) {
+    try {
+        auto reply = db.eval!string(ZNC_ENGINE_GATE_SCRIPT,
+            [RedisKeys.serverList()], [RedisKeys.server("")]);
+        return !reply.empty && reply.front == "1";
+    } catch (Exception) { return false; }
+}
+
 /// The policy must already be explicitly seeded by the controlled migration.
 /// Revision and rollback activation are committed together, with no TTL.
 RoutingPolicyDocument saveRoutingPolicy(RedisDatabase db, long expectedRevision,
@@ -162,7 +171,8 @@ private RoutingPolicyDocument saveValidatedRoutingPolicy(RedisDatabase db, long 
 }
 
 private enum ENGINE_GATE_FUNCTION = q"LUA
-local function enginesAware(setKey, prefix)
+local function enginesAware(setKey, prefix, field)
+  field = field or 'routingPolicyVersion'
   local ids = {}
   for _, id in ipairs(redis.call('SMEMBERS', setKey)) do ids[id] = true end
   local cursor = '0'
@@ -175,10 +185,14 @@ local function enginesAware(setKey, prefix)
     local raw = redis.call('HGET', prefix .. id, 'data')
     if not raw then return false end
     local ok, metadata = pcall(cjson.decode, raw)
-    if not ok or type(metadata) ~= 'table' or metadata.routingPolicyVersion ~= 1 then return false end
+    if not ok or type(metadata) ~= 'table' or metadata[field] ~= 1 then return false end
   end
   return true
 end
+LUA";
+
+private enum ZNC_ENGINE_GATE_SCRIPT = ENGINE_GATE_FUNCTION ~ q"LUA
+if enginesAware(KEYS[1], ARGV[1], 'zncStatusConfigVersion') then return '1' else return '0' end
 LUA";
 
 private enum ENGINE_GATE_SCRIPT = ENGINE_GATE_FUNCTION ~ q"LUA

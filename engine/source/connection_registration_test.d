@@ -1,5 +1,5 @@
 /// Connection lifecycle and protocol regressions, including JOIN throttling,
-/// roster convergence, identity enrichment, services and history handoff.
+/// saved-channel suppression, roster convergence, services and history handoff.
 /// Run with `dub run --config=connection-registration-test --compiler=ldc2`.
 module connection_registration_test;
 
@@ -13,9 +13,10 @@ import ircfiber.irc.connection : parseJoinThrottleSeconds, remainingJoinDelayMs,
     memberNeedsRealname, channelNeedsRealnameWho, MAX_WHO_ENRICH_ATTEMPTS,
     upsertRosterEntry, applyNamesBurst, isSaslRequiredRefusal, extractServerReason,
     saslMechanismOffered, fiberMlsBackstopChecks, fiberMlsWireChecks, servicesIdentityWireChecks,
-    ircv3ProtocolChecks, silentTransportRouteChecks, slowdownWireChecks;
+    ircv3ProtocolChecks, silentTransportRouteChecks, slowdownWireChecks,
+    holderCertificateRegistrationChecks;
 import ircfiber.engine.session_snapshot : historySnapshotRegressionChecks;
-import ircfiber.engine.processor : historyCheckpointRegressionChecks;
+import ircfiber.engine.processor : historyCheckpointRegressionChecks, channelIntentRegressionChecks;
 import ircfiber.irc.bnc_ownership : runBncOwnershipProtocolChecks;
 import std.string : indexOf;
 
@@ -267,12 +268,15 @@ void main() {
     foreach (check; ircv3ProtocolChecks(ircv3Wire)) ok(check.name, check.passed);
     foreach (line; ircv3Wire) stderr.writeln("    wire> ", line);
     foreach (check; silentTransportRouteChecks()) ok(check.name, check.passed);
-    stderr.writeln("\n[connection.slowdown] shared admission and confirmed JOINs");
+    stderr.writeln("\n[connection.tls] holder capability and registration gate");
+    foreach (check; holderCertificateRegistrationChecks()) ok(check.name, check.passed);
+    stderr.writeln("\n[connection.slowdown] shared admission, channel suppression and confirmed JOINs");
     string[] slowdownWire;
     foreach (check; slowdownWireChecks(slowdownWire)) ok(check.name, check.passed);
     foreach (line; slowdownWire) stderr.writeln("    wire> ", line);
     historySnapshotRegressionChecks();
     historyCheckpointRegressionChecks();
+    channelIntentRegressionChecks();
     runBncOwnershipProtocolChecks();
     stderr.writeln("\n[", passed, " passed, ", failed, " failed]");
     if (failed > 0) core.stdc.stdlib.exit(1);

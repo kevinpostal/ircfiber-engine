@@ -14,6 +14,7 @@ import std.array : Appender, appender;
 import std.string : indexOf, strip;
 import vibe.data.json : Json, parseJsonString;
 import ircfiber.redis.protocol : TlsInfo;
+import ircfiber.models.network : decodeServerCertificatePolicy, isCanonicalServerFingerprint;
 
 /// Protocol version carried in `HELLO` and `STATUS`.
 enum int PROTO_VERSION = 1;
@@ -62,7 +63,7 @@ enum size_t MAX_INVENTORY_BYTES = 64 << 10;
 enum size_t MAX_INVENTORY_ROWS = 128;
 enum size_t MAX_TOMBSTONES = 4096;
 enum string[] HOLDER_CAPABILITIES =
-    ["inventory_v1", "gap_ack_v1", "bounded_meta_v1", "independent_pong_v1"];
+    ["inventory_v1", "gap_ack_v1", "bounded_meta_v1", "independent_pong_v1", "tls_leaf_sha256_v1"];
 /// Wire message the holder sends upstream when the engine never came back.
 enum string QUIT_ENGINE_UNAVAILABLE          = "engine unavailable";
 enum string QUIT_ENGINE_UNAVAILABLE_OVERFLOW = "engine unavailable (buffer overflow)";
@@ -141,6 +142,8 @@ struct DialRequest {
     /// "none" | "implicit" | "starttls"
     string tls = "none";
     string sni;
+    bool verifyServerCertificates;
+    string[] trustedServerFingerprints;
     bool hasProxy;
     ProxySpec proxy;
     string bindIp6;
@@ -160,12 +163,19 @@ struct DialRequest {
         const port = jlong(j, "port");
         if (port <= 0 || port > 65_535) throw new Exception("DIAL: port out of range");
         r.port = cast(ushort) port;
+        if (j["tls"].type != Json.Type.undefined && j["tls"].type != Json.Type.string)
+            throw new Exception("DIAL: tls must be none|implicit|starttls");
         r.tls = jstr(j, "tls");
         if (r.tls.length == 0) r.tls = "none";
         if (r.tls != "none" && r.tls != "implicit" && r.tls != "starttls")
             throw new Exception("DIAL: tls must be none|implicit|starttls");
         r.sni = jstr(j, "sni");
         if (r.sni.length == 0) r.sni = r.host;
+        decodeServerCertificatePolicy(j["verifyServerCertificates"],
+            j["trustedServerFingerprints"], r.verifyServerCertificates, r.trustedServerFingerprints);
+        if (r.tls == "none" && (j["verifyServerCertificates"].type != Json.Type.undefined
+                || j["trustedServerFingerprints"].type != Json.Type.undefined))
+            throw new Exception("DIAL: TLS policy fields require TLS");
         auto p = j["proxy"];
         if (p.type == Json.Type.object) {
             r.hasProxy = true;
@@ -196,6 +206,19 @@ struct DialRequest {
     /// Also used by in-process callers, so bypassing JSON cannot relax the
     /// native tier's family/bind/proxy contract.
     void validateTransport() const {
+        if (tls != "none" && tls != "implicit" && tls != "starttls")
+            throw new Exception("DIAL: tls must be none|implicit|starttls");
+        if (trustedServerFingerprints.length && !verifyServerCertificates)
+            throw new Exception("DIAL: fingerprints require certificate verification");
+        if (tls == "none" && (verifyServerCertificates || trustedServerFingerprints.length))
+            throw new Exception("DIAL: TLS policy fields require TLS");
+        foreach (pin; trustedServerFingerprints)
+            if (!isCanonicalServerFingerprint(pin))
+                throw new Exception("DIAL: malformed canonical SHA-256 fingerprint");
+        if (verifyServerCertificates) {
+            if (!host.length || host.indexOf('\0') >= 0 || host.indexOf('\r') >= 0 || host.indexOf('\n') >= 0)
+                throw new Exception("DIAL: invalid certificate verification host");
+        }
         if (addressFamily != "any" && addressFamily != "ipv6")
             throw new Exception("DIAL: addressFamily must be any|ipv6");
         if (addressFamily == "ipv6") {
@@ -214,6 +237,12 @@ struct DialRequest {
         j["port"] = cast(int) port;
         j["tls"] = tls;
         j["sni"] = sni;
+        if (verifyServerCertificates) {
+            j["verifyServerCertificates"] = true;
+            auto pins = Json.emptyArray;
+            foreach (pin; trustedServerFingerprints) pins ~= Json(pin);
+            j["trustedServerFingerprints"] = pins;
+        }
         if (hasProxy) {
             auto p = Json.emptyObject;
             p["host"] = proxy.host;
@@ -424,6 +453,7 @@ struct ConnectedLine {
     long connectedAtMs;
     TlsInfoJson tls;
     string instance;
+    bool tlsVerified;
 
     Json toJson() const {
         auto j = Json.emptyObject;
@@ -435,6 +465,7 @@ struct ConnectedLine {
         j["localPort"] = cast(int) localPort;
         j["connectedAtMs"] = connectedAtMs;
         j["tls"] = tls.toJson();
+        j["tlsVerified"] = tlsVerified;
         return j;
     }
 
@@ -448,6 +479,12 @@ struct ConnectedLine {
         c.connectedAtMs = jlong(j, "connectedAtMs");
         c.tls = TlsInfoJson.fromJson(j["tls"]);
         c.instance = jstr(j, "instance");
+        auto verified = j["tlsVerified"];
+        if (verified.type != Json.Type.undefined) {
+            if (verified.type != Json.Type.bool_)
+                throw new Exception("CONNECTED: tlsVerified must be boolean");
+            c.tlsVerified = verified.get!bool;
+        }
         return c;
     }
 }
@@ -458,16 +495,19 @@ struct FailedLine {
     /// "tcp" | "socks5" | "tls" | "starttls"
     string phase;
     string reason;
+    /// True only for positively completed DNS/TCP failures, never generic errors.
+    bool terminalDnsTcp;
 
     Json toJson() const {
         auto j = Json.emptyObject;
         j["phase"] = phase;
         j["reason"] = reason;
+        if (terminalDnsTcp) j["terminalDnsTcp"] = true;
         return j;
     }
 
     static FailedLine fromJson(Json j) {
-        return FailedLine(jstr(j, "phase"), jstr(j, "reason"));
+        return FailedLine(jstr(j, "phase"), jstr(j, "reason"), jbool(j, "terminalDnsTcp"));
     }
 }
 
@@ -898,6 +938,14 @@ unittest {
     back = DialRequest.fromJson(parseJsonString(r.toJson().toString()));
     assert(back == r);
     assert(r.toJson()["proxy"].type == Json.Type.null_);
+}
+
+@("FAILED terminal proof is explicit, never inferred from a TCP phase") unittest {
+    auto generic = FailedLine("tcp", "fixture");
+    assert(!FailedLine.fromJson(generic.toJson()).terminalDnsTcp);
+    auto terminal = FailedLine("tcp", "fixture", true);
+    assert(FailedLine.fromJson(terminal.toJson()).terminalDnsTcp);
+    assert(!FailedLine.fromJson(parseJsonString(`{"phase":"dns","reason":"fixture"}`)).terminalDnsTcp);
 }
 
 @("DialRequest applies defaults and validates")

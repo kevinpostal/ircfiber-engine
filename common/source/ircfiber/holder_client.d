@@ -74,6 +74,8 @@ class HolderErrorException : Exception {
 class DialFailedException : Exception {
     /// `dns` | `tcp` | `socks5` | `tls` | `starttls` | `holder`.
     string phase;
+    /// Positive terminal proof from the holder; absent/old responses are false.
+    bool terminalDnsTcp;
     this(string phase, string reason, string file = __FILE__, size_t line = __LINE__) {
         super(reason, file, line);
         this.phase = phase;
@@ -124,6 +126,8 @@ struct DialRequest {
     /// `none` | `implicit` | `starttls`.
     string tls = "implicit";
     string sni;
+    bool verifyServerCertificates;
+    string[] trustedServerFingerprints;
     bool hasProxy;
     DialProxy proxy;
     /// Actual requested source bind, never evidence of the socket's source.
@@ -134,6 +138,14 @@ struct DialRequest {
     string addressFamily = "any";
 
     void validate() const {
+        if (trustedServerFingerprints.length && !verifyServerCertificates)
+            throw new HolderErrorException("bad_request", "certificate pins require verification");
+        if (tls == "none" && (verifyServerCertificates || trustedServerFingerprints.length))
+            throw new HolderErrorException("bad_request", "certificate verification requires TLS");
+        import ircfiber.models.network : isCanonicalServerFingerprint;
+        foreach (pin; trustedServerFingerprints)
+            if (!isCanonicalServerFingerprint(pin))
+                throw new HolderErrorException("bad_request", "invalid server certificate fingerprint");
         if (addressFamily != "any" && addressFamily != "ipv6")
             throw new HolderErrorException("bad_request", "unknown addressFamily");
         if (addressFamily == "ipv6") {
@@ -163,6 +175,12 @@ struct DialRequest {
         j["port"] = cast(int) port;
         j["tls"] = tls;
         j["sni"] = sni;
+        if (tls != "none" && verifyServerCertificates) {
+            j["verifyServerCertificates"] = true;
+            import vibe.data.json : serializeToJson;
+            j["trustedServerFingerprints"] = trustedServerFingerprints.length
+                ? trustedServerFingerprints.serializeToJson() : Json.emptyArray;
+        }
         if (hasProxy) {
             auto p = Json.emptyObject;
             p["host"] = proxy.host;
@@ -234,6 +252,8 @@ struct HolderEntry {
     string host;
     ushort port;
     bool tlsOk;
+    /// "tls"/"none" only when the holder explicitly reported tls.ok.
+    string observedTls;
     TlsInfo tls;
     string peerIp;
     string localIp;
@@ -263,6 +283,8 @@ struct HolderEntry {
         e.host = jsonStr(j, "host");
         e.port = cast(ushort) jsonLong(j, "port");
         e.tlsOk = parseTls(j["tls"], e.tls);
+        if (j["tls"].type == Json.Type.object && j["tls"]["ok"].type == Json.Type.bool_)
+            e.observedTls = j["tls"]["ok"].get!bool ? "tls" : "none";
         e.peerIp = jsonStr(j, "peerIp");
         e.localIp = jsonStr(j, "localIp");
         e.connectedAtMs = jsonLong(j, "connectedAtMs");
@@ -300,6 +322,7 @@ struct HolderEntry {
         e.attached = attached;
         e.port = port;
         e.tlsOk = tlsOk;
+        e.observedTls = observedTls;
         e.tls.version_ = tls.version_.idup;
         e.tls.cipher = tls.cipher.idup;
         e.tls.certCn = tls.certCn.idup;
@@ -699,6 +722,7 @@ final class HolderClient {
         bool booted;
         string currentInstance;
         bool inventoryCapable;
+        bool tlsLeafSha256Capable;
         // Identity/state only. Never retain a META tree between observations.
         DialTag[string] knownTags;
     }
@@ -789,10 +813,21 @@ final class HolderClient {
     @property bool controlAlive() const { return controlUp; }
     @property string instance() const { return currentInstance; }
 
-    private void observeIdentity(Json payload) {
+    private void observeIdentity(Json payload, bool hello = false) {
         const observed = jsonStr(payload, "instance");
-        if (observed != currentInstance) knownTags = null;
+        if (observed != currentInstance) {
+            knownTags = null;
+            tlsLeafSha256Capable = false;
+        }
         currentInstance = observed;
+        if (hello) {
+            tlsLeafSha256Capable = false;
+            if (observed.length && payload["capabilities"].type == Json.Type.array)
+                foreach (capability; payload["capabilities"])
+                    if (capability.type == Json.Type.string
+                            && capability.get!string == "tls_leaf_sha256_v1")
+                        tlsLeafSha256Capable = true;
+        }
         inventoryCapable = false;
         if (payload["capabilities"].type == Json.Type.array)
             foreach (capability; payload["capabilities"])
@@ -818,7 +853,7 @@ final class HolderClient {
         auto ok = readIpcResponse!Json(c, deadline, HOLDER_MAX_RESPONSE);
         if (jsonLong(ok, "proto") != HOLDER_PROTO)
             throw new HolderErrorException("proto", "holder speaks proto " ~ jsonLong(ok, "proto").to!string);
-        observeIdentity(ok);
+        observeIdentity(ok, true);
         control = c;
         controlUp = true;
         logJsonMap("info", "holder", "Holder control session up",
@@ -1107,6 +1142,9 @@ final class HolderClient {
         auto requestPayload = req.toJson(token);
         if (req.addressFamily == "ipv6" && !status().supportsFamily("ipv6"))
             throw new DialFailedException("holder", "holder lacks IPv6-only dial capability");
+        if (req.verifyServerCertificates
+                && (!controlUp || !tlsLeafSha256Capable || !currentInstance.length))
+            throw new DialFailedException("tls", "holder lacks certificate verification capability");
         const dialIncarnation = currentInstance;
         auto c = open(OPEN_TIMEOUT);
         bool keep;
@@ -1116,6 +1154,8 @@ final class HolderClient {
         if (beforeSend !is null) beforeSend();
         if (currentInstance != dialIncarnation)
             throw new HolderErrorException("incarnation_changed", "holder changed before DIAL; request was not sent");
+        if (req.verifyServerCertificates && (!controlUp || !tlsLeafSha256Capable))
+            throw new DialFailedException("tls", "holder verification capability changed before DIAL");
         try {
             writeLine(c, "DIAL " ~ requestPayload.toString());
         } catch (Exception e) {
@@ -1152,7 +1192,7 @@ final class HolderClient {
                     DialResult r;
                     r.stream = c;
                     r.instance = jsonStr(payload, "instance");
-                    if (!r.instance.length) r.instance = currentInstance;
+                    if (!r.instance.length && !req.verifyServerCertificates) r.instance = currentInstance;
                     r.id = jsonStr(payload, "id");
                     r.peerIp = jsonStr(payload, "peerIp");
                     r.localIp = jsonStr(payload, "localIp");
@@ -1160,13 +1200,39 @@ final class HolderClient {
                     r.localPort = cast(ushort) jsonLong(payload, "localPort");
                     r.connectedAtMs = jsonLong(payload, "connectedAtMs");
                     r.tlsOk = parseTls(payload["tls"], r.tls);
+                    if (req.verifyServerCertificates
+                            && (payload["tlsVerified"].type != Json.Type.bool_
+                                || !payload["tlsVerified"].get!bool || !r.tlsOk
+                                || !r.id.length || !r.instance.length
+                                || r.instance != dialIncarnation
+                                || currentInstance != dialIncarnation
+                                || !controlUp || !tlsLeafSha256Capable)) {
+                        // Never register on an unattested stream. Closing the
+                        // relay alone only detaches it: also close the exact
+                        // candidate if current holder identity can prove it.
+                        closeQuietly(c);
+                        try {
+                            if (r.id.length) {
+                                auto candidate = infoIdentity(r.id);
+                                if (candidate.instance == dialIncarnation
+                                        && candidate.tag.networkId == req.tag.networkId)
+                                    closeClaim(candidate.id, candidate.instance, candidate.connectedAtMs);
+                            }
+                        } catch (Exception) {}
+                        // Preserve DIAL uncertainty if closure cannot be proven.
+                        throw new DialFailedException("holder", "holder CONNECTED lacks bound TLS verification proof");
+                    }
                     if (r.id.length == 0) throw new HolderUnavailableException("holder CONNECTED without id");
                     if (inventoryCapable && knownTags.length < 65536) knownTags[r.id] = req.tag;
                     c.readTimeout = Duration.max;
                     keep = true;
                     return r;
-                case "FAILED":
-                    throw new DialFailedException(jsonStr(payload, "phase"), jsonStr(payload, "reason"));
+                case "FAILED": {
+                    auto failed = new DialFailedException(jsonStr(payload, "phase"), jsonStr(payload, "reason"));
+                    failed.terminalDnsTcp = jsonBool(payload, "terminalDnsTcp")
+                        && (failed.phase == "dns" || failed.phase == "tcp");
+                    throw failed;
+                }
                 case "ERR":
                     throw new HolderErrorException(jsonStr(payload, "code"), jsonStr(payload, "msg"));
                 default:

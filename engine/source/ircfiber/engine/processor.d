@@ -9,7 +9,8 @@ import vibe.core.log;
 import std.uuid : UUID, parseUUID;
 
 import ircfiber.models.irc_event : IRCRawEvent;
-import ircfiber.models.network : Network, normalizeChannelName;
+import ircfiber.models.network : Network, NetworkConfig, normalizeChannelName,
+    ircCaseMapping, ircCaseEquals;
 import ircfiber.engine.bootstrap : EngineContext;
 import ircfiber.engine.state : writeStateSnapshotForNetwork;
 import ircfiber.redis.protocol : RedisKeys, StateTTL;
@@ -129,6 +130,304 @@ private string historyCheckpointField(string target, string[string] isupport) {
 private bool isHistorical(ref const IRCRawEvent event) {
     return event.getTag("batch") == "chathistory";
 }
+
+private struct ChannelIntentEvidence {
+    bool captured, saved, parted, disabled, unsaved, explicitJoin;
+    string caseMapping;
+
+    static ChannelIntentEvidence fromEvent(const ref IRCRawEvent ev) {
+        return ChannelIntentEvidence(ev.channelIntentCaptured, ev.channelIntentSaved,
+            ev.channelIntentParted, ev.channelIntentDisabled, ev.channelIntentUnsaved,
+            ev.channelIntentExplicit,
+            ev.channelIntentCaseMapping);
+    }
+}
+
+/// A delayed event owns only this channel's intent, never a runtime list.
+/// Reject stale target facts before deriving a delta from the canonical row;
+/// the repository CAS then fences concurrent edits to the compound lists.
+private bool applyChannelIntentDelta(ref NetworkConfig cfg, ChannelIntentEvidence intent,
+        string action, string channel, string renamed) {
+    import std.algorithm : canFind, filter;
+    import std.array : array;
+    const mapping = ircCaseMapping(intent.caseMapping);
+    const key = normalizeChannelName(channel);
+    const replacement = normalizeChannelName(renamed);
+    bool same(string a, string b) { return ircCaseEquals(a, b, mapping); }
+    if (!intent.captured || !key.length
+            || cfg.autoJoinChannels.canFind!(c => same(c, key)) != intent.saved
+            || cfg.partedChannels.canFind!(c => same(c, key)) != intent.parted
+            || cfg.disabledChannels.canFind!(c => same(c, key)) != intent.disabled
+            || cfg.bncUnsavedChannels.canFind!(c => same(c, key)) != intent.unsaved)
+        return false;
+    if (action == "RENAME") {
+        if (!replacement.length) return false;
+        const sameTarget = same(key, replacement);
+        bool destinationIn(string[] entries) {
+            return !sameTarget && entries.canFind!(c => same(c, replacement));
+        }
+        // A rename cannot merge an independently configured target or undo its
+        // deletion. Leave newer definitions untouched rather than guessing.
+        if (destinationIn(cfg.autoJoinChannels) || destinationIn(cfg.partedChannels)
+                || destinationIn(cfg.disabledChannels) || destinationIn(cfg.channelOrder)
+                || destinationIn(cfg.bncUnsavedChannels))
+            return false;
+        bool safeMap(string[string] values) {
+            bool found;
+            string previous;
+            foreach (name, value; values) {
+                if (same(name, key)) {
+                    if (found && previous != value) return false;
+                    found = true;
+                    previous = value;
+                } else if (!sameTarget && same(name, replacement)) return false;
+            }
+            return true;
+        }
+        if (!safeMap(cfg.bncChannelKeys) || !safeMap(cfg.bncChannelDefaultModes)
+                || (intent.unsaved && (intent.saved || intent.parted)))
+            return false;
+        void renameEntries(ref string[] entries) {
+            size_t matches;
+            bool changed;
+            foreach (c; entries) if (same(c, key)) {
+                ++matches;
+                changed = changed || c != replacement;
+            }
+            if (!matches || (!changed && matches == 1)) return;
+            auto result = entries.dup;
+            size_t keep;
+            bool replaced;
+            foreach (c; entries) {
+                if (same(c, key)) {
+                    if (replaced) continue;
+                    replaced = true;
+                    result[keep++] = replacement;
+                } else result[keep++] = c;
+            }
+            entries = result[0 .. keep];
+        }
+        void renameMap(ref string[string] values) {
+            size_t matches;
+            string sourceName, value;
+            foreach (name, stored; values) if (same(name, key)) {
+                ++matches;
+                sourceName = name;
+                value = stored;
+            }
+            if (!matches || (matches == 1 && sourceName == replacement)) return;
+            const original = values;
+            values = values.dup;
+            foreach (name, stored; original) if (same(name, key)) values.remove(name);
+            values[replacement] = value;
+        }
+        renameEntries(cfg.autoJoinChannels);
+        renameEntries(cfg.partedChannels);
+        renameEntries(cfg.disabledChannels);
+        renameEntries(cfg.channelOrder);
+        renameMap(cfg.bncChannelKeys);
+        renameMap(cfg.bncChannelDefaultModes);
+        // Keep the old name fenced against delayed membership events. Unsaved
+        // runtime membership stays unsaved at its new name as well.
+        if (!sameTarget && !intent.unsaved)
+            cfg.bncUnsavedChannels = cfg.bncUnsavedChannels ~ key;
+        if (intent.unsaved && !sameTarget)
+            cfg.bncUnsavedChannels = cfg.bncUnsavedChannels ~ replacement;
+    } else if (action == "JOIN") {
+        // Only a positively admitted successful manual JOIN can clear saved
+        // suppression. Admission evidence must still match the canonical row.
+        if (!intent.explicitJoin && (intent.disabled || intent.unsaved)) return false;
+        if (!cfg.autoJoinChannels.canFind!(c => same(c, key)))
+            cfg.autoJoinChannels = cfg.autoJoinChannels ~ key;
+        if (intent.parted)
+            cfg.partedChannels = cfg.partedChannels.filter!(c => !same(c, key)).array;
+        if (intent.explicitJoin && intent.disabled)
+            cfg.disabledChannels = cfg.disabledChannels.filter!(c => !same(c, key)).array;
+        if (intent.explicitJoin && intent.unsaved)
+            cfg.bncUnsavedChannels = cfg.bncUnsavedChannels.filter!(c => !same(c, key)).array;
+    } else {
+        // PART, KICK and JOIN refusal are not evidence of a saved definition.
+        if (intent.unsaved) return false;
+        if (intent.saved)
+            cfg.autoJoinChannels = cfg.autoJoinChannels.filter!(c => !same(c, key)).array;
+        if (!cfg.partedChannels.canFind!(c => same(c, key)))
+            cfg.partedChannels = cfg.partedChannels ~ key;
+    }
+    return true;
+}
+
+private bool applyChannelIntentDelta(ref NetworkConfig cfg, const ref IRCRawEvent event,
+        string action, string channel, string renamed) {
+    return applyChannelIntentDelta(cfg, ChannelIntentEvidence.fromEvent(event), action, channel, renamed);
+}
+
+/// Invoked by the registration runner as well as unittest builds.
+void channelIntentRegressionChecks() {
+    IRCRawEvent joined;
+    joined.channelIntentCaptured = true;
+    joined.channelIntentSaved = true;
+    joined.channelIntentDisabled = true;
+    joined.channelIntentExplicit = true;
+    joined.channelIntentCaseMapping = "rfc1459";
+    NetworkConfig cfg;
+    cfg.autoJoinChannels = ["#room[", "#other"];
+    cfg.disabledChannels = ["#ROOM{"];
+    cfg.channelOrder = ["#other", "#room["];
+    assert(applyChannelIntentDelta(cfg, joined, "JOIN", "#ROOM{", ""));
+    assert(cfg.autoJoinChannels == ["#room[", "#other"]);
+    assert(!cfg.disabledChannels.length && !cfg.partedChannels.length);
+    assert(cfg.channelOrder == ["#other", "#room["]);
+
+    auto automatic = joined;
+    automatic.channelIntentExplicit = false;
+    automatic.channelIntentDisabled = false;
+    cfg.disabledChannels = ["#room["];
+    const beforeStale = cfg;
+    assert(!applyChannelIntentDelta(cfg, automatic, "JOIN", "#room{", ""));
+    assert(cfg.autoJoinChannels == beforeStale.autoJoinChannels
+        && cfg.disabledChannels == beforeStale.disabledChannels
+        && cfg.channelOrder == beforeStale.channelOrder);
+    automatic.channelIntentDisabled = true;
+    assert(!applyChannelIntentDelta(cfg, automatic, "JOIN", "#room{", ""),
+        "unsolicited JOIN is not manual proof to clear suppression");
+
+    auto renamed = joined;
+    assert(applyChannelIntentDelta(cfg, renamed, "RENAME", "#ROOM{", "#new"));
+    assert(cfg.autoJoinChannels == ["#new", "#other"]);
+    assert(cfg.disabledChannels == ["#new"]);
+    assert(cfg.channelOrder == ["#other", "#new"]);
+    auto refused = joined;
+    assert(applyChannelIntentDelta(cfg, refused, "PART", "#new", ""));
+    assert(cfg.autoJoinChannels == ["#other"] && cfg.partedChannels == ["#new"]);
+    assert(cfg.disabledChannels == ["#new"],
+        "refusal/PART/KICK are inactive membership, not enable/disable changes");
+    assert(!applyChannelIntentDelta(cfg, refused, "PART", "#new", ""),
+        "an old duplicate cannot retire newer/different target intent");
+
+    auto asciiEvent = automatic;
+    asciiEvent.channelIntentCaseMapping = "ascii";
+    asciiEvent.channelIntentDisabled = false;
+    cfg = NetworkConfig.init;
+    cfg.autoJoinChannels = ["#room["];
+    cfg.disabledChannels = ["#room{"];
+    assert(applyChannelIntentDelta(cfg, asciiEvent, "PART", "#ROOM[", ""));
+    assert(!cfg.autoJoinChannels.length && cfg.partedChannels == ["#room["]);
+    assert(cfg.disabledChannels == ["#room{"]);
+
+    IRCRawEvent fresh;
+    fresh.channelIntentCaptured = true;
+    fresh.channelIntentCaseMapping = "rfc1459";
+    cfg = NetworkConfig.init;
+    assert(applyChannelIntentDelta(cfg, fresh, "JOIN", "#new", ""));
+    assert(cfg.autoJoinChannels == ["#new"],
+        "ordinary confirmed JOIN still saves a channel without manual evidence");
+
+    cfg = NetworkConfig.init;
+    cfg.autoJoinChannels = ["#sibling"];
+    cfg.channelOrder = ["#sibling"];
+    cfg.bncUnsavedChannels = ["#ROOM{", "#other"];
+    cfg.bncChannelKeys = ["#sibling": "fixture-key"];
+    cfg.bncChannelDefaultModes = ["#sibling": "+nt"];
+    auto explicitJoin = fresh;
+    explicitJoin.channelIntentExplicit = true;
+    foreach (action; ["JOIN", "PART", "KICK", "RENAME"]) {
+        assert(!applyChannelIntentDelta(cfg, explicitJoin, action, "#room[", "#renamed"),
+            "a tombstone added after admission fences every stale event");
+        assert(cfg.autoJoinChannels == ["#sibling"] && !cfg.partedChannels.length);
+        assert(cfg.bncUnsavedChannels == ["#ROOM{", "#other"]);
+        assert(cfg.channelOrder == ["#sibling"]);
+    }
+    fresh.channelIntentUnsaved = true;
+    foreach (action; ["JOIN", "PART", "KICK"]) {
+        assert(!applyChannelIntentDelta(cfg, fresh, action, "#room[", ""),
+            "matching runtime-only membership cannot become a saved definition");
+        assert(cfg.autoJoinChannels == ["#sibling"] && !cfg.partedChannels.length);
+    }
+    // Refusals use the same PART delta as a genuine self-PART/KICK.
+    fresh.persistChannelIntent = true;
+    assert(!applyChannelIntentDelta(cfg, fresh, "PART", "#room[", ""));
+    explicitJoin.channelIntentUnsaved = true;
+    assert(applyChannelIntentDelta(cfg, explicitJoin, "JOIN", "#room[", ""));
+    assert(cfg.autoJoinChannels == ["#sibling", "#room["]);
+    assert(cfg.bncUnsavedChannels == ["#other"]);
+    assert(cfg.channelOrder == ["#sibling"]);
+    assert(cfg.bncChannelKeys == ["#sibling": "fixture-key"]
+        && cfg.bncChannelDefaultModes == ["#sibling": "+nt"]);
+    assert(!applyChannelIntentDelta(cfg, explicitJoin, "JOIN", "#room[", ""),
+        "an already-consumed admission cannot clear changed intent again");
+
+    // Rename only source-specific state, preserving order and sibling entries.
+    cfg = NetworkConfig.init;
+    cfg.autoJoinChannels = ["#old", "#sibling"];
+    cfg.disabledChannels = ["#old"];
+    cfg.channelOrder = ["#sibling", "#old", "#tail"];
+    cfg.bncChannelKeys = ["#OLD": "fixture-key", "#sibling": "sibling-key"];
+    cfg.bncChannelDefaultModes = ["#old": "+nt", "#sibling": "+s"];
+    auto rename = IRCRawEvent.init;
+    rename.channelIntentCaptured = true;
+    rename.channelIntentSaved = true;
+    rename.channelIntentDisabled = true;
+    rename.channelIntentCaseMapping = "rfc1459";
+    assert(applyChannelIntentDelta(cfg, rename, "RENAME", "#old", "#new"));
+    assert(cfg.autoJoinChannels == ["#new", "#sibling"]);
+    assert(cfg.disabledChannels == ["#new"]);
+    assert(cfg.channelOrder == ["#sibling", "#new", "#tail"]);
+    assert(cfg.bncChannelKeys == ["#new": "fixture-key", "#sibling": "sibling-key"]);
+    assert(cfg.bncChannelDefaultModes == ["#new": "+nt", "#sibling": "+s"]);
+    assert(cfg.bncUnsavedChannels == ["#old"]);
+    auto oldJoin = IRCRawEvent.init;
+    oldJoin.channelIntentCaptured = true;
+    oldJoin.channelIntentCaseMapping = "rfc1459";
+    assert(!applyChannelIntentDelta(cfg, oldJoin, "JOIN", "#old", ""),
+        "rename must also fence a delayed formerly live-only JOIN at the old name");
+
+    // An unsaved runtime channel can follow RENAME, but never becomes saved.
+    cfg = NetworkConfig.init;
+    cfg.bncUnsavedChannels = ["#old", "#sibling"];
+    cfg.channelOrder = ["#sibling", "#old"];
+    rename = fresh;
+    rename.persistChannelIntent = false;
+    assert(applyChannelIntentDelta(cfg, rename, "RENAME", "#old", "#new"));
+    assert(!cfg.autoJoinChannels.length && !cfg.partedChannels.length);
+    assert(cfg.bncUnsavedChannels == ["#old", "#sibling", "#new"]);
+    assert(cfg.channelOrder == ["#sibling", "#new"]);
+    assert(!applyChannelIntentDelta(cfg, rename, "JOIN", "#new", ""));
+
+    // Never resurrect a deleted destination or merge distinct saved settings.
+    cfg = NetworkConfig.init;
+    cfg.autoJoinChannels = ["#old"];
+    cfg.bncUnsavedChannels = ["#new"];
+    rename.channelIntentSaved = true;
+    rename.channelIntentUnsaved = false;
+    assert(!applyChannelIntentDelta(cfg, rename, "RENAME", "#old", "#new"));
+    assert(cfg.autoJoinChannels == ["#old"] && cfg.bncUnsavedChannels == ["#new"]);
+    cfg.bncUnsavedChannels = [];
+    cfg.bncChannelKeys = ["#new": "fixture-key"];
+    assert(!applyChannelIntentDelta(cfg, rename, "RENAME", "#old", "#new"));
+    assert(cfg.autoJoinChannels == ["#old"] && cfg.bncChannelKeys == ["#new": "fixture-key"]);
+
+    cfg = NetworkConfig.init;
+    cfg.partedChannels = ["#old", "#sibling"];
+    cfg.channelOrder = ["#sibling", "#old"];
+    rename.channelIntentSaved = false;
+    rename.channelIntentParted = true;
+    assert(applyChannelIntentDelta(cfg, rename, "RENAME", "#old", "#new"));
+    assert(!cfg.autoJoinChannels.length && cfg.partedChannels == ["#new", "#sibling"]);
+    assert(cfg.channelOrder == ["#sibling", "#new"] && cfg.bncUnsavedChannels == ["#old"]);
+
+    cfg = NetworkConfig.init;
+    cfg.autoJoinChannels = ["#room["];
+    cfg.bncChannelKeys = ["#ROOM{": "fixture-key"];
+    rename.channelIntentSaved = true;
+    rename.channelIntentParted = false;
+    assert(applyChannelIntentDelta(cfg, rename, "RENAME", "#room[", "#ROOM{"));
+    assert(cfg.autoJoinChannels == ["#room{"] && !cfg.bncUnsavedChannels.length);
+    assert(cfg.bncChannelKeys == ["#room{": "fixture-key"],
+        "casemap-equivalent renames only canonicalize the same saved definition");
+}
+
+@("membership deltas are target-specific, casemapped and stale-event fenced")
+unittest { channelIntentRegressionChecks(); }
 
 /// Runs in the same ordered drain as the page rows, before assigning an eid.
 /// Redis scrollback/dedup remains authoritative, independent of archive replay.
@@ -498,43 +797,58 @@ private void processEvent(ref EngineContext ctx, ref IRCRawEvent event, string s
                          || event.command == "RENAME" || event.persistChannelIntent)) {
             auto client = ctx.connManager.getClient(matchedNet.config.id);
             if (client !is null) {
-                bool isOwnEvent = event.persistChannelIntent;
-                if (event.command == "JOIN" && event.nick == client.getCurrentNick) {
-                    isOwnEvent = true;
-                } else if (event.command == "PART" && event.nick == client.getCurrentNick) {
-                    isOwnEvent = true;
-                } else if (event.command == "KICK") {
-                    auto params = event.getParams();
-                    if (params.length >= 2 && params[1] == client.getCurrentNick) {
-                        isOwnEvent = true;
-                    }
-                } else if (event.command == "RENAME") {
-                    // Whoever renamed it, our autojoin list followed.
-                    isOwnEvent = true;
-                }
+                const isOwnEvent = event.channelIntentCaptured;
                 if (isOwnEvent) {
-                    // Mongo can yield while the event-drain loop
-                    // advances. Task arguments keep this admission's
-                    // identity independent of the mutable drain locals.
-                    auto ctxp = &ctx;
-                    runTask((UUID networkId, string networkIdStr, string networkName,
-                            PersistentIRCClient originClient) nothrow {
-                        try {
-                            import ircfiber.irc.dial_guard : ownsNetworkForDial;
-                            const ownerIdStr = ctxp.connManager.getOwnerId(networkId);
-                            auto row = ctxp.networkRepo.findByIdWithUser(networkId);
-                            if (ownerIdStr.length > 0 && row.userId.toString() == ownerIdStr
-                                    && ownsNetworkForDial(ctxp.redis, serverId, networkIdStr)) {
-                                // Runtime channel bookkeeping must not
-                                // write an older routing/IID/tenant copy.
-                                row.config.autoJoinChannels = originClient.getConfig.autoJoinChannels;
-                                row.config.partedChannels = originClient.getConfig.partedChannels;
-                                ctxp.networkRepo.save(row.config, row.userId);
+                    auto params = event.getParams();
+                    string operation = event.persistChannelIntent ? "PART" : event.command;
+                    string target = event.persistChannelIntent
+                        ? (params.length > 1 ? params[1] : "")
+                        : (event.command == "RENAME" && params.length ? params[0] : event.channel);
+                    string destination = operation == "RENAME" && params.length > 1 ? params[1] : "";
+                    if (target.length) {
+                        auto ctxp = &ctx;
+                        runTask((UUID networkId, string networkIdStr, string networkName,
+                                PersistentIRCClient originClient, string action, string channel,
+                                string renamed, ChannelIntentEvidence intent) nothrow {
+                            try {
+                                import ircfiber.irc.dial_guard : ownsNetworkForDial;
+                                import ircfiber.network_write_gate : NetworkWriter, runNetworkWrite;
+                                runNetworkWrite!void(ctxp.redis, (ref NetworkWriter writer) {
+                                    const ownerId = ctxp.connManager.getOwnerId(networkId);
+                                    auto row = ctxp.networkRepo.findByIdWithUser(networkId);
+                                    if (!ownerId.length || row.userId.toString() != ownerId
+                                            || ctxp.connManager.getClient(networkId) !is originClient
+                                            || !ownsNetworkForDial(ctxp.redis, serverId, networkIdStr)) return;
+                                    auto cfg = row.config;
+                                    if (ircCaseMapping(originClient.casemapping())
+                                            != ircCaseMapping(intent.caseMapping)
+                                            || !applyChannelIntentDelta(cfg, intent, action, channel, renamed)) {
+                                        // Never retry the old event against newer channel intent.
+                                        ctxp.connManager.updateConfig(row.config);
+                                        return;
+                                    }
+                                    const persisted = action == "RENAME"
+                                        ? ctxp.networkRepo.updateOwnedFields!("autoJoinChannels", "partedChannels",
+                                            "disabledChannels", "channelOrder", "bncUnsavedChannels",
+                                            "bncChannelKeys", "bncChannelDefaultModes")(
+                                            row.config, cfg, row.userId, writer)
+                                        : ctxp.networkRepo.updateOwnedFields!("autoJoinChannels", "partedChannels",
+                                            "disabledChannels", "channelOrder", "bncUnsavedChannels")(
+                                            row.config, cfg, row.userId, writer);
+                                    if (!persisted) {
+                                        logWarn("Channel intent changed concurrently for network %s", networkIdStr);
+                                        auto latest = ctxp.networkRepo.findByIdWithUser(networkId);
+                                        if (latest.userId == row.userId
+                                                && ctxp.connManager.getClient(networkId) is originClient)
+                                            ctxp.connManager.updateConfig(latest.config);
+                                    }
+                                });
+                            } catch (Exception e) {
+                                logWarn("Failed to persist channel intent for %s: %s", networkName, e.msg);
                             }
-                        } catch (Exception e) {
-                            logWarn("Failed to persist autoJoinChannels for %s: %s", networkName, e.msg);
-                        }
-                    }, matchedNet.config.id, event.networkId, matchedNet.config.name, client);
+                        }, matchedNet.config.id, event.networkId, matchedNet.config.name, client,
+                            operation, target, destination, ChannelIntentEvidence.fromEvent(event));
+                    }
                 }
             }
         }

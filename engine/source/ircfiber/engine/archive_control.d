@@ -114,7 +114,7 @@ final class ArchiveControl {
     bool admitHeldScope(ref EngineContext ctx, const ref NetworkConfig config,
             UUID userId, const ref HolderEntry entry) {
         if (stopping || shutdownRequested || config.id == UUID.init
-                || config.disabled || config.servicesProvisioningPending
+                || !config.hasUpstreamServer() || config.disabled || config.servicesProvisioningPending
                 || ctx.connManager is null || !entry.id.length
                 || !entry.instance.length || entry.connectedAtMs <= 0 || entry.state != "open")
             return false;
@@ -152,7 +152,7 @@ final class ArchiveControl {
             auto cursor = network;
             const id = parseUUID(cursor);
             auto row = ctx.networkRepo.findByIdWithUser(id);
-            if (row.config.id != id || row.config.disabled || row.config.servicesProvisioningPending
+            if (row.config.id != id || !row.config.hasUpstreamServer() || row.config.disabled || row.config.servicesProvisioningPending
                     || row.userId.toString() != expectedOwner || ctx.connManager is null
                     || ctx.connManager.getClient(id) is null
                     || ctx.connManager.getOwnerId(id) != expectedOwner

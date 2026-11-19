@@ -14,6 +14,7 @@ import ircfiber.i18n : isSupportedLanguage;
 import ircfiber.db.prefs_cache : PrefsCache;
 import ircfiber.db.prefs_mongo : loadPrefsDoc, savePrefsDoc, deletePrefsDoc;
 import ircfiber.redis.protocol : RedisKeys;
+import ircfiber.models.network : BncPlaybackCutoff;
 import ircfiber.db.notification_policy : NotificationPolicy, defaultPolicy, migrateFromV1, isTzName,
     projDesktop, projSound, projMuteAll, projHighlightWords, removeClient, CLIENT_WEB;
 
@@ -543,6 +544,24 @@ struct UserPreferences {
     /// Set from Settings → Bouncer → Access via
     /// `/api/me/bouncer/settings`; read by the bnc process on attach.
     int bncPlaybackLines = BNC_PLAYBACK_DEFAULT;
+    /// IRC-only built-in modules; not exposed by the web preferences API.
+    bool bncControlPanelEnabled = true;
+    bool bncUserPerformLoaded;
+    string bncUserPerformCommands;
+    bool bncMultiClients = true;
+    int bncChanBufferSize = -1;
+    int bncQueryBufferSize = -1;
+    BncPlaybackCutoff bncChanBufferCleared;
+    BncPlaybackCutoff bncQueryBufferCleared;
+    bool bncAutoClearChanBuffer;
+    bool bncAutoClearQueryBuffer;
+    bool bncPrependTimestamp = true;
+    bool bncAppendTimestamp;
+    string bncTimezone = "UTC";
+    string bncTimestampFormat = "[%H:%M:%S]";
+    string bncDefaultNick, bncDefaultAltNick, bncDefaultIdent, bncDefaultRealName;
+    string bncDefaultChanModes, bncDefaultQuitMessage;
+    string[string] bncCtcpReplies;
     /// Reject a bouncer client that attaches without TLS.
     bool bncRequireTls = false;
     /// When non-empty, a bouncer client's IP must match one of these
@@ -626,6 +645,17 @@ struct UserPreferences {
         j["highlightWords"] = stringArrayJson(projHighlightWords(notificationPolicy));
         j["notificationPolicy"] = notificationPolicy.toJson();
         j["bncPlaybackLines"] = Json(bncPlaybackLines);
+        j["bncControlPanelEnabled"] = Json(bncControlPanelEnabled);
+        j["bncUserPerformLoaded"] = Json(bncUserPerformLoaded);
+        j["bncUserPerformCommands"] = Json(bncUserPerformCommands);
+        static foreach (field; ["bncMultiClients", "bncAutoClearChanBuffer", "bncAutoClearQueryBuffer",
+                "bncPrependTimestamp", "bncAppendTimestamp", "bncChanBufferSize", "bncQueryBufferSize",
+                "bncTimezone", "bncTimestampFormat", "bncDefaultNick", "bncDefaultAltNick",
+                "bncDefaultIdent", "bncDefaultRealName", "bncDefaultChanModes", "bncDefaultQuitMessage"])
+            j[field] = Json(__traits(getMember, this, field));
+        j["bncChanBufferCleared"] = bncChanBufferCleared.toJson();
+        j["bncQueryBufferCleared"] = bncQueryBufferCleared.toJson();
+        j["bncCtcpReplies"] = bncCtcpReplies.length ? serializeToJson(bncCtcpReplies) : Json.emptyObject;
         j["bncRequireTls"] = Json(bncRequireTls);
         j["bncAllowedCidrs"] = bncAllowedCidrs is null ? Json.emptyArray : serializeToJson(bncAllowedCidrs);
         j["bncMaxClients"] = Json(bncMaxClients);
@@ -830,6 +860,50 @@ struct UserPreferences {
                 logFieldInvalid(userId, "bncPlaybackLines", v.type, "int");
                 needsRepair = true;
             }
+        }
+        if (auto v = "bncControlPanelEnabled" in json) {
+            p.bncControlPanelEnabled = v.type == Json.Type.bool_ && v.get!bool;
+            if (v.type != Json.Type.bool_) needsRepair = true;
+        }
+        if (auto v = "bncUserPerformLoaded" in json) {
+            p.bncUserPerformLoaded = v.type == Json.Type.bool_ && v.get!bool;
+            if (v.type != Json.Type.bool_) needsRepair = true;
+        }
+        if (auto v = "bncUserPerformCommands" in json) {
+            if (v.type == Json.Type.string) p.bncUserPerformCommands = v.get!string;
+            else needsRepair = true;
+        }
+        static foreach (field; ["bncMultiClients", "bncAutoClearChanBuffer", "bncAutoClearQueryBuffer",
+                "bncPrependTimestamp", "bncAppendTimestamp"]) {
+            if (auto v = field in json) {
+                if (v.type == Json.Type.bool_) __traits(getMember, p, field) = v.get!bool;
+                else needsRepair = true;
+            }
+        }
+        static foreach (field; ["bncChanBufferSize", "bncQueryBufferSize"]) {
+            if (auto v = field in json) {
+                if (v.type == Json.Type.int_ && v.get!long >= -1 && v.get!long <= BNC_PLAYBACK_MAX)
+                    __traits(getMember, p, field) = cast(int) v.get!long;
+                else needsRepair = true;
+            }
+        }
+        static foreach (field; ["bncTimezone", "bncTimestampFormat", "bncDefaultNick", "bncDefaultAltNick",
+                "bncDefaultIdent", "bncDefaultRealName", "bncDefaultChanModes", "bncDefaultQuitMessage"]) {
+            if (auto v = field in json) {
+                if (v.type == Json.Type.string) __traits(getMember, p, field) = v.get!string;
+                else needsRepair = true;
+            }
+        }
+        static foreach (field; ["bncChanBufferCleared", "bncQueryBufferCleared"]) {
+            try __traits(getMember, p, field) = BncPlaybackCutoff.fromJson(json[field]);
+            catch (Exception) needsRepair = true;
+        }
+        if (auto v = "bncCtcpReplies" in json) {
+            try {
+                if (v.type == Json.Type.object && v.length <= 32)
+                    p.bncCtcpReplies = deserializeJson!(string[string])(*v);
+                else needsRepair = true;
+            } catch (Exception) needsRepair = true;
         }
         if (auto v = "bncRequireTls" in json) {
             if (v.type == Json.Type.bool_)
@@ -1427,7 +1501,6 @@ string[] normalizeHighlightWords(Json arr) {
 final class PreferencesRepository {
     private RedisStorage redis;
     private PrefsCache cache_;
-    private enum KEY_PREFIX = "prefs:";
 
     /// Shared per-gateway cache instance. Lazily created with defaults
     /// (1000 entries, 30 s TTL) when first needed. Exposed as public so
@@ -1486,21 +1559,29 @@ final class PreferencesRepository {
     /// ARGV[1] = JSON to write; must start with `PAYLOAD_PREFIX` followed
     ///           by ARGV[2] and a comma (see `versionedPayload`)
     /// ARGV[2] = the payload's `welcomeTour` value, exactly as spliced
+    /// ARGV[3] = expected version, or -1 for an unconditional legacy save.
     /// Returns the new prefVersion, negated when the stored tour was kept.
     private enum PAYLOAD_PREFIX = `{"prefVersion":0,"welcomeTour":`;
     static assert(WELCOME_TOUR_LAST_STEP == 6, "update the step bound in INCR_AND_SET_LUA");
     private enum INCR_AND_SET_LUA = `local current = redis.call('GET', KEYS[1])
 local newPrefVersion = 1
+local expected = tonumber(ARGV[3]) or -1
+local currentVersion = 0
 local stored = nil
 if current then
     local ok, parsed = pcall(cjson.decode, current)
     if ok and type(parsed) == 'table' then
-        if parsed.prefVersion then
-            newPrefVersion = tonumber(parsed.prefVersion) + 1
+        currentVersion = tonumber(parsed.prefVersion or 0)
+        if currentVersion == nil then
+            if expected >= 0 then return 0 end
+            currentVersion = 0
         end
+        newPrefVersion = currentVersion + 1
         stored = parsed.welcomeTour
+    elseif expected >= 0 then return 0
     end
 end
+if expected >= 0 and expected ~= currentVersion then return 0 end
 local prefix = '` ~ PAYLOAD_PREFIX ~ `'
 local doc = ARGV[1]
 local tour = ARGV[2]
@@ -1593,6 +1674,26 @@ return newPrefVersion`;
         return prefs;
     }
 
+    UserPreferences loadStrict(UUID userId) {
+        auto db = redis.getDb();
+        const key = RedisKeys.userPreferences(userId.toString());
+        auto raw = db.get(key);
+        if (!raw.length) {
+            const durable = loadPrefsDoc(userId.toString(), true);
+            if (!durable.found) return UserPreferences.init;
+            // A racing writer wins; never rewind the version of its Redis blob.
+            const restore = "if redis.call('EXISTS',KEYS[1])==0 then redis.call('SET',KEYS[1],ARGV[1]); end; return redis.call('GET',KEYS[1])";
+            auto reply = db.eval!string(restore, [key], durable.blob.toString());
+            if (reply.empty) throw new Exception("Preference restore failed");
+            raw = reply.front;
+        }
+        auto json = parseJson(raw);
+        if (json.type != Json.Type.object) throw new Exception("Invalid stored preferences");
+        auto parsed = UserPreferences.fromJson(json, userId);
+        if (parsed.needsRepair) throw new Exception("Stored preferences need repair");
+        return parsed.prefs;
+    }
+
     /// Loads preferences for a user.
     ///
     /// Checks the in-memory LRU cache first. On cache miss, falls through
@@ -1622,7 +1723,7 @@ return newPrefVersion`;
             }
         }
 
-        auto key = KEY_PREFIX ~ userId.toString();
+        const key = RedisKeys.userPreferences(userId.toString());
         // Read the raw bytes directly so we can distinguish "missing key"
         // (silent — return defaults) from "key exists but bytes are
         // unparseable" (loud — `prefs_load_fail` + delete). The
@@ -1708,10 +1809,15 @@ return newPrefVersion`;
     /// prefVersion can capture it from the return value; those that don't
     /// care (the common case for `pinChannel` / `unpinChannel` etc.) can
     /// ignore it — D permits discarding a non-void return.
-        long save(UUID userId, UserPreferences prefs) {
+    long save(UUID userId, UserPreferences prefs) {
+        return saveVersioned(userId, prefs, -1);
+    }
+
+    private long saveVersioned(UUID userId, UserPreferences prefs, long expectedVersion) {
+        import std.conv : to;
         // NOTE: see load() — don't gate Redis prefs on the Mongo breaker.
 
-        auto key = KEY_PREFIX ~ userId.toString();
+        const key = RedisKeys.userPreferences(userId.toString());
         // The Lua is authoritative for prefVersion; zero it so the cached
         // copy below never carries a stale caller-side number.
         prefs.prefVersion = 0;
@@ -1720,11 +1826,12 @@ return newPrefVersion`;
 
         long newVersion = 0;
         try {
-            auto reply = redis.getDb().eval!long(INCR_AND_SET_LUA, [key], payload, tour);
+            auto reply = redis.getDb().eval!long(INCR_AND_SET_LUA, [key], payload, tour, expectedVersion.to!string);
             if (!reply.empty) {
                 newVersion = reply.front;
             }
         } catch (Exception e) {
+            if (expectedVersion >= 0) throw e;
             logWarn("prefsRepo.save EVAL failed for %s: %s — falling back to plain SET",
                 userId, e.msg);
             // Best-effort fallback: plain SET without increment. The
@@ -1740,6 +1847,8 @@ return newPrefVersion`;
             savePrefsDoc(userId.toString(), prefs.toJson(), prefs.prefVersion);
             return 0;
         }
+        if (expectedVersion >= 0 && !newVersion)
+            throw new Exception("Preferences changed; retry the command");
         if (newVersion < 0) {
             // The Lua kept the stored welcome tour over this (older) one:
             // take it so the cache and the durable copy match Redis.
@@ -1801,18 +1910,19 @@ return newPrefVersion`;
     /// Every mutating pref endpoint MUST go through this instead of
     /// hand-rolling `load()`/`save()`, otherwise it reintroduces the lost
     /// update above.
-    long mutate(UUID userId, scope bool delegate(ref UserPreferences) apply) {
+    long mutate(UUID userId, scope bool delegate(ref UserPreferences) apply, bool authoritative = false) {
         auto lock = lockFor(userId);
         synchronized (lock) {
-            auto prefs = load(userId);
+            auto prefs = authoritative ? loadStrict(userId) : load(userId, true);
+            const expectedVersion = authoritative ? prefs.prefVersion : -1L;
             if (!apply(prefs)) return 0;
-            return save(userId, prefs);
+            return saveVersioned(userId, prefs, expectedVersion);
         }
     }
 
     /// Convenience overload for callers that always save.
-    long mutate(UUID userId, scope void delegate(ref UserPreferences) apply) {
-        return mutate(userId, (ref UserPreferences p) { apply(p); return true; });
+    long mutate(UUID userId, scope void delegate(ref UserPreferences) apply, bool authoritative = false) {
+        return mutate(userId, (ref UserPreferences p) { apply(p); return true; }, authoritative);
     }
 
     /// Creates an account so that it can never exist without its welcome tour:
@@ -1850,7 +1960,7 @@ return newPrefVersion`;
     /// Redis key would see the prefs resurrected by `load()`'s fallback.
     void deleteForUser(UUID userId) {
         try
-            redis.del(KEY_PREFIX ~ userId.toString());
+            redis.del(RedisKeys.userPreferences(userId.toString()));
         catch (Exception e)
             logWarn("prefs: redis del failed for %s: %s", userId, e.msg);
         cache_.remove(userId);

@@ -54,6 +54,8 @@ private enum size_t MAX_PRE_TLS_BYTES      = 64 * 1024;
 /// engine keys on `TLS handshake timed out`).
 final class DialFailed : Exception {
     string phase;
+    /// Explicit proof: no socket was selected and every connect terminated.
+    bool terminalDnsTcp;
     this(string phase, string reason, string file = __FILE__, size_t line = __LINE__) {
         super(reason, file, line);
         this.phase = phase;
@@ -69,6 +71,8 @@ struct DialOutcome {
     TCPConnection conn;
     TLSStream tls;
     TlsInfoJson tlsInfo;
+    /// Set only after this socket's actual peer has passed the requested policy.
+    bool tlsVerified;
     string peerIp;
     string localIp;
     ushort peerPort;
@@ -229,7 +233,15 @@ shared static this() {
     try { gDnsLock = new Object(); } catch (Throwable) {}
 }
 
-ResolvedAddr[] resolveAllAddresses(string host, ushort port) {
+/// Resolver errors/timeouts are not evidence of an empty successful lookup.
+enum DnsLookupOutcome { unresolved, resolved, empty, failed, timedOut }
+
+private struct DnsLookupReply {
+    DnsLookupOutcome outcome;
+    string encoded;
+}
+
+ResolvedAddr[] resolveAllAddresses(string host, ushort port, out DnsLookupOutcome outcome) {
     const now = Clock.currTime.toUnixTime!long * 1000;
     auto normalizedHost = stripHostBrackets(host);
     auto cacheKey = normalizedHost;
@@ -237,7 +249,10 @@ ResolvedAddr[] resolveAllAddresses(string host, ushort port) {
     if (gDnsLock !is null) synchronized (gDnsLock) {
         if (auto t = cacheKey in dnsCacheTime) {
             if (now >= *t && now - *t < DNS_CACHE_TTL_MS) {
-                if (auto cached = cacheKey in dnsCache) return (*cached).dup;
+                if (auto cached = cacheKey in dnsCache) {
+                    outcome = (*cached).length ? DnsLookupOutcome.resolved : DnsLookupOutcome.empty;
+                    return (*cached).dup;
+                }
             }
             dnsCache.remove(cacheKey);
             dnsCacheTime.remove(cacheKey);
@@ -245,14 +260,17 @@ ResolvedAddr[] resolveAllAddresses(string host, ushort port) {
     } else {
         if (auto t = cacheKey in dnsCacheTime) {
             if (now >= *t && now - *t < DNS_CACHE_TTL_MS) {
-                if (auto cached = cacheKey in dnsCache) return *cached;
+                if (auto cached = cacheKey in dnsCache) {
+                    outcome = (*cached).length ? DnsLookupOutcome.resolved : DnsLookupOutcome.empty;
+                    return *cached;
+                }
             }
             dnsCache.remove(cacheKey);
             dnsCacheTime.remove(cacheKey);
         }
     }
-    auto ch = createChannel!string();
-    runWorkerTask((string h, ushort p, Channel!string c) nothrow {
+    auto ch = createChannel!DnsLookupReply();
+    runWorkerTask((string h, ushort p, Channel!DnsLookupReply c) nothrow {
         try {
             auto addrs = getAddress(h, p);
             string encoded;
@@ -271,13 +289,18 @@ ResolvedAddr[] resolveAllAddresses(string host, ushort port) {
                     ~ (addr.addressFamily == AddressFamily.INET6 ? "/6" : "/4");
                 if (++added == DNS_CACHE_MAX_ADDRESSES) break;
             }
-            try { c.put(encoded); } catch (Exception) {}
+            try { c.put(DnsLookupReply(encoded.length ? DnsLookupOutcome.resolved : DnsLookupOutcome.empty, encoded)); }
+            catch (Exception) {}
         } catch (Exception) {
-            try { c.put(""); } catch (Exception) {}
+            try { c.put(DnsLookupReply(DnsLookupOutcome.failed)); } catch (Exception) {}
         }
     }, normalizedHost, port, ch);
-    string encoded;
-    if (ch.tryConsumeOne(encoded, 5.seconds) && encoded.length > 0) {
+    DnsLookupReply reply;
+    const completed = ch.tryConsumeOne(reply, 5.seconds);
+    outcome = completed ? reply.outcome : DnsLookupOutcome.timedOut;
+    if (outcome == DnsLookupOutcome.empty) return null;
+    if (outcome == DnsLookupOutcome.resolved) {
+        const encoded = reply.encoded;
         ResolvedAddr[] result;
         foreach (entry; encoded.split("|")) {
             auto sep = entry.lastIndexOf("/");
@@ -289,6 +312,7 @@ ResolvedAddr[] resolveAllAddresses(string host, ushort port) {
             }
         }
         if (result.length > 0) {
+            outcome = DnsLookupOutcome.resolved;
             if (gDnsLock !is null) synchronized (gDnsLock) {
                 cacheDnsAddresses(cacheKey, result, now);
             } else {
@@ -296,7 +320,9 @@ ResolvedAddr[] resolveAllAddresses(string host, ushort port) {
             }
             return result;
         }
+        outcome = DnsLookupOutcome.failed;
     }
+    // Preserve legacy hostname fallback with error/timeout outcome, not proof.
     auto fam = AddressFamily.INET;
     if (normalizedHost.canFind(":")) {
         auto colonCount = 0;
@@ -541,11 +567,17 @@ private void finishHappyEyeballs(TCPConnection[] conns, Task[] tasks, int winner
 /// Emits the `dns` line. Destination protection precedes family filtering.
 /// Throws `DialFailed("dns"|"blocked"|"no_ipv6_destination", …)`.
 private ResolvedAddr[] directCandidates(string host, ushort port, string egressLabel,
-                                       string addressFamily, EventSink emit) {
-    auto addrs = resolveAllAddresses(host, port);
+                                       string addressFamily, EventSink emit, out bool terminalResolution) {
+    DnsLookupOutcome outcome;
+    auto addrs = resolveAllAddresses(host, port, outcome);
+    terminalResolution = outcome == DnsLookupOutcome.resolved;
+    foreach (address; addrs)
+        if (!isIpLiteral(address.ip)) terminalResolution = false;
     if (addrs.length == 0) {
         report(emit, "attempt_fail", "DNS lookup for " ~ host ~ " returned no addresses.");
-        throw new DialFailed("dns", "DNS resolution failed for " ~ host);
+        auto failure = new DialFailed("dns", "DNS resolution failed for " ~ host);
+        failure.terminalDnsTcp = outcome == DnsLookupOutcome.empty;
+        throw failure;
     }
     if (!isPrivateAllowedHost(stripHostBrackets(host), privateAllowHosts())) {
         // Connect only to addresses resolved and vetted here: a name that
@@ -555,7 +587,9 @@ private ResolvedAddr[] directCandidates(string host, ushort port, string egressL
         foreach (a; addrs) {
             if (!isIpLiteral(a.ip)) {
                 report(emit, "attempt_fail", "DNS lookup for " ~ host ~ " failed.");
-                throw new DialFailed("dns", "DNS resolution failed for " ~ host);
+                auto failure = new DialFailed("dns", "DNS resolution failed for " ~ host);
+                failure.terminalDnsTcp = outcome == DnsLookupOutcome.empty;
+                throw failure;
             }
             ips ~= a.ip;
         }
@@ -599,6 +633,7 @@ private struct TcpWinner {
     bool ok;
     TCPConnection conn;
     size_t index;
+    bool terminalFailure;
 }
 
 /// One Happy Eyeballs TCP race over the `candidates` not yet `spent`
@@ -692,7 +727,10 @@ private TcpWinner raceDirectTcp(string host, ushort port, const ResolvedAddr[] c
 
     done = true;
     finishHappyEyeballs(conns, tasks, -1);
-    return TcpWinner.init;
+    TcpWinner result;
+    // Interrupted/time-limited tasks are not terminal proof.
+    result.terminalFailure = failed == pending;
+    return result;
 }
 
 // ── TLS ─────────────────────────────────────────────────────────────────────
@@ -955,12 +993,58 @@ private void recordAddrs(ref DialOutcome o, ref TCPConnection conn) {
     } catch (Exception) {}
 }
 
-private TLSContext clientTlsContext() {
+private TLSContext clientTlsContext(ref const DialRequest req) {
     auto ctx = createTLSContext(TLSContextKind.client);
-    // TODO: peer validation — the engine has always connected with
-    // peerValidationMode = none (self-signed ircds, no CA pinning UI).
-    ctx.peerValidationMode = TLSPeerValidationMode.none;
+    // Pin mode intentionally accepts self-signed leaves at handshake time.
+    // The exact leaf allowlist is enforced before returning the socket.
+    ctx.peerValidationMode = req.verifyServerCertificates && !req.trustedServerFingerprints.length
+        ? TLSPeerValidationMode.trustedCert : TLSPeerValidationMode.none;
+    if (req.verifyServerCertificates && !req.trustedServerFingerprints.length) {
+        import vibe.stream.openssl : OpenSSLContext;
+        import deimos.openssl.ssl : SSL_CTX_set_default_verify_paths;
+        auto ossl = cast(OpenSSLContext) ctx;
+        if (ossl is null) throw new DialFailed("tls", "TLS verification requires the OpenSSL backend");
+        // As with captureTlsInfo, pin the private backend field by name.
+        enum ctxIdx = fieldIndexOf!(OpenSSLContext, "m_ctx");
+        static assert(ctxIdx >= 0 && __traits(identifier, OpenSSLContext.tupleof[ctxIdx]) == "m_ctx");
+        if (SSL_CTX_set_default_verify_paths(ossl.tupleof[ctxIdx]) != 1)
+            throw new DialFailed("tls", "TLS system trust roots could not be loaded");
+    }
     return ctx;
+}
+
+/// Enforce the actual leaf policy before exposing any application stream.
+/// SNI is not an identity assertion: PKI always checks the configured target.
+private void verifyPeer(ref const DialRequest req, TLSStream stream) {
+    import vibe.stream.openssl : OpenSSLStream;
+    import deimos.openssl.x509 : X509_digest;
+    import deimos.openssl.x509v3 : X509_check_host, X509_check_ip_asc, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS;
+    import deimos.openssl.evp : EVP_sha256;
+    auto ossl = cast(OpenSSLStream) stream;
+    if (ossl is null) throw new DialFailed("tls", "TLS verification requires the OpenSSL backend");
+    auto cert = ossl.peerCertificateX509;
+    if (cert is null) throw new DialFailed("tls", "TLS peer certificate missing");
+    if (req.trustedServerFingerprints.length) {
+        ubyte[32] digest;
+        uint length;
+        if (X509_digest(cert, EVP_sha256(), digest.ptr, &length) != 1 || length != digest.length)
+            throw new DialFailed("tls", "TLS peer SHA-256 digest failed");
+        char[64] hex;
+        enum digits = "0123456789abcdef";
+        foreach (i, b; digest) {
+            hex[2 * i] = digits[b >> 4];
+            hex[2 * i + 1] = digits[b & 15];
+        }
+        foreach (pin; req.trustedServerFingerprints)
+            if (pin == hex[]) return;
+        throw new DialFailed("tls", "TLS leaf fingerprint not trusted (SHA-256 " ~ hex[].idup ~ ")");
+    }
+    const host = stripHostBrackets(req.host);
+    const matches = isIpLiteral(host)
+        ? X509_check_ip_asc(cert, host.toStringz, 0)
+        : X509_check_host(cert, host.ptr, host.length, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS, null);
+    if (matches != 1)
+        throw new DialFailed("tls", "TLS certificate does not match configured host");
 }
 
 /// Closes whatever a dial opened (TLS stream first, then the socket).
@@ -993,8 +1077,12 @@ private void negotiate(ref DialRequest req, ref DialOutcome o, EventSink emit) {
     if (req.tls == "implicit" || req.tls == "starttls") {
         if (req.tls == "implicit") report(emit, "tls", "");
         try {
-            o.tls = createTLSStreamWithTimeout(o.conn, clientTlsContext(), stripHostBrackets(req.sni),
+            o.tls = createTLSStreamWithTimeout(o.conn, clientTlsContext(req), stripHostBrackets(req.sni),
                 req.tlsTimeoutMs.msecs);
+            if (req.verifyServerCertificates) {
+                verifyPeer(req, o.tls);
+                o.tlsVerified = true;
+            }
         } catch (Exception e) {
             throw new DialFailed("tls", e.msg);
         }
@@ -1016,15 +1104,17 @@ private int failureDepth(string phase) @safe pure nothrow @nogc {
 /// connect/TLS/STARTTLS timeouts; plain TCP ends at the first connect.
 private DialOutcome dialDirect(ref DialRequest req, Duration connectTimeout, EventSink emit) {
     const egressLabel = req.bindIp6.length > 0 ? "ipv6:" ~ req.bindIp6 : "direct";
-    const candidates = directCandidates(req.host, req.port, egressLabel, req.addressFamily, emit);
+    bool terminalResolution;
+    const candidates = directCandidates(req.host, req.port, egressLabel, req.addressFamily, emit, terminalResolution);
     auto spent = new bool[candidates.length];
     immutable raceStartMs = Clock.currTime.toUnixTime!long * 1000;
     DialFailed furthest;
     size_t protocolFailures = 0;
+    bool terminalTcp;
     while (true) {
         auto won = raceDirectTcp(req.host, req.port, candidates, spent, req.bindIp6, egressLabel,
             connectTimeout, emit);
-        if (!won.ok) break;
+        if (!won.ok) { terminalTcp = won.terminalFailure; break; }
         spent[won.index] = true;
         DialOutcome o;
         o.conn = won.conn;
@@ -1050,7 +1140,9 @@ private DialOutcome dialDirect(ref DialRequest req, Duration connectTimeout, Eve
     const tookMs = Clock.currTime.toUnixTime!long * 1000 - raceStartMs;
     report(emit, "attempt_fail", "No address for " ~ req.host ~ " answered via " ~ egressLabel
         ~ " (" ~ (tookMs / 1000).to!string ~ "s).");
-    throw new DialFailed("tcp", "All connection attempts failed for " ~ req.host ~ ":" ~ req.port.to!string);
+    auto failure = new DialFailed("tcp", "All connection attempts failed for " ~ req.host ~ ":" ~ req.port.to!string);
+    failure.terminalDnsTcp = terminalTcp && terminalResolution;
+    throw failure;
 }
 
 /// Performs one dial exactly as requested. Emits `EVENT`s through `emit`
@@ -1068,9 +1160,11 @@ DialOutcome dialUpstream(ref DialRequest req, EventSink emit) {
     // line for proxied dials; on failure it composes `attempt_fail`.
     {
         string[] resolved;
-        if (!isIpLiteral(target) && !isPrivateAllowedHost(target, privateAllowHosts()))
-            foreach (a; resolveAllAddresses(target, req.port))
+        if (!isIpLiteral(target) && !isPrivateAllowedHost(target, privateAllowHosts())) {
+            DnsLookupOutcome outcome;
+            foreach (a; resolveAllAddresses(target, req.port, outcome))
                 if (isIpLiteral(a.ip)) resolved ~= a.ip;
+        }
         const why = proxiedDialBlockReason(target, resolved, privateAllowHosts());
         if (why.length) throw new DialFailed("blocked", "blocked: " ~ why);
     }

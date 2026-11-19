@@ -37,6 +37,16 @@ struct IRCRawEvent {
     bool hasTrailingParam;
     /// Engine-only pending JOIN refusal correlation; never serialized.
     bool persistChannelIntent;
+    /// Engine-only, target-specific intent at command admission/event receipt.
+    /// These facts fence delayed membership events against newer saved intent.
+    bool channelIntentCaptured;
+    bool channelIntentSaved;
+    bool channelIntentParted;
+    bool channelIntentDisabled;
+    /// Saved-definition tombstone captured before the admitted command mutates intent.
+    bool channelIntentUnsaved;
+    bool channelIntentExplicit;
+    string channelIntentCaseMapping;
     
     /// Construct a new IRCRawEvent
     this(string network, string command) {

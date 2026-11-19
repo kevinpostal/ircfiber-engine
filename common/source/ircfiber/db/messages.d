@@ -14,7 +14,8 @@ import vibe.data.json;
 import vibe.core.log;
 import ircfiber.db.mongo;
 import ircfiber.models.irc_event : IRCRawEvent;
-import ircfiber.models.network : normalizeChannelName;
+import ircfiber.models.network : normalizeChannelName, BncPlaybackCutoff,
+    BncPlaybackConsumption, IrcCaseMapping, foldIrcCaseChar, ircCaseEquals;
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.storage.buffer : sanitizeUtf8;
 import ircfiber.network_write_gate : NetworkWriter, runNetworkWrite, runNetworkMutation,
@@ -154,6 +155,18 @@ int compareHistoryBoundaries(const ref HistoryBoundary a, const ref HistoryBound
     if (a.hasEid && a.eid != b.eid) return a.eid < b.eid ? -1 : 1;
     import std.string : cmp;
     return cmp(a.storageId, b.storageId);
+}
+
+/// A BNC view over the archive; never a retention or read-marker policy.
+struct BncArchiveFilter {
+    int limit = -1;
+    BncPlaybackCutoff category, target;
+    BncPlaybackConsumption consumed;
+
+    bool allows(long time, long eid) const @safe pure nothrow @nogc {
+        return limit != 0 && category.allows(time, eid) && target.allows(time, eid)
+            && consumed.allows(time, eid);
+    }
 }
 
 /// Success means the raw archival command met majority+journal write concern.
@@ -1424,6 +1437,325 @@ final class MessageRepository {
             }
         }
         return out_;
+    }
+
+    private enum BNC_CHANNEL_RE = `^[#&+!][^\x00-\x20\x7F,:]+$`;
+    private enum BNC_QUERY_RE = `^[^#&+!.:*,<>\x00-\x20\x7F]+$`;
+
+    private static bool isBncQuery(string name) @safe pure nothrow @nogc {
+        if (!isDirectBuffer(name) || ircCaseEquals(name, "_server", IrcCaseMapping.ascii))
+            return false;
+        foreach (char c; name)
+            if (c == '+' || c == '!' || c == '<' || c == '>') return false;
+        return true;
+    }
+
+    private static bool isBncTarget(string name) @safe pure nothrow @nogc {
+        if (isBncQuery(name)) return true;
+        if (name.length < 2) return false;
+        const prefix = name[0];
+        if (prefix != '#' && prefix != '&' && prefix != '+' && prefix != '!') return false;
+        foreach (char c; name)
+            if (c <= 0x20 || c == 0x7F || c == ',' || c == ':')
+                return false;
+        return true;
+    }
+
+    private static Bson bncBufferType(bool query) {
+        return query
+            ? Bson(["channel": Bson(["$regex": Bson(BNC_QUERY_RE), "$ne": Bson("_server")])])
+            : Bson(["channel": Bson(["$regex": Bson(BNC_CHANNEL_RE)])]);
+    }
+
+    private static Bson bncArchiveScope(string serverId, string networkId, bool events) {
+        auto filter = Bson(["networkId": Bson(networkId),
+            "payload": Bson(["$regex": Bson(events ? EVENT_PAYLOAD_RE : CHAT_PAYLOAD_RE)])]);
+        if (serverId.length) filter["serverId"] = Bson(serverId);
+        return filter;
+    }
+
+    /// Old DM writers may have used the lower-case spelling. Keep that alias
+    /// inside the database predicate, including exclusions, before any limit.
+    private static string[] bncStorageNames(string target) {
+        import std.uni : toLower;
+        string[] names = [target];
+        const normalized = normalizeChannel(target);
+        if (!names.canFind(normalized)) names ~= normalized;
+        const lower = target.length && canFind("#&+!", target[0]) ? normalized : target.toLower();
+        if (!names.canFind(lower)) names ~= lower;
+        return names;
+    }
+
+    private static Bson bncTargetPredicate(string[] names) {
+        return Bson(["channel": Bson(["$in": serializeToBson(names)])]);
+    }
+
+    private static void appendBncCutoff(ref Bson[] clauses, BncPlaybackCutoff cutoff) {
+        if (!cutoff.active()) return;
+        // A high eid never admits old upstream backfill; a recent timestamp
+        // never admits an already-cleared positive eid. Legacy equal-time rows
+        // are excluded as well, exactly as BncPlaybackCutoff.allows specifies.
+        clauses ~= Bson(["t": Bson(["$gte": Bson(cutoff.timestampMs)])]);
+        clauses ~= Bson(["$or": Bson([
+            Bson(["eid": Bson(["$gt": Bson(cutoff.eid)])]),
+            Bson(["t": Bson(["$gt": Bson(cutoff.timestampMs)]), "$or": Bson([
+                Bson(["eid": Bson(["$exists": Bson(false)])]),
+                Bson(["eid": Bson(["$lte": Bson(0L)])])
+            ])])
+        ])]);
+    }
+
+    private static void appendBncPolicy(ref Bson[] clauses, BncArchiveFilter policy) {
+        appendBncCutoff(clauses, policy.category);
+        appendBncCutoff(clauses, policy.target);
+        if (policy.consumed.active())
+            clauses ~= Bson(["$or": Bson([
+                Bson(["t": Bson(["$gt": Bson(policy.consumed.timestampMs)])]),
+                Bson(["t": Bson(policy.consumed.timestampMs),
+                    "eid": Bson(["$gt": Bson(policy.consumed.eid)])])
+            ])]);
+    }
+
+    private struct BncArchiveRow {
+        long eid;
+        string storageId;
+        Json payload;
+    }
+
+    private BncArchiveRow[] readBncRows(Bson filter, int count, bool newest, bool eidOrder) @trusted {
+        FindOptions options;
+        auto order = Bson.emptyObject;
+        if (!eidOrder) order["t"] = Bson(newest ? -1 : 1);
+        order["eid"] = Bson(newest ? -1 : 1);
+        order["_id"] = Bson(newest ? -1 : 1);
+        options.sort = order;
+        options.limit = cast(long) count;
+        BncArchiveRow[] rows;
+        foreach (doc; collection.find(filter, options)) {
+            if (doc["payload"].type != Bson.Type.string) continue;
+            try {
+                rows ~= BncArchiveRow(readBsonTimestamp(doc["eid"]), doc["_id"].get!string,
+                    parseJsonString(doc["payload"].get!string));
+            } catch (Exception) {
+                logWarn("Failed to parse stored BNC archive payload");
+            }
+        }
+        return rows;
+    }
+
+    /// Bound each category member inside Mongo before the final eid page.
+    /// $topN avoids collecting an unbounded channel history with $push/$slice.
+    private BncArchiveRow[] readBncLimitedRows(Bson filter, int perTarget, int count,
+            long afterEid, bool partitionTargets) @trusted {
+        // Returning replay has always required positive eids. Rank that
+        // eligible inventory first, then apply the caller's cursor below.
+        filter["eid"] = Bson(["$gt": Bson(0L)]);
+        auto newest = Bson.emptyObject;
+        newest["t"] = Bson(-1);
+        newest["eid"] = Bson(-1);
+        newest["_id"] = Bson(-1);
+        auto pageOrder = Bson.emptyObject;
+        pageOrder["eid"] = Bson(1);
+        pageOrder["_id"] = Bson(1);
+        Bson[] pipeline = [
+            Bson(["$match": filter]),
+            Bson(["$group": Bson(["_id": partitionTargets ? Bson("$channel") : Bson(null),
+                "rows": Bson(["$topN": Bson(["n": Bson(min(perTarget, 1000)),
+                    "sortBy": newest, "output": Bson([
+                        "_id": Bson("$_id"), "eid": Bson("$eid"), "payload": Bson("$payload")
+                    ])])])])]),
+            Bson(["$unwind": Bson("$rows")]),
+            Bson(["$replaceRoot": Bson(["newRoot": Bson("$rows")])]),
+            Bson(["$match": Bson(["eid": Bson(["$gt": Bson(max(afterEid, 0L))])])]),
+            Bson(["$sort": pageOrder]),
+            Bson(["$limit": Bson(cast(long) count)])
+        ];
+        AggregateOptions options;
+        BncArchiveRow[] rows;
+        foreach (doc; collection.aggregate!Bson(pipeline, options)) {
+            if (doc["payload"].type != Bson.Type.string) continue;
+            try {
+                rows ~= BncArchiveRow(readBsonTimestamp(doc["eid"]), doc["_id"].get!string,
+                    parseJsonString(doc["payload"].get!string));
+            } catch (Exception) {
+                logWarn("Failed to parse stored BNC archive payload");
+            }
+        }
+        return rows;
+    }
+
+    private static bool bncRowBefore(const ref BncArchiveRow a, const ref BncArchiveRow b) {
+        return a.eid < b.eid || (a.eid == b.eid && a.storageId < b.storageId);
+    }
+
+    /// Both inputs are eid-ordered. Retain only the globally earliest page,
+    /// bounding memory independently of the number of target overrides.
+    private static BncArchiveRow[] mergeBncRows(BncArchiveRow[] a, BncArchiveRow[] b, int count) {
+        if (!a.length) return b[0 .. min(cast(size_t) count, b.length)];
+        if (!b.length) return a[0 .. min(cast(size_t) count, a.length)];
+        BncArchiveRow[] merged;
+        merged.length = min(cast(size_t) count, a.length + b.length);
+        size_t ai, bi;
+        foreach (ref row; merged) {
+            if (bi == b.length || (ai < a.length && bncRowBefore(a[ai], b[bi])))
+                row = a[ai++];
+            else row = b[bi++];
+        }
+        return merged;
+    }
+
+    /// Newest eligible target rows, returned in ascending (t, eid, _id) order.
+    /// Empty serverId deliberately supports offline/ownerless network history.
+    Json[] getBncPlayback(string serverId, string networkId, string target,
+            BncArchiveFilter policy, bool events) @trusted {
+        if (!networkId.length || !isBncTarget(target) || policy.limit == 0) return [];
+        const count = policy.limit < 0 ? 1000 : min(policy.limit, 1000);
+        auto filter = bncArchiveScope(serverId, networkId, events);
+        Bson[] clauses = [bncTargetPredicate(bncStorageNames(target)),
+            Bson(["$or": Bson([bncBufferType(false), bncBufferType(true)])])];
+        appendBncPolicy(clauses, policy);
+        filter["$and"] = Bson(clauses);
+        auto stored = readBncRows(filter, count, true, false);
+        Json[] rows;
+        rows.length = stored.length;
+        foreach (i, ref row; stored) rows[stored.length - i - 1] = row.payload;
+        return rows;
+    }
+
+    /// BNC-only returning-client replay. Positive category/target limits select
+    /// each target's newest eligible N first; -1 keeps the old uncapped eid walk.
+    /// Neither this path nor explicit playback changes archive/cursor state.
+    Json[] getBncMissed(string serverId, string networkId, long afterEid, int limit,
+            BncArchiveFilter channel, BncArchiveFilter query,
+            BncArchiveFilter[string] overrides, string[] detached, bool events) @trusted {
+        if (!networkId.length || limit <= 0) return [];
+        limit = min(limit, 1000);
+        string[] excluded;
+        bool[string] detachedNames;
+        foreach (name; detached) foreach (stored; bncStorageNames(name)) {
+            if (stored in detachedNames) continue;
+            detachedNames[stored] = true;
+            excluded ~= stored;
+        }
+        foreach (name, policy; overrides) excluded ~= bncStorageNames(name);
+
+        BncArchiveRow[] selected;
+        Bson[] alternatives;
+        foreach (isQuery; [false, true]) {
+            const policy = isQuery ? query : channel;
+            if (policy.limit == 0) continue;
+            Bson[] clauses = [bncBufferType(isQuery)];
+            if (excluded.length)
+                clauses ~= Bson(["channel": Bson(["$nin": serializeToBson(excluded)])]);
+            appendBncPolicy(clauses, policy);
+            if (policy.limit < 0) {
+                alternatives ~= Bson(["$and": Bson(clauses)]);
+            } else {
+                auto filter = bncArchiveScope(serverId, networkId, events);
+                filter["$and"] = Bson(clauses);
+                selected = mergeBncRows(selected,
+                    readBncLimitedRows(filter, policy.limit, limit, afterEid, true), limit);
+            }
+        }
+        foreach (name, policy; overrides) {
+            const inherited = isBncQuery(name) ? query.limit : channel.limit;
+            if (policy.limit >= 0 || inherited >= 0 || !isBncTarget(name)) continue;
+            auto names = bncStorageNames(name);
+            if (names.any!(n => (n in detachedNames) !is null)) continue;
+            Bson[] clauses = [bncTargetPredicate(names)];
+            appendBncPolicy(clauses, policy);
+            alternatives ~= Bson(["$and": Bson(clauses)]);
+        }
+        if (alternatives.length) {
+            auto filter = bncArchiveScope(serverId, networkId, events);
+            filter["eid"] = Bson(["$gt": Bson(max(afterEid, 0L))]);
+            filter["$or"] = Bson(alternatives);
+            selected = mergeBncRows(selected, readBncRows(filter, limit, false, true), limit);
+        }
+        foreach (name, policy; overrides) {
+            const inherited = isBncQuery(name) ? query.limit : channel.limit;
+            const targetLimit = policy.limit < 0 ? inherited : policy.limit;
+            if (targetLimit <= 0 || !isBncTarget(name)) continue;
+            auto names = bncStorageNames(name);
+            if (names.any!(n => (n in detachedNames) !is null)) continue;
+            auto filter = bncArchiveScope(serverId, networkId, events);
+            Bson[] clauses = [bncTargetPredicate(names)];
+            appendBncPolicy(clauses, policy);
+            filter["$and"] = Bson(clauses);
+            auto rows = readBncLimitedRows(filter, targetLimit, limit, afterEid, false);
+            selected = mergeBncRows(selected, rows, limit);
+        }
+        Json[] result;
+        result.length = selected.length;
+        foreach (i, ref row; selected) result[i] = row.payload;
+        return result;
+    }
+
+    /// No age cutoff: old query history remains a valid explicit BNC target.
+    /// Mongo groups/ranks first, and the returned inventory is bounded to 1000.
+    string[] recentBncQueries(string networkId, size_t limit) @trusted {
+        if (!networkId.length || limit == 0) return [];
+        auto match = Bson(["networkId": Bson(networkId), "$and": Bson([bncBufferType(true)])]);
+        auto order = Bson.emptyObject;
+        order["last"] = Bson(-1);
+        order["_id"] = Bson(1);
+        Bson[] pipeline = [
+            Bson(["$match": match]),
+            Bson(["$group": Bson(["_id": Bson("$channel"), "last": Bson(["$max": Bson("$t")])])]),
+            Bson(["$sort": order]),
+            Bson(["$limit": Bson(cast(long) min(limit, cast(size_t) 1000))])
+        ];
+        AggregateOptions options;
+        string[] names;
+        foreach (doc; collection.aggregate!Bson(pipeline, options))
+            names ~= doc["_id"].get!string;
+        return names;
+    }
+
+    /// Build a literal, bytewise IRC-folded regex, never an unescaped user
+    /// regex or Mongo's broader Unicode case-insensitive matching.
+    private static string bncLiteralQueryRegex(string name, IrcCaseMapping mapping) {
+        auto pattern = appender!string();
+        pattern.put(`\A`);
+        foreach (char c; name) {
+            const folded = foldIrcCaseChar(c, mapping);
+            if (folded >= 'a' && folded <= 'z') {
+                pattern.put('[');
+                pattern.put(folded);
+                pattern.put(cast(char)(folded - ('a' - 'A')));
+                pattern.put(']');
+                continue;
+            }
+            if (mapping != IrcCaseMapping.ascii) {
+                if (folded == '{') { pattern.put(`(?:\[|\{)`); continue; }
+                if (folded == '}') { pattern.put(`(?:\]|\})`); continue; }
+                if (folded == '|') { pattern.put(`(?:\\|\|)`); continue; }
+                if (folded == '~' && mapping == IrcCaseMapping.rfc1459) {
+                    pattern.put(`(?:\^|~)`); continue;
+                }
+            }
+            if (canFind(`\.^$|?*+()[]{}`, folded)) pattern.put('\\');
+            pattern.put(folded);
+        }
+        pattern.put(`\z`);
+        return pattern.data;
+    }
+
+    /// Return the stored canonical spelling, or "" when no real query exists.
+    /// A literal lookup is not restricted to the newest inventory page.
+    string findBncQuery(string networkId, string name, IrcCaseMapping mapping) @trusted {
+        if (!networkId.length || !isBncQuery(name)) return "";
+        auto filter = Bson(["networkId": Bson(networkId),
+            "channel": Bson(["$regex": Bson(bncLiteralQueryRegex(name, mapping))]),
+            "$and": Bson([bncBufferType(true)])]);
+        FindOptions options;
+        auto order = Bson.emptyObject;
+        order["t"] = Bson(-1);
+        order["_id"] = Bson(1);
+        options.sort = order;
+        options.limit = 1;
+        foreach (doc; collection.find(filter, options)) return doc["channel"].get!string;
+        return "";
     }
 
     /// Delete all messages for a given buffeer from permanent storage.
