@@ -10,11 +10,13 @@ on:
       - 'common/**'
       - 'engine/dub.sdl'
       - 'scripts/check-common-drift.sh'
+      - '.github/workflows/check-common.yml'
   pull_request:
     paths:
       - 'common/**'
       - 'engine/dub.sdl'
       - 'scripts/check-common-drift.sh'
+      - '.github/workflows/check-common.yml'
 
 jobs:
   check:
@@ -51,5 +53,7 @@ jobs:
 
       - name: Test common and resolve it from engine
         run: |
+          dub fetch vibe-serialization --version=1.2.0
+          bash common/scripts/apply-vibe-serialization-patches.sh
           dub test --root=common --compiler=ldc2
           dub describe --root=engine > /dev/null
