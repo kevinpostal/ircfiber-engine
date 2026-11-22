@@ -314,6 +314,10 @@ final class MessageRepository {
         add("message_search_target", ["networkId", "channel", "searchTarget", "t", "eid", "_id"],
             Bson(["searchTarget": Bson(["$exists": Bson(true)])]));
         add("message_search_version", ["networkId", "channel", "searchVersion"]);
+        // A version-leading index also serves the final global backfill gate;
+        // the scoped index above alone requires a full archive scan.
+        add("message_search_build_version", ["searchVersion", "_id"]);
+        add("message_search_pending_time", ["t"], Bson(["searchPending": Bson(true)]));
         auto command = Bson.emptyObject;
         command["createIndexes"] = Bson("messages");
         command["indexes"] = Bson(indexes);

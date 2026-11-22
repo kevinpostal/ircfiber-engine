@@ -168,7 +168,7 @@ private bool visibleBody(string command, ref string text, string diagnostic, boo
 
 /// Classify already parsed compact JSON. `channel` is the current authoritative
 /// Mongo channel; historical ch/p are compared only to each other, for renames.
-SearchClassification classifySearchMessage(Json payload, string channel) @trusted {
+SearchClassification classifySearchMessage(const Json payload, string channel) @trusted {
     return classify(payload, channel, true);
 }
 
@@ -258,7 +258,7 @@ private SearchClassification classify(const Json payload, string channel, bool m
     return result;
 }
 
-private SearchClassification classifyArchive(Bson doc, Json payload, bool materialize) @trusted {
+private SearchClassification classifyArchive(Bson doc, const Json payload, bool materialize) @trusted {
     const channel = doc["channel"].type == Bson.Type.string ? doc["channel"].get!string : "";
     auto result = classify(payload, channel, materialize);
     if (result.kind != SearchKind.message) return result;
@@ -277,7 +277,7 @@ private SearchClassification classifyArchive(Bson doc, Json payload, bool materi
 
 /// Attach only projection metadata; the original payload and archive ID stay
 /// unchanged. Clearing stale fields also makes bootstrap reclassification safe.
-void searchMetadata(ref Bson doc, Json payload) @trusted {
+void searchMetadata(ref Bson doc, const Json payload) @trusted {
     SearchClassification classification;
     // Metadata is not a second projection/body write. Invalid legacy fields must
     // never turn a successful archive insertion into a delivery failure.
