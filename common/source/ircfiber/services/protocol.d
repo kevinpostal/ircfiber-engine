@@ -51,10 +51,11 @@ struct GroupParams { string account; string password; }
 struct RecoverParams { string nick; string password; }
 struct PrivacyParams { PrivacyField field; bool enabled; }
 struct HostRequestParams { string host; }
-struct MemoReadParams { string selection; }
+struct MemoListParams { string channel; }
+struct MemoReadParams { string selection; string channel; }
 struct MemoSendParams { string recipient; string targetNick; string text; }
-struct MemoDeleteParams { uint number; }
-struct MemoDeleteAllParams { bool all; }
+struct MemoDeleteParams { uint number; string channel; }
+struct MemoDeleteAllParams { bool all; string channel; }
 struct MemoIgnoreParams { string entry; }
 struct MemoLimitParams { uint limit; }
 struct AkillViewParams { string entry; }
@@ -326,9 +327,10 @@ Json validateParams(ServiceAction action, Json j) {
     final switch (action) {
         case ServiceAction.discover: case ServiceAction.botList: case ServiceAction.accountGroups:
         case ServiceAction.hostInfo: case ServiceAction.hostOn: case ServiceAction.hostOff:
-        case ServiceAction.memoList: case ServiceAction.operStats: case ServiceAction.akillList:
+        case ServiceAction.operStats: case ServiceAction.akillList:
         case ServiceAction.hostWaiting: case ServiceAction.globalQueue: case ServiceAction.memoIgnoreList:
         case ServiceAction.memoSettings: return decode!EmptyParams(j);
+        case ServiceAction.memoList: return decode!MemoListParams(j, ["channel"]);
         case ServiceAction.channelInfo: case ServiceAction.channelAccessList:
         case ServiceAction.channelModeLockList: case ServiceAction.channelAkickList:
         case ServiceAction.botInfo: case ServiceAction.botUnassign: return decode!ChannelParams(j);
@@ -374,7 +376,7 @@ Json validateParams(ServiceAction action, Json j) {
         case ServiceAction.accountPrivacy: return decode!PrivacyParams(j);
         case ServiceAction.hostRequest: return decode!HostRequestParams(j);
         case ServiceAction.memoRead: {
-            auto result = decode!MemoReadParams(j);
+            auto result = decode!MemoReadParams(j, ["channel"]);
             auto selection = requiredString(result, "selection");
             if (!["LAST", "NEW", "ALL"].canFind(selection)) {
                 enforce(selection.length <= 100, "Invalid memo selection");
@@ -386,11 +388,11 @@ Json validateParams(ServiceAction action, Json j) {
         case ServiceAction.memoSend: return decode!MemoSendParams(j, ["targetNick"]);
         case ServiceAction.memoDelete: {
             if (j["all"].type != Json.Type.undefined) {
-                auto everything = decode!MemoDeleteAllParams(j);
+                auto everything = decode!MemoDeleteAllParams(j, ["channel"]);
                 enforce(everything["all"].get!bool, "Invalid memo selection");
                 return everything;
             }
-            auto result = decode!MemoDeleteParams(j);
+            auto result = decode!MemoDeleteParams(j, ["channel"]);
             enforce(result["number"].get!uint > 0, "Invalid memo number");
             return result;
         }
@@ -435,7 +437,9 @@ private Json decode(T)(Json j, string[] optional = []) {
             validate(text);
             enforce(!containsLineTerminator(text) && text.length <= 8192, "Invalid service parameter");
             enforce(text.length || optional.canFind(field), "Missing service parameter");
-            static if (field == "channel") channelIdentifier(text);
+            static if (field == "channel") {
+                if (text.length || !optional.canFind(field)) channelIdentifier(text);
+            }
             else static if (field == "account") accountIdentifier(text, optional.canFind(field));
             else static if (field == "targetNick" || field == "nick" || field == "bot")
                 nickIdentifier(text, optional.canFind(field));
@@ -540,6 +544,18 @@ private string optionalString(Json j, string key) {
     assertNotThrown(validateParams(ServiceAction.memoDelete, Json(["all": Json(true)])));
     assertThrown(validateParams(ServiceAction.memoDelete, Json(["all": Json(false)])));
     assertThrown(validateParams(ServiceAction.memoDelete, Json(["all": Json(true), "number": Json(1)])));
+    assertNotThrown(validateParams(ServiceAction.memoList, Json.emptyObject));
+    assertNotThrown(validateParams(ServiceAction.memoList, Json(["channel": Json("#fiber")])));
+    assertNotThrown(validateParams(ServiceAction.memoList, Json(["channel": Json("")])));
+    assertThrown(validateParams(ServiceAction.memoList, Json(["channel": Json("fiber")])));
+    assertNotThrown(validateParams(ServiceAction.memoRead,
+        Json(["selection": Json("1"), "channel": Json("#fiber")])));
+    assertNotThrown(validateParams(ServiceAction.memoDelete,
+        Json(["number": Json(2), "channel": Json("#fiber")])));
+    assertNotThrown(validateParams(ServiceAction.memoDelete,
+        Json(["all": Json(true), "channel": Json("#fiber")])));
+    assertThrown(validateParams(ServiceAction.memoDelete,
+        Json(["all": Json(true), "number": Json(1), "channel": Json("#f")])));
     import std.array : replicate;
     assertNotThrown(validateParams(ServiceAction.memoIgnoreAdd, Json(["entry": Json("bob")])));
     assertNotThrown(validateParams(ServiceAction.memoIgnoreAdd, Json(["entry": Json("*!*@spam.example")])));

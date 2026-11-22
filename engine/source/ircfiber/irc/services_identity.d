@@ -25,6 +25,8 @@
  *    header as the (attacker-controlled) body, and reports the read state
  *    only from a fresh LIST; SEND is never re-sent and its receipt never
  *    carries the text.
+ *  - Channel memos are `LIST|READ|DEL <channel> …` (optional `channel`
+ *    param); every reply is verified to name that channel.
  *
  * Generic `details` omit own/private INFO, memo bodies and lists, generated
  * confirmation codes, decrypted password echoes and vhost DNS tokens.
@@ -233,6 +235,12 @@ private enum M_MEMO_ARRIVED_21 = "You have a new memo from %s. Type \x02%s\x1B%z
 private enum M_MEMO_X_ARRIVED_21 = "There is a new memo on channel %s. Type \x02%s\x1B%s\x1B%zu\x02 to read it.";
 private enum M_MEMO_ARRIVED_20 = "You have a new memo from %s.\nType \x02%s%s READ %d\x02 to read it.";
 private enum M_MEMO_X_ARRIVED_20 = "There is a new memo on channel %s.\nType \x02%s%s READ %s %d\x02 to read it.";
+private enum M_MEMO_X_NONE = "%s has no memos.";
+private enum M_MEMO_DELETED_ALL_CHAN = "All memos for channel %s have been deleted.";
+private enum M_MEMO_READ_HINT_CHAN_21 = "To delete, type: \x02%s %s %d\x02";
+private enum M_MEMO_READ_HINT_CHAN_20 = "To delete, type: \x02%s%s %s %s %d\x02";
+// Identical to services_channel.d's template of the same name.
+private enum M_CHAN_NOT_REGISTERED = "Channel \x02%s\x02 isn't registered.";
 /// Unsolicited MemoServ arrival notices (no `+reply`), both releases.
 private static immutable string[] MEMO_ARRIVALS = [M_MEMO_ARRIVED_21, M_MEMO_X_ARRIVED_21, M_MEMO_ARRIVED_20,
     M_MEMO_X_ARRIVED_20];
@@ -361,7 +369,13 @@ private static immutable string[3][] HOST_TOGGLE_REFUSALS = [
 private static immutable string[3][] MEMO_REFUSALS = [
     [M_MEMO_NONE, "r", "memo_not_found"],
     [M_MEMO_NOT_FOUND, "r", "memo_not_found"],
+    [M_CHAN_NOT_REGISTERED, "r", "channel_not_registered"],
+    [M_MEMO_X_NONE, "r", "memo_not_found"],
     ["Sorry, memo sending is temporarily disabled.", "u", "temporarily_unavailable"],
+];
+
+private static immutable string[3][] MEMO_LIST_REFUSALS = [
+    [M_CHAN_NOT_REGISTERED, "r", "channel_not_registered"],
 ];
 
 private static immutable string[3][] MEMO_IGNORE_REFUSALS = [
@@ -2044,18 +2058,26 @@ private bool parseFlexibleMemoRow(AnopeGrammar g, string line, out MemoEntry e) 
     return e.sender.length && !e.sender.canFind(' ');
 }
 
-MemoInbox parseMemoList(AnopeGrammar g, const ref ServiceFrame f) {
+/// With `channel`, the same listing for that channel: the header argument (or
+/// the lone `<channel> has no memos.`) must name it; a personal-only
+/// `You have no memos.` is then not accepted, nor the reverse.
+MemoInbox parseMemoList(AnopeGrammar g, const ref ServiceFrame f, string channel = "", NickEq same = null) {
     MemoInbox r;
     const(ServiceReplyLine)[] lines;
     foreach (ref l; f.lines)
         if (!memoArrival(g, l.plain)) lines ~= l;
     if (!lines.length) return r;
     string[] c;
-    if (lines.length == 1 && g.matches(M_MEMO_NONE, lines[0].plain, c)) {
+    if (lines.length == 1 && channel.length) {
+        if (g.matches(M_MEMO_X_NONE, lines[0].plain, c) && c.length && same !is null && same(c[0], channel))
+            r.ok = true;
+        if (r.ok) return r;
+    } else if (lines.length == 1 && g.matches(M_MEMO_NONE, lines[0].plain, c)) {
         r.ok = true;
         return r;
     }
     if (!g.matches(M_MEMO_LIST_HEADER, lines[0].plain, c) || lines.length < 2) return r;
+    if (channel.length && !(c.length && same !is null && same(c[0], channel))) return r;
     auto rows = lines[1 .. $];
     MemoEntry probe;
     // A header row never matches the flexible template.
@@ -2089,13 +2111,13 @@ private size_t unreadCount(const MemoEntry[] entries) {
     return n;
 }
 
-private Json inboxJson(string account, const MemoEntry[] entries) {
+private Json inboxJson(string account, const MemoEntry[] entries, string channel = "") {
     Json[] list;
     foreach (ref e; entries)
         list ~= Json(["number": Json(e.number), "sender": Json(e.sender), "sentAt": Json(e.sentAt),
             "unread": Json(e.unread)]);
-    return Json(["kind": Json("memoInbox"), "account": Json(account), "entries": Json(list),
-        "unreadCount": Json(cast(long) unreadCount(entries))]);
+    return Json(["kind": Json("memoInbox"), "account": Json(account), "channel": Json(channel),
+        "entries": Json(list), "unreadCount": Json(cast(long) unreadCount(entries))]);
 }
 
 /// `Anope::strftime` appends a translated relative age (`(%s ago)`,
@@ -2108,12 +2130,13 @@ string absoluteServiceTime(string text) {
     return open > 0 ? t[0 .. open] : t;
 }
 
-private Json inboxCanonical(string account, const MemoEntry[] entries) {
+private Json inboxCanonical(string account, const MemoEntry[] entries, string channel = "") {
     Json[] list;
     foreach (ref e; entries)
         list ~= Json(["number": Json(e.number), "sender": Json(e.sender.toLower),
             "sentAt": Json(absoluteServiceTime(e.sentAt)), "unread": Json(e.unread)]);
-    return Json(["kind": Json("memoInbox"), "account": Json(account.toLower), "entries": Json(list)]);
+    return Json(["kind": Json("memoInbox"), "account": Json(account.toLower), "channel": Json(channel.toLower),
+        "entries": Json(list)]);
 }
 
 @("services identity: memo revision ignores the relative age suffix")
@@ -2126,15 +2149,21 @@ unittest {
     assert(inboxCanonical("alice", [a]) == inboxCanonical("Alice", [b]));
 }
 
-/// Fresh LIST, parsed; answers the request itself on failure.
-private void readInbox(ServicesTransaction txn, AnopeGrammar g, void delegate(MemoInbox) done) {
-    txn.frame(readSpec("LIST", memoArrivalRelease(g)), (ServiceFrame f) {
+/// `READ <channel> 3` / `READ 3`.
+private string memoTarget(string channel, string tail) { return channel.length ? channel ~ " " ~ tail : tail; }
+private string memoListBody(string channel) { return channel.length ? "LIST " ~ channel : "LIST"; }
+
+/// Fresh LIST (personal, or of `channel`), parsed; answers the request itself on failure.
+private void readInbox(ServicesTransaction txn, AnopeGrammar g, string channel, void delegate(MemoInbox) done) {
+    const body_ = memoListBody(channel);
+    if (!fitsOrReject(txn, body_)) return;
+    txn.frame(readSpec(body_, memoArrivalRelease(g)), (ServiceFrame f) {
         ServiceStatus st;
         string reason;
         if (readFailed(txn, f)) return;
-        auto inbox = parseMemoList(g, f);
+        auto inbox = parseMemoList(g, f, channel, &txn.sameNick);
         if (!inbox.ok) {
-            if (findRefusal(g, f, null, st, reason)) txn.complete(st, reason);
+            if (findRefusal(g, f, MEMO_LIST_REFUSALS, st, reason)) txn.complete(st, reason);
             else txn.complete(ServiceStatus.unconfirmed, f.lines.length ? "unrecognized_reply" : "no_reply");
             return;
         }
@@ -2144,9 +2173,10 @@ private void readInbox(ServicesTransaction txn, AnopeGrammar g, void delegate(Me
 
 private void runMemoList(ServicesTransaction txn, AnopeGrammar g) {
     const account = txn.actor.account;
-    readInbox(txn, g, (MemoInbox inbox) {
-        const revision = servicesRevision(txn, inboxCanonical(account, inbox.entries));
-        auto data = inboxJson(account, inbox.entries);
+    const channel = paramString(txn, "channel");
+    readInbox(txn, g, channel, (MemoInbox inbox) {
+        const revision = servicesRevision(txn, inboxCanonical(account, inbox.entries, channel));
+        auto data = inboxJson(account, inbox.entries, channel);
         readCapabilities(txn, [
             ServiceAction.memoRead,
             ServiceAction.memoDelete,
@@ -2224,8 +2254,23 @@ private bool memoReadHeader(AnopeGrammar g, string line, out string[] caps) {
 }
 
 /// The optional delete hint naming exactly this memo number.
-private bool memoReadHint(AnopeGrammar g, string line, uint expected) {
+private bool memoReadHint(AnopeGrammar g, string line, uint expected, string channel = "", NickEq same = null) {
     const want = expected.to!string;
+    if (channel.length) {
+        // The command argument holds spaces, so the generic matcher finds the
+        // split ambiguous; the channel argument is a space-free token.
+        static immutable bool[3] tight21 = [false, true, true];
+        static immutable bool[5] tight20 = [false, false, false, true, true];
+        foreach (idx, m; [M_MEMO_READ_HINT_CHAN_21, M_MEMO_READ_HINT_CHAN_20]) {
+            const flags = idx == 0 ? tight21[] : tight20[];
+            foreach (v; g.variants(m)) {
+                string[] h;
+                if (printfCapture(v, normalizeServiceText(line), flags, h) && h.length >= 2 && h[$ - 1] == want
+                        && same !is null && same(h[$ - 2], channel)) return true;
+            }
+        }
+        return false;
+    }
     foreach (m; [M_MEMO_READ_HINT_21, M_MEMO_READ_HINT_20]) {
         string[] h;
         if (g.matches(m, line, h) && h.length && h[$ - 1] == want) return true;
@@ -2253,7 +2298,8 @@ struct MemoReadView {
     string text;
 }
 
-MemoReadView parseMemoRead(AnopeGrammar g, const ref ServiceFrame f, uint expected) {
+MemoReadView parseMemoRead(AnopeGrammar g, const ref ServiceFrame f, uint expected, string channel = "",
+        NickEq same = null) {
     MemoReadView r;
     if (!frameComplete(f)) return r;
     const(ServiceReplyLine)[] lines;
@@ -2276,7 +2322,7 @@ MemoReadView parseMemoRead(AnopeGrammar g, const ref ServiceFrame f, uint expect
     r.number = expected;
     r.sender = c[1];
     r.sentAt = c[2];
-    if (start < lines.length && memoReadHint(g, lines[start].plain, expected)) ++start;
+    if (start < lines.length && memoReadHint(g, lines[start].plain, expected, channel, same)) ++start;
     if (start >= lines.length) return r;
     string[] body_;
     foreach (ref l; lines[start .. $]) body_ ~= l.plain;
@@ -2311,21 +2357,24 @@ private uint memoSelection(string selection, const MemoEntry[] entries, out stri
 
 private void runMemoRead(ServicesTransaction txn, AnopeGrammar g) {
     const selection = paramString(txn, "selection");
+    const channel = paramString(txn, "channel");
     const account = txn.actor.account;
     requireHelp(txn, ServiceAction.memoRead, () {
-        readInbox(txn, g, (MemoInbox before) {
-            if (!requireServicesRevision(txn, servicesRevision(txn, inboxCanonical(account, before.entries)),
-                    inboxJson(account, before.entries), Json.undefined)) return;
+        readInbox(txn, g, channel, (MemoInbox before) {
+            if (!requireServicesRevision(txn, servicesRevision(txn, inboxCanonical(account, before.entries, channel)),
+                    inboxJson(account, before.entries, channel), Json.undefined)) return;
             string reason;
             const number = memoSelection(selection, before.entries, reason);
             if (!number) {
                 txn.complete(reason == "single_memo_only" ? ServiceStatus.unavailable : ServiceStatus.rejected, reason);
                 return;
             }
+            const readBody = "READ " ~ memoTarget(channel, number.to!string);
+            if (!fitsOrReject(txn, readBody)) return;
             // READ marks the memo read: a mutation with one number only.
-            txn.frame(writeSpec(txn, "READ " ~ number.to!string, ServiceFrameKind.ordinary), (ServiceFrame f) {
+            txn.frame(writeSpec(txn, readBody, ServiceFrameKind.ordinary), (ServiceFrame f) {
                 if (ambiguousWrite(txn, f)) return;
-                auto memo = parseMemoRead(g, f, number);
+                auto memo = parseMemoRead(g, f, number, channel, &txn.sameNick);
                 if (!memo.ok) {
                     ServiceStatus st;
                     string why;
@@ -2339,17 +2388,18 @@ private void runMemoRead(ServicesTransaction txn, AnopeGrammar g) {
                     else txn.complete(ServiceStatus.unconfirmed, f.lines.length ? "unrecognized_reply" : "no_reply");
                     return;
                 }
-                auto data = Json(["kind": Json("memo"), "account": Json(account), "number": Json(number),
-                    "sender": Json(memo.sender), "sentAt": Json(memo.sentAt), "text": Json(memo.text)]);
+                auto data = Json(["kind": Json("memo"), "account": Json(account), "channel": Json(channel),
+                    "number": Json(number), "sender": Json(memo.sender), "sentAt": Json(memo.sentAt),
+                    "text": Json(memo.text)]);
                 // The read state comes from a fresh LIST, not the READ reply.
-                txn.frame(readSpec("LIST", memoArrivalRelease(g)), (ServiceFrame lf) {
-                    auto after = parseMemoList(g, lf);
+                txn.frame(readSpec(memoListBody(channel), memoArrivalRelease(g)), (ServiceFrame lf) {
+                    auto after = parseMemoList(g, lf, channel, &txn.sameNick);
                     if (lf.outcome != ServiceFrameOutcome.completed || !frameComplete(lf) || !after.ok) {
                         txn.complete(ServiceStatus.unconfirmed, "readback_unavailable", data);
                         return;
                     }
-                    data["inbox"] = inboxJson(account, after.entries);
-                    const revision = servicesRevision(txn, inboxCanonical(account, after.entries));
+                    data["inbox"] = inboxJson(account, after.entries, channel);
+                    const revision = servicesRevision(txn, inboxCanonical(account, after.entries, channel));
                     const marked = number <= after.entries.length && !after.entries[number - 1].unread;
                     txn.complete(marked ? ServiceStatus.confirmed : ServiceStatus.unconfirmed,
                         marked ? "" : "readback_mismatch", data, revision);
@@ -2405,15 +2455,17 @@ bool memoDeleted(AnopeGrammar g, const ref ServiceFrame f, uint number) {
     return g.matches(M_MEMO_DELETED, f, c) && c.length && c[0] == number.to!string;
 }
 
-/// DEL ALL ack.
-bool memoDeletedAll(AnopeGrammar g, const ref ServiceFrame f) {
+/// DEL ALL ack: the personal one, or (with `channel`) the one naming it.
+bool memoDeletedAll(AnopeGrammar g, const ref ServiceFrame f, string channel = "", NickEq same = null) {
     string[] c;
+    if (channel.length) return g.matches(M_MEMO_DELETED_ALL_CHAN, f, c) && c.length && same !is null && same(c[0], channel);
     return g.matches(M_MEMO_DELETED_ALL, f, c);
 }
 
 private void runMemoDelete(ServicesTransaction txn, AnopeGrammar g) {
     const all = paramBool(txn, "all");
     const number = paramLong(txn, "number");
+    const channel = paramString(txn, "channel");
     const account = txn.actor.account;
     if (!all && (number <= 0 || number > uint.max)) {
         txn.complete(ServiceStatus.rejected, "memo_not_found");
@@ -2421,19 +2473,21 @@ private void runMemoDelete(ServicesTransaction txn, AnopeGrammar g) {
     }
     const n = all ? 0u : cast(uint) number;
     requireHelp(txn, ServiceAction.memoDelete, () {
-        readInbox(txn, g, (MemoInbox before) {
-            if (!requireServicesRevision(txn, servicesRevision(txn, inboxCanonical(account, before.entries)),
-                    inboxJson(account, before.entries), Json.undefined)) return;
+        readInbox(txn, g, channel, (MemoInbox before) {
+            if (!requireServicesRevision(txn, servicesRevision(txn, inboxCanonical(account, before.entries, channel)),
+                    inboxJson(account, before.entries, channel), Json.undefined)) return;
             if (all ? before.entries.length == 0 : n > before.entries.length) {
                 txn.complete(ServiceStatus.rejected, "memo_not_found");
                 return;
             }
-            txn.frame(writeSpec(txn, all ? "DEL ALL" : "DEL " ~ n.to!string, ServiceFrameKind.ordinary, null,
+            const delBody = "DEL " ~ memoTarget(channel, all ? "ALL" : n.to!string);
+            if (!fitsOrReject(txn, delBody)) return;
+            txn.frame(writeSpec(txn, delBody, ServiceFrameKind.ordinary, null,
                     memoArrivalRelease(g)), (ServiceFrame f) {
                 if (ambiguousWrite(txn, f)) return;
                 auto details = recognizedDetails(txn, g, f,
-                    [M_MEMO_DELETED, M_MEMO_DELETED_ALL] ~ refusalMsgids(MEMO_REFUSALS));
-                if (!(all ? memoDeletedAll(g, f) : memoDeleted(g, f, n))) {
+                    [M_MEMO_DELETED, M_MEMO_DELETED_ALL, M_MEMO_DELETED_ALL_CHAN] ~ refusalMsgids(MEMO_REFUSALS));
+                if (!(all ? memoDeletedAll(g, f, channel, &txn.sameNick) : memoDeleted(g, f, n))) {
                     ServiceStatus st;
                     string reason;
                     if (findRefusal(g, f, MEMO_REFUSALS, st, reason))
@@ -2443,8 +2497,8 @@ private void runMemoDelete(ServicesTransaction txn, AnopeGrammar g) {
                         Json.undefined, "", Json.undefined, details);
                     return;
                 }
-                txn.frame(readSpec("LIST", memoArrivalRelease(g)), (ServiceFrame lf) {
-                    auto after = parseMemoList(g, lf);
+                txn.frame(readSpec(memoListBody(channel), memoArrivalRelease(g)), (ServiceFrame lf) {
+                    auto after = parseMemoList(g, lf, channel, &txn.sameNick);
                     if (lf.outcome != ServiceFrameOutcome.completed || !frameComplete(lf) || !after.ok) {
                         txn.complete(ServiceStatus.unconfirmed, "readback_unavailable", Json.undefined, "",
                             Json.undefined, details);
@@ -2455,8 +2509,8 @@ private void runMemoDelete(ServicesTransaction txn, AnopeGrammar g) {
                             Json.undefined, details);
                         return;
                     }
-                    txn.complete(ServiceStatus.confirmed, "", inboxJson(account, after.entries),
-                        servicesRevision(txn, inboxCanonical(account, after.entries)), Json.undefined, details);
+                    txn.complete(ServiceStatus.confirmed, "", inboxJson(account, after.entries, channel),
+                        servicesRevision(txn, inboxCanonical(account, after.entries, channel)), Json.undefined, details);
                 });
             });
         });
@@ -2848,6 +2902,36 @@ unittest {
     assert(monoInbox.ok && monoInbox.entries.length == 2 && !monoInbox.entries[1].unread);
     auto gap = testFrame(["Memos for alice:", "Number  Sender  Date/Time", "* 2     bob     Nov 06 2026"]);
     assert(!parseMemoList(g, gap).ok);
+}
+
+@("services identity: channel memo replies must name the requested channel")
+unittest {
+    auto g = new AnopeGrammar(TEST_V21);
+    NickEq same = (string a, string b) => testSame(a, b);
+    auto list = testFrame(["Memos for #fiber:", "Number  Sender  Date/Time", "* 1     bob     Nov 06 2026"]);
+    auto inbox = parseMemoList(g, list, "#fiber", same);
+    assert(inbox.ok && inbox.entries.length == 1 && inbox.entries[0].unread, "channel list parses");
+    assert(!parseMemoList(g, list, "#other", same).ok, "header names another channel");
+    assert(parseMemoList(g, list).ok, "personal parse is unchanged");
+    auto none = testFrame(["#fiber has no memos."]);
+    auto empty = parseMemoList(g, none, "#fiber", same);
+    assert(empty.ok && !empty.entries.length, "channel empty parses");
+    assert(!parseMemoList(g, none, "#other", same).ok, "empty notice names another channel");
+    assert(!parseMemoList(g, none).ok, "a channel notice is not the personal empty inbox");
+    auto personalNone = testFrame(["You have no memos."]);
+    assert(!parseMemoList(g, personalNone, "#fiber", same).ok, "personal empty is not a channel empty");
+
+    auto hinted = testFrame(["Memo 11 from bob (Nov 06 2026).",
+        "To delete, type: \x02/msg MemoServ DEL\x1B#fiber\x1B11\x02", "the text"]);
+    auto r = parseMemoRead(g, hinted, 11, "#fiber", same);
+    assert(r.ok && r.text == "the text", "channel hint is consumed");
+    auto wrong = parseMemoRead(g, hinted, 11, "#other", same);
+    assert(wrong.ok && wrong.text.startsWith("To delete, type:"), "hint for another channel stays body");
+
+    auto all = testFrame(["All memos for channel #fiber have been deleted."]);
+    assert(memoDeletedAll(g, all, "#fiber", same), "channel ack accepted");
+    assert(!memoDeletedAll(g, all, "#other", same), "ack for another channel rejected");
+    assert(!memoDeletedAll(g, all), "channel ack is not the personal ack");
 }
 
 @("services identity: an accepted SET HIDE stays accepted-unverified")

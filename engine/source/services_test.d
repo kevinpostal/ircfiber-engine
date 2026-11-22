@@ -1200,6 +1200,91 @@ void fingerprintChecks() {
                 r.last.status != ServiceStatus.confirmed && countBody(r, "DEL ALL") == 0);
     }
     {
+        auto r = Rig.make();
+        size_t cursor;
+        bool readSent;
+        string[] memoReply(string service, string body) {
+            if (body == "LIST #fiber")
+                return ["Memos for #fiber:", "Number  Sender  Date/Time",
+                    (readSent ? "  1" : "* 1") ~ "     bob     Nov 06 2026"];
+            if (body == "LIST")
+                return ["Memos for acct:", "Number  Sender  Date/Time", "* 1     carol   Nov 07 2026"];
+            if (body == "HELP READ") return ["Syntax: READ [channel] {num | list | LAST | NEW | ALL}"];
+            if (body == "HELP SEND") return ["Syntax: SEND {nick | channel} memo-text"];
+            if (body == "HELP DEL") return ["Syntax: DEL [channel] {num | list | LAST | ALL}"];
+            if (body == "READ #fiber 1") {
+                readSent = true;
+                return ["Memo 1 from bob (Nov 06 2026).", "channel memo body"];
+            }
+            return ["Unknown command"];
+        }
+        r.run(r.request(ServiceAction.memoList, `{"channel":"#fiber"}`));
+        answer(r, cursor, &memoReply);
+        ok("channel memo LIST sends one LIST <channel> and no bare LIST",
+            r.last.status == ServiceStatus.confirmed && countBody(r, "LIST #fiber") == 1
+            && countBody(r, "LIST") == 0 && r.last.data["channel"].get!string == "#fiber");
+        const channelRevision = r.last.revision;
+        auto read = r.request(ServiceAction.memoRead, `{"selection":"1","channel":"#fiber"}`);
+        read.expectedRevision = channelRevision;
+        r.run(read);
+        answer(r, cursor, &memoReply);
+        ok("channel memo READ sends one READ <channel> n and confirms after the channel read-back",
+            r.last.status == ServiceStatus.confirmed && countBody(r, "READ #fiber 1") == 1
+            && countBody(r, "READ 1") == 0 && r.last.data["text"].get!string == "channel memo body"
+            && r.last.data["channel"].get!string == "#fiber");
+        r.run(r.request(ServiceAction.memoList, `{}`));
+        answer(r, cursor, &memoReply);
+        ok("a personal LIST after a channel one still sends a bare LIST under a different revision",
+            r.last.status == ServiceStatus.confirmed && countBody(r, "LIST") == 1
+            && r.last.revision != channelRevision);
+    }
+    foreach (scenario; ["all", "leftover", "notRegistered", "denied", "wrongChannel"]) {
+        auto r = Rig.make();
+        size_t cursor;
+        bool deleted;
+        string[] memoReply(string service, string body) {
+            if (body == "LIST #fiber") {
+                if (scenario == "notRegistered") return ["Channel \x02#fiber\x02 isn't registered."];
+                if (scenario == "denied") return ["Access denied."];
+                if (scenario == "wrongChannel") return ["Memos for #other:", "Number  Sender  Date/Time",
+                    "* 1     bob     Nov 06 2026"];
+                return scenario == "all" && deleted ? ["#fiber has no memos."]
+                    : ["Memos for #fiber:", "Number  Sender  Date/Time", "* 1     bob     Nov 06 2026"];
+            }
+            if (body == "HELP DEL") return ["Syntax: DEL [channel] {num | list | LAST | ALL}"];
+            if (body == "DEL #fiber ALL") {
+                deleted = true;
+                return ["All memos for channel #fiber have been deleted."];
+            }
+            return ["Unknown command"];
+        }
+        r.run(r.request(ServiceAction.memoList, `{"channel":"#fiber"}`));
+        answer(r, cursor, &memoReply);
+        if (scenario == "notRegistered")
+            ok("channel memo LIST of an unregistered channel is rejected channel_not_registered",
+                r.last.status == ServiceStatus.rejected && r.last.reasonCode == "channel_not_registered");
+        else if (scenario == "denied")
+            ok("channel memo LIST without the MEMO privilege is rejected access_denied",
+                r.last.status == ServiceStatus.rejected && r.last.reasonCode == "access_denied");
+        else if (scenario == "wrongChannel")
+            ok("channel memo LIST answering for another channel is never accepted",
+                r.last.status != ServiceStatus.confirmed);
+        else {
+            auto del = r.request(ServiceAction.memoDelete, `{"all":true,"channel":"#fiber"}`);
+            del.expectedRevision = r.last.revision;
+            r.run(del);
+            answer(r, cursor, &memoReply);
+            if (scenario == "all")
+                ok("channel memo DEL ALL sends one DEL <channel> ALL and confirms only the empty channel read-back",
+                    r.last.status == ServiceStatus.confirmed && countBody(r, "DEL #fiber ALL") == 1
+                    && countBody(r, "DEL ALL") == 0 && r.last.data["entries"].length == 0);
+            else
+                ok("channel memo DEL ALL stays unconfirmed when the channel read-back still lists memos",
+                    r.last.status == ServiceStatus.unconfirmed && r.last.reasonCode == "readback_mismatch"
+                    && countBody(r, "DEL #fiber ALL") == 1);
+        }
+    }
+    {
         static immutable ignoreHelp = ["Syntax: IGNORE [channel] ADD entry", "        IGNORE [channel] DEL entry",
             "        IGNORE [channel] LIST"];
         foreach (shape; ["empty", "fixed", "flexible", "v20header", "garbage"]) {
