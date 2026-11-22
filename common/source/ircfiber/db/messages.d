@@ -13,6 +13,7 @@ import vibe.data.bson;
 import vibe.data.json;
 import vibe.core.log;
 import ircfiber.db.mongo;
+import ircfiber.db.message_search : isSearchChannel, searchMetadata;
 import ircfiber.models.irc_event : IRCRawEvent;
 import ircfiber.models.network : normalizeChannelName, BncPlaybackCutoff,
     BncPlaybackConsumption, IrcCaseMapping, foldIrcCaseChar, ircCaseEquals;
@@ -297,6 +298,28 @@ final class MessageRepository {
         ensureIndexes();
     }
 
+    /// Provisioned by the indexing worker, not by chat writers on startup.
+    /// A single createIndexes lets Mongo build these in one collection scan.
+    static void ensureSearchIndexes() @trusted {
+        Bson[] indexes;
+        void add(string name, string[] fields, Bson partial = Bson.init) {
+            auto definition = Bson(["name": Bson(name), "key": indexKeys(fields)]);
+            if (partial.type == Bson.Type.object)
+                definition["partialFilterExpression"] = partial;
+            indexes ~= definition;
+        }
+        add("message_search_pending", ["searchPending", "_id"], Bson(["searchPending": Bson(true)]));
+        add("message_search_alias", ["networkId", "channel", "searchAliases"],
+            Bson(["searchAliases": Bson(["$exists": Bson(true)])]));
+        add("message_search_target", ["networkId", "channel", "searchTarget", "t", "eid", "_id"],
+            Bson(["searchTarget": Bson(["$exists": Bson(true)])]));
+        add("message_search_version", ["networkId", "channel", "searchVersion"]);
+        auto command = Bson.emptyObject;
+        command["createIndexes"] = Bson("messages");
+        command["indexes"] = Bson(indexes);
+        AppMongoConnection.runCommand(command);
+    }
+
     /// Build the compound query indexes, the `tsAt` TTL index (retention),
     /// and backfill `tsAt` on legacy rows in the background.
     private void ensureIndexes() @trusted {
@@ -471,14 +494,14 @@ final class MessageRepository {
 
         try {
             collection.insertOne(messageDocument(serverId, networkId, channel,
-                payloadStr, ts, eid, msgid));
+                message, payloadStr, ts, eid, msgid));
         } catch (Exception e) {
             logDebug("Mongo insert (probably duplicate): %s", e.msg);
         }
     }
 
     private static Bson messageDocument(string serverId, string networkId, string channel,
-            string payload, long timestampMs, long eid, string msgid) @trusted {
+            Json message, string payload, long timestampMs, long eid, string msgid) @trusted {
         auto jdoc = Json([
             "_id": Json(serverId ~ ":" ~ networkId ~ ":" ~ channel ~ ":" ~
                 (eid > 0 ? to!string(eid) : (msgid.length > 0 ? msgid : to!string(timestampMs)))),
@@ -494,6 +517,7 @@ final class MessageRepository {
         // Private conversations are kept for good: a row without `tsAt` is never
         // matched by the TTL index (see `isDirectBuffer`).
         if (!isDirectBuffer(channel)) doc["tsAt"] = Bson(BsonDate(timestampMs));
+        searchMetadata(doc, message);
         return doc;
     }
 
@@ -575,7 +599,7 @@ final class MessageRepository {
         string msgid;
         if (auto m = "m" in message)
             if (m.type == Json.Type.string) msgid = m.get!string;
-        const doc = messageDocument(serverId, networkId, channel, payload, timestampMs, eid, msgid);
+        const doc = messageDocument(serverId, networkId, channel, message, payload, timestampMs, eid, msgid);
         auto command = Bson.emptyObject; // Mongo requires the verb first.
         command["insert"] = Bson("messages");
         command["documents"] = Bson([doc]);
@@ -614,7 +638,7 @@ final class MessageRepository {
         command["update"] = Bson("messages");
         command["updates"] = Bson([Bson([
             "q": filter,
-            "u": Bson(["$set": Bson(["channel": Bson(newChannel)])]),
+            "u": searchRenameUpdate(oldChannel, newChannel),
             "multi": Bson(true),
             "upsert": Bson(false)
         ])]);
@@ -1001,7 +1025,7 @@ final class MessageRepository {
                 Bson(["serverId": Bson(serverId),
                       "networkId": Bson(networkId),
                       "channel": Bson(oldChan)]),
-                Bson(["$set": Bson(["channel": Bson(newChan)])]));
+                searchRenameUpdate(oldChan, newChan));
             if (res.modifiedCount > 0)
                 logInfo("Renamed Mongo channel %s:%s %s -> %s (%s docs)",
                     serverId, networkId, oldChan, newChan, res.modifiedCount.to!string);
@@ -1010,6 +1034,15 @@ final class MessageRepository {
             logWarn("renameChannel failed: %s", e.msg);
             return 0;
         }
+    }
+
+    // Eligible channel → eligible channel preserves classification, not scope.
+    // Crossing the channel/DM boundary requires classification before reads.
+    private static Bson searchRenameUpdate(string oldChannel, string channel) {
+        auto update = Bson(["$set": Bson(["channel": Bson(channel), "searchPending": Bson(true)])]);
+        if (isSearchChannel(oldChannel) != isSearchChannel(channel))
+            update["$unset"] = Bson(["searchVersion": Bson(1)]);
+        return update;
     }
 
     /// Convenience: append directly from an IRCRawEvent.
@@ -1211,7 +1244,7 @@ final class MessageRepository {
         return historyWindow(serverId, networkId, channel, after, before, count, fromNewest, events);
     }
 
-    private static Bson boundaryFilter(HistoryBoundary boundary, bool after, bool inclusive = false) {
+    static Bson boundaryFilter(HistoryBoundary boundary, bool after, bool inclusive = false) {
         const op = after ? "$gt" : "$lt";
         const edgeOp = inclusive ? (after ? "$gte" : "$lte") : op;
         if (!boundary.exact)
