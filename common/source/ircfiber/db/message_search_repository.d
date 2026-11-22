@@ -36,6 +36,10 @@ struct MessageSearchContext {
 
 private struct EvidenceBudget {
     MonoTime deadline;
+    size_t evidenceBytes;
+    // Cumulative raw source bytes, including worker hints and repeated reads.
+    // Row limits alone do not bound JSON payload/evidence memory.
+    private enum size_t maxEvidenceBytes = 32 * 1024 * 1024;
     static EvidenceBudget start() {
         return EvidenceBudget(MonoTime.currTime + 5.seconds);
     }
@@ -45,6 +49,12 @@ private struct EvidenceBudget {
             throw new MessageSearchEvidenceException(MessageSearchEvidenceFailure.limitExceeded);
         return min(remaining, 2_000L);
     }
+    void account(Bson doc) {
+        const bytes = doc.data.length;
+        if (bytes > maxEvidenceBytes - evidenceBytes)
+            throw new MessageSearchEvidenceException(MessageSearchEvidenceFailure.limitExceeded);
+        evidenceBytes += bytes;
+    }
 }
 
 /// Authoritative retained-history evidence, independent of the external index.
@@ -52,13 +62,19 @@ private struct EvidenceBudget {
 final class MessageSearchRepository {
     private MongoCollection collection;
     private MongoCollection networks;
+    private Bson sourceProjection;
     private enum size_t maxBatch = 250;
+    private enum size_t maxWorkerBatch = 1_000;
     private enum size_t maxEvidence = 10_000;
     private enum size_t maxContextScan = 10_000;
 
     this() {
         collection = AppMongoConnection.getDb()["messages"];
         networks = AppMongoConnection.getDb()["networks"];
+        sourceProjection = Bson.emptyObject;
+        foreach (field; ["_id", "networkId", "channel", "t", "eid", "payload", "msgid",
+                "searchVersion", "searchKind", "searchAliases", "searchTarget"])
+            sourceProjection[field] = Bson(1);
     }
 
     /// Results align with requested IDs, including invisible entries for absent,
@@ -132,6 +148,193 @@ final class MessageSearchRepository {
         return result;
     }
 
+    /// Worker hints have a separate cap; public ID/context requests stay at 250.
+    /// Only fresh Mongo rows become bases or evidence. The first owner lookup
+    /// already supplies canonical sources and complete ownership for its aliases;
+    /// query again only for aliases introduced by those owners.
+    /// A supplied monotonic deadline is shared across caller-side partitions;
+    /// it can shorten, but never extend, this invocation's five-second budget.
+    SearchResolution[] resolveChangedRowsWorker(Bson[] changedRows,
+            MessageSearchScope[] scopes, MonoTime deadline = MonoTime.init) @trusted {
+        auto budget = EvidenceBudget.start();
+        if (deadline != MonoTime.init) budget.deadline = min(budget.deadline, deadline);
+        budget.remainingMs();
+        scopes = normalizedScopes(scopes);
+        if (changedRows.length > maxWorkerBatch) fail(MessageSearchEvidenceFailure.limitExceeded);
+        requireClassified(scopes, budget, true);
+        string[] ids;
+        bool[string] seenIds;
+        foreach (doc; changedRows) {
+            budget.account(doc);
+            const id = stringField(doc, "_id");
+            if (id.length && id !in seenIds) {
+                seenIds[id] = true;
+                ids ~= id;
+            }
+        }
+        auto current = readIds(ids, scopes, budget);
+        string[] baseIds;
+        bool[string] seenBases;
+        string[][MessageSearchScope] aliases;
+        bool[ScopedAlias] seenAliases;
+        SearchRow[string] canonical;
+        void discover(SearchRow row) {
+            if (!allowed(row, scopes)) return;
+            const scope_ = MessageSearchScope(row.networkId, row.channel);
+            if (row.classification.kind == SearchKind.message) {
+                if (row.rowId !in seenBases) {
+                    seenBases[row.rowId] = true;
+                    baseIds ~= row.rowId;
+                }
+                foreach (name; row.classification.aliases)
+                    addWorkerAlias(aliases, seenAliases, scope_, name);
+            } else if (row.classification.kind == SearchKind.edit
+                    || row.classification.kind == SearchKind.redact) {
+                addWorkerAlias(aliases, seenAliases, scope_, row.classification.target);
+            }
+        }
+        foreach (doc; changedRows) discover(searchRow(doc));
+        foreach (doc; current) {
+            // Validate every fresh source, including controls, before its
+            // payload-derived aliases or target can select indexed evidence.
+            auto row = checkedRow(doc);
+            discover(row);
+            const id = stringField(doc, "_id");
+            canonical[id] = row;
+        }
+        SearchRow[string] evidence;
+        foreach (doc; readWorkerAliases(aliases, false, budget)) {
+            auto row = checkedRow(doc);
+            if (row.classification.kind != SearchKind.message)
+                fail(MessageSearchEvidenceFailure.unclassified);
+            const id = stringField(doc, "_id");
+            canonical[id] = row;
+            evidence[id] = row;
+            if (id !in seenBases) {
+                seenBases[id] = true;
+                baseIds ~= id;
+            }
+        }
+        if (baseIds.length > maxEvidence) fail(MessageSearchEvidenceFailure.limitExceeded);
+        SearchRow[] bases;
+        bases.reserve(baseIds.length);
+        string[][MessageSearchScope] baseAliases;
+        bool[ScopedAlias] seenBaseAliases;
+        string[][MessageSearchScope] missingAliases;
+        string[] missingIds;
+        foreach (id; baseIds) {
+            auto row = id in canonical;
+            if (!row) {
+                missingIds ~= id;
+                continue;
+            }
+            if (!allowed(*row, scopes)) {
+                missingIds ~= id;
+                continue;
+            }
+            bases ~= *row;
+            if (row.classification.kind != SearchKind.message) continue;
+            const scope_ = MessageSearchScope(row.networkId, row.channel);
+            foreach (name; row.classification.aliases) {
+                const key = ScopedAlias(scope_, name);
+                if (key in seenBaseAliases) continue;
+                addWorkerAlias(baseAliases, seenBaseAliases, scope_, name);
+                if (key !in seenAliases) missingAliases[scope_] ~= name;
+            }
+        }
+        foreach (doc; readWorkerAliases(missingAliases, false, budget)) {
+            auto row = checkedRow(doc);
+            if (row.classification.kind != SearchKind.message)
+                fail(MessageSearchEvidenceFailure.unclassified);
+            evidence[stringField(doc, "_id")] = row;
+            if (evidence.length > maxEvidence) fail(MessageSearchEvidenceFailure.limitExceeded);
+        }
+        foreach (doc; readWorkerAliases(baseAliases, true, budget)) {
+            auto row = checkedRow(doc);
+            if (row.classification.kind != SearchKind.edit
+                    && row.classification.kind != SearchKind.redact)
+                fail(MessageSearchEvidenceFailure.unclassified);
+            evidence[stringField(doc, "_id")] = row;
+            if (evidence.length > maxEvidence) fail(MessageSearchEvidenceFailure.limitExceeded);
+        }
+        auto result = resolveWorkerBases(bases, evidence, seenBaseAliases, budget);
+        foreach (id; missingIds) {
+            SearchResolution absent;
+            absent.original.rowId = id;
+            result ~= absent;
+        }
+        requireClassified(scopes, budget, true);
+        return result;
+    }
+
+    /// Each branch fixes the leading network/channel index keys and implies the
+    /// existing partial index predicate. Never hint the mixed owner/control OR:
+    /// a single partial index would silently omit the other kind of evidence.
+    private Bson[] readWorkerAliases(string[][MessageSearchScope] aliases, bool mutations,
+            ref EvidenceBudget budget) {
+        Bson[] clauses;
+        foreach (scope_, names; aliases) {
+            if (!names.length) continue;
+            auto filter = exactScopeFilter(scope_);
+            filter[mutations ? "searchTarget" : "searchAliases"] =
+                Bson(["$in": serializeToBson(names), "$exists": Bson(true)]);
+            clauses ~= filter;
+        }
+        if (!clauses.length) return null;
+        return read(Bson(["$or": Bson(clauses)]), maxEvidence, budget, Bson.init,
+            mutations ? "message_search_target" : "message_search_alias");
+    }
+
+    /// Index evidence by exact scoped alias, not the whole channel. A reusable
+    /// scratch slice and generation marks avoid allocating/deduplicating a new
+    /// related-row array for every base, while preserving the pure resolver.
+    private SearchResolution[] resolveWorkerBases(SearchRow[] bases,
+            SearchRow[string] evidence, bool[ScopedAlias] wantedAliases,
+            ref EvidenceBudget budget) {
+        SearchRow[] rows;
+        rows.reserve(evidence.length);
+        size_t[][ScopedAlias] byAlias;
+        foreach (row; evidence) {
+            const index = rows.length;
+            rows ~= row;
+            const scope_ = MessageSearchScope(row.networkId, row.channel);
+            if (row.classification.kind == SearchKind.message) {
+                foreach (name; row.classification.aliases) {
+                    const key = ScopedAlias(scope_, name);
+                    if (key in wantedAliases) byAlias[key] ~= index;
+                }
+            } else if (row.classification.kind == SearchKind.edit
+                    || row.classification.kind == SearchKind.redact) {
+                const key = ScopedAlias(scope_, row.classification.target);
+                if (key in wantedAliases) byAlias[key] ~= index;
+            }
+        }
+        auto scratch = new SearchRow[rows.length];
+        auto marks = new size_t[rows.length];
+        SearchResolution[] result;
+        result.reserve(bases.length);
+        const oldest = Clock.currTime().toUnixTime!long * 1000
+            - cast(long) messageRetentionDays() * 86_400_000;
+        foreach (i, base; bases) {
+            budget.remainingMs();
+            size_t count;
+            const scope_ = MessageSearchScope(base.networkId, base.channel);
+            foreach (name; base.classification.aliases) {
+                auto related = ScopedAlias(scope_, name) in byAlias;
+                if (!related) continue;
+                foreach (index; *related) {
+                    if (marks[index] == i + 1) continue;
+                    marks[index] = i + 1;
+                    scratch[count++] = rows[index];
+                }
+            }
+            auto resolved = resolveSearchMessage(base, scratch[0 .. count]);
+            if (base.t <= oldest) resolved.visible = false;
+            result ~= resolved;
+        }
+        return result;
+    }
+
     /// Exact storage reference, not msgid/time inference. Fills each side after
     /// folding all scoped controls, including mutations outside the raw window.
     /// Exhausting the bounded evidence budget throws, never pretends an edge.
@@ -165,12 +368,15 @@ final class MessageSearchRepository {
         requireClassified(normalizedScopes(scopes), budget);
     }
 
-    private void requireClassified(MessageSearchScope[] scopes, ref EvidenceBudget budget) {
+    private void requireClassified(MessageSearchScope[] scopes, ref EvidenceBudget budget,
+            bool worker = false) {
         auto filter = scopeFilter(scopes);
         filter["searchVersion"] = Bson(["$ne": Bson(cast(int) MESSAGE_SEARCH_VERSION)]);
         FindOptions mixedOptions;
         mixedOptions.limit = 1;
         mixedOptions.maxTimeMS = budget.remainingMs();
+        mixedOptions.projection = Bson(["_id": Bson(1)]);
+        if (worker) mixedOptions.hint = Bson("message_search_version");
         foreach (doc; collection.find(filter, mixedOptions))
             fail(MessageSearchEvidenceFailure.unclassified);
         // Orphaned network content is never searchable, even during rebuilding.
@@ -180,6 +386,10 @@ final class MessageSearchRepository {
         FindOptions options;
         options.limit = cast(long) requested.length;
         options.maxTimeMS = budget.remainingMs();
+        options.projection = Bson(["_id": Bson(0), "id": Bson(1)]);
+        // Worker setup provisions this index; a missing hint must fail closed,
+        // never fall back to scanning the networks collection.
+        if (worker) options.hint = Bson("message_search_network_owner");
         bool[string] existing;
         foreach (doc; networks.find(Bson(["id": Bson(["$in": serializeToBson(requested)])]), options)) {
             const id = stringField(doc, "id");
@@ -260,7 +470,7 @@ final class MessageSearchRepository {
         if (ids.length > maxEvidence) fail(MessageSearchEvidenceFailure.limitExceeded);
         auto filter = scopeFilter(scopes);
         filter["_id"] = Bson(["$in": serializeToBson(ids)]);
-        return read(filter, maxEvidence, budget);
+        return read(filter, maxEvidence, budget, Bson.init, "_id_");
     }
 
     /// One query for all scoped alias owners and mutations, not one per hit.
@@ -285,11 +495,13 @@ final class MessageSearchRepository {
     }
 
     private Bson[] read(Bson filter, size_t limit, ref EvidenceBudget budget,
-            Bson order = Bson.init) {
+            Bson order = Bson.init, string hint = "") {
         FindOptions options;
         // Fetch one extra so bounded lookup cannot silently omit a tombstone.
         options.limit = cast(long) limit + 1;
         options.maxTimeMS = budget.remainingMs();
+        options.projection = sourceProjection;
+        if (hint.length) options.hint = Bson(hint);
         if (order.type != Bson.Type.undefined) options.sort = order;
         Bson[] result;
         foreach (doc; collection.find(filter, options)) {
@@ -298,6 +510,7 @@ final class MessageSearchRepository {
                 if (limit == maxBatch && order.type != Bson.Type.undefined) break;
                 fail(MessageSearchEvidenceFailure.limitExceeded);
             }
+            budget.account(doc);
             result ~= doc;
         }
         return result;
@@ -340,6 +553,20 @@ private bool allowed(SearchRow row, MessageSearchScope[] scopes) {
     return false;
 }
 
+private struct ScopedAlias {
+    MessageSearchScope scope_;
+    string name;
+}
+
+private void addWorkerAlias(ref string[][MessageSearchScope] aliases,
+        ref bool[ScopedAlias] seen, MessageSearchScope scope_, string name) {
+    if (!name.length) return;
+    const key = ScopedAlias(scope_, name);
+    if (key in seen) return;
+    seen[key] = true;
+    aliases[scope_] ~= name;
+}
+
 private void addAlias(ref string[][MessageSearchScope] aliases, MessageSearchScope scope_, string alias_) {
     if (!alias_.length) return;
     auto existing = scope_ in aliases;
@@ -354,10 +581,15 @@ private void addAliases(ref string[][MessageSearchScope] aliases, SearchRow row)
 
 private SearchRow checkedRow(Bson doc) {
     auto row = searchRow(doc);
+    checkMetadata(doc, row);
+    return row;
+}
+
+private void checkMetadata(Bson doc, SearchRow row) {
     if (!row.rowId.length) {
         if (stringField(doc, "searchKind") != "skip")
             fail(MessageSearchEvidenceFailure.unclassified);
-        return row;
+        return;
     }
     // Metadata selects batched evidence; any mismatch invalidates the request
     // rather than risking attachment to an unrelated event or missed deletion.
@@ -367,17 +599,20 @@ private SearchRow checkedRow(Bson doc) {
     if (row.classification.kind == SearchKind.message) {
         if (doc["searchAliases"].type != Bson.Type.array)
             fail(MessageSearchEvidenceFailure.unclassified);
-        string[] aliases;
-        foreach (value; doc["searchAliases"]) {
-            if (value.type != Bson.Type.string) fail(MessageSearchEvidenceFailure.unclassified);
-            aliases ~= value.get!string;
+        const stored = doc["searchAliases"];
+        size_t index;
+        foreach (value; stored) {
+            if (index >= row.classification.aliases.length || value.type != Bson.Type.string
+                    || value.get!string != row.classification.aliases[index])
+                fail(MessageSearchEvidenceFailure.unclassified);
+            ++index;
         }
-        if (aliases != row.classification.aliases) fail(MessageSearchEvidenceFailure.unclassified);
+        if (index != row.classification.aliases.length)
+            fail(MessageSearchEvidenceFailure.unclassified);
     } else if (row.classification.kind == SearchKind.edit || row.classification.kind == SearchKind.redact) {
         if (stringField(doc, "searchTarget") != row.classification.target)
             fail(MessageSearchEvidenceFailure.unclassified);
     }
-    return row;
 }
 
 private string kindName(SearchKind kind) {

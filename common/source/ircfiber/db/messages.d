@@ -298,8 +298,8 @@ final class MessageRepository {
         ensureIndexes();
     }
 
-    /// Provisioned by the indexing worker, not by chat writers on startup.
-    /// A single createIndexes lets Mongo build these in one collection scan.
+    /// Admin-only provisioning, never performed with worker/chat credentials.
+    /// A single createIndexes lets Mongo build source indexes in one scan.
     static void ensureSearchIndexes() @trusted {
         Bson[] indexes;
         void add(string name, string[] fields, Bson partial = Bson.init) {
@@ -322,6 +322,13 @@ final class MessageRepository {
         command["createIndexes"] = Bson("messages");
         command["indexes"] = Bson(indexes);
         AppMongoConnection.runCommand(command);
+        // Ownership probes must remain indexed as the account count grows.
+        auto ownership = Bson.emptyObject;
+        ownership["createIndexes"] = Bson("networks");
+        ownership["indexes"] = Bson([Bson([
+            "name": Bson("message_search_network_owner"),
+            "key": indexKeys(["id", "userId"])])]);
+        AppMongoConnection.runCommand(ownership);
     }
 
     /// Build the compound query indexes, the `tsAt` TTL index (retention),
