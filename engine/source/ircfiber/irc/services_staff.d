@@ -2037,6 +2037,17 @@ version (ServicesWireHarness) {
         }
         {
             auto r = StaffRig.make(candidate21);
+            r.anope.reply("HELP WAITING", helpOk("WAITING", "hostserv/set"));
+            r.anope.reply("HELP ACTIVATE", helpOk("ACTIVATE nick", "hostserv/set"));
+            r.anope.reply("HELP REJECT", helpOk("REJECT nick [reason]", "hostserv/set"));
+            r.anope.reply("WAITING", ["Displayed \x020\x02 records (\x020\x02 total)."]);
+            auto w = r.run(ServiceAction.hostWaiting, `{}`);
+            ok("staff: a candidate release proves ACTIVATE from its exact `ACTIVATE nick` syntax",
+                answered(w, ServiceStatus.confirmed) && capState(w, "hostWaiting") == "allowed"
+                && capState(w, "hostReject") == "allowed" && capState(w, "hostActivate") == "allowed");
+        }
+        {
+            auto r = StaffRig.make(candidate21);
             r.anope.reply("HELP GLOBAL", helpOk("GLOBAL [message]", "global/global"));
             r.anope.reply("HELP QUEUE", helpOk("QUEUE LIST [message]", "global/queue"));
             r.anope.reply("QUEUE LIST", ["You have no messages queued."]);
