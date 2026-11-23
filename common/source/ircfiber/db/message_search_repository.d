@@ -183,6 +183,11 @@ final class MessageSearchRepository {
         bool[string] seenBases;
         string[][MessageSearchScope] aliases;
         bool[ScopedAlias] seenAliases;
+        // Aliases owned by rows in this batch. Reading every owner's aliases back
+        // from the large alias index costs random I/O per row, so collisions are
+        // only checked for rows that actually have an edit or redaction.
+        string[][MessageSearchScope] ownAliases;
+        bool[ScopedAlias] seenOwn;
         SearchRow[string] canonical;
         void discover(SearchRow row) {
             if (!allowed(row, scopes)) return;
@@ -193,7 +198,7 @@ final class MessageSearchRepository {
                     baseIds ~= row.rowId;
                 }
                 foreach (name; row.classification.aliases)
-                    addWorkerAlias(aliases, seenAliases, scope_, name);
+                    addWorkerAlias(ownAliases, seenOwn, scope_, name);
             } else if (row.classification.kind == SearchKind.edit
                     || row.classification.kind == SearchKind.redact) {
                 addWorkerAlias(aliases, seenAliases, scope_, row.classification.target);
@@ -208,7 +213,40 @@ final class MessageSearchRepository {
             const id = stringField(doc, "_id");
             canonical[id] = row;
         }
+        // Controls are rare and have their own small partial index: read them
+        // first and expand collision reads only for aliases they target.
         SearchRow[string] evidence;
+        bool[ScopedAlias] controlled;
+        string[][MessageSearchScope] probe;
+        bool[ScopedAlias] seenProbe;
+        foreach (scope_, names; ownAliases)
+            foreach (name; names) addWorkerAlias(probe, seenProbe, scope_, name);
+        foreach (scope_, names; aliases)
+            foreach (name; names) addWorkerAlias(probe, seenProbe, scope_, name);
+        foreach (doc; readWorkerAliases(probe, true, budget)) {
+            auto row = checkedRow(doc);
+            if (row.classification.kind != SearchKind.edit
+                    && row.classification.kind != SearchKind.redact)
+                fail(MessageSearchEvidenceFailure.unclassified);
+            const controlScope = MessageSearchScope(row.networkId, row.channel);
+            controlled[ScopedAlias(controlScope, row.classification.target)] = true;
+            addWorkerAlias(aliases, seenAliases, controlScope, row.classification.target);
+            evidence[stringField(doc, "_id")] = row;
+            if (evidence.length > maxEvidence) fail(MessageSearchEvidenceFailure.limitExceeded);
+        }
+        bool[string] skipCollision;
+        foreach (id; baseIds) {
+            auto owner = id in canonical;
+            if (!owner || owner.classification.kind != SearchKind.message) continue;
+            const ownerScope = MessageSearchScope(owner.networkId, owner.channel);
+            bool hasControl;
+            foreach (name; owner.classification.aliases)
+                if (ScopedAlias(ownerScope, name) in controlled) { hasControl = true; break; }
+            if (hasControl) {
+                foreach (name; owner.classification.aliases)
+                    addWorkerAlias(aliases, seenAliases, ownerScope, name);
+            } else skipCollision[id] = true;
+        }
         foreach (doc; readWorkerAliases(aliases, false, budget)) {
             auto row = checkedRow(doc);
             if (row.classification.kind != SearchKind.message)
@@ -245,7 +283,7 @@ final class MessageSearchRepository {
                 const key = ScopedAlias(scope_, name);
                 if (key in seenBaseAliases) continue;
                 addWorkerAlias(baseAliases, seenBaseAliases, scope_, name);
-                if (key !in seenAliases) missingAliases[scope_] ~= name;
+                if (key !in seenAliases && id !in skipCollision) missingAliases[scope_] ~= name;
             }
         }
         foreach (doc; readWorkerAliases(missingAliases, false, budget)) {
