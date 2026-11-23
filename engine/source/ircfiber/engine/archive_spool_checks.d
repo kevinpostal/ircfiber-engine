@@ -28,6 +28,7 @@ import ircfiber.engine.archive_spool : ArchiveSpool, ArchiveSpoolConfig,
     ArchiveOperationStatus, ArchiveOperationState, ArchiveLookup,
     decodeArchiveRecord, archiveMaxRecordBytes, archiveSegmentBytes;
 import ircfiber.runtime_diagnostic : RuntimeDiagnosticMailbox, DiagnosticAdmission;
+import vibe.data.json : Json, parseJsonString;
 
 private enum ulong fixtureBudget = 32UL * 1024 * 1024;
 private enum string fixturePrefix = "ircfiber-archive-check-";
@@ -35,6 +36,7 @@ private enum string originalCompact =
     "{\"eid\":71001,\"t\":1700000000123,\"m\":\"original compact\"}";
 private enum long originalEid = 71001;
 private enum long originalTimestamp = 1_700_000_000_123;
+private enum string originalOwner = "b15d4ea7-a665-4d1d-94d8-626803a7c7ad";
 
 private void requireCheck(bool condition, string reason) {
     if (!condition) throw new Exception(reason);
@@ -170,8 +172,93 @@ private void checkOriginal(ref ArchiveRecord record) {
     requireCheck(record.kind == ArchiveKind.append && record.serverId == "original-server"
         && record.networkId == "original-network" && record.channel == "#original"
         && record.eid == originalEid && record.timestampMs == originalTimestamp
-        && record.compactJson == originalCompact,
-        "replay changed original attribution, eid, timestamp or compact bytes");
+        && record.compactJson == originalCompact && record.ownerId == originalOwner
+        && !record.pendingCatalog,
+        "replay changed original attribution, owner, eid, timestamp or compact bytes");
+}
+
+private void recordVersionCheck() {
+    auto legacy = Json.emptyObject;
+    legacy["kind"] = "append";
+    legacy["serverId"] = "original-server"; legacy["networkId"] = "original-network";
+    legacy["channel"] = "#original"; legacy["queuedAtMs"] = originalTimestamp + 1;
+    legacy["eid"] = originalEid; legacy["timestampMs"] = originalTimestamp;
+    legacy["payload"] = originalCompact;
+    auto record = decodeArchiveRecord(legacy.toString(), 7);
+    requireCheck(record.sequence == 7 && !record.ownerId.length && !record.pendingCatalog
+        && record.compactJson == originalCompact && record.timestampMs == originalTimestamp,
+        "legacy ownerless decode fabricated ownership or changed event bytes");
+    legacy["pendingCatalogOwner"] = originalOwner;
+    record = decodeArchiveRecord(legacy.toString(), 8);
+    requireCheck(record.ownerId == originalOwner && record.pendingCatalog,
+        "legacy pending-catalog proof was lost");
+
+    auto current = parseJsonString(legacy.toString());
+    current.remove("pendingCatalogOwner");
+    current["recordVersion"] = 2;
+    current["ownerId"] = originalOwner; current["pendingCatalog"] = false;
+    record = decodeArchiveRecord(current.toString(), 9);
+    checkOriginal(record);
+    void rejected(Json candidate) {
+        bool failed;
+        try decodeArchiveRecord(candidate.toString(), 10);
+        catch (Exception) { failed = true; }
+        requireCheck(failed, "invalid/versioned ownership record was accepted");
+    }
+    auto invalid = parseJsonString(current.toString());
+    invalid["ownerId"] = "";
+    rejected(invalid);
+    invalid = parseJsonString(current.toString());
+    invalid.remove("ownerId");
+    rejected(invalid);
+    invalid = parseJsonString(current.toString());
+    invalid["recordVersion"] = 3;
+    rejected(invalid);
+    invalid = parseJsonString(current.toString());
+    invalid["pendingCatalogOwner"] = originalOwner;
+    rejected(invalid);
+}
+
+private void admittedOwnerRecoveryCheck() {
+    auto root = createRoot();
+    ArchiveSpool spool;
+    scope(exit) { stopOwned(spool); removeOwned(root); }
+    spool = new ArchiveSpool(fixtureConfig(root));
+    awaitReady(spool);
+    requireCheck(spool.tryAppend("original-server", "original-network", "#original",
+        originalEid, originalCompact, "") == ArchiveAdmission.unavailable,
+        "new append admitted without owner");
+    requireCheck(spool.tryRename("original-server", "original-network", "#original", "#after",
+        originalEid, originalTimestamp, "") == ArchiveAdmission.unavailable,
+        "new rename admitted without owner");
+    queueAppend(spool, "original-server", "original-network", "#original", originalEid, originalCompact);
+    requireCheck(until({
+        return spool.tryAppend("original-server", "original-network", "#original",
+            originalEid, originalCompact, originalOwner, true) == ArchiveAdmission.queued;
+    }), "pending owner append was not admitted");
+    requireCheck(until({
+        return spool.tryRename("original-server", "original-network", "#original", "#after",
+            originalEid, originalTimestamp, originalOwner) == ArchiveAdmission.queued;
+    }), "established owner rename was not admitted");
+    auto status = awaitStatus(spool, (ref ArchiveSpoolStatus s) => s.durableSequence == 3 || s.failed);
+    requireCheck(!status.failed, "owner fixture failed before restart");
+    stopOwned(spool);
+    spool = new ArchiveSpool(fixtureConfig(root));
+    awaitReady(spool);
+    auto record = takeRecord(spool);
+    checkOriginal(record);
+    acknowledge(spool, record.sequence);
+    record = takeRecord(spool);
+    requireCheck(record.ownerId == originalOwner && record.pendingCatalog
+        && record.compactJson == originalCompact && record.timestampMs == originalTimestamp,
+        "restart lost pending-catalog owner or original event bytes");
+    acknowledge(spool, record.sequence);
+    record = takeRecord(spool);
+    requireCheck(record.kind == ArchiveKind.rename && record.ownerId == originalOwner
+        && !record.pendingCatalog && record.newChannel == "#after",
+        "restart lost established rename ownership");
+    acknowledge(spool, record.sequence);
+    noRecord(spool);
 }
 
 // The parent executable must dispatch this hook before constructing any ordinary
@@ -612,7 +699,7 @@ private void quotaAndOversizeCheck() {
     // Fast rejection occurs before any giant JSON is parsed or queued.
     auto huge = new char[archiveMaxRecordBytes + 1];
     huge[] = 'x';
-    requireCheck(spool.tryAppend("quota-server", "quota-network", "#quota", 1, huge.idup)
+    requireCheck(spool.tryAppend("quota-server", "quota-network", "#quota", 1, huge.idup, originalOwner)
         == ArchiveAdmission.oversized, "oversized record was not explicitly rejected");
     auto status = awaitStatus(spool,
         (ref ArchiveSpoolStatus s) => hasGap(s, "admission_rejected") || s.failed);
@@ -685,7 +772,7 @@ private void startupIoFailureCheck() {
     requireCheck(!status.ready && status.gapCount > 0 && status.failureReason.length > 0,
         "filesystem failure was not explicitly unavailable/degraded");
     requireCheck(spool.tryAppend("original-server", "original-network", "#original",
-        originalEid, originalCompact) == ArchiveAdmission.unavailable,
+        originalEid, originalCompact, originalOwner) == ArchiveAdmission.unavailable,
         "failed journal accepted an archival message");
     requireCheck(readText(obstruction) == "retain this evidence", "failed open changed unrelated fixture bytes");
 }
@@ -709,7 +796,7 @@ private void queueAppend(ArchiveSpool spool, string server, string network,
         string channel, long eid, string compact) {
     ArchiveAdmission admission;
     requireCheck(until({
-        admission = spool.tryAppend(server, network, channel, eid, compact);
+        admission = spool.tryAppend(server, network, channel, eid, compact, originalOwner);
         return admission != ArchiveAdmission.full;
     }) && admission == ArchiveAdmission.queued,
         "valid append could not enter the bounded ingress");
@@ -719,7 +806,7 @@ private void queueRename(ArchiveSpool spool) {
     ArchiveAdmission admission;
     requireCheck(until({
         admission = spool.tryRename("queue-server", "queue-network", "#before", "#after",
-            90000, originalTimestamp);
+            90000, originalTimestamp, originalOwner);
         return admission != ArchiveAdmission.full;
     }) && admission == ArchiveAdmission.queued, "reserved control admission failed");
 }
@@ -743,7 +830,7 @@ private void commandSaturationCheck() {
     requireCheck(status.durableSequence == 0 && status.ingressBytes <= 7 * 1024 * 1024,
         "paused data escaped its reserved count/byte budget");
     requireCheck(spool.tryAppend("queue-server", "queue-network", "#queue", 99999,
-        "{\"eid\":99999,\"t\":1700000000123}") == ArchiveAdmission.full,
+        "{\"eid\":99999,\"t\":1700000000123}", originalOwner) == ArchiveAdmission.full,
         "897th data command consumed control-reserved slots");
     foreach (i; 0 .. 128) {
         if (i % 32 == 0) pauseDrain(spool);
@@ -753,7 +840,7 @@ private void commandSaturationCheck() {
     status = awaitStatus(spool, (ref ArchiveSpoolStatus s) => s.ingressCommands == 1024);
     requireCheck(status.durableSequence == 0, "paused commands reached disk unexpectedly");
     requireCheck(spool.tryRename("queue-server", "queue-network", "#before", "#after",
-        90000, originalTimestamp) == ArchiveAdmission.full, "1025th total command was admitted");
+        90000, originalTimestamp, originalOwner) == ArchiveAdmission.full, "1025th total command was admitted");
     fixtureBounds(root, status);
     requireCheck(until({ return spool.harnessResumeDrain(); }), "drain gate release failed");
     status = awaitStatus(spool, (ref ArchiveSpoolStatus s) =>
@@ -787,7 +874,7 @@ private void byteSaturationCheck() {
         const eid = 91000L + i;
         auto compact = quotaCompact(eid, bodyText);
         auto before = awaitStatus(spool, (ref ArchiveSpoolStatus s) => s.ready);
-        auto admission = spool.tryAppend("byte-server", "byte-network", "#bytes", eid, compact);
+        auto admission = spool.tryAppend("byte-server", "byte-network", "#bytes", eid, compact, originalOwner);
         if (admission == ArchiveAdmission.full) {
             // A mutex miss is NOT proof: existing bytes must exclude even the
             // compact payload alone, before the archive-envelope overhead.
@@ -872,7 +959,7 @@ private void failedJournalDiagnosticsCheck() {
     requireCheck(until({ return readText(config.diagnosticPath) == second; }),
         "failed owner stopped refreshing diagnostic snapshots");
     requireCheck(spool.tryAppend("original-server", "original-network", "#original",
-        originalEid, originalCompact) == ArchiveAdmission.unavailable,
+        originalEid, originalCompact, originalOwner) == ArchiveAdmission.unavailable,
         "diagnostic availability reopened failed journal admission");
     noRecord(spool);
     stopOwned(spool);
@@ -901,7 +988,7 @@ private void admissionContentionCheck() {
     });
     scope(exit) timer.stop();
     const admission = spool.tryAppend("original-server", "original-network", "#original",
-        originalEid, originalCompact);
+        originalEid, originalCompact, originalOwner);
     requireCheck(timerFired && admission == ArchiveAdmission.queued,
         "bookkeeping contention blocked the event loop or rejected below-capacity history");
     auto status = awaitStatus(spool, (ref ArchiveSpoolStatus s) => s.durableSequence == 1 || s.failed);
@@ -955,6 +1042,10 @@ Ircv3Check[] archiveSpoolRegressionChecks() {
         catch (Throwable error) { stderr.writeln("[archive-spool] ", name, ": ", error.toString()); }
         checks ~= Ircv3Check(name, passed);
     }
+    run("journal versioned decode preserves legacy uncertainty and rejects missing/ambiguous owners",
+        { recordVersionCheck(); });
+    run("journal admitted and pending owners survive fsync recovery without changing event bytes",
+        { admittedOwnerRecoveryCheck(); });
     run("journal SIGKILL before checkpoint replays original identity exactly once and retains uncertainty",
         { crashReplayCheck(); });
     run("journal durable checkpoint survives SIGKILL and next sequence remains monotonic",

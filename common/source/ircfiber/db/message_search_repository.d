@@ -8,6 +8,8 @@ import vibe.db.mongo.cursor : FindOptions;
 import ircfiber.db.mongo : AppMongoConnection;
 import ircfiber.db.messages : HistoryBoundary, MessageRepository, messageRetentionDays;
 import ircfiber.db.message_search;
+import ircfiber.db.history_suppression : HistorySuppressionRepository;
+import ircfiber.db.history_visibility : HistoryReadBatch;
 import ircfiber.models.network : normalizeChannelName;
 import std.datetime : Clock;
 
@@ -35,6 +37,7 @@ struct MessageSearchContext {
 }
 
 private struct EvidenceBudget {
+    HistoryReadBatch visibility;
     MonoTime deadline;
     size_t evidenceBytes;
     // Per-operation server time limit. Interactive reads stay at two seconds;
@@ -44,10 +47,15 @@ private struct EvidenceBudget {
     // Row limits alone do not bound JSON payload/evidence memory.
     private enum size_t maxEvidenceBytes = 32 * 1024 * 1024;
     static EvidenceBudget start() {
-        return EvidenceBudget(MonoTime.currTime + 5.seconds);
+        EvidenceBudget result;
+        result.deadline = MonoTime.currTime + 5.seconds;
+        return result;
     }
     static EvidenceBudget startWorker() {
-        return EvidenceBudget(MonoTime.currTime + 45.seconds, 0, 20_000);
+        auto result = start();
+        result.deadline = MonoTime.currTime + 45.seconds;
+        result.opCapMs = 20_000;
+        return result;
     }
     long remainingMs() {
         const remaining = (deadline - MonoTime.currTime).total!"msecs";
@@ -78,16 +86,19 @@ final class MessageSearchRepository {
         collection = AppMongoConnection.getDb()["messages"];
         networks = AppMongoConnection.getDb()["networks"];
         sourceProjection = Bson.emptyObject;
-        foreach (field; ["_id", "networkId", "channel", "t", "eid", "payload", "msgid",
-                "searchVersion", "searchKind", "searchAliases", "searchTarget"])
+        foreach (field; ["_id", "serverId", "networkId", "channel", "t", "eid", "payload", "msgid",
+                "searchVersion", "searchKind", "searchAliases", "searchTarget",
+                "historyOwnerId", "historyWasDirect"])
             sourceProjection[field] = Bson(1);
     }
 
     /// Results align with requested IDs, including invisible entries for absent,
     /// expired, moved, ambiguous or deleted sources. Never trust index content.
-    SearchResolution[] resolveByIds(string[] rowIds, MessageSearchScope[] scopes) @trusted {
+    SearchResolution[] resolveByIds(string[] rowIds, MessageSearchScope[] scopes,
+            HistoryReadBatch visibility = null) @trusted {
         auto budget = EvidenceBudget.start();
         scopes = normalizedScopes(scopes);
+        budget.visibility = visibilityFor(scopes, visibility);
         if (rowIds.length > maxBatch) fail(MessageSearchEvidenceFailure.limitExceeded);
         requireClassified(scopes, budget);
         auto docs = readIds(rowIds, scopes, budget);
@@ -108,9 +119,11 @@ final class MessageSearchRepository {
     /// resolve bases for old AND current targets/aliases, so rename/reclassification
     /// and an out-of-order mutation can repair previously materialized documents.
     /// Output is deduplicated by base storage ID; mutations are never hits.
-    SearchResolution[] resolveChangedRows(Bson[] changedRows, MessageSearchScope[] scopes) @trusted {
+    SearchResolution[] resolveChangedRows(Bson[] changedRows, MessageSearchScope[] scopes,
+            HistoryReadBatch visibility = null) @trusted {
         auto budget = EvidenceBudget.start();
         scopes = normalizedScopes(scopes);
+        budget.visibility = visibilityFor(scopes, visibility);
         if (changedRows.length > maxBatch) fail(MessageSearchEvidenceFailure.limitExceeded);
         requireClassified(scopes, budget);
         string[] ids;
@@ -161,11 +174,13 @@ final class MessageSearchRepository {
     /// A supplied monotonic deadline is shared across caller-side partitions;
     /// it can shorten, but never extend, this invocation's five-second budget.
     SearchResolution[] resolveChangedRowsWorker(Bson[] changedRows,
-            MessageSearchScope[] scopes, MonoTime deadline = MonoTime.init) @trusted {
+            MessageSearchScope[] scopes, MonoTime deadline = MonoTime.init,
+            HistoryReadBatch visibility = null) @trusted {
         auto budget = EvidenceBudget.startWorker();
         if (deadline != MonoTime.init) budget.deadline = min(budget.deadline, deadline);
         budget.remainingMs();
         scopes = normalizedScopes(scopes);
+        budget.visibility = visibilityFor(scopes, visibility);
         if (changedRows.length > maxWorkerBatch) fail(MessageSearchEvidenceFailure.limitExceeded);
         requireClassified(scopes, budget, true);
         string[] ids;
@@ -189,6 +204,8 @@ final class MessageSearchRepository {
         string[][MessageSearchScope] ownAliases;
         bool[ScopedAlias] seenOwn;
         SearchRow[string] canonical;
+        string[string] serverIds;
+        bool[string] visibleSources;
         void discover(SearchRow row) {
             if (!allowed(row, scopes)) return;
             const scope_ = MessageSearchScope(row.networkId, row.channel);
@@ -204,14 +221,19 @@ final class MessageSearchRepository {
                 addWorkerAlias(aliases, seenAliases, scope_, row.classification.target);
             }
         }
-        foreach (doc; changedRows) discover(searchRow(doc));
+        foreach (doc; changedRows)
+            if (sourceOwned(doc, budget.visibility)) discover(searchRow(doc));
         foreach (doc; current) {
             // Validate every fresh source, including controls, before its
             // payload-derived aliases or target can select indexed evidence.
+            if (budget.visibility.active() && stringField(doc, "searchKind") == "message"
+                    && !sourceVisible(doc, budget.visibility)) continue;
             auto row = checkedRow(doc);
-            discover(row);
+            if (sourceOwned(doc, budget.visibility)) discover(row);
             const id = stringField(doc, "_id");
             canonical[id] = row;
+            serverIds[id] = stringField(doc, "serverId");
+            visibleSources[id] = sourceVisible(doc, budget.visibility);
         }
         // Controls are rare and have their own small partial index: read them
         // first and expand collision reads only for aliases they target.
@@ -253,6 +275,8 @@ final class MessageSearchRepository {
                 fail(MessageSearchEvidenceFailure.unclassified);
             const id = stringField(doc, "_id");
             canonical[id] = row;
+            serverIds[id] = stringField(doc, "serverId");
+            visibleSources[id] = sourceVisible(doc, budget.visibility);
             evidence[id] = row;
             if (id !in seenBases) {
                 seenBases[id] = true;
@@ -301,8 +325,17 @@ final class MessageSearchRepository {
             evidence[stringField(doc, "_id")] = row;
             if (evidence.length > maxEvidence) fail(MessageSearchEvidenceFailure.limitExceeded);
         }
-        auto result = resolveWorkerBases(bases, evidence, seenBaseAliases, budget);
+        auto result = resolveWorkerBases(bases, evidence, seenBaseAliases, serverIds,
+            visibleSources, budget);
         foreach (id; missingIds) {
+            SearchResolution absent;
+            absent.original.rowId = id;
+            result ~= absent;
+        }
+        // Invalid attribution/identity and controls are not visible bases, but
+        // their old physical projection still needs an explicit delete hint.
+        foreach (id; ids) {
+            if (id in seenBases) continue;
             SearchResolution absent;
             absent.original.rowId = id;
             result ~= absent;
@@ -334,7 +367,7 @@ final class MessageSearchRepository {
     /// related-row array for every base, while preserving the pure resolver.
     private SearchResolution[] resolveWorkerBases(SearchRow[] bases,
             SearchRow[string] evidence, bool[ScopedAlias] wantedAliases,
-            ref EvidenceBudget budget) {
+            string[string] serverIds, bool[string] visibleSources, ref EvidenceBudget budget) {
         SearchRow[] rows;
         rows.reserve(evidence.length);
         size_t[][ScopedAlias] byAlias;
@@ -353,6 +386,7 @@ final class MessageSearchRepository {
                 if (key in wantedAliases) byAlias[key] ~= index;
             }
         }
+        const suppressed = readSuppressions(bases, serverIds, budget);
         auto scratch = new SearchRow[rows.length];
         auto marks = new size_t[rows.length];
         SearchResolution[] result;
@@ -373,7 +407,13 @@ final class MessageSearchRepository {
                 }
             }
             auto resolved = resolveSearchMessage(base, scratch[0 .. count]);
-            if (base.t <= oldest) resolved.visible = false;
+            const visible = base.rowId in visibleSources;
+            if (!visible || !*visible
+                    || (!budget.visibility.active() && base.t <= oldest)) resolved.visible = false;
+            if (base.rowId in suppressed) {
+                resolved.visible = false;
+                resolved.text = resolved.bodyFold = resolved.senderFold = "";
+            }
             result ~= resolved;
         }
         return result;
@@ -383,11 +423,12 @@ final class MessageSearchRepository {
     /// folding all scoped controls, including mutations outside the raw window.
     /// Exhausting the bounded evidence budget throws, never pretends an edge.
     MessageSearchContext getContext(string networkId, string channel, string rowId,
-            int neighbors = 10) @trusted {
+            int neighbors = 10, HistoryReadBatch visibility = null) @trusted {
         if (neighbors < 0 || neighbors > 10 || !rowId.length || !channel.length)
             fail(MessageSearchEvidenceFailure.invalidScope);
         auto budget = EvidenceBudget.start();
         auto scopes = normalizedScopes([MessageSearchScope(networkId, channel)]);
+        budget.visibility = visibilityFor(scopes, visibility);
         requireClassified(scopes, budget);
         auto docs = readIds([rowId], scopes, budget);
         auto centers = resolveDocuments(docs, scopes, budget);
@@ -407,9 +448,11 @@ final class MessageSearchRepository {
 
     /// Scope-wide mixed-writer gate. A single unclassified legacy REDACT must
     /// prevent any result, even when it is not among the index's candidate IDs.
-    void requireClassified(MessageSearchScope[] scopes) @trusted {
+    void requireClassified(MessageSearchScope[] scopes, HistoryReadBatch visibility = null) @trusted {
         auto budget = EvidenceBudget.start();
-        requireClassified(normalizedScopes(scopes), budget);
+        scopes = normalizedScopes(scopes);
+        budget.visibility = visibilityFor(scopes, visibility);
+        requireClassified(scopes, budget);
     }
 
     private void requireClassified(MessageSearchScope[] scopes, ref EvidenceBudget budget,
@@ -430,36 +473,81 @@ final class MessageSearchRepository {
         FindOptions options;
         options.limit = cast(long) requested.length;
         options.maxTimeMS = budget.remainingMs();
-        options.projection = Bson(["_id": Bson(0), "id": Bson(1)]);
+        options.projection = Bson(["_id": Bson(0), "id": Bson(1), "userId": Bson(1)]);
         // Worker setup provisions this index; a missing hint must fail closed,
         // never fall back to scanning the networks collection.
         if (worker) options.hint = Bson("message_search_network_owner");
         bool[string] existing;
         foreach (doc; networks.find(Bson(["id": Bson(["$in": serializeToBson(requested)])]), options)) {
             const id = stringField(doc, "id");
-            if (id.length) existing[id] = true;
+            if (id.length && budget.visibility.contains(id)
+                    && stringField(doc, "userId") == budget.visibility.network(id).ownerId())
+                existing[id] = true;
         }
         foreach (id; requested)
             if (id !in existing) fail(MessageSearchEvidenceFailure.invalidScope);
+    }
+
+    private HistoryReadBatch visibilityFor(MessageSearchScope[] scopes, HistoryReadBatch supplied) {
+        string[] ids;
+        foreach (scope_; scopes)
+            if (!ids.canFind(scope_.networkId)) ids ~= scope_.networkId;
+        if (supplied is null) supplied = new HistoryReadBatch(AppMongoConnection.getDb(), ids);
+        foreach (id; ids)
+            if (!supplied.contains(id)) fail(MessageSearchEvidenceFailure.invalidScope);
+        return supplied;
+    }
+
+    /// Controls are evidence even when older than the visible floor. Their
+    /// canonical attribution still matters; never attach another owner's bytes.
+    private bool sourceOwned(Bson doc, HistoryReadBatch visibility) {
+        const id = stringField(doc, "networkId");
+        if (!visibility.contains(id)) return false;
+        const owner = doc["historyOwnerId"];
+        // Compatibility is for genuinely unstamped old rows, never a
+        // contradictory attribution from a newer writer or malformed metadata.
+        if (!visibility.active() && doc.tryIndex("historyOwnerId").isNull) return true;
+        return owner.type == Bson.Type.string
+            && owner.get!string == visibility.network(id).ownerId();
+    }
+
+    private bool sourceVisible(Bson doc, HistoryReadBatch visibility) {
+        if (!sourceOwned(doc, visibility)) return false;
+        if (!doc.tryIndex("historyWasDirect").isNull
+                && (doc["historyWasDirect"].type != Bson.Type.bool_
+                    || doc["historyWasDirect"].get!bool)) return false;
+        if (!visibility.active()) return true;
+        const time = doc["t"];
+        return (time.type == Bson.Type.long_ || time.type == Bson.Type.int_)
+            && visibility.network(stringField(doc, "networkId")).allows(time.get!long, false);
     }
 
     private SearchResolution[] resolveDocuments(Bson[] docs, MessageSearchScope[] scopes,
             ref EvidenceBudget budget) {
         SearchRow[] bases;
         string[][MessageSearchScope] aliases;
+        string[string] serverIds;
+        bool[string] visibleSources;
         foreach (doc; docs) {
+            if (budget.visibility.active() && !sourceVisible(doc, budget.visibility)) continue;
             auto row = checkedRow(doc);
             if (!allowed(row, scopes)) continue;
             bases ~= row;
-            if (row.classification.kind == SearchKind.message) addAliases(aliases, row);
+            serverIds[row.rowId] = stringField(doc, "serverId");
+            visibleSources[row.rowId] = sourceVisible(doc, budget.visibility);
+            if (visibleSources[row.rowId] && row.classification.kind == SearchKind.message)
+                addAliases(aliases, row);
         }
         auto evidenceDocs = readRelated(aliases, true, budget);
         SearchRow[][MessageSearchScope] evidence;
         foreach (doc; evidenceDocs) {
+            if (!sourceOwned(doc, budget.visibility))
+                fail(MessageSearchEvidenceFailure.unclassified);
             auto row = checkedRow(doc);
             if (row.rowId.length)
                 evidence[MessageSearchScope(row.networkId, row.channel)] ~= row;
         }
+        const suppressed = readSuppressions(bases, serverIds, budget);
         SearchResolution[] result;
         result.reserve(bases.length);
         const oldest = Clock.currTime().toUnixTime!long * 1000
@@ -468,12 +556,25 @@ final class MessageSearchRepository {
             budget.remainingMs();
             auto related = MessageSearchScope(base.networkId, base.channel) in evidence;
             auto resolved = resolveSearchMessage(base, related ? *related : null);
-            // Mongo's TTL monitor is asynchronous; expired rows are already
-            // unreadable even if their original document has not been removed.
-            if (base.t <= oldest) resolved.visible = false;
+            if (!visibleSources[base.rowId]
+                    || (!budget.visibility.active() && base.t <= oldest)) resolved.visible = false;
+            if (base.rowId in suppressed) {
+                resolved.visible = false;
+                resolved.text = resolved.bodyFold = resolved.senderFold = "";
+            }
             result ~= resolved;
         }
         return result;
+    }
+
+    private bool[string] readSuppressions(SearchRow[] bases, string[string] serverIds,
+            ref EvidenceBudget budget) {
+        try return new HistorySuppressionRepository(AppMongoConnection.getDb())
+            .suppressedRows(bases, serverIds, budget.remainingMs());
+        catch (Exception) {
+            fail(MessageSearchEvidenceFailure.unclassified);
+            return null;
+        }
     }
 
     private SearchResolution[] contextSide(SearchRow center, MessageSearchScope[] scopes,
@@ -486,6 +587,9 @@ final class MessageSearchRepository {
             auto filter = scopeFilter(scopes);
             filter["searchKind"] = Bson("message");
             filter["$and"] = Bson([MessageRepository.boundaryFilter(edge, !older)]);
+            // Only visible bases are paged. Alias/control evidence deliberately
+            // uses the unrestricted source queries instead.
+            filter = budget.visibility.network(center.networkId).filter(filter);
             auto order = Bson.emptyObject;
             foreach (key; ["t", "eid", "_id"]) order[key] = Bson(older ? -1 : 1);
             auto docs = read(filter, maxBatch, budget, order);
@@ -549,6 +653,9 @@ final class MessageSearchRepository {
         if (order.type != Bson.Type.undefined) options.sort = order;
         Bson[] result;
         foreach (doc; collection.find(filter, options)) {
+            if (hint == "message_search_target" || hint == "message_search_alias")
+                if (!sourceOwned(doc, budget.visibility))
+                    fail(MessageSearchEvidenceFailure.unclassified);
             if (result.length == limit) {
                 // Context pages deliberately continue with a strict tuple edge.
                 if (limit == maxBatch && order.type != Bson.Type.undefined) break;

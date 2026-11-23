@@ -76,16 +76,18 @@ private void archiveRename(ref EngineContext ctx, string serverId, string networ
         string from, string toChannel, long cutoffEid) {
     auto admission = ArchiveAdmission.unavailable;
     if (ctx.archiveSpool !is null) {
-        string pendingOwner;
-        if (ctx.archiveControl !is null && ctx.connManager !is null)
-            pendingOwner = ctx.archiveControl.pendingScopeOwner(networkId,
-                ctx.connManager.getOwnerId(parseUUID(networkId[])));
-        if (ctx.archiveControl !is null
-                && (ctx.archiveControl.scopeReady(networkId) || pendingOwner.length)
+        string admittedOwner, pendingOwner;
+        if (ctx.archiveControl !is null && ctx.connManager !is null) {
+            const owner = ctx.connManager.getOwnerId(parseUUID(networkId[]));
+            admittedOwner = ctx.archiveControl.admittedScopeOwner(networkId, owner);
+            pendingOwner = ctx.archiveControl.pendingScopeOwner(networkId, owner);
+        }
+        if (ctx.archiveControl !is null && (admittedOwner.length || pendingOwner.length)
                 && ctx.archiveControl.orderFrozenControls(ctx, networkId, cutoffEid))
             admission = ctx.archiveSpool.tryRename(serverId, networkId,
                 normalizeChannelName(from), normalizeChannelName(toChannel), cutoffEid,
-                Clock.currTime.stdTime / 10_000 - 62_135_596_800_000L, pendingOwner);
+                Clock.currTime.stdTime / 10_000 - 62_135_596_800_000L,
+                admittedOwner.length ? admittedOwner : pendingOwner, pendingOwner.length != 0);
         else ctx.archiveSpool.reportAdmissionUnavailable();
     }
     noteArchiveAdmission(admission);
@@ -695,14 +697,16 @@ private void processEvent(ref EngineContext ctx, ref IRCRawEvent event, string s
                 && !isTransientServerLogPhase(event) && event.getTag("archive_gap").length == 0) {
             auto admission = ArchiveAdmission.unavailable;
             if (ctx.archiveSpool !is null) {
-                string pendingOwner;
-                if (ctx.archiveControl !is null)
+                string admittedOwner, pendingOwner;
+                if (ctx.archiveControl !is null) {
+                    admittedOwner = ctx.archiveControl.admittedScopeOwner(event.networkId, userIdStr);
                     pendingOwner = ctx.archiveControl.pendingScopeOwner(event.networkId, userIdStr);
-                if (ctx.archiveControl !is null
-                        && (ctx.archiveControl.scopeReady(event.networkId) || pendingOwner.length))
+                }
+                if (admittedOwner.length || pendingOwner.length)
                     admission = ctx.archiveSpool.tryAppend(serverId, event.networkId,
                         event.channel.length ? normalizeChannelName(event.channel) : "_server",
-                        event.eid, json.toString(), pendingOwner);
+                        event.eid, json.toString(), admittedOwner.length ? admittedOwner : pendingOwner,
+                        pendingOwner.length != 0);
                 else ctx.archiveSpool.reportAdmissionUnavailable();
             }
             noteArchiveAdmission(admission);

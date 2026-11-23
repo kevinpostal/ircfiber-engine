@@ -227,9 +227,9 @@ final class ArchiveSpool {
     }
 
     ArchiveAdmission tryAppend(string serverId, string networkId, string normalizedChannel,
-            long eid, string compactJson, string pendingCatalogOwner = "") {
-        if (eid <= 0 || !validScope(serverId, networkId, normalizedChannel)) return reject(ArchiveAdmission.unavailable);
-        if (pendingCatalogOwner.length && !validCanonicalUuid(pendingCatalogOwner))
+            long eid, string compactJson, string ownerId, bool pendingCatalog = false) {
+        if (eid <= 0 || !validScope(serverId, networkId, normalizedChannel)
+                || !validCanonicalUuid(ownerId))
             return reject(ArchiveAdmission.unavailable);
         if (compactJson.length > archiveMaxRecordBytes) return reject(ArchiveAdmission.oversized);
         try {
@@ -243,24 +243,26 @@ final class ArchiveSpool {
             require(event["t"].get!long > 0, "invalid_event_timestamp");
             j["timestampMs"] = event["t"].get!long;
             j["payload"] = compactJson;
-            if (pendingCatalogOwner.length) j["pendingCatalogOwner"] = pendingCatalogOwner;
+            j["ownerId"] = ownerId;
+            j["pendingCatalog"] = pendingCatalog;
             return enqueue(j.toString(), ArchiveKind.append, serverId, networkId,
                 j["queuedAtMs"].get!long, j["timestampMs"].get!long);
         } catch (Exception) { return reject(ArchiveAdmission.unavailable); }
     }
 
     ArchiveAdmission tryRename(string serverId, string networkId, string fromChannel,
-            string toChannel, long cutoffEid, long legacyCutoffMs, string pendingCatalogOwner = "") {
+            string toChannel, long cutoffEid, long legacyCutoffMs, string ownerId,
+            bool pendingCatalog = false) {
         if (!validScope(serverId, networkId, fromChannel) || !toChannel.length
-                || toChannel.length > 512 || cutoffEid <= 0 || legacyCutoffMs <= 0)
-            return reject(ArchiveAdmission.unavailable);
-        if (pendingCatalogOwner.length && !validCanonicalUuid(pendingCatalogOwner))
+                || toChannel.length > 512 || cutoffEid <= 0 || legacyCutoffMs <= 0
+                || !validCanonicalUuid(ownerId))
             return reject(ArchiveAdmission.unavailable);
         auto j = baseRecord("rename", serverId, networkId, fromChannel);
         j["newChannel"] = toChannel;
         j["cutoffEid"] = cutoffEid;
         j["legacyCutoffMs"] = legacyCutoffMs;
-        if (pendingCatalogOwner.length) j["pendingCatalogOwner"] = pendingCatalogOwner;
+        j["ownerId"] = ownerId;
+        j["pendingCatalog"] = pendingCatalog;
         const queuedAt = j["queuedAtMs"].get!long;
         return enqueue(j.toString(), ArchiveKind.rename, serverId, networkId, queuedAt, queuedAt);
     }
@@ -602,6 +604,7 @@ final class ArchiveSpool {
     }
     private static Json baseRecord(string kind, string server, string network, string channel) {
         auto j = Json.emptyObject;
+        j["recordVersion"] = 2;
         j["kind"] = kind; j["serverId"] = server; j["networkId"] = network; j["channel"] = channel;
         j["queuedAtMs"] = nowMs();
         return j;
@@ -1587,6 +1590,10 @@ Json archiveNetworkProjection(ref const ArchiveNetworkStatus sample, long evalua
 ArchiveRecord decodeArchiveRecord(string encoded, ulong sequence) {
     require(encoded.length && encoded.length <= archiveMaxRecordBytes, "invalid_record_size");
     auto j = parseJsonString(encoded);
+    // Version one had no version field and only retained owners for pending
+    // catalog records. Never manufacture an admitted owner while decoding it.
+    const recordVersion = "recordVersion" in j ? j["recordVersion"].get!int : 1;
+    require(recordVersion == 1 || recordVersion == 2, "unsupported_record_version");
     ArchiveRecord r;
     r.sequence = sequence;
     auto kind = j["kind"].get!string;
@@ -1600,7 +1607,13 @@ ArchiveRecord decodeArchiveRecord(string encoded, ulong sequence) {
     r.queuedAtMs = j["queuedAtMs"].get!long;
     require(r.queuedAtMs > 0, "invalid_record_queued_time");
     r.timestampMs = r.queuedAtMs;
-    if (auto pending = "pendingCatalogOwner" in j) {
+    if (recordVersion == 2 && r.kind != ArchiveKind.purge) {
+        r.ownerId = j["ownerId"].get!string;
+        r.pendingCatalog = j["pendingCatalog"].get!bool;
+        require(validCanonicalUuid(r.ownerId) && ("pendingCatalogOwner" in j) is null,
+            "invalid_admitted_owner");
+    } else if (auto pending = "pendingCatalogOwner" in j) {
+        require(recordVersion == 1, "invalid_pending_catalog_version");
         r.ownerId = pending.get!string;
         require(validCanonicalUuid(r.ownerId) && r.kind != ArchiveKind.purge, "invalid_pending_catalog_owner");
         r.pendingCatalog = true;

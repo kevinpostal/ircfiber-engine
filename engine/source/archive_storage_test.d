@@ -128,6 +128,7 @@ private final class StorageFixture {
     private MongoDatabase admin;
     private MessageRepository repository;
     private RedisStorage redis;
+    private string fixtureOwner;
     private string[] ownedNetworks;
     private string[] ownedMessageIds;
     private bool failpointOwned;
@@ -144,6 +145,7 @@ private final class StorageFixture {
             && redis.getDb().scard(NETWORK_WRITERS_KEY) == 0,
             "fixture Redis must be dedicated and have no exclusion or unresolved writers");
         databaseName = "ircfiber_archive_test_" ~ randomUUID().toString().replace("-", "");
+        fixtureOwner = randomUUID().toString();
         timestamp = Clock.currTime().toUnixTime!long * 1000;
         MongoClientSettings settings;
         require(parseMongoDBUrl(settings, uri), "fixture URL rejected by Mongo driver");
@@ -217,10 +219,17 @@ private final class StorageFixture {
         return result[0];
     }
 
-    private string newNetwork(bool catalog = false) {
+    private string newNetwork(bool legacyCatalog = false, bool missing = false) {
         const id = randomUUID().toString();
         ownedNetworks ~= id;
-        if (catalog) insertRaw("networks", Bson(["_id": Bson(id), "id": Bson(id)]));
+        if (!missing) {
+            auto document = Bson(["_id": Bson(id), "id": Bson(id), "userId": Bson(fixtureOwner)]);
+            if (!legacyCatalog) {
+                document["archiveScopeVersion"] = Bson(1);
+                document["archiveServers"] = Bson([Bson(SERVER), Bson(OTHER_SERVER)]);
+            }
+            insertRaw("networks", document);
+        }
         return id;
     }
 
@@ -324,7 +333,8 @@ private final class StorageFixture {
     }
 
     private void verifyUnchanged(Bson before, Bson after, string channel) {
-        foreach (field; ["_id", "serverId", "networkId", "eid", "t", "payload", "tsAt"]) {
+        foreach (field; ["_id", "serverId", "networkId", "eid", "t", "payload", "tsAt",
+                "historyOwnerId", "historyBytes"]) {
             require(hasField(before, field) == hasField(after, field),
                 "mutation changed immutable field presence");
             if (hasField(before, field))
@@ -360,7 +370,7 @@ private final class StorageFixture {
     void runCases() {
         recordCase("compact insert preserves original bytes and exact retry is alreadyPersisted", {
             const network = newNetwork();
-            const compact = payload(101, timestamp, "verbatim");
+            const compact = payload(101, timestamp, "verbatim — 雪");
             require(repository.appendArchivedCompactMessage(SERVER, network, "#SOURCE", compact)
                 == ArchiveWriteResult.inserted, "compact append did not acknowledge insert");
             auto found = rows("messages", Bson(["networkId": Bson(network)]));
@@ -370,6 +380,14 @@ private final class StorageFixture {
                 && row["channel"].get!string == "#source" && integer(row["eid"]) == 101
                 && integer(row["t"]) == timestamp && row["payload"].get!string == compact
                 && hasField(row, "tsAt"), "compact append changed original attribution or payload");
+            require(row["historyOwnerId"].type == Bson.Type.string
+                && row["historyOwnerId"].get!string == fixtureOwner
+                && row["historyBytes"].type == Bson.Type.long_, "archive lacked canonical byte attribution");
+            auto envelope = Bson.emptyObject;
+            foreach (field; ["_id", "serverId", "networkId", "channel", "t", "payload", "eid", "msgid"])
+                if (hasField(row, field)) envelope[field] = row[field];
+            require(row["historyBytes"].get!long == cast(long)envelope.data.length,
+                "frozen charge differed from original BSON envelope");
             require(repository.appendArchivedCompactMessage(SERVER, network, "#source", compact)
                 == ArchiveWriteResult.alreadyPersisted, "identical bytes were not idempotent");
             require(countRows("messages", Bson(["networkId": Bson(network)])) == 1,
@@ -579,7 +597,7 @@ private final class StorageFixture {
         });
 
         recordCase("producer preparation validates majority owner and rejects uncertain catalog acknowledgments", {
-            const network = newNetwork();
+            const network = newNetwork(false, true);
             const owner = randomUUID().toString();
             insertRaw("networks", Bson(["_id": Bson(network), "id": Bson(network), "userId": Bson(owner)]));
             expectFailure({ repository.registerArchiveScopes(redis, network, [SERVER], randomUUID().toString()); },
@@ -625,12 +643,142 @@ private final class StorageFixture {
         });
 
         recordCase("deleted network cannot silently gain a new archival scope", {
-            const missing = newNetwork();
+            const missing = newNetwork(false, true);
             require(repository.registerArchiveScopes(redis, missing, [SERVER]).length == 0,
                 "register recreated explicitly absent network metadata");
             expectFailure({ repository.archivedServerScopes(redis, missing); }, ArchiveWriteFailure.unavailable);
             require(countRows("networks", Bson(["id": Bson(missing)])) == 0,
                 "archival discovery recreated deleted network metadata");
+        });
+
+        recordCase("unknown ownership retries; corrupt ownership and unproven engines conflict", {
+            const missing = newNetwork(false, true);
+            expectFailure({ repository.appendArchivedCompactMessage(SERVER, missing,
+                "#unknown", payload(200, timestamp)); }, ArchiveWriteFailure.unavailable);
+            const legacyCatalog = newNetwork(true);
+            expectFailure({ repository.appendArchivedCompactMessage(SERVER, legacyCatalog,
+                "#unknown", payload(200, timestamp)); }, ArchiveWriteFailure.unavailable);
+            const network = newNetwork();
+            expectFailure({ repository.appendArchivedCompactMessage("unproven-engine", network,
+                "#unknown", payload(200, timestamp)); }, ArchiveWriteFailure.identityMismatch);
+            expectFailure({ repository.appendArchivedCompactMessage(SERVER, network,
+                "#unknown", payload(200, timestamp), randomUUID().toString()); },
+                ArchiveWriteFailure.identityMismatch);
+            require(setRaw("networks", network, Bson(["userId": Bson("not-an-account")])) == 1,
+                "malformed owner fixture did not update");
+            expectFailure({ repository.appendArchivedCompactMessage(SERVER, network,
+                "#unknown", payload(200, timestamp)); }, ArchiveWriteFailure.identityMismatch);
+            require(countRows("messages", Bson(["networkId": Bson(network)])) == 0,
+                "unproven ownership created archive rows");
+        });
+
+        recordCase("only a verified durable network fence permits deleted-scope discard", {
+            const network = newNetwork(false, true);
+            require(!repository.historyNetworkDeleted(network, fixtureOwner),
+                "missing canonical network was treated as a deletion fence");
+            insertRaw("history_network_fences", Bson(["_id": Bson(network), "ownerId": Bson(fixtureOwner)]));
+            require(repository.historyNetworkDeleted(network, fixtureOwner),
+                "durable network fence was not recognized");
+            require(repository.appendArchivedCompactMessage(SERVER, network, "#deleted",
+                payload(202, timestamp), fixtureOwner) == ArchiveWriteResult.expiredDiscard,
+                "fenced append was not a successful discard");
+            require(repository.appendArchivedCompactMessage(SERVER, network, "#deleted",
+                payload(203, timestamp)) == ArchiveWriteResult.expiredDiscard,
+                "ownerless old replay ignored a canonical deletion fence");
+            expectFailure({ repository.appendArchivedCompactMessage(SERVER, network, "#deleted",
+                payload(204, timestamp), randomUUID().toString()); }, ArchiveWriteFailure.identityMismatch);
+            require(countRows("messages", Bson(["networkId": Bson(network)])) == 0,
+                "fenced replay repopulated deleted history");
+        });
+
+        recordCase("ordinary inserts without eid use the same frozen BSON envelope", {
+            const network = newNetwork();
+            const message = Json(["t": Json(timestamp), "c": Json("PRIVMSG"),
+                "x": Json("private 雪")]);
+            auto admitted = repository.admitArchiveWrite(SERVER, network, fixtureOwner);
+            require(repository.appendMessage(admitted, "Alice", message) == ArchiveWriteResult.inserted,
+                "ordinary no-eid append failed");
+            require(repository.appendMessage(admitted, "Alice", message) == ArchiveWriteResult.alreadyPersisted,
+                "ordinary no-eid duplicate was charged twice");
+            auto found = rows("messages", Bson(["networkId": Bson(network)]));
+            require(found.length == 1 && !hasField(found[0], "tsAt")
+                && !hasField(found[0], "eid"), "ordinary DM changed legacy envelope semantics");
+            auto envelope = Bson.emptyObject;
+            foreach (field; ["_id", "serverId", "networkId", "channel", "t", "payload"])
+                envelope[field] = found[0][field];
+            require(found[0]["historyBytes"].type == Bson.Type.long_
+                && found[0]["historyBytes"].get!long == cast(long)envelope.data.length,
+                "ordinary DM charge included accounting metadata");
+        });
+
+        recordCase("active replay uses original clock, inclusive floors, and fail-closed policy", {
+            import ircfiber.db.history_retention : NORMAL_WINDOW_MS;
+            insertRaw("history_retention_state", Bson(["_id": Bson("policy-v1"), "phase": Bson("active"),
+                "cutoverAtMs": Bson(timestamp - 1), "legacyTtlSeconds": Bson(2_592_000L),
+                "donorReconciliationComplete": Bson(true)]));
+            const network = newNetwork();
+            expectFailure({ repository.appendArchivedCompactMessage(SERVER, network,
+                "#missing-policy", payload(210, timestamp)); }, ArchiveWriteFailure.unavailable);
+            const floor = timestamp - NORMAL_WINDOW_MS;
+            insertRaw("account_history_policy", Bson(["_id": Bson(fixtureOwner),
+                "manualPro": Bson(false), "donorPro": Bson(false), "revision": Bson(0L),
+                "noticeAtMs": Bson(0L), "normalFromMs": Bson(0L),
+                "expiredThroughMs": Bson(0L), "legacyPublicThroughMs": Bson(0L)]));
+            auto admitted = repository.admitArchiveWrite(SERVER, network, fixtureOwner, timestamp);
+            foreach (channel; ["#expired", "Alice", "_server"]) {
+                require(repository.appendArchivedCompactMessage(admitted, channel, payload(211, floor))
+                    == ArchiveWriteResult.expiredDiscard, "14-day equality did not expire original event");
+                require(repository.appendArchivedCompactMessage(admitted, channel, payload(212, floor + 1))
+                    == ArchiveWriteResult.inserted, "event immediately above age floor was lost");
+            }
+            auto retained = rows("messages", Bson(["networkId": Bson(network)]));
+            require(retained.length == 3, "expired replay created additional rows");
+            foreach (row; retained)
+                require(!hasField(row, "tsAt"), "active writer retained obsolete TTL authority");
+            expectFailure({ repository.appendMessage(admitted, "Alice", Json(["x": Json("missing clock")])); },
+                ArchiveWriteFailure.invalidInput);
+            const hotKey = "scrollback:" ~ SERVER ~ ":" ~ network ~ ":#backfill";
+            scope(exit) redis.getDb().del(hotKey);
+            const compact = payload(218, timestamp);
+            redis.getDb().lpush(hotKey, compact);
+            redis.getDb().lpush(hotKey, payload(219, floor));
+            redis.getDb().lpush(hotKey, `{"c":"NOTICE"}`);
+            auto first = repository.syncFromRedis(redis, SERVER, network, "#backfill");
+            require(first.scanned == 3 && first.inserted == 1 && first.discarded == 1
+                && first.parseErrors == 1 && !first.writeErrors && !first.duplicates,
+                "backfill lost original cutoff: " ~ first.to!string);
+            require(repository.appendArchivedCompactMessage(admitted, "#backfill", compact)
+                == ArchiveWriteResult.alreadyPersisted, "backfill changed journal bytes");
+            auto retry = repository.syncFromRedis(redis, SERVER, network, "#backfill");
+            require(!retry.inserted && retry.duplicates == 1 && retry.discarded == 1
+                && retry.parseErrors == 1 && !retry.writeErrors, "backfill retry charged another row");
+            require(setRaw("account_history_policy", fixtureOwner, Bson(["manualPro": Bson(true)])) == 1,
+                "Pro fixture grant failed");
+            admitted = repository.admitArchiveWrite(SERVER, network, fixtureOwner, timestamp);
+            foreach (channel; ["#pro-old", "ProFriend"])
+                require(repository.appendArchivedCompactMessage(admitted, channel,
+                    payload(216, timestamp - 45L * 86_400_000)) == ArchiveWriteResult.inserted,
+                    "Pro incorrectly retained a global age cap");
+            require(setRaw("account_history_policy", fixtureOwner, Bson(["manualPro": Bson(true),
+                "expiredThroughMs": Bson(floor), "legacyPublicThroughMs": Bson(floor + 10)])) == 1,
+                "Pro fixture policy update failed");
+            admitted = repository.admitArchiveWrite(SERVER, network, fixtureOwner, timestamp);
+            require(repository.appendArchivedCompactMessage(admitted, "#legacy", payload(213, floor + 10))
+                == ArchiveWriteResult.expiredDiscard, "Pro bypassed legacy public floor");
+            require(repository.appendArchivedCompactMessage(admitted, "Bob", payload(213, floor + 10))
+                == ArchiveWriteResult.inserted, "legacy public floor incorrectly discarded a DM");
+            require(repository.appendArchivedCompactMessage(admitted, "Bob", payload(214, floor))
+                == ArchiveWriteResult.expiredDiscard, "Pro bypassed irreversible floor");
+            require(setRaw("account_history_policy", fixtureOwner, Bson(["manualPro": Bson(false),
+                "noticeAtMs": Bson(timestamp - NORMAL_WINDOW_MS), "normalFromMs": Bson(timestamp)])) == 1,
+                "due policy fixture update failed");
+            admitted = repository.admitArchiveWrite(SERVER, network, fixtureOwner, timestamp);
+            expectFailure({ repository.appendArchivedCompactMessage(admitted, "#due", payload(215, timestamp)); },
+                ArchiveWriteFailure.unavailable);
+            require(setRaw("account_history_policy", fixtureOwner, Bson(["revision": Bson("corrupt")])) == 1,
+                "malformed policy fixture update failed");
+            expectFailure({ repository.admitArchiveWrite(SERVER, network, fixtureOwner, timestamp); },
+                ArchiveWriteFailure.unavailable);
         });
     }
 

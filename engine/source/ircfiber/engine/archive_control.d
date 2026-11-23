@@ -97,6 +97,16 @@ final class ArchiveControl {
         return index != size_t.max && registrations[index].ready;
     }
 
+    /// Retain the exact canonical owner admitted with the established catalog.
+    /// A ready network alone cannot authorize a different/replaced producer.
+    string admittedScopeOwner(string network, string owner) {
+        if (stopping || !started || !canonicalId(owner)) return "";
+        const index = scopeRegistration(network);
+        if (index == size_t.max || !registrations[index].ready
+                || registrations[index].preparedOwnerId != owner) return "";
+        return owner;
+    }
+
     /// A canonical existing producer may retain bounded raw journal records
     /// while catalog mutation is temporarily excluded. This is not Mongo or
     /// checkpoint admission; the durable record carries its exact owner.
@@ -1304,7 +1314,8 @@ version (MemoryReliabilityHarness) {
         if (ctx.redis is null || ctx.connManager is null || ctx.archiveSpool is null
                 || !canonicalId(network)) return false;
         auto cursor = network;
-        if (!ctx.connManager.getOwnerId(parseUUID(cursor)).length || cursor.length) return false;
+        const owner = ctx.connManager.getOwnerId(parseUUID(cursor));
+        if (!canonicalId(owner) || cursor.length) return false;
         const raw = ctx.redis.getDb().get(archiveOwnerKey(network));
         if (!raw.length || raw.length > archiveClearGroupMaxBytes) return false;
         const scopes = archiveOwnerServers(parseJsonString(raw), network);
@@ -1322,6 +1333,7 @@ version (MemoryReliabilityHarness) {
         control.started = true;
         control.scopeReady(network);
         foreach (ref entry; control.registrations) if (entry.networkId == network) {
+            entry.preparedOwnerId = owner;
             entry.ready = true;
             return true;
         }

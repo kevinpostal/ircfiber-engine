@@ -13,6 +13,114 @@ import vibe.db.redis.redis;
 import ircfiber.models.irc_event : IRCRawEvent;
 import ircfiber.models.network : normalizeChannelName;
 import ircfiber.storage.redis : RedisStorage;
+import ircfiber.db.history_visibility : HistoryReadScope, HistoryReadBatch, historyReadScope;
+
+/// Redis keys prove the network for old rows; explicit row identity must agree.
+/// Classify the ORIGINAL row, never the buffer name after a rename.
+bool historyHotRowVisible(Json row, ref HistoryReadScope view) @trusted {
+    if (row.type != Json.Type.object) return false;
+    static immutable string[] identityKeys = ["nid", "networkId"];
+    foreach (key; identityKeys) {
+        if (auto id = key in row)
+            if (id.type != Json.Type.string || id.get!string != view.networkId()) return false;
+    }
+    if (auto owner = "historyOwnerId" in row)
+        if (owner.type != Json.Type.string || owner.get!string != view.ownerId()) return false;
+    long timestamp;
+    if (auto t = "t" in row) {
+        if (t.type == Json.Type.int_) timestamp = t.get!long;
+    } else if (auto t = "timestamp" in row) {
+        if (t.type == Json.Type.int_) timestamp = t.get!long;
+    }
+    if (timestamp <= 0) return false;
+    bool direct;
+    if (auto original = "historyWasDirect" in row) {
+        if (original.type != Json.Type.bool_) return false;
+        direct = original.get!bool;
+    } else {
+        auto channel = "ch" in row;
+        if (channel is null) channel = "channel" in row;
+        if (channel is null || channel.type != Json.Type.string) return false;
+        const name = channel.get!string;
+        direct = name.length && name != "_server" && !canFind("#&+!", name[0]);
+    }
+    return view.allows(timestamp, direct);
+}
+
+/// A reconnect stream contains both history and current protocol state. Only
+/// explicit state commands bypass the archive time boundary; chat never does.
+bool historyReplayStateEvent(Json row) @trusted {
+    if (row.type != Json.Type.object) return false;
+    // Engine isHistorical uses batch=chathistory, and toCompactJson preserves
+    // that provenance in the user stream. Historical state-shaped events are
+    // archive replay, not live state reconstruction.
+    if (auto batch = "batch" in row)
+        if (batch.type != Json.Type.string || batch.get!string == "chathistory") return false;
+    auto c = "c" in row;
+    if (c is null || c.type != Json.Type.string) return false;
+    static immutable string[] stateCommands = ["CAP", "JOIN", "PART", "QUIT", "KICK", "NICK", "MODE", "TOPIC",
+        "RENAME", "AWAY", "ACCOUNT", "CHGHOST", "SETNAME", "CONNECTED",
+        "DISCONNECTED", "CONNECTION_RETRY_STATUS", "CONNECTION_FAIL",
+        "you_join", "you_part", "you_kick", "you_nickchange"];
+    return stateCommands.canFind(c.get!string);
+}
+
+bool historyReplayEventVisible(Json row, HistoryReadBatch batch,
+                              bool[string] ownedNetworks) @trusted {
+    if (row.type != Json.Type.object) return false;
+    auto id = "nid" in row;
+    if (id is null || id.type != Json.Type.string || id.get!string !in ownedNetworks) return false;
+    // Current state must remain recoverable during an archive-policy outage.
+    if (batch is null) return historyReplayStateEvent(row);
+    if (!batch.contains(id.get!string)) return false;
+    auto view = batch.network(id.get!string);
+    if (auto owner = "historyOwnerId" in row)
+        if (owner.type != Json.Type.string || owner.get!string != view.ownerId()) return false;
+    return historyReplayStateEvent(row) || historyHotRowVisible(row, view);
+}
+
+private HistoryReadScope hotHistoryScope(string networkId, HistoryReadScope* view) @trusted {
+    if (view is null) return historyReadScope(networkId);
+    if (view.networkId() != networkId) throw new Exception("History scope network mismatch");
+    return *view;
+}
+
+private long hotHistoryNumber(Json row, string key) @trusted {
+    auto value = key in row;
+    if (value is null && key == "t") value = "timestamp" in row;
+    return value !is null && value.type == Json.Type.int_ ? value.get!long : 0;
+}
+
+/// Merge already-visible hot/cold unread pages, preferring the hot copy of a
+/// duplicate. Both sources selected their newest page before this bounded merge.
+Json[] mergeVisibleHistoryTails(Json[] hot, Json[] cold, size_t limit) @trusted {
+    if (!limit) return [];
+    Json[] rows;
+    rows.reserve(hot.length + cold.length);
+    bool[string] messageIds;
+    bool[long] eventIds;
+    foreach (pass; 0 .. 2) {
+        auto source = pass == 0 ? hot : cold;
+        foreach (row; source) {
+            const eid = hotHistoryNumber(row, "eid");
+            string id;
+            if (auto m = "m" in row)
+                if (m.type == Json.Type.string) id = m.get!string;
+            if (!id.length)
+                if (auto i = "i" in row)
+                    if (i.type == Json.Type.string) id = i.get!string;
+            if ((eid > 0 && eid in eventIds) || (id.length && id in messageIds)) continue;
+            if (eid > 0) eventIds[eid] = true;
+            if (id.length) messageIds[id] = true;
+            rows ~= row;
+        }
+    }
+    rows.sort!((a, b) {
+        const at = hotHistoryNumber(a, "t"), bt = hotHistoryNumber(b, "t");
+        return at != bt ? at < bt : hotHistoryNumber(a, "eid") < hotHistoryNumber(b, "eid");
+    });
+    return rows.length > limit ? rows[$ - limit .. $] : rows;
+}
 
 /// Shared by append/rename and the engine's journal-bound cutoff purge. Tokens
 /// identify physical list incarnations, not reusable channel names. Pending
@@ -385,7 +493,8 @@ LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string]);
         return true;
     }
 
-    private Json[] _getRecentFiltered(string key, long count, long before, long after,
+    private Json[] _getRecentFiltered(string key, ref HistoryReadScope view,
+                                      long count, long before, long after,
                                       long beforeIdx = -1, bool filterNoise = false,
                                       bool unreadOnly = false) @trusted {
         if (count <= 0) return [];
@@ -423,6 +532,7 @@ LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string]);
             try {
                 auto msg = parseJson(r);
                 if (msg.type != Json.Type.object) continue;
+                if (!historyHotRowVisible(msg, view)) continue;
                 long timestamp;
                 if (auto t = "t" in msg) timestamp = t.get!long;
                 else if (auto t = "timestamp" in msg) timestamp = t.get!long;
@@ -467,19 +577,20 @@ LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string]);
      */
     Json[] getRecent(string serverId, string networkId, string channel,
                      long count = 50, long before = 0, long after = 0,
-                     long beforeIdx = -1) @trusted {
+                     long beforeIdx = -1, HistoryReadScope* view = null) @trusted {
         if (serverId.length == 0) {
             logError("getRecent: serverId is empty");
             return [];
         }
+        auto historyView = hotHistoryScope(networkId, view);
         auto norm = normalizeChannel(channel);
         const filterNoise = norm != "_server";
         auto key = KEY_PREFIX ~ serverId ~ ":" ~ networkId ~ ":" ~ norm;
-        auto res = _getRecentFiltered(key, count, before, after, beforeIdx, filterNoise);
+        auto res = _getRecentFiltered(key, historyView, count, before, after, beforeIdx, filterNoise);
         if (res.length == 0 && norm.length > 0 && norm[0] != '#' && norm[0] != '&' && norm[0] != '+' && norm[0] != '!') {
             import std.uni : toLower;
             auto legacyKey = KEY_PREFIX ~ serverId ~ ":" ~ networkId ~ ":" ~ ("#" ~ norm.toLower());
-            auto legacyRes = _getRecentFiltered(legacyKey, count, before, after, beforeIdx, filterNoise);
+            auto legacyRes = _getRecentFiltered(legacyKey, historyView, count, before, after, beforeIdx, filterNoise);
             if (legacyRes.length > 0) return legacyRes;
         }
         return res;
@@ -491,12 +602,14 @@ LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string]);
     /// (IRCCloud OOB backlog). Scan the bounded hot buffer, including live rows
     /// beneath arbitrarily sized older CHATHISTORY batches. Empty `serverId`
     /// reads the legacy non-namespaced key. Never throws on bad rows.
-    Json[] getUnreadTail(string serverId, string networkId, string channel, long afterTs, long limit) @trusted {
+    Json[] getUnreadTail(string serverId, string networkId, string channel, long afterTs, long limit,
+                         HistoryReadScope* view = null) @trusted {
+        auto historyView = hotHistoryScope(networkId, view);
         auto norm = normalizeChannel(channel);
         auto key = serverId.length
             ? KEY_PREFIX ~ serverId ~ ":" ~ networkId ~ ":" ~ norm
             : KEY_PREFIX ~ networkId ~ ":" ~ norm;
-        return _getRecentFiltered(key, limit, 0, afterTs, -1, false, true);
+        return _getRecentFiltered(key, historyView, limit, 0, afterTs, -1, false, true);
     }
 
     /**
@@ -507,11 +620,12 @@ LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string]);
      */
     Json[] getRecent(string serverId, string networkId, string channel,
                      long count, long before, long after,
-                     string beforeMsgid, string afterMsgid) @trusted {
+                     string beforeMsgid, string afterMsgid, HistoryReadScope* view = null) @trusted {
         if (serverId.length == 0) {
             logError("getRecent: serverId is empty");
             return [];
         }
+        auto historyView = hotHistoryScope(networkId, view);
 
         long beforeTs = before;
         long afterTs = after;
@@ -532,6 +646,7 @@ LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string]);
                 } catch (Exception e) { continue; }
                 try {
                     auto msg = parseJson(r);
+                    if (!historyHotRowVisible(msg, historyView)) continue;
                     if (msg.type == Json.Type.object && "m" in msg) {
                         const msgMsgid = msg["m"].get!string;
                         if (beforeMsgid.length > 0 && msgMsgid == beforeMsgid && "t" in msg) {
@@ -549,9 +664,9 @@ LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string]);
         if (beforeIdx >= 0) {
             channel = normalizeChannel(channel);
             auto key = KEY_PREFIX ~ serverId ~ ":" ~ networkId ~ ":" ~ channel;
-            return _getRecentFiltered(key, count, beforeTs, afterTs, beforeIdx, channel != "_server");
+            return _getRecentFiltered(key, historyView, count, beforeTs, afterTs, beforeIdx, channel != "_server");
         }
-        return getRecent(serverId, networkId, channel, count, beforeTs, afterTs);
+        return getRecent(serverId, networkId, channel, count, beforeTs, afterTs, -1, &historyView);
     }
 
     /**
@@ -561,15 +676,16 @@ LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string]);
      * Uses non-namespaced key format.
      */
     Json[] getRecent(string networkId, string channel, long count = 50, long before = 0, long after = 0,
-                     long beforeIdx = -1) @trusted {
+                     long beforeIdx = -1, HistoryReadScope* view = null) @trusted {
+        auto historyView = hotHistoryScope(networkId, view);
         auto norm = normalizeChannel(channel);
         const filterNoise = norm != "_server";
         auto key = KEY_PREFIX ~ networkId ~ ":" ~ norm;
-        auto res = _getRecentFiltered(key, count, before, after, beforeIdx, filterNoise);
+        auto res = _getRecentFiltered(key, historyView, count, before, after, beforeIdx, filterNoise);
         if (res.length == 0 && norm.length > 0 && norm[0] != '#' && norm[0] != '&' && norm[0] != '+' && norm[0] != '!') {
             import std.uni : toLower;
             auto legacyKey = KEY_PREFIX ~ networkId ~ ":" ~ ("#" ~ norm.toLower());
-            auto legacyRes = _getRecentFiltered(legacyKey, count, before, after, beforeIdx, filterNoise);
+            auto legacyRes = _getRecentFiltered(legacyKey, historyView, count, before, after, beforeIdx, filterNoise);
             if (legacyRes.length > 0) return legacyRes;
         }
         return res;
@@ -579,7 +695,8 @@ LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string]);
      * Legacy overload with msgid cursor support.
      */
     Json[] getRecent(string networkId, string channel, long count, long before, long after,
-                     string beforeMsgid, string afterMsgid) @trusted {
+                     string beforeMsgid, string afterMsgid, HistoryReadScope* view = null) @trusted {
+        auto historyView = hotHistoryScope(networkId, view);
         long beforeTs = before;
         long afterTs = after;
         long beforeIdx = -1;
@@ -599,6 +716,7 @@ LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string]);
                 } catch (Exception e) { continue; }
                 try {
                     auto msg = parseJson(r);
+                    if (!historyHotRowVisible(msg, historyView)) continue;
                     if (msg.type == Json.Type.object && "m" in msg) {
                         const msgMsgid = msg["m"].get!string;
                         if (beforeMsgid.length > 0 && msgMsgid == beforeMsgid && "t" in msg) {
@@ -616,9 +734,9 @@ LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string]);
         if (beforeIdx >= 0) {
             channel = normalizeChannel(channel);
             auto key = KEY_PREFIX ~ networkId ~ ":" ~ channel;
-            return _getRecentFiltered(key, count, beforeTs, afterTs, beforeIdx, channel != "_server");
+            return _getRecentFiltered(key, historyView, count, beforeTs, afterTs, beforeIdx, channel != "_server");
         }
-        return getRecent(networkId, channel, count, beforeTs, afterTs);
+        return getRecent(networkId, channel, count, beforeTs, afterTs, -1, &historyView);
     }
 
     /**

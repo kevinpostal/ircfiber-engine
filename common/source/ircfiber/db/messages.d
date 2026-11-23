@@ -5,8 +5,7 @@ import std.conv;
 import std.algorithm;
 import std.array;
 import std.json;
-import std.datetime : Clock, days;
-import vibe.core.core : runTask;
+import std.datetime : Clock;
 import vibe.db.mongo.mongo;
 import vibe.db.mongo.cursor;     // FindOptions
 import vibe.data.bson;
@@ -14,6 +13,10 @@ import vibe.data.json;
 import vibe.core.log;
 import ircfiber.db.mongo;
 import ircfiber.db.message_search : isSearchChannel, searchMetadata;
+import ircfiber.db.history_retention : HistoryRetentionRepository, HistoryRetentionState,
+    HistoryPolicy;
+import ircfiber.db.history_suppression : HistorySuppressionRepository;
+import ircfiber.db.history_visibility : HistoryReadScope, historyReadScope;
 import ircfiber.models.irc_event : IRCRawEvent;
 import ircfiber.models.network : normalizeChannelName, BncPlaybackCutoff,
     BncPlaybackConsumption, IrcCaseMapping, foldIrcCaseChar, ircCaseEquals;
@@ -61,7 +64,8 @@ version (RoutingPolicyTest) {
             messages.deleteMany(Bson(["networkId": Bson(id)]));
             networks.deleteOne(Bson(["id": Bson(id)]));
         }
-        networks.insertOne(Bson(["id": Bson(id), "userId": Bson(owner), "nick": Bson("Preserve")]));
+        networks.insertOne(Bson(["id": Bson(id), "userId": Bson(owner), "nick": Bson("Preserve"),
+            "archiveScopeVersion": Bson(1), "archiveServers": Bson([Bson("archive-gate-original")])]));
         auto repository = new MessageRepository();
         const timestamp = Clock.currTime().toUnixTime!long * 1000;
         const payload = `{"eid":1,"t":` ~ timestamp.to!string ~ `,"text":"preserved"}`;
@@ -170,8 +174,20 @@ struct BncArchiveFilter {
     }
 }
 
-/// Success means the raw archival command met majority+journal write concern.
-enum ArchiveWriteResult { inserted, alreadyPersisted }
+/// Durable insert/duplicate, or an intentionally fenced/expired event.
+enum ArchiveWriteResult { inserted, alreadyPersisted, expiredDiscard }
+
+/// Operation-scoped admission, reusable for bounded backfill batches. Fields
+/// are private so callers cannot manufacture an owner or relax a policy floor.
+struct ArchiveWriteScope {
+    private string serverId, networkId, ownerId;
+    private bool deleted;
+    private HistoryRetentionState installation;
+    private HistoryPolicy policy;
+    private long nowMs;
+
+    bool isDeleted() const pure nothrow @safe { return deleted; }
+}
 
 enum ArchiveWriteFailure { invalidInput, unavailable, rejected, identityMismatch, invalidReply }
 
@@ -187,8 +203,7 @@ final class ArchiveWriteException : Exception {
     }
 }
 
-/// Days a `messages` row stays in Mongo before the TTL monitor deletes it.
-/// Read once per process by `MessageRepository.ensureIndexes`.
+/// Legacy search age before operator cutover. Readers never create or modify TTL.
 enum MESSAGE_RETENTION_DAYS_DEFAULT = 30;
 
 /// `IRCFIBER_MESSAGE_RETENTION_DAYS` (positive int) or the default.
@@ -205,13 +220,10 @@ int messageRetentionDays() @trusted {
     return MESSAGE_RETENTION_DAYS_DEFAULT;
 }
 
-/// MongoDB (PCRE) spelling of `isDirectBuffer` for server-side filters.
-enum DIRECT_BUFFER_REGEX = `^[^#&.:*,\s]+$`;
-
 /// Whether a `messages.channel` value is a private conversation (a nick),
 /// as opposed to a channel, the `_server` log or a server-name pseudo buffer.
-/// Private conversations are not subject to retention: `messageDocument`
-/// writes no `tsAt` for them, so the TTL index never deletes them.
+/// Legacy TTL compatibility omits `tsAt` for private conversations. Active
+/// account retention includes them in both the age and logical-byte allowance.
 bool isDirectBuffer(string channel) @safe pure nothrow @nogc {
     if (channel.length == 0 || channel == "_server") return false;
     if (channel[0] == '#' || channel[0] == '&') return false;
@@ -232,12 +244,11 @@ bool isDirectBuffer(string channel) @safe pure nothrow @nogc {
 /**
  * Rolling message storage (IRCCloud-style).
  *
- * MongoDB stores every message the engine sees; channel and server-log rows expire after
- * `messageRetentionDays()` via the `tsAt` TTL index (Mongo's TTL monitor
- * deletes them in the background; private conversations carry no `tsAt` and are kept). Redis keeps a hot cache of the most
- * recent N messages for fast access. When the cache is exhausted, the
- * REST API falls through to MongoDB for scrollback within the retention
- * window.
+ * MongoDB stores the durable compact archive, including DMs and protocol
+ * records. Until account-policy cutover, non-DMs retain the legacy `tsAt`
+ * date for the installed TTL. Active policy instead applies account-wide
+ * history floors to the original event timestamp. Redis is a separate hot
+ * cache, not part of the logical Mongo allowance.
  *
  * Each document is indexed by (serverId, networkId, channel, t, msgid)
  * for efficient paginated queries. The full compact JSON payload is
@@ -246,6 +257,16 @@ bool isDirectBuffer(string channel) @safe pure nothrow @nogc {
  */
 final class MessageRepository {
     private MongoCollection collection;
+    private RedisStorage maintenanceRedis;
+    private long lastDirtyWarningMs;
+    enum historyDirtyKey = "irc:maint:history:dirty";
+
+    private static HistoryReadScope resolveHistoryView(string networkId, HistoryReadScope* view) {
+        auto resolved = view is null ? historyReadScope(networkId) : *view;
+        import std.exception : enforce;
+        enforce(resolved.networkId() == networkId, "History scope does not match network");
+        return resolved;
+    }
 
     /// Docs store the IRC command inside the `payload` JSON string
     /// (`"c":"315"`). Exclude the noise commands the chat UI cannot
@@ -293,7 +314,8 @@ final class MessageRepository {
     private static bool indexesEnsured;
 
     /// Creates a repository bound to the messages collection.
-    this() {
+    this(RedisStorage maintenanceRedis = null) {
+        this.maintenanceRedis = maintenanceRedis;
         collection = AppMongoConnection.getDb()["messages"];
         ensureIndexes();
     }
@@ -331,8 +353,7 @@ final class MessageRepository {
         AppMongoConnection.runCommand(ownership);
     }
 
-    /// Build the compound query indexes, the `tsAt` TTL index (retention),
-    /// and backfill `tsAt` on legacy rows in the background.
+    /// Add query indexes only. Retention DDL belongs to the operator migration.
     private void ensureIndexes() @trusted {
         if (indexesEnsured) return;
         indexesEnsured = true;
@@ -358,54 +379,6 @@ final class MessageRepository {
         } catch (Exception e) {
             logWarn("Failed to create messages compound index: %s", e.msg);
         }
-        dropSupersededIndexes();
-
-        const retentionDays = messageRetentionDays();
-        try {
-            IndexOptions o;
-            o.expireAfter = retentionDays.days;
-            collection.createIndex(Bson(["tsAt": Bson(1)]), o);
-        } catch (Exception e) {
-            // IndexOptionsConflict (code 85): index exists with a different
-            // expireAfterSeconds. Change it in place instead of drop+recreate.
-            try {
-                auto cmd = Bson.emptyObject;              // field order matters: command name first
-                cmd["collMod"] = Bson("messages");
-                auto idx = Bson.emptyObject;
-                idx["keyPattern"] = Bson(["tsAt": Bson(1)]);
-                idx["expireAfterSeconds"] = Bson(cast(long) retentionDays * 86_400);
-                cmd["index"] = idx;
-                AppMongoConnection.runCommand(cmd);
-                logInfo("messages TTL index retention set to %s days via collMod", retentionDays);
-            } catch (Exception e2) {
-                logWarn("messages TTL index: createIndex (%s) and collMod (%s) both failed; "
-                    ~ "retention NOT enforced — db.messages.dropIndex(\"tsAt_1\") and restart",
-                    e.msg, e2.msg);
-            }
-        }
-
-        // Rows written before `tsAt` existed never age out unless they get
-        // one. `{tsAt: {$exists: false}}` is served by the non-sparse tsAt_1
-        // index, so after the first run this is a cheap seek. Private
-        // conversations (see `isDirectBuffer`) deliberately carry no `tsAt`
-        // and are excluded, or they would be given an expiry on every start.
-        // Runs in a fiber so engine boot and gateway requests never block.
-        runTask({
-            try {
-                auto filter = Bson.emptyObject;
-                filter["tsAt"] = Bson(["$exists": Bson(false)]);
-                filter["$or"] = Bson([
-                    Bson(["channel": Bson("_server")]),
-                    Bson(["channel": Bson(["$not": Bson(["$regex": Bson(DIRECT_BUFFER_REGEX)])])]),
-                ]);
-                Bson[] pipeline = [Bson(["$set": Bson(["tsAt": Bson(["$toDate": Bson("$t")])])])];
-                auto res = collection.updateMany(filter, Bson(pipeline));
-                if (res.modifiedCount > 0)
-                    logInfo("messages retention backfill: set tsAt on %s legacy rows", res.modifiedCount);
-            } catch (Exception e) {
-                logWarn("messages retention backfill failed: %s", e.msg);
-            }
-        });
     }
 
     /// Index key document with the fields in exactly this order; a leading
@@ -417,31 +390,6 @@ final class MessageRepository {
             else keys[f] = Bson(1);
         }
         return keys;
-    }
-
-    /// Earlier layouts: associative-array order (`t` first) from builds
-    /// before 2026-10-25, and the `serverId`-first and `serverId`-less pairs
-    /// briefly deployed that day. Dropped once the current pair exists so
-    /// writes stop maintaining copies. Best-effort.
-    private void dropSupersededIndexes() @trusted {
-        static immutable string[] superseded = [
-            "t_-1_networkId_1_channel_1_serverId_1",
-            "serverId_1_networkId_1_channel_1_t_-1",
-            "serverId_1_networkId_1_channel_1_eid_-1",
-            "networkId_1_channel_1_t_-1",
-            "networkId_1_channel_1_eid_-1",
-        ];
-        try {
-            bool[string] present;
-            foreach (idx; collection.listIndexes()) present[idx["name"].get!string] = true;
-            if ("networkId_1_channel_1_t_-1_serverId_1" !in present
-                || "networkId_1_eid_-1_channel_1_serverId_1" !in present) return;
-            foreach (name; superseded)
-                if (name in present) {
-                    collection.dropIndex(name);
-                    logInfo("messages: dropped superseded index %s", name);
-                }
-        } catch (Exception e) logWarn("messages superseded index drop: %s", e.msg);
     }
 
     /// Normalize channel name via the canonical helper in
@@ -470,49 +418,149 @@ final class MessageRepository {
                 return 0;
         }
     }
-
-    /// Append a compact message JSON to storage. Called from the event
-    /// processor for every event the engine sees. `tsAt` mirrors `t` as a
-    /// BSON Date so the TTL index can age the row out.
-    void appendMessage(string serverId, string networkId, string channel, Json message) @trusted {
-        if (serverId.length == 0) {
-            logError("MessageRepository.appendMessage: serverId is empty");
-            return;
+    /// Read once per operation/bounded network batch, not once per event.
+    ArchiveWriteScope admitArchiveWrite(string serverId, string networkId,
+            string expectedOwner = "", long nowMs = 0) @trusted {
+        import ircfiber.archive_protocol : isCanonicalArchiveOperationId;
+        if (!serverId.length || serverId.length > 128
+                || !isCanonicalArchiveOperationId(networkId)
+                || (expectedOwner.length && !isCanonicalArchiveOperationId(expectedOwner)))
+            throw new ArchiveWriteException(ArchiveWriteFailure.invalidInput);
+        ArchiveWriteScope admission;
+        admission.serverId = serverId; admission.networkId = networkId;
+        import std.datetime : SysTime, DateTime, UTC;
+        const epoch = SysTime(DateTime(1970, 1, 1), UTC());
+        admission.nowMs = nowMs != 0 ? nowMs : (Clock.currTime - epoch).total!"msecs";
+        if (admission.nowMs <= 0)
+            throw new ArchiveWriteException(ArchiveWriteFailure.invalidInput);
+        const catalog = archiveNetworkCatalog(networkId);
+        const fencedOwner = historyNetworkFenceOwner(networkId);
+        if (!catalog.isNull) {
+            if (catalog["userId"].type != Bson.Type.string
+                    || !isCanonicalArchiveOperationId(catalog["userId"].get!string))
+                throw new ArchiveWriteException(ArchiveWriteFailure.identityMismatch);
+            admission.ownerId = catalog["userId"].get!string;
+            if ((expectedOwner.length && expectedOwner != admission.ownerId)
+                    || (fencedOwner.length && fencedOwner != admission.ownerId))
+                throw new ArchiveWriteException(ArchiveWriteFailure.identityMismatch);
+        } else {
+            if (!fencedOwner.length)
+                throw new ArchiveWriteException(ArchiveWriteFailure.unavailable);
+            admission.ownerId = fencedOwner;
         }
-        channel = normalizeChannel(channel);
-
-        auto payloadStr = message.toString();
-
-        // Build document via Json first (vibe.d handles all types
-        // correctly at the Json layer), then convert to Bson.
-        long ts;
-        if (auto t = "t" in message) {
-            if (t.type == Json.Type.int_) ts = t.get!long;
+        if (expectedOwner.length && expectedOwner != admission.ownerId)
+            throw new ArchiveWriteException(ArchiveWriteFailure.identityMismatch);
+        if (fencedOwner.length) {
+            admission.deleted = true;
+            return admission;
         }
-        if (ts == 0) ts = Clock.currTime.toUnixTime!long * 1000;
-
-        string msgid;
-        if (auto m = "m" in message) {
-            if (m.type == Json.Type.string) msgid = m.get!string;
+        if (catalog.tryIndex("archiveScopeVersion").isNull && catalog.tryIndex("archiveServers").isNull)
+            throw new ArchiveWriteException(ArchiveWriteFailure.unavailable);
+        if (!archiveIntegerEquals(catalog["archiveScopeVersion"], 1)
+                || catalog["archiveServers"].type != Bson.Type.array
+                || !catalog["archiveServers"].length || catalog["archiveServers"].length > 64)
+            throw new ArchiveWriteException(ArchiveWriteFailure.identityMismatch);
+        string[64] servers;
+        size_t count;
+        foreach (server; catalog["archiveServers"].byValue) {
+            if (server.type != Bson.Type.string)
+                throw new ArchiveWriteException(ArchiveWriteFailure.identityMismatch);
+            const value = server.get!string;
+            if (!value.length || value.length > 128 || servers[0 .. count].canFind(value))
+                throw new ArchiveWriteException(ArchiveWriteFailure.identityMismatch);
+            servers[count++] = value;
         }
-
-        // IRCCloud-style eid: global sequential event ID, always present.
-        // Stored as a top-level field so cursor lookups are O(1) indexed.
-        long eid;
-        if (auto e = "eid" in message) {
-            if (e.type == Json.Type.int_) eid = e.get!long;
-        }
-
+        if (!servers[0 .. count].canFind(serverId))
+            throw new ArchiveWriteException(ArchiveWriteFailure.identityMismatch);
         try {
-            collection.insertOne(messageDocument(serverId, networkId, channel,
-                message, payloadStr, ts, eid, msgid));
-        } catch (Exception e) {
-            logDebug("Mongo insert (probably duplicate): %s", e.msg);
+            auto retention = new HistoryRetentionRepository(AppMongoConnection.getDb());
+            admission.installation = retention.loadInstallationState();
+            if (admission.installation.active) {
+                auto policy = retention.loadPolicy(admission.ownerId);
+                if (policy.isNull)
+                    throw new ArchiveWriteException(ArchiveWriteFailure.unavailable);
+                admission.policy = policy.get;
+            }
+        } catch (ArchiveWriteException e) { throw e; }
+        catch (Exception) { throw new ArchiveWriteException(ArchiveWriteFailure.unavailable); }
+        return admission;
+    }
+
+    /// Only a majority-read durable fence proves deletion. Absence is not
+    /// deletion; malformed storage or owner conflicts remain hard failures.
+    bool historyNetworkDeleted(string networkId, string expectedOwner) @trusted {
+        import ircfiber.archive_protocol : isCanonicalArchiveOperationId;
+        if (!isCanonicalArchiveOperationId(networkId)
+                || !isCanonicalArchiveOperationId(expectedOwner))
+            throw new ArchiveWriteException(ArchiveWriteFailure.invalidInput);
+        const owner = historyNetworkFenceOwner(networkId);
+        if (owner.length && owner != expectedOwner)
+            throw new ArchiveWriteException(ArchiveWriteFailure.identityMismatch);
+        return owner.length != 0;
+    }
+
+    private static string historyNetworkFenceOwner(string networkId) @trusted {
+        import ircfiber.archive_protocol : isCanonicalArchiveOperationId;
+        auto command = Bson.emptyObject;
+        command["find"] = Bson("history_network_fences");
+        command["filter"] = Bson(["_id": Bson(networkId)]);
+        command["projection"] = Bson(["_id": Bson(1), "ownerId": Bson(1)]);
+        command["limit"] = Bson(2L); command["singleBatch"] = Bson(true);
+        command["maxTimeMS"] = Bson(5000);
+        command["readConcern"] = Bson(["level": Bson("majority")]);
+        const reply = runArchiveCommand(command);
+        checkArchiveReply(reply); checkArchiveWriteErrors(reply);
+        const cursor = reply["cursor"];
+        if (cursor.type != Bson.Type.object || !archiveIntegerEquals(cursor["id"], 0)
+                || cursor["ns"].type != Bson.Type.string
+                || cursor["ns"].get!string != AppMongoConnection.getDb().name ~ ".history_network_fences"
+                || cursor["firstBatch"].type != Bson.Type.array || cursor["firstBatch"].length > 1)
+            throw new ArchiveWriteException(ArchiveWriteFailure.invalidReply);
+        if (!cursor["firstBatch"].length) return "";
+        const row = cursor["firstBatch"][0];
+        if (row.type != Bson.Type.object || row["_id"].type != Bson.Type.string
+                || row["_id"].get!string != networkId || row["ownerId"].type != Bson.Type.string
+                || !isCanonicalArchiveOperationId(row["ownerId"].get!string))
+            throw new ArchiveWriteException(ArchiveWriteFailure.identityMismatch);
+        return row["ownerId"].get!string;
+    }
+
+    /// Ordinary producers share the checked insert path; callers decide how a
+    /// failed archive affects their independent live delivery.
+    ArchiveWriteResult appendMessage(string serverId, string networkId, string channel,
+            Json message) @trusted {
+        return appendMessage(admitArchiveWrite(serverId, networkId), channel, message);
+    }
+
+    ArchiveWriteResult appendMessage(ArchiveWriteScope admission, string channel, Json message) @trusted {
+        return appendOrdinaryPayload(admission, channel, message, message.toString());
+    }
+
+    private ArchiveWriteResult appendOrdinaryPayload(ArchiveWriteScope admission, string channel,
+            Json message, string compact) @trusted {
+        if (message.type != Json.Type.object)
+            throw new ArchiveWriteException(ArchiveWriteFailure.invalidInput);
+        long timestampMs, eid;
+        if (auto t = "t" in message)
+            if (t.type == Json.Type.int_) timestampMs = t.get!long;
+        // Compatibility for pre-cutover producers only. An active archive may
+        // never rejuvenate an old row using the wall clock at drain time.
+        if (timestampMs <= 0) {
+            if (admission.installation.active)
+                throw new ArchiveWriteException(ArchiveWriteFailure.invalidInput);
+            timestampMs = admission.nowMs;
         }
+        if (auto e = "eid" in message)
+            if (e.type == Json.Type.int_) eid = e.get!long;
+        string msgid;
+        if (auto m = "m" in message)
+            if (m.type == Json.Type.string) msgid = m.get!string;
+        return insertArchivedPayload(admission, channel, message, compact, timestampMs, eid, msgid);
     }
 
     private static Bson messageDocument(string serverId, string networkId, string channel,
-            Json message, string payload, long timestampMs, long eid, string msgid) @trusted {
+            Json message, string payload, long timestampMs, long eid, string msgid,
+            string ownerId, bool active) @trusted {
         auto jdoc = Json([
             "_id": Json(serverId ~ ":" ~ networkId ~ ":" ~ channel ~ ":" ~
                 (eid > 0 ? to!string(eid) : (msgid.length > 0 ? msgid : to!string(timestampMs)))),
@@ -525,9 +573,14 @@ final class MessageRepository {
         if (msgid.length > 0) jdoc["msgid"] = Json(msgid);
         if (eid > 0) jdoc["eid"] = Json(eid);
         auto doc = Bson(jdoc);
-        // Private conversations are kept for good: a row without `tsAt` is never
-        // matched by the TTL index (see `isDirectBuffer`).
-        if (!isDirectBuffer(channel)) doc["tsAt"] = Bson(BsonDate(timestampMs));
+        // Bson.data is the encoded envelope already built above, not a JSON
+        // estimate or a second serialization of the compact payload.
+        const charge = cast(long)doc.data.length;
+        doc["historyOwnerId"] = Bson(ownerId);
+        doc["historyBytes"] = Bson(charge);
+        if (isDirectBuffer(channel)) doc["historyWasDirect"] = Bson(true);
+        // Preserve compatibility with the installed legacy TTL until cutover.
+        if (!active && !isDirectBuffer(channel)) doc["tsAt"] = Bson(BsonDate(timestampMs));
         searchMetadata(doc, message);
         return doc;
     }
@@ -538,14 +591,16 @@ final class MessageRepository {
     /// restart, fresh dial): the history is the durable record of who the
     /// user talked to. One `distinct` over the (networkId, channel, t) index;
     /// only a network with more than `limit` candidates pays for the ranking.
-    string[] recentDirectBuffers(string networkId, long sinceMs, size_t limit) @trusted {
+    string[] recentDirectBuffers(string networkId, long sinceMs, size_t limit,
+            HistoryReadScope* view = null) @trusted {
+        auto historyView = resolveHistoryView(networkId, view);
         auto query = Bson.emptyObject;
         query["networkId"] = Bson(networkId);
         query["t"] = Bson(["$gt": Bson(sinceMs)]);
         auto cmd = Bson.emptyObject;              // field order matters: command name first
         cmd["distinct"] = Bson("messages");
         cmd["key"] = Bson("channel");
-        cmd["query"] = query;
+        cmd["query"] = historyView.filter(query);
         cmd["maxTimeMS"] = Bson(15_000L);
         auto reply = AppMongoConnection.runCommand(cmd);
 
@@ -562,7 +617,7 @@ final class MessageRepository {
         match["networkId"] = Bson(networkId);
         match["channel"] = Bson(["$in": serializeToBson(names)]);
         match["t"] = Bson(["$gt": Bson(sinceMs)]);
-        pipeline ~= Bson(["$match": match]);
+        pipeline ~= Bson(["$match": historyView.filter(match)]);
         auto group = Bson.emptyObject;
         group["_id"] = Bson("$channel");
         group["last"] = Bson(["$max": Bson("$t")]);
@@ -580,24 +635,29 @@ final class MessageRepository {
     /// channel is intentionally ignored because ordered renames can change it.
     ArchiveWriteResult appendArchivedMessage(string serverId, string networkId,
             string channel, Json message) @trusted {
-        return appendArchivedPayload(serverId, networkId, channel, message, message.toString());
+        return appendArchivedPayload(admitArchiveWrite(serverId, networkId),
+            channel, message, message.toString());
     }
 
     /// Journal replay keeps the admitted compact bytes verbatim. Do not
     /// serialize a parsed object again on every uncertain-write retry.
     ArchiveWriteResult appendArchivedCompactMessage(string serverId, string networkId,
+            string channel, string compactJson, string expectedOwner = "") @trusted {
+        return appendArchivedCompactMessage(admitArchiveWrite(serverId, networkId, expectedOwner),
+            channel, compactJson);
+    }
+
+    ArchiveWriteResult appendArchivedCompactMessage(ArchiveWriteScope admission,
             string channel, string compactJson) @trusted {
         Json message;
         try message = parseJsonString(compactJson);
         catch (Exception) { throw new ArchiveWriteException(ArchiveWriteFailure.invalidInput); }
-        return appendArchivedPayload(serverId, networkId, channel, message, compactJson);
+        return appendArchivedPayload(admission, channel, message, compactJson);
     }
 
-    private ArchiveWriteResult appendArchivedPayload(string serverId, string networkId,
+    private ArchiveWriteResult appendArchivedPayload(ArchiveWriteScope admission,
             string channel, Json message, string payload) @trusted {
-        channel = normalizeChannel(channel);
-        if (!serverId.length || !networkId.length || !channel.length
-                || message.type != Json.Type.object)
+        if (message.type != Json.Type.object)
             throw new ArchiveWriteException(ArchiveWriteFailure.invalidInput);
         const eidValue = "eid" in message;
         const timestampValue = "t" in message;
@@ -610,7 +670,28 @@ final class MessageRepository {
         string msgid;
         if (auto m = "m" in message)
             if (m.type == Json.Type.string) msgid = m.get!string;
-        const doc = messageDocument(serverId, networkId, channel, message, payload, timestampMs, eid, msgid);
+        return insertArchivedPayload(admission, channel, message, payload, timestampMs, eid, msgid);
+    }
+
+    private ArchiveWriteResult insertArchivedPayload(ArchiveWriteScope admission, string channel,
+            Json message, string payload, long timestampMs, long eid, string msgid) @trusted {
+        channel = normalizeChannel(channel);
+        if (!admission.serverId.length || !admission.networkId.length || !admission.ownerId.length
+                || !channel.length || timestampMs <= 0)
+            throw new ArchiveWriteException(ArchiveWriteFailure.invalidInput);
+        if (admission.deleted) return ArchiveWriteResult.expiredDiscard;
+        if (admission.installation.active) {
+            if (admission.policy.due(admission.nowMs))
+                throw new ArchiveWriteException(ArchiveWriteFailure.unavailable);
+            if (timestampMs <= admission.policy.visibleFloor(admission.nowMs, isDirectBuffer(channel))) {
+                const expired = messageDocument(admission.serverId, admission.networkId, channel, message,
+                    payload, timestampMs, eid, msgid, admission.ownerId, true);
+                preserveHistorySuppression([expired]);
+                return ArchiveWriteResult.expiredDiscard;
+            }
+        }
+        const doc = messageDocument(admission.serverId, admission.networkId, channel, message,
+            payload, timestampMs, eid, msgid, admission.ownerId, admission.installation.active);
         auto command = Bson.emptyObject; // Mongo requires the verb first.
         command["insert"] = Bson("messages");
         command["documents"] = Bson([doc]);
@@ -627,12 +708,28 @@ final class MessageRepository {
                 throw new ArchiveWriteException(ArchiveWriteFailure.rejected,
                     archiveErrorCode(error));
             verifyArchivedDuplicate(doc);
+            signalHistoryDirty(admission);
             return ArchiveWriteResult.alreadyPersisted;
         }
         checkArchiveWriteErrors(reply);
         if (!archiveIntegerEquals(reply["n"], 1))
             throw new ArchiveWriteException(ArchiveWriteFailure.invalidReply);
+        signalHistoryDirty(admission);
         return ArchiveWriteResult.inserted;
+    }
+
+    // A Redis outage must not change the durability result of a Mongo write.
+    // The roster scan repairs lost signals. NX retains the oldest enqueue time.
+    private void signalHistoryDirty(const ref ArchiveWriteScope admission) {
+        if (!admission.installation.active || maintenanceRedis is null) return;
+        try maintenanceRedis.getDb().request!long("ZADD", historyDirtyKey, "NX",
+            admission.nowMs, admission.ownerId);
+        catch (Exception) {
+            if (admission.nowMs - lastDirtyWarningMs >= 60_000) {
+                lastDirtyWarningMs = admission.nowMs;
+                logWarn("history retention: dirty signal unavailable; relying on roster sweep");
+            }
+        }
     }
 
     /// Returns the acknowledged modified count, including zero on replay.
@@ -645,6 +742,9 @@ final class MessageRepository {
         newChannel = normalizeChannel(newChannel);
         if (!newChannel.length)
             throw new ArchiveWriteException(ArchiveWriteFailure.invalidInput);
+        try new HistorySuppressionRepository(AppMongoConnection.getDb()).beforeRename(
+            serverId, networkId, oldChannel, newChannel, cutoffEid, legacyTimestampCutoffMs);
+        catch (Exception) { throw new ArchiveWriteException(ArchiveWriteFailure.unavailable); }
         auto command = Bson.emptyObject;
         command["update"] = Bson("messages");
         command["updates"] = Bson([Bson([
@@ -671,15 +771,37 @@ final class MessageRepository {
             long cutoffEid, long legacyTimestampCutoffMs) @trusted {
         auto filter = archiveCutoffFilter(serverId, networkId, channel,
             cutoffEid, legacyTimestampCutoffMs);
-        auto command = Bson.emptyObject;
-        command["delete"] = Bson("messages");
-        command["deletes"] = Bson([Bson(["q": filter, "limit": Bson(0)])]);
-        command["ordered"] = Bson(true);
-        command["writeConcern"] = archiveWriteConcern();
-        const reply = runArchiveCommand(command);
-        checkArchiveReply(reply);
-        checkArchiveWriteErrors(reply);
-        return archiveReplyCount(reply, "n");
+        auto suppression = new HistorySuppressionRepository(AppMongoConnection.getDb());
+        try suppression.beforeClear(serverId, networkId, channel, cutoffEid, legacyTimestampCutoffMs);
+        catch (Exception) { throw new ArchiveWriteException(ArchiveWriteFailure.unavailable); }
+        long deleted;
+        while (true) {
+            FindOptions options;
+            options.limit = 256;
+            options.maxTimeMS = 2_000;
+            Bson[] page;
+            foreach (doc; collection.find(filter, options)) page ~= doc;
+            if (!page.length) return deleted;
+            preserveHistorySuppression(page, true);
+            string[] ids;
+            foreach (doc; page) ids ~= doc["_id"].get!string;
+            auto exact = Bson(["$and": Bson([filter,
+                Bson(["_id": Bson(["$in": serializeToBson(ids)])])])]);
+            auto command = Bson.emptyObject;
+            command["delete"] = Bson("messages");
+            command["deletes"] = Bson([Bson(["q": exact, "limit": Bson(0)])]);
+            command["ordered"] = Bson(true);
+            command["writeConcern"] = archiveWriteConcern();
+            const reply = runArchiveCommand(command);
+            checkArchiveReply(reply);
+            checkArchiveWriteErrors(reply);
+            deleted += archiveReplyCount(reply, "n");
+        }
+    }
+
+    private static void preserveHistorySuppression(Bson[] rows, bool clearingScope = false) {
+        try new HistorySuppressionRepository(AppMongoConnection.getDb()).preserveBeforeDelete(rows, clearingScope);
+        catch (Exception) { throw new ArchiveWriteException(ArchiveWriteFailure.unavailable); }
     }
 
     /// Canonical network metadata survives Redis eviction and ordinary config
@@ -732,14 +854,16 @@ final class MessageRepository {
         command["filter"] = Bson(["id": Bson(networkId)]);
         command["projection"] = Bson(["_id": Bson(0), "id": Bson(1),
             "userId": Bson(1), "archiveScopeVersion": Bson(1), "archiveServers": Bson(1)]);
-        command["limit"] = Bson(1L); command["singleBatch"] = Bson(true);
+        command["limit"] = Bson(2L); command["singleBatch"] = Bson(true);
         command["maxTimeMS"] = Bson(5000);
         command["readConcern"] = Bson(["level": Bson("majority")]);
         auto reply = runArchiveCommand(command);
         checkArchiveReply(reply); checkArchiveWriteErrors(reply);
         auto cursor = reply["cursor"];
-        if (cursor.type != Bson.Type.object || cursor["firstBatch"].type != Bson.Type.array
-                || cursor["firstBatch"].length > 1)
+        if (cursor.type != Bson.Type.object || !archiveIntegerEquals(cursor["id"], 0)
+                || cursor["ns"].type != Bson.Type.string
+                || cursor["ns"].get!string != AppMongoConnection.getDb().name ~ ".networks"
+                || cursor["firstBatch"].type != Bson.Type.array || cursor["firstBatch"].length > 1)
             throw new ArchiveWriteException(ArchiveWriteFailure.invalidReply);
         if (!cursor["firstBatch"].length) return Bson(null);
         auto doc = cursor["firstBatch"][0];
@@ -1003,7 +1127,10 @@ final class MessageRepository {
         checkArchiveReply(reply);
         checkArchiveWriteErrors(reply);
         const cursor = reply["cursor"];
-        if (cursor.type != Bson.Type.object || cursor["firstBatch"].type != Bson.Type.array)
+        if (cursor.type != Bson.Type.object || !archiveIntegerEquals(cursor["id"], 0)
+                || cursor["ns"].type != Bson.Type.string
+                || cursor["ns"].get!string != AppMongoConnection.getDb().name ~ ".messages"
+                || cursor["firstBatch"].type != Bson.Type.array)
             throw new ArchiveWriteException(ArchiveWriteFailure.invalidReply);
         const batch = cursor["firstBatch"];
         if (batch.length == 0)
@@ -1016,9 +1143,25 @@ final class MessageRepository {
                     || stored[field].get!string != expected[field].get!string)
                 throw new ArchiveWriteException(ArchiveWriteFailure.identityMismatch);
         }
-        foreach (field; ["eid", "t"])
-            if (!archiveIntegerEquals(stored[field], expected[field].get!long))
+        foreach (field; ["eid", "t"]) {
+            const wanted = expected.tryIndex(field);
+            const actual = stored.tryIndex(field);
+            if (wanted.isNull) {
+                if (!actual.isNull)
+                    throw new ArchiveWriteException(ArchiveWriteFailure.identityMismatch);
+            } else if (actual.isNull || !archiveIntegerEquals(actual.get, wanted.get.get!long)) {
                 throw new ArchiveWriteException(ArchiveWriteFailure.identityMismatch);
+            }
+        }
+        // Pre-migration duplicates can lack stamps, but may never carry a
+        // contradictory owner. A rename intentionally preserves the old charge.
+        foreach (key, value; stored.byKeyValue) {
+            if (key == "historyOwnerId" && (value.type != Bson.Type.string
+                    || value.get!string != expected["historyOwnerId"].get!string))
+                throw new ArchiveWriteException(ArchiveWriteFailure.identityMismatch);
+            if (key == "historyBytes" && (value.type != Bson.Type.long_ || value.get!long <= 0))
+                throw new ArchiveWriteException(ArchiveWriteFailure.identityMismatch);
+        }
     }
 
     /// Rename a buffer's channel field after a NICK-follow, so Mongo
@@ -1057,11 +1200,11 @@ final class MessageRepository {
     }
 
     /// Convenience: append directly from an IRCRawEvent.
-    void appendIRCEvent(IRCRawEvent event, string serverId) @trusted {
+    ArchiveWriteResult appendIRCEvent(IRCRawEvent event, string serverId) @trusted {
         const networkId = event.networkId.length > 0 ? event.networkId : event.network;
         const channel = event.channel.length > 0 ? normalizeChannel(event.channel) : "_server";
         auto msg = event.toCompactJson();
-        appendMessage(serverId, networkId, channel, msg);
+        return appendMessage(serverId, networkId, channel, msg);
     }
 
     /// Read a payload back from Mongo and convert the stored JSON
@@ -1071,7 +1214,7 @@ final class MessageRepository {
     /// Returns oldest-first (IRCCloud/Redis convention) — the find()
     /// above returns newest-first (sort by t desc) and we reverse here
     /// so the caller can treat MongoDB and Redis results identically.
-    private Json[] readPayloads(Bson filter, int count) @trusted {
+    private Json[] readPayloads(Bson filter, int count, HistoryReadScope* view) @trusted {
         if (count <= 0) count = 50;
         if (count > 1000) count = 1000;
 
@@ -1079,13 +1222,14 @@ final class MessageRepository {
         options.sort = Bson(["t": Bson(-1)]);
         options.limit = cast(long)count;
 
+        filter = view.filter(filter);
         Json[] out_;
         foreach (doc; collection.find(filter, options)) {
             const p = doc["payload"];
             if (p.type == Bson.Type.string) {
-                auto raw = p.get!string;
                 try {
-                    out_ ~= parseJsonString(raw);
+                    Json payload;
+                    if (visiblePayload(doc, view, payload)) out_ ~= payload;
                 } catch (Exception e) {
                     logWarn("Failed to parse stored message payload: %s", e.msg);
                 }
@@ -1096,13 +1240,34 @@ final class MessageRepository {
         return out_;
     }
 
+    /// The admitted envelope owns routing and event time. A rename may change
+    /// its target without rewriting immutable compact bytes.
+    private static bool visiblePayload(Bson doc, HistoryReadScope* view, out Json payload) {
+        if (doc["payload"].type != Bson.Type.string) return false;
+        payload = parseJsonString(doc["payload"].get!string);
+        if (!view.active()) return true;
+        if (payload.type != Json.Type.object || payload["t"].type != Json.Type.int_
+                || payload["t"].get!long != readBsonTimestamp(doc["t"]))
+            return false;
+        foreach (key; ["nid", "networkId"]) {
+            if (auto value = key in payload) {
+                if (value.type != Json.Type.string || value.get!string != view.networkId())
+                    return false;
+            }
+        }
+        if (doc["channel"].type != Bson.Type.string) return false;
+        payload["ch"] = Json(doc["channel"].get!string);
+        return true;
+    }
+
     /**
      * Fetch the most recent `count` messages for a channel, newest-first
      * by timestamp. Used as the MongoDB fallback for the `_server` buffer
      * scrollback during WebSocket state dump when Redis is cold.
      */
     Json[] getRecent(string serverId, string networkId, string channel,
-                     int count = 50) @trusted {
+                     int count = 50, HistoryReadScope* view = null) @trusted {
+        auto historyView = resolveHistoryView(networkId, view);
         channel = normalizeChannel(channel);
         if (count <= 0) count = 50;
         if (count > 1000) count = 1000;
@@ -1120,7 +1285,20 @@ final class MessageRepository {
                 "channel": Bson(channel)
             ]);
         }
-        return readPayloads(filter, count);
+        return readPayloads(filter, count, &historyView);
+    }
+
+    /// Initial unread tails span engine moves and count only highlight-bearing
+    /// commands before selecting the newest bounded chronological page.
+    Json[] getUnreadTail(string networkId, string channel, long afterTs, int count,
+            HistoryReadScope* view = null) @trusted {
+        if (count <= 0) return [];
+        auto historyView = resolveHistoryView(networkId, view);
+        auto filter = Bson(["networkId": Bson(networkId),
+            "channel": Bson(normalizeChannel(channel)),
+            "t": Bson(["$gt": Bson(afterTs)]),
+            "payload": Bson(["$regex": Bson(`"c"\s*:\s*"(PRIVMSG|NOTICE|INVITE|WALLOPS)"`)])]);
+        return readPayloads(filter, count, &historyView);
     }
 
     /**
@@ -1137,7 +1315,8 @@ final class MessageRepository {
      * for every new event, matching IRCCloud's architecture.
      */
     Json[] getBeforeEid(string serverId, string networkId, string channel,
-                        long beforeEid, long fallbackTs, int count) @trusted {
+                        long beforeEid, long fallbackTs, int count, HistoryReadScope* view = null) @trusted {
+        auto historyView = resolveHistoryView(networkId, view);
         channel = normalizeChannel(channel);
         if (count <= 0) count = 50;
         if (count > 1000) count = 1000;
@@ -1159,7 +1338,7 @@ final class MessageRepository {
                     "eid": Bson(beforeEid)
                 ]);
             }
-            auto cursorDoc = collection.findOne(cursorFilter);
+            auto cursorDoc = collection.findOne(historyView.filter(cursorFilter));
             if (!cursorDoc.isNull) {
                 beforeTs = readBsonTimestamp(cursorDoc["t"]);
             }
@@ -1189,11 +1368,12 @@ final class MessageRepository {
             ]);
         }
         applyNoiseExclusion(filter, channel);
-        return readPayloads(filter, count);
+        return readPayloads(filter, count, &historyView);
     }
 
     Json[] getBeforeMsgid(string serverId, string networkId, string channel,
-                          string beforeMsgid, long fallbackTs, int count) @trusted {
+                          string beforeMsgid, long fallbackTs, int count, HistoryReadScope* view = null) @trusted {
+        auto historyView = resolveHistoryView(networkId, view);
         channel = normalizeChannel(channel);
         if (count <= 0) count = 50;
         if (count > 1000) count = 1000;
@@ -1213,7 +1393,7 @@ final class MessageRepository {
                 "msgid": Bson(beforeMsgid)
             ]);
         }
-        auto cursorDoc = collection.findOne(cursorFilter);
+        auto cursorDoc = collection.findOne(historyView.filter(cursorFilter));
         if (!cursorDoc.isNull) {
             beforeTs = readBsonTimestamp(cursorDoc["t"]);
         }
@@ -1245,14 +1425,15 @@ final class MessageRepository {
             ]);
         }
         applyNoiseExclusion(filter, channel);
-        return readPayloads(filter, count);
+        return readPayloads(filter, count, &historyView);
     }
 
     /// Exclusive bounds; selected rows are always returned in ascending storage order.
     Json[] getWindow(string serverId, string networkId, string channel,
                      HistoryBoundary after, HistoryBoundary before, int count,
-                     bool fromNewest, bool events = false) @trusted {
-        return historyWindow(serverId, networkId, channel, after, before, count, fromNewest, events);
+                     bool fromNewest, bool events = false, HistoryReadScope* view = null) @trusted {
+        auto historyView = resolveHistoryView(networkId, view);
+        return historyWindow(serverId, networkId, channel, after, before, count, fromNewest, events, false, &historyView);
     }
 
     static Bson boundaryFilter(HistoryBoundary boundary, bool after, bool inclusive = false) {
@@ -1277,7 +1458,7 @@ final class MessageRepository {
 
     private Json[] historyWindow(string serverId, string networkId, string channel,
             HistoryBoundary after, HistoryBoundary before, int count, bool fromNewest,
-            bool events, bool includeAfter = false) @trusted {
+            bool events, bool includeAfter, HistoryReadScope* view) @trusted {
         if (count <= 0) return [];
         count = min(count, 1000);
         channel = normalizeChannel(channel);
@@ -1289,6 +1470,7 @@ final class MessageRepository {
         if (before.exact || before.timestampMs != 0) bounds ~= boundaryFilter(before, false);
         if (bounds.length) filter["$and"] = Bson(bounds);
         filter["payload"] = Bson(["$regex": Bson(events ? EVENT_PAYLOAD_RE : CHAT_PAYLOAD_RE)]);
+        filter = view.filter(filter);
         FindOptions options;
         auto order = Bson.emptyObject;
         foreach (key; ["t", "eid", "_id"]) order[key] = Bson(fromNewest ? -1 : 1);
@@ -1296,8 +1478,10 @@ final class MessageRepository {
         options.limit = cast(long) count;
         Json[] rows;
         foreach (doc; collection.find(filter, options)) {
-            if (doc["payload"].type != Bson.Type.string) continue;
-            try rows ~= parseJsonString(doc["payload"].get!string);
+            try {
+                Json payload;
+                if (visiblePayload(doc, view, payload)) rows ~= payload;
+            }
             catch (Exception e) logWarn("Failed to parse stored message payload: %s", e.msg);
         }
         if (fromNewest) rows.reverse;
@@ -1306,22 +1490,25 @@ final class MessageRepository {
 
     /// Include the selected exact row once, between strict older/newer halves.
     Json[] getAround(string serverId, string networkId, string channel,
-            HistoryBoundary center, int count, bool events = false) @trusted {
+            HistoryBoundary center, int count, bool events = false, HistoryReadScope* view = null) @trusted {
+        auto historyView = resolveHistoryView(networkId, view);
         if (count <= 0) return [];
         const half = count / 2;
-        return historyWindow(serverId, networkId, channel, HistoryBoundary.init, center, half, true, events)
+        return historyWindow(serverId, networkId, channel, HistoryBoundary.init, center, half, true, events, false, &historyView)
             ~ historyWindow(serverId, networkId, channel, center, HistoryBoundary.init,
-                count - half, false, events, true);
+                count - half, false, events, true, &historyView);
     }
 
 
     /// False is an unknown reference, never an unbounded window.
     bool boundaryOfMsgid(string serverId, string networkId, string channel, string msgid,
-            out HistoryBoundary boundary) @trusted {
+            out HistoryBoundary boundary, HistoryReadScope* view = null) @trusted {
+        auto historyView = resolveHistoryView(networkId, view);
         channel = normalizeChannel(channel);
         Bson filter = serverId.length > 0
             ? Bson(["serverId": Bson(serverId), "networkId": Bson(networkId), "channel": Bson(channel), "msgid": Bson(msgid)])
             : Bson(["networkId": Bson(networkId), "channel": Bson(channel), "msgid": Bson(msgid)]);
+        filter = historyView.filter(filter);
         FindOptions options;
         options.sort = indexKeys(["t", "eid", "_id"]);
         options.limit = 1;
@@ -1341,8 +1528,9 @@ final class MessageRepository {
 
     /// Filter the actual latest retained chat row, not the latest within the interval.
     long latestTimestamp(string serverId, string networkId, string channel,
-                         long afterTs, long beforeTs) @trusted {
-        auto rows = getWindow(serverId, networkId, channel, HistoryBoundary.init, HistoryBoundary.init, 1, true);
+                         long afterTs, long beforeTs, HistoryReadScope* view = null) @trusted {
+        auto historyView = resolveHistoryView(networkId, view);
+        auto rows = getWindow(serverId, networkId, channel, HistoryBoundary.init, HistoryBoundary.init, 1, true, false, &historyView);
         foreach (ev; rows) {
             if (ev.type != Json.Type.object) continue;
             if (auto t = "t" in ev) if (t.type == Json.Type.int_) {
@@ -1354,7 +1542,9 @@ final class MessageRepository {
     }
 
     /// Previously delivered identities among a reconnect page; timestamps are not identity.
-    bool[string] deliveredHistoryKeys(string serverId, string networkId, Json[] rows, long throughEid) @trusted {
+    bool[string] deliveredHistoryKeys(string serverId, string networkId, Json[] rows, long throughEid,
+            HistoryReadScope* view = null) @trusted {
+        auto historyView = resolveHistoryView(networkId, view);
         Bson[] identities;
         foreach (row; rows) {
             if (row["m"].type != Json.Type.string || !row["m"].get!string.length) continue;
@@ -1366,6 +1556,7 @@ final class MessageRepository {
         if (!identities.length) return keys;
         auto filter = Bson(["serverId": Bson(serverId), "networkId": Bson(networkId),
             "eid": Bson(["$lte": Bson(throughEid)]), "$or": Bson(identities)]);
+        filter = historyView.filter(filter);
         foreach (doc; collection.find(filter)) {
             if (doc["msgid"].type == Bson.Type.string && doc["channel"].type == Bson.Type.string)
                 keys[doc["channel"].get!string ~ "\0m" ~ doc["msgid"].get!string] = true;
@@ -1376,7 +1567,8 @@ final class MessageRepository {
     /// Fetch older messages using a timestamp cursor (fallback when
     /// no msgid is available).
     Json[] getBeforeTimestamp(string serverId, string networkId, string channel,
-                             long beforeTs, int count) @trusted {
+                             long beforeTs, int count, HistoryReadScope* view = null) @trusted {
+        auto historyView = resolveHistoryView(networkId, view);
         channel = normalizeChannel(channel);
 
         Bson filter;
@@ -1410,7 +1602,7 @@ final class MessageRepository {
             }
         }
         applyNoiseExclusion(filter, channel);
-        return readPayloads(filter, count);
+        return readPayloads(filter, count, &historyView);
     }
 
     /**
@@ -1427,7 +1619,8 @@ final class MessageRepository {
      * index seek + O(count) for the read.
      */
     Json[] getAfterEid(string serverId, string networkId, string channel,
-                       long afterEid, int count) @trusted {
+                       long afterEid, int count, HistoryReadScope* view = null) @trusted {
+        auto historyView = resolveHistoryView(networkId, view);
         if (serverId.length == 0) return [];
         channel = normalizeChannel(channel);
         if (count <= 0) count = 50;
@@ -1439,7 +1632,7 @@ final class MessageRepository {
             "channel": Bson(channel),
             "eid": Bson(["$gt": Bson(afterEid)])
         ]);
-        return readPayloads(filter, count);
+        return readPayloads(filter, count, &historyView);
     }
 
     /**
@@ -1451,8 +1644,8 @@ final class MessageRepository {
      * by eid and append to the appropriate buffer.
      */
     Json[] getAfterEidForNetwork(string serverId, string networkId,
-                                 long afterEid, int count) @trusted {
-        if (serverId.length == 0) return [];
+                                 long afterEid, int count, HistoryReadScope* view = null) @trusted {
+        auto historyView = resolveHistoryView(networkId, view);
         if (count <= 0) count = 50;
         if (count > 1000) count = 1000;
 
@@ -1464,17 +1657,18 @@ final class MessageRepository {
         options.limit = cast(long)count;
 
         Bson filter = Bson([
-            "serverId": Bson(serverId),
             "networkId": Bson(networkId),
             "eid": Bson(["$gt": Bson(afterEid)])
         ]);
+        if (serverId.length) filter["serverId"] = Bson(serverId);
+        filter = historyView.filter(filter);
         Json[] out_;
         foreach (doc; collection.find(filter, options)) {
             const p = doc["payload"];
             if (p.type == Bson.Type.string) {
-                auto raw = p.get!string;
                 try {
-                    out_ ~= parseJsonString(raw);
+                    Json payload;
+                    if (visiblePayload(doc, &historyView, payload)) out_ ~= payload;
                 } catch (Exception e) {
                     logWarn("getAfterEidForNetwork: bad payload: %s", e.msg);
                 }
@@ -1566,7 +1760,9 @@ final class MessageRepository {
         Json payload;
     }
 
-    private BncArchiveRow[] readBncRows(Bson filter, int count, bool newest, bool eidOrder) @trusted {
+    private BncArchiveRow[] readBncRows(Bson filter, int count, bool newest, bool eidOrder,
+            HistoryReadScope* view) @trusted {
+        filter = view.filter(filter);
         FindOptions options;
         auto order = Bson.emptyObject;
         if (!eidOrder) order["t"] = Bson(newest ? -1 : 1);
@@ -1578,8 +1774,9 @@ final class MessageRepository {
         foreach (doc; collection.find(filter, options)) {
             if (doc["payload"].type != Bson.Type.string) continue;
             try {
-                rows ~= BncArchiveRow(readBsonTimestamp(doc["eid"]), doc["_id"].get!string,
-                    parseJsonString(doc["payload"].get!string));
+                Json payload;
+                if (!visiblePayload(doc, view, payload)) continue;
+                rows ~= BncArchiveRow(readBsonTimestamp(doc["eid"]), doc["_id"].get!string, payload);
             } catch (Exception) {
                 logWarn("Failed to parse stored BNC archive payload");
             }
@@ -1590,10 +1787,11 @@ final class MessageRepository {
     /// Bound each category member inside Mongo before the final eid page.
     /// $topN avoids collecting an unbounded channel history with $push/$slice.
     private BncArchiveRow[] readBncLimitedRows(Bson filter, int perTarget, int count,
-            long afterEid, bool partitionTargets) @trusted {
+            long afterEid, bool partitionTargets, HistoryReadScope* view) @trusted {
         // Returning replay has always required positive eids. Rank that
         // eligible inventory first, then apply the caller's cursor below.
         filter["eid"] = Bson(["$gt": Bson(0L)]);
+        filter = view.filter(filter);
         auto newest = Bson.emptyObject;
         newest["t"] = Bson(-1);
         newest["eid"] = Bson(-1);
@@ -1606,7 +1804,8 @@ final class MessageRepository {
             Bson(["$group": Bson(["_id": partitionTargets ? Bson("$channel") : Bson(null),
                 "rows": Bson(["$topN": Bson(["n": Bson(min(perTarget, 1000)),
                     "sortBy": newest, "output": Bson([
-                        "_id": Bson("$_id"), "eid": Bson("$eid"), "payload": Bson("$payload")
+                        "_id": Bson("$_id"), "eid": Bson("$eid"), "payload": Bson("$payload"),
+                        "t": Bson("$t"), "channel": Bson("$channel")
                     ])])])])]),
             Bson(["$unwind": Bson("$rows")]),
             Bson(["$replaceRoot": Bson(["newRoot": Bson("$rows")])]),
@@ -1619,8 +1818,9 @@ final class MessageRepository {
         foreach (doc; collection.aggregate!Bson(pipeline, options)) {
             if (doc["payload"].type != Bson.Type.string) continue;
             try {
-                rows ~= BncArchiveRow(readBsonTimestamp(doc["eid"]), doc["_id"].get!string,
-                    parseJsonString(doc["payload"].get!string));
+                Json payload;
+                if (!visiblePayload(doc, view, payload)) continue;
+                rows ~= BncArchiveRow(readBsonTimestamp(doc["eid"]), doc["_id"].get!string, payload);
             } catch (Exception) {
                 logWarn("Failed to parse stored BNC archive payload");
             }
@@ -1651,7 +1851,8 @@ final class MessageRepository {
     /// Newest eligible target rows, returned in ascending (t, eid, _id) order.
     /// Empty serverId deliberately supports offline/ownerless network history.
     Json[] getBncPlayback(string serverId, string networkId, string target,
-            BncArchiveFilter policy, bool events) @trusted {
+            BncArchiveFilter policy, bool events, HistoryReadScope* view = null) @trusted {
+        auto historyView = resolveHistoryView(networkId, view);
         if (!networkId.length || !isBncTarget(target) || policy.limit == 0) return [];
         const count = policy.limit < 0 ? 1000 : min(policy.limit, 1000);
         auto filter = bncArchiveScope(serverId, networkId, events);
@@ -1659,7 +1860,7 @@ final class MessageRepository {
             Bson(["$or": Bson([bncBufferType(false), bncBufferType(true)])])];
         appendBncPolicy(clauses, policy);
         filter["$and"] = Bson(clauses);
-        auto stored = readBncRows(filter, count, true, false);
+        auto stored = readBncRows(filter, count, true, false, &historyView);
         Json[] rows;
         rows.length = stored.length;
         foreach (i, ref row; stored) rows[stored.length - i - 1] = row.payload;
@@ -1671,7 +1872,9 @@ final class MessageRepository {
     /// Neither this path nor explicit playback changes archive/cursor state.
     Json[] getBncMissed(string serverId, string networkId, long afterEid, int limit,
             BncArchiveFilter channel, BncArchiveFilter query,
-            BncArchiveFilter[string] overrides, string[] detached, bool events) @trusted {
+            BncArchiveFilter[string] overrides, string[] detached, bool events,
+            HistoryReadScope* view = null) @trusted {
+        auto historyView = resolveHistoryView(networkId, view);
         if (!networkId.length || limit <= 0) return [];
         limit = min(limit, 1000);
         string[] excluded;
@@ -1698,7 +1901,7 @@ final class MessageRepository {
                 auto filter = bncArchiveScope(serverId, networkId, events);
                 filter["$and"] = Bson(clauses);
                 selected = mergeBncRows(selected,
-                    readBncLimitedRows(filter, policy.limit, limit, afterEid, true), limit);
+                    readBncLimitedRows(filter, policy.limit, limit, afterEid, true, &historyView), limit);
             }
         }
         foreach (name, policy; overrides) {
@@ -1714,7 +1917,7 @@ final class MessageRepository {
             auto filter = bncArchiveScope(serverId, networkId, events);
             filter["eid"] = Bson(["$gt": Bson(max(afterEid, 0L))]);
             filter["$or"] = Bson(alternatives);
-            selected = mergeBncRows(selected, readBncRows(filter, limit, false, true), limit);
+            selected = mergeBncRows(selected, readBncRows(filter, limit, false, true, &historyView), limit);
         }
         foreach (name, policy; overrides) {
             const inherited = isBncQuery(name) ? query.limit : channel.limit;
@@ -1726,7 +1929,7 @@ final class MessageRepository {
             Bson[] clauses = [bncTargetPredicate(names)];
             appendBncPolicy(clauses, policy);
             filter["$and"] = Bson(clauses);
-            auto rows = readBncLimitedRows(filter, targetLimit, limit, afterEid, false);
+            auto rows = readBncLimitedRows(filter, targetLimit, limit, afterEid, false, &historyView);
             selected = mergeBncRows(selected, rows, limit);
         }
         Json[] result;
@@ -1735,11 +1938,13 @@ final class MessageRepository {
         return result;
     }
 
-    /// No age cutoff: old query history remains a valid explicit BNC target.
+    /// Query inventory contains only retained, visible history.
     /// Mongo groups/ranks first, and the returned inventory is bounded to 1000.
-    string[] recentBncQueries(string networkId, size_t limit) @trusted {
+    string[] recentBncQueries(string networkId, size_t limit, HistoryReadScope* view = null) @trusted {
+        auto historyView = resolveHistoryView(networkId, view);
         if (!networkId.length || limit == 0) return [];
         auto match = Bson(["networkId": Bson(networkId), "$and": Bson([bncBufferType(true)])]);
+        match = historyView.filter(match);
         auto order = Bson.emptyObject;
         order["last"] = Bson(-1);
         order["_id"] = Bson(1);
@@ -1787,11 +1992,14 @@ final class MessageRepository {
 
     /// Return the stored canonical spelling, or "" when no real query exists.
     /// A literal lookup is not restricted to the newest inventory page.
-    string findBncQuery(string networkId, string name, IrcCaseMapping mapping) @trusted {
+    string findBncQuery(string networkId, string name, IrcCaseMapping mapping,
+            HistoryReadScope* view = null) @trusted {
+        auto historyView = resolveHistoryView(networkId, view);
         if (!networkId.length || !isBncQuery(name)) return "";
         auto filter = Bson(["networkId": Bson(networkId),
             "channel": Bson(["$regex": Bson(bncLiteralQueryRegex(name, mapping))]),
             "$and": Bson([bncBufferType(true)])]);
+        filter = historyView.filter(filter);
         FindOptions options;
         auto order = Bson.emptyObject;
         order["t"] = Bson(-1);
@@ -1822,7 +2030,8 @@ final class MessageRepository {
 
     /// Count total messages in a buffer (IRCCloud exposes this as
     /// `backlog_size` to the client).
-    long count(string serverId, string networkId, string channel) @trusted {
+    long count(string serverId, string networkId, string channel, HistoryReadScope* view = null) @trusted {
+        auto historyView = resolveHistoryView(networkId, view);
         channel = normalizeChannel(channel);
         Bson filter;
         if (serverId.length > 0) {
@@ -1837,78 +2046,109 @@ final class MessageRepository {
                 "channel": Bson(channel)
             ]);
         }
-        return cast(long)collection.countDocuments(filter);
+        return cast(long)collection.countDocuments(historyView.filter(filter));
     }
 
-    /// Result of a Redis→Mongo sync pass for a single buffer.
+    /// Mutually exclusive entry outcomes from one Redis→Mongo buffer pass.
     struct SyncResult {
-        /// Entries pulled from Redis.
-        long scanned;       // entries pulled from Redis
-        /// New Mongo docs written.
-        long inserted;      // new Mongo docs written
-        /// Entries that already existed in Mongo.
-        long duplicates;    // entries that already existed in Mongo
-        /// Entries that failed JSON parsing.
-        long parseErrors;   // entries that failed JSON parsing
+        long scanned;
+        long inserted;
+        long duplicates;
+        /// Intentionally expired or durably fenced records, not failed writes.
+        long discarded;
+        /// Invalid JSON/envelope, including absent or invalid original `t`.
+        long parseErrors;
+        /// Admission, identity, storage or acknowledgement failures; retryable.
+        long writeErrors;
     }
 
-    /**
-     * Drain a Redis scrollback buffer into MongoDB. Idempotent —
-     * existing documents (matched by `_id = serverId:networkId:channel:msgid`
-     * or `:timestamp`) are silently dropped because the underlying
-     * `insertOne` is wrapped in a try/catch in `appendMessage`.
-     *
-     * Use this to backfill messages that were appended to Redis during
-     * a window when the event→Mongo path was down (e.g. before a
-     * restart, or if the engine was offline). After the sync, Mongo's
-     * `backlog_size` will reflect everything in Redis for this buffer.
-     */
+    private struct RedisSyncAdmission {
+        ArchiveWriteScope admittedWrite;
+        bool failed;
+    }
+
+    /// Backfill without inventing timestamps/eids or mistaking a storage error
+    /// for a duplicate. Owner, provenance and policy are resolved once per
+    /// engine/network batch; each accepted row keeps its original event time.
     SyncResult syncFromRedis(
         RedisStorage redis,
         string serverId, string networkId, string channel
     ) @trusted {
+        RedisSyncAdmission[string][string] admissions;
+        return syncFromRedis(redis, serverId, networkId, channel, admissions);
+    }
+
+    private SyncResult syncFromRedis(
+        RedisStorage redis, string serverId, string networkId, string channel,
+        ref RedisSyncAdmission[string][string] admissions
+    ) @trusted {
         import std.range : walkLength;
+        if (!serverId.length || !networkId.length || !channel.length)
+            throw new ArchiveWriteException(ArchiveWriteFailure.invalidInput);
+        channel = normalizeChannel(channel);
+        auto key = "scrollback:" ~ serverId ~ ":" ~ networkId ~ ":" ~ channel;
+        auto raw = redis.getDb().lrange!(ubyte[])(key, 0, 4999);
         SyncResult r;
-        if (serverId.length == 0) {
-            logError("syncFromRedis: serverId is empty");
+        if (raw.empty) return r;
+
+        auto serverAdmissions = serverId in admissions;
+        if (serverAdmissions is null) {
+            admissions[serverId] = null;
+            serverAdmissions = serverId in admissions;
+        }
+        auto admitted = networkId in *serverAdmissions;
+        if (admitted is null) {
+            RedisSyncAdmission admission;
+            try admission.admittedWrite = admitArchiveWrite(serverId, networkId);
+            catch (Exception) { admission.failed = true; }
+            (*serverAdmissions)[networkId] = admission;
+            admitted = networkId in *serverAdmissions;
+        }
+        if (admitted.failed) {
+            r.writeErrors = r.scanned = raw.walkLength;
             return r;
         }
 
-        channel = normalizeChannel(channel);
-        auto key = "scrollback:" ~ serverId ~ ":" ~ networkId ~ ":" ~ channel;
-        auto db = redis.getDb();
-        auto raw = db.lrange!(ubyte[])(key, 0, 5000);
-        r.scanned = raw.walkLength;
-
-        const long before = count(serverId, networkId, channel);
         foreach (entry; raw) {
-            string s;
-            try { s = () @trusted { return cast(string)entry.idup; } (); }
-            catch (Exception e) { r.parseErrors++; continue; }
-            s = sanitizeUtf8(s);
-            if (s.length == 0) { r.parseErrors++; continue; }
+            ++r.scanned; // RedisReply copies share one socket cursor; never count before consuming.
+            Json msg;
+            string compact;
             try {
-                auto msg = parseJson(s);
-                if (msg.type != Json.Type.object) { r.parseErrors++; continue; }
-                appendMessage(serverId, networkId, channel, msg);
-            } catch (Exception e) {
+                compact = sanitizeUtf8(cast(string)entry);
+                msg = parseJsonString(compact);
+                if (msg.type != Json.Type.object) {
+                    r.parseErrors++;
+                    continue;
+                }
+                const timestamp = "t" in msg;
+                if (timestamp is null || timestamp.type != Json.Type.int_
+                        || timestamp.get!long <= 0) {
+                    r.parseErrors++;
+                    continue;
+                }
+            } catch (Exception) {
                 r.parseErrors++;
+                continue;
+            }
+            try {
+                final switch (appendOrdinaryPayload(admitted.admittedWrite, channel, msg, compact)) {
+                    case ArchiveWriteResult.inserted: r.inserted++; break;
+                    case ArchiveWriteResult.alreadyPersisted: r.duplicates++; break;
+                    case ArchiveWriteResult.expiredDiscard: r.discarded++; break;
+                }
+            } catch (Exception) {
+                r.writeErrors++;
             }
         }
-        const long after = count(serverId, networkId, channel);
-        r.inserted = after - before;
-        r.duplicates = r.scanned - r.inserted - r.parseErrors;
-        if (r.duplicates < 0) r.duplicates = 0;
         return r;
     }
 
-    /// Enumerate every Redis scrollback key and sync it to Mongo. Returns
-    /// one SyncResult per buffer. Uses KEYS (not SCAN) for simplicity —
-    /// fine for a one-shot backfill, but for a multi-million key Redis
-    /// you'd want to swap in a SCAN-based iterator.
+    /// Enumerate buffers for a one-shot backfill. Cache unsuccessful admission
+    /// too: unavailable ownership is never repeatedly guessed across buffers.
     SyncResult[] syncAllFromRedis(RedisStorage redis) @trusted {
         import std.string : indexOf;
         SyncResult[] all;
+        RedisSyncAdmission[string][string] admissions;
         auto db = redis.getDb();
         auto reply = db.keys("scrollback:*");
         foreach (k; reply) {
@@ -1923,15 +2163,16 @@ final class MessageRepository {
             if (p2 < 0) continue;
             auto networkId = rest2[0 .. p2];
             auto channel = rest2[p2 + 1 .. $];
-            all ~= syncFromRedis(redis, serverId, networkId, channel);
+            all ~= syncFromRedis(redis, serverId, networkId, channel, admissions);
         }
         return all;
     }
 }
 
-@("private conversations carry no retention stamp and are listed newest first")
+@("private conversations omit legacy TTL dates and are listed newest first")
 unittest {
     import std.uuid : randomUUID;
+    import std.exception : assertThrown;
     import ircfiber.testing.isolated_db : connectIsolatedTestMongo;
     if (!connectIsolatedTestMongo("messages private conversations")) return;
 
@@ -1940,6 +2181,10 @@ unittest {
     auto repo = new MessageRepository();
     auto coll = AppMongoConnection.getDb()["messages"];
     scope (exit) coll.deleteMany(Bson(["networkId": Bson(network)]));
+    auto networks = AppMongoConnection.getDb()["networks"];
+    networks.insertOne(Bson(["id": Bson(network), "userId": Bson(randomUUID().toString()),
+        "archiveScopeVersion": Bson(1), "archiveServers": Bson([Bson("ovh")])]));
+    scope (exit) networks.deleteOne(Bson(["id": Bson(network)]));
 
     long eid;
     void put(string channel, long agoMs) {
@@ -1968,5 +2213,5 @@ unittest {
     all.sort();
     assert(all == ["alice", "bob", "carol"], "channels, _server and rows outside the window are not conversations");
     assert(repo.recentDirectBuffers(network, since, 2) == ["bob", "alice"], "the newest two, newest first");
-    assert(repo.recentDirectBuffers(randomUUID().toString(), since, 10).length == 0);
+    assertThrown(repo.recentDirectBuffers(randomUUID().toString(), since, 10));
 }

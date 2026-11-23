@@ -9,6 +9,7 @@ import vibe.data.bson;
 import vibe.core.log;
 import ircfiber.models.user;
 import ircfiber.db.mongo;
+import ircfiber.db.history_retention : provisionHistoryPolicy;
 
 /// Repository for user accounts.
 final class UserRepository {
@@ -169,11 +170,28 @@ final class UserRepository {
         return result;
     }
 
-    /// Creates a new user account, including its initial `isTestAccount`.
+    /// Every account-creation path lands here. Provision history only after
+    /// the user is durable; failures propagate and history remains fail closed.
     void create(User user) {
+        const createdAtMs = (user.createdAt.stdTime - unixTimeToStdTime(0)) / 10_000;
+        if (createdAtMs <= 0) throw new Exception("Account creation timestamp is required");
         auto doc = userToBson(user);
         doc["isTestAccount"] = Bson(user.isTestAccount);
-        collection.insertOne(doc);
+        // Insert-only: profile/session round trips still carry second-precision
+        // createdAt. They must never erase the precise cutover evidence.
+        doc["createdAtMs"] = Bson(createdAtMs);
+        // Durable signup kick, consumed only by the scoped local-ledger worker.
+        // No receipt, grant reason or billing identity is stored on the user.
+        doc["historyDonorCheckPending"] = Bson(true);
+        auto command = Bson.emptyObject;
+        command["insert"] = Bson("users");
+        command["documents"] = Bson([doc]);
+        command["ordered"] = Bson(true);
+        command["writeConcern"] = Bson([
+            "w": Bson("majority"), "j": Bson(true), "wtimeout": Bson(5000)]);
+        // insertOne's driver helper does not check writeConcernError.
+        checkUserInsertReply(AppMongoConnection.getDb().runCommandChecked(command));
+        provisionHistoryPolicy(user.id.toString(), createdAtMs);
     }
 
     /// Updates an existing user account. `$set` rather than a replace so
@@ -413,7 +431,7 @@ final class UserRepository {
         return results;
     }
 
-    private Bson userToBson(User u) {
+    private static Bson userToBson(User u) {
         Bson[string] fields;
         fields["id"] = Bson(u.id.toString());
         fields["username"] = Bson(u.username);
@@ -443,7 +461,7 @@ final class UserRepository {
         return Bson(fields);
     }
 
-    private long readBsonTimestamp(const(Bson) b) {
+    private static long readBsonTimestamp(const(Bson) b) {
         switch (b.type) with (Bson.Type) {
             case long_:
                 return b.get!long;
@@ -458,7 +476,7 @@ final class UserRepository {
         }
     }
 
-    private User docFromBson(const(Bson) doc) {
+    private static User docFromBson(const(Bson) doc) {
         User u;
         u.id = parseUUID(doc["id"].get!string);
         u.username = doc["username"].get!string;
@@ -475,7 +493,9 @@ final class UserRepository {
             auto ts = readBsonTimestamp(doc["lastLoginAt"]);
             if (ts > 0) u.lastLoginAt = SysTime(unixTimeToStdTime(ts));
         }
-        if (doc["createdAt"].type != Bson.Type.null_) {
+        if (doc["createdAtMs"].type == Bson.Type.long_ && doc["createdAtMs"].get!long > 0) {
+            u.createdAt = SysTime(unixTimeToStdTime(0) + doc["createdAtMs"].get!long * 10_000);
+        } else if (doc["createdAt"].type != Bson.Type.null_) {
             auto ts = readBsonTimestamp(doc["createdAt"]);
             if (ts > 0) u.createdAt = SysTime(unixTimeToStdTime(ts));
         }
@@ -503,6 +523,70 @@ final class UserRepository {
         } catch (Exception) { u.oauthIdentities = []; }
         return u;
     }
+}
+
+/// A write-concern timeout can accompany ok:1 and n:1. It is not durable
+/// account creation, and must never proceed to policy provisioning.
+private void checkUserInsertReply(const Bson reply) {
+    if (reply.type != Bson.Type.object)
+        throw new Exception("Account insertion returned an invalid reply");
+    foreach (key, value; reply.byKeyValue) {
+        if (key == "writeConcernError")
+            throw new Exception("Account insertion durability unavailable");
+        if (key != "writeErrors") continue;
+        if (value.type != Bson.Type.array)
+            throw new Exception("Account insertion returned invalid write errors");
+        if (value.length > 0) {
+            // Preserve the existing signup duplicate-key contract, without
+            // letting a policy-store failure look like a username collision.
+            auto errors = deserializeBson!(BulkWriteError[])(value);
+            throw new MongoBulkWriteException(errors);
+        }
+    }
+    const count = reply["n"];
+    const inserted = count.type == Bson.Type.int_ ? count.get!int == 1
+        : count.type == Bson.Type.long_ ? count.get!long == 1
+        : count.type == Bson.Type.double_ && count.get!double == 1;
+    if (!inserted) throw new Exception("Account insertion was not acknowledged");
+}
+
+@("user insertion requires acknowledged durability and preserves duplicate errors")
+unittest {
+    import std.exception : assertThrown;
+    foreach (count; [Bson(1), Bson(1L), Bson(1.0)])
+        checkUserInsertReply(Bson(["ok": Bson(1), "n": count]));
+    checkUserInsertReply(Bson(["ok": Bson(1), "n": Bson(1),
+        "writeErrors": Bson(cast(Bson[]) [])]));
+    foreach (count; [Bson(0), Bson(2), Bson("1"), Bson(1.5), Bson(null)])
+        assertThrown!Exception(checkUserInsertReply(Bson(["ok": Bson(1), "n": count])));
+    assertThrown!Exception(checkUserInsertReply(Bson(null)));
+    assertThrown!Exception(checkUserInsertReply(Bson(["ok": Bson(1)])));
+    assertThrown!Exception(checkUserInsertReply(Bson(["ok": Bson(1), "n": Bson(1),
+        "writeErrors": Bson("invalid")])));
+    foreach (error; [Bson(null), Bson(["code": Bson(64)])])
+        assertThrown!Exception(checkUserInsertReply(Bson(["ok": Bson(1), "n": Bson(1),
+            "writeConcernError": error])));
+    assertThrown!MongoBulkWriteException(checkUserInsertReply(Bson([
+        "ok": Bson(1), "n": Bson(0), "writeErrors": Bson([Bson([
+            "index": Bson(0), "code": Bson(11000), "errmsg": Bson("duplicate key")])])])));
+}
+
+@("persisted millisecond creation evidence survives legacy profile serialization")
+unittest {
+    enum long createdAtMs = 1_800_000_000_987L;
+    User user;
+    user.id = parseUUID("11111111-1111-1111-1111-111111111111");
+    user.createdAt = SysTime(unixTimeToStdTime(0) + createdAtMs * 10_000);
+    auto doc = UserRepository.userToBson(user);
+    assert(doc["createdAt"].get!double == 1_800_000_000);
+    // Updates intentionally omit the insert-only field rather than deriving it
+    // from a stale, second-precision session.
+    assert("createdAtMs" !in doc.get!(Bson[string]));
+    doc["createdAtMs"] = Bson(createdAtMs);
+    auto restored = UserRepository.docFromBson(doc);
+    assert((restored.createdAt.stdTime - unixTimeToStdTime(0)) / 10_000 == createdAtMs);
+    auto legacy = UserRepository.docFromBson(UserRepository.userToBson(user));
+    assert(legacy.createdAt.toUnixTime == 1_800_000_000);
 }
 
 /**

@@ -13,6 +13,8 @@ import ircfiber.services.config : decodeStoredServicesConfig, ServicesConfig;
 import ircfiber.irc.routing_policy : RoutingPreferences, routingPreferencesFromJson;
 import ircfiber.irc.ipv6 : generateIpv6Iid, validIpv6Iid;
 import ircfiber.db.mongo;
+import ircfiber.db.history_network_deletion : fenceHistoryNetworkForDeletion,
+    historyNetworkSaveUpdatesExisting, historyNetworkDeletionOwner;
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.redis.protocol : RedisKeys;
 import ircfiber.db.user : idInFilters;
@@ -631,7 +633,29 @@ final class NetworkRepository {
     }
 
     private void savePrepared(Bson selector, Bson update, UUID userId, ref NetworkWriter writer) {
-        updateConfig(selector, update, writer, true);
+        const networkId = selector["id"].get!string;
+        const ownerId = userId.toString();
+        const existing = historyNetworkSaveUpdatesExisting(AppMongoConnection.getDb(), networkId, ownerId);
+        // A stale save is neither an ownership transfer nor a create. Once
+        // observed, an existing row may only be updated in that same owner.
+        selector["userId"] = Bson(ownerId);
+        auto reply = updateConfig(selector, update, writer, !existing);
+        if (reply["n"].to!long != 1)
+            throw new NetworkWriteUnavailableException("network_write_unavailable");
+        if (historyNetworkDeletionOwner(AppMongoConnection.getDb(), networkId).length) {
+            // Only the owning creation path compensates a raced new insert.
+            // Never erase on an unavailable fence read or guessed ownership.
+            auto upserted = reply["upserted"];
+            if (!existing && upserted.type == Bson.Type.array && upserted.length == 1
+                    && !upserted[0].tryIndex("_id").isNull) {
+                selector["_id"] = upserted[0]["_id"];
+                auto cleanup = Bson.emptyObject;
+                cleanup["delete"] = Bson("networks");
+                cleanup["deletes"] = Bson([Bson(["q": selector, "limit": Bson(1)])]);
+                runNetworkMutation(writer, cleanup);
+            }
+            throw new NetworkWriteUnavailableException("network_write_unavailable");
+        }
         // Invalidate per-user cache so findByUserId doesn't return stale [] for 60s
         // after a new network is provisioned (e.g. ensureDefaultFiberNetwork on register).
         if (cache !is null) {
@@ -882,9 +906,11 @@ final class NetworkRepository {
     }
 
     void deleteById(UUID id, ref NetworkWriter writer) {
+        const ownerId = fenceHistoryNetworkForDeletion(AppMongoConnection.getDb(), id.toString());
         auto command = Bson.emptyObject;
         command["delete"] = Bson("networks");
-        command["deletes"] = Bson([Bson(["q": Bson(["id": Bson(id.toString())]), "limit": Bson(1)])]);
+        command["deletes"] = Bson([Bson(["q": Bson(["id": Bson(id.toString()),
+            "userId": Bson(ownerId)]), "limit": Bson(1)])]);
         runNetworkMutation(writer, command);
     }
 

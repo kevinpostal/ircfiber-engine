@@ -3,7 +3,7 @@ module ircfiber.engine.archive_worker;
 import core.time : msecs;
 import vibe.core.core : runTask, sleep;
 import ircfiber.engine.archive_spool;
-import ircfiber.db.messages : MessageRepository, ArchiveWriteException, ArchiveWriteFailure;
+import ircfiber.db.messages : MessageRepository, ArchiveWriteException, ArchiveWriteFailure, ArchiveWriteResult;
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.network_write_gate : NetworkWriter, runNetworkWrite;
 import ircfiber.logging : logJsonMap;
@@ -61,6 +61,7 @@ void runPendingCatalogArchiveRegressionChecks(RedisStorage redis, MessageReposit
     enforce(chmod(root.toStringz, 448) == 0, "Raw replay fixture mode failed");
     auto collection = AppMongoConnection.getDb()["networks"];
     auto messages = AppMongoConnection.getDb()["messages"];
+    auto fences = AppMongoConnection.getDb()["history_network_fences"];
     string[] ids;
     ArchiveSpool spool;
     ArchiveWorker worker;
@@ -131,6 +132,7 @@ void runPendingCatalogArchiveRegressionChecks(RedisStorage redis, MessageReposit
         foreach (id; ids) {
             collection.deleteOne(Bson(["id": Bson(id)]));
             messages.deleteMany(Bson(["networkId": Bson(id)]));
+            fences.deleteOne(Bson(["_id": Bson(id)]));
             db.hdel(RedisKeys.networkAssignments(), id);
             db.del(archiveOwnerKey(id));
             if (ctx.bufferManager !is null) ctx.bufferManager.clearNetworkBuffers(server, id);
@@ -338,6 +340,8 @@ void runPendingCatalogArchiveRegressionChecks(RedisStorage redis, MessageReposit
         "Released replay lacks actual history and canonical catalog");
     bool foundRaw, foundRestart;
     foreach (message; messages.find(["networkId": id.toString()])) {
+        enforce(message["historyOwnerId"].get!string == owner.toString(),
+            "Pending replay did not preserve its admitted owner");
         const text = message["payload"].get!string;
         foundRaw = foundRaw || text.canFind("pending raw line");
         foundRestart = foundRestart || text.canFind("pending raw line after restart");
@@ -345,7 +349,7 @@ void runPendingCatalogArchiveRegressionChecks(RedisStorage redis, MessageReposit
     enforce(foundRaw && (heldClient is null || foundRestart),
         "Actual held/raw lines were not replayed after exclusion release");
     stop();
-    foreach (kind; ["transferred", "deleted", "unknown"]) {
+    foreach (kind; ["transferred", "deleted", "unknown", "fenced-other-owner"]) {
         auto badId = randomUUID();
         ids ~= badId.toString();
         if (kind != "unknown") {
@@ -356,26 +360,80 @@ void runPendingCatalogArchiveRegressionChecks(RedisStorage redis, MessageReposit
                     Bson(["$set": Bson(["userId": Bson(randomUUID().toString())])]));
             else collection.deleteOne(Bson(["id": Bson(badId.toString())]));
         }
+        if (kind == "fenced-other-owner")
+            fences.insert(Bson(["_id": Bson(badId.toString()), "ownerId": Bson(randomUUID().toString())]));
         open(kind);
-        enforce(spool.tryAppend(server, badId.toString(), "#raw", 1, payload, owner.toString())
+        enforce(spool.tryAppend(server, badId.toString(), "#raw", 1, payload, owner.toString(), true)
             == ArchiveAdmission.queued, "Negative fixture raw record was not journaled");
         worker = new ArchiveWorker(spool, repository, null, redis);
         worker.start();
-        awaitState({
-            ArchiveSpoolStatus sample;
-            return spool.tryStatus(sample) && sample.failed;
-        }, "Unproven raw ownership did not quarantine native journal");
+        if (kind == "transferred" || kind == "fenced-other-owner") {
+            awaitState({
+                ArchiveSpoolStatus sample;
+                return spool.tryStatus(sample) && sample.failed;
+            }, "Conflicting owner did not quarantine native journal");
+        } else {
+            sleep(200.msecs);
+            enforce(spool.tryStatus(state) && !state.failed && state.checkpoint == 0,
+                "Canonical absence was mistaken for durable deletion");
+        }
         enforce(spool.tryStatus(state) && state.checkpoint == 0
             && messages.findOne(["networkId": badId.toString()]).isNull
             && db.scard(NETWORK_WRITERS_KEY) == 0,
-            "Transferred/deleted/unknown owner received history or checkpoint");
+            "Unproven owner received history or checkpoint");
+        if (kind == "deleted" || kind == "unknown") {
+            fences.insert(Bson(["_id": Bson(badId.toString()), "ownerId": Bson(owner.toString())]));
+            awaitState({
+                ArchiveSpoolStatus sample;
+                return spool.tryStatus(sample) && !sample.failed && sample.checkpoint == 1;
+            }, "Durably fenced raw record did not successfully discard/checkpoint");
+            enforce(messages.findOne(["networkId": badId.toString()]).isNull,
+                "Deleted raw scope resurrected history");
+        }
         stop();
     }
+
+    // Exercise v1 through the real production binding without rewriting old
+    // disk frames or granting their missing identity during decode.
+    const legacyId = randomUUID();
+    ids ~= legacyId.toString();
+    open("legacy-proof");
+    worker = new ArchiveWorker(spool, repository, null, redis);
+    auto legacy = Json.emptyObject;
+    legacy["kind"] = "append"; legacy["serverId"] = server;
+    legacy["networkId"] = legacyId.toString(); legacy["channel"] = "#legacy";
+    legacy["queuedAtMs"] = Clock.currTime.toUnixTime!long * 1000;
+    legacy["eid"] = 1L; legacy["timestampMs"] = legacy["queuedAtMs"];
+    legacy["payload"] = payload;
+    auto legacyRecord = decodeArchiveRecord(legacy.toString(), 1);
+    enforce(!legacyRecord.ownerId.length && worker.apply(legacyRecord) == ArchiveApplyResult.retry,
+        "Unknown v1 identity was attributed or treated as deleted");
+    auto legacyConfig = cfg; legacyConfig.id = legacyId;
+    networks.save(legacyConfig, owner);
+    enforce(worker.apply(legacyRecord) == ArchiveApplyResult.retry,
+        "Uncatalogued v1 producer inferred archive provenance");
+    repository.registerArchiveScopes(redis, legacyId.toString(), [server], owner.toString());
+    enforce(worker.apply(legacyRecord) == ArchiveApplyResult.applied && !legacyRecord.ownerId.length,
+        "Existing canonical catalog did not prove v1 bytes without mutating decoded identity");
+    enforce(messages.findOne(["networkId": legacyId.toString()])["historyOwnerId"].get!string == owner.toString(),
+        "Catalog-proven v1 bytes were attributed to the wrong owner");
+    legacyRecord.serverId = server ~ "-unproven";
+    enforce(worker.apply(legacyRecord) == ArchiveApplyResult.retry,
+        "Ownerless v1 frame registered an unproven server");
+    legacyRecord.serverId = server;
+    collection.deleteOne(Bson(["id": Bson(legacyId.toString())]));
+    awaitState({ return worker.apply(legacyRecord) == ArchiveApplyResult.retry; },
+        "Existing archived bytes alone authorized v1 replay after canonical absence");
+    fences.insert(Bson(["_id": Bson(legacyId.toString()), "ownerId": Bson(owner.toString())]));
+    awaitState({ return worker.apply(legacyRecord) == ArchiveApplyResult.discarded; },
+        "Durable deletion fence did not discard ownerless v1 bytes");
+    worker = null;
+    stop();
 }
 
-/// Applied is an explicit strict acknowledgment, never a normal return from the
-/// old best-effort appendMessage API. Uncertain replies must return retry.
-enum ArchiveApplyResult { applied, retry, conflict }
+/// Applied/discarded are explicit strict acknowledgments. An expired or
+/// durably fenced record checkpoints without a write; uncertain replies retry.
+enum ArchiveApplyResult { applied, discarded, retry, conflict }
 alias ArchiveApply = ArchiveApplyResult delegate(ref const ArchiveRecord record);
 /// Must execute the operation-ID-marked, cutoff + physical-lineage Redis
 /// mutation. Replayed only without positive, durably persisted Redis evidence.
@@ -408,6 +466,8 @@ final class ArchiveWorker {
             try {
                 if (record.pendingCatalog) {
                     if (redis is null) return ArchiveApplyResult.retry;
+                    if (repository.historyNetworkDeleted(record.networkId, record.ownerId))
+                        return ArchiveApplyResult.discarded;
                     // The raw journal owner survives process replacement.
                     // A real majority catalog read/CAS must establish that
                     // exact owner before either Mongo history or checkpoint.
@@ -422,17 +482,19 @@ final class ArchiveWorker {
                             return ArchiveApplyResult.conflict;
                         }
                         if (!scopes.canFind(record.serverId)) {
-                            notePendingConflict(record, "canonical_network_absent");
-                            return ArchiveApplyResult.conflict;
+                            // Canonical absence alone cannot prove deletion.
+                            return repository.historyNetworkDeleted(record.networkId, record.ownerId)
+                                ? ArchiveApplyResult.discarded : ArchiveApplyResult.retry;
                         }
-                        applyRepositoryRecord(repository, record);
-                        return ArchiveApplyResult.applied;
+                        return applyRepositoryRecord(repository, record);
                     });
                 }
-                // Previously proven admission remains drainable after deletion.
-                applyRepositoryRecord(repository, record);
-                return ArchiveApplyResult.applied;
+                // Established records retain their admitted owner. Legacy
+                // ownerless frames still require canonical catalog provenance.
+                return applyRepositoryRecord(repository, record);
             } catch (ArchiveWriteException e) {
+                if (!record.ownerId.length && e.failure == ArchiveWriteFailure.identityMismatch)
+                    return ArchiveApplyResult.retry;
                 if (e.failure == ArchiveWriteFailure.identityMismatch || e.failure == ArchiveWriteFailure.invalidInput) {
                     if (record.pendingCatalog) notePendingConflict(record, "canonical_owner_or_record_mismatch");
                     return ArchiveApplyResult.conflict;
@@ -449,12 +511,16 @@ final class ArchiveWorker {
             ["event": "archive_pending_catalog_conflict", "networkId": record.networkId, "reason": reason]);
     }
 
-    private static void applyRepositoryRecord(MessageRepository repository, ref const ArchiveRecord record) {
+    private static ArchiveApplyResult applyRepositoryRecord(MessageRepository repository, ref const ArchiveRecord record) {
+        if (record.kind != ArchiveKind.append) {
+            const admitted = repository.admitArchiveWrite(record.serverId, record.networkId, record.ownerId);
+            if (admitted.isDeleted()) return ArchiveApplyResult.discarded;
+        }
         final switch (record.kind) {
             case ArchiveKind.append:
-                repository.appendArchivedCompactMessage(record.serverId, record.networkId,
-                    record.channel, record.compactJson);
-                break;
+                return repository.appendArchivedCompactMessage(record.serverId, record.networkId,
+                    record.channel, record.compactJson, record.ownerId) == ArchiveWriteResult.expiredDiscard
+                    ? ArchiveApplyResult.discarded : ArchiveApplyResult.applied;
             case ArchiveKind.rename:
                 repository.renameArchivedChannel(record.serverId, record.networkId,
                     record.channel, record.newChannel, record.cutoffEid, record.legacyCutoffMs);
@@ -464,6 +530,7 @@ final class ArchiveWorker {
                     record.channel, record.cutoffEid, record.legacyCutoffMs);
                 break;
         }
+        return ArchiveApplyResult.applied;
     }
 
     /// No nominal started flag: successful runTask scheduling is required.
@@ -529,7 +596,7 @@ final class ArchiveWorker {
                     if (redisDone) result = apply(record);
                 } catch (Exception) { result = ArchiveApplyResult.retry; }
                 if (result == ArchiveApplyResult.conflict) { spool.reportConflict(); return; }
-                if (result == ArchiveApplyResult.applied && redisDone) {
+                if ((result == ArchiveApplyResult.applied || result == ArchiveApplyResult.discarded) && redisDone) {
                     while (!stopping) {
                         const generation = spool.progressGeneration();
                         if (spool.tryAcknowledge(sequence)) break;

@@ -345,7 +345,7 @@ EngineContext bootstrapEngine() {
     auto connManager = new ConnectionManager(eventChannel, redis, serverId, holder);
     logInfo("Bootstrap: ConnectionManager created");
     auto networkRepo = new NetworkRepository();
-    auto messageRepo = new MessageRepository();
+    auto messageRepo = new MessageRepository(redis);
     logInfo("Bootstrap: repositories created");
     auto serverRegistry = new ServerRegistry(redis);
     logInfo("Bootstrap: ServerRegistry created, deferred registration to event loop");

@@ -135,7 +135,10 @@ struct IRCRawEvent {
         if (nick.length) j["n"] = nick;
         if (hostmask.length) j["hm"] = hostmask;
         if (text.length) j["x"] = text;
-        if (channel.length) j["ch"] = channel;
+        // An empty original target explicitly identifies a server event. New
+        // stream envelopes need this provenance; stored journal bytes are not
+        // rebuilt or rewritten by serialization.
+        j["ch"] = channel;
         if (prefix.length) j["px"] = prefix;
         auto params = getParams();
         if (params.length) {

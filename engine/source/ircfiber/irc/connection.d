@@ -6543,8 +6543,11 @@ final class PersistentIRCClient {
                     if (!AppMongoConnection.isConnected()) return;
                     const epoch = connectionEpoch;
                     const since = unixMsNow() - QUERY_RESTORE_WINDOW_MS;
+                    import ircfiber.db.history_visibility : historyReadScope;
+                    if (ownerId == UUID.init) return;
+                    auto historyView = historyReadScope(config.id.toString(), ownerId.toString());
                     const names = (new MessageRepository()).recentDirectBuffers(
-                        config.id.toString(), since, QUERY_RESTORE_LIMIT);
+                        config.id.toString(), since, QUERY_RESTORE_LIMIT, &historyView);
                     // The session may have ended or been replaced while Mongo answered.
                     if (epoch != connectionEpoch) return;
                     auto fresh = queriesToReopen(queryBuffers, names, (a, b) => sameNick(a, b));
@@ -9753,8 +9756,8 @@ final class PersistentIRCClient {
         const expectedRouting = config.routing;
         const expectedVerification = config.verifyServerCertificates;
         const expectedFingerprints = config.trustedServerFingerprints;
-        if (canonicalNetworkRepo is null) canonicalNetworkRepo = new NetworkRepository(redis);
         requireMaintenanceRegistration();
+        if (canonicalNetworkRepo is null) canonicalNetworkRepo = new NetworkRepository(redis);
         import ircfiber.irc.dial_guard : ownsNetworkForDial, dialWithOwnership;
         bool mayDial() {
             return !getStopping && !detachedForHotSwap

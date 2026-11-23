@@ -15,14 +15,19 @@ import ircfiber.storage.redis : RedisStorage;
  * One-shot Redis→Mongo backfill.
  *
  * Usage:
- *   dub run --config=sync                                       # sync every scrollback buffer
- *   dub run --config=sync -- <serverId> <networkId> <channel>   # sync one buffer
+ *   dub run --config=sync                                     # every scrollback buffer
+ *   dub run --config=sync -- <serverId> <networkId> <channel>   # one buffer
+ *
+ * Every record must carry its original positive millisecond `t`; missing
+ * timestamps are reported, never replaced with the backfill time. Discarded
+ * records are already expired/fenced by policy. Parse/write failures exit 1
+ * and remain retryable in Redis; duplicates require durable identity proof.
  *
  * Env:
  *   IRCFIBER_MONGO_URL  (default mongodb://localhost:27017/ircfiber)
  *   IRCFIBER_REDIS_URL  (default redis://127.0.0.1:6379)
  */
-void main(string[] args) {
+int main(string[] args) {
     string serverId, networkId, channel;
 
     auto helpInfo = getopt(args,
@@ -32,15 +37,27 @@ void main(string[] args) {
     );
     if (helpInfo.helpWanted) {
         defaultGetoptPrinter("Usage: sync-redis-to-mongo [serverId networkId channel]", helpInfo.options);
-        return;
+        return 0;
     }
-    // After getopt, remaining args are positional (serverId, networkId, channel)
-    if (args.length >= 4) {
+    if (args.length != 1 && args.length != 4) {
+        writeln("Specify all of serverId, networkId and channel, or none.");
+        return 2;
+    }
+    // After getopt, remaining args are positional (serverId, networkId, channel).
+    if (args.length == 4) {
+        if (serverId.length || networkId.length || channel.length) {
+            writeln("Do not mix positional buffer arguments with named options.");
+            return 2;
+        }
         serverId  = args[1];
         networkId = args[2];
         channel   = args[3];
     }
-
+    const singleBuffer = serverId.length && networkId.length && channel.length;
+    if (!singleBuffer && (serverId.length || networkId.length || channel.length)) {
+        writeln("Specify all of serverId, networkId and channel, or none.");
+        return 2;
+    }
     auto mongoUrl = readEnv("IRCFIBER_MONGO_URL", "mongodb://127.0.0.1:27017/ircfiber");
     auto redisUrl = readEnv("IRCFIBER_REDIS_URL", "redis://127.0.0.1:6379");
 
@@ -51,42 +68,42 @@ void main(string[] args) {
     auto redis = new RedisStorage();
     redis.connectFromUrl(redisUrl);
 
-    auto repo = new MessageRepository();
+    auto repo = new MessageRepository(redis);
 
-    long totalScanned = 0, totalInserted = 0, totalDuplicates = 0, totalParseErrors = 0;
-    size_t buffers = 0;
-
-    if (serverId.length > 0 && networkId.length > 0 && channel.length > 0) {
+    MessageRepository.SyncResult[] results;
+    if (singleBuffer) {
         writefln("Syncing single buffer: %s:%s:%s", serverId, networkId, channel);
-        auto r = repo.syncFromRedis(redis, serverId, networkId, channel);
-        writefln("  scanned=%d  inserted=%d  duplicates=%d  parse_errors=%d",
-                 r.scanned, r.inserted, r.duplicates, r.parseErrors);
-        totalScanned += r.scanned;
-        totalInserted += r.inserted;
-        totalDuplicates += r.duplicates;
-        totalParseErrors += r.parseErrors;
-        buffers = 1;
+        results = [repo.syncFromRedis(redis, serverId, networkId, channel)];
     } else {
-        writefln("Syncing ALL scrollback buffers from Redis to Mongo...");
-        auto results = repo.syncAllFromRedis(redis);
-        foreach (r; results) {
-            if (r.scanned == 0 && r.parseErrors == 0) continue;
-            writefln("  buffer#%d  scanned=%d  inserted=%d  duplicates=%d  parse_errors=%d",
-                     buffers + 1, r.scanned, r.inserted, r.duplicates, r.parseErrors);
-            totalScanned += r.scanned;
-            totalInserted += r.inserted;
-            totalDuplicates += r.duplicates;
-            totalParseErrors += r.parseErrors;
-            buffers++;
-        }
+        writeln("Syncing ALL scrollback buffers from Redis to Mongo...");
+        results = repo.syncAllFromRedis(redis);
     }
 
-    writefln("");
-    writefln("Done. Buffers synced: %d", buffers);
-    writefln("  total scanned:     %d", totalScanned);
-    writefln("  total inserted:    %d", totalInserted);
-    writefln("  total duplicates:  %d", totalDuplicates);
-    writefln("  total parse errors:%d", totalParseErrors);
+    MessageRepository.SyncResult total;
+    foreach (i, r; results) {
+        if (r.scanned) {
+            writefln("  buffer#%d  scanned=%d  inserted=%d  duplicates=%d"
+                ~ "  discarded=%d  parse_errors=%d  write_errors=%d",
+                i + 1, r.scanned, r.inserted, r.duplicates,
+                r.discarded, r.parseErrors, r.writeErrors);
+        }
+        total.scanned += r.scanned;
+        total.inserted += r.inserted;
+        total.duplicates += r.duplicates;
+        total.discarded += r.discarded;
+        total.parseErrors += r.parseErrors;
+        total.writeErrors += r.writeErrors;
+    }
+
+    writeln("");
+    writefln("Done. Buffers checked: %d", results.length);
+    writefln("  total scanned:      %d", total.scanned);
+    writefln("  total inserted:     %d", total.inserted);
+    writefln("  total duplicates:   %d", total.duplicates);
+    writefln("  total discarded:    %d", total.discarded);
+    writefln("  total parse errors: %d", total.parseErrors);
+    writefln("  total write errors: %d", total.writeErrors);
+    return total.parseErrors || total.writeErrors ? 1 : 0;
 }
 
 private string readEnv(string name, string fallback) {
