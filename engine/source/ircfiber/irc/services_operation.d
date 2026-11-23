@@ -131,7 +131,10 @@ ServiceSyntaxSpec[] servicesSyntax(ServiceAction action, bool v21, string provid
         case ServiceAction.hostOn: return [syntax("ON")];
         case ServiceAction.hostOff: return [syntax("OFF")];
         case ServiceAction.hostWaiting: return servicesReadSyntax(ServiceReadSyntax.waiting, v21);
-        case ServiceAction.hostActivate: return [syntax("ACTIVATE", "nick")];
+        // Literal, not catalog: English "nick" is also the es/nl/pl rendering of
+        // "nickname", so every catalog variant is contested and a candidate release
+        // (anything but the exact trusted baselines) could never prove ACTIVATE.
+        case ServiceAction.hostActivate: return [syntax("ACTIVATE", "nick", ServiceSyntaxKind.literal)];
         case ServiceAction.hostReject: return [syntax("REJECT", "nick [reason]")];
         case ServiceAction.memoList: return servicesReadSyntax(ServiceReadSyntax.memoList, v21);
         case ServiceAction.memoRead: return [syntax("READ", "[channel] {num | list | LAST | NEW | ALL}")];
