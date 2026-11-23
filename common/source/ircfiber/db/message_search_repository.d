@@ -626,12 +626,19 @@ final class MessageSearchRepository {
 
     /// Owners and controls come from their own partial indexes. One unhinted
     /// $or over both made Mongo's multiplanner exceed its time limit on a cold
-    /// 24M-row archive, so each branch is its own hinted query.
+    /// 24M-row archive, so each branch is its own hinted query. Controls are rare
+    /// and have a small index: read them first and look up alias owners only for
+    /// aliases a control targets. An alias shared by tens of thousands of rows
+    /// (a bot label, say) otherwise makes every hit read all of them.
     private Bson[] readRelated(string[][MessageSearchScope] aliases, bool mutations,
             ref EvidenceBudget budget) {
-        auto result = readWorkerAliases(aliases, false, budget);
-        if (mutations) result ~= readWorkerAliases(aliases, true, budget);
-        return result;
+        if (!mutations) return readWorkerAliases(aliases, false, budget);
+        auto controls = readWorkerAliases(aliases, true, budget);
+        string[][MessageSearchScope] controlled;
+        foreach (doc; controls)
+            addAlias(controlled, MessageSearchScope(stringField(doc, "networkId"),
+                stringField(doc, "channel")), stringField(doc, "searchTarget"));
+        return controls ~ readWorkerAliases(controlled, false, budget);
     }
 
     private Bson[] read(Bson filter, size_t limit, ref EvidenceBudget budget,
