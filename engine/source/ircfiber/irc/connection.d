@@ -6772,6 +6772,26 @@ final class PersistentIRCClient {
         // command ceiling for a server-exempt session after every hot swap.
         sendRaw("MODE " ~ sessionNick);
         foreach (chan; channelState.byKey) sendRaw("NAMES " ~ chan);
+        // The snapshot can be older than the retained socket, or carry no
+        // channels at all (prod 2026-11-23: a session held for 5 days on 13
+        // channels was adopted with none recorded, so the NAMES above had
+        // nothing to re-baseline and the UI sat on "Joining…" indefinitely).
+        // Whatever the config wants that nothing records is asked for like
+        // an initial auto-join: a JOIN is idempotent upstream, an echo
+        // confirms it, and one the server ignores (already a member) falls
+        // to the join-confirm sweep's NAMES probe. An initial burst that is
+        // still owed already covers these channels.
+        if (!initialJoinPending) {
+            auto unrecorded = unrecordedWantedChannels();
+            if (unrecorded.length) {
+                logJsonMap("warn", "connection",
+                    "Attached session records no membership for wanted channels — re-asserting",
+                    ["network": config.name, "networkId": config.id.toString(),
+                     "channels": unrecorded.join(","),
+                     "event": "attach_membership_audit"]);
+                sendAutomaticJoins(unrecorded);
+            }
+        }
         // Registry additions must take effect on retained sockets too.
         // SUB and unchanged profile SETs are idempotent upstream.
         if (hasCap("draft/metadata-2")) publishOwnMetadata();
@@ -7951,6 +7971,159 @@ final class PersistentIRCClient {
         } catch (Exception) {}
     }
 
+    /// Channels the configuration wants us in that this socket has no
+    /// membership record for: neither retained from a previous socket nor
+    /// confirmed on this one. Parted and disabled channels are not wanted.
+    private string[] unrecordedWantedChannels() {
+        const mapping = casemapping();
+        string[] missing;
+        foreach (configured; config.autoJoinChannels) {
+            auto chan = normalizeChannelName(configured.strip());
+            if (!chan.length) continue;
+            if (foldNick(chan) in confirmedMembership || chan in channelState) continue;
+            if (config.partedChannels.canFind!(p => nicksEqualMapped(p, chan, mapping))) continue;
+            if (config.disabledChannels.canFind!(d => nicksEqualMapped(d, chan, mapping))) continue;
+            if (missing.canFind!(m => nicksEqualMapped(m, chan, mapping))) continue;
+            missing ~= chan;
+        }
+        return missing;
+    }
+
+    /// Asks the server which of `channels` this session is actually in.
+    ///
+    /// InspIRCd answers a JOIN for a channel we are already in with nothing
+    /// at all — no echo, no numeric — so an unanswered JOIN cannot tell a
+    /// silent refusal from a membership whose record we lost (a snapshot
+    /// older than the retained socket, a dropped self-JOIN). Re-sending the
+    /// JOIN can never settle that, however many rounds are spent. A public
+    /// NAMES can: the completed 353/366 burst containing our nick is the
+    /// proof `onEndOfNames` adopts (confirmed membership, channel state,
+    /// roster, pending JOIN cleared). One NAMES per channel, never a list.
+    private void probeMembership(string[] channels, string reason) {
+        if (state != ConnectionState.connected) return;
+        string[] probed;
+        foreach (chan; channels) {
+            if (foldNick(chan) in confirmedMembership) continue;
+            sendRaw("NAMES " ~ chan);
+            probed ~= chan;
+        }
+        if (!probed.length) return;
+        logJsonMap("info", "connection",
+            "Probing the server for membership of unconfirmed channels",
+            ["network": config.name, "networkId": config.id.toString(),
+             "channels": probed.join(","), "reason": reason,
+             "event": "membership_probe"]);
+    }
+
+    /// RPL_ENDOFNAMES (366) for one channel: concludes its NAMES burst,
+    /// adopting the channel when the burst proves we are in it.
+    private void onEndOfNames(string recipient, string rawChannel, ref IRCRawEvent event) {
+        logJsonMap("info", "protocol",
+            "366 received",
+            ["network": config.name, "channel": rawChannel, "event": "rpl_endofnames"]);
+        auto chan = gapNamesChannelKey(normalizeChannelName(rawChannel));
+        const recoveringGap = (chan in gapNamesPending) !is null;
+        const wasJoined = (chan in channelState) !is null;
+        // A holder gap may have hidden our NICK; use the
+        // server's current recipient before testing self.
+        if (recoveringGap && recipient.length && recipient != "*")
+            sessionNick = recipient;
+        bool containsSelf;
+        if (auto burst = chan in namesBurst) {
+            // Public NAMES is available outside a channel.
+            // Only the completed burst, never the retained
+            // roster, can prove unknown/gap membership.
+            foreach (member; *burst)
+                if (sameNick(stripNickPrefix(member), sessionNick)) {
+                    containsSelf = true;
+                    break;
+                }
+            if (containsSelf) {
+                confirmedMembership[foldNick(chan)] = true;
+                clearPendingJoin(chan);
+            }
+            if ((wasJoined && !recoveringGap) || containsSelf) {
+                auto held = channelUsers.get(chan, null);
+                auto rebased = applyNamesBurst(held, *burst, casemapping());
+                if (rebased.length != held.length)
+                    logJsonMap("info", "protocol",
+                        "NAMES re-baselined the channel roster",
+                        ["network": config.name, "channel": chan,
+                         "was": held.length.to!string,
+                         "now": rebased.length.to!string,
+                         "event": "roster_rebased"]);
+                channelUsers[chan] = rebased;
+                if (!wasJoined || recoveringGap) {
+                    channelState[chan] = "";
+                    clearPendingJoin(chan);
+                    if (!recoveringGap) {
+                        // Recover a dropped self-JOIN only once
+                        // a complete NAMES proves we are there.
+                        auto pi = config.partedChannels.countUntil(chan);
+                        if (!channelIntent(chan).unsaved && !config.autoJoinChannels.canFind(chan) && pi >= 0) {
+                            config.partedChannels = config.partedChannels.remove(pi);
+                            config.autoJoinChannels ~= chan;
+                        }
+                        logJsonMap("warn", "connection",
+                            "channelState drift: adopted channel from completed NAMES",
+                            ["network": config.name,
+                             "networkId": config.id.toString(),
+                             "channel": chan,
+                             "reason": "join-echo-dropped-but-names-arrived",
+                             "event": "channelstate_self_heal"]);
+                    }
+                }
+            }
+        }
+        // A confirmed self-JOIN is stronger than an omission
+        // from NAMES, except while holder-gap proof is pending.
+        if ((!wasJoined || recoveringGap) && !containsSelf) {
+            channelState.remove(chan);
+            channelUsers.remove(chan);
+        }
+        namesBurst.remove(chan);
+        namesBurstAt.remove(chan);
+        namesBurstIndex.remove(chan);
+        if (!namesBurst.length) resetNamesIdentIndex();
+        gapNamesPending.remove(chan);
+        pruneUnownedIdentities();
+        markMetaDirty();
+        // Our own prefix is now known for this channel, so we
+        // can tell whether `+f` even applies to us, and ask the
+        // server what its effective limit actually is.
+        refreshFloodExemption(chan);
+        probeChannelFlood(chan);
+        if (!fiberHistorical(event)) applyFirstJoinModes(chan, recoveringGap);
+        import std.datetime : Clock;
+        const whoNow = Clock.currTime.toUnixTime!long;
+        if (chan in channelUsers) {
+            auto ap = chan in whoEnrichAttempts;
+            const attempts = ap ? *ap : 0;
+            const needsWho = channelNeedsRealnameWho(
+                channelUsers[chan], realnames, realnameProbed, attempts);
+            logJsonMap("info", "protocol",
+                "366 needsWho check",
+                ["network": config.name, "channel": chan,
+                    "needsWho": needsWho?"true":"false",
+                    "users": channelUsers[chan].length.to!string,
+                    "realnames": realnames.length.to!string,
+                    "event": "rpl_endofnames_check"]);
+            if (needsWho && (chan !in lastWhoTime || whoNow - lastWhoTime[chan] >= 2)
+                && !pacer.isArmed()) {
+                sendRaw(whoLine(chan));
+                lastWhoTime[chan] = whoNow;
+                whoEnrichAttempts[chan] = attempts + 1;
+                logJsonMap("info", "protocol",
+                    "WHO after NAMES to populate realnames",
+                    ["network": config.name, "channel": chan, "event": "who_after_names"]);
+            }
+        } else {
+            logJsonMap("info", "protocol",
+                "366 no channelUsers entry",
+                ["network": config.name, "channel": chan, "event": "rpl_endofnames_no_users"]);
+        }
+    }
+
     private bool automaticJoinStillWanted(string channel, bool retry, string mapping) {
         if (config.bncUnsavedChannels.canFind!(c => nicksEqualMapped(c, channel, mapping))) {
             if (retry)
@@ -8297,30 +8470,7 @@ final class PersistentIRCClient {
                     // A newer socket owns the retry state now.
                     if (joinRetryEpoch != epoch) return;
                     joinConfirmSweepArmed = false;
-                    prunePendingJoins();
-                    if (joinsAwaitingConfirm.length == 0) return;
-                    // A throttle/flood retry already in flight covers these
-                    // same channels — don't send a second JOIN for them.
-                    if (joinThrottleRetryInFlight) return;
-                    if (joinThrottleRounds >= MAX_JOIN_THROTTLE_ROUNDS) {
-                        logJsonMap("warn", "connection",
-                            "JOIN never confirmed or refused — giving up (round cap)",
-                            ["network": config.name,
-                             "channels": joinsAwaitingConfirm.join(","),
-                             "event": "join_confirm_timeout_exhausted"]);
-                        return;
-                    }
-                    if (state != ConnectionState.connected) return;
-                    joinThrottleRounds++;
-                    auto batches = joinBatches(joinsAwaitingConfirm);
-                    if (batches.length == 0) return;
-                    logJsonMap("warn", "connection",
-                        "JOIN never confirmed or refused — retrying once",
-                        ["network": config.name,
-                         "channels": joinsAwaitingConfirm.join(","),
-                         "round": joinThrottleRounds.to!string,
-                         "event": "join_confirm_timeout"]);
-                    sendAutomaticJoins(joinsAwaitingConfirm, true);
+                    joinConfirmSweepRound();
                 } catch (Exception e) {
                     if (joinRetryEpoch == epoch) joinConfirmSweepArmed = false;
                     logWarn("JOIN confirm sweep failed for %s: %s", config.name, e.msg);
@@ -8329,6 +8479,44 @@ final class PersistentIRCClient {
         } catch (Exception) {
             joinConfirmSweepArmed = false;
         }
+    }
+
+    /// One pass of the join-confirm sweep, run `JOIN_CONFIRM_SWEEP_MS` after
+    /// a JOIN burst: whatever is still unconfirmed gets its membership asked
+    /// of the server (NAMES), then one re-sent JOIN for what stays unproven.
+    /// The probe goes first and is not capped by the retry budget — spending
+    /// the budget on JOINs the server will keep ignoring (prod 2026-11-23,
+    /// `#ircfiber,#support` re-sent every 5 min, never confirmed) must not
+    /// leave the channel unadopted when one NAMES would settle it.
+    private void joinConfirmSweepRound() {
+        prunePendingJoins();
+        if (joinsAwaitingConfirm.length == 0) return;
+        // A throttle/flood retry already in flight covers these
+        // same channels — don't send a second JOIN for them.
+        if (joinThrottleRetryInFlight) return;
+        if (joinThrottleRounds >= MAX_JOIN_THROTTLE_ROUNDS) {
+            probeMembership(joinsAwaitingConfirm.dup, "join-retry-budget-spent");
+            logJsonMap("warn", "connection",
+                "JOIN never confirmed or refused — giving up (round cap)",
+                ["network": config.name,
+                 "networkId": config.id.toString(),
+                 "channels": joinsAwaitingConfirm.join(","),
+                 "event": "join_confirm_timeout_exhausted"]);
+            return;
+        }
+        if (state != ConnectionState.connected) return;
+        joinThrottleRounds++;
+        auto batches = joinBatches(joinsAwaitingConfirm);
+        if (batches.length == 0) return;
+        logJsonMap("warn", "connection",
+            "JOIN never confirmed or refused — probing membership, retrying once",
+            ["network": config.name,
+             "networkId": config.id.toString(),
+             "channels": joinsAwaitingConfirm.join(","),
+             "round": joinThrottleRounds.to!string,
+             "event": "join_confirm_timeout"]);
+        probeMembership(joinsAwaitingConfirm.dup, "join-unanswered");
+        sendAutomaticJoins(joinsAwaitingConfirm, true);
     }
 
     /// Drops this client's slot refcount if it holds one. Idempotent by
@@ -12589,110 +12777,16 @@ private void processEvents() {
             // flooding on netsplits or repeated NAMES bursts.
             case "366": {
                 auto params = event.getParams();
-                logJsonMap("info", "protocol",
-                    "366 received",
-                    ["network": config.name, "channel": params.length>=2?params[1]:"?", "event": "rpl_endofnames"]);
-                if (params.length >= 2) {
-                    auto chan = gapNamesChannelKey(normalizeChannelName(params[1]));
-                    const recoveringGap = (chan in gapNamesPending) !is null;
-                    const wasJoined = (chan in channelState) !is null;
-                    // A holder gap may have hidden our NICK; use the
-                    // server's current recipient before testing self.
-                    if (recoveringGap && params[0].length && params[0] != "*")
-                        sessionNick = params[0];
-                    bool containsSelf;
-                    if (auto burst = chan in namesBurst) {
-                        // Public NAMES is available outside a channel.
-                        // Only the completed burst, never the retained
-                        // roster, can prove unknown/gap membership.
-                        foreach (member; *burst)
-                            if (sameNick(stripNickPrefix(member), sessionNick)) {
-                                containsSelf = true;
-                                break;
-                            }
-                        if (containsSelf) {
-                            confirmedMembership[foldNick(chan)] = true;
-                            clearPendingJoin(chan);
-                        }
-                        if ((wasJoined && !recoveringGap) || containsSelf) {
-                            auto held = channelUsers.get(chan, null);
-                            auto rebased = applyNamesBurst(held, *burst, casemapping());
-                            if (rebased.length != held.length)
-                                logJsonMap("info", "protocol",
-                                    "NAMES re-baselined the channel roster",
-                                    ["network": config.name, "channel": chan,
-                                     "was": held.length.to!string,
-                                     "now": rebased.length.to!string,
-                                     "event": "roster_rebased"]);
-                            channelUsers[chan] = rebased;
-                            if (!wasJoined || recoveringGap) {
-                                channelState[chan] = "";
-                                clearPendingJoin(chan);
-                                if (!recoveringGap) {
-                                    // Recover a dropped self-JOIN only once
-                                    // a complete NAMES proves we are there.
-                                    auto pi = config.partedChannels.countUntil(chan);
-                                    if (!channelIntent(chan).unsaved && !config.autoJoinChannels.canFind(chan) && pi >= 0) {
-                                        config.partedChannels = config.partedChannels.remove(pi);
-                                        config.autoJoinChannels ~= chan;
-                                    }
-                                    logJsonMap("warn", "connection",
-                                        "channelState drift: adopted channel from completed NAMES",
-                                        ["network": config.name,
-                                         "channel": chan,
-                                         "reason": "join-echo-dropped-but-names-arrived",
-                                         "event": "channelstate_self_heal"]);
-                                }
-                            }
-                        }
-                    }
-                    // A confirmed self-JOIN is stronger than an omission
-                    // from NAMES, except while holder-gap proof is pending.
-                    if ((!wasJoined || recoveringGap) && !containsSelf) {
-                        channelState.remove(chan);
-                        channelUsers.remove(chan);
-                    }
-                    namesBurst.remove(chan);
-                    namesBurstAt.remove(chan);
-                    namesBurstIndex.remove(chan);
-                    if (!namesBurst.length) resetNamesIdentIndex();
-                    gapNamesPending.remove(chan);
-                    pruneUnownedIdentities();
-                    markMetaDirty();
-                    // Our own prefix is now known for this channel, so we
-                    // can tell whether `+f` even applies to us, and ask the
-                    // server what its effective limit actually is.
-                    refreshFloodExemption(chan);
-                    probeChannelFlood(chan);
-                    if (!fiberHistorical(event)) applyFirstJoinModes(chan, recoveringGap);
-                    import std.datetime : Clock;
-                    const whoNow = Clock.currTime.toUnixTime!long;
-                    if (chan in channelUsers) {
-                        auto ap = chan in whoEnrichAttempts;
-                        const attempts = ap ? *ap : 0;
-                        const needsWho = channelNeedsRealnameWho(
-                            channelUsers[chan], realnames, realnameProbed, attempts);
-                        logJsonMap("info", "protocol",
-                            "366 needsWho check",
-                            ["network": config.name, "channel": chan,
-                                "needsWho": needsWho?"true":"false",
-                                "users": channelUsers[chan].length.to!string,
-                                "realnames": realnames.length.to!string,
-                                "event": "rpl_endofnames_check"]);
-                        if (needsWho && (chan !in lastWhoTime || whoNow - lastWhoTime[chan] >= 2)
-                            && !pacer.isArmed()) {
-                            sendRaw(whoLine(chan));
-                            lastWhoTime[chan] = whoNow;
-                            whoEnrichAttempts[chan] = attempts + 1;
-                            logJsonMap("info", "protocol",
-                                "WHO after NAMES to populate realnames",
-                                ["network": config.name, "channel": chan, "event": "who_after_names"]);
-                        }
-                    } else {
-                        logJsonMap("info", "protocol",
-                            "366 no channelUsers entry",
-                            ["network": config.name, "channel": chan, "event": "rpl_endofnames_no_users"]);
-                    }
+                // One 366 concludes a multi-target NAMES (`NAMES #a,#b`):
+                // its channel parameter is the comma-joined list, and each
+                // named channel has its own 353 burst to conclude.
+                if (params.length < 2) {
+                    logJsonMap("info", "protocol",
+                        "366 received",
+                        ["network": config.name, "channel": "?", "event": "rpl_endofnames"]);
+                } else {
+                    foreach (target; params[1].split(","))
+                        if (target.length) onEndOfNames(params[0], target, event);
                 }
                 break;
             }
@@ -16810,6 +16904,46 @@ unittest {
     ch.close();
 }
 
+@("one 366 naming several channels concludes every NAMES burst it terminates")
+unittest {
+    NetworkConfig cfg;
+    cfg.nick = "Zodiac";
+    auto ch = EngineEventChannel.create();
+    auto c = new PersistentIRCClient(cfg, ch);
+    scope (exit) { ++c.joinRetryEpoch; ch.close(); }
+    c.sessionNick = "Zodiac";
+    c.recordPendingJoins("#a,#b,#c");
+    c.processLine(":s 353 Zodiac = #a :Zodiac @op");
+    c.processLine(":s 353 Zodiac = #b :Zodiac");
+    c.processLine(":s 353 Zodiac = #c :someone else");
+    // InspIRCd terminates `NAMES #a,#b,#c` with ONE 366 whose mask is the
+    // comma-joined list; treating it as a channel named "#a,#b,#c" left all
+    // three bursts unconcluded (prod 2026-11-23).
+    c.processLine(":s 366 Zodiac #a,#b,#c :End of /NAMES list.");
+    assert("#a" in c.channelState && "#b" in c.channelState,
+        "each listed channel whose burst contains us must be adopted");
+    assert("#c" !in c.channelState,
+        "a burst without us proves nothing and must not be adopted");
+    assert(c.joinsAwaitingConfirm == ["#c"],
+        "proven channels leave the pending set; the unproven one stays");
+}
+
+@("unrecordedWantedChannels lists only wanted channels with no membership record")
+unittest {
+    NetworkConfig cfg;
+    cfg.nick = "Zodiac";
+    cfg.autoJoinChannels = ["#new", "#NEW", "#kept", "#proven", "#left", "#off", ""];
+    cfg.partedChannels = ["#left"];
+    cfg.disabledChannels = ["#off"];
+    auto ch = EngineEventChannel.create();
+    auto c = new PersistentIRCClient(cfg, ch);
+    scope (exit) ch.close();
+    c.channelState["#kept"] = "";
+    c.confirmedMembership[c.foldNick("#proven")] = true;
+    assert(c.unrecordedWantedChannels() == ["#new"],
+        "retained, confirmed, parted, disabled, blank and duplicate entries are not re-asserted");
+}
+
 @("flood retry wait comes from the pacer's modelled minIntervalMs, not a naive penaltyMs read")
 unittest {
     NetworkConfig cfg;
@@ -18266,6 +18400,131 @@ Ircv3Check[] slowdownWireChecks(out string[] wire) {
     foreach (line; received)
         wire ~= line.startsWith("PRIVMSG NickServ :IDENTIFY ")
             ? "PRIVMSG NickServ :IDENTIFY [fixture-redacted]" : line;
+    return checks;
+}
+
+/// Socket-level regression for a session whose membership record was lost
+/// while the server still has us in the channels (prod 2026-11-23: a held
+/// session adopted with no channel state sat on "Joining…" for hours). The
+/// fixture behaves like InspIRCd: a JOIN for a channel we are already in is
+/// answered with nothing at all, while NAMES always answers.
+Ircv3Check[] membershipRecoveryWireChecks() {
+    import std.algorithm : count;
+    import vibe.core.net : listenTCP;
+    import vibe.stream.operations : readLine;
+
+    Ircv3Check[] checks;
+    void check(string name, bool passed) { checks ~= Ircv3Check(name, passed); }
+    string[] received;
+    bool[string] serverMembers = ["#ircfiber": true, "#support": true];
+    bool peerClosed;
+    auto listener = listenTCP(0, (TCPConnection peer) {
+        try {
+            while (!peer.empty) {
+                const line = (cast(const(char)[]) peer.readLine()).idup;
+                received ~= line;
+                if (line.startsWith("JOIN ")) {
+                    foreach (target; line[5 .. $].split(",")) {
+                        if (target in serverMembers) continue;
+                        serverMembers[target] = true;
+                        peer.write(":me!u@host JOIN " ~ target ~ "\r\n");
+                    }
+                    peer.flush();
+                } else if (line.startsWith("NAMES ")) {
+                    const target = line[6 .. $];
+                    if (target in serverMembers)
+                        peer.write(":s 353 me = " ~ target ~ " :me @op\r\n");
+                    peer.write(":s 366 me " ~ target ~ " :End of /NAMES list.\r\n");
+                    peer.flush();
+                } else if (line.startsWith("WHO ")) {
+                    const target = line.split()[1];
+                    peer.write(":s 352 me " ~ target ~ " u host s me H :0 Me\r\n"
+                        ~ ":s 315 me " ~ target ~ " :End of WHO\r\n");
+                    peer.flush();
+                }
+            }
+        } catch (Exception) {}
+        try peer.close(); catch (Exception) {}
+        peerClosed = true;
+    }, "127.0.0.1");
+    auto events = EngineEventChannel.create();
+    NetworkConfig cfg;
+    cfg.nick = "me";
+    cfg.name = "Membership recovery fixture";
+    cfg.autoJoinChannels = ["#ircfiber", "#support", "#fresh"];
+    auto client = new PersistentIRCClient(cfg, events);
+    client.sessionNick = "me";
+    client.connection = connectTCP("127.0.0.1", listener.bindAddress.port);
+    client.state = ConnectionState.connected;
+    client.connectedAtMs = unixMsNow();
+    void cleanup() {
+        ++client.joinRetryEpoch;
+        try client.connection.close(); catch (Exception) {}
+        foreach (_; 0 .. 200) {
+            if (peerClosed) break;
+            try sleep(5.msecs); catch (Exception) {}
+        }
+        try listener.stopListening(); catch (Exception) {}
+        events.close();
+    }
+    scope(exit) cleanup();
+    void pump(long milliseconds = 75) {
+        const until = unixMsNow() + milliseconds;
+        ubyte[4096] buffer;
+        while (unixMsNow() < until) {
+            const n = client.readFromStream(buffer[], 10.msecs);
+            if (!n) continue;
+            client.inboundPartial ~= cast(const(char)[]) buffer[0 .. n];
+            for (;;) {
+                const end = client.inboundPartial.indexOf("\r\n");
+                if (end < 0) break;
+                const line = client.inboundPartial[0 .. end].idup;
+                client.inboundPartial = client.inboundPartial[end + 2 .. $];
+                client.processLine(line);
+            }
+        }
+    }
+    void flush() {
+        foreach (_; 0 .. 4) {
+            client.pacer = FakeLagPacer.init;
+            client.processOutboundQueue();
+            pump();
+            if (!client.pacedQueue.length) break;
+        }
+    }
+    size_t occurrences(string line) { return received.count(line); }
+
+    // The attach audit's inputs: a session adopted with an empty record.
+    check("an adopted session with no recorded channels reports every wanted channel unrecorded",
+        client.unrecordedWantedChannels() == ["#ircfiber", "#support", "#fresh"]);
+    client.sendAutomaticJoins(client.unrecordedWantedChannels());
+    flush();
+    check("unrecorded channels are re-asserted with one batched JOIN",
+        occurrences("JOIN #ircfiber,#support,#fresh") == 1);
+    check("a channel the server really joins is confirmed by its echo",
+        "#fresh" in client.channelState
+        && client.foldNick("#fresh") in client.confirmedMembership);
+    check("a channel the server silently ignores stays pending after the JOIN",
+        client.joinsAwaitingConfirm == ["#ircfiber", "#support"]
+        && "#ircfiber" !in client.channelState);
+
+    sleep((PersistentIRCClient.JOIN_CONFIRM_SWEEP_MS + 100).msecs);
+    flush();
+    check("the sweep asks the server with one NAMES per silent channel",
+        occurrences("NAMES #ircfiber") == 1 && occurrences("NAMES #support") == 1
+        && occurrences("NAMES #ircfiber,#support") == 0);
+    check("the completed NAMES adopts the channels the JOIN could not confirm",
+        "#ircfiber" in client.channelState && "#support" in client.channelState
+        && client.foldNick("#ircfiber") in client.confirmedMembership
+        && client.foldNick("#support") in client.confirmedMembership
+        && client.joinsAwaitingConfirm.length == 0);
+    // The single retry JOIN is already queued behind the probe when the NAMES
+    // proof arrives; it is idempotent upstream and the budget caps it at one.
+    check("the retry JOIN stays at one batch — recovery does not loop on JOIN",
+        occurrences("JOIN #ircfiber,#support") <= 1
+        && occurrences("JOIN #ircfiber") == 0 && occurrences("JOIN #support") == 0);
+    check("the adopted channel's roster is the server's, not empty",
+        client.channelUsers.get("#ircfiber", null).length >= 1);
     return checks;
 }
 

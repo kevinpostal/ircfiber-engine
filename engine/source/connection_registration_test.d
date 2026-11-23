@@ -13,7 +13,7 @@ import ircfiber.irc.connection : parseJoinThrottleSeconds, remainingJoinDelayMs,
     memberNeedsRealname, channelNeedsRealnameWho, MAX_WHO_ENRICH_ATTEMPTS,
     upsertRosterEntry, applyNamesBurst, isSaslRequiredRefusal, extractServerReason,
     saslMechanismOffered, fiberMlsBackstopChecks, fiberMlsWireChecks, servicesIdentityWireChecks,
-    ircv3ProtocolChecks, silentTransportRouteChecks, slowdownWireChecks,
+    ircv3ProtocolChecks, silentTransportRouteChecks, slowdownWireChecks, membershipRecoveryWireChecks,
     holderCertificateRegistrationChecks;
 import ircfiber.engine.session_snapshot : historySnapshotRegressionChecks;
 import ircfiber.engine.processor : historyCheckpointRegressionChecks, channelIntentRegressionChecks;
@@ -274,6 +274,8 @@ void main() {
     string[] slowdownWire;
     foreach (check; slowdownWireChecks(slowdownWire)) ok(check.name, check.passed);
     foreach (line; slowdownWire) stderr.writeln("    wire> ", line);
+    stderr.writeln("\n[connection.membership] unrecorded channels are recovered from the server");
+    foreach (check; membershipRecoveryWireChecks()) ok(check.name, check.passed);
     historySnapshotRegressionChecks();
     historyCheckpointRegressionChecks();
     channelIntentRegressionChecks();
