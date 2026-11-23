@@ -48,7 +48,10 @@ private struct EvidenceBudget {
     private enum size_t maxEvidenceBytes = 32 * 1024 * 1024;
     static EvidenceBudget start() {
         EvidenceBudget result;
-        result.deadline = MonoTime.currTime + 5.seconds;
+        // Cold production archives need several seconds for an all-channels page;
+        // every read still carries a server-side time limit.
+        result.deadline = MonoTime.currTime + 15.seconds;
+        result.opCapMs = 8_000;
         return result;
     }
     static EvidenceBudget startWorker() {
@@ -621,25 +624,14 @@ final class MessageSearchRepository {
         return read(filter, maxEvidence, budget, Bson.init, "_id_");
     }
 
-    /// One query for all scoped alias owners and mutations, not one per hit.
+    /// Owners and controls come from their own partial indexes. One unhinted
+    /// $or over both made Mongo's multiplanner exceed its time limit on a cold
+    /// 24M-row archive, so each branch is its own hinted query.
     private Bson[] readRelated(string[][MessageSearchScope] aliases, bool mutations,
             ref EvidenceBudget budget) {
-        Bson[] clauses;
-        foreach (scope_, names; aliases) {
-            if (!names.length) continue;
-            auto filter = exactScopeFilter(scope_);
-            auto owners = Bson(["searchKind": Bson("message"),
-                "searchAliases": Bson(["$in": serializeToBson(names)])]);
-            if (mutations) {
-                filter["$or"] = Bson([owners, Bson([
-                    "searchKind": Bson(["$in": serializeToBson(["edit", "redact"])]),
-                    "searchTarget": Bson(["$in": serializeToBson(names)])
-                ])]);
-            } else filter["$and"] = Bson([owners]);
-            clauses ~= filter;
-        }
-        if (!clauses.length) return null;
-        return read(Bson(["$or": Bson(clauses)]), maxEvidence, budget);
+        auto result = readWorkerAliases(aliases, false, budget);
+        if (mutations) result ~= readWorkerAliases(aliases, true, budget);
+        return result;
     }
 
     private Bson[] read(Bson filter, size_t limit, ref EvidenceBudget budget,
