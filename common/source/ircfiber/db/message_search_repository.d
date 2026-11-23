@@ -37,17 +37,23 @@ struct MessageSearchContext {
 private struct EvidenceBudget {
     MonoTime deadline;
     size_t evidenceBytes;
+    // Per-operation server time limit. Interactive reads stay at two seconds;
+    // the background worker raises it for cold production archives.
+    long opCapMs = 2_000;
     // Cumulative raw source bytes, including worker hints and repeated reads.
     // Row limits alone do not bound JSON payload/evidence memory.
     private enum size_t maxEvidenceBytes = 32 * 1024 * 1024;
     static EvidenceBudget start() {
         return EvidenceBudget(MonoTime.currTime + 5.seconds);
     }
+    static EvidenceBudget startWorker() {
+        return EvidenceBudget(MonoTime.currTime + 45.seconds, 0, 20_000);
+    }
     long remainingMs() {
         const remaining = (deadline - MonoTime.currTime).total!"msecs";
         if (remaining <= 0)
             throw new MessageSearchEvidenceException(MessageSearchEvidenceFailure.limitExceeded);
-        return min(remaining, 2_000L);
+        return min(remaining, opCapMs);
     }
     void account(Bson doc) {
         const bytes = doc.data.length;
@@ -156,7 +162,7 @@ final class MessageSearchRepository {
     /// it can shorten, but never extend, this invocation's five-second budget.
     SearchResolution[] resolveChangedRowsWorker(Bson[] changedRows,
             MessageSearchScope[] scopes, MonoTime deadline = MonoTime.init) @trusted {
-        auto budget = EvidenceBudget.start();
+        auto budget = EvidenceBudget.startWorker();
         if (deadline != MonoTime.init) budget.deadline = min(budget.deadline, deadline);
         budget.remainingMs();
         scopes = normalizedScopes(scopes);
