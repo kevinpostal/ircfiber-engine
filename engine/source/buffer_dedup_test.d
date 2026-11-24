@@ -25,9 +25,8 @@
 ///       "Clear backlog" must not leave a dedup set behind, or the buffer
 ///       can never refill.
 ///
-/// Requires an isolated loopback Redis via IRCFIBER_HISTORY_TEST_REDIS_URL.
-/// Build: `dub build --config=buffer-dedup-test`
-/// Run: `IRCFIBER_HISTORY_TEST_REDIS_URL=redis://127.0.0.1:16379 ./buffer-dedup-test`
+/// Requires explicit loopback Redis and Mongo fixtures; history reads resolve
+/// network ownership in Mongo. See the engine README for the build/run command.
 module buffer_dedup_test;
 
 import std.conv : to;
@@ -37,7 +36,9 @@ import std.uuid : randomUUID;
 import ircfiber.models.irc_event : IRCRawEvent;
 import ircfiber.storage.buffer : BufferManager;
 import ircfiber.storage.redis : RedisStorage;
-import ircfiber.testing.isolated_db : isolatedTestRedis;
+import ircfiber.db.mongo : AppMongoConnection;
+import ircfiber.testing.isolated_db : connectIsolatedTestMongo, isolatedTestRedis;
+import vibe.data.bson : Bson;
 
 /// Tracks the number of passing checks.
 int passed;
@@ -90,10 +91,16 @@ void cleanup(RedisStorage redis, string networkId) {
     }
 }
 
-void test_second_append_is_reported_duplicate(RedisStorage redis) {
+private string readableNetwork(string owner) {
+    const nid = randomUUID().toString();
+    AppMongoConnection.getDb()["networks"].insertOne(Bson(["id": Bson(nid), "userId": Bson(owner)]));
+    return nid;
+}
+
+void test_second_append_is_reported_duplicate(RedisStorage redis, string owner) {
     stderr.writeln("\n[dedup] repeat of the same wire event");
     auto bm = new BufferManager(redis);
-    const nid = randomUUID().toString();
+    const nid = readableNetwork(owner);
     scope (exit) cleanup(redis, nid);
 
     auto ev = joinEvent(nid, "#chan", "Testing", 1_788_000_000_000L);
@@ -194,12 +201,12 @@ void test_clear_buffer_drops_both_dedup_spellings(RedisStorage redis) {
     check!("cleared buffer accepts the event again")(bm.appendIRCEvent(again, "engine1"));
 }
 
-void test_reply_and_reaction_history(RedisStorage redis) {
+void test_reply_and_reaction_history(RedisStorage redis, string owner) {
     stderr.writeln("\n[history] replies and reaction transitions survive Redis replay");
     foreach (legacy; [false, true]) {
         foreach (draftTags; [false, true]) {
             auto bm = new BufferManager(redis);
-            const nid = randomUUID().toString();
+            const nid = readableNetwork(owner);
             scope (exit) cleanup(redis, nid);
             IRCRawEvent event(string command, string msgid, long t) {
                 auto ev = IRCRawEvent("TestNet", command);
@@ -278,10 +285,10 @@ IRCRawEvent stateEvent(string nid, string command, bool historical,
     return ev;
 }
 
-void test_state_replay_both_arrival_orders(RedisStorage redis) {
+void test_state_replay_both_arrival_orders(RedisStorage redis, string owner) {
     stderr.writeln("\n[dedup] extended/basic JOIN and voice replay, both arrival orders");
     foreach (command; ["JOIN", "MODE"]) foreach (historyFirst; [false, true]) {
-        const nid = randomUUID().toString();
+        const nid = readableNetwork(owner);
         scope (exit) cleanup(redis, nid);
         auto first = stateEvent(nid, command, historyFirst);
         auto second = stateEvent(nid, command, !historyFirst);
@@ -482,6 +489,70 @@ void test_repeated_chat_identity_is_unchanged(RedisStorage redis) {
     }
 }
 
+/// Read the physical list, not getRecent (which also limits its result).
+void test_scrollback_tail(RedisStorage redis) {
+    import vibe.data.json : Json, parseJsonString;
+
+    enum cap = 2_500;
+    enum ttlSeconds = 30 * 86_400;
+    auto bm = new BufferManager(redis);
+    auto db = redis.getDb();
+    foreach (events; [false, true]) {
+        const nid = randomUUID().toString();
+        scope (exit) cleanup(redis, nid);
+        const key = "scrollback:engine1:" ~ nid ~ ":#cap";
+        const companion = "irc:archive:lineage:buffer:" ~ key;
+        stderr.writeln("\n[scrollback] ", events ? "appendIRCEvent" : "appendMessage");
+        string lineage;
+        IRCRawEvent lastEvent;
+        bool stored = true;
+        foreach (eid; 1 .. cap + 2) {
+            const text = "line " ~ eid.to!string;
+            if (events) {
+                auto event = IRCRawEvent("TestNet", "PRIVMSG");
+                event.networkId = nid;
+                event.channel = "#cap";
+                event.nick = "reader";
+                event.text = text;
+                event.timestampMs = 1_790_000_000_000L + eid;
+                event.eid = eid;
+                event.setParams(["#cap", text]);
+                event.addTag("msgid", eid.to!string);
+                stored &= bm.appendIRCEvent(event, "engine1");
+                if (eid == cap + 1) lastEvent = event;
+            } else {
+                bm.appendMessage("engine1", nid, "#cap", Json(["eid": Json(eid), "x": Json(text)]));
+            }
+            if (eid == 1) lineage = db.get(companion);
+        }
+        if (events) {
+            check!("every distinct IRC event was accepted")(stored);
+            lastEvent.id = randomUUID().toString();
+            ++lastEvent.eid;
+            check!("recent wire identity remains deduplicated after trim")(
+                !bm.appendIRCEvent(lastEvent, "engine1"));
+        }
+        int expected = cap + 1;
+        bool ordered = true;
+        foreach (raw; db.lrange(key, 0, -1)) {
+            auto row = parseJsonString(raw);
+            ordered &= row["eid"].get!long == expected && row["x"].get!string == "line " ~ expected.to!string;
+            --expected;
+        }
+        check!("list contains exactly EIDs 2501 through 2, newest first")(ordered && expected == 1);
+        const locator = "irc:archive:lineage:id:" ~ lineage;
+        check!("trim preserved the first append's unpinned lineage")(lineage.length &&
+            db.get(companion) == lineage && db.hget(locator, "key") == key &&
+            db.hget(locator, "empty") == "0" && db.hget(locator, "refs") == "0");
+        bool expiring = true;
+        foreach (k; [key, companion, locator]) {
+            const ttl = db.ttl(k);
+            expiring &= ttl >= ttlSeconds - 5 && ttl <= ttlSeconds;
+        }
+        check!("list and both lineage keys retain their 30-day expiry")(expiring);
+    }
+}
+
 /// The bound used to be documented but never enforced, and the TTL refreshes
 /// on every append, so a busy channel's set grew without limit (1.6M members
 /// for one Rizon channel) until Redis hit maxmemory.
@@ -577,23 +648,28 @@ int main() {
     try {
         redis = connect();
         redis.getDb().exists("probe");
+        if (!connectIsolatedTestMongo("BufferManager history reads", "ircfiber_buffer_dedup_test"))
+            throw new Exception("Explicit isolated IRCFIBER_HISTORY_TEST_MONGO_URL is required");
     } catch (Exception e) {
-        stderr.writeln("FATAL: isolated test Redis unavailable: ", e.msg);
+        stderr.writeln("FATAL: isolated history fixture unavailable: ", e.msg);
         return 1;
     }
 
-    test_second_append_is_reported_duplicate(redis);
+    const owner = randomUUID().toString();
+    scope (exit) AppMongoConnection.getDb()["networks"].deleteMany(Bson(["userId": Bson(owner)]));
+    test_second_append_is_reported_duplicate(redis, owner);
     test_dedup_survives_server_reassignment(redis);
     test_legacy_server_scoped_set_is_adopted(redis);
     test_distinct_events_are_not_collapsed(redis);
     test_clear_buffer_drops_both_dedup_spellings(redis);
-    test_reply_and_reaction_history(redis);
-    test_state_replay_both_arrival_orders(redis);
+    test_reply_and_reaction_history(redis, owner);
+    test_state_replay_both_arrival_orders(redis, owner);
     test_state_identity_boundaries(redis);
     test_state_alias_provenance(redis);
     test_state_alias_requires_wire_identity(redis);
     test_state_alias_failure_atomicity(redis);
     test_repeated_chat_identity_is_unchanged(redis);
+    test_scrollback_tail(redis);
     test_dedup_set_is_bounded(redis);
     test_oversized_dedup_rebuilds_from_retained_rows(redis);
 

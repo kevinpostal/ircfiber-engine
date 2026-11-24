@@ -136,16 +136,18 @@ dub --root=engine test && dub --root=common test
 python3 -m pytest tests/irc_parity -v  # against mock ircd
 ```
 
-### Reaction history regression
+### Scrollback retention and reaction history regression
 
-With an isolated Redis listening on `127.0.0.1:6379`:
+Use disposable loopback Redis (e.g. `maxmemory 384mb`, `noeviction`) and MongoDB. The filtered reader resolves network ownership in Mongo; the suite creates and removes its own network rows.
 
 ```bash
+export IRCFIBER_HISTORY_TEST_REDIS_URL=redis://127.0.0.1:16379
+export IRCFIBER_HISTORY_TEST_MONGO_URL='mongodb://127.0.0.1:16380/?replicaSet=reclaimFixture'
 dub --root=engine build --config=buffer-dedup-test
 ./engine/buffer-dedup-test
 ```
 
-The Redis round trip checks reply targets and ordered reaction add/remove rows through the actual scrollback writer and filtered reader, including tag aliases, preferred-tag precedence, legacy/namespaced storage and typing-noise exclusion.
+Both append paths must retain EIDs 2,501 through 2 in physical list order, with the original lineage and 30-day expiry. The Redis round trip also checks dedup, reply targets and ordered reaction add/remove rows through the real filtered reader, including legacy/namespaced storage and typing-noise exclusion.
 
 ### VPN egress reliability
 
