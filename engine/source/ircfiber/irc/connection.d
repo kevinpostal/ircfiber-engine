@@ -16895,7 +16895,7 @@ unittest {
     // of those replies, so the channel sat in joinsAwaitingConfirm
     // forever with isJoined still true and a frozen roster. The sweep is
     // the only thing that notices a reply that never arrives.
-    c.sendRaw("JOIN #superbowl");
+    c.noteRawWrite("JOIN #superbowl"); // write boundary: sendRaw only queues without a transport
     assert(c.joinsAwaitingConfirm == ["#superbowl"]);
     assert(!c.joinConfirmSweepArmed, "fresh client starts unarmed");
     c.scheduleJoinConfirmSweep();
@@ -17050,6 +17050,8 @@ unittest {
         cfg.nick = "me";
         auto ch = EngineEventChannel.create();
         auto c = new PersistentIRCClient(cfg, ch);
+        // Other members' lines are tracked only in channels we are in.
+        foreach (joined; ["#c", "#support", "#ircfiber"]) c.channelState[joined] = "";
         foreach (l; lines) c.processLine(l);
         if (settle) c.settleMemberFlaps(unixMsNow() + MEMBER_FLAP_MAX_HOLD_MS);
         ch.close(); // an open, empty channel blocks tryConsumeOne
@@ -17239,11 +17241,18 @@ unittest {
 unittest {
     import std.typecons : tuple;
 
-    static auto run(string[] lines) {
+    static auto run(string[] lines, bool registered = false, bool history = false) {
         NetworkConfig cfg;
         cfg.nick = "me";
         auto ch = EngineEventChannel.create();
         auto c = new PersistentIRCClient(cfg, ch);
+        // Replies go out only on a registered connection; hold the paced
+        // queue so the lines a request would send stay inspectable.
+        if (registered) {
+            c.state = ConnectionState.connected;
+            c.noncriticalWriting = true;
+        }
+        if (history) c.ackedCaps["draft/chathistory"] = true;
         foreach (line; lines) c.processLine(line);
         ch.close();
         IRCRawEvent[] events;
@@ -17251,21 +17260,22 @@ unittest {
         while (ch.tryConsumeOne(event)) events ~= event;
         return tuple(c, events);
     }
-    auto direct = run([":alice!u@h PRIVMSG me :\x01VERSION\x01"]);
+    auto direct = run([":alice!u@h PRIVMSG me :\x01VERSION\x01"], true);
     assert(direct[1].length == 1, "a request must publish one diagnostic");
     assert(direct[1][0].channel == "_server" && direct[1][0].getTag("ctcp") == "VERSION");
-    assert(direct[0].outboundQueue == ["NOTICE alice :\x01VERSION IRC Fiber\x01"]);
+    assert(direct[0].pacedQueue.length == 1
+        && direct[0].pacedQueue[0].line == "NOTICE alice :\x01VERSION IRC Fiber\x01");
 
     foreach (target; ["#room", "@me", "someone"]) {
-        auto channel = run([":alice!u@h PRIVMSG " ~ target ~ " :\x01VERSION\x01"]);
+        auto channel = run([":alice!u@h PRIVMSG " ~ target ~ " :\x01VERSION\x01"], true);
         assert(channel[1].length == 1 && channel[1][0].channel == "_server");
-        assert(channel[0].outboundQueue.length == 0, "only our exact nick may elicit a reply");
+        assert(channel[0].pacedQueue.length == 0, "only our exact nick may elicit a reply");
         assert(channel[0].queryBuffers.length == 0);
     }
     auto replay = run(["BATCH +history chathistory me",
         "@batch=history :alice!u@h PRIVMSG me :\x01VERSION\x01", "BATCH -history"]);
-    assert(replay[0].outboundQueue.length == 0);
-    assert(replay[1].length == 1 && replay[1][0].getTag("batch") == "chathistory");
+    assert(replay[0].pacedQueue.length == 0);
+    assert(replay[1].length == 0, "a replayed CTCP request is neither answered nor published");
 
     auto diagnostics = run([
         "@msgid=secret;account=acct :alice!u@h PRIVMSG me :\x01DCC SEND private\x01",
@@ -17281,7 +17291,7 @@ unittest {
     assert(diagnostics[1][2].command == "NOTICE"
         && diagnostics[1][2].getParams()[0] == "me"
         && diagnostics[1][2].text == "\x01PING private-token\x01");
-    assert(diagnostics[0].outboundQueue.length == 0);
+    assert(diagnostics[0].pacedQueue.length == 0);
     assert(diagnostics[0].queryBuffers.length == 0 && diagnostics[0].queryAccounts.length == 0
         && diagnostics[0].queryHosts.length == 0 && diagnostics[0].accounts.length == 0);
     assert(diagnostics[0].getLatestMsgid("alice").length == 0);
@@ -17309,22 +17319,33 @@ unittest {
     assert(c.getOwnPrefix() == "", "never exported while not registered");
     assert(c.channelUsers["#c"] == ["me!~m@host.a"]);
     // An optimistic /nick and its rejection never move the proof.
-    c.sendRaw("NICK newme");
+    // An optimistic rename is recorded only for a registered connection, so
+    // the write boundary runs with the state registered and then restores it.
+    void wrote(string line) {
+        const before = c.state;
+        c.state = ConnectionState.connected;
+        c.noteRawWrite(line);
+        c.state = before;
+    }
+    wrote("NICK newme");
     assert(c.sessionNick == "newme" && c.ownPrefix == "me!~m@host.a");
     c.processLine(":s 433 me newme :Nickname is already in use");
     assert(c.sessionNick == "me" && c.ownPrefix == "me!~m@host.a");
     // The server's NICK for the identity we hold moves it.
-    c.sendRaw("NICK newme");
+    wrote("NICK newme");
     c.processLine(":me!~m@host.a NICK newme");
     assert(c.ownPrefix == "newme!~m@host.a");
     assert(c.channelUsers["#c"] == ["newme!~m@host.a"], "NICK keeps the roster's user@host");
     // CHGHOST from the identity we hold moves the host.
     c.processLine(":newme!~m@host.a CHGHOST ~m cloak.b");
     assert(c.ownPrefix == "newme!~m@cloak.b");
-    // A replayed CHGHOST for our nick is no proof: dropped until WHO.
-    c.processLine("@batch=h :newme!~m@cloak.b CHGHOST ~m old.host");
+    // A replayed CHGHOST for our nick is no proof: dropped until WHO. (Replay
+    // is the backlog a re-attach delivers; batches are routed to history.)
+    c.attachBacklogBytes = 1_000_000;
+    c.processLine(":newme!~m@cloak.b CHGHOST ~m old.host");
     assert(c.ownPrefix == "");
-    c.processLine("@batch=h :s 352 newme #c ~m old.host s newme H :0 Me");
+    c.processLine(":s 352 newme #c ~m old.host s newme H :0 Me");
+    c.attachBacklogBytes = 0;
     assert(c.ownPrefix == "", "historical WHO cannot restore identity proof");
     // WHO for our confirmed nick restates it.
     c.processLine(":s 352 newme #c ~m cloak.b s newme H :0 Me");
@@ -17336,7 +17357,7 @@ unittest {
     assert(c.ownPrefix == "newme!~m@cloak.d");
     // Someone else holding the nick we optimistically asked for renames:
     // the bookkeeping misreads it as us, the proof must not follow it.
-    c.sendRaw("NICK taken");
+    wrote("NICK taken");
     c.processLine(":taken!x@evil NICK other");
     assert(c.ownPrefix == "", "a rename of another identity never becomes ours");
     // While a /nick awaits its echo a WHO row for that nick proves nothing.
@@ -21295,7 +21316,9 @@ unittest {
     // Our own 306 keeps the message we set, not the server's text.
     {
         auto t = make();
-        t[0].sendRaw("AWAY :brb");
+        // Bookkeeping runs at the write boundary, which a client without a
+        // transport never reaches through sendRaw (it only queues).
+        t[0].noteRawWrite("AWAY :brb");
         t[0].processLine(":s 306 me :You have been marked as being away");
         assert(t[0].isAway && t[0].awayMessage == "brb");
         drain(t);
@@ -21325,9 +21348,15 @@ unittest {
     // the engine's sweep queued behind it stays private.
     {
         auto t = make();
+        t[0].state = ConnectionState.connected; // a read is queued only for a live connection
+        t[0].noncriticalWriting = true; // keep it queued: no transport to write to
         t[0].processLine(":s 005 me WHOX :are supported");
+        // Without a transport sendRaw only queues; the write boundary does the bookkeeping.
         t[0].sendRaw("WHO #c %na", true);
-        t[0].sendRaw(t[0].whoLine("#c"));
+        t[0].noteRawWrite("WHO #c %na");
+        const engineWho = t[0].whoLine("#c");
+        t[0].sendRaw(engineWho);
+        t[0].noteRawWrite(engineWho);
         foreach (l; [":s 354 me bob acct", ":s 354 me carol 0", ":s 315 me #c :End of /WHO list.",
                      ":s 354 me 152 #c u h dave H dacct :Dave", ":s 315 me #c :End of /WHO list."])
             t[0].processLine(l);
@@ -21342,8 +21371,13 @@ unittest {
     // Plain WHO: 352 rows follow the same ownership.
     {
         auto t = make();
+        t[0].state = ConnectionState.connected; // a read is queued only for a live connection
+        t[0].noncriticalWriting = true; // keep it queued: no transport to write to
+        // Without a transport sendRaw only queues; the write boundary does the bookkeeping.
         t[0].sendRaw("WHO #c");
+        t[0].noteRawWrite("WHO #c");
         t[0].sendRaw("WHO #d", true);
+        t[0].noteRawWrite("WHO #d");
         foreach (l; [":s 352 me #c u h s bob H :0 Bob", ":s 315 me #c :End",
                      ":s 352 me #d u h s eve H :0 Eve", ":s 315 me #D :End"])
             t[0].processLine(l);
@@ -21423,6 +21457,7 @@ unittest {
     {
         auto t = make();
         t[0].ackedCaps["draft/chathistory"] = true;
+        t[0].connectionEpoch = "history-fail"; // history is requested only on an established connection
         t[0].requestChathistory("#c", "LATEST", "", 50);
         assert(t[0].isChathistoryInFlight("#c"));
         t[0].processLine(":s FAIL CHATHISTORY INVALID_TARGET LATEST #c :x");
@@ -21435,9 +21470,10 @@ unittest {
         t[0].ackedCaps["draft/chathistory"] = true;
         t[0].processLine(":s 005 me CHATHISTORY=20 MSGREFTYPES=timestamp :are supported");
         t[0].recordChannelMsgid("#c", "abc", 1_788_750_000_000);
+        t[0].connectionEpoch = "history-limit"; // history is requested only on an established connection
         t[0].requestChathistory("#c", "BEFORE", "abc", 100);
-        assert(t[0].outboundQueue[$ - 1] == "CHATHISTORY BEFORE #c timestamp=2026-09-07T03:00:00.000Z 20",
-               t[0].outboundQueue[$ - 1]);
+        assert(t[0].pacedQueue[$ - 1].line == "CHATHISTORY BEFORE #c timestamp=2026-09-07T03:00:00.000Z 20",
+               t[0].pacedQueue[$ - 1].line);
         drain(t);
     }
     // Msgid cursors move by server-time, not by string order.
@@ -21450,11 +21486,17 @@ unittest {
         drain(t);
     }
 
+    // Lines a client without a transport has queued, oldest first.
+    static string[] outq(PersistentIRCClient c) {
+        import std.algorithm : map;
+        import std.array : array;
+        return c.pacedQueue.map!(e => e.line).array;
+    }
     // CAP after registration: NEW requests, ACK/DEL track the cap set.
     {
         auto t = make();
         t[0].processLine(":s CAP me NEW :draft/read-marker");
-        assert(t[0].outboundQueue.canFind("CAP REQ :draft/read-marker"));
+        assert(outq(t[0]).canFind("CAP REQ :draft/read-marker"));
         t[0].processLine(":s CAP me ACK :draft/read-marker");
         assert(t[0].hasCap("draft/read-marker"));
         t[0].processLine(":s CAP me DEL :draft/read-marker");
@@ -21480,15 +21522,15 @@ unittest {
         c.processLine(":me!u@h NICK Guest123");
         assert(c.sessionNick == "Guest123");
         c.processLine(":s CAP Guest123 NEW :sasl=EXTERNAL,PLAIN");
-        assert(c.outboundQueue.canFind("CAP REQ :sasl"));
+        assert(outq(c).canFind("CAP REQ :sasl"));
         c.processLine(":s CAP Guest123 ACK :sasl");
-        assert(c.outboundQueue.canFind("AUTHENTICATE PLAIN"));
+        assert(outq(c).canFind("AUTHENTICATE PLAIN"));
         c.processLine("AUTHENTICATE +");
-        assert(c.outboundQueue.canFind("AUTHENTICATE " ~ buildSaslPlainPayload("me", "secretpw")));
-        assert(!c.outboundQueue.canFind!(l => l.startsWith("PRIVMSG NickServ")), "never IDENTIFY over PRIVMSG");
+        assert(outq(c).canFind("AUTHENTICATE " ~ buildSaslPlainPayload("me", "secretpw")));
+        assert(!outq(c).canFind!(l => l.startsWith("PRIVMSG NickServ")), "never IDENTIFY over PRIVMSG");
         c.processLine(":s 900 Guest123 Guest123!u@h me :You are now logged in as me");
         c.processLine(":s 903 Guest123 :SASL authentication successful");
-        assert(c.outboundQueue[$ - 1] == "NICK me", c.outboundQueue.join(" | "));
+        assert(outq(c)[$ - 1] == "NICK me", outq(c).join(" | "));
         assert(!c.lateSaslPending && c.forcedFromNick.length == 0);
         auto got = drain(t);
         assert(!got.canFind!(e => e.command == "AUTHENTICATE"), "the exchange is not published");
@@ -21499,13 +21541,13 @@ unittest {
         auto c = t[0];
         c.processLine(":s 900 me me!u@h me :You are now logged in as me");
         c.processLine(":s CAP me NEW :sasl");
-        assert(!c.outboundQueue.canFind("CAP REQ :sasl"));
+        assert(!outq(c).canFind("CAP REQ :sasl"));
         drain(t);
     }
     {
         auto t = make();
         t[0].processLine(":s CAP me NEW :sasl");
-        assert(!t[0].outboundQueue.canFind("CAP REQ :sasl"));
+        assert(!outq(t[0]).canFind("CAP REQ :sasl"));
         drain(t);
     }
     {
@@ -21517,7 +21559,7 @@ unittest {
         c.processLine("AUTHENTICATE +");
         c.processLine(":s 904 Guest123 :SASL authentication failed");
         assert(!c.lateSaslPending);
-        assert(!c.outboundQueue.canFind("NICK me"));
+        assert(!outq(c).canFind("NICK me"));
         drain(t);
     }
 
@@ -21529,18 +21571,18 @@ unittest {
         c.saslDone = true;
         auto ls = c.parseIRCLine(":s CAP * LS :multi-prefix server-time draft/multiline chathistory draft/pre-away");
         c.handleCapLine(ls, false);
-        assert(c.outboundQueue.canFind("CAP REQ :multi-prefix server-time"));
-        assert(c.outboundQueue.canFind("CAP REQ :chathistory draft/multiline draft/pre-away"));
+        assert(outq(c).canFind("CAP REQ :multi-prefix server-time"));
+        assert(outq(c).canFind("CAP REQ :chathistory draft/multiline draft/pre-away"));
         assert(c.capReqOutstanding == 2);
         auto ack1 = c.parseIRCLine(":s CAP * ACK :multi-prefix server-time");
         c.handleCapLine(ack1, false);
-        assert(!c.outboundQueue.canFind("CAP END"));
+        assert(!outq(c).canFind("CAP END"));
         c.isAway = true;
         c.awayMessage = "gone";
         auto nak2 = c.parseIRCLine(":s CAP * NAK :chathistory draft/multiline draft/pre-away");
         c.handleCapLine(nak2, false);
-        assert(c.outboundQueue[$ - 1] == "CAP END");
-        assert(!c.outboundQueue.canFind("AWAY :gone"), "no pre-away without the cap");
+        assert(outq(c)[$ - 1] == "CAP END");
+        assert(!outq(c).canFind("AWAY :gone"), "no pre-away without the cap");
         drain(t);
     }
     {
@@ -21553,8 +21595,9 @@ unittest {
         c.handleCapLine(ls, false);
         auto ack = c.parseIRCLine(":s CAP * ACK :draft/pre-away draft/extended-isupport");
         c.handleCapLine(ack, false);
-        const n = c.outboundQueue.length;
-        assert(c.outboundQueue[n - 3 .. n] == ["ISUPPORT", "AWAY :gone", "CAP END"], c.outboundQueue.join(" | "));
+        const sentNow = outq(c);
+        const n = sentNow.length;
+        assert(sentNow[n - 3 .. n] == ["ISUPPORT", "AWAY :gone", "CAP END"], sentNow.join(" | "));
         drain(t);
     }
 
@@ -22743,6 +22786,8 @@ unittest {
     size_t actualDials;
     DialResult owned(DialRequest request, DialProgress progress, RouteKind kind, string trialToken) {
         client.validateFrozenDial(request, kind);
+        // The durable slot admission is validated at the concrete DIAL.
+        client.validateConcreteDial(request, trialToken);
         actualDials++;
         return DialResult.init;
     }
