@@ -307,7 +307,10 @@ class DedupMigrationUnavailableException : Exception {
 final class BufferManager {
     private {
         RedisStorage redis;
-        enum MAX_SCROLLBACK = 5000;
+        // Hot-list rows per (network, buffer). Application Redis is `noeviction` and capped, and
+        // these lists dominated its dataset (~76% at 5000 rows); older history is served from the
+        // Mongo archive, so only the replay tail is kept hot.
+        enum MAX_SCROLLBACK = 2500;
         enum KEY_PREFIX = "scrollback:";
         enum TTL_DAYS = 30;
         static immutable string[] UNREAD_COMMANDS = ["PRIVMSG", "NOTICE", "INVITE", "WALLOPS"];
@@ -377,11 +380,11 @@ lineageReconcile(KEYS[1])
 if kind == 'none' then lineageRetire(KEYS[1]) end
 local token = lineageEnsure(KEYS[1], true)
 redis.call('LPUSH', KEYS[1], ARGV[1])
-redis.call('LTRIM', KEYS[1], 0, 4999)
+redis.call('LTRIM', KEYS[1], 0, tonumber(ARGV[3]))
 redis.call('EXPIRE', KEYS[1], ARGV[2])
 lineageRefresh(KEYS[1], token)
 return '1'
-LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string]);
+LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string, (MAX_SCROLLBACK - 1).to!string]);
         if (result.empty || result.front != "1") throw new Exception("Missing atomic scrollback verdict");
     }
 
@@ -463,7 +466,7 @@ LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string]);
     /// order, escapes in the id, a non-integer `t`) returns false so the
     /// caller falls back to a full parse.
     ///
-    /// The connect-time unread tail scans every buffer's 5000-row hot list and
+    /// The connect-time unread tail scans every buffer's hot list and
     /// almost every row is older than lastSeen; parsing them all built a Json
     /// tree per row and OOM-killed the gateway when several users reconnected.
     static bool peekRowTimestamp(const(ubyte)[] raw, out long ts) @safe pure nothrow @nogc {
