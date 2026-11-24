@@ -586,16 +586,17 @@ final class MessageRepository {
     }
 
     /// The private conversations of `networkId` with a message newer than
-    /// `sinceMs` (unix ms), newest first, at most `limit`. Backs re-opening
-    /// the query tabs a network lost with its in-memory session (holder
-    /// restart, fresh dial): the history is the durable record of who the
-    /// user talked to. One `distinct` over the (networkId, channel, t) index;
-    /// only a network with more than `limit` candidates pays for the ranking.
+    /// `sinceMs` (unix ms), at most `limit`. Backs re-opening query tabs lost
+    /// with an in-memory session (holder restart, fresh dial). Only networks
+    /// with more than `limit` candidates are ranked newest first.
     string[] recentDirectBuffers(string networkId, long sinceMs, size_t limit,
             HistoryReadScope* view = null) @trusted {
         auto historyView = resolveHistoryView(networkId, view);
         auto query = Bson.emptyObject;
         query["networkId"] = Bson(networkId);
+        // Under binary ordering, all four IRC channel sigils (# & + !)
+        // precede "0", and nick initials do not. Bound the channel index scan.
+        query["channel"] = Bson(["$gte": Bson("0")]);
         query["t"] = Bson(["$gt": Bson(sinceMs)]);
         auto cmd = Bson.emptyObject;              // field order matters: command name first
         cmd["distinct"] = Bson("messages");
@@ -612,21 +613,26 @@ final class MessageRepository {
         }
         if (names.length <= limit) return names;
 
-        Bson[] pipeline;
-        auto match = Bson.emptyObject;
-        match["networkId"] = Bson(networkId);
-        match["channel"] = Bson(["$in": serializeToBson(names)]);
-        match["t"] = Bson(["$gt": Bson(sinceMs)]);
-        pipeline ~= Bson(["$match": historyView.filter(match)]);
-        auto group = Bson.emptyObject;
-        group["_id"] = Bson("$channel");
-        group["last"] = Bson(["$max": Bson("$t")]);
-        pipeline ~= Bson(["$group": group]);
-        pipeline ~= Bson(["$sort": Bson(["last": Bson(-1)])]);
-        pipeline ~= Bson(["$limit": Bson(cast(long) limit)]);
-        AggregateOptions options;
-        string[] newest;
-        foreach (doc; collection.aggregate!Bson(pipeline, options)) newest ~= doc["_id"].get!string;
+        struct Latest {
+            string name;
+            long timestamp;
+        }
+        auto ranked = new Latest[names.length];
+        size_t found;
+        FindOptions options;
+        options.sort = Bson(["t": Bson(-1)]);
+        options.limit = 1;
+        options.projection = Bson(["t": Bson(1), "_id": Bson(0)]);
+        foreach (name; names) {
+            query["channel"] = Bson(name);
+            foreach (doc; collection.find(historyView.filter(query), options))
+                ranked[found++] = Latest(name, readBsonTimestamp(doc["t"]));
+        }
+        ranked = ranked[0 .. found];
+        ranked.sort!((a, b) => a.timestamp == b.timestamp
+            ? a.name < b.name : a.timestamp > b.timestamp);
+        auto newest = new string[min(limit, ranked.length)];
+        foreach (i; 0 .. newest.length) newest[i] = ranked[i].name;
         return newest;
     }
 
@@ -2196,8 +2202,11 @@ unittest {
     }
     put("#dlang", 1_000);
     put("_server", 1_000);
+    put("+modeless", 1_000);
+    put("!safe", 1_000);
     put("alice", 5_000);
     put("bob", 3_000);
+    put("zack", 3_000);
     put("carol", 9_000);
     put("old", 200L * 86_400_000);
 
@@ -2211,7 +2220,9 @@ unittest {
     const since = now - 90L * 86_400_000;
     auto all = repo.recentDirectBuffers(network, since, 10);
     all.sort();
-    assert(all == ["alice", "bob", "carol"], "channels, _server and rows outside the window are not conversations");
-    assert(repo.recentDirectBuffers(network, since, 2) == ["bob", "alice"], "the newest two, newest first");
+    assert(all == ["alice", "bob", "carol", "zack"], "channels, _server and rows outside the window are not conversations");
+    assert(repo.recentDirectBuffers(network, since, 3) == ["bob", "zack", "alice"],
+        "newest first; equal timestamps sort by nick");
+    assert(repo.recentDirectBuffers(network, since, 1) == ["bob"]);
     assertThrown(repo.recentDirectBuffers(randomUUID().toString(), since, 10));
 }
