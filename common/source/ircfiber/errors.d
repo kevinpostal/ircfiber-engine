@@ -29,6 +29,25 @@ bool isErrorReportingEnabled() {
     synchronized (configMutex) return config.enabled;
 }
 
+/// A configured ingest file is authoritative, including when unreadable.
+/// Accept one terminal file newline; leave every other byte for strict parsing.
+string readIngestDsnFile(string path) nothrow {
+    import std.file : isFile;
+    import std.stdio : File;
+    try {
+        if (!isFile(path)) return "";
+        auto input = File(path, "rb");
+        ubyte[2048 + 2 + 1] buffer;
+        auto bytes = input.rawRead(buffer[]);
+        if (bytes.length == buffer.length) return "";
+        if (bytes.length && bytes[$ - 1] == '\n') {
+            bytes = bytes[0 .. $ - 1];
+            if (bytes.length && bytes[$ - 1] == '\r') bytes = bytes[0 .. $ - 1];
+        }
+        return bytes.length <= 2048 ? cast(string) bytes.idup : "";
+    } catch (Exception) { return ""; }
+}
+
 private struct ParsedDsn {
     string scheme, key, hostPort, projectId;
     bool valid;

@@ -104,28 +104,15 @@ private bool setupOtel(string svcName) {
 /// Configure Bugsink error reporting from env. Independent switch from
 /// setupOtel() above — see ircfiber.errors module docs.
 private bool setupBugsink(string svcName) {
-    import ircfiber.errors : configureErrorReporting, isErrorReportingEnabled;
-    import std.file : read;
-    import std.string : strip, stripRight;
+    import ircfiber.errors : configureErrorReporting, isErrorReportingEnabled, readIngestDsnFile;
 
     const enabled = isEnvEnabled("IRCFIBER_BUGSINK_ENABLED");
     const release = buildInfo().describe;
     const reportEnvironment = environment.get("IRCFIBER_BUGSINK_ENVIRONMENT", "production");
     configureErrorReporting(false, "", svcName, release, reportEnvironment);
     if (enabled) {
-        string dsn = environment.get("IRCFIBER_BUGSINK_DSN", "");
-        const path = environment.get("IRCFIBER_BUGSINK_DSN_FILE", "").strip();
-        if (path.length) {
-            try {
-                const fromFile = (cast(string) read(path)).stripRight();
-                if (fromFile.length)
-                    dsn = fromFile;
-                else
-                    logWarn("Bugsink DSN file is empty; using inline configuration");
-            } catch (Exception) {
-                logWarn("Bugsink DSN file is unreadable; using inline configuration");
-            }
-        }
+        const file = environment.get("IRCFIBER_BUGSINK_DSN_FILE", "");
+        const dsn = file.length ? readIngestDsnFile(file) : environment.get("IRCFIBER_BUGSINK_DSN", "");
         configureErrorReporting(true, dsn, svcName, release, reportEnvironment);
     }
     const configured = isErrorReportingEnabled();
