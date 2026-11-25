@@ -204,10 +204,14 @@ final class HistorySuppressionRepository {
         string[] pending;
         foreach (base; bases) {
             const key = scopeKey(base.networkId, base.channel);
-            if (key !in scopes) {
+            auto scope_ = key in scopes;
+            if (scope_ is null) {
                 scopes[key] = Scope(base.networkId, base.channel);
+                scope_ = key in scopes;
                 pending ~= key;
             }
+            foreach (alias_; base.classification.aliases)
+                scope_.aliases[digest(alias_)] = true;
         }
         size_t bytes;
         while (pending.length) {
@@ -224,6 +228,7 @@ final class HistorySuppressionRepository {
                     validateEdge(edge);
                     const channel = text(edge, "channel");
                     const ancestor = scopeKey(network, channel);
+                    scope_.ancestors ~= ancestor;
                     if (ancestor in scopes) continue;
                     require(scopes.length < maxScopes);
                     scopes[ancestor] = Scope(network, channel);
@@ -233,12 +238,29 @@ final class HistorySuppressionRepository {
             pending = next;
         }
         bool[string] wanted;
-        foreach (base; bases) foreach (key, scope_; scopes) {
-            if (scope_.network != base.networkId) continue;
-            foreach (name; base.classification.aliases)
-                wanted[markKey(scope_.network, scope_.channel, name)] = true;
+        // A base can only use marks in its own scope or an incoming ancestor.
+        // Same-network sibling channels are not evidence for that base.
+        foreach (root, ref scope_; scopes) {
+            if (!scope_.aliases.length) continue;
+            string[] lineage = [root];
+            bool[string] visited;
+            while (lineage.length) {
+                const key = lineage[$ - 1];
+                lineage.length--;
+                if (key in visited) continue;
+                visited[key] = true;
+                auto ancestor = key in scopes;
+                require(ancestor !is null);
+                const prefix = markPrefix(ancestor.network, ancestor.channel);
+                foreach (aliasDigest; scope_.aliases.byKey) {
+                    const id = prefix ~ aliasDigest;
+                    if (id in wanted) continue;
+                    require(wanted.length < maxKeys);
+                    wanted[id] = true;
+                }
+                lineage ~= ancestor.ancestors;
+            }
         }
-        require(wanted.length <= maxKeys);
         string[] keys;
         foreach (key; wanted.keys) keys ~= key;
         Bson[string] marks;
@@ -352,7 +374,13 @@ final class HistorySuppressionRepository {
         return cast(size_t) integer(reply, "n");
     }
 
-    private struct Scope { string network; string channel; Bson document; }
+    private struct Scope {
+        string network;
+        string channel;
+        Bson document;
+        bool[string] aliases;
+        string[] ancestors;
+    }
     private struct Pin { string rowId; string server; long t; long eid; bool hasEid; }
     private struct Path {
         string key; string server;
@@ -362,8 +390,11 @@ final class HistorySuppressionRepository {
 
     private static string digest(string value) { return toHexString!(LetterCase.lower)(sha256Of(value)).idup; }
     private static string scopeKey(string network, string channel) { return digest(network) ~ ":s:" ~ digest(channel); }
+    private static string markPrefix(string network, string channel) {
+        return digest(network) ~ ":m:" ~ digest(channel) ~ ":";
+    }
     private static string markKey(string network, string channel, string alias_) {
-        return digest(network) ~ ":m:" ~ digest(channel) ~ ":" ~ digest(alias_);
+        return markPrefix(network, channel) ~ digest(alias_);
     }
     private static Bson scopeIdentity(string network, string channel) {
         return Bson(["v": Bson(1), "kind": Bson("scope"), "networkId": Bson(network), "channel": Bson(channel)]);
