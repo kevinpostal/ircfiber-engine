@@ -307,10 +307,9 @@ class DedupMigrationUnavailableException : Exception {
 final class BufferManager {
     private {
         RedisStorage redis;
-        // Hot-list rows per (network, buffer). Application Redis is `noeviction` and capped, and
-        // these lists dominated its dataset (~76% at 5000 rows); older history is served from the
-        // Mongo archive, so only the replay tail is kept hot.
-        enum MAX_SCROLLBACK = 2500;
+        // The newest renderable rows stay hot; Mongo serves the older tail.
+        // _server also keeps its protocol timeline within the same row cap.
+        enum MAX_SCROLLBACK = 1000;
         enum KEY_PREFIX = "scrollback:";
         enum TTL_DAYS = 30;
         static immutable string[] UNREAD_COMMANDS = ["PRIVMSG", "NOTICE", "INVITE", "WALLOPS"];
@@ -330,14 +329,10 @@ final class BufferManager {
         // `dedup:<serverId>:<networkId>:<channel>` sets are adopted atomically
         // with append only when the network-scoped destination is absent.
         //
-        // Bounded by generation rotation, not by TTL: every append refreshes
-        // the TTL, so on a busy channel it never fires. When the live set
-        // reaches DEDUP_MAX / 2 it is RENAMEd over `<key>:prev`, and lookups
-        // consult both, so the newest >= DEDUP_MAX / 2 identities are always
-        // retained and the pair never exceeds DEDUP_MAX. (`:` cannot occur
-        // in an IRC channel or nick, so the suffix cannot collide.) The
-        // unenforced bound grew one Rizon channel's set to 1.6M members and
-        // drove Redis to maxmemory on 2026-11-17.
+        // Each append refreshes TTL, so rotate at one hot window of identities.
+        // Lookups consult the live and previous generation. DEDUP_MAX stays
+        // separate: it admits existing larger generations without rebuilding
+        // them under memory pressure, and bounds truly oversized migrations.
         enum DEDUP_PREFIX = "dedup:";
         enum DEDUP_PREV_SUFFIX = ":prev";
         enum DEDUP_MAX = 10_000;
@@ -768,22 +763,15 @@ LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string, (MAX_SCROLLBACK - 1).to!str
      * Storing the set in Redis
      * (not in-memory) means engine restarts, failovers, and network
      * reassignments between connection servers don't replay duplicates
-     * — exactly the kind of edge case that bit us before (332/333
-     * re-firing on every reconnect, with no in-memory cache to suppress
-     * them after restart).
+     * — exactly the kind of edge case that bit us before.
      *
-     * The set is bounded to DEDUP_MAX entries across two generations and
-     * TTL'd to match the scrollback. When the live generation reaches half
-     * the bound it replaces the previous one, so the most recent half is
-     * always kept — the cost of briefly re-allowing duplicates on ancient
-     * history is much lower than the cost of unbounded growth.
+     * Rotate the live set at MAX_SCROLLBACK identities; lookups also use the
+     * previous generation. DEDUP_MAX is the migration bound, not the rotation
+     * threshold. Both generations retain the scrollback TTL.
      *
-     * Returns `true` when the event was stored and `false` when the dedup
-     * set already held it. Callers MUST honour `false`: the event processor
-     * used to ignore it and still publish the duplicate to the live
-     * WebSocket stream, so a re-emitted event (an IRCv3 batch replayed on
-     * rejoin, a roster-driven fan-out that matched twice) rendered as two
-     * identical rows that vanished on refresh — the scrollback had one.
+     * Returns true for an accepted event, including intentional hot-cache
+     * skips, and false only when the dedup set already held the event.
+     * Callers must not publish or archive confirmed duplicates.
      */
     bool appendIRCEvent(IRCRawEvent event, string serverId) @trusted {
         auto msg = Json([
@@ -853,6 +841,9 @@ LUA", [key], [msgStr, (86_400 * TTL_DAYS).to!string, (MAX_SCROLLBACK - 1).to!str
         const channel = event.channel.length > 0 ? normalizeChannel(event.channel) : "_server";
 
         if (!serverId.length) throw new Exception("Cannot append namespaced event without serverId");
+        // The visible read paths already filter these rows. Leave live delivery
+        // and archive admission to the caller, and keep _server's MOTD timeline.
+        if (channel != "_server" && isScrollbackNoiseRow(msg)) return true;
         return appendDeduplicatedEvent(KEY_PREFIX ~ serverId ~ ":" ~ networkId ~ ":" ~ channel,
             serverId, networkId, channel, msgid, event, params, msg);
     }
@@ -1141,7 +1132,7 @@ LUA", keys, [ownerRaw]);
         enum lastRow = (MAX_SCROLLBACK - 1).to!string;
         enum rowTTL = (86_400 * TTL_DAYS).to!string;
         enum dedupTTL = DEDUP_TTL_SECS.to!string;
-        enum dedupRotateAt = (DEDUP_MAX / 2).to!string;
+        enum dedupRotateAt = MAX_SCROLLBACK.to!string;
         auto verdict = redis.getDb().eval!string(archiveBufferLineageLua ~ q"LUA
 local dedupType = redis.call('TYPE', KEYS[2]).ok
 if dedupType ~= 'none' and dedupType ~= 'set' then

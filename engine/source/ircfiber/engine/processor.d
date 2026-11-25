@@ -16,6 +16,7 @@ import ircfiber.engine.state : writeStateSnapshotForNetwork;
 import ircfiber.redis.protocol : RedisKeys, StateTTL;
 import ircfiber.engine.session_snapshot : HistoryRecovery, historyRecoveryFromJSON,
     historyRecoveryToJSON;
+import ircfiber.storage.buffer : BufferManager;
 import ircfiber.irc.mls_peer : normalizeFiberChannel;
 import ircfiber.irc.connection : PersistentIRCClient;
 import vibe.data.json : Json, parseJsonString;
@@ -28,7 +29,7 @@ import std.conv : to;
 private enum PUBLISH_AND_STREAM_LUA =
     "redis.call('PUBLISH', KEYS[1], ARGV[1]) "
     ~ "redis.call('LPUSH', KEYS[2], ARGV[1]) "
-    ~ "redis.call('LTRIM', KEYS[2], 0, 999) "
+    ~ "redis.call('LTRIM', KEYS[2], 0, " ~ (StateTTL.USER_STREAM_MAX - 1).to!string ~ ") "
     ~ "redis.call('EXPIRE', KEYS[2], ARGV[2]) "
     ~ "return 1";
 
@@ -718,7 +719,10 @@ private void processEvent(ref EngineContext ctx, ref IRCRawEvent event, string s
         auto msg = json.toString();
 
         if (userIdStr.length > 0) {
-            if (publishOnly) ctx.redis.publish(RedisKeys.events(userIdStr), msg);
+            // Typing is live UI state, not replay history. Keep reactions
+            // and roster numerics resumable, and leave archive admission above.
+            if (publishOnly || (event.command == "TAGMSG" && !BufferManager.isReactionRow(json)))
+                ctx.redis.publish(RedisKeys.events(userIdStr), msg);
             else publishAndStream(ctx, userIdStr, msg);
         }
 

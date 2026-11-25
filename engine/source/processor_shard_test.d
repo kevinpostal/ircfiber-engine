@@ -159,10 +159,16 @@ int run() {
         NetworkConfig cfg;
         cfg.id = randomUUID();
         cfg.name = "ShardNet" ~ i.to!string;
+        // Register a real deferred client/owner; this test never starts its dialer.
+        cfg.host = "127.0.0.1";
         cfg.nick = "me";
         owners[i].nid = cfg.id.toString();
         names[i] = cfg.name;
         mgr.addNetwork(cfg, owners[i].userId);
+        if (mgr.getOwnerId(cfg.id) != owners[i].uid) {
+            stderr.writeln("FATAL: fixture owner not registered");
+            return 2;
+        }
     }
 
     g_ctx.connManager = mgr;
@@ -289,6 +295,58 @@ int run() {
         prevLive = eid;
     }
     check!("owner 0 live eids strictly increase in arrival order")(liveRise);
+
+    stderr.writeln("\n[replay] typing live only; reactions, NAMES and chat replay in a bounded tail");
+    const stream = RedisKeys.userStream(owners[0].uid);
+    IRCRawEvent wireEvent(string command) {
+        auto ev = IRCRawEvent(names[0], command);
+        ev.networkId = owners[0].nid;
+        ev.channel = "#flood";
+        ev.nick = "flood";
+        ev.setParams(["#flood", "chat"]);
+        return ev;
+    }
+    bool awaitLive(size_t length, string id) {
+        foreach (_; 0 .. 500) {
+            if (published.length >= length)
+                return parseJsonString(published[length - 1])["i"].get!string == id;
+            sleep(10.msecs);
+        }
+        return false;
+    }
+    auto typing = wireEvent("TAGMSG");
+    typing.addTag("+typing", "active");
+    events.put(typing);
+    check!("typing reaches live subscribers but not the user stream")(
+        awaitLive(EVENTS_PER_OWNER + 1, typing.id)
+        && redis.getDb().llen(stream) == EVENTS_PER_OWNER);
+
+    auto reaction = wireEvent("TAGMSG");
+    reaction.addTag("+reply", "target-message");
+    reaction.addTag("+react", "👍");
+    auto expectedIds = owners[0].ids;
+    foreach (_; 0 .. 110) {
+        auto message = wireEvent("PRIVMSG");
+        events.put(message);
+        expectedIds ~= message.id;
+    }
+    events.put(reaction);
+    expectedIds ~= reaction.id;
+    foreach (command; ["353", "366"]) {
+        auto roster = wireEvent(command);
+        events.put(roster);
+        expectedIds ~= roster.id;
+    }
+    check!("the live subscriber also gets the last resumable event")(
+        awaitLive(expectedIds.length + 1, expectedIds[$ - 1]));
+    auto tail = streamRowsOldestFirst(redis, owners[0].uid);
+    bool replayOk = tail.length == 500;
+    if (replayOk) {
+        expectedIds = expectedIds[$ - 500 .. $];
+        foreach (i, raw; tail)
+            replayOk &= parseJsonString(raw)["i"].get!string == expectedIds[i];
+    }
+    check!("replay keeps exactly the newest 500 chat/reaction/NAMES events, in order")(replayOk);
 
     stopEventSubscriber(g_sub, RedisKeys.events(owners[0].uid));
     check!("live-channel listener stopped")(!g_sub.isListening);

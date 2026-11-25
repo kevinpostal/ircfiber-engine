@@ -442,7 +442,7 @@ private void publishStoppedNetwork(ref EngineContext ctx, NetworkConfig config,
     auto db = ctx.redis.getDb();
     const stream = RedisKeys.userStream(owner);
     db.lpush(stream, payload);
-    db.ltrim(stream, 0, 999);
+    db.ltrim(stream, 0, StateTTL.USER_STREAM_MAX - 1);
     db.expire(stream, StateTTL.USER_STREAM_TTL);
 }
 

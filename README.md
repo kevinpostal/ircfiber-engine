@@ -147,7 +147,12 @@ dub --root=engine build --config=buffer-dedup-test
 ./engine/buffer-dedup-test
 ```
 
-Both append paths must retain EIDs 2,501 through 2 in physical list order, with the original lineage and 30-day expiry. The Redis round trip also checks dedup, reply targets and ordered reaction add/remove rows through the real filtered reader, including legacy/namespaced storage and typing-noise exclusion.
+Both append paths must retain EIDs 1,001 through 2 in physical list order,
+with the original lineage and 30-day expiry. The round trip also checks
+that existing 4,000-row lists trim on the next stored event, channel
+noise bypasses hot history while `_server` keeps it, and reactions replay.
+The processor shard fixture verifies live typing delivery, resumption of
+reactions and NAMES, and the exact newest 500 replay entries.
 
 ### VPN egress reliability
 

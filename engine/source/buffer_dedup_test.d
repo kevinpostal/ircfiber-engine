@@ -489,11 +489,51 @@ void test_repeated_chat_identity_is_unchanged(RedisStorage redis) {
     }
 }
 
+void test_hot_admission_and_existing_tail(RedisStorage redis) {
+    import vibe.data.json : parseJsonString;
+    const nid = randomUUID().toString();
+    scope (exit) cleanup(redis, nid);
+    auto bm = new BufferManager(redis);
+    auto db = redis.getDb();
+    const hot = "scrollback:engine1:" ~ nid ~ ":#hot";
+    const serverLog = "scrollback:engine1:" ~ nid ~ ":_server";
+    const dedup = "dedup:" ~ nid ~ ":#hot";
+
+    foreach (i, cmd; ["353", "QUIT", "TAGMSG"]) {
+        auto ev = joinEvent(nid, "#hot", "reader", 1_790_000_000_000L + i);
+        ev.command = cmd;
+        if (cmd == "TAGMSG") ev.addTag("+typing", "active");
+        check!("channel noise is accepted without creating scrollback or dedup rows")(
+            bm.appendIRCEvent(ev, "engine1") && db.llen(hot) == 0 && !db.exists(dedup), cmd);
+        ev.channel = "_server";
+        check!("server timeline stores the same event")(
+            bm.appendIRCEvent(ev, "engine1") && db.llen(serverLog) == i + 1, cmd);
+    }
+    auto seeded = db.eval!long(q"LUA
+for i = 1, 4000 do redis.call('LPUSH', KEYS[1], cjson.encode({eid=i})) end
+for i = 1, 6000 do redis.call('SADD', KEYS[2], 'old:' .. i) end
+return redis.call('LLEN', KEYS[1])
+LUA", [hot, dedup], cast(string[])[]);
+    check!("inherited physical list starts at 4,000 rows")(!seeded.empty && seeded.front == 4000);
+    auto reaction = joinEvent(nid, "#hot", "reader", 1_790_000_004_001L);
+    reaction.command = "TAGMSG";
+    reaction.eid = 4001;
+    reaction.addTag("+reply", "previous-message");
+    reaction.addTag("+react", "👍");
+    check!("reaction append is accepted without rebuilding a 6,000-member inherited set")(
+        bm.appendIRCEvent(reaction, "engine1") && db.scard(dedup ~ ":prev") == 6001);
+    const head = parseJsonString(db.lrange(hot, 0, 0).front);
+    const tail = parseJsonString(db.lrange(hot, -1, -1).front);
+    check!("reaction survives trimming and preserves the newest exactly 1,000 rows")(
+        db.llen(hot) == 1000 && head["eid"].get!long == 4001
+        && head["rx"].get!string == "👍" && tail["eid"].get!long == 3002);
+}
+
 /// Read the physical list, not getRecent (which also limits its result).
 void test_scrollback_tail(RedisStorage redis) {
     import vibe.data.json : Json, parseJsonString;
 
-    enum cap = 2_500;
+    enum cap = 1_000;
     enum ttlSeconds = 30 * 86_400;
     auto bm = new BufferManager(redis);
     auto db = redis.getDb();
@@ -539,7 +579,7 @@ void test_scrollback_tail(RedisStorage redis) {
             ordered &= row["eid"].get!long == expected && row["x"].get!string == "line " ~ expected.to!string;
             --expected;
         }
-        check!("list contains exactly EIDs 2501 through 2, newest first")(ordered && expected == 1);
+        check!("list contains exactly EIDs 1001 through 2, newest first")(ordered && expected == 1);
         const locator = "irc:archive:lineage:id:" ~ lineage;
         check!("trim preserved the first append's unpinned lineage")(lineage.length &&
             db.get(companion) == lineage && db.hget(locator, "key") == key &&
@@ -575,16 +615,18 @@ void test_dedup_set_is_bounded(RedisStorage redis) {
         ev.addTag("msgid", "busy-" ~ n.to!string);
         return ev;
     }
-    enum total = 12_001;
+    enum total = 3_000;
     bool allStored = true;
     foreach (n; 0 .. total) allStored &= bm.appendIRCEvent(message(n), "engine1");
     check!("every distinct message is stored")(allStored);
-    const members = db.scard(live) + db.scard(prev);
-    check!("both generations together stay within DEDUP_MAX")(members <= 10_000, members.to!string);
-    check!("dedup keys keep a TTL")(db.ttl(live) > 0 && db.ttl(prev) > 0);
+    const currentMembers = db.scard(live);
+    const members = currentMembers + db.scard(prev);
+    check!("one generation is at most 1,000 identities and the pair at most 2,000")(
+        currentMembers <= 1_000 && members <= 2_000, members.to!string);
     check!("newest identity is still a duplicate")(!bm.appendIRCEvent(message(total - 1), "engine1"));
     check!("identity in the previous generation is still a duplicate")(
-        !bm.appendIRCEvent(message(total - 5_000), "engine1"));
+        !bm.appendIRCEvent(message(total - 1_000), "engine1"));
+    check!("dedup keys keep a TTL")(db.ttl(live) > 0 && db.ttl(prev) > 0);
     bm.clearBuffer("engine1", nid, "#busy");
     check!("clear backlog drops both generations")(!db.exists(live) && !db.exists(prev));
 }
@@ -669,6 +711,7 @@ int main() {
     test_state_alias_requires_wire_identity(redis);
     test_state_alias_failure_atomicity(redis);
     test_repeated_chat_identity_is_unchanged(redis);
+    test_hot_admission_and_existing_tail(redis);
     test_scrollback_tail(redis);
     test_dedup_set_is_bounded(redis);
     test_oversized_dedup_rebuilds_from_retained_rows(redis);
