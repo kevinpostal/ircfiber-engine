@@ -20,7 +20,7 @@ struct MessageSearchScope {
     string channel;
 }
 
-enum MessageSearchEvidenceFailure { invalidScope, unclassified, limitExceeded }
+enum MessageSearchEvidenceFailure { invalidScope, unclassified, limitExceeded, suppressionUnavailable }
 
 /// Contains no source identifiers, nicknames, message text or storage errors.
 final class MessageSearchEvidenceException : Exception {
@@ -572,10 +572,12 @@ final class MessageSearchRepository {
 
     private bool[string] readSuppressions(SearchRow[] bases, string[string] serverIds,
             ref EvidenceBudget budget) {
+        const timeMs = budget.remainingMs();
         try return new HistorySuppressionRepository(AppMongoConnection.getDb())
-            .suppressedRows(bases, serverIds, budget.remainingMs());
+            .suppressedRows(bases, serverIds, timeMs);
         catch (Exception) {
-            fail(MessageSearchEvidenceFailure.unclassified);
+            // Reclassifying archive rows cannot repair unavailable suppression evidence.
+            fail(MessageSearchEvidenceFailure.suppressionUnavailable);
             return null;
         }
     }
