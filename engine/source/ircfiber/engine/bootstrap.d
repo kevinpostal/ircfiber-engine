@@ -42,6 +42,31 @@ import ircfiber.engine.archive_worker : ArchiveWorker;
 import ircfiber.engine.archive_control : ArchiveControl;
 import ircfiber.runtime_diagnostic : RuntimeDiagnosticMailbox;
 
+version (BugsinkEngineCoverage) {
+    import ircfiber.errors : ErrorReport;
+    private bool fixtureNetworkLoadFailure;
+    private size_t fixtureNetworkLoadAttempts;
+    private ErrorReport fixtureNetworkLoadReport;
+
+    /// Exercise the real retry owner with no reachable application dependencies.
+    /// All sixty attempts and the production five-second backoff remain intact.
+    void runBugsinkNetworkLoadFixture() {
+        import core.time : MonoTime;
+        import std.exception : enforce;
+        import ircfiber.errors : waitErrorReport;
+        enforce(!fixtureNetworkLoadFailure, "network load fixture already running");
+        fixtureNetworkLoadFailure = true;
+        fixtureNetworkLoadAttempts = 0;
+        scope(exit) fixtureNetworkLoadFailure = false;
+        EngineContext ctx;
+        const started = MonoTime.currTime;
+        loadNetworksWithRetry(ctx);
+        enforce(fixtureNetworkLoadAttempts == 60, "network load attempt count changed");
+        enforce(MonoTime.currTime - started >= 295.seconds, "network load retry delay was shortened");
+        waitErrorReport(fixtureNetworkLoadReport);
+    }
+}
+
 /// Context holding all engine dependencies.
 struct EngineContext {
     /// IRC connection manager.
@@ -448,6 +473,12 @@ private bool reconciliationRunning;
 /// Must be called from a runTask (the event loop must be running because
 /// Redis operations need the event loop to process I/O).
 void loadNetworks(ref EngineContext ctx) {
+    version (BugsinkEngineCoverage) {
+        if (fixtureNetworkLoadFailure) {
+            ++fixtureNetworkLoadAttempts;
+            throw new Exception(environment.get("FIXTURE_PRIVATE_DETAIL", "private-network-load-detail"));
+        }
+    }
     networksLoading = true;
     scope(exit) networksLoading = false;
     ctx.connManager.restoreHolderMaintenance();
@@ -692,7 +723,8 @@ void loadNetworksWithRetry(ref EngineContext ctx) {
             return;
         } catch (Exception e) {
             if (attempt == attempts) {
-                captureException!("engine", "network-load-exhausted")(e);
+                auto report = captureException!("engine", "network-load-exhausted")(e);
+                version (BugsinkEngineCoverage) fixtureNetworkLoadReport = report;
                 logError("Network loading failed after %d attempts: %s — no networks are connected",
                     attempts, e.msg);
                 return;

@@ -269,6 +269,20 @@ ErrorReport captureException(string component, string operation)(
     catch (Throwable) { return ErrorReport.init; }
 }
 
+/// One instance per sequential job loop; recovery means a completed healthy round.
+struct FailureEpisode(string component, string operation) {
+    private bool failed;
+
+    void failure(Throwable error, string moduleName = __MODULE__,
+            string functionName = __FUNCTION__, size_t line = __LINE__) nothrow {
+        if (failed) return;
+        failed = true;
+        captureException!(component, operation)(error, moduleName, functionName, line);
+    }
+
+    void success() nothrow { failed = false; }
+}
+
 /// BNC has a dedicated project and fixed, explicitly allowlisted impact fields.
 ErrorReport captureBncImpact(BncFailureReason reason, long affectedSessions = -1,
                             bool active = false) nothrow {

@@ -36,6 +36,15 @@ configuration "engine" {
     versions "VibeUseFibers" "EngineOnly"
 }
 
+// Isolated Bugsink ownership qualification; never part of a shipped image.
+configuration "bugsink-coverage-test" {
+    targetType "executable"
+    targetName "bugsink-coverage-test"
+    mainSourceFile "source/bugsink_coverage_test.d"
+    versions "VibeUseFibers" "BugsinkEngineCoverage"
+    excludedSourceFiles "source/app_engine.d"
+}
+
 // Kept for backwards compat — `dub --config=gateway` now lives in backend/
 // Running it from engine/ will fail fast with a clear error; use backend/.
 configuration "gateway" {

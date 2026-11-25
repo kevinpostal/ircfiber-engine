@@ -18,6 +18,8 @@ import core.time : Duration, seconds, minutes, MonoTime;
 
 import ircfiber.redis.protocol : RedisKeys, StateTTL;
 import ircfiber.storage.redis : RedisStorage;
+import ircfiber.errors : captureException, FailureEpisode;
+import vibe.core.task : InterruptException;
 
 private string makeActor() {
     auto pid = getpid();
@@ -205,7 +207,9 @@ final class EngineJanitor {
         running = true;
         runTask(() nothrow {
             try runJanitorLoop();
+            catch (InterruptException) { return; }
             catch (Exception e) {
+                captureException!("engine-janitor", "terminal")(e);
                 logError("EngineJanitor loop crashed: %s", e.msg);
             }
         });
@@ -214,6 +218,16 @@ final class EngineJanitor {
     /// Run one cycle synchronously. Returns count of servers reaped.
     /// Used by tests + admin manual-trigger endpoint.
     long runOnce() {
+        Throwable failure;
+        bool completed;
+        return runCycle(failure, completed);
+    }
+
+    // Outcomes belong to this invocation: an admin-triggered pass can yield
+    // alongside the background loop without sharing its reporting state.
+    private long runCycle(out Throwable cycleFailure, out bool cycleCompleted) {
+        cycleFailure = null;
+        cycleCompleted = false;
         const startMono = MonoTime.currTime;
         long reaped = 0;
         lastCycleReaped.length = 0;
@@ -228,7 +242,9 @@ final class EngineJanitor {
                 lockTtlSeconds.to!string);
             const got = db.get(RedisKeys.janitorLock());
             gotLock = (got == lockVal);
-        } catch (Exception e) {
+        } catch (InterruptException e) { throw e; }
+        catch (Exception e) {
+            cycleFailure = e;
             logWarn("EngineJanitor: SET NX failed: %s — skipping cycle", e.msg);
             return 0;
         }
@@ -240,7 +256,9 @@ final class EngineJanitor {
             if (released) return;
             released = true;
             try db.del(RedisKeys.janitorLock());
+            catch (InterruptException) { return; }
             catch (Exception e) {
+                if (cycleFailure is null) cycleFailure = e;
                 logWarn("EngineJanitor: failed to release lock: %s", e.msg);
             }
         }
@@ -250,7 +268,9 @@ final class EngineJanitor {
         try {
             auto reply = db.smembers(RedisKeys.serverList());
             foreach (m; reply) serverIds ~= m.idup;
-        } catch (Exception e) {
+        } catch (InterruptException e) { throw e; }
+        catch (Exception e) {
+            if (cycleFailure is null) cycleFailure = e;
             logWarn("EngineJanitor: SMEMBERS failed: %s", e.msg);
             return 0;
         }
@@ -258,7 +278,9 @@ final class EngineJanitor {
         foreach (sid; serverIds) {
             try {
                 if (db.exists(RedisKeys.server(sid)) > 0) continue;
-            } catch (Exception e) {
+            } catch (InterruptException e) { throw e; }
+            catch (Exception e) {
+                if (cycleFailure is null) cycleFailure = e;
                 logWarn("EngineJanitor: EXISTS check failed for %s: %s", sid, e.msg);
                 continue;
             }
@@ -296,7 +318,9 @@ final class EngineJanitor {
                     totalDeleted += combined[sep + 1 .. $].to!long;
                     if (cursor == "0") break;
                     yield();
-                } catch (Exception e) {
+                } catch (InterruptException e) { throw e; }
+                catch (Exception e) {
+                    if (cycleFailure is null) cycleFailure = e;
                     logWarn("EngineJanitor: SCAN batch failed for %s: %s", sid, e.msg);
                     break;
                 }
@@ -336,7 +360,9 @@ final class EngineJanitor {
                     logInfo("EngineJanitor: reaped %s (%d keys)",
                         sid, totalDeleted);
                 }
-            } catch (Exception e) {
+            } catch (InterruptException e) { throw e; }
+            catch (Exception e) {
+                if (cycleFailure is null) cycleFailure = e;
                 logWarn("EngineJanitor: finalize failed for %s: %s", sid, e.msg);
             }
         }
@@ -344,6 +370,7 @@ final class EngineJanitor {
         totalCycles++;
         totalReaped += reaped;
         lastDurationMs = (MonoTime.currTime - startMono).total!"msecs";
+        cycleCompleted = true;
         return reaped;
     }
 
@@ -471,13 +498,20 @@ final class EngineJanitor {
             actor, intervalSeconds, lockTtlSeconds);
         try sleep(30.seconds); catch (Exception) return;
         int consecutiveFailures = 0;
+        FailureEpisode!("engine-janitor", "sweep") episode;
         while (true) {
             try {
-                auto n = runOnce();
+                Throwable cycleFailure;
+                bool cycleCompleted;
+                auto n = runCycle(cycleFailure, cycleCompleted);
+                if (cycleFailure !is null) episode.failure(cycleFailure);
+                else if (cycleCompleted) episode.success();
                 if (n > 0)
                     logInfo("EngineJanitor: reaped %d orphan(s) this cycle", n);
                 consecutiveFailures = 0;
-            } catch (Exception e) {
+            } catch (InterruptException) { return; }
+            catch (Exception e) {
+                episode.failure(e);
                 consecutiveFailures++;
                 logWarn("EngineJanitor: error (%d/%d): %s — skipping cycle",
                     consecutiveFailures, 5, e.msg);
