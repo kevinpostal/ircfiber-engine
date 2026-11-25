@@ -656,6 +656,21 @@ final class SupportIssueRepository {
         return res.matchedCount > 0;
     }
 
+    /// Updates only supplied text on a live task, without writing triage state.
+    bool editTaskContent(string id, string title, string body_, long now, string actor) @trusted {
+        if (!title.length && !body_.length) return false;
+        Bson fields = Bson(["updatedAt": Bson(now)]);
+        if (title.length) fields["title"] = Bson(title);
+        if (body_.length) fields["body"] = Bson(body_);
+        auto res = collection.updateOne(
+            Bson(["_id": Bson(id), "kind": Bson("task"), "deletedAt": liveMatch()]),
+            Bson([
+                "$set": fields,
+                "$push": Bson(["history": SupportHistoryEntry(now, actor, "content", "", "").toBson()]),
+            ]));
+        return res.matchedCount > 0;
+    }
+
     /// Records that the reporter looked at their issue. Returns false when
     /// it is absent, not theirs or trashed.
     bool markSeen(string userId, string id, long now) @trusted {
