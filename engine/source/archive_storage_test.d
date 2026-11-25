@@ -380,7 +380,7 @@ private final class StorageFixture {
         }
     }
 
-    private void withWorker(scope void delegate(ArchiveSpool) body) {
+    private void withWorker(scope void delegate(ArchiveSpool) body, long delegate() nowMs = null) {
         import core.stdc.stdlib : free;
         import core.sys.posix.stdlib : realpath;
         import core.sys.posix.sys.stat : chmod;
@@ -415,7 +415,7 @@ private final class StorageFixture {
             require(!status.failed, "fixture journal failed during startup");
             return status.ready;
         }, "fixture journal did not start");
-        auto worker = new ArchiveWorker(spool, repository, null, redis);
+        auto worker = new ArchiveWorker(spool, repository, null, redis, nowMs);
         scope (exit) {
             worker.requestStop();
             awaitWorker({ return worker.isStopped(); }, "fixture worker did not stop");
@@ -434,6 +434,69 @@ private final class StorageFixture {
     }
 
     void runCases() {
+        recordCase("interleaved cached appends keep their server, network and owner", {
+            const a = newNetwork(), b = newNetwork(), c = newNetwork();
+            const ownerB = randomUUID().toString();
+            require(setRaw("networks", b, Bson(["userId": Bson(ownerB)])) == 1,
+                "could not establish the second network's owner");
+            const channel = "#scope-cache";
+            withWorker((ArchiveSpool spool) {
+                ulong sequence;
+                void appendAndRead(string server, string network, string owner, long eid) {
+                    const compact = payload(eid, timestamp);
+                    require(spool.tryAppend(server, network, channel, eid, compact, owner)
+                        == ArchiveAdmission.queued, "fixture append was not queued");
+                    awaitCheckpoint(spool, ++sequence);
+                    auto row = rowById("messages", server ~ ":" ~ network ~ ":" ~ channel ~ ":" ~ eid.to!string);
+                    require(row["historyOwnerId"].get!string == owner && row["payload"].get!string == compact,
+                        "cached replay crossed owner or changed event bytes");
+                }
+                appendAndRead(SERVER, a, fixtureOwner, 1);
+                appendAndRead(SERVER, b, ownerB, 1);
+                appendAndRead(SERVER, c, fixtureOwner, 1);
+                appendAndRead(SERVER, a, fixtureOwner, 2);
+                appendAndRead(SERVER, b, ownerB, 2);
+                appendAndRead(OTHER_SERVER, a, fixtureOwner, 1);
+
+                require(spool.tryAppend(SERVER, b, channel, 3, payload(3, timestamp), fixtureOwner)
+                    == ArchiveAdmission.queued, "fixture conflicting append was not queued");
+                awaitWorker({
+                    ArchiveSpoolStatus status;
+                    if (!spool.tryStatus(status)) return false;
+                    require(status.checkpoint == sequence, "cached scope acknowledged a different owner");
+                    return status.failed;
+                }, "conflicting owner did not quarantine the record");
+                require(countRows("messages", Bson(["networkId": Bson(b)])) == 2,
+                    "conflicting owner created history");
+            }, () => 1L);
+        });
+
+        recordCase("fence installed mid-stream is honored at the five-second admission deadline", {
+            import ircfiber.db.history_network_deletion : recordHistoryNetworkFence;
+            const network = newNetwork();
+            const channel = "#scope-expiry";
+            long elapsed = 1_000;
+            withWorker((ArchiveSpool spool) {
+                void appendAndAwait(long eid) {
+                    require(spool.tryAppend(SERVER, network, channel, eid, payload(eid, timestamp), fixtureOwner)
+                        == ArchiveAdmission.queued, "fixture append was not queued");
+                    awaitCheckpoint(spool, cast(ulong) eid);
+                }
+                appendAndAwait(1);
+                recordHistoryNetworkFence(AppMongoConnection.getDb(), network, fixtureOwner);
+                elapsed = 5_999;
+                appendAndAwait(2);
+                // This already admitted scope can finish. The permanent fence
+                // suppresses reads and keeps that network on the cleanup roster.
+                require(countRows("messages", Bson(["networkId": Bson(network), "eid": Bson(2L)])) == 1,
+                    "append did not reuse the still-valid admission");
+                elapsed = 6_000;
+                appendAndAwait(3);
+                require(countRows("messages", Bson(["networkId": Bson(network), "eid": Bson(3L)])) == 0,
+                    "expired admission repopulated fenced history");
+            }, () => elapsed);
+        });
+
         recordCase("saturated writer roster still replays majority-proven pending append", {
             auto db = redis.getDb();
             string[] tokens;
@@ -888,8 +951,9 @@ LUA", [NETWORK_WRITERS_KEY], tokens);
         // failpoint. Every delete is restricted to UUIDs created by this run.
         disarmConcernError(false);
         if (!ownedNetworks.length) return;
-        foreach (collection; ["messages", "networks"]) {
-            const scopeField = collection == "messages" ? "networkId" : "id";
+        foreach (collection; ["messages", "networks", "history_network_fences"]) {
+            const scopeField = collection == "messages" ? "networkId"
+                : collection == "networks" ? "id" : "_id";
             auto filter = Bson([scopeField: Bson(["$in": Bson(ownedNetworks.map!(id => Bson(id)).array)])]);
             // A conflict test deliberately corrupts networkId; its original
             // row identity remains owned even if that test exits early.

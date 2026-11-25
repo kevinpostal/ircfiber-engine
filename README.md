@@ -315,6 +315,11 @@ without a writer slot only after a fresh majority admission proves its exact
 owner and registered server. New catalog registrations still wait, and replay
 does not clear or age out ambiguous writer tokens.
 
+Established owner-bearing appends reuse a majority admission for up to five
+seconds. Pending catalog and ownerless frames still recheck provenance on every
+attempt. Rename/purge invalidate cached scopes, and permanent deletion fences
+hide and clean up writes that were already admitted.
+
 `dub build --config=consumer-write-test` builds the real logical-writer regression
 driver. Run it with `IRCFIBER_CONSUMER_TEST_ISOLATED=1`, explicit loopback
 `IRCFIBER_HISTORY_TEST_REDIS_URL` (initially empty) and

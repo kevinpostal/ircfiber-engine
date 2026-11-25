@@ -1,6 +1,6 @@
 module ircfiber.engine.archive_worker;
 
-import core.time : msecs;
+import core.time : MonoTime, msecs;
 import vibe.core.core : runTask, sleep;
 import ircfiber.engine.archive_spool;
 import ircfiber.db.messages : MessageRepository, ArchiveWriteException, ArchiveWriteFailure,
@@ -449,6 +449,16 @@ final class ArchiveWorker {
     private bool started, stopping, finished;
     private size_t consumers;
 
+    private enum scopeTtlMs = 5_000L;
+    private enum maxCachedScopes = 1_024;
+    private struct ScopeKey {
+        string serverId, networkId, ownerId;
+    }
+    private struct CachedScope {
+        ArchiveWriteScope admitted;
+        long admittedAt;
+    }
+
     this(ArchiveSpool spool, ArchiveApply apply, ArchiveRedisPurge redisPurge = null) {
         if (spool is null || apply is null) throw new Exception("archive_worker_requires_strict_binding");
         this.spool = spool;
@@ -459,12 +469,20 @@ final class ArchiveWorker {
     /// Real production binding to the repository's strict raw-command APIs.
     /// Purges still require the caller's atomic, idempotent Redis stage.
     this(ArchiveSpool spool, MessageRepository repository, ArchiveRedisPurge redisPurge = null,
-            RedisStorage redis = null) {
+            RedisStorage redis = null, long delegate() nowMs = null) {
         if (spool is null || repository is null) throw new Exception("archive_worker_requires_repository");
         this.spool = spool;
         this.redisPurge = redisPurge;
+        const origin = MonoTime.currTime;
+        CachedScope[ScopeKey] admissions;
         this.apply = (ref const ArchiveRecord record) {
+            const key = ScopeKey(record.serverId, record.networkId, record.ownerId);
+            // Control records are rare and may not carry an owner; none may
+            // reuse previously admitted scopes.
+            if (record.kind != ArchiveKind.append) admissions.clear();
+            else if (record.pendingCatalog) admissions.remove(key);
             try {
+                scope (failure) admissions.remove(key);
                 if (record.pendingCatalog) {
                     if (redis is null) return ArchiveApplyResult.retry;
                     if (repository.historyNetworkDeleted(record.networkId, record.ownerId))
@@ -501,9 +519,22 @@ final class ArchiveWorker {
                         return applyAdmittedAppend(repository, record, admitted);
                     }
                 }
-                // Established records retain their admitted owner. Legacy
-                // ownerless frames still require canonical catalog provenance.
-                return applyRepositoryRecord(repository, record);
+                // Ownerless v1 frames must re-prove provenance on every attempt.
+                if (record.kind != ArchiveKind.append || !record.ownerId.length)
+                    return applyRepositoryRecord(repository, record);
+                const at = nowMs is null ? (MonoTime.currTime - origin).total!"msecs" : nowMs();
+                if (const cached = key in admissions) {
+                    if (at >= cached.admittedAt && at - cached.admittedAt < scopeTtlMs)
+                        return applyAdmittedAppend(repository, record, cached.admitted);
+                    admissions.remove(key);
+                }
+                const admitted = repository.admitArchiveWrite(record.serverId, record.networkId, record.ownerId);
+                const result = applyAdmittedAppend(repository, record, admitted);
+                if (!admitted.isDeleted()) {
+                    if (admissions.length >= maxCachedScopes) admissions.clear();
+                    admissions[key] = CachedScope(admitted, at);
+                }
+                return result;
             } catch (ArchiveWriteException e) {
                 if (!record.ownerId.length && e.failure == ArchiveWriteFailure.identityMismatch)
                     return ArchiveApplyResult.retry;
