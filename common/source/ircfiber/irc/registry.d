@@ -88,68 +88,46 @@ final class ServerRegistry {
      * This is the fix for IRCCloud's 2020 data leak vulnerability.
      */
 
-    /// Registers a new connection server in the registry.
+    /// Refresh only this engine's Redis registry metadata. The exclusion
+    /// check and all writes share one script, so the holder collector cannot
+    /// interleave with registration and no cross-store writer slot is needed.
     void registerServer(ConnectionServer server) {
-        if (server.serverId.length == 0) {
-            throw new Exception("Server ID must be non-empty");
-        }
-        runNetworkWrite!void(redis, (ref NetworkWriter writer) {
-            registerServer(server, writer);
-        });
-    }
-
-    void registerServer(ConnectionServer server, ref NetworkWriter writer) {
         if (!server.serverId.length) throw new Exception("Server ID must be non-empty");
-        runNetworkRedisMutation!void(writer, (RedisDatabase actualDb) {
-            registerServerAdmitted(server, actualDb);
-        });
-    }
-
-    private void registerServerAdmitted(ConnectionServer server, RedisDatabase db) {
-
-        // Registration refreshes capabilities too; heartbeat alone must not
-        // retain an older process's transport advertisement.
-        const existing = getServer(server.serverId);
-        if (existing.serverId.length) {
-            server.bufferOffset = existing.bufferOffset;
+        const key = RedisKeys.server(server.serverId);
+        try {
+            // Copy before issuing another Redis command. CAS preserves the
+            // published offset if two generations refresh the same server ID.
+            const previous = db.hget(key, "data").idup;
+            server.bufferOffset = 1000;
+            if (previous.length) {
+                const existing = ConnectionServer.fromJson(parseJsonString(previous));
+                if (existing.serverId != server.serverId)
+                    throw new NetworkWriteUnavailableException("network_write_unavailable");
+                server.bufferOffset = existing.bufferOffset;
+            }
             server.lastHeartbeat = Clock.currTime.toUnixTime!long * 1000;
             server.isHealthy = true;
             server.draining = false;
-            db.hset(RedisKeys.server(server.serverId), "data", server.toJson().toString());
-            db.hset(RedisKeys.server(server.serverId), "isHealthy", "true");
-            db.hdel(RedisKeys.server(server.serverId), "draining");
-            db.del(RedisKeys.draining(server.serverId));
-            db.hset(RedisKeys.server(server.serverId), "lastHeartbeat", server.lastHeartbeat.to!string);
-            db.hdel(RedisKeys.server(server.serverId), "hotswapAt");
-            db.sadd(RedisKeys.serverList(), server.serverId);
-            return;
+            auto result = db.eval!string(q"LUA
+if redis.call('EXISTS', KEYS[1]) ~= 0 then return {'maintenance'} end
+local kind = redis.call('TYPE', KEYS[4]).ok
+if kind ~= 'none' and kind ~= 'set' then return {'changed'} end
+if (redis.call('HGET', KEYS[2], 'data') or '') ~= ARGV[1] then return {'changed'} end
+redis.call('HSET', KEYS[2], 'data', ARGV[2], 'lastHeartbeat', ARGV[3], 'isHealthy', 'true')
+redis.call('HDEL', KEYS[2], 'draining', 'hotswapAt')
+redis.call('DEL', KEYS[3])
+redis.call('SADD', KEYS[4], ARGV[4])
+return {'registered'}
+LUA", [NETWORK_WRITE_EXCLUSION_KEY, key, RedisKeys.draining(server.serverId), RedisKeys.serverList()],
+                [previous, server.toJson().toString(), server.lastHeartbeat.to!string, server.serverId]);
+            if (!result.empty && result.front == "registered") return;
+            if (!result.empty && result.front == "maintenance") throw new NetworkWriteUnavailableException();
+        } catch (NetworkWriteUnavailableException e) {
+            throw e;
+        } catch (Exception) {
+            // Repeating the same registry refresh is safe after a lost reply.
         }
-
-        // Use a simple default offset instead of scanning all servers,
-        // because getMaxBufferOffset() calls getAllServers() which uses
-        // SMEMBERS/SCAN — these can hang when called before the event
-        // loop is fully initialized (the event loop needs to process
-        // Redis I/O but the first registration happens in a runTask
-        // that may race with the heartbeat task's HSET on the same
-        // RedisClient pool, corrupting the SMEMBERS response stream).
-        // A fixed offset of 1000 is safe: buffer IDs are allocated
-        // sequentially from the server's offset, and the gap prevents
-        // collision between servers.
-        server.bufferOffset = 1000;
-        server.lastHeartbeat = Clock.currTime.toUnixTime!long * 1000;
-        server.isHealthy = true;
-
-        auto key = RedisKeys.server(server.serverId);
-        db.hset(key, "data", server.toJson().toString());
-        // A fresh registration ends any hot-swap grace window left by the
-        // previous process (see markHotSwap).
-        db.hdel(key, "hotswapAt");
-
-        // Add to server list
-        db.sadd(RedisKeys.serverList(), server.serverId);
-
-        logInfo("Registered connection server: %s@%s (offset=%d)",
-            server.serverId, server.bindAddress, server.bufferOffset);
+        throw new NetworkWriteUnavailableException("network_write_unavailable");
     }
 
     /// Removing registry metadata never proves that a remote holder closed.

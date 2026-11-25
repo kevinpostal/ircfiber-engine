@@ -537,23 +537,34 @@ void loadNetworks(ref EngineContext ctx) {
         }
         auto assignedServer = ctx.serverRegistry.getServerForNetwork(nidForAssignment);
         if (!assignedServer.length) {
-            import ircfiber.network_write_gate : NetworkWriter, runNetworkWrite;
-            assignedServer = runNetworkWrite!string(ctx.redis, (ref NetworkWriter writer) {
-            // Restore unique prior ownership first; arbitrary saved rows are
-            // not new provisioning and must not be assigned opportunistically.
-            auto recovered = ctx.serverRegistry.assignNetwork(nidForAssignment, writer);
-            if (!recovered.length) {
-                if (auto entry = nidForAssignment in held) {
-                    if (entry.state == "open") {
-                        recovered = ctx.serverRegistry.claimNetwork(nidForAssignment, serverId, writer);
-                        // An empty/unavailable plan cannot turn missing
-                        // assignment storage into permission to close a socket.
-                        if (!recovered.length) consumed[entry.id] = true;
+            import ircfiber.network_write_gate : NetworkWriter, NetworkWriteUnavailableException,
+                runNetworkWrite;
+            try {
+                assignedServer = runNetworkWrite!string(ctx.redis, (ref NetworkWriter writer) {
+                    // Restore unique prior ownership first; arbitrary saved rows
+                    // are not new provisioning and must not be assigned opportunistically.
+                    auto recovered = ctx.serverRegistry.assignNetwork(nidForAssignment, writer);
+                    if (!recovered.length) {
+                        if (auto entry = nidForAssignment in held) {
+                            if (entry.state == "open") {
+                                recovered = ctx.serverRegistry.claimNetwork(nidForAssignment, serverId, writer);
+                                // An empty/unavailable plan cannot authorize closing an existing socket.
+                                if (!recovered.length) consumed[entry.id] = true;
+                            }
+                        }
                     }
-                }
+                    return recovered;
+                });
+            } catch (NetworkWriteUnavailableException e) {
+                // Keep existing sockets undisturbed while this row's ownership
+                // is unprovable. Continue restoring independently owned rows.
+                foreach (entry; heldAll)
+                    if (entry.tag.networkId == nidForAssignment) consumed[entry.id] = true;
+                logWarn("Network loading: ownership recovery unavailable for %s (%s)",
+                    nidForAssignment, e.code);
+                skippedCount++;
+                continue;
             }
-            return recovered;
-            });
         }
         const shouldLoad = assignedServer == serverId
             && !networkMoveFenced(ctx.redis.getDb(), nidForAssignment);

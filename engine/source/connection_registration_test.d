@@ -36,6 +36,59 @@ void ok(string name, bool cond, string msg = "") {
     }
 }
 
+private void checkRegistrationUnderSaturation() {
+    import ircfiber.irc.registry : ServerRegistry;
+    import ircfiber.network_write_gate : NETWORK_WRITERS_KEY, NETWORK_WRITER_LIMIT,
+        NETWORK_WRITE_EXCLUSION_KEY, NetworkWriteUnavailableException;
+    import ircfiber.redis.protocol : RedisKeys;
+    import ircfiber.testing.isolated_db : isolatedTestRedis;
+    auto redis = isolatedTestRedis("registration with full writer ledger");
+    if (redis is null) return;
+    auto db = redis.getDb();
+    assert(!db.exists(NETWORK_WRITERS_KEY) && !db.exists(NETWORK_WRITE_EXCLUSION_KEY),
+        "registration test requires an isolated Redis with an empty writer ledger");
+    scope(exit) db.del(NETWORK_WRITERS_KEY);
+    foreach (i; 0 .. NETWORK_WRITER_LIMIT)
+        db.sadd(NETWORK_WRITERS_KEY, "unresolved-" ~ i.to!string);
+
+    auto registry = new ServerRegistry(redis);
+    ConnectionServer server;
+    server.serverId = "test-saturated-registration";
+    server.bindAddress = "127.0.0.1";
+    server.port = 8091;
+    const key = RedisKeys.server(server.serverId);
+    scope(exit) {
+        db.del(key);
+        db.del(RedisKeys.draining(server.serverId));
+        db.srem(RedisKeys.serverList(), server.serverId);
+    }
+    registry.registerServer(server);
+    auto registered = registry.getServer(server.serverId);
+    ok("full writer ledger permits fresh registration",
+        registered.serverId == server.serverId && registered.bufferOffset == 1000);
+
+    registered.bufferOffset = 4271;
+    db.hset(key, "data", registered.toJson().toString());
+    server.port = 8092;
+    {
+        db.set(NETWORK_WRITE_EXCLUSION_KEY, "fixture-holder-fence");
+        scope(exit) db.del(NETWORK_WRITE_EXCLUSION_KEY);
+        bool refused;
+        try registry.registerServer(server);
+        catch (NetworkWriteUnavailableException e) { refused = e.code == "network_maintenance"; }
+        ok("holder maintenance still blocks registry changes",
+            refused && registry.getServer(server.serverId).port == 8091);
+    }
+    registry.registerServer(server);
+    registered = registry.getServer(server.serverId);
+    ok("re-registration preserves the published buffer offset",
+        registered.port == 8092 && registered.bufferOffset == 4271);
+    bool preserved = db.scard(NETWORK_WRITERS_KEY) == NETWORK_WRITER_LIMIT && db.ttl(NETWORK_WRITERS_KEY) == -1;
+    foreach (i; 0 .. NETWORK_WRITER_LIMIT)
+        preserved &= db.sisMember(NETWORK_WRITERS_KEY, "unresolved-" ~ i.to!string);
+    ok("registration never consumes or expires unresolved writer evidence", preserved);
+}
+
 
 void main() {
     stderr.writeln("\n[connection.registration] admin surface contract");
@@ -276,6 +329,7 @@ void main() {
     foreach (line; slowdownWire) stderr.writeln("    wire> ", line);
     stderr.writeln("\n[connection.membership] unrecorded channels are recovered from the server");
     foreach (check; membershipRecoveryWireChecks()) ok(check.name, check.passed);
+    checkRegistrationUnderSaturation();
     historySnapshotRegressionChecks();
     historyCheckpointRegressionChecks();
     channelIntentRegressionChecks();
