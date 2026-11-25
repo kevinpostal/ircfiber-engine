@@ -1,5 +1,6 @@
 module archive_storage_test;
 
+import core.time : MonoTime, msecs, seconds;
 import std.algorithm : canFind, map;
 import std.array : array;
 import std.conv : to;
@@ -10,7 +11,7 @@ import std.stdio : stderr;
 import std.string : replace;
 import std.uuid : randomUUID;
 
-import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
 import vibe.core.log : setLogLevel, LogLevel;
 import vibe.data.bson : Bson, BsonDate;
 import vibe.data.json : Json, parseJsonString;
@@ -20,7 +21,11 @@ import ircfiber.db.messages : MessageRepository, ArchiveWriteResult,
     ArchiveWriteException, ArchiveWriteFailure;
 import ircfiber.db.mongo : AppMongoConnection;
 import ircfiber.storage.redis : RedisStorage;
-import ircfiber.network_write_gate : NETWORK_WRITE_EXCLUSION_KEY, NETWORK_WRITERS_KEY;
+import ircfiber.engine.archive_spool : ArchiveAdmission, ArchiveShutdown, ArchiveSpool,
+    ArchiveSpoolConfig, ArchiveSpoolStatus;
+import ircfiber.engine.archive_worker : ArchiveWorker;
+import ircfiber.network_write_gate : NETWORK_WRITE_EXCLUSION_KEY, NETWORK_WRITERS_KEY,
+    NETWORK_WRITER_LIMIT;
 
 // This executable never reads application Mongo environment variables. The
 // explicit opt-in grants failpoint control of a disposable Mongo 7 fixture;
@@ -367,7 +372,100 @@ private final class StorageFixture {
         return data;
     }
 
+    private void awaitWorker(scope bool delegate() ready, string failure) {
+        const deadline = MonoTime.currTime + 8.seconds;
+        while (!ready()) {
+            require(MonoTime.currTime < deadline, failure);
+            sleep(5.msecs);
+        }
+    }
+
+    private void withWorker(scope void delegate(ArchiveSpool) body) {
+        import core.stdc.stdlib : free;
+        import core.sys.posix.stdlib : realpath;
+        import core.sys.posix.sys.stat : chmod;
+        import std.file : mkdir, rmdirRecurse, tempDir;
+        import std.path : buildPath;
+        import std.string : fromStringz, toStringz;
+
+        ArchiveSpoolConfig config;
+        // The spool refuses symlinks, including macOS's usual temp path.
+        auto parent = realpath(tempDir().toStringz, null);
+        require(parent !is null, "fixture temp directory could not be resolved");
+        scope (exit) free(parent);
+        config.directory = buildPath(fromStringz(parent).idup, "ircfiber-archive-storage-" ~ randomUUID().toString());
+        config.maxBytes = 64 * 1024 * 1024;
+        config.minFreeBytes = 0;
+        config.diagnosticPath = "";
+        mkdir(config.directory);
+        scope (exit) rmdirRecurse(config.directory);
+        require(chmod(config.directory.toStringz, 448) == 0, "fixture journal mode was not private");
+
+        auto spool = new ArchiveSpool(config);
+        scope (exit) {
+            spool.requestShutdown(5.seconds, ArchiveShutdown.producersDrained);
+            awaitWorker({
+                ArchiveSpoolStatus status;
+                return spool.tryStatus(status) && status.stopped;
+            }, "fixture journal did not stop");
+        }
+        awaitWorker({
+            ArchiveSpoolStatus status;
+            if (!spool.tryStatus(status)) return false;
+            require(!status.failed, "fixture journal failed during startup");
+            return status.ready;
+        }, "fixture journal did not start");
+        auto worker = new ArchiveWorker(spool, repository, null, redis);
+        scope (exit) {
+            worker.requestStop();
+            awaitWorker({ return worker.isStopped(); }, "fixture worker did not stop");
+        }
+        worker.start();
+        body(spool);
+    }
+
+    private void awaitCheckpoint(ArchiveSpool spool, ulong sequence) {
+        awaitWorker({
+            ArchiveSpoolStatus status;
+            if (!spool.tryStatus(status)) return false;
+            require(!status.failed, "fixture journal stopped before durable checkpoint");
+            return status.checkpoint == sequence;
+        }, "fixture worker did not reach the durable checkpoint");
+    }
+
     void runCases() {
+        recordCase("saturated writer roster still replays majority-proven pending append", {
+            auto db = redis.getDb();
+            string[] tokens;
+            foreach (_; 0 .. NETWORK_WRITER_LIMIT) tokens ~= randomUUID().toString();
+            auto registered = db.eval!long("return redis.call('SADD', KEYS[1], unpack(ARGV))",
+                [NETWORK_WRITERS_KEY], tokens);
+            scope (exit) db.eval!long("return redis.call('SREM', KEYS[1], unpack(ARGV))",
+                [NETWORK_WRITERS_KEY], tokens);
+            require(!registered.empty && registered.front == NETWORK_WRITER_LIMIT,
+                "fixture did not fill the real writer roster");
+
+            const network = newNetwork();
+            const channel = "#writer-saturation";
+            const compact = payload(1, timestamp);
+            withWorker((ArchiveSpool spool) {
+                require(spool.tryAppend(SERVER, network, channel, 1, compact, fixtureOwner, true)
+                    == ArchiveAdmission.queued, "fixture pending append was not queued");
+                awaitCheckpoint(spool, 1);
+                const row = rowById("messages", SERVER ~ ":" ~ network ~ ":" ~ channel ~ ":1");
+                require(row["historyOwnerId"].get!string == fixtureOwner
+                    && row["payload"].get!string == compact, "pending replay changed owner or original bytes");
+                auto retained = db.eval!long(q"LUA
+for _, token in ipairs(ARGV) do
+    if redis.call('SISMEMBER', KEYS[1], token) ~= 1 then return -1 end
+end
+return redis.call('SCARD', KEYS[1])
+LUA", [NETWORK_WRITERS_KEY], tokens);
+                require(!retained.empty && retained.front == NETWORK_WRITER_LIMIT,
+                    "replay modified unresolved writer evidence");
+            });
+        });
+
         recordCase("compact insert preserves original bytes and exact retry is alreadyPersisted", {
             const network = newNetwork();
             const compact = payload(101, timestamp, "verbatim — 雪");

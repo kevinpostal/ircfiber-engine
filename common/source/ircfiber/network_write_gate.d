@@ -32,6 +32,11 @@ class NetworkWriteUnavailableException : Exception {
     }
 }
 
+/// Redis confirmed the roster is full and no maintenance exclusion is active.
+final class NetworkWriterSaturatedException : NetworkWriteUnavailableException {
+    this() { super("network_write_unavailable"); }
+}
+
 /// Preserve the server acknowledgement for typed storage consumers without
 /// exposing command contents in the public exception message.
 final class NetworkMutationException : NetworkWriteUnavailableException {
@@ -61,6 +66,7 @@ struct NetworkWriter {
             if (result.empty) throw new NetworkWriteUnavailableException("network_write_unavailable");
             const state = result.front.idup;
             if (state == "maintenance") throw new NetworkWriteUnavailableException();
+            if (state == "saturated") throw new NetworkWriterSaturatedException();
             if (state != "admitted") throw new NetworkWriteUnavailableException("network_write_unavailable");
         } catch (NetworkWriteUnavailableException e) { throw e; }
         catch (Exception) {

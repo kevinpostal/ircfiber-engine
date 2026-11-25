@@ -3,9 +3,10 @@ module ircfiber.engine.archive_worker;
 import core.time : msecs;
 import vibe.core.core : runTask, sleep;
 import ircfiber.engine.archive_spool;
-import ircfiber.db.messages : MessageRepository, ArchiveWriteException, ArchiveWriteFailure, ArchiveWriteResult;
+import ircfiber.db.messages : MessageRepository, ArchiveWriteException, ArchiveWriteFailure,
+    ArchiveWriteResult, ArchiveWriteScope;
 import ircfiber.storage.redis : RedisStorage;
-import ircfiber.network_write_gate : NetworkWriter, runNetworkWrite;
+import ircfiber.network_write_gate : NetworkWriter, NetworkWriterSaturatedException, runNetworkWrite;
 import ircfiber.logging : logJsonMap;
 import std.algorithm : canFind;
 import ircfiber.db.network : NetworkRepository;
@@ -468,26 +469,37 @@ final class ArchiveWorker {
                     if (redis is null) return ArchiveApplyResult.retry;
                     if (repository.historyNetworkDeleted(record.networkId, record.ownerId))
                         return ArchiveApplyResult.discarded;
-                    // The raw journal owner survives process replacement.
-                    // A real majority catalog read/CAS must establish that
-                    // exact owner before either Mongo history or checkpoint.
-                    return runNetworkWrite!ArchiveApplyResult(redis, (ref NetworkWriter writer) {
-                        string[] scopes;
-                        try scopes = repository.registerArchiveScopes(redis, record.networkId,
-                            [record.serverId], record.ownerId, writer);
-                        catch (ArchiveWriteException e) {
-                            if (e.failure != ArchiveWriteFailure.identityMismatch
-                                    && e.failure != ArchiveWriteFailure.invalidInput) throw e;
-                            notePendingConflict(record, "canonical_owner_or_record_mismatch");
-                            return ArchiveApplyResult.conflict;
-                        }
-                        if (!scopes.canFind(record.serverId)) {
-                            // Canonical absence alone cannot prove deletion.
-                            return repository.historyNetworkDeleted(record.networkId, record.ownerId)
-                                ? ArchiveApplyResult.discarded : ArchiveApplyResult.retry;
-                        }
-                        return applyRepositoryRecord(repository, record);
-                    });
+                    // The raw journal owner survives process replacement. An
+                    // unregistered scope still needs the tracked catalog CAS.
+                    try {
+                        return runNetworkWrite!ArchiveApplyResult(redis, (ref NetworkWriter writer) {
+                            string[] scopes;
+                            try scopes = repository.registerArchiveScopes(redis, record.networkId,
+                                [record.serverId], record.ownerId, writer);
+                            catch (ArchiveWriteException e) {
+                                if (e.failure != ArchiveWriteFailure.identityMismatch
+                                        && e.failure != ArchiveWriteFailure.invalidInput) throw e;
+                                notePendingConflict(record, "canonical_owner_or_record_mismatch");
+                                return ArchiveApplyResult.conflict;
+                            }
+                            if (!scopes.canFind(record.serverId)) {
+                                // Canonical absence alone cannot prove deletion.
+                                return repository.historyNetworkDeleted(record.networkId, record.ownerId)
+                                    ? ArchiveApplyResult.discarded : ArchiveApplyResult.retry;
+                            }
+                            return applyRepositoryRecord(repository, record);
+                        });
+                    } catch (NetworkWriterSaturatedException) {
+                        // No catalog mutation is needed if a fresh majority
+                        // admission already proves this exact owner and scope.
+                        // Never take this path during maintenance or on an
+                        // ambiguous writer admission. Leave all tokens intact.
+                        if (record.kind != ArchiveKind.append) return ArchiveApplyResult.retry;
+                        ArchiveWriteScope admitted;
+                        try admitted = repository.admitArchiveWrite(record.serverId, record.networkId, record.ownerId);
+                        catch (ArchiveWriteException) { return ArchiveApplyResult.retry; }
+                        return applyAdmittedAppend(repository, record, admitted);
+                    }
                 }
                 // Established records retain their admitted owner. Legacy
                 // ownerless frames still require canonical catalog provenance.
@@ -511,6 +523,12 @@ final class ArchiveWorker {
             ["event": "archive_pending_catalog_conflict", "networkId": record.networkId, "reason": reason]);
     }
 
+    private static ArchiveApplyResult applyAdmittedAppend(MessageRepository repository,
+            ref const ArchiveRecord record, ref const ArchiveWriteScope admitted) {
+        return repository.appendArchivedCompactMessage(admitted, record.channel, record.compactJson)
+            == ArchiveWriteResult.expiredDiscard ? ArchiveApplyResult.discarded : ArchiveApplyResult.applied;
+    }
+
     private static ArchiveApplyResult applyRepositoryRecord(MessageRepository repository, ref const ArchiveRecord record) {
         if (record.kind != ArchiveKind.append) {
             const admitted = repository.admitArchiveWrite(record.serverId, record.networkId, record.ownerId);
@@ -518,9 +536,8 @@ final class ArchiveWorker {
         }
         final switch (record.kind) {
             case ArchiveKind.append:
-                return repository.appendArchivedCompactMessage(record.serverId, record.networkId,
-                    record.channel, record.compactJson, record.ownerId) == ArchiveWriteResult.expiredDiscard
-                    ? ArchiveApplyResult.discarded : ArchiveApplyResult.applied;
+                auto admitted = repository.admitArchiveWrite(record.serverId, record.networkId, record.ownerId);
+                return applyAdmittedAppend(repository, record, admitted);
             case ArchiveKind.rename:
                 repository.renameArchivedChannel(record.serverId, record.networkId,
                     record.channel, record.newChannel, record.cutoffEid, record.legacyCutoffMs);

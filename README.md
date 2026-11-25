@@ -310,6 +310,10 @@ pending catalog provenance. Replay must prove the current canonical owner and
 catalog before history persistence or checkpoint advancement. Transferred/deleted
 owners are quarantined visibly rather than silently discarded or replayed under
 an unverified owner.
+With a full writer roster and no active exclusion, a pending append may replay
+without a writer slot only after a fresh majority admission proves its exact
+owner and registered server. New catalog registrations still wait, and replay
+does not clear or age out ambiguous writer tokens.
 
 `dub build --config=consumer-write-test` builds the real logical-writer regression
 driver. Run it with `IRCFIBER_CONSUMER_TEST_ISOLATED=1`, explicit loopback
