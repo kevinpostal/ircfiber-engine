@@ -2,13 +2,15 @@ module ircfiber.db.uploads;
 
 import std.datetime : Clock;
 import std.uuid : randomUUID;
+import std.typecons : Nullable;
 import vibe.db.mongo.mongo;
 import vibe.db.mongo.cursor;
 import vibe.data.bson;
 import vibe.core.log;
 import ircfiber.db.mongo : AppMongoConnection;
+import ircfiber.db.upload_category : uploadOriginalNameExpression;
 
-/// One uploaded file reference (the bytes live on postimages.org).
+/// One uploaded file reference; bytes may be managed locally or legacy remote.
 struct UploadRecord {
     /// Upload identifier (UUID string).
     string id;               // _id (UUID string)
@@ -40,10 +42,16 @@ struct UploadRecord {
     long createdAt;          // unix ms
     /// Soft-delete flag.
     bool deleted;
+    private Nullable!bool localProvenance;
+
+    /// Explicit provenance; an absent legacy field must not become false on save.
+    @property bool local() const { return localProvenance.get(false); }
+    @property void local(bool value) { localProvenance = value; }
+    @property bool hasLocalProvenance() const { return !localProvenance.isNull; }
 
     /// Serializes to Bson.
     Bson toBson() const @trusted {
-        return Bson([
+        auto doc = Bson([
             "_id": Bson(id), "userId": Bson(userId), "networkId": Bson(networkId),
             "buffer": Bson(buffer), "filename": Bson(filename),
             "originalFilename": Bson(originalFilename), "mimeType": Bson(mimeType),
@@ -52,6 +60,8 @@ struct UploadRecord {
             "thumbUrl": Bson(thumbUrl), "createdAt": Bson(createdAt),
             "deleted": Bson(deleted),
         ]);
+        if (!localProvenance.isNull) doc["local"] = Bson(local);
+        return doc;
     }
 
     /// Deserializes from Bson.
@@ -62,8 +72,8 @@ struct UploadRecord {
         r.networkId = b["networkId"].get!string;
         r.buffer = b["buffer"].get!string;
         r.filename = b["filename"].get!string;
-        r.originalFilename = b["originalFilename"].get!string;
-        r.mimeType = b["mimeType"].get!string;
+        r.originalFilename = b["originalFilename"].type == Bson.Type.string ? b["originalFilename"].get!string : "";
+        r.mimeType = b["mimeType"].type == Bson.Type.string ? b["mimeType"].get!string : "";
         r.size = b["size"].get!long;
         r.width = b["width"].get!long;
         r.height = b["height"].get!long;
@@ -72,6 +82,8 @@ struct UploadRecord {
         r.thumbUrl = b["thumbUrl"].get!string;
         r.createdAt = b["createdAt"].get!long;
         r.deleted = b["deleted"].get!bool;
+        if (b["local"].type != Bson.Type.undefined)
+            r.local = b["local"].type == Bson.Type.bool_ && b["local"].get!bool;
         return r;
     }
 }
@@ -141,6 +153,16 @@ final class UploadRepository {
         return UploadRecord.fromBson(doc);
     }
 
+    /// Live owner-scoped lookup for all library operations.
+    UploadRecord getLiveById(string userId, string id) @trusted {
+        auto doc = collection.findOne(liveFilter(userId, id));
+        return doc.isNull ? UploadRecord.init : UploadRecord.fromBson(doc);
+    }
+
+    private Bson liveFilter(string userId, string id) @trusted {
+        return Bson(["_id": Bson(id), "userId": Bson(userId), "deleted": Bson(false)]);
+    }
+
     /// Count of ALL user uploads (including soft-deleted), for admin cleanup.
     long countAllByUser(string userId) @trusted {
         return collection.countDocuments(Bson(["userId": Bson(userId)]));
@@ -181,14 +203,32 @@ final class UploadRepository {
         return res.deletedCount > 0;
     }
 
-    /// Updates filename and size for an existing upload (content is written to disk by caller).
-    /// Returns false if not found or not owned.
-    bool updateContent(string userId, string id, string newContent, string newFilename, long newSize) @trusted {
-        auto doc = collection.findOne(Bson(["_id": Bson(id), "userId": Bson(userId)]));
-        if (doc.isNull) return false;
-        auto upd = Bson(["$set": Bson(["filename": Bson(newFilename), "size": Bson(newSize)])]);
-        auto res = collection.updateOne(Bson(["_id": Bson(id)]), upd);
-        return res.modifiedCount > 0;
+    /// Library deletion, unlike administrative hardDelete, excludes tombstones.
+    bool hardDeleteLive(string userId, string id) @trusted {
+        return collection.deleteOne(liveFilter(userId, id)).deletedCount > 0;
+    }
+
+    /// Metadata-only rename; freeze the legacy original-name fallback atomically.
+    /// Matched rather than modified count makes an unchanged name successful.
+    bool rename(string userId, string id, string filename) @trusted {
+        auto fields = Bson([
+            "filename": Bson(["$literal": Bson(filename)]),
+            "originalFilename": uploadOriginalNameExpression(),
+        ]);
+        return collection.updateOne(liveFilter(userId, id),
+            Bson([Bson(["$set": fields])])).matchedCount > 0;
+    }
+
+    /// Caller coordinates bytes under the shared filesystem lock; content never
+    /// enters Mongo. Equal-size and unchanged updates still match successfully.
+    bool updateContent(string userId, string id, string newFilename, long newSize) @trusted {
+        auto fields = Bson([
+            "filename": Bson(["$literal": Bson(newFilename)]),
+            "size": Bson(newSize),
+            "originalFilename": uploadOriginalNameExpression(),
+        ]);
+        return collection.updateOne(liveFilter(userId, id),
+            Bson([Bson(["$set": fields])])).matchedCount > 0;
     }
 
 
@@ -208,16 +248,26 @@ unittest {
     r.directUrl = "http://localhost:8090/uploads/abc.py";
     r.createdAt = Clock.currTime.toUnixTime * 1000;
     repo.insert(r);
-    bool ok = repo.updateContent(r.userId, r.id, "new content", "new.py", 11);
+    scope(exit) repo.hardDelete(r.userId, r.id);
+    bool ok = repo.updateContent(r.userId, r.id, "new.py", 11);
     assert(ok);
     auto fetched = repo.getById(r.userId, r.id);
     assert(fetched.filename == "new.py");
     assert(fetched.size == 11);
+    assert(fetched.originalFilename == "test.py"); // final legacy fallback frozen
+    assert(repo.updateContent(r.userId, r.id, "new.py", 11)); // true no-op
+    assert(repo.updateContent(r.userId, r.id, "same.py", 11)); // equal-byte edit
+    assert(repo.rename(r.userId, r.id, "$literal.py"));
+    assert(repo.rename(r.userId, r.id, "$literal.py"));
+    auto renamed = repo.getLiveById(r.userId, r.id);
+    assert(renamed.filename == "$literal.py");
+    assert(renamed.originalFilename == "test.py");
+    assert(renamed.directUrl == r.directUrl && renamed.mimeType == r.mimeType);
+    assert(!repo.rename(randomUUID().toString(), r.id, "other.py"));
+    assert(!repo.hardDeleteLive(randomUUID().toString(), r.id));
     // Verify ownership check: wrong user should not update
-    bool wrong = repo.updateContent(randomUUID().toString(), r.id, "x", "x.py", 1);
+    bool wrong = repo.updateContent(randomUUID().toString(), r.id, "x.py", 1);
     assert(!wrong);
-    // Cleanup
-    repo.hardDelete(r.userId, r.id);
 }
 
 @("UploadRecord round-trips through Bson")
@@ -238,4 +288,32 @@ unittest {
     const back = UploadRecord.fromBson(b);
     assert(back == r);
     assert(b["deleted"].get!bool == false);
+    assert(b["local"].type == Bson.Type.undefined);
+    assert(!back.hasLocalProvenance);
+    r.local = true;
+    auto managed = UploadRecord.fromBson(r.toBson());
+    assert(managed.local && managed.hasLocalProvenance);
+    r.local = false;
+    auto remote = UploadRecord.fromBson(r.toBson());
+    assert(!remote.local && remote.hasLocalProvenance);
+    assert(remote.toBson()["local"].type == Bson.Type.bool_);
+}
+
+@("UploadRepository library mutations reject deleted records")
+unittest {
+    import ircfiber.testing.isolated_db : connectIsolatedTestMongo;
+    if (!connectIsolatedTestMongo("UploadRepository.liveMutations")) return;
+    auto repo = new UploadRepository();
+    UploadRecord record;
+    record.id = randomUUID().toString();
+    record.userId = randomUUID().toString();
+    record.filename = "deleted.txt";
+    record.deleted = true;
+    repo.insert(record);
+    scope(exit) repo.hardDelete(record.userId, record.id);
+    assert(repo.getLiveById(record.userId, record.id).id.length == 0);
+    assert(!repo.updateContent(record.userId, record.id, "changed.txt", 0));
+    assert(!repo.rename(record.userId, record.id, "changed.txt"));
+    assert(!repo.hardDeleteLive(record.userId, record.id));
+    assert(repo.getById(record.userId, record.id).filename == "deleted.txt");
 }
