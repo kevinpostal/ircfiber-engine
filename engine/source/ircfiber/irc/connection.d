@@ -12731,6 +12731,9 @@ private void processEvents() {
                         }
                     }
                     if (replacedNamesBurst) pruneUnownedIdentities();
+                    // An empty 353 never calls upsertNamesMember. Install its
+                    // default index so the WHO check can also read empty bursts.
+                    if (chan !in namesBurstIndex) namesBurstIndex[chan] = NamesBurstIndex.init;
                     logJsonMap("info", "protocol",
                         "NAMES (353)",
                         ["network": config.name,
@@ -18549,6 +18552,19 @@ Ircv3Check[] membershipRecoveryWireChecks() {
         && occurrences("JOIN #ircfiber") == 0 && occurrences("JOIN #support") == 0);
     check("the adopted channel's roster is the server's, not empty",
         client.channelUsers.get("#ircfiber", null).length >= 1);
+
+    bool emptyNamesThrew;
+    try {
+        client.processLine(":s 353 me = #hollow :");
+        client.processLine(":s 366 me #hollow :End of /NAMES list.");
+    } catch (Throwable) {
+        emptyNamesThrew = true;
+    }
+    check("an empty 353 is absorbed without dereferencing a missing index entry",
+        !emptyNamesThrew);
+    client.processLine(":s 353 me = #hollow :@op");
+    check("a non-empty 353 after an empty burst still builds the roster",
+        client.namesBurst.get("#hollow", null) == ["@op"]);
     return checks;
 }
 
