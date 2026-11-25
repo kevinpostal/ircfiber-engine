@@ -58,6 +58,15 @@ class HolderUnavailableException : Exception {
     this(string msg, string file = __FILE__, size_t line = __LINE__) { super(msg, file, line); }
 }
 
+/// A terminal boot failure. The process owner reports once before its original exit.
+final class HolderStartupException : Exception {
+    immutable int exitCode;
+    this(string msg, int exitCode, string file = __FILE__, size_t line = __LINE__) {
+        super(msg, file, line);
+        this.exitCode = exitCode;
+    }
+}
+
 /// The holder answered `ERR {"code":…}` to a request. `code` is one of
 /// `proto`, `server_id`, `auth`, `bad_request`, `not_found`, `busy`,
 /// `closed`, `too_large`.
@@ -717,6 +726,7 @@ final class HolderClient {
         bool controlUp;
         bool reconnecting;
         TaskMutex mutex;
+        Exception pendingControlLoss; // Taken exactly once on control mutex release.
         /// Set once the first control session was established; afterwards a
         /// loss is logged as `holder_unavailable` and repaired in background.
         bool booted;
@@ -778,7 +788,6 @@ final class HolderClient {
     /// and then exiting 75 (the container restart policy retries). A
     /// protocol/serverId mismatch is a deployment error → exit 78.
     void connectControl() {
-        import core.stdc.stdlib : exit;
         const timeoutSecs = environment.get("IRCFIBER_HOLDER_CONNECT_TIMEOUT_SECS", "60").to!long;
         const deadline = unixMsNow() + timeoutSecs * 1000;
         string lastErr;
@@ -792,7 +801,7 @@ final class HolderClient {
                 if (e.code == "proto" || e.code == "server_id" || e.code == "auth") {
                     logJsonMap("error", "holder", "Holder rejected this engine — fix the deployment",
                         ["addr": addrText, "code": e.code, "err": e.msg, "event": "holder_rejected"]);
-                    exit(78);
+                    throw new HolderStartupException("Holder rejected control registration", 78);
                 }
                 lastErr = e.code ~ ": " ~ e.msg;
             } catch (Exception e) {
@@ -802,7 +811,7 @@ final class HolderClient {
                 logJsonMap("error", "holder", "Connection holder unreachable at boot",
                     ["addr": addrText, "err": lastErr, "timeoutSecs": timeoutSecs.to!string,
                      "event": "holder_boot_timeout"]);
-                exit(75);
+                throw new HolderStartupException("Holder control registration timed out", 75);
             }
             logWarn("Holder not reachable at %s (%s) — retrying in 1s", addrText, lastErr);
             sleep(1.seconds);
@@ -883,13 +892,15 @@ final class HolderClient {
 
     /// Marks the control session dead and repairs it in the background
     /// (1 s cadence, forever). Logged once per outage.
-    private void controlLost(string why) {
+    private void controlLost(Exception cause = null) {
         if (controlUp) {
             controlUp = false;
             try control.close(); catch (Exception) {}
-            if (booted)
+            if (booted) {
+                pendingControlLoss = cause;
                 logJsonMap("error", "holder", "Holder control session lost",
-                    ["addr": addrText, "err": why, "event": "holder_unavailable"]);
+                    ["addr": addrText, "err": cause.msg, "event": "holder_unavailable"]);
+            }
         }
         if (reconnecting || !booted) return;
         reconnecting = true;
@@ -910,10 +921,20 @@ final class HolderClient {
         });
     }
 
+    private void unlockControl() {
+        auto lost = pendingControlLoss;
+        pendingControlLoss = null;
+        mutex.unlock();
+        if (lost !is null) {
+            import ircfiber.errors : captureException;
+            captureException!("holder-control", "control-lost")(lost);
+        }
+    }
+
     /// One control request. Serialised (one in flight), 10 s timeout.
     private Json request(string verb, Json payload = Json.undefined) {
         mutex.lock();
-        scope (exit) mutex.unlock();
+        scope (exit) unlockControl();
         return requestLocked(verb, payload);
     }
 
@@ -926,7 +947,7 @@ final class HolderClient {
     /// evidence. Start the deadline before writing, not once each chunk arrives.
     private T requestDecodedLocked(T)(string verb, Json payload = Json.undefined) {
         if (!controlUp) {
-            controlLost("control session down");
+            controlLost();
             throw new HolderUnavailableException("holder control session down");
         }
         const deadline = MonoTime.currTime + CONTROL_TIMEOUT;
@@ -943,7 +964,7 @@ final class HolderClient {
             // A valid ERR has consumed its terminator. The control is reusable.
             throw e;
         } catch (Exception e) {
-            controlLost(e.msg);
+            controlLost(e);
             throw new HolderUnavailableException("holder control I/O failed: " ~ e.msg);
         }
     }
@@ -974,7 +995,7 @@ final class HolderClient {
             knownTags = null;
             if (includeMeta) return list();
             mutex.lock();
-            scope(exit) mutex.unlock();
+            scope(exit) unlockControl();
             auto wire = requestDecodedLocked!HolderWireList("LIST");
             auto entries = new HolderEntry[wire.connections.length];
             foreach (i, row; wire.connections) entries[i] = row.entry();
@@ -1058,7 +1079,7 @@ final class HolderClient {
     /// INFO still consumes and validates the complete wire response.
     HolderEntry infoIdentity(string id) {
         mutex.lock();
-        scope(exit) mutex.unlock();
+        scope(exit) unlockControl();
         auto entry = requestDecodedLocked!HolderWireEntry("INFO", idPayload(id)).entry();
         if (!entry.instance.length) entry.instance = currentInstance;
         return entry;
@@ -1071,7 +1092,7 @@ final class HolderClient {
         mutex.lock();
         scope (exit) {
             buildMeta = null;
-            mutex.unlock();
+            unlockControl();
         }
         void attempt(bool dropMembers) {
             auto meta = buildMeta(dropMembers);
@@ -1109,7 +1130,7 @@ final class HolderClient {
     /// death must never close/forget another process's socket.
     private bool mutateClaim(string verb, string id, string incarnation, long connectedAtMs, string quit) {
         mutex.lock();
-        scope(exit) mutex.unlock();
+        scope(exit) unlockControl();
         auto entry = requestDecodedLocked!HolderWireEntry("INFO", idPayload(id)).entry();
         if (entry.id != id || entry.instance != incarnation
                 || connectedAtMs <= 0 || entry.connectedAtMs != connectedAtMs)

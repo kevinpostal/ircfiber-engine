@@ -16,6 +16,7 @@ import vibe.core.core : runTask, runApplication, sleep, yield;
 import vibe.core.log;
 
 import ircfiber.logging : logException, configureLogging, setLoggingEnabled, isLoggingEnabled;
+import ircfiber.build_info : buildInfo;
 import ircfiber.engine.bootstrap : bootstrapEngine, startHeartbeatTask,
     startOrphanReaperTask, startTelemetryFlushTask, loadNetworksWithRetry, refreshRoutingCapabilities, EngineContext;
 import ircfiber.tracing : configureTracing,
@@ -39,7 +40,8 @@ import ircfiber.runtime_memory : compactRuntimeMemorySample;
 import ircfiber.runtime_diagnostic : DiagnosticStatus;
 import std.uuid : UUID;
 import ircfiber.models.network : NetworkConfig;
-import ircfiber.holder_client : HolderEntry;
+import ircfiber.holder_client : HolderEntry, HolderStartupException;
+import ircfiber.errors : captureException, waitErrorReport;
 /// Global engine context shared across the process.
 __gshared EngineContext g_ctx;
 
@@ -88,9 +90,9 @@ private bool setupOtel(string svcName) {
     } else {
         logsEp = base ~ "/v1/logs";
     }
-    configureTracing(tracesEp, svcName, "0.3.0");
-    configureMetrics(metricsEp, svcName, "0.3.0");
-    configureLogging(logsEp, svcName, "0.3.0");
+    configureTracing(tracesEp, svcName, buildInfo().describe);
+    configureMetrics(metricsEp, svcName, buildInfo().describe);
+    configureLogging(logsEp, svcName, buildInfo().describe);
     // configure* sets enabled flag; be explicit for clarity.
     setTracingEnabled(true);
     setMetricsEnabled(true);
@@ -102,23 +104,72 @@ private bool setupOtel(string svcName) {
 /// Configure Bugsink error reporting from env. Independent switch from
 /// setupOtel() above — see ircfiber.errors module docs.
 private bool setupBugsink(string svcName) {
-    import ircfiber.errors : configureErrorReporting, setErrorReportingEnabled;
-    bool enabled = isEnvEnabled("IRCFIBER_BUGSINK_ENABLED");
-    string dsn = environment.get("IRCFIBER_BUGSINK_DSN", "");
-    if (!enabled || dsn.length == 0) {
-        setErrorReportingEnabled(false);
-        logInfo("Bugsink disabled for %s (IRCFIBER_BUGSINK_ENABLED=%s, dsn set=%s)",
-            svcName, enabled, dsn.length > 0);
-        return false;
+    import ircfiber.errors : configureErrorReporting, isErrorReportingEnabled;
+    import std.file : read;
+    import std.string : strip, stripRight;
+
+    const enabled = isEnvEnabled("IRCFIBER_BUGSINK_ENABLED");
+    const release = buildInfo().describe;
+    const reportEnvironment = environment.get("IRCFIBER_BUGSINK_ENVIRONMENT", "production");
+    configureErrorReporting(false, "", svcName, release, reportEnvironment);
+    if (enabled) {
+        string dsn = environment.get("IRCFIBER_BUGSINK_DSN", "");
+        const path = environment.get("IRCFIBER_BUGSINK_DSN_FILE", "").strip();
+        if (path.length) {
+            try {
+                const fromFile = (cast(string) read(path)).stripRight();
+                if (fromFile.length)
+                    dsn = fromFile;
+                else
+                    logWarn("Bugsink DSN file is empty; using inline configuration");
+            } catch (Exception) {
+                logWarn("Bugsink DSN file is unreadable; using inline configuration");
+            }
+        }
+        configureErrorReporting(true, dsn, svcName, release, reportEnvironment);
     }
-    configureErrorReporting(dsn, svcName, "0.3.0", "production");
-    setErrorReportingEnabled(true);
-    logInfo("Bugsink enabled for %s", svcName);
-    return true;
+    const configured = isErrorReportingEnabled();
+    logInfo("Bugsink %s for %s", configured ? "enabled" : "disabled", svcName);
+    return configured;
 }
 
-void main() {
-    initializeServicesOperations();
+int main() {
+    // Error reporting owns startup failures too; OTLP remains independent.
+    try cast(void) setupBugsink("ircfiber-engine");
+    catch (Throwable) {
+        import ircfiber.errors : configureErrorReporting;
+        try configureErrorReporting(false, "", "ircfiber-engine", "", ""); catch (Throwable) {}
+        try logError("Bugsink configuration failed; reporting disabled"); catch (Throwable) {}
+    }
+
+    bool bootstrapped;
+    try {
+        runEngine(bootstrapped);
+        return 0;
+    } catch (HolderStartupException e) {
+        waitErrorReport(captureException!("engine", "bootstrap")(e));
+        return e.exitCode;
+    } catch (Throwable e) {
+        if (bootstrapped)
+            waitErrorReport(captureException!("engine", "terminal")(e));
+        else
+            waitErrorReport(captureException!("engine", "bootstrap")(e));
+        throw e;
+    }
+}
+
+/// Only this boundary consumes an escaping task exception.
+private void startEngineTask(string operation)(void delegate() dg) {
+    runTask(() nothrow {
+        try dg();
+        catch (Throwable e) {
+            captureException!("engine", operation)(e);
+            logException("runtime", e, "Task crashed");
+        }
+    });
+}
+
+private void runEngine(ref bool bootstrapped) {
     // Global crash handler: ensure buffered OTLP logs are shipped even if
     // the process terminates via an uncaught Throwable. vibe.d's event loop
     // normally swallows fiber exceptions, but a top-level Error (e.g.
@@ -134,11 +185,9 @@ void main() {
             try flushAndSendMetrics(); catch (Throwable) {}
         } catch (Throwable) {}
     }
-    // ── Bootstrap ─────────────────────────────────────────────────
-    // One startup path: read Mongo, connect the holder, attach any session
-    // the holder kept across the restart (hot swap / crash), dial the rest.
-
+    initializeServicesOperations();
     auto ctx = bootstrapEngine();
+    bootstrapped = true;
     g_ctx = ctx;
 
     // OTel must be configured AFTER bootstrap so any bootstrap failures
@@ -149,12 +198,6 @@ void main() {
     catch (Throwable e) {
         string m; try { m = e.msg; } catch (Throwable) { m = "unknown"; }
         try logError("setupOtel failed: %s", m); catch (Throwable) {}
-    }
-
-    try cast(void) setupBugsink("ircfiber-engine");
-    catch (Throwable e) {
-        string m; try { m = e.msg; } catch (Throwable) { m = "unknown"; }
-        try logError("setupBugsink failed: %s", m); catch (Throwable) {}
     }
 
     // Write a fresh state snapshot immediately so the frontend sees the
@@ -213,6 +256,7 @@ void main() {
             loadNetworksWithRetry(ctx);
         } catch (Throwable e) {
             logException("registration", e, "Registration task failed");
+            captureException!("engine", "registration")(e);
         }
     });
     if (ctx.archiveSpool !is null && ctx.archiveControl !is null) {
@@ -224,6 +268,7 @@ void main() {
             ctx.archiveWorker.start();
             ctx.archiveControl.start(ctx);
         } catch (Throwable e) {
+            captureException!("archive-worker", "startup")(e);
             ctx.localServer.archiveVersion = 0;
             logJsonMap("error", "engine", "Archive consumer unavailable; live sockets preserved",
                 ["event":"archive_gap", "reason":"consumer_initialization_failed"]);
@@ -245,26 +290,11 @@ void main() {
         logInfo("EngineJanitor: started in engine process");
     }
 
-    auto runSafe = (void delegate() dg) {
-        runTask(() nothrow {
-            try {
-                dg();
-            } catch (Throwable e) {
-                logException("runtime", e, "Task crashed");
-            }
-        });
-    };
-
-    runSafe({ try { startEventProcessor(ctx); }
-              catch (Throwable e) { logException("event_processor", e, "Event processor crashed"); } });
-    runSafe({ try { startControlConsumer(ctx); }
-              catch (Throwable e) { logException("control_consumer", e, "Control consumer crashed"); } });
-    runSafe({ try { startCommandConsumers(ctx); }
-              catch (Throwable e) { logException("command_consumers", e, "Command consumers crashed"); } });
-    runSafe({ try { startStateSnapshotter(ctx); }
-              catch (Throwable e) { logException("state_snapshotter", e, "State snapshotter crashed"); } });
-    runSafe({ try { startDailyReachabilityRefresh(); }
-              catch (Throwable e) { logException("daily_reachability_refresh", e, "Daily reachability refresh crashed"); } });
+    startEngineTask!"event-processor"({ startEventProcessor(ctx); });
+    startEngineTask!"control-consumer"({ startControlConsumer(ctx); });
+    startEngineTask!"command-consumers"({ startCommandConsumers(ctx); });
+    startEngineTask!"state-snapshotter"({ startStateSnapshotter(ctx); });
+    startEngineTask!"daily-reachability-refresh"({ startDailyReachabilityRefresh(); });
 
     // ── Signals ─────────────────────────────────────────────────────
     // SIGTERM = hot swap: detach every session (META + close the relay,

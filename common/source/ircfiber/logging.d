@@ -198,6 +198,8 @@ void logErrorJ(string component, string msg, string network = "") {
 /// and `e.info.toString()` chains every `Throwable` in the chain with
 /// its file/line. Capturing both lets Loki/Grafana pivot on either the
 /// error message text or the stack frame.
+/// This is local/OTLP logging only. Error-report transport belongs to the
+/// owning failure boundary and must not inherit log context or extra fields.
 ///
 /// Use this from every `catch (Exception e)` block instead of writing
 /// `logError("...: %s", e.msg)` — `e.msg` alone is just a sentence,
@@ -220,14 +222,6 @@ void logException(string component,
         // Best-effort immediate flush supplements the independent periodic
         // telemetry task, preserving the existing error/shutdown behavior.
         try flushAndSendLogs(); catch (Throwable) {}
-        // Bugsink: independent on/off switch from the OTLP logs flush
-        // above — IRCFIBER_BUGSINK_ENABLED gates this separately so ops can
-        // silence error reporting (e.g. Bugsink itself is down) without
-        // touching tracing/metrics/logs.
-        try {
-            import ircfiber.errors : captureException, isErrorReportingEnabled;
-            if (isErrorReportingEnabled()) captureException(component, e, context, extra);
-        } catch (Throwable) {}
     } catch (Throwable secondary) {
         // We are already in an error path — never throw from here.
         try {

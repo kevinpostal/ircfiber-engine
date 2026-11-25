@@ -12,6 +12,7 @@ import core.sys.posix.unistd : getpid;
 import vibe.core.core : runTask, sleep, runApplication;
 import ircfiber.engine.event_channel : EngineEventChannel;
 import ircfiber.logging : logJsonMap, logException, flushAndSendLogs;
+import ircfiber.errors : captureException;
 import vibe.data.json : Json;
 import ircfiber.tracing : withSpan, flushAndSendSpans, Span, isTracingEnabled;
 import ircfiber.observability : flushAndSendMetrics, recordGauge, isMetricsEnabled;
@@ -33,7 +34,7 @@ import ircfiber.db.network : NetworkRepository;
 import ircfiber.db.user : UserRepository;
 import ircfiber.db.messages : MessageRepository;
 import ircfiber.redis.protocol : RedisKeys, StateTTL;
-import ircfiber.holder_client : HolderClient, HolderEntry, HolderUnavailableException;
+import ircfiber.holder_client : HolderClient, HolderEntry, HolderUnavailableException, HolderStartupException;
 import ircfiber.engine.session_snapshot : SessionSnapshot, fromJSON;
 import ircfiber.irc.routing_moves : networkMoveFenced;
 import ircfiber.engine.archive_spool : ArchiveSpool, ArchiveSpoolConfig;
@@ -226,6 +227,16 @@ EngineContext bootstrapEngine() {
 
     logInfo("Server identity: id=%s bind=%s port=%d", serverId, bindAddress, adminPort);
 
+    // Validate holder configuration before touching storage. Opening the
+    // control session still happens after storage initialization below.
+    HolderClient holder;
+    try {
+        holder = new HolderClient(serverId);
+    } catch (Exception e) {
+        logError("Invalid IRCFIBER_HOLDER_ADDR: %s", e.msg);
+        throw new HolderStartupException("Invalid holder configuration", 78);
+    }
+
     // Connect to MongoDB
     auto mongoUrl = environment.get("IRCFIBER_MONGO_URL", "mongodb://127.0.0.1:27017/ircfiber");
     auto mongoDbName = "ircfiber";
@@ -274,16 +285,8 @@ EngineContext bootstrapEngine() {
     // ── Connection holder ─────────────────────────────────────────
     // The holder owns every IRC socket; the engine attaches to it. Boot
     // blocks until the control session is up (≤ IRCFIBER_HOLDER_CONNECT_
-    // TIMEOUT_SECS, then exit 75 so the restart policy retries); a
-    // protocol/serverId mismatch exits 78.
-    HolderClient holder;
-    try {
-        holder = new HolderClient(serverId);
-    } catch (Exception e) {
-        logError("Invalid IRCFIBER_HOLDER_ADDR: %s", e.msg);
-        import core.stdc.stdlib : exit;
-        exit(78);
-    }
+    // TIMEOUT_SECS, then propagate exit 75 so the restart policy retries);
+    // a protocol/serverId mismatch propagates exit 78 to the process owner.
     holder.connectControl();
     long heldLive;
     bool heldStateKnown;
@@ -689,6 +692,7 @@ void loadNetworksWithRetry(ref EngineContext ctx) {
             return;
         } catch (Exception e) {
             if (attempt == attempts) {
+                captureException!("engine", "network-load-exhausted")(e);
                 logError("Network loading failed after %d attempts: %s — no networks are connected",
                     attempts, e.msg);
                 return;

@@ -7,6 +7,7 @@ import ircfiber.db.messages : MessageRepository, ArchiveWriteException, ArchiveW
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.network_write_gate : NetworkWriter, runNetworkWrite;
 import ircfiber.logging : logJsonMap;
+import ircfiber.errors : captureException;
 import std.algorithm : canFind;
 import ircfiber.db.network : NetworkRepository;
 
@@ -540,7 +541,10 @@ final class ArchiveWorker {
         started = true;
         try runTask(() nothrow {
             try run();
-            catch (Throwable) { spool.reportWorkerFailure(); }
+            catch (Throwable e) {
+                spool.reportWorkerFailure();
+                captureException!("archive-worker", "terminal")(e);
+            }
         });
         catch (Throwable e) { started = false; spool.reportWorkerFailure(); throw e; }
     }
@@ -549,6 +553,22 @@ final class ArchiveWorker {
     void requestStop() { stopping = true; }
     bool isStopped() const { return finished || (!started && stopping); }
     size_t activeConsumerFibers() const nothrow { return consumers; }
+
+    // Observe terminal disk-owner failure without exporting its diagnostic
+    // ledger. Ordinary stop, backoff and temporary Mongo/Redis failures stay local.
+    private bool spoolEnded(out ArchiveSpoolProgress status) {
+        if (!spool.tryProgress(status)) return false;
+        if (status.failed) {
+            captureException!("archive-worker", "spool-terminal")(new Exception("Archive spool failed"));
+            return true;
+        }
+        return status.stopped || status.stopping;
+    }
+
+    private void terminalConflict() {
+        spool.reportConflict();
+        captureException!("archive-worker", "record-conflict")(new Exception("Archive record conflict"));
+    }
 
     private void run() {
         ++consumers;
@@ -560,19 +580,23 @@ final class ArchiveWorker {
             const availableGeneration = spool.progressGeneration();
             if (!spool.tryTake(encoded, sequence, durableRedisApplied)) {
                 ArchiveSpoolProgress status;
-                if (spool.tryProgress(status) && (status.failed || status.stopped || status.stopping)) return;
+                if (spoolEnded(status)) return;
                 spool.awaitProgress(availableGeneration, 100.msecs);
                 continue;
             }
             ArchiveRecord record;
             try record = decodeArchiveRecord(encoded, sequence);
-            catch (Exception) { spool.reportConflict(); return; }
+            catch (Exception e) {
+                spool.reportConflict();
+                captureException!("archive-worker", "record-decode")(e);
+                return;
+            }
             record.durableRedisApplied = durableRedisApplied;
             uint delayMs = 100;
             bool redisDone = record.kind != ArchiveKind.purge || durableRedisApplied;
             while (!stopping) {
                 ArchiveSpoolProgress status;
-                if (spool.tryProgress(status) && (status.failed || status.stopped || status.stopping)) return;
+                if (spoolEnded(status)) return;
                 ArchiveApplyResult result = ArchiveApplyResult.retry;
                 try {
                     if (!redisDone) {
@@ -585,7 +609,7 @@ final class ArchiveWorker {
                     }
                     if (!redisDone) {
                         if (redisPurge !is null) result = redisPurge(record);
-                        if (result == ArchiveApplyResult.conflict) { spool.reportConflict(); return; }
+                        if (result == ArchiveApplyResult.conflict) { terminalConflict(); return; }
                         if (result == ArchiveApplyResult.applied) {
                             // RAM admission of a persistence request is not its
                             // durable ACK. Never reach Mongo before slot sync.
@@ -595,22 +619,20 @@ final class ArchiveWorker {
                     }
                     if (redisDone) result = apply(record);
                 } catch (Exception) { result = ArchiveApplyResult.retry; }
-                if (result == ArchiveApplyResult.conflict) { spool.reportConflict(); return; }
+                if (result == ArchiveApplyResult.conflict) { terminalConflict(); return; }
                 if ((result == ArchiveApplyResult.applied || result == ArchiveApplyResult.discarded) && redisDone) {
                     while (!stopping) {
                         const generation = spool.progressGeneration();
                         if (spool.tryAcknowledge(sequence)) break;
-                        if (spool.tryProgress(status) && (status.failed || status.stopped || status.stopping)) return;
+                        if (spoolEnded(status)) return;
                         spool.awaitProgress(generation, 100.msecs);
                     }
                     // Retain one in-flight record until the disk owner confirms
                     // durable checkpoint, not merely RAM acceptance of its ACK.
                     while (!stopping) {
                         const generation = spool.progressGeneration();
-                        if (spool.tryProgress(status)) {
-                            if (status.failed || status.stopped || status.stopping) return;
-                            if (status.checkpoint >= sequence) break;
-                        }
+                        if (spoolEnded(status)) return;
+                        if (status.checkpoint >= sequence) break;
                         spool.awaitProgress(generation, 100.msecs);
                     }
                     break;
@@ -634,7 +656,7 @@ final class ArchiveWorker {
         while (!stopping) {
             const generation = spool.progressGeneration();
             ArchiveSpoolProgress status;
-            if (spool.tryProgress(status) && (status.failed || status.stopped || status.stopping)) return false;
+            if (spoolEnded(status)) return false;
             if (!requested) requested = spool.tryMarkRedisApplied(record.operationId, record.sequence);
             ArchiveOperationStatus retained;
             if (spool.tryOperationStatus(record.operationId, retained)

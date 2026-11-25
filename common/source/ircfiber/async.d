@@ -63,10 +63,12 @@ auto safeFiberRun(string event_, string network,
         scope(exit) free(mem);
         auto t = cast(Trampoline*) mem;
         try t.dg();
-        catch (Throwable e) {
-            // Enterprise: catch Throwable (SyncError) — previously only Exception,
-            // so SyncError killed the fiber as FATAL (cnTb-fin 2026-08-17).
-            // Log and swallow so the connection loop's own catch handles recovery.
+        catch (Exception e) {
+            import vibe.core.task : InterruptException;
+            if (cast(InterruptException)e is null) {
+                import ircfiber.errors : captureException;
+                captureException!("async", "fiber-run")(e);
+            }
             try {
                 string m;
                 try { m = e.msg; } catch (Throwable) { m = "unknown"; }
@@ -134,7 +136,12 @@ Task watchedRunTask(string label, string taskId, void delegate() dg) {
         }
 
         try dg();
-        catch (Throwable e) {
+        catch (Exception e) {
+            import vibe.core.task : InterruptException;
+            if (cast(InterruptException)e is null) {
+                import ircfiber.errors : captureException;
+                captureException!("async", "watched-task")(e);
+            }
             try {
                 string m;
                 try { m = e.msg; } catch (Throwable) { m = "unknown"; }
