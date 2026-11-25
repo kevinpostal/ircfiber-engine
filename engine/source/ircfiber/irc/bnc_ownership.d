@@ -343,9 +343,22 @@ final class BncEngineState {
             if (closing) {
                 if (auto b = ref_ in batches) { id = b.operation; p = id in operations; }
             } else {
-                const bad = (ref_ in batches) !is null || batches.length >= 256
-                    || (parent.length && bp is null) || (bp !is null && bp.quarantined);
-                size_t depth; string walk = parent;
+                // The connection already tracks ordinary replay batches.
+                // Their lifetime must not exhaust the private response budget.
+                if (auto existing = ref_ in batches) {
+                    existing.quarantined = true;
+                    if (auto original = existing.operation in operations)
+                        fail(*original, "INVALID_RESPONSE", "Malformed upstream response batch");
+                    if (p !is null) fail(*p, "INVALID_RESPONSE", "Malformed upstream response batch");
+                    return true;
+                }
+                if (!id.startsWith("bnc-")) return false;
+                const bad = batches.length >= 256
+                    || (bp !is null && bp.quarantined);
+                // A directly labeled root may sit inside a non-private batch.
+                // Unknown or historical parents were rejected by replayContext.
+                const ownedParent = bp is null ? "" : parent;
+                size_t depth; string walk = ownedParent;
                 while (walk.length && depth <= 16) {
                     auto ancestor = walk in batches;
                     if (ancestor is null) break;
@@ -353,10 +366,10 @@ final class BncEngineState {
                 }
                 if (bad || depth >= 16) {
                     if (p !is null) fail(*p, "INVALID_RESPONSE", "Malformed upstream response batch");
-                    if (batches.length < 256) batches[ref_] = OwnedBatch(parent, id, true);
+                    if (batches.length < 256) batches[ref_] = OwnedBatch(ownedParent, id, true);
                     return true;
                 }
-                batches[ref_] = OwnedBatch(parent, id, false);
+                batches[ref_] = OwnedBatch(ownedParent, id, false);
                 if (p !is null && !p.root.length) p.root = ref_;
             }
         }
@@ -931,6 +944,12 @@ final class BncEngineState {
                 walk = ancestor.parent;
             }
         }
+        // Older retained snapshots also included unrelated replay batches.
+        foreach (ref batch; nextBatches)
+            if (auto ancestor = batch.parent in nextBatches)
+                if (!ancestor.operation.startsWith("bnc-")) batch.parent = "";
+        foreach (key; nextBatches.keys)
+            if (!nextBatches[key].operation.startsWith("bnc-")) nextBatches.remove(key);
         foreach (string sid, Json v; j["leases"]) {
             auto l = decodeLease(v.toString()); l.seq = v["seq"].get!long; leases[sid] = l;
         }
@@ -1009,6 +1028,37 @@ void runBncOwnershipProtocolChecks() {
     adopted.expireOperations(30_001);
     assert(replies[$ - 1]["kind"].get!string == "error");
     assert(replies[$ - 1]["code"].get!string == "RESPONSE_TIMEOUT");
+
+    owner.request = randomUUID().toString();
+    auto whoState = new BncEngineState(null, "test", "network", "owner", "engine", hooks);
+    // Unrelated open replay batches may outlive a response. They must not
+    // prevent an independent WHO from receiving its private 352 and 315.
+    foreach (i; 0 .. 256) {
+        auto unrelated = event("BATCH", ["+public-" ~ i.to!string, "netsplit"]);
+        assert(!whoState.observeResponse(unrelated));
+    }
+    const whoLabel = whoState.writeOwned("WHO #test", owner, 1, epoch);
+    const beforeWho = replies.length;
+    auto whoOpen = event("BATCH", ["+who", "labeled-response"], whoLabel);
+    auto whoRow = event("352", ["me", "#test", "ident", "host", "server", "nick", "H", "0 Nick"], "", "who");
+    auto whoEnd = event("315", ["me", "#test", "End of WHO"], "", "who");
+    auto whoClose = event("BATCH", ["-who"]);
+    assert(whoState.observeResponse(whoOpen) && whoState.observeResponse(whoRow)
+        && whoState.observeResponse(whoEnd) && whoState.observeResponse(whoClose));
+    assert(replies.length == beforeWho + 5);
+    assert(replies[beforeWho + 1]["line"]["command"].get!string == "352");
+    assert(replies[beforeWho + 2]["line"]["command"].get!string == "315");
+    assert(replies[$ - 1]["kind"].get!string == "complete");
+    owner.request = randomUUID().toString();
+    const malformedLabel = whoState.writeOwned("WHO #broken", owner, 1, epoch);
+    auto brokenOpen = event("BATCH", ["+broken", "labeled-response"], malformedLabel);
+    auto brokenChild = event("BATCH", ["+unterminated", "example.com/nested"], "", "broken");
+    auto brokenClose = event("BATCH", ["-broken"]);
+    assert(whoState.observeResponse(brokenOpen) && whoState.observeResponse(brokenChild)
+        && whoState.observeResponse(brokenClose));
+    assert(replies[$ - 1]["kind"].get!string == "error"
+        && replies[$ - 1]["code"].get!string == "INVALID_RESPONSE");
+
 
     owner.request = "55555555-5555-4555-8555-555555555555";
     auto groupState = new BncEngineState(null, "test", "network", "owner", "engine", hooks);
