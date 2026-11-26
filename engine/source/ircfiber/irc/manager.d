@@ -22,17 +22,6 @@ import vibe.data.json : Json;
 import std.datetime : Clock;
 import core.time : Duration;
 
-/// Per-host circuit breaker state. Tracks consecutive failures to the
-/// same host so we don't hammer unresponsive servers (getting us banned).
-private struct HostCircuitBreaker {
-    /// Number of consecutive failures since last success.
-    int failCount;
-    /// Unix-ms timestamp when the circuit was last tripped (opened).
-    /// 0 = circuit is closed (normal operation).
-    long openedAt;
-    /// Unix-ms of the most recent attempt.
-    long lastAttemptAt;
-}
 
 struct MemoryNetworkCounters {
     string networkId;
@@ -302,9 +291,6 @@ final class ConnectionManager {
         UUID[string] networkOwners;
         RedisStorage redis;
         string serverId;
-        /// Per-host circuit breakers for smart rate limiting.
-        /// Keyed by host:port string (e.g. "irc.supernets.org:6697").
-        HostCircuitBreaker[string] hostBreakers;
         /// Client of this engine's connection holder (null only in tests).
         HolderClient holder;
         /// Networks removed on this engine, `networkId` → unix ms.
@@ -728,65 +714,6 @@ final class ConnectionManager {
         return [];
     }
 
-    /// Record a connection failure to a host. After FAIL_THRESHOLD consecutive
-    /// failures within the window, the circuit opens for COOLDOWN_MS.
-    void recordHostFailure(string host, int port) {
-        auto key = host ~ ":" ~ port.to!string;
-        auto now = Clock.currTime.toUnixTime!long * 1000;
-        auto breaker = key in hostBreakers;
-        if (breaker !is null) {
-            // Reset window if too much time passed since last attempt
-            if (now - breaker.lastAttemptAt > HOST_CIRCUIT_WINDOW_MS) {
-                breaker.failCount = 0;
-                breaker.openedAt = 0;
-            }
-            breaker.failCount++;
-            breaker.lastAttemptAt = now;
-            if (breaker.failCount >= HOST_FAIL_THRESHOLD && breaker.openedAt == 0) {
-                breaker.openedAt = now;
-                logWarn("Host circuit breaker OPENED for %s after %d failures (cooling down %d ms)",
-                    key, breaker.failCount, HOST_COOLDOWN_MS);
-            }
-        } else {
-            hostBreakers[key] = HostCircuitBreaker(1, 0, now);
-        }
-    }
-
-    /// Record a successful connection — resets the breaker for this host.
-    void recordHostSuccess(string host, int port) {
-        auto key = host ~ ":" ~ port.to!string;
-        if (auto breaker = key in hostBreakers) {
-            if (breaker.openedAt > 0) {
-                logInfo("Host circuit breaker CLOSED for %s (connection succeeded)", key);
-            }
-            hostBreakers.remove(key);
-        }
-    }
-
-    /// Check if the circuit breaker allows a new connection attempt.
-    /// Returns true if the connection is allowed, false if cooling down.
-    bool canConnectToHost(string host, int port) {
-        auto key = host ~ ":" ~ port.to!string;
-        if (auto breaker = key in hostBreakers) {
-            if (breaker.openedAt > 0) {
-                const now = Clock.currTime.toUnixTime!long * 1000;
-                if (now - breaker.openedAt < HOST_COOLDOWN_MS) {
-                    return false;
-                }
-                // Cooldown expired — close the circuit (reset for next cycle)
-                hostBreakers.remove(key);
-                logInfo("Host circuit breaker CLOSED for %s (cooldown expired)", key);
-            }
-        }
-        return true;
-    }
-
-    /// Time window for counting failures (rolling 30 minutes).
-    private static immutable HOST_CIRCUIT_WINDOW_MS = 30 * 60 * 1000;
-    /// Consecutive failures before opening the circuit.
-    private static immutable HOST_FAIL_THRESHOLD = 5;
-    /// Cooldown duration when circuit is open (30 minutes).
-    private static immutable HOST_COOLDOWN_MS = 30 * 60 * 1000;
 
     string[string] getChannelTopics(UUID networkId) {
         if (auto client = getClient(networkId)) {

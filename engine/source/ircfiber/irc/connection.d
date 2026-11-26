@@ -449,112 +449,10 @@ private bool webircSwapSuppressed(string hostLower, string ip) {
 /// legitimate browser origin here, so the session keeps the engine's IP.
 import ircfiber.netaddr : isPublicUnicast;
 
-// ── Per-host circuit breaker ─────────────────────────────────────────────────
-// Prevents hammering unresponsive servers with rapid reconnect attempts.
-// Shared across all PersistentIRCClient instances in the same process.
-// After HOST_FAIL_THRESHOLD consecutive failures to the same host:port within
-// HOST_WINDOW_MS, the circuit opens and blocks further attempts for
-// HOST_COOLDOWN_MS. Reset on any successful connection.
-private struct HostCircuitBreaker {
-    int failCount;
-    long openedAt;   // 0 = closed
-    long lastAttemptAt;
-    /// How many times the breaker has opened without a successful
-    /// connection in between; drives the escalating cooldown.
-    int openCount;
-}
-private HostCircuitBreaker[string] _hostBreakers;
-private __gshared Object gHostBreakerLock;
+// Per-host circuit breaker: see ircfiber.irc.host_breaker.
+import ircfiber.irc.host_breaker : recordHostFailure, recordHostSuccess, canConnectToHost, hostCooldownRemaining;
 private shared static this() {
-    try {
-        if (gMullvadLock is null) gMullvadLock = new Object();
-        gHostBreakerLock = new Object();
-    } catch (Throwable) {}
-}
-private shared static immutable HOST_WINDOW_MS   = 30 * 60 * 1000;  // 30 min
-private shared static immutable HOST_FAIL_THRESHOLD = 5;
-private shared static immutable HOST_COOLDOWN_MS = 5 * 60 * 1000;  // first cooldown; doubles per re-open
-private shared static immutable HOST_COOLDOWN_MAX_MS = 60 * 60 * 1000;
-
-/// Cooldown for the Nth opening of a host breaker: 5, 10, 20, 40, 60 min.
-private long hostCooldownMs(int openCount) @safe pure nothrow @nogc {
-    long ms = HOST_COOLDOWN_MS;
-    foreach (i; 1 .. openCount) {
-        ms *= 2;
-        if (ms >= HOST_COOLDOWN_MAX_MS) return HOST_COOLDOWN_MAX_MS;
-    }
-    return ms;
-}
-
-/// Record a connection failure to a host. Shared across all clients.
-void recordHostFailure(string host, int port) {
-    if (gHostBreakerLock !is null) synchronized (gHostBreakerLock) {
-        recordHostFailureLocked(host, port);
-        return;
-    }
-    recordHostFailureLocked(host, port);
-}
-private void recordHostFailureLocked(string host, int port) {
-    auto key = host ~ ":" ~ port.to!string;
-    auto now = Clock.currTime.toUnixTime!long * 1000;
-    auto breaker = key in _hostBreakers;
-    if (breaker !is null) {
-        if (now - breaker.lastAttemptAt > HOST_WINDOW_MS) {
-            breaker.failCount = 0;
-            breaker.openedAt = 0;
-            breaker.openCount = 0;
-        }
-        breaker.failCount++;
-        breaker.lastAttemptAt = now;
-        if (breaker.failCount >= HOST_FAIL_THRESHOLD && breaker.openedAt == 0) {
-            breaker.openedAt = now;
-            breaker.openCount++;
-            logWarn("Host circuit breaker OPENED for %s after %d failures (opening #%d, cooling down %d ms)",
-                key, breaker.failCount, breaker.openCount, hostCooldownMs(breaker.openCount));
-        }
-    } else {
-        _hostBreakers[key] = HostCircuitBreaker(1, 0, now, 0);
-    }
-}
-
-/// Record a successful connection — resets the breaker for this host.
-void recordHostSuccess(string host, int port) {
-    if (gHostBreakerLock !is null) synchronized (gHostBreakerLock) {
-        auto key = host ~ ":" ~ port.to!string;
-        if (auto breaker = key in _hostBreakers) {
-            _hostBreakers.remove(key);
-            logInfo("Host circuit breaker CLOSED for %s (connection succeeded)", key);
-        }
-        return;
-    }
-    auto key = host ~ ":" ~ port.to!string;
-    if (auto breaker = key in _hostBreakers) {
-        _hostBreakers.remove(key);
-        logInfo("Host circuit breaker CLOSED for %s (connection succeeded)", key);
-    }
-}
-
-/// Check if the circuit breaker allows a new connection. Returns false
-/// (don't connect) when the circuit is open and still in cooldown.
-bool canConnectToHost(string host, int port) {
-    if (gHostBreakerLock !is null) synchronized (gHostBreakerLock) {
-        return canConnectToHostLocked(host, port);
-    }
-    return canConnectToHostLocked(host, port);
-}
-private bool canConnectToHostLocked(string host, int port) {
-    auto key = host ~ ":" ~ port.to!string;
-    if (auto breaker = key in _hostBreakers) {
-        if (breaker.openedAt > 0) {
-            const now = Clock.currTime.toUnixTime!long * 1000;
-            if (now - breaker.openedAt < hostCooldownMs(breaker.openCount)) {
-                return false;
-            }
-            _hostBreakers.remove(key);
-            logInfo("Host circuit breaker CLOSED for %s (cooldown expired)", key);
-        }
-    }
-    return true;
+    try { if (gMullvadLock is null) gMullvadLock = new Object(); } catch (Throwable) {}
 }
 
 // ── Enterprise connection timeouts ───────────────────────────────────────────
@@ -9381,28 +9279,12 @@ final class PersistentIRCClient {
             // The cooldown doubles every time the breaker re-opens
             // (5 → 10 → 20 → 40 → 60 min) — see hostCooldownMs().
             auto hostKey = config.host ~ ":" ~ config.port.to!string;
-            if (auto breaker = hostKey in _hostBreakers) {
-                if (breaker.openedAt > 0) {
-                    const now = Clock.currTime.toUnixTime!long * 1000;
-                    const elapsed = now - breaker.openedAt;
-                    const cooldown = hostCooldownMs(breaker.openCount);
-                    if (elapsed < cooldown) {
-                        auto remaining = cooldown - elapsed;
-                        const remainingDur = dur!"msecs"(remaining);
-                        if (remainingDur > delay) {
-                            delay = remainingDur;
-                            logWarn("Host circuit breaker active for %s — extending delay to %s",
-                                hostKey, delay);
-                        }
-                    } else {
-                        // Cooldown expired — half-open: allow attempts again but
-                        // remember how often this host has tripped so the next
-                        // opening cools down for longer.
-                        breaker.openedAt = 0;
-                        breaker.failCount = 0;
-                        logInfo("Host circuit breaker reset for %s (cooldown expired, opened %d× so far)",
-                            hostKey, breaker.openCount);
-                    }
+            {
+                const remainingDur = hostCooldownRemaining(config.host, config.port);
+                if (remainingDur > delay) {
+                    delay = remainingDur;
+                    logWarn("Host circuit breaker active for %s — extending delay to %s",
+                        hostKey, delay);
                 }
             }
 
