@@ -1,4 +1,6 @@
 # ============================================================================
+# Local dev stack lives in the single canonical deploy tree (site/deploy).
+LOCAL_STACK_DIR ?= ../site/deploy/local
 # IRC Fiber Makefile
 # ============================================================================
 # Best practices:
@@ -303,7 +305,7 @@ debug: ensure-colima ## Component > Gateway only (REST API) — leaves engine/IR
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Gateway only (engine untouched)  $(R)"
 	@if ! docker info >/dev/null 2>&1; then printf "%b\n" "$(Y)$(WR) Docker not running — run: colima start$(R)"; exit 1; fi
 	@# Ensure redis/mongo are healthy — reuse local stack if already up, else start root stack DBs
-	@if docker compose -f deploy/local/docker-compose.yml ps redis mongo 2>/dev/null | grep -q "healthy"; then \
+	@if docker compose -f $(LOCAL_STACK_DIR)/docker-compose.yml ps redis mongo 2>/dev/null | grep -q "healthy"; then \
 		printf "%b\n" "$(BG)$(OK) Reusing local DB stack (ircfiber-redis/mongo)$(R)"; \
 	elif docker ps --format "{{.Names}}" 2>/dev/null | grep -q "^ircfiber-redis$$" && docker inspect ircfiber-redis --format '{{.State.Health.Status}}' 2>/dev/null | grep -q "healthy"; then \
 		printf "%b\n" "$(BG)$(OK) Reusing local DB stack (ircfiber-redis/mongo)$(R)"; \
@@ -455,12 +457,12 @@ stop: ## Component > Stop debug/debug-live + local docker stacks (tailnet + loca
 	if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then \
 		docker compose -p ircfiber-tailnet -f docker-compose.tailnet.yml down --remove-orphans 2>/dev/null && \
 			printf "%b\n" "$(C)  → docker compose tailnet stack stopped$(R)" || true; \
-		if [ -f deploy/local/docker-compose.yml ]; then \
-			docker compose -f deploy/local/docker-compose.yml --profile observability down --remove-orphans --timeout 15 2>/dev/null || true; \
-			docker compose -f deploy/local/docker-compose.yml down --remove-orphans --timeout 15 2>/dev/null && \
+		if [ -f $(LOCAL_STACK_DIR)/docker-compose.yml ]; then \
+			docker compose -f $(LOCAL_STACK_DIR)/docker-compose.yml --profile observability down --remove-orphans --timeout 15 2>/dev/null || true; \
+			docker compose -f $(LOCAL_STACK_DIR)/docker-compose.yml down --remove-orphans --timeout 15 2>/dev/null && \
 				printf "%b\n" "$(C)  → docker compose local stack stopped$(R)" || true; \
 		docker compose stop ircfiber-gateway ircfiber-engine 2>/dev/null || true; \
-		docker compose -f deploy/local/docker-compose.yml stop ircfiber-gateway ircfiber-engine 2>/dev/null || true; \
+		docker compose -f $(LOCAL_STACK_DIR)/docker-compose.yml stop ircfiber-gateway ircfiber-engine 2>/dev/null || true; \
 	fi; \
 	killall -9 irc-fiber irc-fiber-gateway 2>/dev/null || true; \
 	killall -9 irc-fiber-engine 2>/dev/null || true; \
@@ -767,11 +769,11 @@ ircfiber-default-migrate: ## Build > Backfill the default IRC Fiber network for 
 # Python gateway (Step 3 swappable API)
 api-python-up: ## Python API > Bring up Python gateway alongside D gateway (local dev)
 	@printf '\n%b\n' "$(_BC)$(K)$(B)  Python gateway up  $(R)"
-	@docker compose -f deploy/local/docker-compose.yml -f deploy/local/docker-compose.override.python.yml up -d irc-fiber-api-py
+	@docker compose -f $(LOCAL_STACK_DIR)/docker-compose.yml -f $(LOCAL_STACK_DIR)/docker-compose.override.python.yml up -d irc-fiber-api-py
 	@printf '%b\n' "$(BG)$(OK) Python gateway running at http://127.0.0.1:8001 (health: /api/ping)$(R)"
 
 api-python-down: ## Python API > Stop Python gateway
-	@docker compose -f deploy/local/docker-compose.yml -f deploy/local/docker-compose.override.python.yml down --remove-orphans || true
+	@docker compose -f $(LOCAL_STACK_DIR)/docker-compose.yml -f $(LOCAL_STACK_DIR)/docker-compose.override.python.yml down --remove-orphans || true
 	@printf '%b\n' "$(BG)$(OK) Python gateway stopped$(R)"
 
 api-python-build: ## Python API > Build Python gateway image
@@ -868,7 +870,7 @@ define _docker_setup
  	fi; \
 	# Reuse local stack DBs if they're already healthy — avoids duplicate
 	# redis/mongo/ircd on different networks. Check local compose first.
-	if docker compose -f deploy/local/docker-compose.yml ps mongo redis ircd 2>/dev/null | grep -q "healthy"; then \
+	if docker compose -f $(LOCAL_STACK_DIR)/docker-compose.yml ps mongo redis ircd 2>/dev/null | grep -q "healthy"; then \
 		printf "%b\n" "$(BG)$(OK) Local DB stack already running (ircfiber-redis/mongo/ircd) — reusing, skipping root DB startup$(R)"; \
 	elif docker ps --format "{{.Names}}" 2>/dev/null | grep -q "^ircfiber-redis$$" && docker inspect ircfiber-redis --format '{{.State.Health.Status}}' 2>/dev/null | grep -q "healthy"; then \
 		printf "%b\n" "$(BG)$(OK) Local DB stack already running (ircfiber-redis/mongo/ircd) — reusing, skipping root DB startup$(R)"; \
@@ -1241,11 +1243,11 @@ docker-down: ensure-colima ## Docker > Stop ALL IRC Fiber containers (3 compose 
 	@printf '%b\n' "$(D)→ Stopping test stack (docker-compose.test.yml)...$(R)"
 	@docker compose -f docker-compose.test.yml down --timeout 10 2>/dev/null || true
 	@printf '%b\n' "$(BG)$(OK) Test stack stopped$(R)"
-	@printf '%b\n' "$(D)→ Stopping local dev stack (deploy/local/docker-compose.yml)...$(R)"
-	@if [ -f deploy/local/docker-compose.yml ]; then \
-		docker compose -f deploy/local/docker-compose.yml down --remove-orphans --timeout 15 2>/dev/null || true; \
+	@printf '%b\n' "$(D)→ Stopping local dev stack ($(LOCAL_STACK_DIR)/docker-compose.yml)...$(R)"
+	@if [ -f $(LOCAL_STACK_DIR)/docker-compose.yml ]; then \
+		docker compose -f $(LOCAL_STACK_DIR)/docker-compose.yml down --remove-orphans --timeout 15 2>/dev/null || true; \
 	else \
-		printf '%b\n' "$(D)  (skipped — deploy/local/docker-compose.yml not present)$(R)"; \
+		printf '%b\n' "$(D)  (skipped — $(LOCAL_STACK_DIR)/docker-compose.yml not present)$(R)"; \
 	fi
 	@if docker network inspect irc_fiber_irc_network >/dev/null 2>&1; then \
 		printf '%b\n' "$(D)→ Detaching any external containers from irc_fiber_irc_network...$(R)"; \
@@ -1397,7 +1399,7 @@ engine-start: ensure-colima ## Docker > Start Holder + Engine in background (det
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Holder + Engine (detached, holder holds IRC)  $(R)"
 	@if ! docker info >/dev/null 2>&1; then printf "%b\n" "$(Y)$(WR) Docker not running$(R)"; exit 1; fi
 	@# Ensure DBs + ircd are up (engine needs ircd, gateway does not)
-	@if docker compose -f deploy/local/docker-compose.yml ps redis mongo 2>/dev/null | grep -q "healthy"; then \
+	@if docker compose -f $(LOCAL_STACK_DIR)/docker-compose.yml ps redis mongo 2>/dev/null | grep -q "healthy"; then \
 		printf "%b\n" "$(BG)$(OK) Reusing local DB stack$(R)"; \
 	elif ! docker compose ps redis mongo ircd 2>/dev/null | grep -q "healthy"; then \
 		printf "%b\n" "$(C)  → starting redis/mongo/ircd (engine deps)…$(R)"; \
@@ -1429,7 +1431,7 @@ engine-start: ensure-colima ## Docker > Start Holder + Engine in background (det
 	@printf '%b\n' "$(C)  ─ containers $(R)"; docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" | grep -E "ircfiber-holder|ircfiber-engine|irc_redis|irc_mongo|ircd" | sed "s/^/    /" || true
 	@printf '%b\n' "$(D)  Tail: make engine-logs / holder-logs  |  hot swap: make engine-restart-docker  |  holder: make holder-status  |  stop: make engine-down$(R)"
 engine-down: ## Docker > Stop Engine container only (gateway untouched)
-	@docker compose stop ircfiber-engine 2>/dev/null || docker compose -f deploy/local/docker-compose.yml stop ircfiber-engine 2>/dev/null || true
+	@docker compose stop ircfiber-engine 2>/dev/null || docker compose -f $(LOCAL_STACK_DIR)/docker-compose.yml stop ircfiber-engine 2>/dev/null || true
 	@printf '%b\n' "$(BG)$(OK) Engine stopped (gateway untouched)$(R)"
 engine-stop: engine-down ## Docker > Alias: stop engine
 # Recreates ONLY the engine: the holder keeps every IRC socket, the old
@@ -1551,15 +1553,15 @@ docker-restart-code: ensure-colima ## Dev > Rebuild frontend + D binaries + rest
 .PHONY: local-dev-up local-dev-down local-dev-down-clean local-dev-smoke local-dev-up-observability
 .PHONY: local-up local-up-observability local-down local-down-clean local-ircd
 local-up:                                 ## Local > Up without SigNoz (default, ~300 MB)
-	docker compose -f deploy/local/docker-compose.yml up -d
+	docker compose -f $(LOCAL_STACK_DIR)/docker-compose.yml up -d
 
 local-ircd: ensure-colima                  ## Local > Up + seed LocalIRCD (ircd:6667) → /irc/LocalIRCD
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  LocalIRCD — stack + network  $(R)"
 	@if lsof -i :6667 >/dev/null 2>&1 && docker ps --format '{{.Names}}' | grep -qx 'ircd_test'; then \
 		printf '%b\n' "$(Y)$(WR)  Port 6667 taken by ircd_test — local ircd will use host 16667 (engine still dials ircd:6667 internally)$(R)"; \
-		IRCD_HOST_PORT=16667 docker compose -f deploy/local/docker-compose.yml up -d; \
+		IRCD_HOST_PORT=16667 docker compose -f $(LOCAL_STACK_DIR)/docker-compose.yml up -d; \
 	else \
-		docker compose -f deploy/local/docker-compose.yml up -d; \
+		docker compose -f $(LOCAL_STACK_DIR)/docker-compose.yml up -d; \
 	fi
 	@for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do \
 		if curl -fsS http://127.0.0.1:8090/health >/dev/null 2>&1; then break; fi; \
@@ -1569,25 +1571,25 @@ local-ircd: ensure-colima                  ## Local > Up + seed LocalIRCD (ircd:
 	@printf '\n%b\n' "$(BG)$(OK) Done — open http://127.0.0.1:8090/irc/LocalIRCD $(R)"
 
 local-up-observability:                   ## Local > Up with SigNoz (observability, ~4 GB)
-	IRCFIBER_OTEL_ENABLED=1 docker compose --profile observability -f deploy/local/docker-compose.yml up -d
+	IRCFIBER_OTEL_ENABLED=1 docker compose --profile observability -f $(LOCAL_STACK_DIR)/docker-compose.yml up -d
 
 local-down:                               ## Local > Down (preserve data)
-	docker compose -f deploy/local/docker-compose.yml down
+	docker compose -f $(LOCAL_STACK_DIR)/docker-compose.yml down
 
 local-down-clean:                         ## Local > Down + wipe volumes (Caution: destroys data)
-	docker compose -f deploy/local/docker-compose.yml down -v
+	docker compose -f $(LOCAL_STACK_DIR)/docker-compose.yml down -v
 
 local-dev-up:                               ## Dev > Bring up local SigNoz + IRC Fiber stack
-	docker compose -f deploy/local/docker-compose.yml up -d
+	docker compose -f $(LOCAL_STACK_DIR)/docker-compose.yml up -d
 
 local-dev-down:                             ## Dev > Stop local stack (preserve data)
-	docker compose -f deploy/local/docker-compose.yml down
+	docker compose -f $(LOCAL_STACK_DIR)/docker-compose.yml down
 
 local-dev-down-clean:                       ## Dev > Stop local stack and wipe all volumes (Caution: destroys ClickHouse data)
-	docker compose -f deploy/local/docker-compose.yml down -v
+	docker compose -f $(LOCAL_STACK_DIR)/docker-compose.yml down -v
 
 local-dev-up-observability:                 ## Dev > Bring up local stack WITH SigNoz (~4 GB)
-	IRCFIBER_OTEL_ENABLED=1 docker compose --profile observability -f deploy/local/docker-compose.yml up -d
+	IRCFIBER_OTEL_ENABLED=1 docker compose --profile observability -f $(LOCAL_STACK_DIR)/docker-compose.yml up -d
 
 local-dev-smoke:                            ## Dev > Run observability smoke test against local stack
 	bash tests/local-dev/smoke-observability.sh
@@ -1603,7 +1605,7 @@ local-dev-smoke:                            ## Dev > Run observability smoke tes
 .PHONY: signoz-up signoz-down signoz-logs signoz-status
 signoz-up: ensure-colima ## SigNoz > Start observability stack (detached, gateway/engine untouched)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  SigNoz up (detached, ~4 GB)  $(R)"
-	@IRCFIBER_OTEL_ENABLED=1 docker compose -f deploy/local/docker-compose.yml --profile observability up -d clickhouse zookeeper signoz otel-collector fluent-bit
+	@IRCFIBER_OTEL_ENABLED=1 docker compose -f $(LOCAL_STACK_DIR)/docker-compose.yml --profile observability up -d clickhouse zookeeper signoz otel-collector fluent-bit
 	@printf '\n%b\n' "$(BG)$(OK) SigNoz running$(R) $(D)(http://localhost:3301  OTLP:4317/4318)$(R)"
 	@printf '%b\n' "$(C)  ─ containers $(R)"; docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" | grep -E "clickhouse|zookeeper|signoz|otel-collector|fluent" | sed "s/^/    /" || true
 	@# Bridge root gateway/engine to ircfiber_local (actual compose name: local_ircfiber_local) so OTLP reaches collector
@@ -1623,11 +1625,11 @@ signoz-up: ensure-colima ## SigNoz > Start observability stack (detached, gatewa
 
 signoz-down: ## SigNoz > Stop observability stack (preserve data, gateway/engine untouched)
 	@printf '\n%b\n' "$(_BCn)$(K)$(B)  Stopping SigNoz  $(R)"
-	@docker compose -f deploy/local/docker-compose.yml --profile observability stop clickhouse zookeeper signoz otel-collector fluent-bit 2>/dev/null || true
+	@docker compose -f $(LOCAL_STACK_DIR)/docker-compose.yml --profile observability stop clickhouse zookeeper signoz otel-collector fluent-bit 2>/dev/null || true
 	@printf '%b\n' "$(BG)$(OK) SigNoz stopped (data preserved)$(R) $(D)(wipe with: make local-down-clean)$(R)"
 
 signoz-logs: ## SigNoz > Tail SigNoz + OTel collector logs
-	@docker compose -f deploy/local/docker-compose.yml logs -f signoz otel-collector
+	@docker compose -f $(LOCAL_STACK_DIR)/docker-compose.yml logs -f signoz otel-collector
 
 signoz-status: ## SigNoz > Show observability containers + health
 	@printf "\n%b\n" "$(_BC)$(K)$(B)  SigNoz status  $(R)"

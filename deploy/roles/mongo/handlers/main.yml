@@ -1,5 +1,0 @@
----
-- name: Restart mongo
-  community.docker.docker_container:
-    name: "{{ mongo_container_name }}"
-    restart: true

@@ -1,4 +1,0 @@
----
-backup_s3_endpoint: ""    # e.g. https://s3.amazonaws.com — empty for AWS default
-backup_s3_region: "us-east-1"
-backup_compress_level: 6
