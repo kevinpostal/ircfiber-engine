@@ -1767,7 +1767,9 @@ void recoveryTransitionChecks() {
         clearServicesOperations();
         setLegacyAuthTerminalClassifier(null);
     }
-    foreach (completeFence; [true, false]) {
+    foreach (ordering; ["nick_before_fence", "missing_fence", "captured_fence_before_nick"]) {
+        const captured = ordering == "captured_fence_before_nick";
+        const completeFence = ordering != "missing_fence";
         auto r = Rig.make(false);
         r.host.cfg.provider = ServicesProvider.anope;
         r.host.cfg.server = "svc.extnet.test";
@@ -1778,32 +1780,56 @@ void recoveryTransitionChecks() {
         r.fenceReply(0, external);
         r.feed(external ~ "NOTICE me :Syntax: RECOVER nickname [password]");
         r.fenceReply(1, external);
-        r.fenceReply(2, external);
-        r.feed("@msgid=recover-command :me!user@client.test PRIVMSG NickSvc@svc.extnet.test :RECOVER reclaimed private-test-password");
-        r.feed(external ~ "NOTICE me :You have regained control of \x02reclaimed\x02.");
+        // safe-wire-live7c8.jsonl, 2026-11-26 13:28:41 UTC: the actor's
+        // own socket receives echo, regained NOTICE, end fence, then NICK.
+        // Other sockets see NICK earlier, but cannot reorder this stream.
+        r.feed("@time=2026-11-26T13:28:41.696Z;msgid=7EX~1795699181~30247 "
+            ~ external ~ "NOTICE me :\x01PING " ~ r.fence(2) ~ "\x01");
+        r.feed("@time=2026-11-26T13:28:41.746Z;msgid=7EX~1795699181~30248;inspircd.org/echo;account=acct "
+            ~ ":me!user@client.test PRIVMSG NickSvc :RECOVER reclaimed private-test-password");
+        r.feed("@time=2026-11-26T13:28:41.747Z;msgid=7EX~1795699181~30252;inspircd.org/service;bot "
+            ~ external ~ "NOTICE me :You have regained control of \x02reclaimed\x02.");
         ok("recognized RECOVER acknowledgement alone cannot complete before end fence",
             r.results.length == 0);
-        r.feed(":me!user@client.test NICK :reclaimed");
-        r.host.nick = "reclaimed";
-        r.fenceReply(3, ":NickSvc!services@impostor.test ", "reclaimed");
-        r.fenceReply(3, external, "bystander");
-        r.feed(external ~ "NOTICE reclaimed :\x01PING " ~ r.fence(3) ~ "\x01", true);
-        ok("own NICK does not permit unpinned, unrelated-recipient or historical fences",
-            r.results.length == 0);
-        if (completeFence) r.fenceReply(3, external, "reclaimed");
-        else {
-            r.host.now += 31_000;
-            r.t.tick();
-        }
-        if (completeFence) {
-            ok("verified end fence after own NICK confirms real 2.0 RECOVER once",
+        if (captured) {
+            r.feed("@time=2026-11-26T13:28:41.747Z;msgid=7EX~1795699181~30253;inspircd.org/service;bot "
+                ~ external ~ "NOTICE me :\x01PING " ~ r.fence(3) ~ "\x01");
+            ok("captured actor-socket old-nick end fence confirms before queued own NICK",
                 r.results.length == 1 && r.last.status == ServiceStatus.confirmed
                 && r.last.data["effect"].get!string == "nicknameRecovered"
-                && r.last.data["currentNick"].get!string == "reclaimed"
-                && r.last.data["nickHeld"].get!bool);
+                && r.last.data["currentNick"].get!string == "me"
+                && !r.last.data["nickHeld"].get!bool);
+        }
+        r.feed("@time=2026-11-26T13:28:41.748Z;account=acct :me!user@client.test NICK :reclaimed");
+        r.host.nick = "reclaimed";
+        if (captured) {
+            r.host.now += 31_000;
+            r.t.tick();
+            ok("later own NICK cannot rewrite or duplicate the captured RECOVER result",
+                r.results.length == 1 && r.last.status == ServiceStatus.confirmed
+                && r.last.data["currentNick"].get!string == "me"
+                && !r.last.data["nickHeld"].get!bool);
         } else {
-            ok("own NICK plus recognized RECOVER acknowledgement cannot replace missing fence",
-                r.results.length == 1 && r.last.status == ServiceStatus.unconfirmed);
+            r.fenceReply(3, ":NickSvc!services@impostor.test ", "reclaimed");
+            r.fenceReply(3, external, "bystander");
+            r.feed(external ~ "NOTICE reclaimed :\x01PING " ~ r.fence(3) ~ "\x01", true);
+            ok("own NICK does not permit unpinned, unrelated-recipient or historical fences",
+                r.results.length == 0);
+            if (completeFence) r.fenceReply(3, external, "reclaimed");
+            else {
+                r.host.now += 31_000;
+                r.t.tick();
+            }
+            if (completeFence) {
+                ok("verified end fence after own NICK confirms real 2.0 RECOVER once",
+                    r.results.length == 1 && r.last.status == ServiceStatus.confirmed
+                    && r.last.data["effect"].get!string == "nicknameRecovered"
+                    && r.last.data["currentNick"].get!string == "reclaimed"
+                    && r.last.data["nickHeld"].get!bool);
+            } else {
+                ok("own NICK plus recognized RECOVER acknowledgement cannot replace missing fence",
+                    r.results.length == 1 && r.last.status == ServiceStatus.unconfirmed);
+            }
         }
         ok("credential-bearing RECOVER details remain private", r.last.details.length == 0);
         ok("RECOVER mutation is never replayed across own NICK or deadline",
