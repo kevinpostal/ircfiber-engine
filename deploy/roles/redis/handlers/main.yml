@@ -1,5 +1,0 @@
----
-- name: Restart redis
-  community.docker.docker_container:
-    name: "{{ redis_container_name }}"
-    restart: true

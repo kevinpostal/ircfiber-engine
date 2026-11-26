@@ -158,7 +158,7 @@ services:
       - signoz-network
     volumes:
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
-      - ./deploy/local/parsers.conf:/fluent-bit/etc/parsers.conf:ro
+      - ../site/deploy/local/parsers.conf:/fluent-bit/etc/parsers.conf:ro
       - ./fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
     command: ["/fluent-bit/bin/fluent-bit", "-c", "/fluent-bit/etc/fluent-bit.conf"]
 
