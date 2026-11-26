@@ -359,7 +359,7 @@ debug-all: ensure-colima ## Component > Full stack: gateway + engine (both) — 
 		stamp_eng=.docker-build-stamp-engine; \
 		build_gw=0; build_eng=0; \
 		if [ ! -f "$$stamp_eng" ] || [ Containerfile -nt "$$stamp_eng" ] || [ engine/dub.sdl -nt "$$stamp_eng" ] || [ engine/dub.selections.json -nt "$$stamp_eng" ] || [ common/dub.sdl -nt "$$stamp_eng" ] || [ common/dub.selections.json -nt "$$stamp_eng" ]; then build_eng=1; \
-		elif [ -n "$$(find engine/source common/source deploy/roles/engine/files -type f -newer "$$stamp_eng" 2>/dev/null | head -n1)" ]; then build_eng=1; fi; \
+		elif [ -n "$$(find engine/source common/source scripts/runtime -type f -newer "$$stamp_eng" 2>/dev/null | head -n1)" ]; then build_eng=1; fi; \
 		if [ ! -f "$$stamp_gw" ] || [ Containerfile -nt "$$stamp_gw" ] || [ backend/dub.sdl -nt "$$stamp_gw" ] || [ backend/dub.selections.json -nt "$$stamp_gw" ] || [ common/dub.sdl -nt "$$stamp_gw" ] || [ common/dub.selections.json -nt "$$stamp_gw" ] || [ frontend/package.json -nt "$$stamp_gw" ]; then build_gw=1; \
 		elif [ -n "$$(find backend/source backend/views common/source config public deploy/roles/gateway -type f -newer "$$stamp_gw" 2>/dev/null | head -n1)" ]; then build_gw=1; fi; \
 		svcs=""; [ "$$build_gw" = "1" ] && svcs="$$svcs ircfiber-gateway"; [ "$$build_eng" = "1" ] && svcs="$$svcs ircfiber-holder ircfiber-engine"; \
@@ -1409,7 +1409,7 @@ engine-start: ensure-colima ## Docker > Start Holder + Engine in background (det
 	fi
 	@stamp_eng=.docker-build-stamp-engine; build_eng=0; \
 		if [ ! -f "$$stamp_eng" ] || [ Containerfile -nt "$$stamp_eng" ] || [ engine/dub.sdl -nt "$$stamp_eng" ] || [ engine/dub.selections.json -nt "$$stamp_eng" ] || [ common/dub.sdl -nt "$$stamp_eng" ] || [ common/dub.selections.json -nt "$$stamp_eng" ]; then build_eng=1; \
-		elif [ -n "$$(find engine/source common/source deploy/roles/engine/files -type f -newer "$$stamp_eng" 2>/dev/null | head -n1)" ]; then build_eng=1; fi; \
+		elif [ -n "$$(find engine/source common/source scripts/runtime -type f -newer "$$stamp_eng" 2>/dev/null | head -n1)" ]; then build_eng=1; fi; \
 		if [ "$$build_eng" = "1" ]; then printf "\n%b\n" "$(_BCn)$(K)$(B)  Building holder + engine images  $(R)"; DOCKER_BUILDKIT=1 docker compose build ircfiber-holder ircfiber-engine; touch "$$stamp_eng"; \
 		else printf "%b\n" "$(BG)$(OK) Holder + engine images up-to-date — skipping build (cached)$(R)"; fi; \
 		if [ "$$build_eng" = "1" ]; then docker rm -f ircfiber-engine 2>/dev/null || true; fi

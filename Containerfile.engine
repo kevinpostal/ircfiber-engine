@@ -171,8 +171,8 @@ COPY config/ ./config/
 RUN mkdir -p /app/data /app/uploads
 
 # Engine entrypoint + healthcheck
-COPY deploy/roles/engine/files/ircfiber-engine-entrypoint.sh /usr/local/bin/ircfiber-engine-entrypoint.sh
-COPY deploy/roles/engine/files/ircfiber-engine-healthcheck.sh /usr/local/bin/ircfiber-engine-healthcheck.sh
+COPY scripts/runtime/ircfiber-engine-entrypoint.sh /usr/local/bin/ircfiber-engine-entrypoint.sh
+COPY scripts/runtime/ircfiber-engine-healthcheck.sh /usr/local/bin/ircfiber-engine-healthcheck.sh
 RUN chmod 0755 /usr/local/bin/ircfiber-engine-entrypoint.sh \
               /usr/local/bin/ircfiber-engine-healthcheck.sh
 
