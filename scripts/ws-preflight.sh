@@ -119,7 +119,7 @@ case "$CODE" in
     ;;
   404)
     say 'FAIL  HTTP 404 - /signoz/ws/logs/* not in Caddyfile.j2 handle_path block'
-    say '      remediation: deploy/roles/caddy/templates/Caddyfile.j2:60-79 may need a dedicated handle_path /signoz/ws/logs/* block with flush_interval -1'
+    say '      remediation: site/deploy/roles/caddy/templates/Caddyfile.j2:60-79 may need a dedicated handle_path /signoz/ws/logs/* block with flush_interval -1'
     exit 1
     ;;
   502)
