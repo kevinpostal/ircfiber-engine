@@ -130,11 +130,7 @@
         - >-
           mongosh --quiet
           --host {{ mongo_bind_ip }}
-          -u {{ vault_mongo_app_username }}
-          -p {{ vault_mongo_app_password }}
-          --authenticationDatabase {{ mongo_initdb_database }}
-          --eval 'db.adminCommand({ping:1}).ok'
-          | grep -q 1
+          --eval 'quit(db.adminCommand({ping:1}).ok === 1 ? 0 : 1)'
       interval: "{{ mongo_healthcheck_interval }}"
       timeout: "{{ mongo_healthcheck_timeout }}"
       retries: "{{ mongo_healthcheck_retries }}"
@@ -147,12 +143,9 @@
   ansible.builtin.command: >
     docker exec {{ mongo_container_name }} mongosh --quiet
     --host {{ mongo_bind_ip }}
-    -u {{ vault_mongo_app_username }}
-    -p {{ vault_mongo_app_password }}
-    --authenticationDatabase {{ mongo_initdb_database }}
-    --eval 'db.adminCommand({ping:1}).ok'
+    --eval 'quit(db.adminCommand({ping:1}).ok === 1 ? 0 : 1)'
   register: mongo_ping
-  until: mongo_ping.stdout is search("1")
+  until: mongo_ping.rc == 0
   retries: 12
   delay: 5
   changed_when: false
