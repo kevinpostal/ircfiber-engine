@@ -394,53 +394,7 @@ private string webircPassword() {
     return cached;
 }
 
-/// WEBIRC-swap suppression after a Z-line kill, keyed `hostLower|ip`.
-/// Swapping into an address the server just banned gets this session killed
-/// with it (p34c3, 2026-09-10: every site attach re-asserted a Mullvad exit
-/// under an active connectban loop-ban, and each 5-minute ban reaped the
-/// swapped engine session). After applyBanPolicy records one,
-/// performRegistration skips asserting that IP for ZLINE_SWAP_SUPPRESS_MS
-/// and the session keeps the engine IP: slightly wrong geo display, stays
-/// alive. Recorded unconditionally when a fiber session dies asserting an
-/// IP — whether the ban targeted the asserted address or the socket, the
-/// next swap into it is unsafe either way.
-private enum ZLINE_SWAP_SUPPRESS_MS = 30 * 60 * 1000L; // 30 min
-private __gshared long[string] webircSwapSuppressedUntil;
-
-private string webircSuppressKey(string hostLower, string ip) @safe pure {
-    return hostLower ~ "|" ~ ip;
-}
-
-private void suppressWebircSwapFor(string host, string ip, long durationMs = ZLINE_SWAP_SUPPRESS_MS) {
-    if (host.length == 0 || ip.length == 0) return;
-    import std.string : toLower;
-    const hl = host.toLower();
-    const exp = nowMsSafe() + durationMs;
-    if (gMullvadLock !is null) synchronized (gMullvadLock) {
-        webircSwapSuppressedUntil[webircSuppressKey(hl, ip)] = exp;
-    } else {
-        webircSwapSuppressedUntil[webircSuppressKey(hl, ip)] = exp;
-    }
-    logWarn("WEBIRC swap suppressed: %s for %s for %d ms (until %d)", ip, hl, durationMs, exp);
-}
-
-private bool webircSwapSuppressed(string hostLower, string ip) {
-    if (hostLower.length == 0 || ip.length == 0) return false;
-    const now = nowMsSafe();
-    const k = webircSuppressKey(hostLower, ip);
-    if (gMullvadLock !is null) synchronized (gMullvadLock) {
-        if (auto p = k in webircSwapSuppressedUntil) {
-            if (now < *p) return true;
-            webircSwapSuppressedUntil.remove(k);
-        }
-        return false;
-    }
-    if (auto p = k in webircSwapSuppressedUntil) {
-        if (now < *p) return true;
-        webircSwapSuppressedUntil.remove(k);
-    }
-    return false;
-}
+import ircfiber.irc.webirc_suppress : suppressWebircSwapFor, webircSwapSuppressed;
 
 /// `isPublicUnicast` (shared with the holder's dial guard): load-bearing,
 /// not hygiene. The address forwarded via WEBIRC is what the ircd
@@ -1075,56 +1029,16 @@ shared static this() {
     // main loop). Unprotected __gshared access caused SyncError@(0) on
     // 2026-08-17 cnTb-fin — this mutex eliminates that class of crash.
     try { gMullvadLock = new Object(); } catch (Throwable) {}
-    try { if (gIpv6Lock is null) gIpv6Lock = new Object(); } catch (Throwable) {}
 }
 
-// ── Saved-connection IPv6 reservations ───────────────────────────────────────
-// A provider-owned, aligned global-unicast /64 and the persisted connection IID
-// determine a reservation. It is not a source address until an IPv6-only native
-// holder dial uses it; shared-direct Happy Eyeballs must not bind this pool.
-private __gshared string gIpv6Prefix;
-private __gshared bool gIpv6Loaded;
-private __gshared Object gIpv6Lock;
-
-private void loadIpv6Config() {
-    if (gIpv6Lock !is null) synchronized (gIpv6Lock) {
-        if (gIpv6Loaded) return;
-        gIpv6Loaded = true;
-        loadIpv6ConfigUnlocked();
-        return;
-    }
-    if (gIpv6Loaded) return;
-    gIpv6Loaded = true;
-    loadIpv6ConfigUnlocked();
-}
-private void loadIpv6ConfigUnlocked() {
-    import core.stdc.stdlib : getenv;
-    import core.stdc.string : strlen;
-    import std.string : toStringz;
-    auto ep = getenv(toStringz("IRCFIBER_IPV6_PREFIX"));
-    if (ep !is null) {
-        auto raw = ep[0 .. strlen(ep)].idup;
-        ubyte[16] prefix;
-        if (parseRoutedIpv6Prefix(raw, prefix)) {
-            gIpv6Prefix = raw;
-            logInfo("IPv6 connection pool: prefix=%s (from IRCFIBER_IPV6_PREFIX)", gIpv6Prefix);
-        } else if (raw.length > 0) {
-            logWarn("IPv6 connection pool disabled: IRCFIBER_IPV6_PREFIX must be an aligned global-unicast /64");
-        }
-    }
-    if (gIpv6Prefix.length == 0)
-        logInfo("IPv6 connection pool: disabled");
-}
+import ircfiber.irc.ipv6_config : configuredIpv6Prefix, overrideIpv6Prefix, restoreIpv6Config;
 
 /// Native transport is advertised and planned only after the node's physical
 /// routing gate has passed and this holder explicitly supports family-only DIAL.
 string nativeIpv6Prefix(HolderClient holder) {
     import std.process : environment;
     if (environment.get("IRCFIBER_IPV6_ROUTING_VERIFIED", "") != "1" || holder is null) return "";
-    loadIpv6Config();
-    string prefix;
-    if (gIpv6Lock !is null) synchronized (gIpv6Lock) { prefix = gIpv6Prefix; }
-    else prefix = gIpv6Prefix;
+    const prefix = configuredIpv6Prefix();
     ubyte[16] binary;
     if (!parseRoutedIpv6Prefix(prefix, binary)) return "";
     try { return holder.status().supportsFamily("ipv6") ? prefix : ""; }
@@ -3940,14 +3854,8 @@ unittest {
 
 @("IPv6 reservation uses only the saved IID and serving pool, not mutable connection metadata")
 unittest {
-    const savedPrefix = gIpv6Prefix;
-    const savedLoaded = gIpv6Loaded;
-    scope(exit) {
-        gIpv6Prefix = savedPrefix;
-        gIpv6Loaded = savedLoaded;
-    }
-    gIpv6Prefix = "2001:db8:1234:5678::/64";
-    gIpv6Loaded = true;
+    const savedIpv6 = overrideIpv6Prefix("2001:db8:1234:5678::/64");
+    scope(exit) restoreIpv6Config(savedIpv6);
     NetworkConfig cfg;
     cfg.id = parseUUID("550e8400-e29b-41d4-a716-446655440001");
     cfg.ipv6Iid = "a516446655440123";
@@ -3984,10 +3892,10 @@ unittest {
     c.updateConfig(cfg);
     foreach (bad; ["", "2001:db8:1234:5678::", "2001:db8:1234:5678::/48",
                    "2001:db8:1234:5678::1/64", "fd00:1234::/64"]) {
-        gIpv6Prefix = bad;
+        overrideIpv6Prefix(bad);
         assert(c.resolveIpv6Bind() == "");
     }
-    gIpv6Prefix = "2001:db8:1234:5678::/64";
+    overrideIpv6Prefix("2001:db8:1234:5678::/64");
     cfg.id = UUID.init;
     c.updateConfig(cfg);
     assert(c.resolveIpv6Bind() == "", "unsaved configs cannot acquire a native identity");
@@ -8839,10 +8747,7 @@ final class PersistentIRCClient {
 
     private static string resolveIpv6BindForConfig(const ref NetworkConfig config) {
         if (config.id == UUID.init) return "";
-        loadIpv6Config();
-        string prefix;
-        if (gIpv6Lock !is null) synchronized (gIpv6Lock) { prefix = gIpv6Prefix; }
-        else prefix = gIpv6Prefix;
+        const prefix = configuredIpv6Prefix();
         return ipv6ForConnection(prefix, config.ipv6Iid);
     }
 
@@ -16937,25 +16842,6 @@ unittest {
 }
 
 
-@("webircSwapSuppressed skips recently Z-lined addresses only")
-unittest {
-    assert(webircSuppressKey("irc.ircfiber.com", "1.2.3.4") == "irc.ircfiber.com|1.2.3.4");
-    assert(!webircSwapSuppressed("irc.ircfiber.com", "9.9.9.9"),
-           "an address never recorded is never suppressed");
-    assert(!webircSwapSuppressed("", "1.2.3.4") && !webircSwapSuppressed("irc.ircfiber.com", ""));
-    suppressWebircSwapFor("irc.ircfiber.com", "1.2.3.4");
-    assert(webircSwapSuppressed("irc.ircfiber.com", "1.2.3.4"));
-    assert(!webircSwapSuppressed("irc.ircfiber.com", "1.2.3.5"),
-           "suppression is per-address");
-    assert(!webircSwapSuppressed("irc.example.org", "1.2.3.4"),
-           "suppression is per-host");
-    suppressWebircSwapFor("irc.ircfiber.com", "5.6.7.8", 0);
-    assert(!webircSwapSuppressed("irc.ircfiber.com", "5.6.7.8"),
-           "a zero-duration record is already lapsed");
-    suppressWebircSwapFor("", "");
-    assert(!webircSwapSuppressed("irc.ircfiber.com", "9.9.9.9"),
-           "empty records change nothing");
-}
 
 @("a DM follows its partner's NICK, never a stranger holding the nick")
 unittest {
