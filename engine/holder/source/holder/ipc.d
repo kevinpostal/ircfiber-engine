@@ -231,6 +231,13 @@ final class HolderServer {
         }
     }
     private Record[string] records;
+    private struct NordAttempt {
+        string generation;
+        string state;
+    }
+    // Independent of ordinary tombstones: terminal evidence has no expiry.
+    // Admission stops at ten until the engine durably releases and ACKs.
+    private NordAttempt[string] nordAttempts;
     private Record[ulong] ordinals;
     private Record first, last, firstClosed, lastClosed;
     private size_t tombstoneCount;
@@ -342,6 +349,8 @@ final class HolderServer {
     private void retire(Record record) {
         auto h = record.owner;
         if (h is null || !h.getRetireQuiescent()) return;
+        if (h.nordCapacityToken.length && h.physicalUpstreamTerminal)
+            markNordTerminal(h.nordCapacityToken, h.nordCapacityGeneration);
         auto e = h.entry(false);
         auto tiny = Entry.init;
         tiny.id = record.id;
@@ -466,6 +475,84 @@ final class HolderServer {
         page["more"] = more;
         page["connections"] = rows;
         return page;
+    }
+
+    private void requireNordInstance(Json req) {
+        if (req.type != Json.Type.object || req["instance"].type != Json.Type.string
+                || req["instance"].get!string != instance)
+            throw new RequestError(ERR_BAD_REQUEST, "Nord evidence instance mismatch");
+    }
+
+    private string beginNordAttempt(Json payload) {
+        if (payload.type != Json.Type.object || payload["proxy"].type != Json.Type.object
+                || payload["proxy"]["provider"].type != Json.Type.string
+                || payload["proxy"]["provider"].get!string != "nordvpn") return "";
+        auto token = payload["nordCapacityToken"];
+        auto generation = payload["nordCapacityGeneration"];
+        auto intended = payload["holderInstance"];
+        if (token.type != Json.Type.string || !validNordCapacityToken(token.get!string)
+                || generation.type != Json.Type.string || !validNordCapacityGeneration(generation.get!string)
+                || intended.type != Json.Type.string || intended.get!string != instance)
+            throw new RequestError(ERR_BAD_REQUEST, "Nord generation, token and matching instance required");
+        const key = token.get!string;
+        if (key in nordAttempts) throw new RequestError(ERR_BUSY, "Nord token already received");
+        if (nordAttempts.length >= 10) throw new RequestError(ERR_NORD_NOT_ADMITTED, "Nord evidence capacity exhausted");
+        nordAttempts[key.idup] = NordAttempt(generation.get!string.idup, "pending");
+        return key.idup;
+    }
+
+    private void markNordTerminal(string token, string generation) {
+        if (auto attempt = token in nordAttempts)
+            if (attempt.generation == generation) attempt.state = "terminal";
+    }
+
+    private Json nordStatus(Json req) {
+        requireNordInstance(req);
+        auto tokens = req["tokens"];
+        if (tokens.type != Json.Type.array || tokens.length > 10)
+            throw new RequestError(ERR_BAD_REQUEST, "at most ten Nord tokens required");
+        string generation;
+        if (tokens.length) {
+            if (req["nordCapacityGeneration"].type != Json.Type.string
+                    || !validNordCapacityGeneration(req["nordCapacityGeneration"].get!string))
+                throw new RequestError(ERR_BAD_REQUEST, "Nord status generation required");
+            generation = req["nordCapacityGeneration"].get!string;
+        }
+        auto rows = Json.emptyArray;
+        void append(string token) {
+            auto row = Json.emptyObject;
+            row["token"] = token;
+            auto attempt = token in nordAttempts;
+            if (attempt !is null && generation.length && attempt.generation != generation) attempt = null;
+            row["state"] = attempt is null ? "unknown" : attempt.state;
+            row["generation"] = attempt is null ? "" : attempt.generation;
+            rows ~= row;
+        }
+        if (!tokens.length) {
+            foreach (token, _; nordAttempts) append(token);
+        } else foreach (token; tokens) {
+            if (token.type != Json.Type.string || !validNordCapacityToken(token.get!string))
+                throw new RequestError(ERR_BAD_REQUEST, "invalid Nord token");
+            append(token.get!string);
+        }
+        auto result = Json.emptyObject;
+        result["instance"] = instance;
+        result["tokens"] = rows;
+        return result;
+    }
+
+    private void ackNord(Json req) {
+        requireNordInstance(req);
+        auto token = req["nordCapacityToken"];
+        auto generation = req["nordCapacityGeneration"];
+        if (token.type != Json.Type.string || !validNordCapacityToken(token.get!string)
+                || generation.type != Json.Type.string || !validNordCapacityGeneration(generation.get!string))
+            throw new RequestError(ERR_BAD_REQUEST, "Nord generation and token required");
+        if (auto attempt = token.get!string in nordAttempts) {
+            if (attempt.generation != generation.get!string || attempt.state != "terminal")
+                throw new RequestError(ERR_BUSY, "Nord token is not terminal in this generation");
+            nordAttempts.remove(token.get!string);
+        }
     }
 
     /// Holder SIGTERM: QUIT every open session (full reconnect event).
@@ -620,6 +707,11 @@ final class HolderServer {
     private string controlRequest(string verb, Json req, ValidatedMeta meta = ValidatedMeta.init) {
         pruneTombstones(unixMsNow());
         switch (verb) {
+            case "NORD_STATUS":
+                return okLine(nordStatus(req));
+            case "NORD_ACK":
+                ackNord(req);
+                return "OK {}";
             case "LIST": {
                 auto output = appender!string();
                 output.put(`OK {"connections":[`);
@@ -681,13 +773,22 @@ final class HolderServer {
 
     private void dial(ref TCPConnection c, Json payload) {
         if (auto code = tokenError(payload)) { writeLine(c, errLine(code, "bad token")); return; }
+        string nordToken;
+        try nordToken = beginNordAttempt(payload);
+        catch (RequestError e) { writeLine(c, errLine(e.code, e.msg)); return; }
+        const nordGeneration = nordToken.length ? nordAttempts[nordToken].generation : "";
         DialRequest req;
         try {
             req = DialRequest.fromJson(payload);
             validateSourcePool(req, cfg.routedIpv6Prefix);
         }
-        catch (Exception e) { writeLine(c, errLine(ERR_BAD_REQUEST, e.msg)); return; }
+        catch (Exception e) {
+            if (nordToken.length) markNordTerminal(nordToken, nordGeneration);
+            writeLine(c, errLine(ERR_BAD_REQUEST, e.msg));
+            return;
+        }
         if (!heldAdmissionAvailable() || nextId == long.max) {
+            if (nordToken.length) markNordTerminal(nordToken, nordGeneration);
             writeLine(c, "FAILED " ~ FailedLine("capacity", "holder admission capacity exhausted").toJson().toString());
             return;
         }
@@ -701,6 +802,7 @@ final class HolderServer {
         try {
             outcome = dialUpstream(req, (EventLine ev) { writeLine(c, "EVENT " ~ ev.toJson().toString()); });
         } catch (DialFailed e) {
+            if (nordToken.length && e.terminalTransport) markNordTerminal(nordToken, nordGeneration);
             fields["event"] = "dial_fail";
             fields["phase"] = e.phase;
             fields["error"] = e.msg;
@@ -718,8 +820,7 @@ final class HolderServer {
         }
         if (nextId == long.max) {
             // Exhaustion is unreachable in practice, but never reuse an ID.
-            if (outcome.tls !is null) outcome.tls.finalize();
-            outcome.conn.close();
+            if (closeDialOutcome(outcome) && nordToken.length) markNordTerminal(nordToken, nordGeneration);
             writeLine(c, errLine(ERR_CLOSED, "holder ordinal exhausted"));
             return;
         }
@@ -730,16 +831,17 @@ final class HolderServer {
         catch (HeldAdmissionException) {
             // Constructor admission failed before any owner was started.
             // No existing held connection is disturbed by capacity pressure.
-            try { if (outcome.tls !is null) outcome.tls.finalize(); } catch (Exception) {}
-            try outcome.conn.close(); catch (Exception) {}
+            if (closeDialOutcome(outcome) && nordToken.length) markNordTerminal(nordToken, nordGeneration);
             writeLine(c, "FAILED " ~ FailedLine("capacity", "holder admission capacity exhausted").toJson().toString());
             return;
         }
         catch (Exception e) {
-            try { if (outcome.tls !is null) outcome.tls.finalize(); } catch (Exception) {}
-            try outcome.conn.close(); catch (Exception) {}
+            // A general constructor failure is not proof that no task started.
+            // Close raw transport but retain evidence until issuer recovery.
+            try outcome.conn.close(); catch (Throwable) {}
             throw e;
         }
+        if (auto attempt = nordToken in nordAttempts) attempt.state = "open";
         registerHeld(held);
         fields["event"] = "dial_ok";
         fields["id"] = id;
@@ -749,6 +851,20 @@ final class HolderServer {
         auto connected = ConnectedLine(id, held.peerIp, held.localIp, held.peerPort, held.localPort,
             held.connectedAtMs, held.tlsInfo, instance, outcome.tlsVerified);
         held.attach(c, "CONNECTED " ~ connected.toJson().toString());
+    }
+
+    private bool closeDialOutcome(ref DialOutcome outcome) {
+        bool closed;
+        try { outcome.conn.close(); closed = !outcome.conn.connected; } catch (Throwable) {}
+        try {
+            if (outcome.tls !is null) {
+                import vibe.stream.openssl : OpenSSLStream;
+                auto stream = cast(OpenSSLStream) outcome.tls;
+                if (stream is null) return false;
+                stream.abort();
+            }
+        } catch (Throwable) { return false; }
+        return closed;
     }
 
     // ── ATTACH → relay ──────────────────────────────────────────────────
@@ -896,6 +1012,12 @@ void runHolderMetaRegressions(string directory, scope void delegate(bool, string
     request.host = "127.0.0.1";
     request.port = upstream.bindAddress.port;
     request.tag = Tag("meta-network", "private-user", "private-network", "");
+    // Bind the real physical upstream below to a seeded test-only reservation.
+    enum nordGeneration = "0123456789abcdef0123456789abcdef01234567:11111111-2222-4333-8444-555555555555";
+    enum nordToken = "0123456789abcdef0123456789abcdef";
+    request.nordCapacityToken = nordToken;
+    request.nordCapacityGeneration = nordGeneration;
+    server.nordAttempts[nordToken] = HolderServer.NordAttempt(nordGeneration, "open");
     DialOutcome outcome;
     outcome.conn = connectTCP("127.0.0.1", request.port);
     outcome.peerIp = outcome.localIp = "127.0.0.1";
@@ -919,6 +1041,18 @@ void runHolderMetaRegressions(string directory, scope void delegate(bool, string
         return payload;
     }
     exchange("HELLO " ~ HelloRequest(PROTO_VERSION, cfg.serverId, "meta-harness", cfg.token).toJson().toString());
+    auto nordQuery = Json.emptyObject;
+    nordQuery["instance"] = server.instance;
+    nordQuery["tokens"] = Json([Json(nordToken)]);
+    nordQuery["nordCapacityGeneration"] = nordGeneration;
+    auto nordAck = Json.emptyObject;
+    nordAck["instance"] = server.instance;
+    nordAck["nordCapacityToken"] = nordToken;
+    nordAck["nordCapacityGeneration"] = nordGeneration;
+    check(exchange("NORD_STATUS " ~ nordQuery.toString())["tokens"][0]["state"].get!string == "open"
+        && !owner.physicalUpstreamTerminal, "live physical upstream retains its Nord permit evidence");
+    check(exchange("NORD_ACK " ~ nordAck.toString(), "ERR")["code"].get!string == ERR_BUSY,
+        "open physical upstream cannot ACK its Nord evidence");
     const idJson = Json(id).toString();
     const idPayload = `{"id":` ~ idJson ~ `}`;
     const metaPrefix = `META {"id":` ~ idJson ~ `,"meta":`;
@@ -1008,4 +1142,77 @@ void runHolderMetaRegressions(string directory, scope void delegate(bool, string
         && sampleHeldMemory().metaMembersKnown == before.metaMembersKnown
         && sampleHeldMemory().openMembersKnown == before.openMembersKnown,
         "close releases all META bytes and membership evidence");
+    bool terminal;
+    foreach (_; 0 .. 200) {
+        auto evidence = exchange("NORD_STATUS " ~ nordQuery.toString());
+        terminal = evidence["tokens"][0]["state"].get!string == "terminal";
+        if (terminal) break;
+        sleep(10.msecs);
+    }
+    check(terminal && owner.physicalUpstreamTerminal && owner.getRetireQuiescent(),
+        "Nord terminal proof follows physical close, TLS finalization and completed upstream writer");
+    if (terminal) {
+        exchange("NORD_ACK " ~ nordAck.toString());
+        check(exchange("NORD_STATUS " ~ nordQuery.toString())["tokens"][0]["state"].get!string == "unknown",
+            "durable-release ACK removes only the completed Nord evidence");
+    }
+}
+
+@("Nord evidence is generation bound, nonexpiring and ACK bounded")
+unittest {
+    import std.exception : assertThrown;
+    HolderConfig cfg;
+    auto server = new HolderServer(cfg);
+    enum generation = "0123456789abcdef0123456789abcdef01234567:11111111-2222-4333-8444-555555555555";
+    enum otherGeneration = "abcdef0123456789abcdef0123456789abcdef01:11111111-2222-4333-8444-555555555555";
+    auto dial = Json.emptyObject;
+    auto proxy = Json.emptyObject;
+    proxy["provider"] = "nordvpn";
+    dial["proxy"] = proxy;
+    dial["holderInstance"] = server.instance;
+    dial["nordCapacityGeneration"] = generation;
+    string firstToken;
+    foreach (i; 0 .. 10) {
+        import std.uuid : randomUUID;
+        auto token = randomUUID().toString();
+        if (!i) firstToken = token;
+        dial["nordCapacityToken"] = token;
+        assert(server.beginNordAttempt(dial) == token);
+    }
+    assertThrown(server.beginNordAttempt(dial));
+    dial["nordCapacityToken"] = "0123456789abcdef0123456789abcdef";
+    assertThrown(server.beginNordAttempt(dial));
+    auto query = Json.emptyObject;
+    query["instance"] = server.instance;
+    query["tokens"] = Json([Json(firstToken)]);
+    query["nordCapacityGeneration"] = generation;
+    assert(server.nordStatus(query)["tokens"][0]["state"].get!string == "pending");
+    auto ack = Json.emptyObject;
+    ack["instance"] = server.instance;
+    ack["nordCapacityToken"] = firstToken;
+    ack["nordCapacityGeneration"] = generation;
+    assertThrown(server.ackNord(ack));
+    server.markNordTerminal(firstToken, otherGeneration);
+    assert(server.nordStatus(query)["tokens"][0]["state"].get!string == "pending");
+    server.markNordTerminal(firstToken, generation);
+    server.pruneTombstones(long.max);
+    assert(server.nordStatus(query)["tokens"][0]["state"].get!string == "terminal");
+    query["nordCapacityGeneration"] = otherGeneration;
+    assert(server.nordStatus(query)["tokens"][0]["state"].get!string == "unknown");
+    ack["nordCapacityGeneration"] = otherGeneration;
+    assertThrown(server.ackNord(ack));
+    ack["nordCapacityGeneration"] = generation;
+    server.ackNord(ack);
+    server.ackNord(ack);
+    query["nordCapacityGeneration"] = generation;
+    assert(server.nordStatus(query)["tokens"][0]["state"].get!string == "unknown");
+    assert(server.beginNordAttempt(dial).length);
+    query["tokens"] = Json.emptyArray;
+    auto all = server.nordStatus(query);
+    assert(all["tokens"].length == 10);
+    assert(okLine(all).length < 4096);
+    foreach (row; all["tokens"])
+        assert(row["generation"].get!string == generation);
+    query["instance"] = "11111111-2222-4333-8444-555555555555";
+    assertThrown(server.nordStatus(query));
 }

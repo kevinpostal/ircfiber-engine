@@ -76,4 +76,17 @@ elif [[ $ROUTED_IMMUTABLE_IMAGES == 0 && $driver == routed_policy_driver.py ]]; 
 else
     fail 'archive qualification requires ROUTED_IMMUTABLE_IMAGES=1'
 fi
+# This standalone family also contains Nord producers. Activate only with its
+# complete labelled inventory created and every producer stopped; unavailable
+# exclusive fencing disables the fixture instead of bypassing the budget.
+dc create --no-build
+dc up -d --no-deps redis
+ready=0
+for attempt in {1..30}; do
+    if [[ $(dc exec -T redis redis-cli --raw PING 2>/dev/null) == PONG ]]; then ready=1; break; fi
+    sleep 1
+done
+[[ $ready == 1 ]] || fail 'routed fixture Redis did not become ready for cold activation'
+python3 "$SCRIPT_DIR/../../../site/scripts/ircfiber-nord-capacity.py" fixture-activate \
+    --docker-socket "${endpoint#unix://}" --project "$ROUTED_RUN" --redis-service redis --redis-db 0
 python3 "$SCRIPT_DIR/fixtures/$driver" "$COMPOSE"

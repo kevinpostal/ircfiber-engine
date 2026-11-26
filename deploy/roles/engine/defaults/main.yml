@@ -23,10 +23,10 @@ mullvad_sidecar_socks_port: 1055
 # NordVPN SOCKS5 proxies — no sidecar, no license, no retargeting: each
 # entry dials NordVPN's own public proxy host directly with RFC1929
 # username/password auth. Each entry falls back to the shared
-# vault_nordvpn_socks_username/password (vault.example.yml) when it sets no
-# username/password of its own — set them per-entry to spread load across
-# more than one NordVPN account, since each account has its own
-# connection-concurrency limit. Renders IRCFIBER_NORDVPN_POOL as
+# vault_nordvpn_socks_username/password when it sets no credentials of its
+# own. All entries, accounts and IRC Fiber producers share the same ten
+# physical-session budget; adding credentials does not increase it.
+# Renders IRCFIBER_NORDVPN_POOL as
 # socks5://<name>:<user>:<pass>@<host>:<port>, merged into the same
 # picker/ban/circuit-breaker pool as mullvad_sidecars.
 nordvpn_proxies: []

@@ -20,8 +20,8 @@ x-env: &env
   IRCFIBER_BUGSINK_ENABLED: "0"
   IRCFIBER_LOG_LEVEL: ${ROUTING_REGRESSION_LOG_LEVEL:-debug}
   IRCFIBER_IPV6_PREFIX: ""
-  IRCFIBER_MULLVAD_POOL: ""
-  IRCFIBER_NORDVPN_POOL: socks5://north:test:test@192.0.2.30:1080,socks5://south:test:test@192.0.2.31:1080
+  IRCFIBER_MULLVAD_POOL: ${ROUTING_REGRESSION_MULLVAD_POOL:-}
+  IRCFIBER_NORDVPN_POOL: ${ROUTING_REGRESSION_NORDVPN_POOL:-socks5://north:test:test@192.0.2.30:1080,socks5://south:test:test@192.0.2.31:1080}
 x-fixture: &fixture
   <<: *runtime
   build:
@@ -61,12 +61,20 @@ services:
       target: runtime-gateway
     image: ${ROUTING_REGRESSION_GATEWAY_IMAGE:?launcher supplies image}
     command: [/app/irc-fiber]
-    environment: *env
+    environment:
+      <<: *env
+      IRCFIBER_IMAGE_PROXY_SOCKS: ${ROUTING_REGRESSION_IMAGE_SOCKS:-}
+      CURL_CA_BUNDLE: ${ROUTING_REGRESSION_CA_FILE:-/etc/ssl/certs/ca-certificates.crt}
+      SSL_CERT_FILE: ${ROUTING_REGRESSION_CA_FILE:-/etc/ssl/certs/ca-certificates.crt}
+    volumes: [fixture-certs:/fixture-certs:ro]
     extra_hosts: &irc-hosts
       - default.regression.test=192.0.2.10
       - alpha.example.org=192.0.2.10
       - beta.example.net=192.0.2.10
       - fallback.example.org=192.0.2.10
+      - am.i.mullvad.net=93.184.216.34
+      - ipinfo.io=93.184.216.34
+      - image.regression.test=93.184.216.34
     networks:
       fixture: {ipv4_address: 192.0.2.4}
     depends_on:
@@ -135,11 +143,18 @@ services:
   egress-a:
     <<: *fixture
     command: ${ROUTING_REGRESSION_SOCKS_COMMAND:-python3 -u /fixture/socks_exit.py}
+    environment:
+      NORD_CAPACITY_FIXTURE: ${ROUTING_REGRESSION_NORD_CAPACITY:-0}
+    volumes: [fixture-certs:/fixture-certs:ro]
     networks:
       fixture: {ipv4_address: 192.0.2.30}
   egress-b:
     <<: *fixture
     command: ${ROUTING_REGRESSION_SOCKS_COMMAND:-python3 -u /fixture/socks_exit.py}
+    environment:
+      NORD_CAPACITY_FIXTURE: ${ROUTING_REGRESSION_NORD_CAPACITY:-0}
+      NORD_CAPACITY_MULLVAD: ${ROUTING_REGRESSION_NORD_CAPACITY:-0}
+    volumes: [fixture-certs:/fixture-certs:ro]
     networks:
       fixture: {ipv4_address: 192.0.2.31}
 

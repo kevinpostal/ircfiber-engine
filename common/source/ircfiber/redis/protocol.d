@@ -94,6 +94,7 @@ struct RedisKeys {
     /// No TTL — a drain or open circuit must survive restarts and hot swaps.
     /// Not per-server: every engine and the gateway share one verdict.
     static string egressAdmission(string label) { return "irc:egress:admission:" ~ label; }
+    static string nordCapacity() { return "irc:egress:nordvpn:capacity:v1"; }
 
     /// Latest reachability result for one proxy label against every host the
     /// daily sweep (ircfiber.web.admin.egress_reachability) has tested it

@@ -1,9 +1,10 @@
-# Compose overlay for egress_failover.sh; used after docker-compose.mock-irc.yml.
+# Legacy shared-stack overlay: it cannot prove an exclusive cold fence.
+# Use routing_regression.sh egress_failover for isolated Nord qualification.
 services:
   ircfiber-engine:
     environment:
       IRCFIBER_MULLVAD_POOL: ""
-      IRCFIBER_NORDVPN_POOL: socks5://north:test:test@egress-a:1080,socks5://south:test:test@egress-b:1080
+      IRCFIBER_NORDVPN_POOL: ""
   egress-a:
     image: python:3.12-alpine
     container_name: egress-a

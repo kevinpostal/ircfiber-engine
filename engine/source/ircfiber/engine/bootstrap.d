@@ -313,6 +313,8 @@ EngineContext bootstrapEngine() {
     // TIMEOUT_SECS, then propagate exit 75 so the restart policy retries);
     // a protocol/serverId mismatch propagates exit 78 to the process owner.
     holder.connectControl();
+    import ircfiber.irc.dial_guard : reconcileNordCapacityQuietly;
+    reconcileNordCapacityQuietly(holder, redis, serverId);
     long heldLive;
     bool heldStateKnown;
     try {
@@ -915,6 +917,10 @@ void startHeartbeatTask(ref EngineContext ctx) {
                 // can see the holder every engine rides (skipped when the
                 // holder is unreachable — the engine's own beat still counts).
                 if (ctx.holder !is null) {
+                    import ircfiber.irc.dial_guard : reconcileNordCapacityQuietly;
+                    // Includes reconnect recovery and the durable-release/ACK
+                    // crash window; no socket is closed on coordinator loss.
+                    reconcileNordCapacityQuietly(ctx.holder, ctx.redis, ctx.localServer.serverId);
                     try {
                         auto hs = ctx.holder.status();
                         auto key = RedisKeys.server(ctx.localServer.serverId);

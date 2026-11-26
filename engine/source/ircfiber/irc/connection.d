@@ -57,8 +57,9 @@ public import ircfiber.irc.bnc_ownership : BncCommandOwner;
 import ircfiber.irc.bnc_ownership : BncPendingWrite;
 import ircfiber.holder_client : HolderClient, DialTag, DialProxy, DialRequest, DialResult, DialEvent,
     DialProgress, AttachResult, HolderEntry, DialFailedException, HolderUnavailableException, HolderErrorException;
-import ircfiber.irc.registration_admission : RegistrationAdmission;
-import ircfiber.irc.dial_guard : holderDialIncarnation;
+import ircfiber.irc.registration_admission : RegistrationAdmission, registrationAdmission;
+import ircfiber.irc.dial_guard : holderDialIncarnation, NordCapacityException,
+    NordDialUnprovenException, reconcileNordCapacityQuietly;
 import ircfiber.logging : logJsonMap, logException;
 import ircfiber.observability : recordCounter, recordGauge, recordHistogram;
 import ircfiber.tracing : withSpan, Span;
@@ -1090,7 +1091,6 @@ private __gshared bool[string][string] dailyReachabilityBanned;
 private __gshared RouteMemory gRouteMemory;
 
 // Event-loop admission is independent of the durable per-network dial ledger.
-private RegistrationAdmission registrationAdmission;
 private bool registrationRecoveryObserverRunning;
 
 
@@ -1108,14 +1108,19 @@ private void observeUnprovenRegistrations(HolderClient holder) {
                     const claim = admission.terminalClaimAt(slot);
                     if (!claim.token) continue;
                     bool ended;
-                    try {
-                        auto entry = holder.info(claim.id);
-                        scope(exit) entry.meta = Json.undefined;
-                        ended = entry.state == "closed" || entry.instance != claim.incarnation
-                            || entry.connectedAtMs != claim.connectedAtMs;
-                    } catch (HolderErrorException e) {
-                        if (e.code != "closed" && e.code != "not_found") throw e;
-                        ended = true;
+                    if (claim.capacityToken.length) {
+                        ended = holder.nordTokenStatus(claim.incarnation, claim.capacityToken,
+                            claim.capacityGeneration) == "terminal";
+                    } else {
+                        try {
+                            auto entry = holder.info(claim.id);
+                            scope(exit) entry.meta = Json.undefined;
+                            ended = entry.state == "closed" || entry.instance != claim.incarnation
+                                || entry.connectedAtMs != claim.connectedAtMs;
+                        } catch (HolderErrorException e) {
+                            if (e.code != "closed" && e.code != "not_found") throw e;
+                            ended = true;
+                        }
                     }
                     if (ended) admission.resolveTerminalClaim(slot, claim.token, claim.epoch);
                 }
@@ -2577,6 +2582,8 @@ private TCPConnection happyEyeballsConnectWithProxy(HolderClient holder, DialTag
                                                     scope DialResult delegate(DialRequest, DialProgress, RouteKind, string) ownedDial = null,
                                                     bool scoreFailures = true) {
     auto proxy = candidate.proxy;
+    if (proxy !is null && proxy.provider != candidate.kind)
+        throw new RoutingPolicyBlockedException("routing_policy_blocked", "concrete proxy provider changed");
     const providerName = proxy !is null && proxy.provider == RouteKind.mullvad ? "Mullvad" : "NordVPN";
     if (proxy !is null) logInfo("%s egress %s (%s:%d) for %s:%d", providerName, proxy.label, proxy.host, proxy.port, host, port);
     const egressLabel = proxy !is null ? providerName ~ " exit " ~ proxy.label : routeToken(candidate.kind);
@@ -2592,6 +2599,7 @@ private TCPConnection happyEyeballsConnectWithProxy(HolderClient holder, DialTag
     if (proxy !is null) {
         req.hasProxy = true;
         req.proxy = DialProxy(proxy.host, proxy.port, proxy.username, proxy.password);
+        req.proxy.provider = routeToken(proxy.provider);
     }
     req.addressFamily = candidate.kind == RouteKind.ipv6 ? "ipv6" : "any";
     req.bindIp6 = candidate.sourceAddress;
@@ -2656,6 +2664,7 @@ private TCPConnection happyEyeballsConnectWithProxy(HolderClient holder, DialTag
 /// learned per endpoint by the route memory, never a global penalty. A
 /// holder-side failure never reached the exit at all.
 private bool countsAgainstExitHealth(Exception e) nothrow {
+    if (cast(HolderUnavailableException) e) return false;
     if (cast(HolderErrorException) e) return false;
     if (auto d = cast(DialFailedException) e)
         return d.phase != "tls" && d.phase != "starttls" && d.phase != "holder";
@@ -2668,6 +2677,8 @@ unittest {
     assert(!countsAgainstExitHealth(new DialFailedException("starttls", "STARTTLS rejected")));
     assert(!countsAgainstExitHealth(new DialFailedException("holder", "holder dial timed out")));
     assert(!countsAgainstExitHealth(new HolderErrorException("busy", "busy")));
+    assert(!countsAgainstExitHealth(new NordCapacityException("nord_capacity_full")));
+    assert(!countsAgainstExitHealth(new NordCapacityException("nord_capacity_unavailable")));
     assert(countsAgainstExitHealth(new DialFailedException("socks5", "general SOCKS server failure")));
     assert(countsAgainstExitHealth(new DialFailedException("tcp", "connection refused")));
     assert(countsAgainstExitHealth(new Exception("unexpected")));
@@ -3097,10 +3108,12 @@ private TCPConnection connectThroughEgressPlan(scope EgressDial dial, string net
     Exception lastErr;
     string[] failures;
     bool terminalDnsTcpOnly = true;
+    bool nordBlocked;
     foreach (candidate; toTry) {
         if (mayDial !is null && !mayDial()) throw new HolderUnavailableException("connection stopped during routing");
         auto proxy = candidate.proxy;
         const kind = candidate.kind;
+        if (kind == RouteKind.nordvpn && nordBlocked) continue;
         if (!requireRoutingOrder(hostLower, routing).canFind(kind)) continue;
         // Atomic re-check right before the dial: a drain or quarantine that
         // landed after planning still stops it, and only a recovery-tier
@@ -3157,6 +3170,17 @@ private TCPConnection connectThroughEgressPlan(scope EgressDial dial, string net
                 if (trialToken.length) used.trialExit = exitRef(proxy);
             }
             return conn;
+        } catch (NordCapacityException e) {
+            // The account-wide refusal applies to every Nord label in this
+            // pass. Only already-permitted alternative providers may follow.
+            nordBlocked = true;
+            terminalDnsTcpOnly = false;
+            if (trialToken.length)
+                settleTrial(exitRef(proxy), trialToken, EgressTrialOutcome.abort, "");
+            lastErr = e;
+            failures ~= candidate.hostBanKey ~ " [capacity]: " ~ e.reason;
+            report(progress, "info", e.reason);
+            continue;
         } catch (HolderUnavailableException e) {
             // The exit was never tried: no ban, no counters — just retry
             // later from the connection loop. A claimed trial is released
@@ -3352,6 +3376,8 @@ version (EgressPlanRegressionHarness) {
                 switch (*outcome) {
                     case "holder-down": throw new HolderUnavailableException("holder down");
                     case "holder-err": throw new HolderErrorException("busy", "holder busy");
+                    case "nord_capacity_full":
+                    case "nord_capacity_unavailable": throw new NordCapacityException(*outcome);
                     case "untyped": throw new Exception("unexpected holder reply");
                     default: throw new DialFailedException(*outcome, "connection closed by peer");
                 }
@@ -3395,6 +3421,47 @@ version (EgressPlanRegressionHarness) {
                 unixMsNow(), at);
         }
     }
+}
+
+@("Nord capacity: one refusal skips all labels without route-health evidence")
+unittest {
+    foreach (reason; ["nord_capacity_full", "nord_capacity_unavailable"]) {
+        auto pool = EgressPlanHarness.standardPool();
+        auto second = pool[2];
+        second.label = "nord-us";
+        second.host = "10.64.0.4";
+        pool ~= second;
+        auto h = EgressPlanHarness.open(pool);
+        scope(exit) h.close();
+        enum host = "capacity.example.org";
+        h.failWith = ["nord-se": reason, "nord-us": reason];
+        const routes = h.connect(host, testRouting([RouteKind.nordvpn, RouteKind.direct]));
+        assert(routes.length == 2 && routes[$ - 1] == "direct");
+        assert(h.failed is null && h.used.kind == RouteKind.direct);
+        assert(h.used.fallbackReason.canFind(reason));
+        assert(h.standing(host, "nord-se") == RouteStanding.neutral);
+        assert(h.standing(host, "nord-us") == RouteStanding.neutral);
+        assert(!isRouteBannedForHost(host, "slot:nord-se"));
+        assert(!isRouteBannedForHost(host, "slot:nord-us"));
+        assert(h.connect(host, testRouting([RouteKind.nordvpn])).length == 1);
+        assert(cast(NordCapacityException) h.failed !is null);
+        const alternative = h.connect(host, testRouting([RouteKind.nordvpn, RouteKind.mullvad]));
+        assert(alternative.length == 2 && h.used.kind == RouteKind.mullvad);
+    }
+}
+
+@("Nord capacity: a recovery trial aborts without recording a failed trial")
+unittest {
+    auto pool = EgressPlanHarness.standardPool();
+    auto h = EgressPlanHarness.open([pool[2]]);
+    scope(exit) h.close();
+    h.admission.set("nord-se", "recovering");
+    h.admission.admitReplies["nord-se"] = EgressDialAdmit(true, "capacity-trial", "");
+    h.failWith["nord-se"] = "nord_capacity_full";
+    assert(h.connect("capacity.example.org", testRouting([RouteKind.nordvpn])) == ["nord-se"]);
+    assert(cast(NordCapacityException) h.failed !is null);
+    assert(h.admission.verdicts == ["nord-se:abort"]);
+    assert(h.admission.openTrials.length == 0);
 }
 
 version (FiberMlsWireHarness)
@@ -7134,7 +7201,8 @@ final class PersistentIRCClient {
         withPoolLock({
             foreach (ref proxy; mullvadPool) if (proxy.label == req.tag.egressLabel) {
                 ready = proxy.state == "ready" && proxy.host == req.proxy.host
-                    && proxy.port == req.proxy.port;
+                    && proxy.port == req.proxy.port
+                    && routeToken(proxy.provider) == req.proxy.provider;
                 endpoint = exitRef(&proxy);
                 break;
             }
@@ -7337,6 +7405,8 @@ final class PersistentIRCClient {
                 || entry.connectedAtMs != holderConnectedAtMs) return;
         entry.meta = Json.undefined;
         pendingHolderGap = entry;
+        if (entry.state == "closed")
+            reconcileNordCapacityQuietly(holder, redis, serverId);
     }
 
     private void recoverHolderGap(const ref HolderEntry entry, bool partialLost = false) {
@@ -7419,6 +7489,11 @@ final class PersistentIRCClient {
     /// engine-initiated disconnect goes through here — only
     /// `detachForHotSwap()` closes the relay without closing upstream.
     void transportClose(string quit = "") {
+        // CLOSE/QUIT alone is not proof; terminal token evidence is emitted
+        // only after the upstream writer has retired. A later heartbeat
+        // completes reconciliation if that has not happened on this return.
+        scope(exit) if (activeRoute == "nordvpn")
+            reconcileNordCapacityQuietly(holder, redis, serverId);
         if (holder !is null && holderConnId.length && registrationPermit && observed001AtMs == 0) {
             if (!getStopping) {
                 recoverHolderRelay(false, true);
@@ -9093,14 +9168,15 @@ final class PersistentIRCClient {
                     lastEmittedReason = displayReason;
                     lastDisconnectReason = displayReason;
                 }
-                if (!wasRegistered) avoidFailedRegistrationRoute(errMsg, hadServerError);
+                const capacityRefusal = cast(NordCapacityException) e !is null;
+                if (!wasRegistered && !capacityRefusal) avoidFailedRegistrationRoute(errMsg, hadServerError);
 
                 // handleDisconnection now emits the DISCONNECTED lifecycle
                 // event so the frontend sees the state transition for ALL
                 // disconnect paths. Wrapped in Throwable catch so a secondary
                 // SyncError there doesn't kill the loop.
                 try {
-                    handleDisconnection();
+                    handleDisconnection(!capacityRefusal);
                 } catch (Throwable he) {
                     try logWarn("handleDisconnection threw for %s: %s", config.name, he.msg);
                     catch (Throwable) {}
@@ -9131,7 +9207,7 @@ final class PersistentIRCClient {
                 // Report the failure to Redis for smart routing (per-network failover).
                 // The gateway's health monitor checks this and may reassign the network
                 // to a different engine if failures exceed the threshold.
-                if (redis !is null && serverId.length > 0 && !wasEverConnected) {
+                if (!capacityRefusal && redis !is null && serverId.length > 0 && !wasEverConnected) {
                     try {
                         auto rdb = redis.getDb();
                         auto failKey = RedisKeys.networkFail(config.id.toString());
@@ -9816,8 +9892,14 @@ final class PersistentIRCClient {
                 if (cast(HolderErrorException) error) ambiguous = false;
                 if (auto failed = cast(DialFailedException) error) ambiguous = sent && failed.phase == "holder";
                 if (ambiguous && registrationPermit && !registrationPermitUnproven) {
-                    registrationPermitUnproven = true;
-                    registrationAdmission.retainUnproven(registrationPermitEpoch);
+                    if (auto nord = cast(NordDialUnprovenException) error) {
+                        registrationAdmission.retainTerminalClaim(registrationPermit,
+                            registrationPermitUnproven, registrationPermitEpoch, "",
+                            nord.incarnation, 0, nord.generation, nord.token);
+                    } else {
+                        registrationPermitUnproven = true;
+                        registrationAdmission.retainUnproven(registrationPermitEpoch);
+                    }
                     observeUnprovenRegistrations(holder);
                     logJsonMap("error", "connection", "Unproven DIAL retains full-registration admission",
                         ["event": "registration_unproven", "networkId": config.id.toString(),
@@ -15824,7 +15906,7 @@ private void processEvents() {
 
     // ── Disconnect / cleanup ──────────────────────────────────────────────────
 
-    private void handleDisconnection() {
+    private void handleDisconnection(bool recordFailure = true) {
         // A hot-swap detach is not a disconnect: the session lives on in the
         // holder and the next engine re-attaches. Nothing to emit or reset.
         if (detachedForHotSwap) return;
@@ -15917,7 +15999,7 @@ private void processEvents() {
                  "event": "disconnected"]);
             // Record host failure for the circuit breaker — unless this is
             // a shutdown (user-initiated disconnect), which shouldn't count.
-            if (!isShutdownRequested && !maintenanceActive()) {
+            if (recordFailure && !isShutdownRequested && !maintenanceActive()) {
                 recordHostFailure(config.host, config.port);
             }
             s.setStatusOk();
@@ -22661,7 +22743,7 @@ Ircv3Check[] holderRecoveryRegressionChecks() {
         queued.port = config.port;
         queued.hasProxy = true;
         queued.tag.egressLabel = mullvadPool[0].label;
-        queued.proxy = DialProxy(mullvadPool[0].host, mullvadPool[0].port, "", "");
+        queued.proxy = DialProxy(mullvadPool[0].host, mullvadPool[0].port, "", "", "mullvad");
         foreach (trial; [false, true]) {
             registrationAdmission = new RegistrationAdmission;
             bool[8] held;

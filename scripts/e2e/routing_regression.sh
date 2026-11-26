@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 mode=${1:-}
-case "$mode" in egress_failover|hot_swap|memory_reliability|holder_pressure|holder_engine_qualification|archive_reliability|holder_memory_reliability|legacy_holder_continuity|coordinated_holder) shift;; *) fail 'unsupported routing qualification mode';; esac
+case "$mode" in nord_capacity|egress_failover|hot_swap|memory_reliability|holder_pressure|holder_engine_qualification|archive_reliability|holder_memory_reliability|legacy_holder_continuity|coordinated_holder) shift;; *) fail 'unsupported routing qualification mode';; esac
 qualification=0
 case "$mode" in memory_reliability|holder_pressure|holder_engine_qualification|archive_reliability|holder_memory_reliability|legacy_holder_continuity|coordinated_holder) qualification=1;; esac
 for binary in docker python3 jq curl; do command -v "$binary" >/dev/null || fail "missing $binary"; done
@@ -48,6 +48,19 @@ export ROUTING_REGRESSION_MEMORY=0
 [[ $mode != memory_reliability ]] || export ROUTING_REGRESSION_MEMORY=1
 export ROUTING_REGRESSION_ENGINE_HOLDER_ADDR=unix:///run/ircfiber/holder.sock
 [[ $mode != memory_reliability ]] || export ROUTING_REGRESSION_ENGINE_HOLDER_ADDR=tcp://192.0.2.10:7690
+if [[ $mode == nord_capacity ]]; then
+    export ROUTING_REGRESSION_NORD_CAPACITY=1
+    export ROUTING_REGRESSION_ENGINE_HOLDER_ADDR=tcp://192.0.2.10:7690
+    export ROUTING_REGRESSION_MOCK_COMMAND='python3 -u /fixture/nord_capacity_fixture.py serve'
+    export ROUTING_REGRESSION_CA_FILE=/fixture-certs/ca-certificates.crt
+    export ROUTING_REGRESSION_NORDVPN_POOL='socks5://north:test:test@192.0.2.30:1080,socks5://south:second:test@192.0.2.30:1080'
+    export ROUTING_REGRESSION_MULLVAD_POOL='fixture-mullvad@192.0.2.31:1080'
+    export ROUTING_REGRESSION_IMAGE_SOCKS='socks5://test:test@192.0.2.30:1080'
+    export NORD_CAPACITY_EVIDENCE_DIR=${NORD_CAPACITY_EVIDENCE_DIR:-${TMPDIR:-/tmp}/$ROUTING_REGRESSION_RUN-nord-capacity}
+    [[ ! -e $NORD_CAPACITY_EVIDENCE_DIR ]] || fail 'Nord capacity evidence directory must be fresh'
+    mkdir -m 700 "$NORD_CAPACITY_EVIDENCE_DIR"
+    printf 'Nord physical-session evidence: %s\n' "$NORD_CAPACITY_EVIDENCE_DIR"
+fi
 export ROUTING_REGRESSION_HOLDER_DETACH_SECS=600 ROUTING_REGRESSION_HOLDER_SWAP=3g
 if [[ $mode == holder_pressure || $mode == holder_engine_qualification ]]; then
     export ROUTING_REGRESSION_HOLDER_DETACH_SECS=0 ROUTING_REGRESSION_HOLDER_SWAP=3145728000
@@ -262,18 +275,28 @@ cleanup() {
 }
 trap cleanup EXIT
 dc build --pull "${build_services[@]}"
-if [[ $mode == holder_engine_qualification || $mode == coordinated_holder ]]; then
+if [[ $mode == nord_capacity ]]; then
+    dc run --rm --no-deps mock-irc python3 /fixture/nord_capacity_fixture.py certificates
+elif [[ $mode == holder_engine_qualification || $mode == coordinated_holder ]]; then
     dc run --rm --no-deps mock-irc python3 /fixture/holder_engine_qualification.py certificates
 elif [[ $qualification == 1 ]]; then
     dc run --rm --no-deps mock-irc python3 /fixture/memory_fixture.py certificates
 fi
-dc up -d --wait --wait-timeout 120 redis mongo
+# Cold activation precedes every Nord-enabled fixture path. No producer, proxy,
+# database other than Redis, or previous generation may be running at this point.
+dc create --no-build
+dc up -d --no-deps --wait --wait-timeout 120 redis
+export NORD_CAPACITY_HELPER="$SCRIPT_DIR/../../../site/scripts/ircfiber-nord-capacity.py"
+export NORD_CAPACITY_DOCKER_SOCKET=${endpoint#unix://}
+python3 "$NORD_CAPACITY_HELPER" fixture-activate --docker-socket "$NORD_CAPACITY_DOCKER_SOCKET" \
+    --project "$COMPOSE_PROJECT_NAME" --redis-service redis --redis-db 0
+dc up -d --no-deps --wait --wait-timeout 120 mongo
 dc exec -T redis redis-cli SET irc:config:egressRoutingPolicy \
     '{"schema":1,"revision":0,"global":{"order":["mullvad","nordvpn","direct"],"blockedRoutes":[]},"hosts":[]}' NX >/dev/null
 dc exec -T redis redis-cli SET irc:config:routingSchemaVersion 1 NX >/dev/null
 [[ $(dc exec -T redis redis-cli --raw GET irc:config:routingSchemaVersion) == 1 ]] || fail 'fixture schema seed failed'
 services=(mock-irc ircfiber-holder ircfiber-gateway egress-a ircfiber-engine)
-[[ $mode != holder_engine_qualification && $mode != coordinated_holder ]] || services+=(egress-b)
+[[ $mode != holder_engine_qualification && $mode != coordinated_holder && $mode != nord_capacity ]] || services+=(egress-b)
 [[ $mode != coordinated_holder ]] || services+=(ircfiber-sysagent)
 dc up -d --no-build --wait --wait-timeout 120 "${services[@]}"
 export DOCKER_CONTEXT="$context" ROUTING_REGRESSION_READY=1

@@ -5,6 +5,11 @@ import std.conv : to;
 import std.datetime : Clock;
 import std.range : empty, front;
 import std.string : startsWith;
+import std.algorithm : canFind;
+import vibe.db.redis.redis : RedisDatabase;
+import ircfiber.irc.nord_capacity : NordPermit, NordVerdict, tryAcquireNordCapacity,
+    releaseNordCapacity, nordReservations;
+import ircfiber.irc.registration_admission : registrationAdmission;
 import ircfiber.storage.redis : RedisStorage;
 import ircfiber.redis.protocol : RedisKeys;
 import ircfiber.holder_client : HolderClient, DialRequest, DialResult, DialProgress,
@@ -21,6 +26,72 @@ string holderDialIncarnation(HolderClient holder) {
     if (status.pid <= 0)
         throw new HolderUnavailableException("holder incarnation unavailable for dial ownership");
     return "legacy-pid:" ~ status.pid.to!string;
+}
+
+/// Capacity refusals are coordinator outcomes, never observations of an exit.
+class NordCapacityException : HolderUnavailableException {
+    string reason;
+    this(string reason) {
+        this.reason = reason;
+        super(reason);
+    }
+}
+
+/// Carries only nonsecret proof coordinates, not a client or relay reference.
+class NordDialUnprovenException : DialFailedException {
+    string generation, token, incarnation;
+    this(string generation, string token, string incarnation) {
+        this.generation = generation;
+        this.token = token;
+        this.incarnation = incarnation;
+        super("holder", "Nord holder DIAL completion unproven");
+    }
+}
+
+/// Only the exact holder's retained terminal evidence proves physical closure.
+/// A new instance/PID, missing inventory entry, or an old heartbeat proves
+/// nothing about a reservation. Such claims require fenced operator recovery.
+/// Enumerating terminal evidence also repairs a release-before-ACK crash: the
+/// original generation remains in the holder even when its hash field is gone.
+void reconcileNordCapacity(HolderClient holder, RedisStorage redis, string serverId) {
+    if (holder is null || redis is null || !serverId.length) return;
+    auto status = holder.status();
+    if (!status.instance.length || !status.capabilities.canFind("nord-capacity-v1")) return;
+    auto terminal = holder.nordTerminalTokens(status.instance);
+    if (!terminal.length) return;
+    auto db = redis.getDb();
+    const reservations = nordReservations(db);
+    foreach (evidence; terminal) {
+        bool eligible = true;
+        foreach (reservation; reservations) if (reservation.token == evidence.token) {
+            eligible = reservation.kind == "holder" && reservation.owner == serverId
+                && reservation.incarnation == status.instance
+                && reservation.generation == evidence.generation;
+            break;
+        }
+        if (!eligible) continue;
+        if (registrationAdmission !is null)
+            registrationAdmission.resolveNordTerminal(evidence.generation, evidence.token);
+        if (releaseNordCapacity(db, evidence.generation, evidence.token))
+            holder.ackNordToken(status.instance, evidence.token, evidence.generation);
+    }
+}
+
+/// Recovery is best effort outside admission. Never interrupt a healthy socket
+/// because Redis or the holder control stream is unavailable.
+void reconcileNordCapacityQuietly(HolderClient holder, RedisStorage redis, string serverId) nothrow {
+    try reconcileNordCapacity(holder, redis, serverId);
+    catch (Exception) {}
+}
+
+private void deleteDialMarkerQuietly(RedisDatabase db, string key, string token) nothrow {
+    try db.hdel(key, token);
+    catch (Exception) {}
+}
+
+private void releaseUnsentNordCapacityQuietly(RedisDatabase db, string generation, string token) nothrow {
+    try releaseNordCapacity(db, generation, token);
+    catch (Exception) {}
 }
 
 /// Upper bound on how long one holder DIAL can still be running after the
@@ -147,6 +218,14 @@ DialResult dialWithOwnership(HolderClient holder, DialRequest req, DialProgress 
         hex[i * 2 + 1] = "0123456789abcdef"[value & 15];
     }
     const token = hex[].idup;
+    const nord = req.hasProxy && req.proxy.provider == "nordvpn";
+    if (nord) {
+        auto status = holder.status();
+        if (status.instance != incarnation || !status.capabilities.canFind("nord-capacity-v1"))
+            throw new NordCapacityException("nord_capacity_unavailable");
+        req.holderInstance = incarnation;
+        req.nordCapacityToken = token;
+    }
     const key = dialKey(serverId, req.tag.networkId);
     beginLocalDial(serverId, req.tag.networkId, token);
     scope(exit) endLocalDial(serverId, req.tag.networkId, token);
@@ -158,7 +237,24 @@ DialResult dialWithOwnership(HolderClient holder, DialRequest req, DialProgress 
     if (reply.empty || reply.front != "1")
         throw new HolderUnavailableException("canonical owner changed, routing move fenced, or an earlier holder DIAL has unproven completion (inspect " ~ key ~ ")");
     bool terminal = true;
-    scope(exit) if (terminal) db.hdel(key, token);
+    scope(exit) if (terminal) {
+        // Failed cleanup retains the marker, without replacing a typed
+        // capacity refusal with an unrelated Redis/exit failure.
+        deleteDialMarkerQuietly(db, key, token);
+    }
+    NordPermit capacity;
+    scope(exit) if (nord) {
+        if (capacity.verdict == NordVerdict.acquired && !sent) {
+            // No physical dial occurred (local cancellation or definitive
+            // never-admitted response). Unavailable release retains the claim.
+            releaseUnsentNordCapacityQuietly(db, capacity.generation, capacity.token);
+        }
+        // An uncertain failure first transfers its registration proof
+        // coordinates to the observer; do not ACK its evidence before that.
+        if (sent && terminal) reconcileNordCapacityQuietly(holder, redis, serverId);
+        if ((!sent || terminal) && registrationAdmission !is null)
+            registrationAdmission.forgetNordAttempt(capacity.generation, token);
+    }
     // Redis and progress callbacks yield; stop intent always wins before IPC.
     if (stopping()) {
         terminal = true;
@@ -192,19 +288,69 @@ DialResult dialWithOwnership(HolderClient holder, DialRequest req, DialProgress 
             if (stopping() || !ownsNetworkForDial(redis, serverId, req.tag.networkId))
                 throw new HolderUnavailableException("connection stopped or fenced after registration admission");
             validatePolicy();
+            if (nord) {
+                // The serialized request is bound to this exact incarnation;
+                // registration admission may have waited across a reconnect.
+                auto status = holder.status();
+                if (actualIncarnation != incarnation || status.instance != incarnation
+                        || !status.capabilities.canFind("nord-capacity-v1"))
+                    throw new NordCapacityException("nord_capacity_unavailable");
+                try reconcileNordCapacity(holder, redis, serverId);
+                catch (Exception) { throw new NordCapacityException("nord_capacity_unavailable"); }
+                capacity = tryAcquireNordCapacity(db, "holder", incarnation, serverId, token);
+                if (capacity.verdict != NordVerdict.acquired)
+                    throw new NordCapacityException(capacity.reason);
+                req.nordCapacityGeneration = capacity.generation;
+                if (registrationAdmission !is null)
+                    registrationAdmission.trackNordAttempt(capacity.generation, token);
+                // Acquisition yields. Refresh all existing fences before the
+                // holder may open a proxy socket; failed checks release above.
+                validatePolicy();
+                if (stopping() || !ownsNetworkForDial(redis, serverId, req.tag.networkId))
+                    throw new HolderUnavailableException("connection stopped or fenced after Nord admission");
+            }
             if (stopping()) throw new HolderUnavailableException("connection stopped before DIAL");
+        }, onResponse, {
+            // The client has finished all local validation/serialization.
+            // Any failure from this boundary onward is an ambiguous write
+            // until the exact holder supplies terminal token evidence.
             terminal = false;
             sent = true;
-        }, onResponse);
+        });
         terminal = true;
         return result;
     } catch (HolderErrorException e) {
-        terminal = true; // authenticated holder rejected this request
+        if (nord && sent && e.code == "nord_not_admitted") {
+            // This code is issued only for a validated, previously unseen
+            // token that the holder positively refused before any dial.
+            sent = false;
+            terminal = true;
+            throw new NordCapacityException("nord_capacity_unavailable");
+        }
+        if (nord && sent) {
+            // ERR busy can describe a duplicate while its original attempt
+            // is pending/open. Only this generation's terminal proof permits
+            // retiring the operation or the full-registration claim.
+            try terminal = holder.nordTokenStatus(incarnation, token, capacity.generation) == "terminal";
+            catch (Exception) { terminal = false; }
+            if (!terminal)
+                throw new NordDialUnprovenException(capacity.generation, token, incarnation);
+        } else terminal = true;
         throw e;
     } catch (DialFailedException e) {
-        // 'holder' includes a timed-out/malformed IPC stream, not an observed
-        // terminal holder response. Retain that operation's uncertainty.
-        terminal = terminal || e.phase != "holder";
+        if (nord && sent) {
+            try terminal = holder.nordTokenStatus(incarnation, token, capacity.generation) == "terminal";
+            catch (Exception) { terminal = false; }
+            if (!terminal)
+                throw new NordDialUnprovenException(capacity.generation, token, incarnation);
+        } else {
+            // A timed-out/malformed IPC stream is not a terminal response.
+            terminal = terminal || e.phase != "holder";
+        }
+        throw e;
+    } catch (Exception e) {
+        if (nord && sent)
+            throw new NordDialUnprovenException(capacity.generation, token, incarnation);
         throw e;
     }
 }

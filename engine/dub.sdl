@@ -20,8 +20,6 @@ dependency "vibe-d:redis" version="~>0.10.0"
 dependency "vibe-d:mongodb" version="~>0.10.0"
 dependency "diet-ng" version="~>1.8"
 
-dependency "unit-threaded" version="~>2.2.0"
-
 configuration "application" {
     targetType "executable"
     targetName "irc-fiber-engine"
@@ -74,6 +72,7 @@ configuration "unittest" {
     targetType "executable"
     targetName "irc-fiber-test"
     mainSourceFile "source/app_test.d"
+    dependency "unit-threaded" version="~>2.2.0"
     versions "VibeUseFibers" "unitThreadedLight"
     // Engine-only: after the repo split `engine/backend/` is a dub stub with
     // no sources, so depending on it (for the old `ircfiber.auth` import in

@@ -125,6 +125,7 @@ struct DialProxy {
     ushort port;
     string username;
     string password;
+    string provider;
 }
 
 /// One dial attempt through exactly one egress.
@@ -139,6 +140,9 @@ struct DialRequest {
     string[] trustedServerFingerprints;
     bool hasProxy;
     DialProxy proxy;
+    string nordCapacityToken;
+    string nordCapacityGeneration;
+    string holderInstance;
     /// Actual requested source bind, never evidence of the socket's source.
     string bindIp6;
     int connectTimeoutMs = 10_000;
@@ -147,6 +151,15 @@ struct DialRequest {
     string addressFamily = "any";
 
     void validate() const {
+        if (hasProxy && proxy.provider != "nordvpn" && proxy.provider != "mullvad")
+            throw new HolderErrorException("bad_request", "explicit proxy provider required");
+        if (hasProxy && proxy.provider == "nordvpn") {
+            if (!holderNordToken(nordCapacityToken) || !holderNordGeneration(nordCapacityGeneration)
+                    || !holderUuid(holderInstance))
+                throw new HolderErrorException("bad_request", "Nord generation, token and holder instance required");
+        } else if (nordCapacityToken.length || nordCapacityGeneration.length || holderInstance.length) {
+            throw new HolderErrorException("bad_request", "Nord fields require Nord proxy");
+        }
         if (trustedServerFingerprints.length && !verifyServerCertificates)
             throw new HolderErrorException("bad_request", "certificate pins require verification");
         if (tls == "none" && (verifyServerCertificates || trustedServerFingerprints.length))
@@ -196,9 +209,15 @@ struct DialRequest {
             p["port"] = cast(int) proxy.port;
             if (proxy.username.length) p["username"] = proxy.username;
             if (proxy.password.length) p["password"] = proxy.password;
+            p["provider"] = proxy.provider;
             j["proxy"] = p;
         } else {
             j["proxy"] = Json(null);
+        }
+        if (nordCapacityToken.length) {
+            j["nordCapacityToken"] = nordCapacityToken;
+            j["nordCapacityGeneration"] = nordCapacityGeneration;
+            j["holderInstance"] = holderInstance;
         }
         j["bindIp6"] = bindIp6.length ? Json(bindIp6) : Json(null);
         j["addressFamily"] = addressFamily;
@@ -207,6 +226,37 @@ struct DialRequest {
         j["starttlsTimeoutMs"] = starttlsTimeoutMs;
         return j;
     }
+}
+
+private bool holderUuid(string value) @safe pure nothrow @nogc {
+    if (value.length != 36) return false;
+    foreach (i, c; value) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            if (c != '-') return false;
+        } else if (!(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f')) return false;
+    }
+    return true;
+}
+
+private bool holderNordToken(string token) @safe pure nothrow @nogc {
+    if (token.length == 36) return holderUuid(token);
+    if (token.length != 32) return false;
+    foreach (c; token)
+        if (!(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f')) return false;
+    return true;
+}
+
+private bool holderNordGeneration(string value) @safe pure nothrow @nogc {
+    if (value.length != 77 || value[40] != ':' || !holderUuid(value[41 .. $])) return false;
+    foreach (c; value[0 .. 40])
+        if (!(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f')) return false;
+    return true;
+}
+
+/// Retained terminal evidence includes its original activation generation.
+struct HolderNordTerminalToken {
+    string generation;
+    string token;
 }
 
 /// One `EVENT` line of a dial, forwarded to the connection's timeline in
@@ -733,6 +783,7 @@ final class HolderClient {
         string currentInstance;
         bool inventoryCapable;
         bool tlsLeafSha256Capable;
+        bool nordCapacityCapable;
         // Identity/state only. Never retain a META tree between observations.
         DialTag[string] knownTags;
     }
@@ -827,10 +878,17 @@ final class HolderClient {
         if (observed != currentInstance) {
             knownTags = null;
             tlsLeafSha256Capable = false;
+            nordCapacityCapable = false;
         }
         currentInstance = observed;
         if (hello) {
             tlsLeafSha256Capable = false;
+            nordCapacityCapable = false;
+            if (observed.length && payload["capabilities"].type == Json.Type.array)
+                foreach (capability; payload["capabilities"])
+                    if (capability.type == Json.Type.string
+                            && capability.get!string == "nord-capacity-v1")
+                        nordCapacityCapable = true;
             if (observed.length && payload["capabilities"].type == Json.Type.array)
                 foreach (capability; payload["capabilities"])
                     if (capability.type == Json.Type.string
@@ -975,6 +1033,58 @@ final class HolderClient {
         return j;
     }
 
+
+    private Json nordEvidence(string incarnation, string token = "", string generation = "") {
+        if (!holderUuid(incarnation) || (token.length
+                && (!holderNordToken(token) || !holderNordGeneration(generation))))
+            throw new HolderErrorException("bad_request", "invalid Nord evidence identity");
+        auto payload = Json.emptyObject;
+        payload["instance"] = incarnation;
+        payload["tokens"] = token.length ? Json([Json(token)]) : Json.emptyArray;
+        if (token.length) payload["nordCapacityGeneration"] = generation;
+        auto reply = request("NORD_STATUS", payload);
+        if (jsonStr(reply, "instance") != incarnation || reply["tokens"].type != Json.Type.array
+                || reply["tokens"].length > 10 || (token.length && reply["tokens"].length != 1))
+            throw new HolderUnavailableException("invalid bounded Nord evidence");
+        bool[string] seen;
+        foreach (row; reply["tokens"]) {
+            const key = jsonStr(row, "token");
+            const state = jsonStr(row, "state");
+            if (!holderNordToken(key) || (token.length && key != token) || key in seen
+                    || (state != "pending" && state != "open" && state != "terminal" && state != "unknown")
+                    || (state != "unknown" && (!holderNordGeneration(jsonStr(row, "generation"))
+                        || (token.length && jsonStr(row, "generation") != generation))))
+                throw new HolderUnavailableException("invalid Nord token evidence");
+            seen[key] = true;
+        }
+        return reply;
+    }
+
+    string nordTokenStatus(string incarnation, string token, string generation) {
+        if (!token.length) throw new HolderErrorException("bad_request", "Nord token required");
+        auto reply = nordEvidence(incarnation, token, generation);
+        return jsonStr(reply["tokens"][0], "state");
+    }
+
+    HolderNordTerminalToken[] nordTerminalTokens(string incarnation) {
+        auto reply = nordEvidence(incarnation);
+        HolderNordTerminalToken[] result;
+        foreach (row; reply["tokens"])
+            if (jsonStr(row, "state") == "terminal")
+                result ~= HolderNordTerminalToken(jsonStr(row, "generation"), jsonStr(row, "token"));
+        return result;
+    }
+
+    /// Call only after durable release in this exact, intact ledger generation.
+    void ackNordToken(string incarnation, string token, string generation) {
+        if (!holderUuid(incarnation) || !holderNordToken(token) || !holderNordGeneration(generation))
+            throw new HolderErrorException("bad_request", "invalid Nord ACK identity");
+        auto payload = Json.emptyObject;
+        payload["instance"] = incarnation;
+        payload["nordCapacityToken"] = token;
+        payload["nordCapacityGeneration"] = generation;
+        request("NORD_ACK", payload);
+    }
     /// Every connection the holder knows about (open and retained closed).
     HolderEntry[] list() {
         auto ok = request("LIST");
@@ -1157,15 +1267,18 @@ final class HolderClient {
     /// `HolderUnavailableException` when the holder cannot be reached.
     /// onResponse commits pacing once the holder has processed this DIAL.
     /// A completed local write alone does not prove remote admission.
-    DialResult dial(DialRequest req, DialProgress progress,
+    DialResult dial(ref DialRequest req, DialProgress progress,
             scope void delegate() beforeSend = null,
-            scope void delegate() onResponse = null) {
-        auto requestPayload = req.toJson(token);
+            scope void delegate() onResponse = null,
+            scope void delegate() onSend = null) {
         if (req.addressFamily == "ipv6" && !status().supportsFamily("ipv6"))
             throw new DialFailedException("holder", "holder lacks IPv6-only dial capability");
         if (req.verifyServerCertificates
                 && (!controlUp || !tlsLeafSha256Capable || !currentInstance.length))
             throw new DialFailedException("tls", "holder lacks certificate verification capability");
+        if (req.hasProxy && req.proxy.provider == "nordvpn"
+                && (!controlUp || !nordCapacityCapable || req.holderInstance != currentInstance))
+            throw new HolderErrorException("nord_capacity_unavailable", "holder lacks matching Nord capacity capability");
         const dialIncarnation = currentInstance;
         auto c = open(OPEN_TIMEOUT);
         bool keep;
@@ -1177,8 +1290,16 @@ final class HolderClient {
             throw new HolderErrorException("incarnation_changed", "holder changed before DIAL; request was not sent");
         if (req.verifyServerCertificates && (!controlUp || !tlsLeafSha256Capable))
             throw new DialFailedException("tls", "holder verification capability changed before DIAL");
+        if (req.hasProxy && req.proxy.provider == "nordvpn"
+                && (!controlUp || !nordCapacityCapable || req.holderInstance != currentInstance))
+            throw new HolderErrorException("nord_capacity_unavailable", "holder Nord capacity capability changed before DIAL");
+        // beforeSend acquires the permit and fills its generation. Do not
+        // serialize the request until that callback has committed admission.
+        auto requestPayload = req.toJson(token);
+        const requestLine = "DIAL " ~ requestPayload.toString();
         try {
-            writeLine(c, "DIAL " ~ requestPayload.toString());
+            if (onSend !is null) onSend();
+            writeLine(c, requestLine);
         } catch (Exception e) {
             throw new HolderUnavailableException("holder dial write failed: " ~ e.msg);
         }
@@ -1337,4 +1458,59 @@ unittest {
     try expectOk(`ERR {"code":"busy","msg":"already attached"}`);
     catch (HolderErrorException e) { threw = e.code == "busy"; }
     assert(threw);
+}
+
+@("Nord DIAL serializes the generation acquired at beforeSend")
+unittest {
+    import vibe.core.core : runEventLoop, exitEventLoop;
+    import vibe.core.net : listenTCP;
+    enum incarnation = "11111111-2222-4333-8444-555555555555";
+    enum generation = "0123456789abcdef0123456789abcdef01234567:" ~ incarnation;
+    string wireGeneration, wireProvider, serverError, clientError;
+    bool acquired, sent, failed;
+    auto listener = listenTCP(0, (TCPConnection socket) @trusted nothrow {
+        scope(exit) HolderClient.closeQuietly(socket);
+        try {
+            socket.readTimeout = 3.seconds;
+            auto line = readIpcLine(socket);
+            if (!line.startsWith("DIAL ")) throw new Exception("DIAL expected");
+            auto payload = parseJsonString(line[5 .. $]);
+            wireGeneration = jsonStr(payload, "nordCapacityGeneration");
+            wireProvider = jsonStr(payload["proxy"], "provider");
+            HolderClient.writeLine(socket, "FAILED {\"phase\":\"fixture\",\"reason\":\"closed\"}");
+        } catch (Exception e) { serverError = e.msg; }
+    }, "127.0.0.1");
+    scope(exit) listener.stopListening();
+    const port = listener.bindAddress.port;
+    auto client = new HolderClient("fixture", "tcp://127.0.0.1:" ~ port.to!string);
+    client.currentInstance = incarnation;
+    client.controlUp = true;
+    client.nordCapacityCapable = true;
+    DialRequest req;
+    req.host = "example.com";
+    req.port = 6667;
+    req.tls = "none";
+    req.hasProxy = true;
+    req.proxy = DialProxy("127.0.0.1", 1080, "", "", "nordvpn");
+    req.holderInstance = incarnation;
+    req.nordCapacityToken = "0123456789abcdef0123456789abcdef";
+    runTask(() nothrow {
+        auto timeout = setTimer(5.seconds, { clientError = "deadline"; exitEventLoop(); });
+        scope(exit) { timeout.stop(); exitEventLoop(); }
+        try client.dial(req, null, {
+            assert(!sent && !req.nordCapacityGeneration.length);
+            acquired = true;
+            req.nordCapacityGeneration = generation;
+        }, null, {
+            assert(acquired && req.nordCapacityGeneration == generation);
+            sent = true;
+        });
+        catch (DialFailedException e) { failed = e.phase == "fixture"; }
+        catch (Exception e) { clientError = e.msg; }
+    });
+    runEventLoop();
+    assert(serverError.length == 0, serverError);
+    assert(clientError.length == 0, clientError);
+    assert(acquired && sent && failed);
+    assert(wireGeneration == generation && wireProvider == "nordvpn");
 }

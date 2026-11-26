@@ -50,8 +50,8 @@ def gateway_access(context, project, compose, service, address, port, external=F
                     sockets.add(upstream)
                     with relay.lock:
                         relay.connections.add(upstream)
-                    upstream.settimeout(3)
-                    self.request.settimeout(3)
+                    upstream.settimeout(30)
+                    self.request.settimeout(30)
                     while not relay.stopping.is_set():
                         ready, _, _ = select.select((self.request, upstream), (), (), 1)
                         for source in ready:

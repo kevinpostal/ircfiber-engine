@@ -1,5 +1,9 @@
 module ircfiber.irc.registration_admission;
 
+/// One admission ledger for this event-loop thread; shared with terminal
+/// Nord reconciliation so evidence cannot be ACKed before claim settlement.
+RegistrationAdmission registrationAdmission;
+
 /// Event-loop-owned admission, shared by every client on this engine. A route
 /// waiter owns no full-attempt permit. No callbacks/yields occur in tryStart.
 final class RegistrationAdmission {
@@ -17,11 +21,31 @@ final class RegistrationAdmission {
         string id;
         string incarnation;
         long connectedAtMs;
+        string capacityGeneration;
+        string capacityToken;
         ulong token;
         ulong epoch;
     }
     private TerminalClaim[MAX_IN_FLIGHT] terminalClaims;
     private ulong nextTerminalToken;
+    private struct NordAttempt { string generation, token; bool terminal; }
+    private NordAttempt[MAX_IN_FLIGHT] nordAttempts;
+
+    /// Reserve proof coordinates before IPC can yield. A concurrent terminal
+    /// reconciliation may ACK while the DIAL caller is still reading a reply.
+    void trackNordAttempt(string capacityGeneration, string capacityToken) nothrow {
+        foreach (ref attempt; nordAttempts) if (!attempt.token.length) {
+            attempt = NordAttempt(capacityGeneration, capacityToken, false);
+            return;
+        }
+        assert(0, "every tracked Nord attempt owns a registration permit");
+    }
+
+    void forgetNordAttempt(string capacityGeneration, string capacityToken) nothrow {
+        foreach (ref attempt; nordAttempts)
+            if (attempt.generation == capacityGeneration && attempt.token == capacityToken)
+                attempt = NordAttempt.init;
+    }
 
     /// Only a fresh, different holder incarnation proves all earlier in-flight
     /// operations gone. Keep route spacing across this reset.
@@ -34,6 +58,7 @@ final class RegistrationAdmission {
         active = unproven = 0;
         foreach (ref route; routes) route.writing = false;
         terminalClaims[] = TerminalClaim.init;
+        nordAttempts[] = NordAttempt.init;
     }
 
     void retainUnproven(ulong issuedGeneration) nothrow {
@@ -53,20 +78,31 @@ final class RegistrationAdmission {
     }
 
     /// Transfers an unresolved known claim out of a stopping client before
-    /// its actor/object can be reaped. Unknown-ID DIALs use retainUnproven.
+    /// its actor/object can be reaped. Nord unknown-ID claims retain exact
+    /// generation/token coordinates; other unknown DIALs use retainUnproven.
     void retainTerminalClaim(ref bool owned, ref bool uncertain, ulong issuedGeneration,
-            string id, string instance, long connectedAtMs) nothrow {
+            string id, string instance, long connectedAtMs,
+            string capacityGeneration = "", string capacityToken = "") nothrow {
         if (!owned) return;
         if (issuedGeneration != generation) {
             owned = uncertain = false;
             return;
         }
-        assert(id.length);
-        foreach (ref claim; terminalClaims) if (!claim.token) {
+        assert(id.length || capacityToken.length);
+        foreach (slot, ref claim; terminalClaims) if (!claim.token) {
             if (!uncertain) retainUnproven(issuedGeneration);
             assert(nextTerminalToken < ulong.max);
-            claim = TerminalClaim(id, instance, connectedAtMs, ++nextTerminalToken, generation);
+            claim = TerminalClaim(id, instance, connectedAtMs, capacityGeneration,
+                capacityToken, ++nextTerminalToken, generation);
             owned = uncertain = false;
+            if (capacityToken.length) {
+                foreach (ref attempt; nordAttempts)
+                    if (attempt.generation == capacityGeneration && attempt.token == capacityToken) {
+                        if (attempt.terminal) resolveTerminalClaim(slot, claim.token, claim.epoch);
+                        attempt = NordAttempt.init;
+                        break;
+                    }
+            }
             return;
         }
         assert(0, "every known terminal claim must own one of the eight permits");
@@ -86,6 +122,19 @@ final class RegistrationAdmission {
         active--;
         unproven--;
         return true;
+    }
+
+    /// Same-instance terminal evidence may arrive through either the observer
+    /// or capacity reconciliation. Match original generation/token before ACK;
+    /// consuming the fixed claim slot makes duplicate observations inert.
+    void resolveNordTerminal(string capacityGeneration, string capacityToken) nothrow {
+        foreach (ref attempt; nordAttempts)
+            if (attempt.generation == capacityGeneration && attempt.token == capacityToken)
+                attempt.terminal = true;
+        foreach (slot, ref claim; terminalClaims)
+            if (claim.token && claim.capacityGeneration == capacityGeneration
+                    && claim.capacityToken == capacityToken)
+                resolveTerminalClaim(slot, claim.token, claim.epoch);
     }
 
     @property size_t terminalClaimCount() const nothrow {
@@ -193,4 +242,34 @@ unittest {
     assert(!oldPermit && newPermit && admission.inFlight == 1);
     admission.release(newPermit, admission.epoch);
     assert(admission.inFlight == 0);
+}
+
+@("Nord terminal coordinates settle detached registration exactly once")
+unittest {
+    auto admission = new RegistrationAdmission;
+    admission.observeIncarnation("holder");
+    bool owned = admission.tryStart("route", 10_000);
+    bool uncertain;
+    admission.retainTerminalClaim(owned, uncertain, admission.epoch,
+        "", "holder", 0, "original-generation", "attempt");
+    assert(!owned && !uncertain && admission.inFlight == 1 && admission.unprovenCount == 1);
+    admission.resolveNordTerminal("other-generation", "attempt");
+    assert(admission.inFlight == 1);
+    admission.resolveNordTerminal("original-generation", "attempt");
+    admission.resolveNordTerminal("original-generation", "attempt");
+    assert(admission.inFlight == 0 && admission.unprovenCount == 0);
+}
+
+@("Nord terminal proof arriving before ambiguous reply transfer survives ACK")
+unittest {
+    auto admission = new RegistrationAdmission;
+    admission.observeIncarnation("holder");
+    bool owned = admission.tryStart("route", 10_000);
+    bool uncertain;
+    admission.trackNordAttempt("generation", "attempt");
+    admission.resolveNordTerminal("generation", "attempt");
+    assert(admission.inFlight == 1);
+    admission.retainTerminalClaim(owned, uncertain, admission.epoch,
+        "", "holder", 0, "generation", "attempt");
+    assert(!owned && !uncertain && admission.inFlight == 0 && admission.unprovenCount == 0);
 }

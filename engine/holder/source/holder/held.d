@@ -111,6 +111,9 @@ private final class Attachment {
 final class Held {
     string id;
     string instance;
+    /// Nonsecret attempt identity; lives until physical upstream retirement.
+    string nordCapacityToken;
+    string nordCapacityGeneration;
     ulong ordinal;
     Tag tag;
     string host;
@@ -138,6 +141,7 @@ final class Held {
     private immutable long detachMaxMs;
     private bool closing, tornDown, writerDone;
     private bool tlsFinalized;
+    private bool upstreamPhysicallyClosed;
     private long upstreamWriteStartedAtMs;
     private ulong attachmentWriterCompletions;
     private bool commandBoundary = true;
@@ -153,6 +157,8 @@ final class Held {
         this.id = id;
         this.ordinal = ordinal;
         this.instance = instance;
+        this.nordCapacityToken = req.nordCapacityToken.idup;
+        this.nordCapacityGeneration = req.nordCapacityGeneration.idup;
         // Do not let tiny parsed scalar views pin a whole control request.
         tag.networkId = req.tag.networkId.idup;
         tag.userId = req.tag.userId.idup;
@@ -285,6 +291,10 @@ final class Held {
     }
     @property size_t bufferedBytes() const { return relay.queuedBytes; }
     @property bool isOpen() const @safe pure nothrow { return state == "open"; }
+    /// State=closed or CLOSE acknowledged alone cannot prove socket teardown.
+    @property bool physicalUpstreamTerminal() const {
+        return tornDown && writerDone && upstreamPhysicallyClosed && tlsFinalized;
+    }
     bool getRetireQuiescent() const {
         return !isOpen && !readers && !writers && !relayWriters && !pumps && !timers;
     }
@@ -424,6 +434,7 @@ final class Held {
     private void teardownUpstream() {
         if (tornDown) return;
         try conn.close(); catch (Throwable) {}
+        try upstreamPhysicallyClosed = !conn.connected; catch (Throwable) {}
         // Closing raw TCP wakes a writer blocked inside TLS/TCP. No timeout can
         // establish that OpenSSL is unused; only positive completion can.
         while (!writerDone) {

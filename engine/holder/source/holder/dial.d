@@ -56,6 +56,8 @@ final class DialFailed : Exception {
     string phase;
     /// Explicit proof: no socket was selected and every connect terminated.
     bool terminalDnsTcp;
+    /// Physical proxy transport closed and every handshake task completed.
+    bool terminalTransport;
     this(string phase, string reason, string file = __FILE__, size_t line = __LINE__) {
         super(reason, file, line);
         this.phase = phase;
@@ -77,6 +79,8 @@ struct DialOutcome {
     string localIp;
     ushort peerPort;
     ushort localPort;
+    bool unresolvedHandshake;
+    bool terminalTransport;
     /// Server lines received before STARTTLS `670`, delivered as the first
     /// relay bytes after `CONNECTED`.
     ubyte[] preTlsLines;
@@ -378,11 +382,19 @@ private void report(EventSink emit, string phase, string text) {
 // unreachable from a remote sidecar) and the exit's answer is the one that
 // matches the address the IRC network will see anyway.
 TCPConnection socks5ConnectViaProxy(string proxyHost, ushort proxyPort, string username, string password,
-                                    string target, ushort targetPort, Duration connectTimeout) {
+                                    string target, ushort targetPort, Duration connectTimeout,
+                                    bool* terminalClosed = null) {
     import core.sys.posix.arpa.inet : inet_pton;
     import core.sys.posix.sys.socket : AF_INET, AF_INET6;
+    if (terminalClosed !is null) *terminalClosed = true;
     auto proxyConn = connectTCP(proxyHost, proxyPort, null, 0, connectTimeout);
-    scope(failure) try { proxyConn.close(); } catch (Exception) {}
+    if (terminalClosed !is null) *terminalClosed = false;
+    scope(failure) {
+        try {
+            proxyConn.close();
+            if (terminalClosed !is null) *terminalClosed = !proxyConn.connected;
+        } catch (Throwable) {}
+    }
     // The exit dials the IRC server before answering CONNECT; bound that wait
     // like every other connect step (an unbounded read here wedged fibers on
     // a hung sidecar). Reset afterwards — the socket carries TLS + IRC next.
@@ -753,9 +765,11 @@ private TcpWinner raceDirectTcp(string host, ushort port, const ResolvedAddr[] c
  *  - Catch Throwable (not just Exception) so SyncError propagates as a
  *    clean timeout exception instead of killing the TaskFiber.
  */
-TLSStream createTLSStreamWithTimeout(TCPConnection connection, TLSContext ctx, string host, Duration timeout) {
+TLSStream createTLSStreamWithTimeout(TCPConnection connection, TLSContext ctx, string host, Duration timeout,
+                                    bool requireCompletion = false, bool* terminalHandshake = null) {
     import core.atomic : atomicLoad, atomicStore;
     import core.sys.posix.sys.socket : shutdown, SHUT_RDWR;
+    if (terminalHandshake !is null) *terminalHandshake = false;
     shared bool handshakeDone = false;
     auto doneCh = createChannel!bool();
     TLSStream resultStream;
@@ -805,16 +819,29 @@ TLSStream createTLSStreamWithTimeout(TCPConnection connection, TLSContext ctx, s
         try { holder.conn.close(); } catch (Throwable) {}
         // 3) interrupt the fiber (best-effort — may already be blocked in C).
         try { task.interrupt(); } catch (Throwable) {}
-        // Give the handshake task a brief grace to observe the shutdown and exit.
-        try { sleep(200.msecs); } catch (Throwable) {}
-        // If it still hasn't completed, the task will be reaped on next GC; we throw now
-        // so the engine retries via the next egress instead of wedging forever.
-        if (!atomicLoad(handshakeDone)) {
-            logWarn("TLS handshake task for %s still not done after shutdown — abandoning (fiber will be GC'd)", host);
+        if (requireCompletion) {
+            // A Nord permit cannot be released while the handshake can still
+            // own the physical transport. No elapsed grace is terminal proof.
+            while (!atomicLoad(handshakeDone)) {
+                try sleep(10.msecs); catch (Throwable) {}
+            }
+            if (resultStream !is null) {
+                import vibe.stream.openssl : OpenSSLStream;
+                auto stream = cast(OpenSSLStream) resultStream;
+                if (stream is null) throw new Exception("unsupported TLS backend for terminal abort");
+                stream.abort();
+                resultStream = null;
+            }
+            if (terminalHandshake !is null) *terminalHandshake = true;
+        } else {
+            try { sleep(200.msecs); } catch (Throwable) {}
+            if (!atomicLoad(handshakeDone))
+                logWarn("TLS handshake task for %s still not done after shutdown — abandoning (fiber will be GC'd)", host);
         }
         throw new Exception("TLS handshake timed out after " ~ timeout.to!string ~ " for " ~ host);
     }
 
+    if (terminalHandshake !is null) *terminalHandshake = true;
     if (!ok) {
         if (resultThrowable !is null) {
             // Preserve original error chain for operator triage.
@@ -1047,10 +1074,19 @@ private void verifyPeer(ref const DialRequest req, TLSStream stream) {
         throw new DialFailed("tls", "TLS certificate does not match configured host");
 }
 
-/// Closes whatever a dial opened (TLS stream first, then the socket).
+/// Close raw transport before TLS cleanup; no new upstream writes are allowed.
 private void closeOutcome(ref DialOutcome o) nothrow {
-    try { if (o.tls !is null) o.tls.finalize(); } catch (Exception) {}
-    try { o.conn.close(); } catch (Exception) {}
+    bool closed;
+    try { o.conn.close(); closed = !o.conn.connected; } catch (Throwable) {}
+    bool tlsDone = o.tls is null;
+    if (o.tls !is null) {
+        try {
+            import vibe.stream.openssl : OpenSSLStream;
+            auto stream = cast(OpenSSLStream) o.tls;
+            if (stream !is null) { stream.abort(); tlsDone = true; }
+        } catch (Throwable) {}
+    }
+    o.terminalTransport = closed && tlsDone && !o.unresolvedHandshake;
 }
 
 /// Runs the requested protocol on the freshly connected `o.conn`:
@@ -1076,14 +1112,16 @@ private void negotiate(ref DialRequest req, ref DialOutcome o, EventSink emit) {
     }
     if (req.tls == "implicit" || req.tls == "starttls") {
         if (req.tls == "implicit") report(emit, "tls", "");
+        bool handshakeTerminal;
         try {
             o.tls = createTLSStreamWithTimeout(o.conn, clientTlsContext(req), stripHostBrackets(req.sni),
-                req.tlsTimeoutMs.msecs);
+                req.tlsTimeoutMs.msecs, req.hasProxy && req.proxy.provider == "nordvpn", &handshakeTerminal);
             if (req.verifyServerCertificates) {
                 verifyPeer(req, o.tls);
                 o.tlsVerified = true;
             }
         } catch (Exception e) {
+            o.unresolvedHandshake = !handshakeTerminal;
             throw new DialFailed("tls", e.msg);
         }
         o.tlsInfo = captureTlsInfo(o.tls, req.tag.name);
@@ -1166,16 +1204,30 @@ DialOutcome dialUpstream(ref DialRequest req, EventSink emit) {
                 if (isIpLiteral(a.ip)) resolved ~= a.ip;
         }
         const why = proxiedDialBlockReason(target, resolved, privateAllowHosts());
-        if (why.length) throw new DialFailed("blocked", "blocked: " ~ why);
+        if (why.length) {
+            auto failure = new DialFailed("blocked", "blocked: " ~ why);
+            failure.terminalTransport = true;
+            throw failure;
+        }
     }
     DialOutcome o;
+    bool terminalClosed;
     try {
-        o.conn = socks5ConnectViaProxy(req.proxy.host, req.proxy.port, req.proxy.username, req.proxy.password, target, req.port, connectTimeout);
+        o.conn = socks5ConnectViaProxy(req.proxy.host, req.proxy.port, req.proxy.username, req.proxy.password,
+            target, req.port, connectTimeout, &terminalClosed);
     } catch (Exception e) {
         const l = e.msg.toLower();
-        throw new DialFailed(l.canFind("socks") ? "socks5" : "tcp", e.msg);
+        auto failure = new DialFailed(l.canFind("socks") ? "socks5" : "tcp", e.msg);
+        failure.terminalTransport = terminalClosed;
+        throw failure;
     }
-    negotiate(req, o, emit);
+    try negotiate(req, o, emit);
+    catch (Exception e) {
+        auto failure = cast(DialFailed) e;
+        if (failure is null) failure = new DialFailed("tcp", e.msg);
+        failure.terminalTransport = o.terminalTransport;
+        throw failure;
+    }
     return o;
 }
 

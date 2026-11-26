@@ -28,6 +28,8 @@ enum ERR_NOT_FOUND   = "not_found";
 enum ERR_BUSY        = "busy";
 enum ERR_CLOSED      = "closed";
 enum ERR_TOO_LARGE   = "too_large";
+/// Valid fresh Nord token definitively rejected before any transport starts.
+enum ERR_NORD_NOT_ADMITTED = "nord_not_admitted";
 
 // ── Environment ─────────────────────────────────────────────────────────────
 enum ENV_ADDR                 = "IRCFIBER_HOLDER_ADDR";
@@ -63,7 +65,7 @@ enum size_t MAX_INVENTORY_BYTES = 64 << 10;
 enum size_t MAX_INVENTORY_ROWS = 128;
 enum size_t MAX_TOMBSTONES = 4096;
 enum string[] HOLDER_CAPABILITIES =
-    ["inventory_v1", "gap_ack_v1", "bounded_meta_v1", "independent_pong_v1", "tls_leaf_sha256_v1"];
+    ["inventory_v1", "gap_ack_v1", "bounded_meta_v1", "independent_pong_v1", "tls_leaf_sha256_v1", "nord-capacity-v1"];
 /// Wire message the holder sends upstream when the engine never came back.
 enum string QUIT_ENGINE_UNAVAILABLE          = "engine unavailable";
 enum string QUIT_ENGINE_UNAVAILABLE_OVERFLOW = "engine unavailable (buffer overflow)";
@@ -131,6 +133,8 @@ struct ProxySpec {
     ushort port;
     string username;
     string password;
+    /// Explicit subscription attribution; never inferred from credentials.
+    string provider;
 }
 
 /// `DIAL` request payload.
@@ -146,6 +150,9 @@ struct DialRequest {
     string[] trustedServerFingerprints;
     bool hasProxy;
     ProxySpec proxy;
+    string nordCapacityToken;
+    string nordCapacityGeneration;
+    string holderInstance;
     string bindIp6;
     /// "any" preserves dual-stack Happy Eyeballs; "ipv6" never dials IPv4.
     string addressFamily = "any";
@@ -186,7 +193,11 @@ struct DialRequest {
             r.proxy.port = cast(ushort) pp;
             r.proxy.username = jstr(p, "username");
             r.proxy.password = jstr(p, "password");
+            r.proxy.provider = jstr(p, "provider");
         }
+        r.nordCapacityToken = jstr(j, "nordCapacityToken");
+        r.nordCapacityGeneration = jstr(j, "nordCapacityGeneration");
+        r.holderInstance = jstr(j, "holderInstance");
         r.bindIp6 = jstr(j, "bindIp6");
         auto family = j["addressFamily"];
         if (family.type != Json.Type.undefined) {
@@ -206,6 +217,15 @@ struct DialRequest {
     /// Also used by in-process callers, so bypassing JSON cannot relax the
     /// native tier's family/bind/proxy contract.
     void validateTransport() const {
+        if (hasProxy && proxy.provider != "nordvpn" && proxy.provider != "mullvad")
+            throw new Exception("DIAL: explicit proxy provider required");
+        if (hasProxy && proxy.provider == "nordvpn") {
+            if (!validNordCapacityToken(nordCapacityToken) || !validHolderInstance(holderInstance)
+                    || !validNordCapacityGeneration(nordCapacityGeneration))
+                throw new Exception("DIAL: Nord generation, token and holder instance required");
+        } else if (nordCapacityToken.length || nordCapacityGeneration.length || holderInstance.length) {
+            throw new Exception("DIAL: Nord capacity fields require Nord proxy");
+        }
         if (tls != "none" && tls != "implicit" && tls != "starttls")
             throw new Exception("DIAL: tls must be none|implicit|starttls");
         if (trustedServerFingerprints.length && !verifyServerCertificates)
@@ -249,9 +269,15 @@ struct DialRequest {
             p["port"] = cast(int) proxy.port;
             if (proxy.username.length) p["username"] = proxy.username;
             if (proxy.password.length) p["password"] = proxy.password;
+            p["provider"] = proxy.provider;
             j["proxy"] = p;
         } else {
             j["proxy"] = Json(null);
+        }
+        if (nordCapacityToken.length) {
+            j["nordCapacityToken"] = nordCapacityToken;
+            j["nordCapacityGeneration"] = nordCapacityGeneration;
+            j["holderInstance"] = holderInstance;
         }
         j["bindIp6"] = bindIp6.length ? Json(bindIp6) : Json(null);
         j["addressFamily"] = addressFamily;
@@ -260,6 +286,32 @@ struct DialRequest {
         j["starttlsTimeoutMs"] = starttlsTimeoutMs;
         return j;
     }
+}
+
+/// Canonical random attempt IDs; old ownership attempts use 128-bit hex.
+bool validNordCapacityToken(string token) @safe pure nothrow @nogc {
+    if (token.length == 36) return validHolderInstance(token);
+    if (token.length != 32) return false;
+    foreach (c; token)
+        if (!(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f')) return false;
+    return true;
+}
+
+bool validHolderInstance(string value) @safe pure nothrow @nogc {
+    if (value.length != 36) return false;
+    foreach (i, c; value) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            if (c != '-') return false;
+        } else if (!(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f')) return false;
+    }
+    return true;
+}
+
+bool validNordCapacityGeneration(string value) @safe pure nothrow @nogc {
+    if (value.length != 77 || value[40] != ':' || !validHolderInstance(value[41 .. $])) return false;
+    foreach (c; value[0 .. 40])
+        if (!(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f')) return false;
+    return true;
 }
 
 /// A literal IPv6 source, never an IPv4-mapped address. Pool authorization
@@ -927,7 +979,7 @@ unittest {
     r.tls = "implicit";
     r.sni = "irc.libera.chat";
     r.hasProxy = true;
-    r.proxy = ProxySpec("tailscale-mullvad-se", 1055);
+    r.proxy = ProxySpec("tailscale-mullvad-se", 1055, "", "", "mullvad");
     r.bindIp6 = "";
     auto back = DialRequest.fromJson(parseJsonString(r.toJson().toString()));
     assert(back == r);
@@ -958,6 +1010,24 @@ unittest {
     assertThrown(DialRequest.fromJson(parseJsonString(`{"host":"h","port":70000}`)));
     assertThrown(DialRequest.fromJson(parseJsonString(`{"host":"h","port":1,"tls":"maybe"}`)));
     assertThrown(DialRequest.fromJson(parseJsonString(`{"host":"h","port":1,"proxy":{"host":"p"}}`)));
+}
+
+@("Nord DIAL requires explicit attribution and canonical attempt identity")
+unittest {
+    import std.exception : assertThrown;
+    auto j = parseJsonString(`{"host":"h","port":6667,"proxy":{"host":"p","port":1080}}`);
+    assertThrown(DialRequest.fromJson(j));
+    j["proxy"]["provider"] = "nordvpn";
+    assertThrown(DialRequest.fromJson(j));
+    j["nordCapacityToken"] = "0123456789abcdef0123456789abcdef";
+    j["holderInstance"] = "11111111-2222-4333-8444-555555555555";
+    j["nordCapacityGeneration"] = "0123456789abcdef0123456789abcdef01234567:11111111-2222-4333-8444-555555555555";
+    auto req = DialRequest.fromJson(j);
+    assert(DialRequest.fromJson(req.toJson()) == req);
+    j["nordCapacityToken"] = "ABCDEF0123456789abcdef0123456789ab";
+    assertThrown(DialRequest.fromJson(j));
+    j["nordCapacityToken"] = "11111111-2222-4333-8444-555555555555";
+    assert(DialRequest.fromJson(j).proxy.provider == "nordvpn");
 }
 
 @("Entry round-trips, nulls for open entries")

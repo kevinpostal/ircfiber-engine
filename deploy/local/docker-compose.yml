@@ -217,6 +217,9 @@ services:
       IRCFIBER_REDIS_URL: redis://redis:6379/0
       IRCFIBER_MONGO_URL: mongodb://mongo:27017/ircfiber
       IRCFIBER_LOG_LEVEL: debug
+      # Unknown SOCKS endpoints are Nord-metered unless explicitly attributed.
+      IRCFIBER_IMAGE_PROXY_SOCKS: "${IRCFIBER_IMAGE_PROXY_SOCKS:-}"
+      IRCFIBER_IMAGE_PROXY_PROVIDER: "${IRCFIBER_IMAGE_PROXY_PROVIDER:-}"
     depends_on:
       redis:
         condition: service_healthy

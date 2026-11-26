@@ -793,6 +793,7 @@ private void caseSourcePoolBoundary(string dir) {
     auto proxy = Json.emptyObject;
     proxy["host"] = "127.0.0.1";
     proxy["port"] = cast(int) port;
+    proxy["provider"] = "mullvad";
     payload["proxy"] = proxy;
     rejected(payload, "native with proxy");
     payload["proxy"] = Json(null);
