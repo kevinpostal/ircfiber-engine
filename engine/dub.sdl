@@ -141,6 +141,13 @@ configuration "connection-registration-test" {
     versions "VibeUseFibers" "FiberMlsWireHarness"
 }
 
+configuration "startup-test" {
+    targetType "executable"
+    targetName "startup-test"
+    mainSourceFile "source/startup_test.d"
+    versions "VibeUseFibers"
+}
+
 configuration "architecture-test" {
     targetType "executable"
     targetName "architecture-test"

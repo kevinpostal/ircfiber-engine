@@ -102,22 +102,25 @@ private bool setupOtel(string svcName) {
 /// Configure Bugsink error reporting from env. Independent switch from
 /// setupOtel() above — see ircfiber.errors module docs.
 private bool setupBugsink(string svcName) {
-    import ircfiber.errors : configureErrorReporting, setErrorReportingEnabled;
-    bool enabled = isEnvEnabled("IRCFIBER_BUGSINK_ENABLED");
-    string dsn = environment.get("IRCFIBER_BUGSINK_DSN", "");
-    if (!enabled || dsn.length == 0) {
-        setErrorReportingEnabled(false);
-        logInfo("Bugsink disabled for %s (IRCFIBER_BUGSINK_ENABLED=%s, dsn set=%s)",
-            svcName, enabled, dsn.length > 0);
-        return false;
-    }
-    configureErrorReporting(dsn, svcName, "0.3.0", "production");
-    setErrorReportingEnabled(true);
-    logInfo("Bugsink enabled for %s", svcName);
-    return true;
+    import ircfiber.engine.startup : configureEngineReporting;
+    const configured = configureEngineReporting(svcName, "0.3.0");
+    logInfo("Bugsink %s for %s", configured ? "enabled" : "disabled", svcName);
+    return configured;
 }
 
-void main() {
+int main() {
+    // The process owner configures private reporting before holder bootstrap.
+    try cast(void) setupBugsink("ircfiber-engine");
+    catch (Throwable) {
+        import ircfiber.errors : configureErrorReporting;
+        try configureErrorReporting(false, "", "ircfiber-engine", "0.3.0", "production"); catch (Throwable) {}
+        try logError("Bugsink configuration failed; reporting disabled"); catch (Throwable) {}
+    }
+    import ircfiber.engine.startup : runEngineProcess;
+    return runEngineProcess((ref bool bootstrapped) { runEngine(bootstrapped); });
+}
+
+private void runEngine(ref bool bootstrapped) {
     initializeServicesOperations();
     // Global crash handler: ensure buffered OTLP logs are shipped even if
     // the process terminates via an uncaught Throwable. vibe.d's event loop
@@ -139,6 +142,7 @@ void main() {
     // the holder kept across the restart (hot swap / crash), dial the rest.
 
     auto ctx = bootstrapEngine();
+    bootstrapped = true;
     g_ctx = ctx;
 
     // OTel must be configured AFTER bootstrap so any bootstrap failures
@@ -149,12 +153,6 @@ void main() {
     catch (Throwable e) {
         string m; try { m = e.msg; } catch (Throwable) { m = "unknown"; }
         try logError("setupOtel failed: %s", m); catch (Throwable) {}
-    }
-
-    try cast(void) setupBugsink("ircfiber-engine");
-    catch (Throwable e) {
-        string m; try { m = e.msg; } catch (Throwable) { m = "unknown"; }
-        try logError("setupBugsink failed: %s", m); catch (Throwable) {}
     }
 
     // Write a fresh state snapshot immediately so the frontend sees the

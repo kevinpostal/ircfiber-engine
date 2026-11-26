@@ -65,6 +65,7 @@ Run native extraction and transport gates from `engine/engine`:
 
 ```sh
 dub run --config=architecture-test
+dub run --config=startup-test
 dub run --config=unittest -b unittest
 dub run --config=services-test
 dub run --config=connection-registration-test
@@ -81,6 +82,19 @@ fixture. Do not point these tests at production or a shared development DB.
 The architecture gate exercises cross-thread breaker visibility, shared
 WEBIRC inserts/read/expiry under concurrency and concurrent IPv6 initialization.
 The module unittest runner explicitly enumerates all three extracted modules.
+
+The canonical common library also requires atomic strict reporter configuration
+and process-owner handling of `HolderStartupException`. The narrow
+`ircfiber.engine.startup` adapter configures reporting before holder bootstrap,
+honors an authoritative DSN file, reports a typed startup failure once, waits
+for its bounded report and preserves process status 75/78. Other exceptions
+retain their prior propagation. `startup-test` checks the status boundary in
+subprocesses with reporting disabled, plus configuration state transitions
+without sending reports. From the repository root,
+`python3 test/test_engine_startup.py` runs the same status boundary with a
+loopback-only synthetic HTTP ingest and checks exactly one private report for
+each bootstrap/terminal failure before process exit. No production ingest or
+credentials are used.
 
 ## Anope services compatibility
 
