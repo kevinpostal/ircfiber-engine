@@ -48,3 +48,32 @@ package Ipv6ConfigState overrideIpv6Prefix(string prefix) {
 package void restoreIpv6Config(Ipv6ConfigState st) {
     synchronized (gIpv6Lock) { gIpv6Prefix = st.prefix; gIpv6Loaded = st.loaded; }
 }
+
+@("IPv6 configuration validates environment once and restores both cache fields")
+unittest {
+    import std.process : environment;
+    assert(gIpv6Lock !is null, "IPv6 lock is initialized before first use");
+    const oldEnv = environment.get("IRCFIBER_IPV6_PREFIX", null);
+    const saved = overrideIpv6Prefix("");
+    scope(exit) {
+        restoreIpv6Config(saved);
+        if (oldEnv is null) environment.remove("IRCFIBER_IPV6_PREFIX");
+        else environment["IRCFIBER_IPV6_PREFIX"] = oldEnv;
+    }
+    foreach (raw; ["", "2001:db8:1:2::", "2001:db8:1:2::/48",
+                   "2001:db8:1:2::1/64", "fd00:1234::/64"]) {
+        environment["IRCFIBER_IPV6_PREFIX"] = raw;
+        restoreIpv6Config(Ipv6ConfigState("", false));
+        assert(configuredIpv6Prefix() == "");
+    }
+    enum valid = "2001:db8:1234:5678::/64";
+    environment["IRCFIBER_IPV6_PREFIX"] = valid;
+    restoreIpv6Config(Ipv6ConfigState("", false));
+    assert(configuredIpv6Prefix() == valid);
+    environment["IRCFIBER_IPV6_PREFIX"] = "invalid";
+    assert(configuredIpv6Prefix() == valid, "loaded config is not re-read");
+    const loaded = overrideIpv6Prefix("");
+    assert(configuredIpv6Prefix() == "", "explicit empty override disables the pool");
+    restoreIpv6Config(loaded);
+    assert(configuredIpv6Prefix() == valid, "restore preserves loaded state and value");
+}

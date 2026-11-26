@@ -37,6 +37,9 @@ import ircfiber.irc.sasl;
 import ircfiber.irc.pacer;
 import ircfiber.irc.reconnect;
 import ircfiber.irc.route_memory;
+import ircfiber.irc.host_breaker;
+import ircfiber.irc.webirc_suppress;
+import ircfiber.irc.ipv6_config;
 import ircfiber.engine.session_snapshot;
 import ircfiber.irc.services;
 import ircfiber.irc.services_identity;
@@ -77,6 +80,9 @@ int main() {
         ircfiber.irc.pacer,
         ircfiber.irc.reconnect,
         ircfiber.irc.route_memory,
+        ircfiber.irc.host_breaker,
+        ircfiber.irc.webirc_suppress,
+        ircfiber.irc.ipv6_config,
         ircfiber.irc.chathistory,
         ircfiber.engine.session_snapshot,
         ircfiber.irc.services,

@@ -17,6 +17,9 @@ import vibe.core.log : logWarn;
 enum long ZLINE_SWAP_SUPPRESS_MS = 30 * 60 * 1000L; // 30 min
 
 private __gshared long[string] gSuppressedUntil;
+// This table has no compound invariant with the egress pool. Both registration
+// and ban-policy callers invoke the API outside gMullvadLock. Never acquire the
+// pool lock here: one eagerly initialized lock owns every access to this table.
 private __gshared Object gLock;
 shared static this() { gLock = new Object(); }
 
@@ -52,6 +55,7 @@ bool webircSwapSuppressed(string hostLower, string ip) {
 
 @("webircSwapSuppressed skips recently Z-lined addresses only")
 unittest {
+    assert(gLock !is null, "WEBIRC suppression lock is initialized before first use");
     assert(suppressKey("irc.ircfiber.com", "1.2.3.4") == "irc.ircfiber.com|1.2.3.4");
     assert(!webircSwapSuppressed("irc.ircfiber.com", "9.9.9.9"),
            "an address never recorded is never suppressed");

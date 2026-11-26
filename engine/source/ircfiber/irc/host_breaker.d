@@ -116,6 +116,7 @@ Duration hostCooldownRemaining(string host, int port) {
 }
 
 unittest {
+    assert(gLock !is null, "host breaker lock is initialized before first use");
     assert(hostCooldownMs(1) == HOST_COOLDOWN_MS);
     assert(hostCooldownMs(2) == 2 * HOST_COOLDOWN_MS);
     assert(hostCooldownMs(10) == HOST_COOLDOWN_MAX_MS);
@@ -128,4 +129,35 @@ unittest {
     recordHostSuccess(h, 1);
     assert(canConnectToHost(h, 1));
     assert(hostCooldownRemaining(h, 1) == Duration.zero);
+}
+
+@("host breaker preserves rolling-window and distinct cooldown-expiry paths")
+unittest {
+    enum h = "breaker-expiry.test";
+    const k = key(h, 6697);
+    scope(exit) recordHostSuccess(h, 6697);
+    // Expired rolling window starts a new failure sequence.
+    synchronized (gLock)
+        gBreakers[k] = HostCircuitBreaker(4, 0, nowMs() - HOST_WINDOW_MS - 1000, 3);
+    recordHostFailure(h, 6697);
+    synchronized (gLock) {
+        assert(gBreakers[k].failCount == 1);
+        assert(gBreakers[k].openCount == 0);
+    }
+    // The reconnect-delay path retains opening count for escalating backoff.
+    synchronized (gLock)
+        gBreakers[k] = HostCircuitBreaker(5, nowMs() - HOST_COOLDOWN_MS - 1000, nowMs(), 1);
+    assert(hostCooldownRemaining(h, 6697) == Duration.zero);
+    synchronized (gLock) {
+        assert(gBreakers[k].openedAt == 0 && gBreakers[k].failCount == 0);
+        assert(gBreakers[k].openCount == 1);
+    }
+    foreach (i; 0 .. HOST_FAIL_THRESHOLD) recordHostFailure(h, 6697);
+    synchronized (gLock) assert(gBreakers[k].openCount == 2);
+    assert(!canConnectToHost(h, 6697));
+    // Preserve the separate admission path's original removal on expiry.
+    synchronized (gLock)
+        gBreakers[k].openedAt = nowMs() - hostCooldownMs(2) - 1000;
+    assert(canConnectToHost(h, 6697));
+    synchronized (gLock) assert((k in gBreakers) is null);
 }
