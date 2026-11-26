@@ -36,6 +36,52 @@ make build-engine # engine binary only
 - Diet templates are compiled via `stringImportPaths` resolved relative to `engine/` when built with `--root=engine`.
 - All `find source` / `find views` references in the top-level Makefile now point to `engine/source` and `engine/views`.
 
+## Shared dependency and process-state ownership
+
+`common/` is a real git submodule pinned to one immutable commit of
+`kevinpostal/ircfiber-common`. Existing clones should run
+`git submodule update --init --recursive`. Do not restore an inline mirror or
+edit common sources in this repository. The local deployment stack is the
+sibling `../site/deploy/local` tree, configurable through `LOCAL_STACK_DIR`.
+
+The architecture extraction confines state behind module APIs, not eliminates
+all process globals:
+
+- `ircfiber.irc.host_breaker` owns one process-shared table and its eagerly
+  initialized lock. Failure, success, admission and reconnect-delay access all
+  take that lock. The unused manager-local duplicate was removed. The original
+  window, thresholds and distinct cooldown-expiry paths are preserved.
+- `ircfiber.irc.webirc_suppress` owns the process-wide suppression table and an
+  independent eagerly initialized lock. It does not acquire `gMullvadLock`.
+  Ban-policy and registration call sites already invoke suppression separately
+  from egress-pool operations, so there is no compound pool-table transaction
+  being split. Every suppression read, insertion and expiry removal takes the
+  same module lock.
+- `ircfiber.irc.ipv6_config` owns the prefix cache, loaded flag and lock. First
+  environment read and all later reads are serialized. Existing holder-family,
+  physical-routing and saved-IID gates remain in the connection path.
+
+Run native extraction and transport gates from `engine/engine`:
+
+```sh
+dub run --config=architecture-test
+dub run --config=unittest -b unittest
+dub run --config=services-test
+dub run --config=connection-registration-test
+dub run --config=dial-guard-test
+dub run :holder --config=dial-fallback-test
+dub build --config=engine
+dub build :holder
+```
+
+`dial-guard-test` requires an isolated Redis on `127.0.0.1:6379`.
+Set `IRCFIBER_HISTORY_TEST_REDIS_URL=redis://127.0.0.1:6379/0` to include
+registration's full writer-ledger regression, using only an isolated empty
+fixture. Do not point these tests at production or a shared development DB.
+The architecture gate exercises cross-thread breaker visibility, shared
+WEBIRC inserts/read/expiry under concurrency and concurrent IPv6 initialization.
+The module unittest runner explicitly enumerates all three extracted modules.
+
 ## Anope services compatibility
 
 Anope 2.0/2.1 VERSION families select candidate reply decoders; an unknown

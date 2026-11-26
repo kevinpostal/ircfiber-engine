@@ -77,7 +77,7 @@ Part of [kevinpostal/irc-fiber](https://github.com/kevinpostal/irc-fiber) superp
 ## Quick start
 
 ```bash
-git clone https://github.com/kevinpostal/ircfiber-engine.git
+git clone --recurse-submodules https://github.com/kevinpostal/ircfiber-engine.git
 cd ircfiber-engine
 ./scripts/generate-version.sh
 dub --root=common build && dub --root=engine build
@@ -97,7 +97,7 @@ docker compose logs -f engine
 ircfiber-engine/
  engine/source/app_engine.d
  engine/source/ircfiber/{irc/{connection,manager,parser,sasl},engine/{bootstrap,consumer,processor,state}}
- common/source/ircfiber/{redis,models,db,storage} # duplicated from ircfiber-common
+ common/                                  # pinned ircfiber-common git submodule
  backend/dub.sdl + dub.selections.json           # stub for dub validation
  Containerfile.engine + Makefile.engine + docker-compose.yml
  (deploys: `make ship-engine` from ircfiber-infra — site/deploy/playbooks/engine-deploy.yml)
@@ -106,9 +106,9 @@ ircfiber-engine/
 ## Configuration
 
 ```bash
-cp deploy/inventories/production/group_vars/vault.example.yml deploy/inventories/production/group_vars/vault.yml
+cp ../site/deploy/inventories/production/group_vars/vault.example.yml ../site/deploy/inventories/production/group_vars/vault.yml
 op inject -i vault.example.yml -o vault.yml  # 1Password, or Codespaces secret
-ansible-vault edit deploy/inventories/production/group_vars/vault.yml
+ansible-vault edit ../site/deploy/inventories/production/group_vars/vault.yml
 ```
 
 No hardcoded `ircfiber_admin_password` — via `vault_ircfiber_admin_password`.
