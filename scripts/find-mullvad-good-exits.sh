@@ -79,7 +79,7 @@ if [ ${#GOOD[@]} -ge 3 ]; then
     echo "  - { name: \"$SHORT\", exit_node: \"$IP\" } # $HN"
   done
   echo ""
-  echo "Then: ansible-playbook -i deploy/inventories/production/hosts.ini deploy/playbooks/engine.yml -l vps-833a04ee --vault-password-file deploy/.vault_pass.txt"
+  echo "Then: (cd site/deploy && ansible-playbook -i inventories/production/hosts.ini playbooks/engine.yml -l vps-833a04ee --vault-password-file .vault_pass.txt)"
   echo "Or manual: update /etc/ircfiber/engine/env-ovh pool and restart engine"
 else
   echo "Not enough good exits (need 3, got ${#GOOD[@]}), try larger limit."
