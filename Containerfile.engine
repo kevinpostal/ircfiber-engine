@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 #
 # ===================================
 #
@@ -22,9 +22,24 @@
 # ============================================================================
 # Stage: base — Ubuntu + toolchain
 # ============================================================================
-FROM ubuntu:22.04 AS base
-
+ARG TAILSCALE_IMAGE=tailscale/tailscale:stable@sha256:72c1e19e0aedca96b8533bbb0b4368564410ff20b17e53b804eb6c1f04a31be4
+ARG UBUNTU_IMAGE=ubuntu:22.04@sha256:b000e69a50ff940390233025e7a337fb8469b509e2334fa4d018ac30f3e18cdb
 ARG LDC_VERSION=1.41.0
+# Keep BuildKit's automatic global TARGETARCH; redeclare only inside base.
+
+FROM scratch AS ldc-src-amd64
+ARG LDC_VERSION
+ADD --checksum=sha256:4a439457f0fe59e69d02fd6b57549fc3c87ad0f55ad9fb9e42507b6f8e327c8f https://github.com/ldc-developers/ldc/releases/download/v${LDC_VERSION}/ldc2-${LDC_VERSION}-linux-x86_64.tar.xz /ldc.tar.xz
+
+FROM scratch AS ldc-src-arm64
+ARG LDC_VERSION
+ADD --checksum=sha256:1c4b950a13d53379ed4f564366c27ec56d6261e21686880d70c7486b3e8c7ba8 https://github.com/ldc-developers/ldc/releases/download/v${LDC_VERSION}/ldc2-${LDC_VERSION}-linux-aarch64.tar.xz /ldc.tar.xz
+
+FROM ldc-src-${TARGETARCH} AS ldc-src
+
+FROM ${UBUNTU_IMAGE} AS base
+
+ARG LDC_VERSION
 ARG TARGETARCH
 
 # Docker ships an apt-clean hook that empties /var/cache/apt on every RUN,
@@ -44,20 +59,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         patch \
         ca-certificates
 
-# $TARGETARCH is set automatically by buildx (amd64 | arm64 | 386 | arm/v7).
-# Previous version used `uname -m` which silently broke on multi-platform
-# builds (always returned the kernel arch, not the requested target).
-RUN case "$TARGETARCH" in \
-        amd64)  LDC_ARCH=x86_64  ;; \
-        arm64)  LDC_ARCH=aarch64 ;; \
-        *) echo "Unsupported TARGETARCH: $TARGETARCH"; exit 1 ;; \
-    esac && \
+# The selected source stage fails closed for unsupported target architectures.
+RUN --mount=from=ldc-src,target=/ldc \
     mkdir -p /opt && \
-    curl -fsSL -o /tmp/ldc.tar.xz \
-        "https://github.com/ldc-developers/ldc/releases/download/v${LDC_VERSION}/ldc2-${LDC_VERSION}-linux-${LDC_ARCH}.tar.xz" && \
-    tar -xf /tmp/ldc.tar.xz -C /opt && \
-    ln -s "/opt/ldc2-${LDC_VERSION}-linux-${LDC_ARCH}" /opt/ldc2 && \
-    rm /tmp/ldc.tar.xz
+    tar -xf /ldc/ldc.tar.xz -C /opt && \
+    ln -s "/opt/ldc2-${LDC_VERSION}-linux-$(case ${TARGETARCH} in amd64) echo x86_64;; arm64) echo aarch64;; esac)" /opt/ldc2
 
 ENV PATH="/opt/ldc2/bin:${PATH}"
 WORKDIR /build
@@ -134,7 +140,9 @@ RUN strip ./irc-fiber-engine ./irc-fiber-holder ./janitor-migrate ./ircfiber-def
 # COPYs come from builder-engine only — building this target never compiles
 # backend sources.
 # ============================================================================
-FROM ubuntu:22.04 AS runtime-engine
+FROM ${TAILSCALE_IMAGE} AS tailscale-src
+
+FROM ${UBUNTU_IMAGE} AS runtime-engine
 
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
@@ -154,25 +162,25 @@ WORKDIR /app
 # tailscale CLI: the engine drives each Mullvad slot's tailscaled through the
 # slot's own LocalAPI socket (`tailscale --socket=<slot> set --exit-node=…`)
 # to retarget an idle exit to the location a user picked.
-COPY --from=tailscale/tailscale:stable /usr/local/bin/tailscale /usr/local/bin/tailscale
+COPY --link --from=tailscale-src /usr/local/bin/tailscale /usr/local/bin/tailscale
 
-COPY --from=builder-engine /build/irc-fiber-engine      /app/irc-fiber-engine
-COPY --from=builder-engine /build/janitor-migrate       /app/janitor-migrate
+COPY --link --from=builder-engine /build/irc-fiber-engine      /app/irc-fiber-engine
+COPY --link --from=builder-engine /build/janitor-migrate       /app/janitor-migrate
 # Keep the independently licensed catalog sources and notices with the
 # binary that embeds their compiled translations.
-COPY --from=builder-engine /build/engine/catalogs/anope/SOURCE.txt /usr/share/ircfiber/anope-catalogs/SOURCE.txt
-COPY --from=builder-engine /build/engine/catalogs/anope/2.1/source/ /usr/share/ircfiber/anope-catalogs/2.1/source/
-COPY --from=builder-engine /build/engine/catalogs/anope/2.1/LICENSE.txt /usr/share/ircfiber/anope-catalogs/2.1/LICENSE.txt
-COPY --from=builder-engine /build/engine/catalogs/anope/2.0.20/source/ /usr/share/ircfiber/anope-catalogs/2.0.20/source/
-COPY --from=builder-engine /build/engine/catalogs/anope/2.0.20/COPYING /usr/share/ircfiber/anope-catalogs/2.0.20/COPYING
-COPY config/ ./config/
+COPY --link --from=builder-engine /build/engine/catalogs/anope/SOURCE.txt /usr/share/ircfiber/anope-catalogs/SOURCE.txt
+COPY --link --from=builder-engine /build/engine/catalogs/anope/2.1/source/ /usr/share/ircfiber/anope-catalogs/2.1/source/
+COPY --link --from=builder-engine /build/engine/catalogs/anope/2.1/LICENSE.txt /usr/share/ircfiber/anope-catalogs/2.1/LICENSE.txt
+COPY --link --from=builder-engine /build/engine/catalogs/anope/2.0.20/source/ /usr/share/ircfiber/anope-catalogs/2.0.20/source/
+COPY --link --from=builder-engine /build/engine/catalogs/anope/2.0.20/COPYING /usr/share/ircfiber/anope-catalogs/2.0.20/COPYING
+COPY --link config/ ./config/
 
 # Data dirs (engine needs no public/views).
 RUN mkdir -p /app/data /app/uploads
 
 # Engine entrypoint + healthcheck
-COPY deploy/roles/engine/files/ircfiber-engine-entrypoint.sh /usr/local/bin/ircfiber-engine-entrypoint.sh
-COPY deploy/roles/engine/files/ircfiber-engine-healthcheck.sh /usr/local/bin/ircfiber-engine-healthcheck.sh
+COPY --link deploy/roles/engine/files/ircfiber-engine-entrypoint.sh /usr/local/bin/ircfiber-engine-entrypoint.sh
+COPY --link deploy/roles/engine/files/ircfiber-engine-healthcheck.sh /usr/local/bin/ircfiber-engine-healthcheck.sh
 RUN chmod 0755 /usr/local/bin/ircfiber-engine-entrypoint.sh \
               /usr/local/bin/ircfiber-engine-healthcheck.sh
 
@@ -211,7 +219,7 @@ LABEL com.ircfiber.coordinated-exclusion-version="1"
 # an engine ship (recreating it reconnects every IRC network). Needs no
 # tailscale (egress policy stays in the engine) and no config/ tree.
 # ============================================================================
-FROM ubuntu:22.04 AS runtime-holder
+FROM ${UBUNTU_IMAGE} AS runtime-holder
 
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
@@ -224,7 +232,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 WORKDIR /app
 
-COPY --from=builder-engine /build/irc-fiber-holder /app/irc-fiber-holder
+COPY --link --from=builder-engine /build/irc-fiber-holder /app/irc-fiber-holder
 
 # Unix-socket directory shared with the engine (compose/ansible mount a
 # named volume here); HEALTHCHECK (`--check`) is set by compose/ansible/k8s.

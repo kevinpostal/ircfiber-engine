@@ -12,3 +12,5 @@ docs
 *.log
 backend/irc-fiber*
 engine/irc-fiber*
+**/*.md
+**/*.log
